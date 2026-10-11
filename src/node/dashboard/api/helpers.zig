@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 pub const json = @import("../../../util/json.zig");
 pub const MetricsRegistry = @import("../../../metrics/registry.zig").MetricsRegistry;
 pub const HostStats = @import("../host_stats.zig");
+pub const NodeHealth = @import("../../health.zig").NodeHealth;
 
 // =============================================================================
 // Dashboard Context — Central context for all dashboard API handlers
@@ -43,6 +44,11 @@ pub const DashboardContext = struct {
     client_ip4: [4]u8 = .{ 127, 0, 0, 1 },
     /// Live host telemetry for this node (CPU/MEM/IO), sampled by /cluster/stats.
     host: HostStats.Sampler = .{},
+    /// Each shard's published state, for /ready.
+    health: ?*const NodeHealth = null,
+    /// `shard_ptrs` is set. The dashboard starts before the shards replay,
+    /// and a data API before this would read shards still being built.
+    shards_ready: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
         return .{
@@ -52,6 +58,14 @@ pub const DashboardContext = struct {
             .start_time = @import("stdx").time.milliTimestamp(),
             .shard_ptrs = null,
         };
+    }
+
+    /// Point the data APIs at the shards, once they are built and wired.
+    pub fn wireShards(self: *DashboardContext, allocator: Allocator, shards: anytype) !void {
+        const ptrs = try allocator.alloc(*anyopaque, shards.len);
+        for (shards, ptrs) |*shard, *p| p.* = @ptrCast(shard);
+        self.shard_ptrs = ptrs;
+        self.shards_ready.store(true, .release);
     }
 
     /// `host:port` of this node's client listener, for the dashboard's own writes.

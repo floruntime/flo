@@ -60,19 +60,24 @@ test "e2e/metrics: prometheus exporter serves the registry" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "flo_shards_total") != null);
 }
 
-test "e2e/metrics: exporter health endpoint reports the real shard count" {
+test "e2e/metrics: exporter /health answers ok, and /status lists every shard" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .metrics_enabled = true },
+        .server = .{ .metrics_enabled = true, .shards = 2 },
     });
     defer ctx.deinit();
 
     var http = try ctx.createMetricsHttp();
     defer http.deinit();
 
-    var resp = try http.get("/health");
-    defer resp.deinit();
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ok\"") != null);
-    // Was always "shards":0 because initShards() had no caller.
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"shards\":0") == null);
+    var health = try http.get("/health");
+    defer health.deinit();
+    try testing.expectEqual(@as(u16, 200), health.status);
+    try testing.expectEqualStrings("ok", health.bodyTrimmed());
+
+    var status = try http.get("/status");
+    defer status.deinit();
+    try testing.expectEqual(@as(u16, 200), status.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, status.body, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.get("shards").?.array.items.len);
 }

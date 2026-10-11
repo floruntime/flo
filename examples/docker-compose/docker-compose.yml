@@ -11,11 +11,15 @@ services:
       - flo-data:/data/flo
       # Mount our local config which sets dashboard bind to 0.0.0.0
       - ./flo.toml:/etc/flo/flo.toml
+    # Healthy means ready: every shard has replayed and serves. Services that
+    # `depends_on: flo: condition: service_healthy` start after that. The
+    # start period allows a long replay; /health is the liveness check.
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9002/health || nc -z localhost 9000 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9002/ready || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 120s
     restart: unless-stopped
 
 volumes:

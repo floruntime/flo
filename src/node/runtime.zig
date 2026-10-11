@@ -48,6 +48,7 @@ const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const HttpMetricsServer = @import("../metrics/http_server.zig").HttpMetricsServer;
+const NodeHealth = @import("health.zig").NodeHealth;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
 ///
@@ -232,6 +233,10 @@ pub const Runtime = struct {
     /// Prometheus exporter (serves GET /metrics on the metrics port).
     metrics_server: ?*HttpMetricsServer,
 
+    /// Each shard's published state, for /ready and /status. Outlives both
+    /// HTTP servers.
+    health: ?*NodeHealth,
+
     /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
     /// Each entry is a per-shard array of projection pointers for one walk opcode.
     /// Slots: [0] = ts_list. More slots added as modules gain list support.
@@ -284,6 +289,7 @@ pub const Runtime = struct {
             .dashboard_ctx = null,
             .metrics_registry = null,
             .metrics_server = null,
+            .health = null,
             .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .data_dir_lock = null,
             .peer_stream_handlers_slice = null,
@@ -323,6 +329,11 @@ pub const Runtime = struct {
             metrics.deinit();
             self.allocator.destroy(metrics);
             self.metrics_registry = null;
+        }
+        if (self.health) |h| {
+            h.deinit(self.allocator);
+            self.allocator.destroy(h);
+            self.health = null;
         }
 
         // Clean up raft network, then the queue it fed (the shards that
@@ -556,6 +567,16 @@ pub const Runtime = struct {
         raft_config.durable_commits = self.config.durability == .sync;
         raft_config.self_counts_when_durable = self.config.durability == .sync;
 
+        // 1.5 HTTP before the shards: replaying a large log takes a while,
+        //     and a probe that finds nothing listening reads it as dead.
+        const node_health = try self.allocator.create(NodeHealth);
+        node_health.* = NodeHealth.init(self.allocator, cluster_node_id, self.shard_count) catch |err| {
+            self.allocator.destroy(node_health);
+            return err;
+        };
+        self.health = node_health;
+        try self.startHttp(bind_ip);
+
         // 2. Create shards
         const shards = try self.allocator.alloc(Shard, self.shard_count);
         var shards_created: usize = 0;
@@ -566,8 +587,11 @@ pub const Runtime = struct {
             self.allocator.free(shards);
             self.shards = null;
         }
+        // Runs before the shards are freed: the dashboard reads them.
+        errdefer self.stopHttp();
 
         for (0..self.shard_count) |i| {
+            node_health.shards[i].set(.replaying);
             shards[i] = try Shard.init(
                 self.allocator,
                 @intCast(i),
@@ -584,6 +608,7 @@ pub const Runtime = struct {
                 raft_config,
             );
             shards_created += 1;
+            shards[i].health = &node_health.shards[i];
         }
         self.shards = shards;
 
@@ -613,6 +638,11 @@ pub const Runtime = struct {
             shards[i].wireHandlerShardPtrs();
             shards[i].applyDeferredTail();
         }
+        if (self.metrics_registry) |metrics| {
+            for (shards) |*shard| shard.setMetricsRegistry(metrics);
+        }
+        for (shards) |*shard| shard.publishHealth();
+        if (self.dashboard_ctx) |ctx| try ctx.wireShards(self.allocator, shards);
 
         log.debug("Runtime.start: {d} shards initialized", .{shards_created});
 
@@ -674,6 +704,7 @@ pub const Runtime = struct {
             rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip, secret);
             errdefer rn.deinit();
             rn.setRaftQueue(q);
+            if (self.metrics_registry) |metrics| rn.setReplicationMetrics(&metrics.replication);
             try rn.start();
             self.raft_queue = q;
             shards[0].raft_queue = q;
@@ -739,49 +770,47 @@ pub const Runtime = struct {
         // 5. Spawn acceptor thread
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
         log.debug("Runtime.start: acceptor thread spawned", .{});
+        node_health.accepting.store(true, .release);
 
-        // 6. Metrics registry — shared by the Prometheus exporter and the
-        //    dashboard. Created when either consumer is enabled.
+        self.started = true;
+        log.debug("Runtime.start: all components started, node is ready", .{});
+    }
+
+    /// The metrics registry, the exporter and the dashboard, before any
+    /// shard exists. Until the shards are wired the dashboard's data APIs
+    /// answer that the node is replaying; /health, /ready and /status
+    /// answer throughout.
+    fn startHttp(self: *Runtime, bind_ip: [4]u8) !void {
+        const node_health = self.health.?;
+        // Shared by the exporter and the dashboard; created when either is.
         if (self.config.metrics_enabled or self.config.dashboard_enabled) {
             const metrics = try self.allocator.create(MetricsRegistry);
             metrics.* = MetricsRegistry.init(self.allocator);
             self.metrics_registry = metrics;
 
             // Size the per-shard counter table. Without this `shardCount()`
-            // stays 0, so /health reported "shards":0 on a multi-shard node and
-            // the shard metric family was omitted entirely.
+            // stays 0 and the shard metric family is omitted entirely.
             metrics.initShards(self.shard_count) catch |err| {
                 log.warn("metrics: initShards({d}) failed: {s}", .{ self.shard_count, @errorName(err) });
             };
-
-            // Wire metrics registry into each shard's handlers
-            if (self.shards) |s| {
-                for (s) |*shard| {
-                    shard.setMetricsRegistry(metrics);
-                }
-            }
-
-            if (self.raft_network) |rn| rn.setReplicationMetrics(&metrics.replication);
         }
 
-        // 6a. Prometheus exporter if metrics is enabled
         if (self.config.metrics_enabled) {
-            if (self.metrics_registry) |metrics| {
-                const ms = try self.allocator.create(HttpMetricsServer);
-                ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), self.config.metrics_bind, metrics);
-                self.metrics_server = ms;
-                ms.start() catch |err| {
-                    log.err("metrics exporter failed to start on port {d}: {s}", .{ self.config.effectiveMetricsPort(), @errorName(err) });
-                    self.allocator.destroy(ms);
-                    self.metrics_server = null;
-                };
-                if (self.metrics_server != null) {
-                    log.debug("Runtime.start: metrics exporter on port {d}", .{self.config.effectiveMetricsPort()});
-                }
+            const metrics = self.metrics_registry.?;
+            const ms = try self.allocator.create(HttpMetricsServer);
+            ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), self.config.metrics_bind, metrics);
+            ms.health = node_health;
+            self.metrics_server = ms;
+            ms.start() catch |err| {
+                log.err("metrics exporter failed to start on port {d}: {s}", .{ self.config.effectiveMetricsPort(), @errorName(err) });
+                self.allocator.destroy(ms);
+                self.metrics_server = null;
+            };
+            if (self.metrics_server != null) {
+                log.debug("Runtime.start: metrics exporter on port {d}", .{self.config.effectiveMetricsPort()});
             }
         }
 
-        // 6b. Start dashboard HTTP server if enabled
         if (self.config.dashboard_enabled) {
             const metrics = self.metrics_registry.?;
 
@@ -791,16 +820,7 @@ pub const Runtime = struct {
             // Dashboard writes go through the client port; a node bound to one
             // interface is not reachable at 127.0.0.1.
             ctx.client_ip4 = if (std.mem.eql(u8, &bind_ip, &stdx.net.any_ip4)) .{ 127, 0, 0, 1 } else bind_ip;
-
-            // Wire shard references for read-only projection access
-            if (self.shards) |s| {
-                const ptrs = try self.allocator.alloc(*anyopaque, s.len);
-                for (s, 0..) |*shard, i| {
-                    ptrs[i] = @ptrCast(shard);
-                }
-                ctx.shard_ptrs = ptrs;
-            }
-
+            ctx.health = node_health;
             self.dashboard_ctx = ctx;
 
             const server = try self.allocator.create(DashboardServer);
@@ -813,9 +833,11 @@ pub const Runtime = struct {
             self.dashboard_server = server;
             try server.start();
         }
+    }
 
-        self.started = true;
-        log.debug("Runtime.start: all components started, node is ready", .{});
+    fn stopHttp(self: *Runtime) void {
+        if (self.dashboard_server) |server| server.stop();
+        if (self.metrics_server) |ms| ms.stop();
     }
 
     /// Wire cross-shard stream handler references so processing pipelines
@@ -1003,16 +1025,11 @@ pub const Runtime = struct {
         log.debug("Runtime.stop: initiating graceful shutdown", .{});
 
         // 0. Stop the HTTP servers first. The exporter must go down with the
-        //    dashboard: otherwise it keeps answering /health with
-        //    {"status":"ok"} and serving /metrics for a node that has stopped,
-        //    for the whole window between stop() and deinit() — which includes
-        //    every shard's final flush.
-        if (self.dashboard_server) |server| {
-            server.stop();
-        }
-        if (self.metrics_server) |ms| {
-            ms.stop();
-        }
+        //    dashboard: otherwise it keeps answering /health with ok and
+        //    serving /metrics for a node that has stopped, for the whole
+        //    window between stop() and deinit() — which includes every
+        //    shard's final flush.
+        self.stopHttp();
 
         // 0.5 Stop raft network
         if (self.raft_network) |rn| {

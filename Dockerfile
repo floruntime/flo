@@ -82,9 +82,12 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # The peer port (port+500) is bound only by a cluster member
 EXPOSE 9000 9001 9002
 
-# Health check: try dashboard /health first (rich JSON), fall back to TCP
-# connect on the main port (works even when dashboard is disabled).
-HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
+# Liveness, not readiness: runtimes that replace unhealthy containers would
+# otherwise kill a node mid-replay, or one that needs an operator, and
+# restart it forever. /ready is for routing (see the compose example).
+# HTTP is up before replay, so a short start period is enough. The TCP
+# fallback covers --no-dashboard.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=10 \
     CMD curl -sf http://localhost:9002/health \
      || nc -z localhost 9000 \
      || exit 1

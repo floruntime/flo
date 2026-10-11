@@ -1,6 +1,6 @@
 //! Dashboard API — System Endpoints
 //!
-//! - GET /cluster/stats — Cluster health, RPS, connections
+//! - GET /cluster/stats — Cluster health, readiness and each shard's state, RPS, connections
 //! - GET /metrics       — Internal metrics (JSON format)
 
 const std = @import("std");
@@ -40,6 +40,24 @@ pub fn getClusterStats(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     try obj.intField("bytes_received", server_metrics.bytes_received);
     try obj.intField("bytes_sent", server_metrics.bytes_sent);
     try obj.intField("subscriptions", server_metrics.subscriptions);
+
+    // Answered while the shards replay, so the console can say so.
+    if (ctx.health) |health| {
+        const r = health.readiness();
+        try obj.boolField("ready", r.ready);
+        try obj.stringField("state", r.word);
+        var shards_arr = try obj.arrayField("shards");
+        try shards_arr.begin();
+        for (health.shards, 0..) |*slot, i| {
+            try shards_arr.next();
+            var shard_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try shard_obj.begin();
+            try shard_obj.intField("id", i);
+            try shard_obj.stringField("state", @tagName(slot.get()));
+            try shard_obj.end();
+        }
+        try shards_arr.end();
+    }
 
     // A node's dashboard only observes itself (no cluster-membership view here),
     // so we report one node: this live process, with real host telemetry. The
@@ -138,6 +156,7 @@ test "getClusterStats returns valid JSON" {
 
     // Should contain key fields
     try std.testing.expect(std.mem.indexOf(u8, result, "\"rps\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ready\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"version\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"num_shards\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"nodes\"") != null);
@@ -163,4 +182,27 @@ test "getMetricsJson returns valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"kv_namespaces\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"replication\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"peers_linked\"") != null);
+}
+
+test "getClusterStats says whether the node is ready, and each shard's state" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var health = try h.NodeHealth.init(allocator, 1, 2);
+    defer health.deinit(allocator);
+    health.shards[0].set(.ok);
+    health.shards[1].set(.replaying);
+    var ctx = DashboardContext.init(allocator, &metrics, 2);
+    ctx.health = &health;
+
+    const result = try getClusterStats(allocator, &ctx);
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(!root.get("ready").?.bool);
+    try std.testing.expectEqualStrings("replaying", root.get("state").?.string);
+    const shards = root.get("shards").?.array.items;
+    try std.testing.expectEqualStrings("ok", shards[0].object.get("state").?.string);
+    try std.testing.expectEqualStrings("replaying", shards[1].object.get("state").?.string);
 }
