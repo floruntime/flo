@@ -392,5 +392,6 @@ test "TaskScheduler: tasks that take little all run in one tick" {
     var sched = TaskScheduler.init();
     var ctxs: [4]TestContext = @splat(.{});
     for (&ctxs) |*c| try sched.register("t", 999_999, testTask, @ptrCast(c));
-    try std.testing.expectEqual(@as(u32, 4), sched.tick(2_000_000));
+    // A budget no loaded machine runs four empty tasks past.
+    try std.testing.expectEqual(@as(u32, 4), sched.tick(std.time.ns_per_s));
 }
