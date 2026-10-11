@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("ual/entry.zig");
 const ual_mod = @import("ual/ual.zig");
+const tombstones = @import("tombstones.zig");
 const snapshot_mod = @import("snapshot.zig");
 const router_mod = @import("../projection/router.zig");
 const kv_mod = @import("../projection/kv.zig");
@@ -61,6 +62,9 @@ pub const Partition = struct {
     /// Warm store — payload copies for entries evicted from the hot ring buffer.
     /// Populated on every non-KV apply() so reads can fall back to warm when UAL evicts.
     warm_store: std.AutoHashMapUnmanaged(u64, []const u8),
+    /// Under a budget the warm store holds steady, evicting as it adds;
+    /// this keeps its tombstones bounded.
+    warm_sweep: tombstones.Sweep = .{},
 
     /// Warm store memory tracking (bounded by warm_budget).
     warm_bytes_used: usize,
@@ -199,6 +203,7 @@ pub const Partition = struct {
 
             // Free old copy if this index was already in warm store (idempotent apply)
             if (self.warm_store.fetchRemove(e.header.index)) |old| {
+                self.warm_sweep.noteRemoved([]const u8, &self.warm_store);
                 self.warm_bytes_used -= old.value.len;
                 self.allocator.free(@constCast(old.value));
             }
@@ -233,6 +238,7 @@ pub const Partition = struct {
 
             // Remove it
             if (self.warm_store.fetchRemove(min_index)) |removed| {
+                self.warm_sweep.noteRemoved([]const u8, &self.warm_store);
                 self.warm_bytes_used -= removed.value.len;
                 self.allocator.free(@constCast(removed.value));
             }
@@ -710,10 +716,11 @@ test "partition: warm store eviction under budget" {
     // Set a very tight warm budget (100 bytes)
     part.setWarmBudget(100);
 
-    // Apply entries with payloads that accumulate beyond 100 bytes
+    // Apply entries with payloads that accumulate beyond 100 bytes. Not KV:
+    // KV entries never reach the warm store.
     var i: u64 = 1;
     while (i <= 20) : (i += 1) {
-        var e = makeEntry(.kv_put, i, 1, "0123456789"); // 10 bytes each
+        var e = makeEntry(.stream_append, i, 1, "0123456789"); // 10 bytes each
         e.header.crc32c = e.computeCrc();
         _ = try part.apply(&e);
     }
@@ -721,7 +728,28 @@ test "partition: warm store eviction under budget" {
     // After eviction, warm usage should be at or under budget
     try testing.expect(part.warmUsed() <= 100);
     // Oldest entries should have been evicted
-    try testing.expect(part.warmCount() <= 10);
+    try testing.expectEqual(@as(usize, 10), part.warmCount());
+    try testing.expect(part.warm_store.get(20) != null and part.warm_store.get(10) == null);
+}
+
+test "partition: a warm store held at its budget keeps its tombstones bounded" {
+    var part = try Partition.init(testing.allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    // 1,000 held: a table large enough that tombstones alone could fill
+    // more than half of it.
+    part.setWarmBudget(10_000);
+
+    var i: u64 = 1;
+    while (i <= 100_000) : (i += 1) {
+        var e = makeEntry(.stream_append, i, 1, "0123456789");
+        e.header.crc32c = e.computeCrc();
+        _ = try part.apply(&e);
+        try testing.expect(tombstones.count([]const u8, &part.warm_store) <= part.warm_store.capacity() / 2);
+    }
+    try testing.expectEqual(@as(usize, 1000), part.warmCount());
+    var live: u64 = 100_000 - 999;
+    while (live <= 100_000) : (live += 1) try testing.expectEqualStrings("0123456789", part.warm_store.get(live).?);
 }
 
 test "partition: cold tier not wired returns defaults" {

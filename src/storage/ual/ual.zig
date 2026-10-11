@@ -2,7 +2,8 @@
 //!
 //! Fixed-capacity ring buffer for recent UAL entries. Each partition
 //! owns one hot ring (default 64 MB). Variable-size entries are
-//! serialized contiguously. A hash map provides O(1) by-index reads.
+//! serialized contiguously. `Positions` maps an index to where its entry
+//! starts: O(1) where indexes are dense, a binary search where they are not.
 //!
 //! ## Append
 //!
@@ -35,6 +36,7 @@
 const std = @import("std");
 const entry_mod = @import("entry.zig");
 const log = @import("stdx").log;
+const Positions = @import("positions.zig").Positions;
 
 const Entry = entry_mod.Entry;
 const Header = entry_mod.Header;
@@ -56,8 +58,9 @@ pub const UAL = struct {
     /// Monotonic read cursor (oldest valid byte).
     read_pos: u64,
 
-    /// Index map: UAL index → ring position (byte offset in virtual space).
-    index_map: std.AutoHashMapUnmanaged(u64, u64),
+    /// UAL index → ring position (byte offset in virtual space), oldest
+    /// first.
+    positions: Positions,
 
     /// Number of live entries in the ring.
     entry_count: u64,
@@ -93,7 +96,7 @@ pub const UAL = struct {
             .capacity = capacity,
             .write_pos = 0,
             .read_pos = 0,
-            .index_map = .{},
+            .positions = .{},
             .entry_count = 0,
             .total_appended = 0,
             .total_bytes_written = 0,
@@ -108,7 +111,7 @@ pub const UAL = struct {
     }
 
     pub fn deinit(self: *UAL) void {
-        self.index_map.deinit(self.allocator);
+        self.positions.deinit(self.allocator);
         self.allocator.free(self.buffer);
     }
 
@@ -130,10 +133,16 @@ pub const UAL = struct {
     pub fn append(self: *UAL, entry: *const Entry) !u64 {
         const total_size = entry.totalSize();
         if (total_size > self.capacity) return error.EntryTooLarge;
-        // The index map's room first: an allocation that fails after the
-        // ring was written would leave bytes the map does not know of.
-        // Failing here, nothing has changed.
-        try self.index_map.ensureUnusedCapacity(self.allocator, 1);
+        // Lookups binary-search the positions, which only works while
+        // indexes increase: an append that breaks that is refused, not
+        // left to misdirect every later read.
+        if (self.positions.back()) |last| {
+            if (entry.header.index <= last.index) return error.IndexNotIncreasing;
+        }
+        // The positions' room first: an allocation that fails after the
+        // ring was written would leave bytes they do not know of. Failing
+        // here, nothing has changed.
+        try self.positions.ensureUnusedCapacity(self.allocator, 1);
 
         // Evict until there's room
         while (self.available() < total_size) {
@@ -152,8 +161,7 @@ pub const UAL = struct {
             self.writeToRing(entry.payload);
         }
 
-        // Record in index map
-        self.index_map.putAssumeCapacity(entry.header.index, pos);
+        self.positions.pushBackAssumeCapacity(.{ .index = entry.header.index, .pos = pos });
 
         self.entry_count += 1;
         self.total_appended += 1;
@@ -195,7 +203,7 @@ pub const UAL = struct {
     /// The returned Entry borrows from the ring buffer — valid until that region
     /// is overwritten.
     pub fn read(self: *const UAL, index: u64) ?Entry {
-        const pos = self.index_map.get(index) orelse return null;
+        const pos = self.positions.find(index) orelse return null;
 
         // Verify position is still in live range
         if (pos < self.read_pos) return null;
@@ -233,7 +241,7 @@ pub const UAL = struct {
     /// The header of the entry at `index`, while it is in the ring: always
     /// whole, whatever the payload does at the ring's edge.
     pub fn readHeader(self: *const UAL, index: u64) ?Header {
-        const pos = self.index_map.get(index) orelse return null;
+        const pos = self.positions.find(index) orelse return null;
         if (pos < self.read_pos) return null;
         var hdr_buf: [HEADER_SIZE]u8 = undefined;
         self.readFromRing(pos, &hdr_buf);
@@ -245,7 +253,7 @@ pub const UAL = struct {
     /// Read an entry by index, copying payload into a caller-provided buffer.
     /// Works even if the payload wraps around the ring boundary.
     pub fn readCopy(self: *const UAL, index: u64, payload_buf: []u8) ?Entry {
-        const pos = self.index_map.get(index) orelse return null;
+        const pos = self.positions.find(index) orelse return null;
         if (pos < self.read_pos) return null;
 
         var hdr_buf: [HEADER_SIZE]u8 = undefined;
@@ -311,7 +319,7 @@ pub const UAL = struct {
 
     /// Check if an index is present in the hot ring.
     pub fn contains(self: *const UAL, index: u64) bool {
-        return self.index_map.get(index) != null;
+        return self.positions.find(index) != null;
     }
 
     /// Drop every entry above `after_index` and give its ring space back.
@@ -328,12 +336,11 @@ pub const UAL = struct {
 
         var new_write_pos = self.write_pos;
         var removed: u64 = 0;
-        var idx = after_index + 1;
-        while (idx <= self.max_index) : (idx += 1) {
-            if (self.index_map.fetchRemove(idx)) |kv| {
-                removed += 1;
-                new_write_pos = @min(new_write_pos, kv.value);
-            }
+        while (self.positions.back()) |last| {
+            if (last.index <= after_index) break;
+            _ = self.positions.popBack();
+            removed += 1;
+            new_write_pos = @min(new_write_pos, last.pos);
         }
 
         self.entry_count -= removed;
@@ -396,8 +403,10 @@ pub const UAL = struct {
             cb(hdr_buf[0..HEADER_SIZE], hdr.index);
         }
 
-        // Remove from index map
-        _ = self.index_map.remove(hdr.index);
+        // The oldest position is this entry's: the ring and the positions
+        // hold the same entries in the same order.
+        const oldest = self.positions.popFront();
+        std.debug.assert(oldest != null and oldest.?.index == hdr.index and oldest.?.pos == self.read_pos);
 
         self.read_pos += entry_size;
         self.entry_count -= 1;
@@ -762,7 +771,55 @@ test "UAL: an append whose index-map allocation fails leaves the ring as it was"
     }
     try testing.expect(i < 200);
     // What is there reads back, and the refused entry is not there.
-    try testing.expectEqual(@as(u64, ual.index_map.count()), ual.entry_count);
+    try testing.expectEqual(@as(u64, ual.positions.len), ual.entry_count);
     try testing.expect(ual.readHeader(i) == null);
     try testing.expect(ual.readHeader(appended) != null);
+}
+
+test "UAL: with gaps in its indexes, every held entry reads back through eviction and truncation, and a gap reads as absent" {
+    // ~100 entries live in a ring wrapped many times over; every fifth
+    // index is skipped, as KV entries skip a partition's ring.
+    var ual = try UAL.init(testing.allocator, 100 * (HEADER_SIZE + 8), 0);
+    defer ual.deinit();
+
+    var index: u64 = 1;
+    for (0..20_000) |n| {
+        if (index % 5 == 0) index += 1;
+        const entry = makeEntry(index, "payload!");
+        _ = try ual.append(&entry);
+        index += 1;
+        // Now and then the newest three are truncated and written again.
+        if (n % 997 == 996) {
+            const keep = ual.positions.at(ual.positions.len - 4).index;
+            ual.truncateAfter(keep);
+            try testing.expect(ual.read(keep + 1) == null);
+            index = keep + 1;
+        }
+        if (n % 499 != 0) continue;
+        var i = ual.min_live_index;
+        while (i <= ual.max_index) : (i += 1) {
+            if (i % 5 == 0) {
+                try testing.expect(!ual.contains(i));
+                continue;
+            }
+            const e = ual.readHeader(i) orelse return error.EntryMissing;
+            try testing.expectEqual(i, e.index);
+        }
+        try testing.expect(!ual.contains(ual.min_live_index -| 1) or ual.min_live_index == 1);
+        try testing.expectEqual(@as(u64, ual.positions.len), ual.entry_count);
+    }
+}
+
+test "UAL: an index that does not increase is refused, and the ring is unchanged" {
+    var ual = try UAL.init(testing.allocator, 4096, 0);
+    defer ual.deinit();
+    _ = try ual.append(&makeEntry(5, "a"));
+    _ = try ual.append(&makeEntry(7, "b"));
+    const used_before = ual.used();
+    try testing.expectError(error.IndexNotIncreasing, ual.append(&makeEntry(7, "c")));
+    try testing.expectError(error.IndexNotIncreasing, ual.append(&makeEntry(6, "c")));
+    try testing.expectEqual(used_before, ual.used());
+    try testing.expectEqualStrings("b", ual.read(7).?.payload);
+    _ = try ual.append(&makeEntry(8, "d"));
+    try testing.expectEqualStrings("d", ual.read(8).?.payload);
 }
