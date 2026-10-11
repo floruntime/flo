@@ -22,6 +22,14 @@ pub fn monotonicMs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+/// Nanoseconds from a clock that never jumps, for timing work; its zero
+/// is arbitrary.
+pub fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 /// Wall-clock time in milliseconds since the Unix epoch.
 pub fn milliTimestamp() i64 {
     return @intCast(@divFloor(nanoTimestamp(), std.time.ns_per_ms));

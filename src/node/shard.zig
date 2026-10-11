@@ -3460,7 +3460,6 @@ pub const Shard = struct {
             self.task_scheduler.register(
                 "hot_flush",
                 1_000, // check every 1 second
-                500_000, // 0.5ms budget per invocation
                 hotFlushTask,
                 @ptrCast(self),
             ) catch {};
@@ -3470,7 +3469,6 @@ pub const Shard = struct {
         self.task_scheduler.register(
             "stream_retention",
             10_000, // check every 10 seconds
-            1_000_000, // 1ms budget per invocation
             streamRetentionTask,
             @ptrCast(self),
         ) catch {};
@@ -3482,7 +3480,6 @@ pub const Shard = struct {
         self.task_scheduler.register(
             "stream_group_sweep",
             1_000, // check every 1 second
-            1_000_000, // 1ms budget per invocation
             streamGroupSweepTask,
             @ptrCast(self),
         ) catch {};
@@ -3492,7 +3489,6 @@ pub const Shard = struct {
             self.task_scheduler.register(
                 "segment_flush",
                 1_000, // flush at most once per second
-                2_000_000, // 2ms budget
                 segmentFlushTask,
                 @ptrCast(self),
             ) catch {};
@@ -3500,7 +3496,7 @@ pub const Shard = struct {
     }
 
     /// TaskScheduler callback: flush buffered Raft entries to disk.
-    fn segmentFlushTask(ctx: *anyopaque, _: u64) u64 {
+    fn segmentFlushTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         self.flushSegmentToDisk() catch |err| {
             self.persist_failures += 1;
@@ -3511,7 +3507,7 @@ pub const Shard = struct {
 
     /// TaskScheduler callback: evict entries older than hot_flush_seconds
     /// from every partition's UAL hot ring.
-    fn hotFlushTask(ctx: *anyopaque, _: u64) u64 {
+    fn hotFlushTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const now_ns: u64 = @intCast(@import("stdx").time.nanoTimestamp());
         const cutoff_ns = now_ns -| (self.hot_flush_seconds *| std.time.ns_per_s);
@@ -3526,7 +3522,7 @@ pub const Shard = struct {
     /// TaskScheduler callback: enforce stream retention policies.
     /// Computes trim targets locally, then persists through Raft so
     /// replicas apply the same deterministic trims.
-    fn streamRetentionTask(ctx: *anyopaque, _: u64) u64 {
+    fn streamRetentionTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         // Trims are proposals: only the leader makes them.
         if (self.raft_node.role != .leader) return 0;
@@ -3574,7 +3570,7 @@ pub const Shard = struct {
     /// TaskScheduler callback: sweep every consumer group's PEL.
     /// Re-nacks entries idle past ack_timeout_ms and drops poison entries
     /// past max_deliver. Returns renacked + dropped for scheduler accounting.
-    fn streamGroupSweepTask(ctx: *anyopaque, _: u64) u64 {
+    fn streamGroupSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const proj = self.stream_handler.stream;
         const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
@@ -10153,7 +10149,7 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     _ = try stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
     _ = try stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
     // Older than 5 seconds: the 10 s old record goes, the 1 s old one stays.
-    try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard), 0));
+    try std.testing.expectEqual(@as(u64, 1), Shard.streamRetentionTask(@ptrCast(&shard)));
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expectEqual(@as(u64, 1), stream.streamLogicalCount(h));
 }
