@@ -10,6 +10,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
+const build_info = @import("../../build_info.zig");
 const server_config = @import("../../config/mod.zig").server;
 const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
@@ -573,6 +574,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const bound_port = runtime.boundPort();
     ctx.print("\n", .{});
     ctx.print("Flo server ready on {s}:{d}\n", .{ config.bind, bound_port });
+    ctx.print("Build: {s}\n", .{build_info.line});
     ctx.print("Press Ctrl+C to stop.\n", .{});
     ctx.print("\n", .{});
 
