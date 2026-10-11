@@ -24,7 +24,6 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-/// Server process manager for e2e tests
 /// One e2e run per checkout. Each run kills the checkout's leftover servers
 /// (below), so a second run alongside the first would kill its live ones.
 /// The second is refused instead. The lock is an flock the OS drops when the
@@ -108,6 +107,7 @@ fn claimCheckout() !void {
     if (r.term == .exited and r.term.exited == 0) stdx.time.sleep(500 * std.time.ns_per_ms);
 }
 
+/// Server process manager for e2e tests
 pub const ServerProcess = struct {
     const Self = @This();
 
