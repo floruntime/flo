@@ -162,3 +162,47 @@ test "e2e/server: metrics as json are valid JSON carrying the exposition whole" 
     try testing.expect(text.stdoutContains("flo_stream_append_records_total{"));
     try testing.expect(std.mem.startsWith(u8, text.stdout, "# HELP "));
 }
+
+/// Start a server with `--<which>-port` naming a port something else holds,
+/// and check it refuses with exit 3, naming the port.
+fn expectBindRefused(comptime which: []const u8) !void {
+    const allocator = testing.allocator;
+    const server = try ServerProcess.init(allocator);
+    defer server.deinit();
+    const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+
+    // Something else holds the port.
+    const held = try stdx.net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer stdx.net.sysClose(held);
+    const any = stdx.net.SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try stdx.net.sysBind(held, any.anyPtr(), any.anyLen());
+    try stdx.net.sysListen(held, 1);
+    const port = (try stdx.net.sysLocalIp4(held)).port;
+    var port_buf: [8]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    // Only the listener under test is on; bounded, since a regression
+    // starts without it and keeps running.
+    const other = if (comptime std.mem.eql(u8, which, "metrics")) "--no-dashboard" else "--no-metrics";
+    const start = try cli.runAsync(&.{ "server", "start", "--data-dir", server.data_dir, "--port", "0", other, "--" ++ which ++ "-port", port_arg });
+    defer start.deinit();
+    defer stopAnyway(cli, &.{ "server", "stop", "--data-dir", server.data_dir, "--force" });
+    var out = try start.waitWithTimeout(10_000);
+    defer out.deinit();
+    try testing.expectEqual(@as(u8, 3), out.exit_code);
+    var want_buf: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "[" ++ which ++ "] cannot listen on 127.0.0.1:{d}", .{port});
+    if (!out.stdoutContains(want) and !out.stderrContains(want)) {
+        std.debug.print("expected: {s}\nstdout: {s}\nstderr: {s}\n", .{ want, out.stdout, out.stderr });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "e2e/server: a metrics port already in use refuses the start, naming the port" {
+    try expectBindRefused("metrics");
+}
+
+test "e2e/server: a dashboard port already in use refuses the start, naming the port" {
+    try expectBindRefused("dashboard");
+}
