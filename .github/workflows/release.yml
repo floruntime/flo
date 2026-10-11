@@ -9,6 +9,10 @@ on:
       tag:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
+      publish:
+        description: 'Create the GitHub release. Off: build and package only'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -100,6 +104,7 @@ jobs:
 
   release:
     needs: build
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

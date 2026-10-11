@@ -128,6 +128,10 @@ jobs:
           path: src/node/dashboard/dist
       - name: Build (ReleaseSafe)
         run: zig build -Drelease
+      - name: Release allocator
+        # main roots every allocation in libc's allocator outside Debug; a
+        # toolchain bump must not quietly swap in Zig's slower default.
+        run: ./zig-out/bin/flo version | tee /dev/stderr | grep -qF 'alloc=libc'
       - name: Swarm
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
         timeout-minutes: 20
