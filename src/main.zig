@@ -20,24 +20,6 @@ pub const std_options: std.Options = .{
     .log_level = .debug, // Allow all at compile time; filter at runtime
 };
 
-/// Configure logging format and level at runtime.
-pub fn configureLogging(format_str: ?[]const u8, level_str: ?[]const u8) void {
-    var format_type = log.Format.text;
-    if (format_str) |fmt| {
-        format_type = log.Format.parse(fmt) orelse .text;
-    }
-
-    var level = log.Level.info;
-    if (level_str) |lvl| {
-        level = log.Level.parse(lvl) orelse .info;
-    }
-
-    log.configure(.{
-        .level = level,
-        .format = format_type,
-    });
-}
-
 pub fn main(init: std.process.Init) !void {
     // Bind the stdx.io facade to the Init-provided Io for boundary code.
     @import("stdx").io.bootFromInit(init.io);
