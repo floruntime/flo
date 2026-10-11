@@ -24,7 +24,7 @@ RUN apk add --no-cache \
     linux-headers
 
 # Install Zig for the BUILD platform (native, never emulated)
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG BUILDPLATFORM
 RUN case "${BUILDPLATFORM}" in \
       */arm64) ZIG_ARCH="aarch64" ;; \

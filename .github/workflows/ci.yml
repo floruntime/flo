@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   # The console is compiled into the Zig binary, so a TypeScript error here

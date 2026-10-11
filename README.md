@@ -60,6 +60,8 @@ curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.
 Or download a tarball for your platform from
 [Releases](https://github.com/floruntime/flo/releases); each has a `.sha256` beside it.
 
+The macOS binaries need macOS 15 or later.
+
 ### Start the Server
 
 ```bash
@@ -541,7 +543,7 @@ bench/                       # Benchmarks
 
 ## Building from Source
 
-Requires [Zig 0.16.0+](https://ziglang.org/download/).
+Requires [Zig 0.17.x](https://ziglang.org/download/); `build.zig` refuses any other version.
 
 ```bash
 git clone https://github.com/floruntime/flo.git
