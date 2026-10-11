@@ -801,15 +801,15 @@ pub const Runtime = struct {
             const ms = try self.allocator.create(HttpMetricsServer);
             ms.* = HttpMetricsServer.init(self.allocator, self.config.effectiveMetricsPort(), self.config.metrics_bind, metrics);
             ms.health = node_health;
-            self.metrics_server = ms;
+            // A node asked for metrics that cannot serve them does not
+            // start without them: /metrics and /status would be missing
+            // with nothing but a log line to say so.
             ms.start() catch |err| {
-                log.err("metrics exporter failed to start on port {d}: {s}", .{ self.config.effectiveMetricsPort(), @errorName(err) });
+                log.err("[metrics] cannot listen on {s}:{d}: {s}; free the port, set [metrics] port, or set [metrics] enabled = false", .{ self.config.metrics_bind, self.config.effectiveMetricsPort(), @errorName(err) });
                 self.allocator.destroy(ms);
-                self.metrics_server = null;
+                return err;
             };
-            if (self.metrics_server != null) {
-                log.debug("Runtime.start: metrics exporter on port {d}", .{self.config.effectiveMetricsPort()});
-            }
+            self.metrics_server = ms;
         }
 
         if (self.config.dashboard_enabled) {
@@ -832,7 +832,10 @@ pub const Runtime = struct {
                 .hosts = self.config.dashboard_hosts orelse "",
             }, ctx);
             self.dashboard_server = server;
-            try server.start();
+            server.start() catch |err| {
+                log.err("[dashboard] cannot listen on {s}:{d}: {s}; free the port, set [dashboard] port, or set [dashboard] enabled = false", .{ self.config.dashboard_bind, self.config.effectiveDashboardPort(), @errorName(err) });
+                return err;
+            };
         }
     }
 
