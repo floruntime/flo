@@ -3,9 +3,9 @@
 # Downloads a pre-built binary from GitHub Releases and installs it.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh -s -- --version v0.1.0
-#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh -s -- --dir ~/.local/bin
+#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh -s -- --version v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh -s -- --dir ~/.local/bin
 
 set -e
 
@@ -60,7 +60,9 @@ fi
 # --- Resolve version ---
 if [ -z "$VERSION" ]; then
   echo "Fetching latest release..."
-  VERSION=$(curl -sfL "https://api.github.com/repos/$REPO/releases/latest" \
+  # The newest release, prereleases included: releases/latest skips those,
+  # and every flo release so far is one.
+  VERSION=$(curl -sfL "https://api.github.com/repos/$REPO/releases?per_page=1" \
     | grep '"tag_name"' | head -1 | cut -d'"' -f4)
   if [ -z "$VERSION" ]; then
     echo "Error: Could not determine latest version."

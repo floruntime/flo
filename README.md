@@ -54,12 +54,11 @@ Flo takes a different approach. All five primitives share one Raft consensus log
 
 ```bash
 # One-line install (macOS / Linux)
-curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh
-
-# Homebrew (macOS)
-brew tap floruntime/tap
-brew install flo
+curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh
 ```
+
+Or download a tarball for your platform from
+[Releases](https://github.com/floruntime/flo/releases); each has a `.sha256` beside it.
 
 ### Start the Server
 

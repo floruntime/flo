@@ -35,9 +35,9 @@ fi
 
 echo "Installing Flo..."
 if [ -n "$FLO_VERSION" ]; then
-  curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh -s -- --version "$FLO_VERSION"
+  curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh -s -- --version "$FLO_VERSION"
 else
-  curl -fsSL https://raw.githubusercontent.com/floruntime/flo/master/scripts/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.sh | sh
 fi
 
 # Verify
