@@ -85,10 +85,13 @@ EXPOSE 9000 9001 9002
 # Liveness, not readiness: runtimes that replace unhealthy containers would
 # otherwise kill a node mid-replay, or one that needs an operator, and
 # restart it forever. /ready is for routing (see the compose example).
-# HTTP is up before replay, so a short start period is enough. The TCP
-# fallback covers --no-dashboard.
+# HTTP is up before replay, so a short start period is enough. The metrics
+# port answers /health too, for --no-dashboard. The TCP fallback covers only
+# dashboard and metrics both off, and the client port opens after replay,
+# so that case cannot see a replay in progress.
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=10 \
     CMD curl -sf http://localhost:9002/health \
+     || curl -sf http://localhost:9001/health \
      || nc -z localhost 9000 \
      || exit 1
 

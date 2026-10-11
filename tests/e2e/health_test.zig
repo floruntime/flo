@@ -33,6 +33,11 @@ test "e2e/health: a healthy node is live and ready on both ports, and /status na
     try expectAnswer(dashboard, "/ready", 200, "ready");
     try expectAnswer(metrics, "/health", 200, "ok");
     try expectAnswer(metrics, "/ready", 200, "ready");
+    // /status is the metrics listener's alone. The dashboard answers it as
+    // any other unknown path: 404, or its page where the console is built in.
+    var on_dashboard = try dashboard.get("/status");
+    defer on_dashboard.deinit();
+    try testing.expect(std.mem.indexOf(u8, on_dashboard.body, "\"node_id\"") == null);
 
     var resp = try metrics.get("/status");
     defer resp.deinit();
@@ -166,71 +171,34 @@ fn putMany(port: u16, count: usize, batch: usize) !void {
     }
 }
 
-const ReadyWatch = struct {
-    server: *stdx.testing.ServerProcess,
-    saw_replaying_ms: ?i64 = null,
-    saw_ready_ms: ?i64 = null,
-    words: [8][]const u8 = undefined,
-    word_count: usize = 0,
-
-    /// Poll /ready on the restarted server's metrics port, noting each
-    /// change of answer. The old server has stopped, so until the new one
-    /// listens nothing answers, whichever port is read.
-    fn run(self: *ReadyWatch) void {
-        const start = stdx.time.milliTimestamp();
-        var last: []const u8 = "";
-        while (stdx.time.milliTimestamp() - start < 120_000) {
-            // The harness picks the new port before it spawns the server.
-            const port = @atomicLoad(u16, &self.server.metrics_port, .acquire);
-            const word = probe(port) orelse {
-                stdx.time.sleep(std.time.ns_per_ms);
-                continue;
-            };
-            if (!std.mem.eql(u8, word, last) and self.word_count < self.words.len) {
-                self.words[self.word_count] = word;
-                self.word_count += 1;
-                last = word;
-            }
-            const now = stdx.time.milliTimestamp();
-            if (std.mem.eql(u8, word, "503 replaying") and self.saw_replaying_ms == null) self.saw_replaying_ms = now;
-            if (std.mem.eql(u8, word, "200 ready")) {
-                self.saw_ready_ms = now;
-                return;
-            }
-            stdx.time.sleep(2 * std.time.ns_per_ms);
+/// "<status> <word>" from GET `path` (/ready or /health), or null when
+/// nothing answers yet.
+fn probe(port: u16, comptime path: []const u8) ?[]const u8 {
+    const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 200) catch return null;
+    defer _ = std.c.close(fd);
+    const req = "GET " ++ path ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    if (std.c.write(fd, req, req.len) != req.len) return null;
+    var buf: [512]u8 = undefined;
+    var got: usize = 0;
+    // The socket does not block: read until the server closes it.
+    const deadline = stdx.time.milliTimestamp() + 1000;
+    while (got < buf.len and stdx.time.milliTimestamp() < deadline) {
+        const rc = std.c.read(fd, buf[got..].ptr, buf.len - got);
+        if (rc == 0) break;
+        if (rc < 0) {
+            stdx.time.sleep(std.time.ns_per_ms / 4);
+            continue;
         }
+        got += @intCast(rc);
     }
-
-    /// "<status> <word>" from GET /ready, or null when nothing answers yet.
-    fn probe(port: u16) ?[]const u8 {
-        const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 200) catch return null;
-        defer _ = std.c.close(fd);
-        const req = "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        if (std.c.write(fd, req, req.len) != req.len) return null;
-        var buf: [512]u8 = undefined;
-        var got: usize = 0;
-        // The socket does not block: read until the server closes it.
-        const deadline = stdx.time.milliTimestamp() + 1000;
-        while (got < buf.len and stdx.time.milliTimestamp() < deadline) {
-            const rc = std.c.read(fd, buf[got..].ptr, buf.len - got);
-            if (rc == 0) break;
-            if (rc < 0) {
-                stdx.time.sleep(std.time.ns_per_ms / 4);
-                continue;
-            }
-            got += @intCast(rc);
-        }
-        const answer = buf[0..got];
-        const body = if (std.mem.indexOf(u8, answer, "\r\n\r\n")) |i| std.mem.trim(u8, answer[i + 4 ..], "\r\n ") else return null;
-        const status: []const u8 = if (std.mem.startsWith(u8, answer, "HTTP/1.1 200")) "200" else if (std.mem.startsWith(u8, answer, "HTTP/1.1 503")) "503" else "???";
-        for (known) |k| {
-            if (std.mem.startsWith(u8, k, status) and std.mem.eql(u8, k[4..], body)) return k;
-        }
-        return "unexpected";
+    const answer = buf[0..got];
+    const body = if (std.mem.indexOf(u8, answer, "\r\n\r\n")) |i| std.mem.trim(u8, answer[i + 4 ..], "\r\n ") else return null;
+    const status: []const u8 = if (std.mem.startsWith(u8, answer, "HTTP/1.1 200")) "200" else if (std.mem.startsWith(u8, answer, "HTTP/1.1 503")) "503" else "???";
+    for ([_][]const u8{ "200 ready", "503 loading", "503 replaying", "200 ok" }) |k| {
+        if (std.mem.startsWith(u8, k, status) and std.mem.eql(u8, k[4..], body)) return k;
     }
-
-    const known = [_][]const u8{ "200 ready", "503 loading", "503 replaying" };
-};
+    return "unexpected";
+}
 
 test "e2e/health: a node replaying its log answers /ready with 503 replaying, then 200 ready" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
@@ -242,25 +210,43 @@ test "e2e/health: a node replaying its log answers /ready with 503 replaying, th
     try putMany(ctx.getPort(), 40_000, 512);
 
     ctx.server.stop();
-    var watch: ReadyWatch = .{ .server = ctx.server };
-    const watcher = try std.Thread.spawn(.{}, ReadyWatch.run, .{&watch});
-    const restart_ms = stdx.time.milliTimestamp();
-    ctx.restartServer() catch |err| {
-        watcher.join();
-        return err;
-    };
-    watcher.join();
+    try ctx.server.spawn();
+    const started_ms = stdx.time.milliTimestamp();
 
-    const unexpected = for (watch.words[0..watch.word_count]) |w| {
-        if (std.mem.eql(u8, w, "unexpected")) break true;
-    } else false;
-    if (watch.saw_replaying_ms == null or watch.saw_ready_ms == null or unexpected) {
-        for (watch.words[0..watch.word_count]) |w| std.debug.print("/ready answered {s}\n", .{w});
-        std.debug.print("replaying seen at +{?d} ms, ready at +{?d} ms\n", .{
-            if (watch.saw_replaying_ms) |t| t - restart_ms else null,
-            if (watch.saw_ready_ms) |t| t - restart_ms else null,
-        });
+    // Every change of answer, until ready.
+    var words: [8][]const u8 = undefined;
+    var word_count: usize = 0;
+    var replaying_ms: ?i64 = null;
+    // Liveness answered while the node replays; anything else is a failure.
+    var live_while_replaying: usize = 0;
+    var health_wrong: ?[]const u8 = null;
+    while (stdx.time.milliTimestamp() - started_ms < 120_000) {
+        const word = probe(ctx.server.metrics_port, "/ready") orelse {
+            stdx.time.sleep(std.time.ns_per_ms);
+            continue;
+        };
+        if (std.mem.eql(u8, word, "503 replaying")) {
+            if (probe(ctx.server.metrics_port, "/health")) |health| {
+                if (std.mem.eql(u8, health, "200 ok")) live_while_replaying += 1 else health_wrong = health;
+            }
+        }
+        if ((word_count == 0 or !std.mem.eql(u8, word, words[word_count - 1])) and word_count < words.len) {
+            words[word_count] = word;
+            word_count += 1;
+        }
+        if (std.mem.eql(u8, word, "503 replaying") and replaying_ms == null) replaying_ms = stdx.time.milliTimestamp() - started_ms;
+        if (std.mem.eql(u8, word, "200 ready")) break;
+        stdx.time.sleep(2 * std.time.ns_per_ms);
+    }
+    try ctx.server.awaitReady(stdx.testing.ServerProcess.DEFAULT_READY_TIMEOUT_MS);
+
+    const ok = replaying_ms != null and live_while_replaying > 0 and health_wrong == null and word_count > 0 and std.mem.eql(u8, words[word_count - 1], "200 ready") and
+        for (words[0..word_count]) |w| {
+            if (std.mem.eql(u8, w, "unexpected")) break false;
+        } else true;
+    if (!ok) {
+        for (words[0..word_count]) |w| std.debug.print("/ready answered {s}\n", .{w});
+        std.debug.print("replaying seen at +{?d} ms; /health answered 200 ok {d} times while replaying, otherwise {?s}\n", .{ replaying_ms, live_while_replaying, health_wrong });
         return error.TestUnexpectedResult;
     }
-    try testing.expect(watch.saw_replaying_ms.? <= watch.saw_ready_ms.?);
 }
