@@ -115,8 +115,8 @@ pub const StreamWindow = struct {
 
 /// A single pending waiter registration.
 ///
-/// The key is copied into `key_buf` to avoid lifetime issues with
-/// request payloads.
+/// The key is copied to avoid lifetime issues with request payloads:
+/// inline when it fits `key_buf`, else onto the pool's heap.
 pub const Waiter = struct {
     /// What this waiter is blocking on.
     kind: WaiterKind,
@@ -129,8 +129,10 @@ pub const Waiter = struct {
     request_id: u64,
 
     /// Inline key storage (namespace + key for KV/queue/stream/action name).
-    key_buf: [256]u8,
+    key_buf: [INLINE_KEY]u8,
     key_len: u16,
+    /// A key longer than `key_buf`, owned by the pool.
+    key_heap: ?[]u8 = null,
 
     /// Minimum version/offset threshold.
     ///   - KV:     trigger when `entry.version > min_version`
@@ -153,7 +155,7 @@ pub const Waiter = struct {
 
     /// Get the key slice.
     pub fn key(self: *const Waiter) []const u8 {
-        return self.key_buf[0..self.key_len];
+        return self.key_heap orelse self.key_buf[0..self.key_len];
     }
 };
 
@@ -161,7 +163,14 @@ pub const Waiter = struct {
 ///
 /// Waiters are stored in a flat array and managed with swap-remove.
 /// This gives O(1) insert, O(1) remove, and O(n) scan for notify/expire.
+/// A key this long or shorter is held inline; most are.
+const INLINE_KEY = 256;
+
+/// The longest key a waiter holds: a namespace-qualified key.
+pub const MAX_WAITER_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
+
 pub const WaiterPool = struct {
+    allocator: std.mem.Allocator,
     waiters: []Waiter,
     count: u16,
     /// The shard whose clients count as local.
@@ -178,6 +187,7 @@ pub const WaiterPool = struct {
 
     pub fn init(allocator: std.mem.Allocator) !WaiterPool {
         return .{
+            .allocator = allocator,
             .waiters = try allocator.alloc(Waiter, MAX_WAITERS),
             .count = 0,
         };
@@ -191,6 +201,7 @@ pub const WaiterPool = struct {
     }
 
     pub fn deinit(self: *WaiterPool, allocator: std.mem.Allocator) void {
+        for (self.waiters[0..self.count]) |w| if (w.key_heap) |k| allocator.free(k);
         allocator.free(self.waiters);
     }
 
@@ -210,7 +221,8 @@ pub const WaiterPool = struct {
     };
 
     /// Register a new waiter. False when its part of the pool is full
-    /// (`LOCAL_WAITERS`), or the key is empty or too long.
+    /// (`LOCAL_WAITERS`), the key is empty or longer than `MAX_WAITER_KEY`,
+    /// or a long key can't be copied.
     pub fn register(self: *WaiterPool, opts: RegisterOpts) bool {
         const forwarded = self.isForwarded(opts.reply_to);
         const room = if (!self.split) self.count < MAX_WAITERS else if (forwarded) self.forwarded < MAX_WAITERS - LOCAL_WAITERS else self.count - self.forwarded < LOCAL_WAITERS;
@@ -222,7 +234,8 @@ pub const WaiterPool = struct {
             }
             return false;
         }
-        if (opts.key.len == 0 or opts.key.len > 256) return false;
+        if (opts.key.len == 0 or opts.key.len > MAX_WAITER_KEY) return false;
+        const heap_key = if (opts.key.len > INLINE_KEY) self.allocator.dupe(u8, opts.key) catch return false else null;
 
         // Waits of 0 and over the cap never get here (see the fields' docs);
         // clamped rather than trusted all the same.
@@ -233,7 +246,8 @@ pub const WaiterPool = struct {
         w.reply_to = opts.reply_to;
         w.request_id = opts.request_id;
         w.key_buf = undefined;
-        @memcpy(w.key_buf[0..opts.key.len], opts.key);
+        w.key_heap = heap_key;
+        if (heap_key == null) @memcpy(w.key_buf[0..opts.key.len], opts.key);
         w.key_len = @intCast(opts.key.len);
         w.min_version = opts.min_version;
         w.stream = opts.stream;
@@ -386,6 +400,7 @@ pub const WaiterPool = struct {
     fn swapRemove(self: *WaiterPool, index: u16) void {
         if (self.count == 0) return;
         const gone = &self.waiters[index];
+        if (gone.key_heap) |k| self.allocator.free(k);
         if (self.isForwarded(gone.reply_to)) self.forwarded -= 1;
         self.of_kind[@intFromEnum(gone.kind)] -= 1;
         if (index < self.count - 1) {
@@ -542,4 +557,19 @@ test "WaiterPool: the split holds whichever side comes first, counts other nodes
     one.split = false;
     for (0..MAX_WAITERS) |i| try std.testing.expect(one.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, @intCast(i), 1), .request_id = i, .key = "k", .timeout_ms = 1_000 }));
     try std.testing.expect(!one.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 9999, 1), .request_id = 0, .key = "k", .timeout_ms = 1_000 }));
+}
+
+test "WaiterPool: a key past the inline buffer, up to a qualified key's length, waits and is freed" {
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    var long: [MAX_WAITER_KEY]u8 = undefined;
+    @memset(&long, 'k');
+    try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 1, .key = long[0..300], .timeout_ms = 1_000 }));
+    try std.testing.expect(pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 2, .key = &long, .timeout_ms = 1_000 }));
+    try std.testing.expectEqualSlices(u8, long[0..300], pool.waiters[0].key());
+    try std.testing.expect(!pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 10, 1), .request_id = 3, .key = &(long ++ [_]u8{'k'}), .timeout_ms = 1_000 }));
+    // Removing one frees its copy; the other is freed by deinit.
+    pool.swapRemove(0);
+    try std.testing.expectEqual(@as(u16, 1), pool.count);
+    try std.testing.expectEqual(@as(usize, MAX_WAITER_KEY), pool.waiters[0].key().len);
 }

@@ -283,7 +283,7 @@ test "kv table: a set in a transaction is buffered, read back inside it, and uns
     try expectValue((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id }))).?, 0, "5");
     _ = try expectRefused((try h.get("bal", getBody(.{ .routing_key = "user:1" }))).?, .not_found, .not_found);
     // Its routing key is the transaction's, or it's refused.
-    _ = try expectRefused(try h.set("bal", setBody("6", .{ .txn = id })), .bad_request, .txn_routing_key);
+    _ = try expectRefused(try h.set("bal", setBody("6", .{ .txn = id })), .bad_request, .wrong_routing_key);
     _ = try expectRefused((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id, .wait_ms = 10 }))).?, .bad_request, .conflicting_fields);
     try testing.expectEqual(@as(usize, 1), txn_table.get(id).?.ops.items.len);
 }
@@ -315,4 +315,56 @@ test "kv table: a request in a transaction goes to the leader, and to the shard 
     try testing.expect(!table_run.writes(plain));
     try testing.expectEqual(@as(?u64, null), table_run.txnId(plain));
     try testing.expectEqual(@as(u16, 3), txn_mod.idShard(id));
+}
+
+test "kv table: the longest value applies with the longest key and routing key, TTL and cas, and one byte more is refused unrun" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const a = testing.allocator;
+    const key = try a.alloc(u8, 4000);
+    defer a.free(key);
+    @memset(key, 'k');
+    const rk = try a.alloc(u8, 4000);
+    defer a.free(rk);
+    @memset(rk, 'r');
+
+    // Hand-coded so the over-long value reaches the server.
+    const body = try a.alloc(u8, 4 + kv_ops.MAX_VALUE + 1 + 9 + 2 + 9 + 3 + rk.len + 1);
+    defer a.free(body);
+    for ([_]u32{ kv_ops.MAX_VALUE, kv_ops.MAX_VALUE + 1 }) |n| {
+        var w: schema.Writer = .{ .buf = body };
+        try w.int(u32, n);
+        @memset(body[4..][0..n], 'v');
+        w.pos += n;
+        try w.put(&.{1});
+        try w.int(u64, 60_000); // ttl_ms
+        try w.put(&.{ 1, 0 }); // condition always
+        try w.put(&.{1});
+        try w.int(u64, 0); // cas_version: absent
+        try w.put(&.{1});
+        try w.int(u16, @intCast(rk.len));
+        try w.put(rk);
+        try w.put(&.{0}); // no txn
+        _ = h.send(set_op.code, key, w.written());
+        const resp = (try h.answer()).?;
+        if (n == kv_ops.MAX_VALUE) {
+            try expectSet(resp, 1);
+        } else {
+            const r = try expectRefused(resp, .bad_request, .field_too_long);
+            try testing.expectEqualStrings("bad request: kv.set: value is longer than 253817 bytes", r.message);
+        }
+    }
+    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    try testing.expectEqual(@as(usize, kv_ops.MAX_VALUE), h.shard.defaultPartition().kv.get(qualified(&qbuf, key)).?.value.len);
+}
+
+test "kv table: a get waits on a key past the waiter's inline buffer" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const key = [_]u8{'k'} ** 300;
+    try testing.expect((try h.get(&key, getBody(.{ .wait_ms = 5000 }))) == null);
+    try testing.expectEqual(@as(u16, 1), h.shard.waiter_pool.countByKind(.kv_get));
+    try h.setWaking(&key, setBody("w", .{}), h.next_id - 1, 1);
 }

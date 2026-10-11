@@ -6376,6 +6376,69 @@ fn nextAnswer(c: TestClient, shard: *Shard, out: []u8) !proto.Response {
     return proto.Response.parse(out[0..n]);
 }
 
+/// kv.get inside transaction `id`, its body in `buf`.
+fn txnGet(buf: []u8, id: u64) proto.Request {
+    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = id }) catch unreachable;
+    return .{ .header = proto.RequestHeader.init(.kv_get, 9), .namespace = "", .key = "k", .value = body };
+}
+
+test "Shard: a request in a transaction goes to the shard its id names, and commit and rollback by the id alone" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const makeId = txn_mod.makeId;
+
+    var buf: [64]u8 = undefined;
+    // Another shard's id goes there; this shard's, or a shard that doesn't
+    // exist, runs here, where the second is refused as no transaction.
+    for ([_]struct { id: u64, to: ?u16 }{
+        .{ .id = makeId(1, 7), .to = 1 },
+        .{ .id = makeId(0, 7), .to = null },
+        .{ .id = makeId(9, 7), .to = null },
+    }) |case| {
+        switch (a.resolveTarget(@intFromEnum(proto.OpCode.kv_get), txnGet(&buf, case.id))) {
+            .local => try std.testing.expectEqual(@as(?u16, null), case.to),
+            .shard => |t| try std.testing.expectEqual(case.to.?, t.shard_id),
+        }
+    }
+    for ([_]proto.OpCode{ .kv_commit_txn, .kv_rollback_txn }) |op| {
+        var opt_buf: [16]u8 = undefined;
+        var ob = proto.OptionsBuilder.init(&opt_buf);
+        try ob.addU64(.txn_id, makeId(1, 3));
+        const req = testReq(op, 4, "", "", "", ob.getOptions());
+        switch (a.resolveTarget(@intFromEnum(op), req)) {
+            .local => return error.TestUnexpectedResult,
+            .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
+        }
+    }
+}
+
+test "Shard: a transaction id naming a shard that exists but doesn't hold it is refused there" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const txn = txn_mod;
+
+    // Begun on shard 0; the same counter under shard 1's bits.
+    const id = try a.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""), 0);
+    const forged = txn.makeId(1, id & txn.ID_COUNTER_MASK);
+    var buf: [64]u8 = undefined;
+    switch (a.resolveTarget(@intFromEnum(proto.OpCode.kv_get), txnGet(&buf, forged))) {
+        .local => return error.TestUnexpectedResult,
+        .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
+    }
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    b.runRequest(c.conn, txnGet(&buf, forged), .shard);
+    var out: [512]u8 = undefined;
+    const resp = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.not_found), resp.header.status);
+    try std.testing.expectEqual(proto.Reason.no_such_transaction, (try resp.refused()).reason);
+}
+
 test "Shard: a request another shard routed here meets the same checks as a client's" {
     var two: TwoShards = undefined;
     try two.init();

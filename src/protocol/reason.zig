@@ -49,7 +49,7 @@ pub const Reason = enum(u16) {
     no_such_transaction = 17,
     /// The request's routing key (its key, when it gives none) isn't the
     /// one its transaction was begun with.
-    txn_routing_key = 18,
+    wrong_routing_key = 18,
     /// The transaction holds as many ops or bytes as it may.
     txn_too_large = 19,
     /// The shard holds as many waiting reads as it may.

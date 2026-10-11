@@ -190,7 +190,7 @@ pub const KVHandler = struct {
         CasMismatch,
         ConditionFailed,
         NoSuchTransaction,
-        TxnRoutingKey,
+        WrongRoutingKey,
         TxnTooLarge,
         WaitInTxn,
         TooManyWaiters,
@@ -211,7 +211,7 @@ pub const KVHandler = struct {
             error.CasMismatch => refused(.conflict, .cas_mismatch, "conflict: cas_version isn't the key's version"),
             error.ConditionFailed => refused(.conflict, .condition_failed, "conflict: the condition didn't hold"),
             error.NoSuchTransaction => refused(.not_found, .no_such_transaction, "not found: no such transaction — it committed, rolled back, or was begun in another namespace"),
-            error.TxnRoutingKey => refused(.bad_request, .txn_routing_key, "bad request: the routing key (the key, when none is given) isn't the one the transaction was begun with"),
+            error.WrongRoutingKey => refused(.bad_request, .wrong_routing_key, "bad request: the routing key (the key, when none is given) isn't the one the transaction was begun with"),
             error.TxnTooLarge => refused(.bad_request, .txn_too_large, "bad request: the transaction holds as many ops or bytes as it may"),
             error.WaitInTxn => refused(.bad_request, .conflicting_fields, "bad request: a read in a transaction can't wait: give wait_ms or txn, not both"),
             error.TooManyWaiters => refused(.overloaded, .too_many_waiters, "overloaded: too many reads waiting on this shard — retry"),
@@ -351,7 +351,7 @@ pub const KVHandler = struct {
     /// request's key routes to.
     fn openTxn(shard: *Shard, req: Request, id: u64, routing_key: ?[]const u8) Error!*txn_mod.TxnState {
         const t = txnIn(&shard.kv_handler.*.txn_table, id, req.namespace) orelse return error.NoSuchTransaction;
-        if (t.pinned_hash != router.hashKeyWithNamespace(req.namespace, routing_key orelse req.key)) return error.TxnRoutingKey;
+        if (t.pinned_hash != router.hashKeyWithNamespace(req.namespace, routing_key orelse req.key)) return error.WrongRoutingKey;
         return t;
     }
 

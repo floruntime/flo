@@ -189,14 +189,13 @@ test "e2e/kv: json output format" {
 }
 
 // =============================================================================
-// Conditional Operations: --nx (Not eXists)
+// Conditional Operations: --condition if_absent
 // =============================================================================
 
-test "e2e/kv: set --nx on new key succeeds" {
+test "e2e/kv: set --condition if_absent on a new key succeeds" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set nx_test_key first_value --nx
     try ctx.exec(&.{ "kv", "set", "nx_test_key", "first_value", "--condition", "if_absent" });
 
     // Verify value was set
@@ -204,28 +203,26 @@ test "e2e/kv: set --nx on new key succeeds" {
     try testing.expect(std.mem.indexOf(u8, value, "first_value") != null);
 }
 
-test "e2e/kv: set --nx on existing key fails" {
+test "e2e/kv: set --condition if_absent on an existing key fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // First set
     try ctx.exec(&.{ "kv", "set", "nx_existing", "first_value" });
 
-    // flo kv set nx_existing second_value --nx (should fail)
     var result = try ctx.cli.run(&.{ "kv", "set", "nx_existing", "second_value", "--condition", "if_absent" });
     defer result.deinit();
 
-    try stdx.testing.assertFailed(result);
-    try stdx.testing.assertContains(result, "already exists");
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
+    try testing.expectEqualStrings("Error: conflict: the condition didn't hold [conflict/condition_failed]", std.mem.trimEnd(u8, result.stderr, "\n"));
 }
 
-test "e2e/kv: set --nx preserves original value" {
+test "e2e/kv: set --condition if_absent preserves the original value" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "nx_preserve", "original" });
 
-    // flo kv set nx_preserve new --nx (should fail, but we don't assert)
     var r2 = try ctx.cli.run(&.{ "kv", "set", "nx_preserve", "new", "--condition", "if_absent" });
     defer r2.deinit();
 
@@ -235,16 +232,15 @@ test "e2e/kv: set --nx preserves original value" {
 }
 
 // =============================================================================
-// Conditional Operations: --xx (eXists)
+// Conditional Operations: --condition if_present
 // =============================================================================
 
-test "e2e/kv: set --xx on existing key succeeds" {
+test "e2e/kv: set --condition if_present on an existing key succeeds" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "xx_test_key", "first_value" });
 
-    // flo kv set xx_test_key updated_value --xx
     try ctx.exec(&.{ "kv", "set", "xx_test_key", "updated_value", "--condition", "if_present" });
 
     // Verify update
@@ -252,16 +248,15 @@ test "e2e/kv: set --xx on existing key succeeds" {
     try testing.expect(std.mem.indexOf(u8, value, "updated_value") != null);
 }
 
-test "e2e/kv: set --xx on non-existent key fails" {
+test "e2e/kv: set --condition if_present on a missing key fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set xx_nonexistent some_value --xx
     var result = try ctx.cli.run(&.{ "kv", "set", "xx_nonexistent", "some_value", "--condition", "if_present" });
     defer result.deinit();
 
-    try stdx.testing.assertFailed(result);
-    try stdx.testing.assertContains(result, "does not exist");
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
+    try testing.expectEqualStrings("Error: conflict: the condition didn't hold [conflict/condition_failed]", std.mem.trimEnd(u8, result.stderr, "\n"));
 }
 
 test "e2e/kv: set with a --condition it doesn't know is a usage error" {
@@ -275,10 +270,10 @@ test "e2e/kv: set with a --condition it doesn't know is a usage error" {
 }
 
 // =============================================================================
-// Conditional Operations: --cas (Compare-and-Swap)
+// Conditional Operations: --cas-version (Compare-and-Swap)
 // =============================================================================
 
-test "e2e/kv: set --cas with correct version succeeds" {
+test "e2e/kv: set --cas-version with the right version succeeds" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -291,7 +286,6 @@ test "e2e/kv: set --cas with correct version succeeds" {
     var version_buf: [32]u8 = undefined;
     const version_str = try std.fmt.bufPrint(&version_buf, "{d}", .{version});
 
-    // flo kv set cas_test_key updated_via_cas --cas <version>
     try ctx.exec(&.{ "kv", "set", "cas_test_key", "updated_via_cas", "--cas-version", version_str });
 
     // Verify update
@@ -299,13 +293,12 @@ test "e2e/kv: set --cas with correct version succeeds" {
     try testing.expect(std.mem.indexOf(u8, value, "updated_via_cas") != null);
 }
 
-test "e2e/kv: set --cas with wrong version fails" {
+test "e2e/kv: set --cas-version with the wrong version fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "cas_wrong", "initial" });
 
-    // flo kv set cas_wrong should_not_work --cas 999999
     var result = try ctx.cli.run(&.{ "kv", "set", "cas_wrong", "should_not_work", "--cas-version", "999999" });
     defer result.deinit();
 
@@ -319,7 +312,6 @@ test "e2e/kv: failed CAS preserves original value" {
 
     try ctx.exec(&.{ "kv", "set", "cas_preserve", "original_value" });
 
-    // flo kv set cas_preserve new_value --cas 999999 (wrong version)
     var r2 = try ctx.cli.run(&.{ "kv", "set", "cas_preserve", "new_value", "--cas-version", "999999" });
     defer r2.deinit();
 
@@ -402,7 +394,6 @@ test "e2e/kv: set with TTL expires after timeout" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set ttl_key ttl_value --ttl 1s
     try ctx.exec(&.{ "kv", "set", "ttl_key", "ttl_value", "--ttl-ms", "1s" });
 
     // Immediately readable
@@ -418,7 +409,7 @@ test "e2e/kv: set with TTL expires after timeout" {
     try stdx.testing.assertContains(after, "(nil)");
 }
 
-test "e2e/kv: a TTL in milliseconds expires the key; --ttl needs a unit, and touch --ttl 0 clears" {
+test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it doesn't know, and touch --ttl 0 clears" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -462,7 +453,6 @@ test "e2e/kv: set with TTL 0 means no expiration" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set no_ttl_key value --ttl 0 (explicit no TTL)
     try ctx.exec(&.{ "kv", "set", "no_ttl_key", "permanent_value", "--ttl-ms", "0" });
 
     // Small wait to verify it doesn't expire immediately
@@ -491,26 +481,25 @@ test "e2e/kv: overwrite resets TTL" {
     try testing.expect(std.mem.indexOf(u8, value, "updated") != null);
 }
 
-test "e2e/kv: TTL with conditional --nx" {
+test "e2e/kv: TTL with --condition if_absent" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv set ttl_nx_key value --ttl 2s --nx
     try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "first", "--ttl-ms", "2s", "--condition", "if_absent" });
 
     // Verify value exists
     const v1 = try ctx.execCapture(&.{ "kv", "get", "ttl_nx_key" });
     try testing.expect(std.mem.indexOf(u8, v1, "first") != null);
 
-    // Try to set again with --nx (should fail)
+    // Again with if_absent: refused while the key lives
     var result = try ctx.cli.run(&.{ "kv", "set", "ttl_nx_key", "second", "--ttl-ms", "2s", "--condition", "if_absent" });
     defer result.deinit();
-    try stdx.testing.assertFailed(result);
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
 
     // Wait for expiration
     @import("stdx").time.sleep(2500 * std.time.ns_per_ms);
 
-    // Now should be able to set with --nx
+    // Expired, so absent: if_absent writes
     try ctx.exec(&.{ "kv", "set", "ttl_nx_key", "third", "--ttl-ms", "2s", "--condition", "if_absent" });
 
     const v3 = try ctx.execCapture(&.{ "kv", "get", "ttl_nx_key" });
@@ -1296,17 +1285,17 @@ test "e2e/kv: list only shows keys in the requested namespace" {
     try stdx.testing.assertNotContains(result_b, "onlyInA");
 }
 
-test "e2e/kv: conditional --nx is per-namespace" {
+test "e2e/kv: --condition if_absent is per-namespace" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "ns", "create", "kv_nx_a" });
     try ctx.exec(&.{ "ns", "create", "kv_nx_b" });
 
-    // Set key with --nx in namespace A
+    // Set the key if absent in namespace A
     try ctx.exec(&.{ "kv", "set", "unique", "first", "--condition", "if_absent", "-n", "kv_nx_a" });
 
-    // Same key with --nx in namespace B should succeed (key doesn't exist there)
+    // The same key if absent in namespace B succeeds: it doesn't exist there
     try ctx.exec(&.{ "kv", "set", "unique", "second", "--condition", "if_absent", "-n", "kv_nx_b" });
 
     // Verify both values

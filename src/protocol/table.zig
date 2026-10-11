@@ -15,11 +15,6 @@ comptime {
     entries.check(&entry_table);
 }
 
-/// Bump this in any change to a request, answer or log-entry layout that is
-/// still coded by hand rather than declared in the tables above: the table
-/// hash can't see those layouts, so without a bump a client or node built
-/// before the change would be misread instead of refused. It goes once every
-/// layout is declared in a table.
 /// Whether `code` is a table op: its request is `[namespace][key][body]`,
 /// the body coded by its schema.
 pub fn isOp(code: u16) bool {
@@ -27,6 +22,11 @@ pub fn isOp(code: u16) bool {
     return false;
 }
 
+/// Bump this in any change to a request, answer or log-entry layout that is
+/// still coded by hand rather than declared in the tables above: the table
+/// hash can't see those layouts, so without a bump a client or node built
+/// before the change would be misread instead of refused. It goes once every
+/// layout is declared in a table.
 pub const HAND_LAYOUT_EPOCH: u32 = 2;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);
