@@ -82,7 +82,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("config", 'c', "", "Path to flo.toml config file")
                 .uintFlag("port", 'p', 0, "TCP port to listen on (default: 9000; 0 picks a free one, printed when ready)")
                 .stringFlag("data-dir", 'd', "", "Data directory for storage")
-                .stringFlag("durability", 0, "", "Storage durability: sync, async_flush, ephemeral")
+                .stringFlag("durability", 0, "", "Storage durability: sync or async_flush")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
                 .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
@@ -410,7 +410,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     ) catch |err| {
         switch (err) {
             error.InvalidDurability => {
-                ctx.printErr("Invalid --durability value. Use: sync, async_flush, or ephemeral\n", .{});
+                ctx.printErr("Invalid --durability value. Use: sync or async_flush\n", .{});
             },
             // Already logged, naming the file or the flag.
             error.InvalidShardCount, error.InvalidPartitionCount, error.UnknownSetting, error.InvalidSetting, error.FileNotFound => {},

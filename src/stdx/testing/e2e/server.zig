@@ -160,14 +160,11 @@ pub const ServerProcess = struct {
         sync,
         /// Return after WAL append (async flush) - fast but may lose recent writes on crash
         async_flush,
-        /// No persistence - for pure caching use cases
-        ephemeral,
 
         fn toConfigString(self: Durability) []const u8 {
             return switch (self) {
                 .sync => "sync",
                 .async_flush => "async_flush",
-                .ephemeral => "ephemeral",
             };
         }
     };
@@ -197,7 +194,7 @@ pub const ServerProcess = struct {
         /// server got when it never became ready — the captured log is the
         /// only view the harness has into a server's startup.
         log_level: []const u8 = "info",
-        /// Durability mode (sync = guaranteed persistence, async_flush = fast, ephemeral = no persistence)
+        /// Durability mode (sync = guaranteed persistence, async_flush = fast)
         durability: Durability = .async_flush,
         /// Serve from this data dir rather than the node's own, e.g. another
         /// node's. Config and log stay in the node's own.

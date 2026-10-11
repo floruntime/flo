@@ -15,14 +15,11 @@ pub const Durability = enum(u8) {
     sync = 0,
     /// Return after WAL append (async flush) — DEFAULT
     async_flush = 1,
-    /// No persistence (for caching use cases)
-    ephemeral = 2,
 
     /// Parse durability from CLI input; rejects unknown values.
     pub fn parseDurability(s: []const u8) error{InvalidDurability}!Durability {
         if (std.mem.eql(u8, s, "sync")) return .sync;
         if (std.mem.eql(u8, s, "async_flush")) return .async_flush;
-        if (std.mem.eql(u8, s, "ephemeral")) return .ephemeral;
         return error.InvalidDurability;
     }
 };
@@ -57,7 +54,7 @@ pub const ServerConfig = struct {
 
     // [storage] section — unified tier configuration
     // NOTE: memtable_size_mb removed - no SpilloverEngine in "Log is Data" architecture
-    durability: Durability = .async_flush, // sync, async_flush, or ephemeral
+    durability: Durability = .async_flush, // sync or async_flush
 
     // Tier settings (parsed from [storage] section)
     tiered_log: TieredLogConfig = .{},
@@ -380,7 +377,7 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         // NOTE: memtable_size_mb parsing removed - no SpilloverEngine
         if (storage.getString("durability")) |d| {
             config.durability = Durability.parseDurability(d) catch {
-                log.err("[storage] durability = \"{s}\": use sync, async_flush or ephemeral", .{d});
+                log.err("[storage] durability = \"{s}\": use sync or async_flush", .{d});
                 return error.InvalidSetting;
             };
         }
@@ -525,11 +522,9 @@ pub fn loadWithOverrides(
         };
     }
     // Durability override via CLI is permitted but warned on downgrade.
-    // Historical note: durability was originally TOML-only to prevent an
-    // operator from accidentally starting with --durability ephemeral and
-    // silently losing data. Allowing the flag preserves test ergonomics and
-    // explicit overrides, but a warning is emitted when the CLI value is
-    // less durable than what the file says, so the choice is never silent.
+    // The flag is allowed for tests and explicit overrides, but a warning is
+    // emitted when it asks for less durability than the file, so the choice
+    // is never silent.
     if (durability_override) |d| {
         if (d.len > 0) {
             const requested = try Durability.parseDurability(d);
@@ -579,7 +574,6 @@ pub fn generateDefaultConfig() []const u8 {
     \\# --- WAL Durability ---
     \\# sync: Wait for fsync after every write (strongest guarantee)
     \\# async_flush: Background flush about once a second (highest throughput, default)
-    \\# ephemeral: Skip WAL entirely (for caches/temporary data)
     \\durability = "async_flush"
     \\
     \\# --- Hot Tier (RAM Ring Buffer) ---
@@ -666,7 +660,6 @@ test "load default config" {
 test "Durability.parseDurability accepts known values" {
     try std.testing.expectEqual(Durability.sync, try Durability.parseDurability("sync"));
     try std.testing.expectEqual(Durability.async_flush, try Durability.parseDurability("async_flush"));
-    try std.testing.expectEqual(Durability.ephemeral, try Durability.parseDurability("ephemeral"));
     try std.testing.expectError(error.InvalidDurability, Durability.parseDurability("invalid"));
 }
 
