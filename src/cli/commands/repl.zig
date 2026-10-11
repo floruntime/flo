@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
+const cli_config = @import("../config.zig");
 const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
@@ -61,7 +62,7 @@ fn runRepl(ctx: *commander.Context) commander.Error!void {
     }
 
     // Get initial namespace
-    var current_namespace: []const u8 = ctx.getString("namespace") orelse "default";
+    var current_namespace: []const u8 = cli_config.getNamespace(ctx);
 
     // Connect to server
     var client = Client.init(allocator, endpoint);

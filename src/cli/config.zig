@@ -12,10 +12,11 @@ pub fn getDefaultEndpoint() []const u8 {
     return @import("stdx").io.getenv("FLO_ENDPOINT") orelse "127.0.0.1:9000";
 }
 
-/// Default namespace for CLI commands.
-/// Precedence: FLO_NAMESPACE env → "default"
+/// The namespace a command uses when -n isn't given: FLO_NAMESPACE, else
+/// "default". An empty FLO_NAMESPACE counts as unset.
 pub fn getDefaultNamespace() []const u8 {
-    return @import("stdx").io.getenv("FLO_NAMESPACE") orelse "default";
+    const env = @import("stdx").io.getenv("FLO_NAMESPACE") orelse return "default";
+    return if (env.len > 0) env else "default";
 }
 
 /// Static buffer for --port constructed endpoint (CLI is single-threaded).
@@ -47,12 +48,60 @@ pub fn getEndpoint(ctx: *commander.Context) []const u8 {
     return "127.0.0.1:9000";
 }
 
-/// Get namespace from command flags, falling back to env/default.
+/// The namespace a command acts in. Every command resolves it here: -n /
+/// --namespace when given, even as "default"; else FLO_NAMESPACE; else
+/// "default".
 pub fn getNamespace(ctx: *commander.Context) []const u8 {
-    if (ctx.getString("namespace")) |ns| {
-        if (ns.len > 0 and !std.mem.eql(u8, ns, "default")) return ns;
+    if (ctx.flagChanged("namespace")) {
+        if (ctx.getString("namespace")) |ns| return ns;
     }
     return getDefaultNamespace();
+}
+
+test "config: -n wins whenever given, FLO_NAMESPACE fills in, then default" {
+    const outcome = @import("outcome.zig");
+    const allocator = std.testing.allocator;
+    const libc = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const Probe = struct {
+        var seen: [64]u8 = undefined;
+        var seen_len: usize = 0;
+        fn run(ctx_ptr: *anyopaque) commander.Error!void {
+            const ctx: *commander.Context = @ptrCast(@alignCast(ctx_ptr));
+            const ns = getNamespace(ctx);
+            @memcpy(seen[0..ns.len], ns);
+            seen_len = ns.len;
+        }
+        fn got() []const u8 {
+            return seen[0..seen_len];
+        }
+    };
+    const root = try outcome.testRoot(allocator, try commander.newBuilder(allocator).name("probe").action(Probe.run).build());
+    defer root.deinit();
+
+    // Put back whatever the process had, on every exit: later tests must
+    // not inherit this one's value.
+    var before_buf: [256:0]u8 = undefined;
+    const before: ?[:0]const u8 = if (@import("stdx").io.getenv("FLO_NAMESPACE")) |v| (std.fmt.bufPrintZ(&before_buf, "{s}", .{v}) catch null) else null;
+    defer _ = if (before) |v| libc.setenv("FLO_NAMESPACE", v.ptr, 1) else libc.unsetenv("FLO_NAMESPACE");
+    _ = libc.unsetenv("FLO_NAMESPACE");
+    try root.executeSlice(&.{ "flo", "probe" });
+    try std.testing.expectEqualStrings("default", Probe.got());
+
+    try std.testing.expectEqual(@as(c_int, 0), libc.setenv("FLO_NAMESPACE", "staging", 1));
+    try root.executeSlice(&.{ "flo", "probe" });
+    try std.testing.expectEqualStrings("staging", Probe.got());
+    try root.executeSlice(&.{ "flo", "probe", "-n", "prod" });
+    try std.testing.expectEqualStrings("prod", Probe.got());
+    // Asking for "default" by name is asking, not leaving it out.
+    try root.executeSlice(&.{ "flo", "probe", "-n", "default" });
+    try std.testing.expectEqualStrings("default", Probe.got());
+
+    try std.testing.expectEqual(@as(c_int, 0), libc.setenv("FLO_NAMESPACE", "", 1));
+    try root.executeSlice(&.{ "flo", "probe" });
+    try std.testing.expectEqualStrings("default", Probe.got());
 }
 
 /// A context represents a connection to a Flo server

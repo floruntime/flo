@@ -181,7 +181,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "--file is required", .{});
     }
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     // Read definition from file or stdin
@@ -283,7 +283,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const version = ctx.getString("version") orelse "latest";
     const idempotency_key = ctx.getString("idempotency-key");
     const run_id = ctx.getString("run-id");
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     // Validate idempotency_key is not empty string
@@ -322,7 +322,7 @@ fn runSignal(ctx: *commander.Context) commander.Error!void {
     const payload = ctx.getString("payload");
     const payload_val: ?[]const u8 = if (payload) |p| if (p.len > 0) p else null else null;
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -343,7 +343,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "run_id is required", .{});
     };
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -437,7 +437,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     };
 
     const limit = ctx.getUint("limit") orelse 100;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -480,7 +480,7 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
     }
 
     const limit = ctx.getUint("limit") orelse 100;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -516,7 +516,7 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
     const reason = ctx.getString("reason");
     const reason_val: ?[]const u8 = if (reason) |r| if (r.len > 0) r else null else null;
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -544,7 +544,7 @@ fn runGetDefinition(ctx: *commander.Context) commander.Error!void {
     const version = ctx.getString("version");
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -574,7 +574,7 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
     const version = ctx.getString("version");
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -602,7 +602,7 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
     const version = ctx.getString("version");
     const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -623,7 +623,7 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
