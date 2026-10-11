@@ -408,7 +408,7 @@ fn writeFmtEntry(
     fields: anytype,
     src: std.builtin.SourceLocation,
 ) void {
-    var buf: [8192]u8 = undefined;
+    var buf: [line_buf_len]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
     const writer = &fbs;
 
@@ -443,7 +443,7 @@ fn writeEntry(
     src: std.builtin.SourceLocation,
 ) void {
     // Stack buffer - no heap allocation
-    var buf: [8192]u8 = undefined;
+    var buf: [line_buf_len]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
     const writer = &fbs;
 
@@ -532,32 +532,36 @@ fn formatJsonEntry(
     caller: ?format.Caller,
     fields: anytype,
 ) void {
+    writeJsonLine(writer, level, msg, timestamp, caller, fields);
+}
+
+/// One JSON object per line. The message is escaped whole; callers cut an
+/// overlong one before this (`formatMessage`), so the line always parses.
+fn writeJsonLine(
+    writer: anytype,
+    level: Level,
+    msg: []const u8,
+    timestamp: i128,
+    caller: ?format.Caller,
+    fields: anytype,
+) void {
     writer.writeByte('{') catch {};
+    if (global.show_timestamp) writer.print("\"ts\":{d},", .{timestamp}) catch {};
 
-    // Timestamp
-    if (global.show_timestamp) {
-        writer.writeAll("\"ts\":") catch {};
-        writer.print("{d}", .{timestamp}) catch {};
-    }
-
-    // Level
-    writer.writeAll(",\"level\":\"") catch {};
+    writer.writeAll("\"level\":\"") catch {};
     writer.writeAll(level.toString()) catch {};
     writer.writeByte('"') catch {};
 
-    // Message
     writer.writeAll(",\"msg\":\"") catch {};
     format.writeJsonEscaped(writer, msg) catch {};
     writer.writeByte('"') catch {};
 
-    // Caller
     if (caller) |c| {
         writer.writeAll(",\"caller\":\"") catch {};
         writer.print("{s}:{d}", .{ format.shortenPath(c.file), c.line }) catch {};
         writer.writeByte('"') catch {};
     }
 
-    // Fields (comptime iteration)
     inline for (fields) |field| {
         writer.writeAll(",\"") catch {};
         writer.writeAll(field.key) catch {};
@@ -566,6 +570,39 @@ fn formatJsonEntry(
     }
 
     writer.writeAll("}\n") catch {};
+}
+
+/// Longest message a log line carries; a longer one is cut.
+pub const max_message_len = 4096;
+/// Room for a line holding a message of `max_message_len` bytes even when
+/// every byte escapes to six (`\u00XX`), plus the line's other fields.
+const line_buf_len = 6 * max_message_len + 2048;
+const cut_marker = "…";
+
+/// `fmt` formatted into `buf`. A message that doesn't fit is cut at a UTF-8
+/// boundary and ends with "…", so it is never dropped and never splits a
+/// character.
+fn formatMessage(buf: *[max_message_len]u8, comptime fmt: []const u8, args: anytype) []const u8 {
+    var w: std.Io.Writer = .fixed(buf[0 .. max_message_len - cut_marker.len]);
+    w.print(fmt, args) catch {
+        const kept = utf8Prefix(w.buffered());
+        @memcpy(buf[kept.len..][0..cut_marker.len], cut_marker);
+        return buf[0 .. kept.len + cut_marker.len];
+    };
+    return w.buffered();
+}
+
+/// `s` without a trailing incomplete UTF-8 sequence.
+fn utf8Prefix(s: []const u8) []const u8 {
+    var i = s.len;
+    // Step back over continuation bytes (10xxxxxx) to the sequence's lead.
+    var back: usize = 0;
+    while (i > 0 and back < 4 and s[i - 1] & 0xC0 == 0x80) : (back += 1) i -= 1;
+    if (i == 0) return s[0..0];
+    const lead = s[i - 1];
+    const need: usize = if (lead < 0x80) 1 else if (lead & 0xE0 == 0xC0) 2 else if (lead & 0xF0 == 0xE0) 3 else if (lead & 0xF8 == 0xF0) 4 else 1;
+    // The sequence starting at i-1 is complete only if all its bytes are here.
+    return if (s.len - (i - 1) >= need) s else s[0 .. i - 1];
 }
 
 fn formatCompactEntry(
@@ -660,43 +697,8 @@ fn formatFmtJsonEntry(
     caller: ?format.Caller,
     fields: anytype,
 ) void {
-    writer.writeByte('{') catch {};
-
-    // Timestamp
-    if (global.show_timestamp) {
-        writer.writeAll("\"ts\":") catch {};
-        writer.print("{d}", .{timestamp}) catch {};
-    }
-
-    // Level
-    writer.writeAll(",\"level\":\"") catch {};
-    writer.writeAll(level.toString()) catch {};
-    writer.writeByte('"') catch {};
-
-    // Message (format into buffer first, then JSON-escape)
-    writer.writeAll(",\"msg\":\"") catch {};
-    // For JSON, we need to format and then escape - use a small buffer
-    var msg_buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch fmt;
-    format.writeJsonEscaped(writer, msg) catch {};
-    writer.writeByte('"') catch {};
-
-    // Caller
-    if (caller) |c| {
-        writer.writeAll(",\"caller\":\"") catch {};
-        writer.print("{s}:{d}", .{ format.shortenPath(c.file), c.line }) catch {};
-        writer.writeByte('"') catch {};
-    }
-
-    // Fields (comptime iteration)
-    inline for (fields) |field| {
-        writer.writeAll(",\"") catch {};
-        writer.writeAll(field.key) catch {};
-        writer.writeAll("\":") catch {};
-        field.formatJsonValue(writer) catch {};
-    }
-
-    writer.writeAll("}\n") catch {};
+    var msg_buf: [max_message_len]u8 = undefined;
+    writeJsonLine(writer, level, formatMessage(&msg_buf, fmt, args), timestamp, caller, fields);
 }
 
 fn formatFmtCompactEntry(
@@ -748,44 +750,12 @@ pub fn stdLogFn(
         return;
     }
 
-    // Format the message into a stack buffer
-    var msg_buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch return;
+    var msg_buf: [max_message_len]u8 = undefined;
+    const msg = formatMessage(&msg_buf, fmt, args);
 
-    const scope_name = @tagName(scope);
-    const has_scope = !std.mem.eql(u8, scope_name, "default");
-
-    // Stack buffer for output
-    var buf: [8192]u8 = undefined;
+    var buf: [line_buf_len]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
-    const writer = &fbs;
-
-    const timestamp = time.nanoTimestamp();
-    const colors = global.use_colors;
-
-    // Simple text format for std.log bridge
-    if (global.show_timestamp) {
-        if (colors) writer.writeAll(Color.dim) catch {};
-        format.writeShortTimestamp(writer, timestamp) catch {};
-        if (colors) writer.writeAll(Color.reset) catch {};
-        writer.writeByte(' ') catch {};
-    }
-
-    if (colors) writer.writeAll(Color.forLevel(log_level)) catch {};
-    writer.writeAll(log_level.toShort()) catch {};
-    if (colors) writer.writeAll(Color.reset) catch {};
-    writer.writeByte(' ') catch {};
-
-    if (has_scope) {
-        if (colors) writer.writeAll(Color.cyan) catch {};
-        writer.writeByte('[') catch {};
-        writer.writeAll(scope_name) catch {};
-        writer.writeAll("] ") catch {};
-        if (colors) writer.writeAll(Color.reset) catch {};
-    }
-
-    writer.writeAll(msg) catch {};
-    writer.writeByte('\n') catch {};
+    formatStdEntry(&fbs, log_level, @tagName(scope), msg, time.nanoTimestamp());
 
     const output_bytes = fbs.buffered();
     const use_stderr = (log_level == .err or log_level == .fatal);
@@ -793,6 +763,51 @@ pub fn stdLogFn(
         _ = @import("io.zig").writeFd(std.posix.STDERR_FILENO, output_bytes);
     } else {
         _ = @import("io.zig").writeFd(std.posix.STDOUT_FILENO, output_bytes);
+    }
+}
+
+/// A std.log line in the configured format, so a JSON stream has no text
+/// lines in it. A scope other than the default is the `component` field,
+/// as stdx's scoped loggers write it. `global.format` is set once by
+/// `configure`, before any thread that logs starts, so a plain read is safe.
+fn formatStdEntry(writer: *std.Io.Writer, log_level: Level, scope_name: []const u8, msg: []const u8, timestamp: i128) void {
+    const has_scope = !std.mem.eql(u8, scope_name, "default");
+    switch (global.format) {
+        .json => if (has_scope)
+            writeJsonLine(writer, log_level, msg, timestamp, null, .{Field.component(scope_name)})
+        else
+            writeJsonLine(writer, log_level, msg, timestamp, null, .{}),
+        .compact => if (has_scope)
+            formatFmtCompactEntry(writer, log_level, "{s}", .{msg}, .{Field.component(scope_name)})
+        else
+            formatFmtCompactEntry(writer, log_level, "{s}", .{msg}, .{}),
+        .text => {
+            const colors = global.use_colors;
+
+            // Simple text format for std.log bridge
+            if (global.show_timestamp) {
+                if (colors) writer.writeAll(Color.dim) catch {};
+                format.writeShortTimestamp(writer, timestamp) catch {};
+                if (colors) writer.writeAll(Color.reset) catch {};
+                writer.writeByte(' ') catch {};
+            }
+
+            if (colors) writer.writeAll(Color.forLevel(log_level)) catch {};
+            writer.writeAll(log_level.toShort()) catch {};
+            if (colors) writer.writeAll(Color.reset) catch {};
+            writer.writeByte(' ') catch {};
+
+            if (has_scope) {
+                if (colors) writer.writeAll(Color.cyan) catch {};
+                writer.writeByte('[') catch {};
+                writer.writeAll(scope_name) catch {};
+                writer.writeAll("] ") catch {};
+                if (colors) writer.writeAll(Color.reset) catch {};
+            }
+
+            writer.writeAll(msg) catch {};
+            writer.writeByte('\n') catch {};
+        },
     }
 }
 
@@ -907,4 +922,104 @@ test "test logger buffer" {
     const output = test_log.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "test message") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "key=") != null);
+}
+
+fn withGlobal(fmt: Format, show_timestamp: bool) @TypeOf(global) {
+    const saved = global;
+    global.format = fmt;
+    global.use_colors = false;
+    global.show_timestamp = show_timestamp;
+    return saved;
+}
+
+fn parseLine(line: []const u8) !std.json.Parsed(std.json.Value) {
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, line[0 .. line.len - 1], .{});
+}
+
+test "std.log bridge writes JSON under format json, scope as component" {
+    const saved = withGlobal(.json, true);
+    defer global = saved;
+    var buf: [line_buf_len]u8 = undefined;
+
+    var w: std.Io.Writer = .fixed(&buf);
+    formatStdEntry(&w, .warn, "reactor", "a \"quoted\" line", 42);
+    const with_scope = try parseLine(w.buffered());
+    defer with_scope.deinit();
+    try std.testing.expectEqualStrings("a \"quoted\" line", with_scope.value.object.get("msg").?.string);
+    try std.testing.expectEqualStrings("reactor", with_scope.value.object.get("component").?.string);
+    try std.testing.expectEqualStrings(Level.warn.toString(), with_scope.value.object.get("level").?.string);
+
+    w = .fixed(&buf);
+    formatStdEntry(&w, .info, "default", "plain", 42);
+    const unscoped = try parseLine(w.buffered());
+    defer unscoped.deinit();
+    try std.testing.expect(unscoped.value.object.get("component") == null);
+}
+
+test "std.log bridge text output is unchanged" {
+    const saved = withGlobal(.text, false);
+    defer global = saved;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatStdEntry(&w, .info, "ts", "flushed", 0);
+    var want_buf: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{s} [ts] flushed\n", .{Level.info.toShort()});
+    try std.testing.expectEqualStrings(want, w.buffered());
+}
+
+test "a JSON line without timestamps is valid JSON" {
+    const saved = withGlobal(.json, false);
+    defer global = saved;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatStdEntry(&w, .err, "default", "x", 0);
+    const parsed = try parseLine(w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("x", parsed.value.object.get("msg").?.string);
+}
+
+test "an overlong message is cut at a character boundary, and its JSON line still parses" {
+    const saved = withGlobal(.json, true);
+    defer global = saved;
+    // 6 KiB of quotes, backslashes, controls and multibyte characters, so the
+    // cut can fall inside an escape or a code point if it isn't careful.
+    var long: [6 * 1024]u8 = undefined;
+    const pattern = "ab\"\\\x01é€😀";
+    for (&long, 0..) |*c, i| c.* = pattern[i % pattern.len];
+    const raw = utf8Prefix(&long);
+
+    var msg_buf: [max_message_len]u8 = undefined;
+    const msg = formatMessage(&msg_buf, "{s}", .{raw});
+    try std.testing.expect(msg.len <= max_message_len);
+    try std.testing.expect(std.mem.endsWith(u8, msg, cut_marker));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(msg));
+
+    var buf: [line_buf_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatStdEntry(&w, .info, "big", msg, 1);
+    const parsed = try parseLine(w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(msg, parsed.value.object.get("msg").?.string);
+}
+
+test "a cut that would split a character drops the whole character" {
+    // ASCII up to one byte before the cut, then a 4-byte character across it.
+    const room = max_message_len - cut_marker.len;
+    const msg_in = ("a" ** (room - 1)) ++ "😀" ++ ("b" ** 100);
+    var msg_buf: [max_message_len]u8 = undefined;
+    const msg = formatMessage(&msg_buf, "{s}", .{msg_in});
+    try std.testing.expectEqualStrings(("a" ** (room - 1)) ++ cut_marker, msg);
+}
+
+test "a formatted JSON message over 1 KiB is kept, not replaced by its format string" {
+    const saved = withGlobal(.json, true);
+    defer global = saved;
+    const body = "y" ** 2000;
+    var buf: [line_buf_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    formatFmtJsonEntry(&w, .info, "n={s}", .{body}, 0, null, .{});
+    const parsed = try parseLine(w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("n=" ++ body, parsed.value.object.get("msg").?.string);
 }
