@@ -58,9 +58,9 @@ fn benchSteady(allocator: std.mem.Allocator, label: []const u8, capacity: usize,
     var worst_ns: u64 = 0;
     for (0..appends) |i| {
         const entry = entry_mod.buildEntry(.kv_put, 0, 1, @as(u64, @intCast(i)) + 1, 0, payload);
-        const t0 = stdx.time.nanoTimestamp();
+        const t0 = stdx.time.monotonicNs();
         _ = try ual.append(&entry);
-        const ns: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
+        const ns: u64 = stdx.time.monotonicNs() - t0;
         total_ns += ns;
         // The ring's first fill grows the map; count from the first wrap.
         if (i >= per_ring) worst_ns = @max(worst_ns, ns);
@@ -90,12 +90,12 @@ fn benchLookups(allocator: std.mem.Allocator, label: []const u8, capacity: usize
     const random = prng.random();
     const lookups = 2_000_000;
     var found: u64 = 0;
-    const t0 = stdx.time.nanoTimestamp();
+    const t0 = stdx.time.monotonicNs();
     for (0..lookups) |_| {
         const i = random.intRangeAtMost(u64, ual.min_live_index, ual.max_index);
         found += @intFromBool(ual.contains(i));
     }
-    const ns: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
+    const ns: u64 = stdx.time.monotonicNs() - t0;
     std.mem.doNotOptimizeAway(found);
     std.debug.print("  {s}: {d} live, {d} ns/lookup ({d} found)\n", .{ label, ual.entry_count, ns / lookups, found });
 }
@@ -113,13 +113,13 @@ fn benchWarmModel(allocator: std.mem.Allocator) !void {
     var total_ns: u64 = 0;
     var worst_ns: u64 = 0;
     for (0..steps) |i| {
-        const t0 = stdx.time.nanoTimestamp();
+        const t0 = stdx.time.monotonicNs();
         try map.put(allocator, i, i);
         if (i >= held) {
             _ = map.remove(i - held);
             sweep.noteRemoved(u64, &map);
         }
-        const ns: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
+        const ns: u64 = stdx.time.monotonicNs() - t0;
         total_ns += ns;
         if (i >= held) worst_ns = @max(worst_ns, ns);
     }
@@ -149,9 +149,9 @@ pub fn main() !void {
         ual.deinit();
         ual = try UAL.init(allocator, 4 * 1024 * 1024, 0);
 
-        const start = stdx.time.nanoTimestamp();
+        const start = stdx.time.monotonicNs();
         benchAppend(&ual);
-        const elapsed = stdx.time.nanoTimestamp() - start;
+        const elapsed = stdx.time.monotonicNs() - start;
 
         const elapsed_ns: u64 = @intCast(elapsed);
         const ops_per_sec = @as(u64, BENCH_ITERS) * 1_000_000_000 / elapsed_ns;
@@ -162,9 +162,9 @@ pub fn main() !void {
         });
 
         // ── Read Benchmark ──
-        const read_start = stdx.time.nanoTimestamp();
+        const read_start = stdx.time.monotonicNs();
         benchRead(&ual);
-        const read_elapsed = stdx.time.nanoTimestamp() - read_start;
+        const read_elapsed = stdx.time.monotonicNs() - read_start;
 
         const read_ns: u64 = @intCast(read_elapsed);
         const read_iters: u64 = @intCast(@min(BENCH_ITERS, ual.max_index - ual.min_live_index + 1));
