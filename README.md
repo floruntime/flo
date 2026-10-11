@@ -453,20 +453,14 @@ enabled = true
 
 [dashboard]
 enabled = true
-bind = "0.0.0.0"
+# bind = "127.0.0.1"   # loopback by default: the dashboard authenticates no one yet
 # hosts = "flo.example.internal, 10.0.1.5"   # names/addresses you browse to it by (besides localhost)
 ```
 
-Environment variables override config values:
-
-| Variable | Default | Description |
-|---|---|---|
-| `FLO_DATA_DIR` | `/data/flo` | Data directory |
-| `FLO_LISTEN_ADDR` | `0.0.0.0:9000` | Client API address |
-| `FLO_METRICS_ADDR` | `0.0.0.0:9001` | Metrics endpoint |
-| `FLO_NODE_ID` | - | Node ID (required for clustering) |
-| `FLO_LOG_LEVEL` | `info` | Log level |
-| `FLO_LOG_FORMAT` | `text` | Log format (`text` or `json`) |
+The server takes its settings from `flo.toml` and its flags. The one
+environment variable it reads is `FLO_CLUSTER_SECRET`, the cluster's shared
+secret. The CLI reads `FLO_ENDPOINT`, `FLO_PORT` and `FLO_NAMESPACE` when
+`--endpoint`, `--port` or `--namespace` isn't given.
 
 ## Module Structure
 
