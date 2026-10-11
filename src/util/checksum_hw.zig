@@ -9,9 +9,9 @@ const builtin = @import("builtin");
 /// self-hosted x86_64 backend, the Debug default there, can't encode crc32).
 /// The release targets are baseline CPUs, which have neither SSE4.2 nor ARM
 /// CRC, so they take the software path.
-const hw_path: enum { x86_64, aarch64, none } = switch (builtin.cpu.arch) {
-    .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2) and builtin.zig_backend != .stage2_x86_64) .x86_64 else .none,
-    .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc) and builtin.zig_backend != .stage2_aarch64) .aarch64 else .none,
+const hw_path: enum { x86_64, aarch64, none } = switch (builtin.target.cpu.arch) {
+    .x86_64 => if (std.Target.x86.featureSetHas(builtin.target.cpu.features, .sse4_2) and builtin.zig_backend != .stage2_x86_64) .x86_64 else .none,
+    .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .crc) and builtin.zig_backend != .stage2_aarch64) .aarch64 else .none,
     else => .none,
 };
 

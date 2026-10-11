@@ -20,8 +20,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const stdx = @import("stdx");
 
-const is_linux = builtin.os.tag == .linux;
-const is_darwin = switch (builtin.os.tag) {
+const is_linux = builtin.target.os.tag == .linux;
+const is_darwin = switch (builtin.target.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => true,
     else => false,
 };

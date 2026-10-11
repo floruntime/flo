@@ -108,7 +108,7 @@ test "harness: only an exit the harness caused is normal" {
 /// /proc counts as gone.
 fn processGone(pid: std.c.pid_t) bool {
     if (std.c.kill(pid, @enumFromInt(0)) != 0) return true;
-    if (@import("builtin").os.tag != .linux) return false;
+    if (@import("builtin").target.os.tag != .linux) return false;
     var path_buf: [32]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
     var stat_buf: [512]u8 = undefined;

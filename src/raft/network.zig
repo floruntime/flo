@@ -1280,7 +1280,7 @@ pub const RaftNetwork = struct {
         // The OS default idle is hours; probe after fifteen seconds.
         const idle: c_int = 15;
         const builtin = @import("builtin");
-        const idle_opt: ?u32 = switch (builtin.os.tag) {
+        const idle_opt: ?u32 = switch (builtin.target.os.tag) {
             .macos, .ios => 0x10, // TCP_KEEPALIVE
             .linux => 4, // TCP_KEEPIDLE
             else => null,

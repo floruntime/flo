@@ -268,7 +268,7 @@ pub fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.s
     // macOS rejects SOCK.NONBLOCK / SOCK.CLOEXEC in the socket() type field
     // (returns EPROTONOSUPPORT). Strip them and apply via fcntl after creation.
     const builtin = @import("builtin");
-    const strip_mask: u32 = if (builtin.os.tag == .macos)
+    const strip_mask: u32 = if (builtin.target.os.tag == .macos)
         posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC
     else
         0;
@@ -280,7 +280,7 @@ pub fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.s
     if (rc < 0) return error.SocketCreateFailed;
     const fd: posix.socket_t = @intCast(rc);
 
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         if (want_nonblock) {
             const F_GETFL: c_int = 3;
             const F_SETFL: c_int = 4;

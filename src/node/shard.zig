@@ -7477,7 +7477,7 @@ fn feedClient(client_fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, data: []co
 /// Bytes the kernel holds for `fd` that nobody has read yet.
 fn unreadBytes(fd: std.posix.fd_t) c_int {
     // std's Darwin table has no FIONREAD; it is _IOR('f', 127, int) there.
-    const fionread: c_int = if (@import("builtin").os.tag == .linux) @intCast(std.os.linux.T.FIONREAD) else 0x4004667f;
+    const fionread: c_int = if (@import("builtin").target.os.tag == .linux) @intCast(std.os.linux.T.FIONREAD) else 0x4004667f;
     var n: c_int = 0;
     _ = std.c.ioctl(fd, fionread, &n);
     return n;

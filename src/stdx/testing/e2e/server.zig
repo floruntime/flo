@@ -68,7 +68,7 @@ fn claimCheckout() !void {
         .refused => return error.E2eRunInProgress,
         .pending => {},
     }
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) {
         claim = .held;
         return;
     }
@@ -851,11 +851,11 @@ pub fn findFloBinary(allocator: Allocator) ![]const u8 {
     // Try to find from current exe path (best-effort, macOS via _NSGetExecutablePath)
     var exe_buf: [4096]u8 = undefined;
     const self_exe = blk: {
-        if (builtin.os.tag == .macos) {
+        if (builtin.target.os.tag == .macos) {
             var len: u32 = exe_buf.len;
             if (std.c._NSGetExecutablePath(&exe_buf, &len) != 0) return error.FloBinaryNotFound;
             break :blk std.mem.sliceTo(&exe_buf, 0);
-        } else if (builtin.os.tag == .linux) {
+        } else if (builtin.target.os.tag == .linux) {
             const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
             if (n <= 0) return error.FloBinaryNotFound;
             break :blk exe_buf[0..@intCast(n)];
