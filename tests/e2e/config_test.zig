@@ -29,3 +29,40 @@ test "e2e/config: a section or key the server doesn't read is refused at start, 
 test "e2e/config: a config file named on the command line that is missing is refused at start" {
     try expectRefused(.{ .shards = 1, .config_file_missing = true }, "not found");
 }
+
+test "e2e/config: a node restarted with a partition count other than the one its data was written with is refused, automatic included" {
+    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 1 });
+    defer node.deinit();
+    // Automatic: 4096 for one shard, recorded as that.
+    try node.start();
+    node.stop();
+
+    node.config.extra_config = "[server]\npartition_count = 8192\n";
+    node.dump_log_on_failure = false;
+    try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
+    const says = "the data was written with 4096 partitions, and this start asks for 8192";
+    if (!try node.logsContain(says)) {
+        std.debug.print("expected the log to say: {s}\n", .{says});
+        return error.TestUnexpectedResult;
+    }
+
+    // The same count, explicit, is the same topology.
+    node.config.extra_config = "[server]\npartition_count = 4096\n";
+    try node.start();
+}
+
+test "e2e/config: a node written with an explicit partition count is refused when restarted automatic, if the counts differ" {
+    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 1, .extra_config = "[server]\npartition_count = 8192\n" });
+    defer node.deinit();
+    try node.start();
+    node.stop();
+
+    node.config.extra_config = null;
+    node.dump_log_on_failure = false;
+    try testing.expectError(error.ServerNotReady, node.startWithTimeout(3000));
+    const says = "the data was written with 8192 partitions, and this start asks for 4096 (automatic)";
+    if (!try node.logsContain(says)) {
+        std.debug.print("expected the log to say: {s}\n", .{says});
+        return error.TestUnexpectedResult;
+    }
+}
