@@ -25,6 +25,40 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 /// Server process manager for e2e tests
+/// Servers this checkout's binary left running: those of an earlier run
+/// that crashed, or of a test the runner killed at its time limit. The runner
+/// kills only the test process, and each server leads its own process group,
+/// so it outlives the test as an orphan. Cleared once per test process, at
+/// its first server start, before anything this process starts is running;
+/// the runner restarts the process after a timeout, so the next test clears
+/// the previous one's. Only servers of this checkout's own binary: a pattern
+/// any flo matches would kill other checkouts' runs and hand-started servers.
+var orphans_cleared: std.atomic.Value(bool) = .init(false);
+
+fn clearOrphanedServers() void {
+    if (orphans_cleared.swap(true, .acq_rel)) return;
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    const binary = findFloBinary(std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(binary);
+    // pkill -f takes an extended regex: escape the path so it matches only itself.
+    var pattern: std.ArrayListUnmanaged(u8) = .empty;
+    defer pattern.deinit(std.heap.page_allocator);
+    pattern.append(std.heap.page_allocator, '^') catch return;
+    for (binary) |c| {
+        if (std.mem.indexOfScalar(u8, "\\.^$|?*+()[]{}", c) != null) pattern.append(std.heap.page_allocator, '\\') catch return;
+        pattern.append(std.heap.page_allocator, c) catch return;
+    }
+    pattern.appendSlice(std.heap.page_allocator, " server ") catch return;
+    const r = std.process.run(std.heap.page_allocator, stdx.io.instance(), .{
+        .argv = &.{ "pkill", "-9", "-f", pattern.items },
+    }) catch return;
+    std.heap.page_allocator.free(r.stdout);
+    std.heap.page_allocator.free(r.stderr);
+    // pkill exits 0 only when it matched: then give the killed servers a
+    // moment to release their ports.
+    if (r.term == .exited and r.term.exited == 0) stdx.time.sleep(500 * std.time.ns_per_ms);
+}
+
 pub const ServerProcess = struct {
     const Self = @This();
 
@@ -227,6 +261,8 @@ pub const ServerProcess = struct {
     /// Start the server with custom timeout
     pub fn startWithTimeout(self: *Self, timeout_ms: u64) !void {
         if (self.started) return error.AlreadyStarted;
+
+        clearOrphanedServers();
 
         // Find free port for main server
         self.port = try findFreePort();

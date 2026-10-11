@@ -78,7 +78,18 @@ jobs:
       # Report every suite's result — one failure should not hide the others.
       fail-fast: false
       matrix:
-        step: [test-unit, test-integration, test-e2e]
+        # A hung test is killed at its step's limit and fails by name; the
+        # job's timeout-minutes stays as the backstop. Each limit is about
+        # three times the slowest test measured locally (unit: a VOPR swarm,
+        # 10-20 s; e2e: list paging and the namespace limit, 40-70 s), so a
+        # slower runner doesn't flake.
+        include:
+          - step: test-unit
+            test_timeout: 90s
+          - step: test-integration
+            test_timeout: 60s
+          - step: test-e2e
+            test_timeout: 300s
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -92,7 +103,7 @@ jobs:
           path: src/node/dashboard/dist
 
       - name: zig build ${{ matrix.step }}
-        run: zig build ${{ matrix.step }}
+        run: zig build ${{ matrix.step }} --test-timeout ${{ matrix.test_timeout }}
         timeout-minutes: 30
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
