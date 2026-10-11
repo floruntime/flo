@@ -7788,7 +7788,10 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     n = std.c.read(pair[1], &out, out.len);
     resp = try proto.Response.parse(out[0..@intCast(n)]);
     try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.data, "may still apply") != null);
+    // Sent, then the term moved on: it may still have applied.
+    const lost = try resp.refused();
+    try std.testing.expectEqualStrings("unavailable: lost leadership before commit — write may still apply", lost.message);
+    try std.testing.expectEqual(proto.Ran.unknown, lost.ran);
 
     // Sent over a link that then went down, with the term unchanged: the
     // answer will never come either.

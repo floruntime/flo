@@ -238,12 +238,12 @@ pub const Dispatcher = struct {
         }
     }
 
-    /// Check if an opcode has a registered handler.
     /// Whether `op` has a handler: an op code past the table has none.
     pub fn serves(self: *const Dispatcher, op: u16) bool {
         return op < proto.MAX_OPCODES and self.handlers[op] != null;
     }
 
+    /// Check if an opcode has a registered handler.
     pub fn hasHandler(self: *const Dispatcher, opcode: proto.OpCode) bool {
         return self.handlers[@intFromEnum(opcode)] != null;
     }
