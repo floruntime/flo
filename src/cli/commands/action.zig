@@ -233,7 +233,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     const owner = ctx.getString("owner") orelse "cli";
     const timeout = ctx.getUint("timeout") orelse 30000;
     const retries = ctx.getUint("retries") orelse 0;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -256,7 +256,7 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
 
     const labels_str = ctx.getString("labels") orelse "";
     const required_labels: ?[]const u8 = if (labels_str.len > 0) labels_str else null;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -298,7 +298,7 @@ fn runInvoke(ctx: *commander.Context) commander.Error!void {
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const run_id = ctx.getPositional("run_id").?; // validated by commander
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -393,7 +393,7 @@ fn readOptionalSlice(data: []const u8, off: *usize) error{Truncated}!?[]const u8
 
 fn runList(ctx: *commander.Context) commander.Error!void {
     const limit = ctx.getUint("limit") orelse 100;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -479,7 +479,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -498,7 +498,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
 
 fn runRuns(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const limit: u32 = @intCast(ctx.getUint("limit") orelse 50);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -536,7 +536,7 @@ fn runWorkerRegister(ctx: *commander.Context) commander.Error!void {
     const task_types = ctx.getVariadicArgs("task_types") orelse &.{};
     if (task_types.len == 0) return outcome.usage(ctx, "give at least one task type", .{});
 
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const labels_str = ctx.getString("labels") orelse "";
     const labels: ?[]const u8 = if (labels_str.len > 0) labels_str else null;
     const endpoint = cli_config.getEndpoint(ctx);
@@ -563,7 +563,7 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
     };
 
     const block = ctx.getUint("block") orelse 5000;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -642,7 +642,7 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
 
     const action_name = ctx.getString("action") orelse "";
     const result_payload = ctx.getString("result") orelse "";
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -669,7 +669,7 @@ fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
     const action_name = ctx.getString("action") orelse "";
     const error_msg = ctx.getString("error") orelse "";
     const allow_retry = ctx.getBool("retry");
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -694,7 +694,7 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
 
     const action_name = ctx.getString("action") orelse "";
     const extend = ctx.getUint("extend") orelse 30000;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -712,7 +712,7 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runWorkerList(ctx: *commander.Context) commander.Error!void {
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -763,7 +763,7 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
 
 fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
     const worker_id = ctx.getPositional("worker_id").?; // validated by commander
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -781,7 +781,7 @@ fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
 
 fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
     const worker_id = ctx.getPositional("worker_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);

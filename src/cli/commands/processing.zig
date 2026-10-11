@@ -136,7 +136,7 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
 
 fn runSubmit(ctx: *commander.Context) commander.Error!void {
     const file_path = ctx.getPositional("file").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     // Read the YAML file
@@ -165,7 +165,7 @@ fn runSubmit(ctx: *commander.Context) commander.Error!void {
 
 fn runStop(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -187,7 +187,7 @@ fn runStop(ctx: *commander.Context) commander.Error!void {
 
 fn runCancel(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -209,7 +209,7 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -259,7 +259,7 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -288,7 +288,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
 fn runSavepoint(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -315,7 +315,7 @@ fn runSavepoint(ctx: *commander.Context) commander.Error!void {
 fn runRestore(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const savepoint_id = ctx.getPositional("savepoint_id").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     var client = Client.init(ctx.allocator, endpoint);
@@ -338,7 +338,7 @@ fn runRestore(ctx: *commander.Context) commander.Error!void {
 fn runRescale(ctx: *commander.Context) commander.Error!void {
     const job_id = ctx.getPositional("job_id").?;
     const parallelism_str = ctx.getPositional("parallelism").?;
-    const namespace = ctx.getString("namespace") orelse "default";
+    const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
     const parallelism = std.fmt.parseInt(u32, parallelism_str, 10) catch {
