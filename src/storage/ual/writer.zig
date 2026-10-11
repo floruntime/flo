@@ -36,7 +36,6 @@ pub const SegmentWriter = struct {
     last_ts_ns: u64,
     entry_count: u32,
     entry_type_bitmap: u32,
-    compression: segment.Compression,
     /// Written into the header at seal; `DurableLog` sets it: the Raft
     /// commit index at flush, clamped to the cut when a truncation rewrites
     /// a file.
@@ -56,7 +55,7 @@ pub const SegmentWriter = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, partition_id: u32, compression: segment.Compression) SegmentWriter {
+    pub fn init(allocator: std.mem.Allocator, partition_id: u32) SegmentWriter {
         return .{
             .data = std.ArrayList(u8).empty,
             .sparse_index = std.ArrayList(segment.SparseIndexEntry).empty,
@@ -67,7 +66,6 @@ pub const SegmentWriter = struct {
             .last_ts_ns = 0,
             .entry_count = 0,
             .entry_type_bitmap = 0,
-            .compression = compression,
             .commit_index_at_seal = 0,
             .buffer_failures = 0,
             .first_unbuffered = null,
@@ -190,7 +188,9 @@ pub const SegmentWriter = struct {
             .last_ts_ns = self.last_ts_ns,
             .entry_count = self.entry_count,
             .data_size = @intCast(self.data.items.len),
-            .compression = @intFromEnum(self.compression),
+            // Nothing compresses yet; the header keeps the byte for when
+            // something does.
+            .compression = @intFromEnum(segment.Compression.none),
             .commit_index_at_seal = self.commit_index_at_seal,
             .reserved = .{0},
         };
@@ -280,7 +280,7 @@ fn makeTestEntry(index: u64, payload: []const u8) Entry {
 }
 
 test "writer: empty segment seals correctly" {
-    var writer = SegmentWriter.init(std.testing.allocator, 42, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 42);
     defer writer.deinit();
 
     const sealed = try writer.seal();
@@ -297,7 +297,7 @@ test "writer: empty segment seals correctly" {
 }
 
 test "writer: add entries and seal" {
-    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 0);
     defer writer.deinit();
 
     // Add 3 entries
@@ -325,7 +325,7 @@ test "writer: add entries and seal" {
 }
 
 test "writer: sparse index created for 256+ entries" {
-    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 0);
     defer writer.deinit();
 
     // Add 300 entries — should get 2 sparse index entries (0, 256)
@@ -343,7 +343,7 @@ test "writer: sparse index created for 256+ entries" {
 }
 
 test "writer: entry type bitmap tracks types" {
-    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 0);
     defer writer.deinit();
 
     const kv = entry_mod.buildEntry(.kv_put, 0, 1, 1, 0, "a");
@@ -358,7 +358,7 @@ test "writer: entry type bitmap tracks types" {
 }
 
 test "writer: CRC in footer is non-zero" {
-    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 0);
     defer writer.deinit();
 
     const entry = makeTestEntry(1, "data");
@@ -381,7 +381,7 @@ test "writer: writeToFile syncs the segment directory after the rename" {
     const dir_path = try tmp.dir.realPathFileAlloc(@import("stdx").io.instance(), ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
-    var writer = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(std.testing.allocator, 0);
     defer writer.deinit();
     try writer.addEntry(&makeTestEntry(1, "data"));
 

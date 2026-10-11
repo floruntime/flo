@@ -578,7 +578,7 @@ pub fn generateDefaultConfig() []const u8 {
     \\[storage]
     \\# --- WAL Durability ---
     \\# sync: Wait for fsync after every write (strongest guarantee)
-    \\# async_flush: Background flush every ~1ms (highest throughput, default)
+    \\# async_flush: Background flush about once a second (highest throughput, default)
     \\# ephemeral: Skip WAL entirely (for caches/temporary data)
     \\durability = "async_flush"
     \\

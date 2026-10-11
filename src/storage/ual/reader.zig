@@ -197,7 +197,7 @@ fn makeTestEntry(index: u64, payload: []const u8) Entry {
 }
 
 test "reader: open empty segment" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const sealed = try w.seal();
@@ -208,7 +208,7 @@ test "reader: open empty segment" {
 }
 
 test "reader: write and read back entries" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const e1 = makeTestEntry(1, "hello");
@@ -236,7 +236,7 @@ test "reader: write and read back entries" {
 }
 
 test "reader: findByIndex" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     var i: u64 = 1;
@@ -270,7 +270,7 @@ test "reader: findByIndex" {
 }
 
 test "reader: CRC validation rejects corrupt data" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const entry = makeTestEntry(1, "test");
@@ -287,7 +287,7 @@ test "reader: CRC validation rejects corrupt data" {
 }
 
 test "reader: containsIndex" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const e1 = makeTestEntry(10, "a");
@@ -307,7 +307,7 @@ test "reader: containsIndex" {
 }
 
 test "reader: hasEntryType bitmap check" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const kv = entry_mod.buildEntry(.kv_put, 0, 1, 1, 0, "a");
@@ -322,7 +322,7 @@ test "reader: hasEntryType bitmap check" {
 }
 
 test "reader: sparse index used for large segments" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     // 300 entries → sparse index has entries at 0 and 256
@@ -345,7 +345,7 @@ test "reader: sparse index used for large segments" {
 }
 
 test "reader: individual entry CRC still valid" {
-    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
 
     const entry = makeTestEntry(1, "verify_me");

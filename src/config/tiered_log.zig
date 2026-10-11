@@ -21,7 +21,7 @@ pub const TieredLogConfig = struct {
     max_hot_entries: usize = 0,
 
     /// Maximum seconds entries stay in hot tier before flush to warm.
-    /// 0 = disable time-based flush (default — timer not yet implemented).
+    /// 0 = disable time-based flush (default).
     /// Recommended production value: 300 (5 minutes).
     hot_flush_seconds: u64 = 0,
 };

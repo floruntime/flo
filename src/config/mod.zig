@@ -2,11 +2,11 @@
 //!
 //! This module provides shared configuration types used across the codebase.
 //! It ensures a single source of truth for configuration structs like
-//! ColdStorageConfig, ClusterConfig, etc.
+//! ClusterConfig.
 //!
 //! Usage:
 //!   const config = @import("config/mod.zig");
-//!   const ColdStorageConfig = config.ColdStorageConfig;
+//!   const ClusterConfig = config.cluster.ClusterConfig;
 
 pub const metrics = @import("metrics.zig");
 pub const dashboard = @import("dashboard.zig");

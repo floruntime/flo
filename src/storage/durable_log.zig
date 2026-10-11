@@ -201,7 +201,7 @@ pub const DurableLog = struct {
     fn rewriteBelow(self: *DurableLog, f: SegmentFile, after_index: u64) !void {
         const opened = try SegmentReader.initFromFile(self.allocator, f.path);
         defer self.allocator.free(opened.buf);
-        var w = SegmentWriter.init(self.allocator, opened.reader.header.partition_id, @enumFromInt(opened.reader.header.compression));
+        var w = SegmentWriter.init(self.allocator, opened.reader.header.partition_id);
         defer w.deinit();
         w.commit_index_at_seal = @min(f.commit_index_at_seal, after_index);
         var offset: usize = 0;
@@ -469,7 +469,7 @@ fn fileNames(dir_path: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !vo
 test "durable log: watermark is the highest commit index any segment was sealed under" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -487,7 +487,7 @@ test "durable log: watermark is the highest commit index any segment was sealed 
 test "durable log: readRange serves the writer buffer, then each sealed segment" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -523,7 +523,7 @@ test "durable log: readRange serves the writer buffer, then each sealed segment"
 test "durable log: truncateAfter rewrites the sealed tail under its own name and deletes emptied files" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -581,7 +581,7 @@ test "durable log: truncateAfter rewrites the sealed tail under its own name and
 }
 
 test "durable log: truncateAfter inside the writer buffer keeps the prefix and its sparse index consistent" {
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var i: u64 = 1;
     while (i <= 600) : (i += 1) try writer.addEntry(&testEntry(i, 1, "x"));
@@ -607,7 +607,7 @@ test "durable log: truncateAfter inside the writer buffer keeps the prefix and i
 test "durable log: a truncation the previous run did not finish is completed before replay" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -638,7 +638,7 @@ test "durable log: a truncation the previous run did not finish is completed bef
 test "durable log: two segments holding the same index refuse to be listed" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -649,7 +649,7 @@ test "durable log: two segments holding the same index refuse to be listed" {
     try dl.flush(3);
     // A second file starting inside the first one's range: an unfinished
     // cut whose intent file was lost.
-    var stray = SegmentWriter.init(testing.allocator, 0, .none);
+    var stray = SegmentWriter.init(testing.allocator, 0);
     defer stray.deinit();
     try stray.addEntry(&testEntry(3, 2, "C"));
     try stray.writeToFile(td.path);
@@ -664,7 +664,7 @@ test "durable log: two segments holding the same index refuse to be listed" {
 test "durable log: the cached listing and open segment are dropped by a flush and a truncation" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -692,7 +692,7 @@ test "durable log: the cached listing and open segment are dropped by a flush an
 test "durable log: a truncation that cannot reach the files wedges flushing until it does" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -738,7 +738,7 @@ test "durable log: a truncation that cannot reach the files wedges flushing unti
 test "durable log: a cut that fails after its intent is recorded is finished by the next flush" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -793,7 +793,7 @@ test "durable log: a cut that fails after its intent is recorded is finished by 
 test "durable log: a cut that cannot even list the files is remembered" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
@@ -818,7 +818,7 @@ test "durable log: a cut that cannot even list the files is remembered" {
 test "durable log: a cut retried after its deletes already happened still syncs the directory before clearing the intent" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0, .none);
+    var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();

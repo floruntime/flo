@@ -335,7 +335,7 @@ const SegmentWriter = @import("../ual/writer.zig").SegmentWriter;
 const entry_mod = @import("../ual/entry.zig");
 
 fn makeTestSegment(allocator: Allocator) ![]u8 {
-    var writer = SegmentWriter.init(allocator, 0, .none);
+    var writer = SegmentWriter.init(allocator, 0);
     defer writer.deinit();
 
     // Write 5 entries
@@ -478,7 +478,7 @@ test "ColdTierManager: archiveWarmSegments scans directory" {
     @import("stdx").fs.makePath(warm_dir) catch {};
 
     // Create two segment files in the warm directory
-    var writer1 = SegmentWriter.init(allocator, 0, .none);
+    var writer1 = SegmentWriter.init(allocator, 0);
     defer writer1.deinit();
     var i: u64 = 1;
     while (i <= 3) : (i += 1) {
@@ -487,7 +487,7 @@ test "ColdTierManager: archiveWarmSegments scans directory" {
     }
     try writer1.writeToFile(warm_dir);
 
-    var writer2 = SegmentWriter.init(allocator, 0, .none);
+    var writer2 = SegmentWriter.init(allocator, 0);
     defer writer2.deinit();
     i = 4;
     while (i <= 6) : (i += 1) {
