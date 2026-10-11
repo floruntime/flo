@@ -1,15 +1,16 @@
 //! TaskScheduler — cooperative periodic background tasks
 //!
 //! Each shard has one TaskScheduler, invoked from the Reactor loop.
-//! Tasks are registered with an interval and a time budget. The
-//! scheduler calls due tasks on each `tick()`, respecting the
-//! per-call budget to avoid blocking the event loop.
+//! Tasks are registered with an interval. Each `tick()` runs the due
+//! tasks until the time they actually took passes the tick's budget; the
+//! rest wait for the next tick. A task runs to completion: the budget
+//! decides how many start, not how long one runs.
 //!
 //! ## Usage
 //!
 //! ```zig
-//! var sched = TaskScheduler.init(allocator);
-//! try sched.register("ttl_sweep", 1_000, 1_000_000, ttlSweepFn, ctx);
+//! var sched = TaskScheduler.init();
+//! try sched.register("ttl_sweep", 1_000, ttlSweepFn, ctx);
 //! // In reactor loop:
 //! sched.tick(2_000_000); // 2ms total budget
 //! ```
@@ -25,7 +26,7 @@ pub const MAX_TASKS: usize = 32;
 
 /// Function type for a background task.
 /// Returns the number of items processed (for stats/logging).
-pub const TaskFn = *const fn (ctx: *anyopaque, budget_ns: u64) u64;
+pub const TaskFn = *const fn (ctx: *anyopaque) u64;
 
 /// A registered periodic task.
 pub const Task = struct {
@@ -40,11 +41,11 @@ pub const Task = struct {
 
     /// Interval between invocations in milliseconds.
     interval_ms: u64,
-    /// Per-invocation time budget in nanoseconds.
-    budget_ns: u64,
 
-    /// Timestamp of last invocation (milliseconds since epoch).
-    last_run_ms: i64,
+    /// When it last ran, on the monotonic clock; null until it has.
+    last_run_ms: ?u64,
+    /// Time it has taken, all runs together.
+    elapsed_ns: u64,
     /// Total invocation count.
     run_count: u64,
     /// Total items processed (sum of callback returns).
@@ -76,14 +77,12 @@ pub const TaskScheduler = struct {
     ///
     /// - `name`:        task name (max 32 bytes, truncated if longer)
     /// - `interval_ms`: how often to run (milliseconds)
-    /// - `budget_ns`:   max time per invocation (nanoseconds)
     /// - `callback`:    task function
     /// - `context`:     opaque context pointer
     pub fn register(
         self: *TaskScheduler,
         name: []const u8,
         interval_ms: u64,
-        budget_ns: u64,
         callback: TaskFn,
         context: *anyopaque,
     ) error{TaskLimitReached}!void {
@@ -95,8 +94,8 @@ pub const TaskScheduler = struct {
             .callback = callback,
             .context = context,
             .interval_ms = interval_ms,
-            .budget_ns = budget_ns,
-            .last_run_ms = 0,
+            .last_run_ms = null,
+            .elapsed_ns = 0,
             .run_count = 0,
             .items_processed = 0,
             .enabled = true,
@@ -110,43 +109,32 @@ pub const TaskScheduler = struct {
         self.task_count += 1;
     }
 
-    /// Run all due tasks, up to `total_budget_ns` total time.
+    /// Run the due tasks until the time they took reaches
+    /// `total_budget_ns`; the rest wait for the next tick.
     ///
     /// Called from the Reactor loop on each tick. Returns the number
     /// of tasks that were executed.
     pub fn tick(self: *TaskScheduler, total_budget_ns: u64) u32 {
-        const now_ms = @import("stdx").time.milliTimestamp();
+        const time = @import("stdx").time;
+        const now_ms = time.monotonicMs();
+        const start_ns = time.monotonicNs();
         var executed: u32 = 0;
-        var budget_remaining: u64 = total_budget_ns;
 
         for (self.tasks[0..self.task_count]) |*task| {
             if (!task.enabled) continue;
-            if (budget_remaining == 0) break;
+            if (time.monotonicNs() -| start_ns >= total_budget_ns) break;
+            if (task.last_run_ms) |last| {
+                if (now_ms -| last < task.interval_ms) continue;
+            }
 
-            // Check if interval has elapsed
-            const elapsed: u64 = if (now_ms > task.last_run_ms)
-                @intCast(now_ms - task.last_run_ms)
-            else
-                0;
-
-            if (elapsed < task.interval_ms) continue;
-
-            // Run with the smaller of task budget and remaining budget
-            const effective_budget = @min(task.budget_ns, budget_remaining);
-            const items = task.callback(task.context, effective_budget);
+            const task_start_ns = time.monotonicNs();
+            const items = task.callback(task.context);
+            task.elapsed_ns += time.monotonicNs() -| task_start_ns;
 
             task.last_run_ms = now_ms;
             task.run_count += 1;
             task.items_processed += items;
             executed += 1;
-
-            // Deduct from total budget (approximate — we trust tasks to
-            // respect their budget, actual timing is caller's concern)
-            if (effective_budget <= budget_remaining) {
-                budget_remaining -= effective_budget;
-            } else {
-                budget_remaining = 0;
-            }
         }
 
         self.total_ticks += 1;
@@ -201,6 +189,7 @@ pub const TaskScheduler = struct {
         for (self.tasks[0..self.task_count]) |*task| {
             task.run_count = 0;
             task.items_processed = 0;
+            task.elapsed_ns = 0;
         }
         self.total_ticks = 0;
     }
@@ -212,17 +201,20 @@ pub const TaskScheduler = struct {
 
 const TestContext = struct {
     invocations: u32 = 0,
-    last_budget: u64 = 0,
+    /// How long each run takes.
+    busy_ns: u64 = 0,
 };
 
-fn testTask(ctx_raw: *anyopaque, budget_ns: u64) u64 {
+fn testTask(ctx_raw: *anyopaque) u64 {
     const ctx: *TestContext = @ptrCast(@alignCast(ctx_raw));
     ctx.invocations += 1;
-    ctx.last_budget = budget_ns;
+    const time = @import("stdx").time;
+    const until = time.monotonicNs() + ctx.busy_ns;
+    while (time.monotonicNs() < until) {}
     return 5; // pretend we processed 5 items
 }
 
-fn testTask2(ctx_raw: *anyopaque, _: u64) u64 {
+fn testTask2(ctx_raw: *anyopaque) u64 {
     const ctx: *TestContext = @ptrCast(@alignCast(ctx_raw));
     ctx.invocations += 1;
     return 1;
@@ -238,7 +230,7 @@ test "TaskScheduler: register and tick" {
     var sched = TaskScheduler.init();
     var ctx = TestContext{};
 
-    try sched.register("test_task", 0, 1_000_000, testTask, @ptrCast(&ctx));
+    try sched.register("test_task", 0, testTask, @ptrCast(&ctx));
     try std.testing.expectEqual(@as(u8, 1), sched.task_count);
 
     // Tick with budget — task has interval 0, always due
@@ -252,7 +244,7 @@ test "TaskScheduler: task name stored correctly" {
     var sched = TaskScheduler.init();
     var ctx = TestContext{};
 
-    try sched.register("ttl_sweep", 1000, 500_000, testTask, @ptrCast(&ctx));
+    try sched.register("ttl_sweep", 1000, testTask, @ptrCast(&ctx));
 
     const task = sched.getTask("ttl_sweep");
     try std.testing.expect(task != null);
@@ -264,7 +256,7 @@ test "TaskScheduler: interval gating" {
     var ctx = TestContext{};
 
     // Register with a very large interval — should never fire on immediate re-tick
-    try sched.register("slow_task", 999_999, 1_000_000, testTask, @ptrCast(&ctx));
+    try sched.register("slow_task", 999_999, testTask, @ptrCast(&ctx));
 
     // First tick fires (last_run_ms=0 → always overdue)
     _ = sched.tick(10_000_000);
@@ -280,8 +272,8 @@ test "TaskScheduler: multiple tasks" {
     var ctx1 = TestContext{};
     var ctx2 = TestContext{};
 
-    try sched.register("task_a", 0, 500_000, testTask, @ptrCast(&ctx1));
-    try sched.register("task_b", 0, 500_000, testTask2, @ptrCast(&ctx2));
+    try sched.register("task_a", 0, testTask, @ptrCast(&ctx1));
+    try sched.register("task_b", 0, testTask2, @ptrCast(&ctx2));
 
     const executed = sched.tick(10_000_000);
     try std.testing.expectEqual(@as(u32, 2), executed);
@@ -293,7 +285,7 @@ test "TaskScheduler: disable and enable" {
     var sched = TaskScheduler.init();
     var ctx = TestContext{};
 
-    try sched.register("toggleable", 0, 1_000_000, testTask, @ptrCast(&ctx));
+    try sched.register("toggleable", 0, testTask, @ptrCast(&ctx));
 
     // Disable
     try std.testing.expect(sched.setEnabled("toggleable", false));
@@ -313,8 +305,8 @@ test "TaskScheduler: unregister" {
     var ctx1 = TestContext{};
     var ctx2 = TestContext{};
 
-    try sched.register("keep", 0, 500_000, testTask, @ptrCast(&ctx1));
-    try sched.register("remove", 0, 500_000, testTask2, @ptrCast(&ctx2));
+    try sched.register("keep", 0, testTask, @ptrCast(&ctx1));
+    try sched.register("remove", 0, testTask2, @ptrCast(&ctx2));
 
     try std.testing.expectEqual(@as(u8, 2), sched.task_count);
 
@@ -332,7 +324,7 @@ test "TaskScheduler: items_processed accumulates" {
     var sched = TaskScheduler.init();
     var ctx = TestContext{};
 
-    try sched.register("counting", 0, 1_000_000, testTask, @ptrCast(&ctx));
+    try sched.register("counting", 0, testTask, @ptrCast(&ctx));
 
     _ = sched.tick(10_000_000);
     _ = sched.tick(10_000_000); // last_run_ms just set, but interval=0
@@ -350,13 +342,13 @@ test "TaskScheduler: max tasks limit" {
 
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
-        try sched.register("t", 0, 1_000, testTask, @ptrCast(&ctx));
+        try sched.register("t", 0, testTask, @ptrCast(&ctx));
     }
 
     // One more should fail
     try std.testing.expectError(
         error.TaskLimitReached,
-        sched.register("overflow", 0, 1_000, testTask, @ptrCast(&ctx)),
+        sched.register("overflow", 0, testTask, @ptrCast(&ctx)),
     );
 }
 
@@ -364,7 +356,7 @@ test "TaskScheduler: resetStats" {
     var sched = TaskScheduler.init();
     var ctx = TestContext{};
 
-    try sched.register("stat_task", 0, 1_000_000, testTask, @ptrCast(&ctx));
+    try sched.register("stat_task", 0, testTask, @ptrCast(&ctx));
 
     _ = sched.tick(10_000_000);
     try std.testing.expect(sched.total_ticks > 0);
@@ -375,4 +367,30 @@ test "TaskScheduler: resetStats" {
     const task = sched.getTask("stat_task");
     try std.testing.expectEqual(@as(u64, 0), task.?.run_count);
     try std.testing.expectEqual(@as(u64, 0), task.?.items_processed);
+}
+
+test "TaskScheduler: a tick charges what tasks took, so a slow one holds the rest for the next tick" {
+    var sched = TaskScheduler.init();
+    var slow = TestContext{ .busy_ns = 3 * std.time.ns_per_ms };
+    var quick = TestContext{};
+    try sched.register("slow", 999_999, testTask, @ptrCast(&slow));
+    try sched.register("quick", 999_999, testTask, @ptrCast(&quick));
+
+    // The slow one takes more than the whole 2ms: the quick one waits.
+    try std.testing.expectEqual(@as(u32, 1), sched.tick(2_000_000));
+    try std.testing.expectEqual(@as(u32, 1), slow.invocations);
+    try std.testing.expectEqual(@as(u32, 0), quick.invocations);
+    try std.testing.expect(sched.getTask("slow").?.elapsed_ns >= 3 * std.time.ns_per_ms);
+
+    // Next tick: the slow one is not due, the quick one runs.
+    try std.testing.expectEqual(@as(u32, 1), sched.tick(2_000_000));
+    try std.testing.expectEqual(@as(u32, 1), quick.invocations);
+    try std.testing.expectEqual(@as(u32, 1), slow.invocations);
+}
+
+test "TaskScheduler: tasks that take little all run in one tick" {
+    var sched = TaskScheduler.init();
+    var ctxs: [4]TestContext = @splat(.{});
+    for (&ctxs) |*c| try sched.register("t", 999_999, testTask, @ptrCast(c));
+    try std.testing.expectEqual(@as(u32, 4), sched.tick(2_000_000));
 }
