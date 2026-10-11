@@ -612,8 +612,9 @@ pub fn generateDefaultConfig() []const u8 {
     \\enabled = true
     \\# Port for dashboard HTTP server (0 = auto: listen_port + 2)
     \\# port = 9002
-    \\# Bind address for dashboard server
-    \\# bind = "0.0.0.0"
+    \\# Bind address for the dashboard. Loopback by default: it authenticates
+    \\# no one yet. Set "0.0.0.0" only on a private network or behind a firewall.
+    \\# bind = "127.0.0.1"
     \\# Other origins whose pages may call the API, exact, comma-separated
     \\# cors_origins = "http://localhost:5173"
     \\# Host names the dashboard answers to besides localhost, 127.0.0.1 and

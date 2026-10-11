@@ -92,7 +92,8 @@ pub const RuntimeConfig = struct {
     dashboard_enabled: bool = true,
     /// Port for dashboard HTTP server (0 = derive from listen_port + 2)
     dashboard_port: u16 = 0,
-    dashboard_bind: []const u8 = "0.0.0.0",
+    /// Localhost unless asked: the dashboard authenticates no one yet.
+    dashboard_bind: []const u8 = "127.0.0.1",
     dashboard_cors_origins: ?[]const u8 = null,
     dashboard_hosts: ?[]const u8 = null,
 
@@ -1116,6 +1117,12 @@ fn seedUsability(bind: [4]u8, seed_ip: [4]u8, seed_port: u16, our_raft_port: u16
     if (seed_is_us and seed_port == our_raft_port) return .self;
     if (stdx.net.isLoopback(bind) and !stdx.net.isLoopback(seed_ip)) return .unreachable_from_loopback;
     return .usable;
+}
+
+test "runtime: the dashboard binds where the config file's default does, loopback" {
+    const dashboard_config = @import("../config/dashboard.zig");
+    try std.testing.expectEqualStrings("127.0.0.1", (RuntimeConfig{}).dashboard_bind);
+    try std.testing.expectEqualStrings((dashboard_config.DashboardConfig{}).bind, (RuntimeConfig{}).dashboard_bind);
 }
 
 test "seedUsability: our own listener and unreachable binds are caught" {
