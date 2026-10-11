@@ -68,7 +68,7 @@ pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
         break :blk true;
     } else |_| false;
 
-    var writer = SegmentWriter.init(allocator, 0, .none);
+    var writer = SegmentWriter.init(allocator, 0);
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
@@ -120,7 +120,7 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
 
-    var writer = SegmentWriter.init(allocator, 0, .none);
+    var writer = SegmentWriter.init(allocator, 0);
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
@@ -226,7 +226,7 @@ fn writeLog(dir: []const u8, entries: []const Entry, commit: u64) !void {
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
     try stdx.fs.makePath(segs);
-    var w = SegmentWriter.init(testing.allocator, 0, .none);
+    var w = SegmentWriter.init(testing.allocator, 0);
     defer w.deinit();
     for (entries) |*e| try w.addEntry(e);
     w.commit_index_at_seal = commit;

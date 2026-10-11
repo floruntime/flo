@@ -69,7 +69,7 @@ fn writeKVSegment(
     start_index: u64,
     count: u64,
 ) !void {
-    var writer = SegmentWriter.init(allocator, 0, .none);
+    var writer = SegmentWriter.init(allocator, 0);
     defer writer.deinit();
     var i: u64 = start_index;
     while (i < start_index + count) : (i += 1) {
@@ -101,7 +101,7 @@ fn writeStreamSegment(
     start_index: u64,
     count: u64,
 ) !void {
-    var writer = SegmentWriter.init(allocator, 0, .none);
+    var writer = SegmentWriter.init(allocator, 0);
     defer writer.deinit();
     var i: u64 = start_index;
     while (i < start_index + count) : (i += 1) {
@@ -350,7 +350,7 @@ test "integration: cold tier — KV MVCC version lookup from cold" {
 
     // Write KV entries: same key "user:42" written 10 times (MVCC versions)
     {
-        var writer = SegmentWriter.init(allocator, 0, .none);
+        var writer = SegmentWriter.init(allocator, 0);
         defer writer.deinit();
         var i: u64 = 1;
         while (i <= 10) : (i += 1) {
@@ -456,7 +456,7 @@ test "integration: cold tier — normal recovery does NOT touch cold" {
         });
         defer mgr.deinit();
 
-        var writer = SegmentWriter.init(allocator, 0, .none);
+        var writer = SegmentWriter.init(allocator, 0);
         defer writer.deinit();
         var i: u64 = 1;
         while (i <= 10) : (i += 1) {
@@ -511,7 +511,7 @@ test "integration: cold tier — idempotent archival (re-scan does not duplicate
 
     // Write one segment
     {
-        var writer = SegmentWriter.init(allocator, 0, .none);
+        var writer = SegmentWriter.init(allocator, 0);
         defer writer.deinit();
         var i: u64 = 1;
         while (i <= 5) : (i += 1) {
@@ -571,7 +571,7 @@ test "integration: cold tier — manifest persists across restarts" {
         defer mgr.deinit();
 
         // Create and archive a test segment
-        var writer = SegmentWriter.init(allocator, 0, .none);
+        var writer = SegmentWriter.init(allocator, 0);
         defer writer.deinit();
         var i: u64 = 100;
         while (i <= 110) : (i += 1) {

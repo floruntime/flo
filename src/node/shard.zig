@@ -266,9 +266,6 @@ pub const Shard = struct {
     /// Raft consensus node — every shard has one. Writes go through
     /// propose() → commit → apply to projections.
     raft_node: *RaftNode,
-    /// How this shard's group came up: alone, as the first member, or
-    /// joining members that exist.
-    cluster_role: ClusterRole,
     /// Scratch for one AppendEntries in either direction: the entries of a
     /// batch, the payload bytes they point into, and the frame payload.
     rpc_entries: []entry_mod.Entry,
@@ -554,7 +551,7 @@ pub const Shard = struct {
         // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);
         errdefer allocator.destroy(seg_writer);
-        seg_writer.* = SegmentWriter.init(allocator, @as(u32, shard_id), .none);
+        seg_writer.* = SegmentWriter.init(allocator, @as(u32, shard_id));
         errdefer seg_writer.deinit();
 
         // Create Raft consensus node, identified by this node's cluster id
@@ -842,7 +839,6 @@ pub const Shard = struct {
             .workflow_handler = workflow_handler,
             .processing_handler = processing_handler,
             .raft_node = raft_node,
-            .cluster_role = cluster_role,
             .rpc_entries = rpc_entries,
             .rpc_arena = rpc_arena,
             .rpc_out = rpc_out,
@@ -7862,7 +7858,7 @@ test "Shard: a data directory that belonged to a group refuses to run alone, and
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
     defer std.testing.allocator.free(segs);
     try @import("stdx").fs.makePath(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -7914,7 +7910,7 @@ test "Shard: a member with no log starts guarded, durably, and one with hard sta
     // Restarted part way through catching up: a log, and still guarded.
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/segs", .{shard_dir});
     defer std.testing.allocator.free(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -7941,7 +7937,7 @@ test "Shard: a member that kept its log but lost its hard state confirms the ter
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/segs", .{shard_dir});
     defer std.testing.allocator.free(segs);
     try @import("stdx").fs.makePath(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -7973,7 +7969,7 @@ test "Shard: --join with a log but no config entry and no hard state is guarded 
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
     defer std.testing.allocator.free(segs);
     try @import("stdx").fs.makePath(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 2, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -9108,7 +9104,7 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
     defer std.testing.allocator.free(segs);
     try @import("stdx").fs.makePath(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -9190,7 +9186,7 @@ test "a committed entry the durable log cannot serve fails the drain instead of 
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
     defer std.testing.allocator.free(segs);
     try @import("stdx").fs.makePath(segs);
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
@@ -9226,7 +9222,7 @@ test "a truncation the previous run recorded is finished before replay" {
     try @import("stdx").fs.makePath(segs);
     // Indices 1-3 in one file, 4 in another, and a cut after 2 that never
     // reached either file.
-    var w = SegmentWriter.init(std.testing.allocator, 0, .none);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
     defer w.deinit();
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();

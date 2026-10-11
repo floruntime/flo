@@ -75,7 +75,6 @@ pub const Partition = struct {
 
     /// Lifecycle.
     allocator: Allocator,
-    ual_capacity: usize,
 
     pub const DEFAULT_UAL_CAPACITY: usize = 64 * 1024 * 1024; // 64 MB
     pub const DEFAULT_GROUP_OFFSET: u32 = 1000;
@@ -109,7 +108,6 @@ pub const Partition = struct {
             .cold_tier = null,
             .memory_controller = null,
             .allocator = allocator,
-            .ual_capacity = ual_capacity,
         };
 
         // NOTE: Do NOT register projections here — the struct will move
