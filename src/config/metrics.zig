@@ -10,9 +10,8 @@ pub const MetricsConfig = struct {
     port: u16 = 0,
     /// Bind address for the metrics server.
     ///
-    /// Defaults to loopback: /metrics and /health are unauthenticated (unlike
-    /// the dashboard, which is API-key gated), so the scrape endpoint is not
-    /// exposed off-box unless an operator opts in. Set "0.0.0.0" to allow
-    /// remote scraping.
+    /// Defaults to loopback: /metrics and /health are unauthenticated, as the
+    /// dashboard is, so the scrape endpoint is not exposed off-box unless an
+    /// operator opts in. Set "0.0.0.0" to allow remote scraping.
     bind: []const u8 = "127.0.0.1",
 };
