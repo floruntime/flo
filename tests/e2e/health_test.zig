@@ -8,6 +8,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const kv_ops = @import("src").protocol.kv_ops;
 const proto = @import("src").protocol.proto;
 
 fn expectAnswer(http: anytype, path: []const u8, status: u16, body: []const u8) !void {
@@ -130,10 +131,12 @@ fn putMany(port: u16, count: usize, batch: usize) !void {
     while (next < count) {
         const n = @min(batch, count - next);
         var used: usize = 0;
+        var body_buf: [16]u8 = undefined;
+        const body = try kv_ops.plainSetBody(&body_buf, "v");
         for (0..n) |i| {
             var key_buf: [24]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "replay-{d}", .{next + i});
-            const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_put, next + i + 1), .namespace = "", .key = key, .value = "v", .options = "" };
+            const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_put, next + i + 1), .namespace = "", .key = key, .value = body, .options = "" };
             used += (try req.serialize(out[used..])).len;
         }
         var sent: usize = 0;

@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const kv_ops = @import("src").protocol.kv_ops;
 const proto = @import("src").protocol.proto;
 
 const Reply = struct { status: u8, data: []const u8 };
@@ -35,8 +36,10 @@ fn rawCall(ctx: *stdx.testing.TestContext, op: proto.OpCode, namespace: []const 
 
 fn alive(ctx: *stdx.testing.TestContext) !void {
     var out: [512]u8 = undefined;
-    _ = try rawCall(ctx, .kv_put, "", "alive", "yes", &out);
-    const r = try rawCall(ctx, .kv_get, "", "alive", "", &out);
+    var set_buf: [32]u8 = undefined;
+    var get_buf: [16]u8 = undefined;
+    _ = try rawCall(ctx, .kv_put, "", "alive", try kv_ops.plainSetBody(&set_buf, "yes"), &out);
+    const r = try rawCall(ctx, .kv_get, "", "alive", try kv_ops.plainGetBody(&get_buf), &out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.status);
     try testing.expect(std.mem.endsWith(u8, r.data, "yes"));
 }

@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const kv_ops = @import("src").protocol.kv_ops;
 const proto = @import("src").protocol.proto;
 
 const Reply = struct { status: u8, data: []const u8 };
@@ -32,16 +33,18 @@ fn header(op: proto.OpCode) proto.RequestHeader {
 
 fn request(op: proto.OpCode, namespace: []const u8, key: []const u8, value: []const u8) ![]u8 {
     const req: proto.Request = .{ .header = header(op), .namespace = namespace, .key = key, .value = value, .options = "" };
-    const buf = try testing.allocator.alloc(u8, @sizeOf(proto.RequestHeader) + 10 + namespace.len + key.len + value.len);
+    const buf = try testing.allocator.alloc(u8, req.wireSize());
     errdefer testing.allocator.free(buf);
     _ = try req.serialize(buf);
     return buf;
 }
 
 fn kvAlive(ctx: *stdx.testing.TestContext) !bool {
-    const put = try request(.kv_put, "", "alive", "yes");
+    var set_buf: [32]u8 = undefined;
+    var get_buf: [16]u8 = undefined;
+    const put = try request(.kv_put, "", "alive", try kv_ops.plainSetBody(&set_buf, "yes"));
     defer testing.allocator.free(put);
-    const get = try request(.kv_get, "", "alive", "");
+    const get = try request(.kv_get, "", "alive", try kv_ops.plainGetBody(&get_buf));
     defer testing.allocator.free(get);
     var out: [4096]u8 = undefined;
     if ((try send(ctx, put, &out)).status != @intFromEnum(proto.StatusCode.ok)) return false;
@@ -88,9 +91,10 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
     defer ctx.deinit();
 
     // [ns_len=0][key_len=2]"kN"[value_len=0], and no options_len; 16 keys so
-    // some route to another of the 4 shards.
+    // some route to another of the 4 shards. kv_exists is coded by hand, so
+    // its frame has the trailer to leave out.
     for (0..16) |i| {
-        var h = header(.kv_get);
+        var h = header(.kv_exists);
         const payload = [_]u8{ 0, 0, 2, 0, 'k', 'a' + @as(u8, @intCast(i)), 0, 0, 0, 0 };
         h.payload_length = payload.len;
         h.crc32 = h.computeCRC32(&payload);
@@ -98,7 +102,7 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
         @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&h));
         @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
         var out: [4096]u8 = undefined;
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.not_found), (try send(ctx, &frame, &out)).status);
+        try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), (try send(ctx, &frame, &out)).status);
     }
     try testing.expect(try kvAlive(ctx));
 }

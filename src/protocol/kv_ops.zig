@@ -89,6 +89,17 @@ pub const MgetEntry = Record(&.{
     .{ .name = "value", .T = Bytes(MAX_VALUE) },
 });
 
+/// A kv.set body carrying only `value`: every other field absent or its
+/// default.
+pub fn plainSetBody(buf: []u8, value: []const u8) schema.EncodeError![]const u8 {
+    return op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+}
+
+/// A kv.get body that doesn't wait, route or join a transaction.
+pub fn plainGetBody(buf: []u8) schema.EncodeError![]const u8 {
+    return op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null });
+}
+
 /// The op in `table` named `name`; a name not there fails the build.
 pub fn op(comptime name: []const u8) ops.Op {
     for (table) |o| if (std.mem.eql(u8, o.name, name)) return o;

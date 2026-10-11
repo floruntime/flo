@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 const proto = @import("src").protocol.proto;
+const kv_ops = @import("src").protocol.kv_ops;
 
 const Reply = struct { status: u8, data: []const u8 };
 
@@ -41,11 +42,12 @@ fn expectRefused(r: Reply, why: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, r.data, why) != null);
 }
 
-/// The stored value from a raw kv_get answer: [version:u64][value].
+/// The stored value from a raw kv.get answer: [version:u64][value_len:u32][value].
 fn kvValue(ctx: *stdx.testing.TestContext, key: []const u8, out: []u8) ![]const u8 {
-    const r = try rawCall(ctx, .kv_get, key, "", "", out);
+    var body: [16]u8 = undefined;
+    const r = try rawCall(ctx, .kv_get, key, try kv_ops.plainGetBody(&body), "", out);
     try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.status);
-    return r.data[8..];
+    return r.data[12..];
 }
 
 /// The point or series count leading a ts read or query answer.
@@ -63,7 +65,10 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
     var out: [4096]u8 = undefined;
     var obuf: [32]u8 = undefined;
     const huge = try option(&obuf, .ttl_ms, u64, std.math.maxInt(u64));
-    try expectRefused(try rawCall(ctx, .kv_put, "k", "v2", huge, &out), "ttl too large");
+    // kv.set's body: "v2", then ttl_ms present and past its bound, condition
+    // always, no cas, routing key or txn.
+    const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ [_]u8{0xff} ** 8 ++ [_]u8{ 1, 0, 0, 0, 0 };
+    try expectRefused(try rawCall(ctx, .kv_put, "k", &set_body, "", &out), "kv.set: ttl_ms is out of range");
     var ttl: [8]u8 = undefined;
     std.mem.writeInt(u64, &ttl, std.math.maxInt(u64), .little);
     try expectRefused(try rawCall(ctx, .kv_touch, "k", &ttl, "", &out), "ttl too large");
@@ -82,26 +87,12 @@ test "e2e/time: a TTL option that isn't 8 bytes is refused, and the key keeps it
     try ctx.exec(&.{ "kv", "set", "doc", "{\"a\":1}" });
 
     var out: [4096]u8 = undefined;
-    // [tag][len][u32 ms]: read as no TTL, the key would never expire.
+    // [tag][len][u32 ms]: read as no TTL, the key would never expire. (A
+    // kv.set's ttl_ms is a fixed u64 field, so only the hand-coded ops take
+    // the option.)
     const short = [_]u8{ @intFromEnum(proto.OptionTag.ttl_ms), 4, 0xe8, 0x03, 0, 0 };
-    try expectRefused(try rawCall(ctx, .kv_put, "k", "v2", &short, &out), "ttl_ms must be 8 bytes");
     const set = [_]u8{ 3, 0 } ++ "$.a".* ++ "2".*;
     try expectRefused(try rawCall(ctx, .kv_json_set, "doc", &set, &short, &out), "ttl_ms must be 8 bytes");
-
-    // A put inside a transaction is buffered, not proposed: it is checked
-    // before the buffer, and the commit writes nothing.
-    const begin = try rawCall(ctx, .kv_begin_txn, "k", "", "", &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), begin.status);
-    const txn_id = std.mem.readInt(u64, begin.data[1..9], .little);
-    var tbuf: [32]u8 = undefined;
-    var tb = proto.OptionsBuilder.init(&tbuf);
-    try tb.addU64(.txn_id, txn_id);
-    var in_txn: [64]u8 = undefined;
-    @memcpy(in_txn[0..short.len], &short);
-    @memcpy(in_txn[short.len..][0..tb.getOptions().len], tb.getOptions());
-    try expectRefused(try rawCall(ctx, .kv_put, "k", "v3", in_txn[0 .. short.len + tb.getOptions().len], &out), "ttl_ms must be 8 bytes");
-    const commit = try rawCall(ctx, .kv_commit_txn, "k", "", tb.getOptions(), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), commit.status);
 
     try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
     try testing.expectEqualStrings("{\"a\":1}", try kvValue(ctx, "doc", &out));
