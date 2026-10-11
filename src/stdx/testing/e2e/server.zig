@@ -25,21 +25,70 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 /// Server process manager for e2e tests
-/// Servers this checkout's binary left running: those of an earlier run
-/// that crashed, or of a test the runner killed at its time limit. The runner
-/// kills only the test process, and each server leads its own process group,
-/// so it outlives the test as an orphan. Cleared once per test process, at
-/// its first server start, before anything this process starts is running;
-/// the runner restarts the process after a timeout, so the next test clears
-/// the previous one's. Only servers of this checkout's own binary: a pattern
-/// any flo matches would kill other checkouts' runs and hand-started servers.
-var orphans_cleared: std.atomic.Value(bool) = .init(false);
+/// One e2e run per checkout. Each run kills the checkout's leftover servers
+/// (below), so a second run alongside the first would kill its live ones.
+/// The second is refused instead. The lock is an flock the OS drops when the
+/// holder exits, however it exits, so a crashed run leaves none behind.
+pub const RUN_LOCK_NAME = ".zig-cache/e2e-run.lock";
 
-fn clearOrphanedServers() void {
-    if (orphans_cleared.swap(true, .acq_rel)) return;
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
-    const binary = findFloBinary(std.heap.page_allocator) catch return;
+pub fn takeRunLock(checkout: []const u8) !stdx.fs.File {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ checkout, RUN_LOCK_NAME });
+    return stdx.fs.createFile(path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => return error.E2eRunInProgress,
+        else => return err,
+    };
+}
+
+/// The checkout a flo binary was built in: `<checkout>/zig-out/bin/flo`.
+pub fn checkoutOf(binary: []const u8) ?[]const u8 {
+    const bin = std.fs.path.dirname(binary) orelse return null;
+    const out = std.fs.path.dirname(bin) orelse return null;
+    return std.fs.path.dirname(out);
+}
+
+/// Claimed once per test process, at its first server start, before
+/// anything this process starts is running: take the checkout's run lock,
+/// then kill the servers its binary left running, those of an earlier run
+/// that crashed or of a test the runner killed at its time limit. The runner
+/// kills only the test process, and each server leads its own process group,
+/// so it outlives the test as an orphan; the runner restarts the process
+/// after a timeout, so the next test clears the previous one's. Only servers
+/// of this checkout's own binary: a pattern any flo matches would kill other
+/// checkouts' runs and hand-started servers.
+const Claim = enum { pending, held, refused };
+var claim: Claim = .pending;
+var claim_mutex: stdx.Mutex = .{};
+var run_lock: ?stdx.fs.File = null;
+
+fn claimCheckout() !void {
+    claim_mutex.lock();
+    defer claim_mutex.unlock();
+    switch (claim) {
+        .held => return,
+        .refused => return error.E2eRunInProgress,
+        .pending => {},
+    }
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
+        claim = .held;
+        return;
+    }
+    const binary = findFloBinary(std.heap.page_allocator) catch {
+        claim = .held;
+        return;
+    };
     defer std.heap.page_allocator.free(binary);
+    if (checkoutOf(binary)) |checkout| {
+        run_lock = takeRunLock(checkout) catch |err| {
+            if (err == error.E2eRunInProgress) {
+                claim = .refused;
+                std.debug.print("another e2e run holds {s}; wait for it or stop it\n", .{checkout});
+            }
+            return err;
+        };
+    }
+    claim = .held;
+
     // pkill -f takes an extended regex: escape the path so it matches only itself.
     var pattern: std.ArrayListUnmanaged(u8) = .empty;
     defer pattern.deinit(std.heap.page_allocator);
@@ -262,7 +311,7 @@ pub const ServerProcess = struct {
     pub fn startWithTimeout(self: *Self, timeout_ms: u64) !void {
         if (self.started) return error.AlreadyStarted;
 
-        clearOrphanedServers();
+        try claimCheckout();
 
         // Find free port for main server
         self.port = try findFreePort();

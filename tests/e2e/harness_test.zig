@@ -110,3 +110,16 @@ fn processGone(pid: std.c.pid_t) bool {
     if (close + 2 >= stat.len) return false;
     return stat[close + 2] == 'Z' or stat[close + 2] == 'X';
 }
+
+test "harness: a second e2e run in the same checkout is refused" {
+    // This process holds the checkout's run lock from its first server start.
+    var server = try stdx.testing.ServerProcess.init(testing.allocator);
+    defer server.deinit();
+    try server.start();
+    server.stop();
+
+    // An flock belongs to an open file, not a process, so a second open here
+    // stands in for another run of the same checkout.
+    const checkout = stdx.testing.checkoutOf(server.flo_binary).?;
+    try testing.expectError(error.E2eRunInProgress, stdx.testing.takeRunLock(checkout));
+}
