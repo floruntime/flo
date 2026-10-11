@@ -124,15 +124,16 @@ test "e2e/scoping: a transaction is committed or rolled back only from its own n
     const begun = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "k", "-n", "a" });
     const tid = after(begun, "txn_id=") orelse return error.NoTxnId;
     for ([_][]const u8{ "commit", "rollback" }) |verb| {
-        var r = try ctx.cli.run(&.{ "kv", verb, tid, "--routing-key", "k", "-n", "b" });
+        var r = try ctx.cli.run(&.{ "kv", verb, tid, "-n", "b" });
         defer r.deinit();
         try stdx.testing.assertContains(r, "transaction not found");
     }
     // A write in it from elsewhere learns no more: not found.
     var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "--routing-key", "k", "--txn", tid, "-n", "b" });
     defer put.deinit();
-    try stdx.testing.assertContains(put, "transaction not found");
-    var own = try ctx.cli.run(&.{ "kv", "rollback", tid, "--routing-key", "k", "-n", "a" });
+    try testing.expectEqual(@as(u8, 1), put.exit_code);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, put.stderr, "\n"), "[not_found/no_such_transaction]"));
+    var own = try ctx.cli.run(&.{ "kv", "rollback", tid, "-n", "a" });
     defer own.deinit();
     try stdx.testing.assertStdoutContains(own, "OK");
 }

@@ -44,6 +44,10 @@ const ReplyPool = reply_pool_mod.ReplyPool;
 const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
 const run_mod = @import("run.zig");
+const table_run = @import("table_run.zig");
+const table = @import("../protocol/table.zig");
+const schema = @import("../protocol/schema.zig");
+const kv_ops = @import("../protocol/kv_ops.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const HandlerFn = @import("dispatcher.zig").HandlerFn;
 const Connection = @import("connection.zig").Connection;
@@ -501,6 +505,7 @@ pub const Shard = struct {
         const kv_handler = try allocator.create(KVHandler);
         errdefer allocator.destroy(kv_handler);
         kv_handler.* = KVHandler.init(allocator, &partition.kv);
+        kv_handler.txn_table.shard_id = @intCast(shard_id);
         errdefer kv_handler.deinit();
 
         const stream_handler = try allocator.create(StreamHandler);
@@ -1278,12 +1283,10 @@ pub const Shard = struct {
 
         // A wait longer than the server keeps a waiter is refused here, once
         // for every kind, not shortened where it is registered.
-        inline for (.{ proto.OptionTag.block_ms, proto.OptionTag.wait_ms }) |tag| {
-            if (req.findOption(tag)) |opt| {
-                if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
-                    self.sendRefusal(conn, req.header.request_id, .bad_request, .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a blocking wait (block_ms/wait_ms, --block/--wait) is at most 300000 ms (5 minutes)" });
-                    return;
-                }
+        if (req.findOption(.block_ms)) |opt| {
+            if ((opt.asU32() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) {
+                self.sendRefusal(conn, req.header.request_id, .bad_request, .{ .reason = .out_of_range, .ran = .no, .message = "bad request: a blocking wait (block_ms, --block) is at most 300000 ms (5 minutes)" });
+                return;
             }
         }
 
@@ -1302,7 +1305,7 @@ pub const Shard = struct {
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
                 answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
-            else if (dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)))
+            else if (requestWrites(req))
                 self.dispatchLocal(conn, req, auth)
             else
                 self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes are forwarded to a leader")),
@@ -1380,12 +1383,20 @@ pub const Shard = struct {
         };
     }
 
+    /// Whether `req` goes to the leader: a write, or a table op inside a
+    /// transaction.
+    fn requestWrites(req: proto.Request) bool {
+        if (table.isOp(req.header.op_code)) return table_run.writes(req);
+        return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code));
+    }
+
     /// How long a read may wait on purpose for its data, or null for any
     /// other request. Such a read holds a slot of its own class, and is not
     /// a slow answer while it waits. A worker's await waits 30 s unless
     /// told otherwise (`ActionsHandler`).
     fn blockingWait(req: proto.Request) ?u64 {
-        if (req.getBlockMs() orelse req.getWaitMs()) |ms| return ms;
+        if (table.isOp(req.header.op_code)) return table_run.waitMs(req);
+        if (req.getBlockMs()) |ms| return ms;
         if (req.header.op_code != @intFromEnum(proto.OpCode.action_await)) return null;
         const opt = req.findOption(.block_ms) orelse return 30_000;
         const ms = opt.asU32() orelse 30_000;
@@ -1420,7 +1431,10 @@ pub const Shard = struct {
     /// waiting request is left unread: nothing about it has run or been
     /// counted.
     fn holdForward(self: *Shard, conn: *Connection, req: proto.Request) ?Connection.Waiting {
-        if ((req.getBlockMs() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS or (req.getWaitMs() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) return null;
+        // A body that doesn't decode is refused when it runs; it waits for
+        // nothing first.
+        if (table.isOp(req.header.op_code) and !table_run.decodes(req)) return null;
+        if ((req.getBlockMs() orelse 0) > waiter_pool_mod.MAX_BLOCK_MS) return null;
         const to: ForwardTo = self.forwardTarget(req) orelse if (blockingWait(req) != null) .{ .target = @intCast(self.id), .blocking = true } else return null;
         var why = self.stillWaits(conn, to, null);
         // Behind connections already waiting for this target, unless this
@@ -1481,7 +1495,7 @@ pub const Shard = struct {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.offlineMessage(&buf)));
             return;
         }
-        if (self.raft_network != null and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code)) and (self.diverged or self.raft_node.role != .leader)) {
+        if (self.raft_network != null and requestWrites(req) and (self.diverged or self.raft_node.role != .leader)) {
             if (self.diverged) {
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(DIVERGED_MESSAGE));
                 return;
@@ -1520,6 +1534,13 @@ pub const Shard = struct {
     /// side effects.
     fn resolveTarget(self: *Shard, op: u16, req: proto.Request) node_router.RouteTarget {
         if (op >= proto.MAX_OPCODES) return .{ .local = .{ .partition_id = 0 } };
+        if (self.dispatcher.shard_route[op]) |f| if (f(req)) |shard_id| {
+            // A shard that doesn't exist holds no transaction: the request
+            // runs here and is refused as one.
+            const shards = if (self.peer_shards) |p| p.len else 1;
+            if (shard_id == self.id or shard_id >= shards) return .{ .local = .{ .partition_id = 0 } };
+            return .{ .shard = .{ .partition_id = 0, .shard_id = shard_id } };
+        };
         const hash = if (self.dispatcher.pre_route[op]) |f| f(req) orelse return .{ .local = .{ .partition_id = 0 } } else return .{ .local = .{ .partition_id = 0 } };
         return self.router.route(hash);
     }
@@ -1530,7 +1551,7 @@ pub const Shard = struct {
     fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
         // Sized from the parts, not header.payload_length: a client may omit
         // the options trailer, which serialize always writes.
-        const size = @sizeOf(proto.RequestHeader) + 2 + req.namespace.len + 2 + req.key.len + 4 + req.value.len + 2 + req.options.len;
+        const size = req.wireSize();
         const buf = try allocator.alloc(u8, size);
         errdefer allocator.free(buf);
         _ = try req.serialize(buf);
@@ -1577,7 +1598,7 @@ pub const Shard = struct {
         const blocking = block != null;
         const op = req.header.op_code;
         const claims = takesItems(op);
-        const writes = claims or (op < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(op)));
+        const writes = claims or requestWrites(req);
         // An answer carrying what its request took is not dropped for a
         // deadline: it would reach no one until its lease ran out. Such a
         // request waits for it as long as the slot is held.
@@ -5015,7 +5036,8 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             if (shard.defaultPartition().kv.get(waiter.key())) |entry| {
                 sendKVWaiterValue(shard, waiter, entry.value, entry.version);
             } else {
-                shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .not_found, "");
+                const r = KVHandler.refusal(error.NotFound);
+                shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, r.status, r.refusal);
             }
         },
         .queue_dequeue => {
@@ -5041,14 +5063,13 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     return true;
 }
 
+/// Answers a waiting `kv.get`.
 fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
-    var resp = proto.Response.ok(waiter.request_id, value);
-    resp.prefix = version;
-    const MAX_BUF = @sizeOf(proto.ResponseHeader) + 8 + (256 * 1024);
-    var buf: [MAX_BUF]u8 = undefined;
-    if (resp.serialize(&buf)) |serialized| {
-        shard.deliverDeferred(waiter.reply_to, serialized);
-    } else |_| {
+    const Response = table_run.op("kv.get").response;
+    var buf: [@sizeOf(proto.ResponseHeader) + Response.max_size]u8 = undefined;
+    if (table_run.encodeAnswer(Response, &buf, waiter.request_id, .{ .version = version, .value = value })) |bytes| {
+        shard.deliverDeferred(waiter.reply_to, bytes);
+    } else {
         // The waiter is gone once this returns; an asker left without an
         // answer would hang until its own timeout.
         shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .internal_error, "internal error: value too large to send");
@@ -5811,7 +5832,7 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     const conn = try shard.addConnection(pair[0]);
 
     const header = proto.RequestHeader.init(.kv_put, 5);
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     // Held for the leader, not answered.
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expect(conn.response_deferred);
@@ -5935,17 +5956,17 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     const value = try std.testing.allocator.alloc(u8, 200 * 1024);
     defer std.testing.allocator.free(value);
     for (value, 0..) |*b, i| b.* = @truncate(i *% 7);
-    var header = proto.RequestHeader.init(.kv_put, 1);
-    const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = value });
+    const set_body = try std.testing.allocator.alloc(u8, table_run.op("kv.set").request.max_size);
+    defer std.testing.allocator.free(set_body);
+    const body = try table_run.op("kv.set").request.encodeInto(set_body, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "big", .value = body });
     defer std.testing.allocator.free(put);
     shard.runRequest(conn, try proto.Request.parse(put), .client);
     _ = shard.applyCommitted();
     var drain_buf: [4096]u8 = undefined;
     _ = try readAnswer(pair[1], &shard, conn.fd, &drain_buf, 1);
 
-    header.op_code = @intFromEnum(proto.OpCode.kv_get);
-    header.request_id = 2;
-    const get = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "big", .value = "" });
+    const get = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_get, 2, "", "big", "", ""));
     shard.runForwardedRequest(.{ .tag = .forward_request, .src_shard = 0, .payload_len = @intCast(get.len), .sequence = seq, .payload_ptr = get.ptr });
     const big_out = try std.testing.allocator.alloc(u8, 300 * 1024);
     defer std.testing.allocator.free(big_out);
@@ -6011,11 +6032,9 @@ test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minut
     const cases = [_]Case{
         .{ .op = .queue_dequeue, .tag = .block_ms, .ms = 0, .key = "q", .value = "", .status = .ok, .waits = false },
         .{ .op = .kv_get, .tag = .block_ms, .ms = 0, .key = "missing", .value = "", .status = .not_found, .waits = false },
-        .{ .op = .kv_get, .tag = .wait_ms, .ms = 0, .key = "missing", .value = "", .status = .not_found, .waits = false },
         .{ .op = .action_await, .tag = .block_ms, .ms = 0, .key = "", .value = &await_value, .status = .ok, .waits = false },
         .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS, .key = "missing", .value = "", .status = .ok, .waits = true },
         .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS + 1, .key = "missing", .value = "", .status = .bad_request, .waits = false },
-        .{ .op = .kv_get, .tag = .wait_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS + 1, .key = "missing", .value = "", .status = .bad_request, .waits = false },
     };
     for (cases, 0..) |case, i| {
         var opt_buf: [16]u8 = undefined;
@@ -6081,8 +6100,41 @@ fn testRequest(op: proto.OpCode, request_id: u64, key: []const u8, value: []cons
 }
 
 fn testRequestWith(op: proto.OpCode, request_id: u64, key: []const u8, value: []const u8, options: []const u8) ![]u8 {
-    const header = proto.RequestHeader.init(op, request_id);
-    return Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = key, .value = value, .options = options });
+    return Shard.serializeRequest(std.testing.allocator, testReq(op, request_id, "", key, value, options));
+}
+
+/// Bodies for test requests: a ring, so the few built together stay valid.
+var test_bodies: [8][160 * 1024]u8 = undefined;
+var test_body_next: usize = 0;
+
+/// A request as a client sends it. For a table op, `value` and `options`
+/// become its body: kv.set's value, and kv.get's `block_ms` as a wait for
+/// the key to exist, written by hand so a wait past its bound reaches the
+/// server.
+fn testReq(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) proto.Request {
+    const header = proto.RequestHeader.init(op, id);
+    if (!table.isOp(@intFromEnum(op))) return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
+    const buf = &test_bodies[test_body_next % test_bodies.len];
+    test_body_next += 1;
+    return .{ .header = header, .namespace = ns, .key = key, .value = testBody(buf, op, value, options) };
+}
+
+fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8) []const u8 {
+    switch (op) {
+        .kv_put => return table_run.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }) catch unreachable,
+        .kv_get => {
+            const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
+            var w: schema.Writer = .{ .buf = buf };
+            if (if (opts.findOption(.block_ms)) |o| o.asU32() else null) |ms| {
+                w.put(&.{1}) catch unreachable;
+                w.int(u64, ms) catch unreachable;
+                w.put(&.{ 1, @intFromEnum(kv_ops.WaitFor.exists) }) catch unreachable;
+            } else w.put(&.{ 0, 0 }) catch unreachable;
+            w.put(&.{ 0, 0 }) catch unreachable; // no routing key, no txn
+            return w.written();
+        },
+        else => unreachable,
+    }
 }
 
 test "Shard: a forward's copy of a request keeps the client's table hash, and a foreign one doesn't parse" {
@@ -6149,7 +6201,8 @@ test "Shard: a client that sends without reading is paced: its requests wait unt
     try std.testing.expectEqual(gets[1].len + gets[2].len, c.conn.read_buf.readable());
 
     // Read on the client side: each drained answer lets the next request run.
-    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + value.len;
+    // kv.get answers [version:u64][value_len:u32][value].
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len;
     const out = try std.testing.allocator.alloc(u8, 3 * answer_len);
     defer std.testing.allocator.free(out);
     var got: usize = 0;
@@ -6219,7 +6272,8 @@ test "Shard: a client that sends its whole pipeline before reading is unpaced on
     try std.testing.expect(!c.conn.reads_paused);
     try std.testing.expect(c.conn.write_buf.readable() > Shard.PAUSE_READS_AT);
 
-    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + value.len;
+    // kv.get answers [version:u64][value_len:u32][value].
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len;
     const out = try std.testing.allocator.alloc(u8, count * answer_len);
     defer std.testing.allocator.free(out);
     var got: usize = 0;
@@ -7088,10 +7142,11 @@ test "Shard: a closing client's blocking read already answered is not cancelled,
     var out: [256]u8 = undefined;
     const answer = try nextAnswer(d, a, &out);
     try std.testing.expectEqual(@as(u64, 831), answer.header.request_id);
-    // A woken get answers the key's version, then its value.
-    try std.testing.expectEqual(@as(usize, 9), answer.data.len);
-    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, answer.data[0..8], .little));
-    try std.testing.expectEqualStrings("w", answer.data[8..]);
+    // A woken get answers the key's version and its value.
+    var diag: schema.Diagnostic = .{};
+    const got = try table_run.op("kv.get").response.decodeAll(answer.data, &diag);
+    try std.testing.expectEqual(@as(u64, 1), got.version);
+    try std.testing.expectEqualStrings("w", got.value);
 }
 
 test "Shard: a closing client's cancel that finds no room in the target's inbox is sent once there is" {
@@ -7684,7 +7739,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     }
     // A well-formed write behind three bytes of fields.
     const header = proto.RequestHeader.init(.kv_put, 9);
-    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = header, .namespace = "", .key = "k", .value = "v" });
+    const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, header.request_id, "", "k", "v", ""));
     defer std.testing.allocator.free(wire);
     const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + 3 + wire.len);
     defer std.testing.allocator.free(frame);
@@ -7727,7 +7782,7 @@ test "Shard: a diverged node refuses writes even if it led" {
     var header = proto.RequestHeader.init(.kv_put, 5);
     header.payload_length = 2 + 2 + 1 + 4 + 1 + 2;
     shard.raft_node.role = .leader;
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     var out: [512]u8 = undefined;
     const n = conn.write_buf.read(&out);
     const resp = try proto.Response.parse(out[0..n]);
@@ -7751,7 +7806,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
     var header = proto.RequestHeader.init(.kv_put, 5);
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     // Ids sit outside the fd range: a client closing on the leader can
     // never match one in its waiter pool.
@@ -7774,7 +7829,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // Sent to a leader: it waits past any deadline for that leader's
     // answer, until the term moves on. (No network here, so the link is
     // not consulted.)
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_ms = now;
@@ -7795,7 +7850,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Sent over a link that then went down, with the term unchanged: the
     // answer will never come either.
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.sweepForwards(now);
@@ -7808,7 +7863,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // so the answer is not coming over it either.
     rn.linked_ids[0].store(2, .release);
     rn.linked_sessions[0].store(5, .release);
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_session = 4;
@@ -7821,7 +7876,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
 
     // Same link, same leader, same term, and no answer: waited on until
     // the backstop, then answered.
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     shard.forwards[0].sent_to = 2;
     shard.forwards[0].sent_term = raft.current_term;
     shard.forwards[0].sent_session = 5;
@@ -7842,7 +7897,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     // runs here as the client's own request.
     raft.leader_id = 0;
     header.request_id = 6;
-    shard.runRequest(conn, .{ .header = header, .namespace = "", .key = "k", .value = "v" }, .client);
+    shard.runRequest(conn, testReq(.kv_put, header.request_id, "", "k", "v", ""), .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     raft.role = .leader;
     raft.leader_id = 8;
@@ -8014,8 +8069,7 @@ const ParkTest = struct {
     }
 
     fn request(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) !proto.Request {
-        const header = proto.RequestHeader.init(op, id);
-        return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
+        return testReq(op, id, ns, key, value, options);
     }
 
     fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
@@ -8193,7 +8247,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
         for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
         rn.outbound.clearRetainingCapacity();
     }
-    const wire = try Shard.serializeRequest(std.testing.allocator, .{ .header = proto.RequestHeader.init(.kv_get, 9), .namespace = "", .key = "k", .value = "" });
+    const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_get, 9, "", "k", "", ""));
     defer std.testing.allocator.free(wire);
     const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + wire.len);
     defer std.testing.allocator.free(frame);
@@ -9642,7 +9696,7 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
 
 test "shard: a forwarded request parsed without its options trailer re-serializes whole" {
     const payload = [_]u8{ 0, 0, 2, 0, 'k', '0', 0, 0, 0, 0 };
-    var header = proto.RequestHeader.init(.kv_get, 5);
+    var header = proto.RequestHeader.init(.kv_exists, 5);
     header.payload_length = payload.len;
     header.crc32 = header.computeCRC32(&payload);
     var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;

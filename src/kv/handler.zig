@@ -42,6 +42,8 @@ const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
 const persistence_mod = @import("../storage/persistence.zig");
 const txn_mod = @import("./txn.zig");
+const kv_ops = @import("../protocol/kv_ops.zig");
+const table_run = @import("../node/table_run.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
@@ -129,8 +131,12 @@ pub const KVHandler = struct {
     /// Register KV opcode handlers with the Dispatcher.
     /// Uses pre-route hooks for routing key extraction.
     pub fn register(dispatcher: *Dispatcher) void {
-        dispatcher.registerWithRoute(.kv_get, dispatchGet, preRouteByKey);
-        dispatcher.registerWithRoute(.kv_put, dispatchPut, preRouteByKey);
+        dispatcher.registerWithRoute(.kv_get, table_run.handler("kv.get", KVHandler, get), table_run.routeByKey("kv.get"));
+        dispatcher.registerWithRoute(.kv_put, table_run.handler("kv.set", KVHandler, set), table_run.routeByKey("kv.set"));
+        dispatcher.setShardRoute(.kv_get, txnShardOfBody);
+        dispatcher.setShardRoute(.kv_put, txnShardOfBody);
+        dispatcher.setShardRoute(.kv_commit_txn, txnShardOfOption);
+        dispatcher.setShardRoute(.kv_rollback_txn, txnShardOfOption);
         dispatcher.registerWithRoute(.kv_delete, dispatchDelete, preRouteByKey);
         dispatcher.registerWalk(.kv_scan, dispatchScan, localScanKeys);
         dispatcher.register(.kv_history, dispatchHistory);
@@ -146,8 +152,8 @@ pub const KVHandler = struct {
         dispatcher.registerWithRoute(.kv_json_del, dispatchJsonDel, preRouteByKey);
 
         // Per-shard transactions. BEGIN pins the txn to the partition that
-        // owns the routing key; COMMIT/ROLLBACK then route to the same shard
-        // by passing the routing key (the CLI carries it forward).
+        // owns the routing key; everything after names the txn, whose id
+        // names its shard.
         dispatcher.registerWithRoute(.kv_begin_txn, dispatchBeginTxn, preRouteByKey);
         dispatcher.registerWithRoute(.kv_commit_txn, dispatchCommitTxn, preRouteByKey);
         dispatcher.registerWithRoute(.kv_rollback_txn, dispatchRollbackTxn, preRouteByKey);
@@ -171,134 +177,202 @@ pub const KVHandler = struct {
     // When Shard owns Partitions, these will extract the correct
     // Partition's KVProjection based on routing.
 
-    fn dispatchGet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+    // ── Table ops ───────────────────────────────────────────────────────
+    // `table_run.handler` decodes each body and calls these with its fields.
 
-        // Upfront key validation — give the user a clear error before any business logic
-        if (refuseKey(shard, conn, req)) return;
+    /// Why a KV table op is refused. `refusal` gives each its reason.
+    pub const Error = error{
+        KeyEmpty,
+        KeyHasNul,
+        KeyTooLong,
+        ReservedKey,
+        NotFound,
+        CasMismatch,
+        ConditionFailed,
+        NoSuchTransaction,
+        TxnRoutingKey,
+        TxnTooLarge,
+        WaitInTxn,
+        TooManyWaiters,
+        LeaderUnknown,
+        WritesStopped,
+        TooManyProposals,
+        TooLarge,
+        Internal,
+    };
 
-        // Namespace-qualify the key for projection lookup
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
-            return;
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.KeyEmpty => refused(.bad_request, .malformed, "bad request: key is required"),
+            error.KeyHasNul => refused(.bad_request, .malformed, "bad request: key must not contain NUL"),
+            error.KeyTooLong => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key is too long: at most {d} bytes, namespace included", .{MAX_QUALIFIED_KEY})),
+            error.ReservedKey => refused(.unauthorized, .reserved_key, "unauthorized: the key is in a prefix the server keeps for itself"),
+            error.NotFound => refused(.not_found, .not_found, "not found"),
+            error.CasMismatch => refused(.conflict, .cas_mismatch, "conflict: cas_version isn't the key's version"),
+            error.ConditionFailed => refused(.conflict, .condition_failed, "conflict: the condition didn't hold"),
+            error.NoSuchTransaction => refused(.not_found, .no_such_transaction, "not found: no such transaction — it committed, rolled back, or was begun in another namespace"),
+            error.TxnRoutingKey => refused(.bad_request, .txn_routing_key, "bad request: the routing key (the key, when none is given) isn't the one the transaction was begun with"),
+            error.TxnTooLarge => refused(.bad_request, .txn_too_large, "bad request: the transaction holds as many ops or bytes as it may"),
+            error.WaitInTxn => refused(.bad_request, .conflicting_fields, "bad request: a read in a transaction can't wait: give wait_ms or txn, not both"),
+            error.TooManyWaiters => refused(.overloaded, .too_many_waiters, "overloaded: too many reads waiting on this shard — retry"),
+            error.LeaderUnknown => refused(.unavailable, .leader_unknown, persistence_mod.failureMessage(error.NotLeader, "")),
+            error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
+            error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
+            error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key and value are too large to write: at most {d} bytes together", .{MAX_ENTRY_PAYLOAD})),
+            error.Internal => refused(.internal_error, .internal, "internal error: the write couldn't be proposed"),
         };
+    }
 
-        // Check for blocking options before normal GET.
-        // Wire mapping (from CLI client):
-        //   CLI --wait  → wire block_ms  (wait-until-exists)
-        //   CLI --block → wire wait_ms   (watch-for-changes / next version)
-        const block_ms = req.getBlockMs(); // wait-until-exists
-        const wait_ms = req.getWaitMs(); // watch-for-changes
+    /// Refused before anything ran.
+    fn refused(status: proto.StatusCode, reason: proto.Reason, message: []const u8) table_run.Refused {
+        return .{ .status = status, .refusal = .{ .reason = reason, .ran = .no, .message = message } };
+    }
 
-        if (block_ms) |bms| {
-            // Wait-until-exists semantics: if key exists, return immediately.
-            if (shard.kv_handler.*.kv.get(qkey)) |entry| {
-                const result = CommandResult{ .kv_value = .{ .value = entry.value, .version = entry.version } };
-                sendKVResponse(shard, conn, req.header.request_id, result);
-                return;
-            }
-            // Key absent — register waiter in unified pool; response sent when key is created.
+    comptime {
+        // A wait the schema allows is one a waiter keeps.
+        std.debug.assert(kv_ops.MAX_WAIT_MS == waiter_pool_mod.MAX_BLOCK_MS);
+    }
+
+    const GetResponse = table_run.op("kv.get").response;
+    const SetResponse = table_run.op("kv.set").response;
+
+    /// Read a key: at once, or once it exists or changes (`wait_ms`,
+    /// `wait_for`), or as a transaction sees it.
+    fn get(
+        shard: *Shard,
+        conn: *Connection,
+        req: Request,
+        wait_ms: u64,
+        wait_for: kv_ops.WaitFor,
+        routing_key: ?[]const u8,
+        txn: ?u64,
+    ) Error!table_run.Outcome(GetResponse) {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = try tableKey(&qbuf, req);
+        const kv = shard.kv_handler.*.kv;
+        if (txn) |id| {
+            if (wait_ms > 0) return error.WaitInTxn;
+            const t = try openTxn(shard, req, id, routing_key);
+            if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
+                .delete => return error.NotFound,
+                // Not committed, so no version yet.
+                .put => return .{ .answer = .{ .version = 0, .value = last.value } },
+                // Their value isn't the key's: read what's committed.
+                .touch, .persist, .incr => {},
+            };
+        }
+        const current = kv.get(qkey);
+        if (wait_ms > 0) {
+            if (wait_for == .exists) if (current) |e| return .{ .answer = .{ .version = e.version, .value = e.value } };
             const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = qkey,
-                .min_version = 0,
-                .timeout_ms = bms,
+                // Answered by the first version past this one.
+                .min_version = switch (wait_for) {
+                    .exists => 0,
+                    .change => if (current) |e| e.version else 0,
+                },
+                // At most kv_ops.MAX_WAIT_MS: the decode checked.
+                .timeout_ms = @intCast(wait_ms),
             });
-            if (!registered) {
-                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
-                return;
-            }
-            conn.response_deferred = true;
-            return;
+            if (!registered) return error.TooManyWaiters;
+            return .wait;
         }
-
-        if (wait_ms) |wms| {
-            // Watch-for-changes semantics: wait for version > current.
-            const current_version: u64 = if (shard.kv_handler.*.kv.get(qkey)) |entry| entry.version else 0;
-            const registered = shard.waiter_pool.register(.{
-                .kind = .kv_get,
-                .reply_to = conn.replyTo(),
-                .request_id = req.header.request_id,
-                .key = qkey,
-                .min_version = current_version,
-                .timeout_ms = wms,
-            });
-            if (!registered) {
-                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
-                return;
-            }
-            conn.response_deferred = true;
-            return;
-        }
-
-        // Normal non-blocking GET.
-        // Inside a transaction? Check buffered ops first (read-your-writes).
-        switch (tryReadInTxn(shard, conn, req, qkey)) {
-            .none => {},
-            .err => return,
-            .deleted => {
-                sendKVResponse(shard, conn, req.header.request_id, .kv_not_found);
-                return;
-            },
-            .value => |v| {
-                sendKVResponse(shard, conn, req.header.request_id, .{ .kv_value = .{ .value = v, .version = 0 } });
-                return;
-            },
-            .miss => {}, // fall through to projection lookup
-        }
-        const cmd_result = shard.kv_handler.*.handleCommand(req);
-        defer shard.kv_handler.*.freeResult(cmd_result);
-        log.debug("KV GET: key={s}, hit={}", .{ req.key, cmd_result != .kv_not_found });
-
         if (shard.kv_handler.metrics_registry) |mr| {
             if (mr.registerKVNamespace(req.namespace)) |km| km.recordGet() else |_| {}
         }
-
-        sendKVResponse(shard, conn, req.header.request_id, cmd_result);
+        const e = current orelse return error.NotFound;
+        return .{ .answer = .{ .version = e.version, .value = e.value } };
     }
 
-    fn dispatchPut(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+    /// Write a key, if its `condition` and `cas_version` hold; inside a
+    /// transaction, buffer the write until it commits.
+    fn set(
+        shard: *Shard,
+        _: *Connection,
+        req: Request,
+        value: []const u8,
+        ttl_ms: ?u64,
+        condition: kv_ops.Condition,
+        cas_version: ?u64,
+        routing_key: ?[]const u8,
+        txn: ?u64,
+    ) Error!table_run.Outcome(SetResponse) {
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = try tableKey(&qbuf, req);
+        const current = shard.kv_handler.*.kv.get(qkey);
+        if (cas_version) |want| if ((if (current) |e| e.version else 0) != want) return error.CasMismatch;
+        switch (condition) {
+            .always => {},
+            .if_absent => if (current != null) return error.ConditionFailed,
+            .if_present => if (current == null) return error.ConditionFailed,
+        }
+        const ttl = ttl_ms orelse 0;
+        if (txn) |id| {
+            const t = try openTxn(shard, req, id, routing_key);
+            shard.kv_handler.*.txn_table.appendOp(t.txn_id, .put, qkey, value, ttl) catch |err| return switch (err) {
+                error.TxnTooLarge => error.TxnTooLarge,
+                error.OutOfMemory => error.Internal,
+            };
+            return .{ .answer = .{ .version = null } };
+        }
+        const proposed = proposeKV(shard, .kv_put, req, qkey, value, ttl) catch |err| return proposeError(err);
+        return .{ .park = .{ .proposed = proposed, .responder = respondSet } };
+    }
+
+    /// The set applied: its version is the key's, and the namespace now
+    /// holds data.
+    fn respondSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-
-        // Upfront key validation — give the user a clear error before any business logic
-        if (refuseKey(shard, conn, req)) return;
-
-        // Namespace-qualify the key
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } });
-            return;
+        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
+            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse
+            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        table_run.answer(SetResponse, shard, conn, req.header.request_id, .{ .version = entry.version });
+    }
+
+    /// The request's key, namespace-qualified, once it passes the checks
+    /// every key does.
+    fn tableKey(buf: *[MAX_QUALIFIED_KEY]u8, req: Request) Error![]const u8 {
+        if (req.key.len == 0) return error.KeyEmpty;
+        if (isReservedKey(req.key)) return error.ReservedKey;
+        return qualifyKey(buf, req.namespace, req.key) catch |err| switch (err) {
+            error.KeyHasNul => error.KeyHasNul,
+            error.KeyTooLarge => error.KeyTooLong,
         };
+    }
 
-        // Validate the request before proposing (uses qualified key)
-        const validation = shard.kv_handler.*.validatePutQ(req, qkey);
-        if (validation) |err_result| {
-            defer shard.kv_handler.*.freeResult(err_result);
-            sendKVResponse(shard, conn, req.header.request_id, err_result);
-            return;
-        }
+    /// Transaction `id`, open in the request's namespace, which the
+    /// request's key routes to.
+    fn openTxn(shard: *Shard, req: Request, id: u64, routing_key: ?[]const u8) Error!*txn_mod.TxnState {
+        const t = txnIn(&shard.kv_handler.*.txn_table, id, req.namespace) orelse return error.NoSuchTransaction;
+        if (t.pinned_hash != router.hashKeyWithNamespace(req.namespace, routing_key orelse req.key)) return error.TxnRoutingKey;
+        return t;
+    }
 
-        // The TTL travels as given; apply counts it from the entry's stamp.
-        const put_ttl_ms = (req.getTtlMs() catch {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } });
-            return;
-        }) orelse 0;
-        if (time_units.msToNs(put_ttl_ms) == null) {
-            sendKVResponse(shard, conn, req.header.request_id, .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } });
-            return;
-        }
+    fn proposeError(err: anyerror) Error {
+        return switch (err) {
+            error.NotLeader => error.LeaderUnknown,
+            error.WritesStopped => error.WritesStopped,
+            error.Overloaded => error.TooManyProposals,
+            error.PayloadTooLarge => error.TooLarge,
+            else => error.Internal,
+        };
+    }
 
-        // Inside a transaction? Buffer instead of proposing.
-        if (tryHandleInTxn(shard, conn, req, qkey, .put, req.value, put_ttl_ms)) return;
+    /// The shard a table op's transaction lives on, when it names one.
+    fn txnShardOfBody(req: Request) ?u16 {
+        return txn_mod.idShard(table_run.txnId(req) orelse return null);
+    }
 
-        // Build CommandPayload and propose through Raft (uses qualified key)
-        const proposed = proposeKVEntry(shard, .kv_put, req, qkey) catch |err| return proposeFailed(shard, conn, req, err);
-        shard.park(conn, req, proposed, respondPut);
+    /// The shard a commit or rollback's transaction lives on.
+    fn txnShardOfOption(req: Request) ?u16 {
+        return txn_mod.idShard(extractTxnId(req) orelse return null);
     }
 
     /// The put applied: its version is the key's, and the namespace now
@@ -951,6 +1025,19 @@ pub const KVHandler = struct {
         qualified_key: []const u8,
         value: []const u8,
     ) !@import("../raft/node.zig").ProposeResult {
+        const ttl_ms: u64 = if (entry_type == .kv_put) (req.getTtlMs() catch return error.TtlNot8Bytes) orelse 0 else 0;
+        return proposeKV(shard, entry_type, req, qualified_key, value, ttl_ms);
+    }
+
+    /// Propose a KV entry; `ttl_ms` applies to a put, 0 for none.
+    fn proposeKV(
+        shard: *Shard,
+        entry_type: entry_mod.EntryType,
+        req: Request,
+        qualified_key: []const u8,
+        value: []const u8,
+        ttl_ms: u64,
+    ) !@import("../raft/node.zig").ProposeResult {
         // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
         var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
         const cmd = entry_mod.CommandPayload{
@@ -968,16 +1055,11 @@ pub const KVHandler = struct {
             flags |= entry_mod.Flags.TOMBSTONE;
         }
 
-        if (entry_type == .kv_put) {
-            if (req.getTtlMs() catch return error.TtlNot8Bytes) |ttl_ms| {
-                if (ttl_ms > 0) {
-                    flags |= entry_mod.Flags.HAS_TTL;
-                    // JSON set/delete reach here without dispatchPut's check.
-                    if (time_units.msToNs(ttl_ms) == null) return error.TtlTooLarge;
-                    std.mem.writeInt(u64, payload_buf[payload_len..][0..8], ttl_ms, .little);
-                    payload_len += 8;
-                }
-            }
+        if (entry_type == .kv_put and ttl_ms > 0) {
+            flags |= entry_mod.Flags.HAS_TTL;
+            if (time_units.msToNs(ttl_ms) == null) return error.TtlTooLarge;
+            std.mem.writeInt(u64, payload_buf[payload_len..][0..8], ttl_ms, .little);
+            payload_len += 8;
         }
 
         return try shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
@@ -1253,36 +1335,15 @@ pub const KVHandler = struct {
     /// Dispatch a KV command to the appropriate handler.
     /// Used for reads, and for the processing KV sink's put, which writes
     /// the projection directly (bypasses Raft). Client writes go through
-    /// dispatchPut/dispatchDelete → proposeKVEntry.
+    /// `set` and dispatchDelete → proposeKV.
     fn handleCommand(self: *KVHandler, req: Request) CommandResult {
         const op: OpCode = @enumFromInt(req.header.op_code);
         return switch (op) {
-            .kv_get => self.handleGet(req),
             .kv_put => self.handlePutDirect(req),
             .kv_scan => self.handleScan(req),
             .kv_history => self.handleHistory(req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown KV opcode" } },
         };
-    }
-
-    // ── GET ─────────────────────────────────────────────────────────────
-
-    fn handleGet(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        }
-
-        if (isReservedKey(req.key)) {
-            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-        }
-
-        // Namespace-qualify key for projection lookup
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch |err|
-            return qualifyRefusal(err);
-
-        const entry = self.kv.get(qkey) orelse return .kv_not_found;
-        return .{ .kv_value = .{ .value = entry.value, .version = entry.version } };
     }
 
     // ── PUT direct (used by handleCommand — test/internal path) ─────────
@@ -1345,50 +1406,6 @@ pub const KVHandler = struct {
         };
         const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
         return .{ .kv_put_ok = .{ .version = version } };
-    }
-
-    // ── PUT validation (pre-checks only — no write to projection) ───────
-
-    /// Validate a put request before proposing to Raft.
-    /// Returns null if all checks pass, or a CommandResult error to send immediately.
-    fn validatePut(self: *KVHandler, req: Request) ?CommandResult {
-        return self.validatePutQ(req, req.key);
-    }
-
-    /// Validate a put request with a namespace-qualified key for projection lookups.
-    fn validatePutQ(self: *KVHandler, req: Request, qkey: []const u8) ?CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        }
-        if (isReservedKey(req.key)) {
-            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-        }
-
-        // CAS check — version must match current (use qualified key for lookup)
-        if (req.getCasVersion()) |expected_version| {
-            const current = self.kv.get(qkey);
-            if (current) |entry| {
-                if (entry.version != expected_version) {
-                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
-                }
-            } else {
-                if (expected_version != 0) {
-                    return .{ .kv_cas_failed = .{ .current_version = 0 } };
-                }
-            }
-        }
-
-        // NX: must not exist
-        if (req.getIfNotExists()) {
-            if (self.kv.get(qkey) != null) return .kv_condition_not_met;
-        }
-
-        // XX: must exist
-        if (req.getIfExists()) {
-            if (self.kv.get(qkey) == null) return .kv_condition_not_met;
-        }
-
-        return null; // all checks passed
     }
 
     // ── DELETE validation (pre-checks only — no write to projection) ─────
@@ -1690,6 +1707,13 @@ fn serializeScanResults(allocator: Allocator, entries: []const ScanEntry) ![]u8 
 const testing = std.testing;
 
 /// Helper to build a test request for a given opcode.
+/// The value the projection holds for `key` in the default namespace.
+fn stored(handler: *KVHandler, key: []const u8) ?[]const u8 {
+    var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+    const entry = handler.kv.get(qualifyKey(&qbuf, "default", key) catch return null) orelse return null;
+    return entry.value;
+}
+
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
     return .{
         .header = proto.RequestHeader.init(op, 1),
@@ -1698,70 +1722,6 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
         .value = value,
         .options = options,
     };
-}
-
-test "kv handler: get existing key" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
-    defer kv.deinit();
-
-    try kv.put("hello", "world", 1, 0, 1000, 0);
-
-    var handler = KVHandler.init(allocator, &kv);
-    const result = handler.handleCommand(makeRequest(.kv_get, "hello", "", ""));
-
-    switch (result) {
-        .kv_value => |v| {
-            try testing.expectEqualStrings("world", v.value);
-            try testing.expectEqual(@as(u64, 1), v.version);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: get non-existent key" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-    const result = handler.handleCommand(makeRequest(.kv_get, "nope", "", ""));
-
-    switch (result) {
-        .kv_not_found => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: get empty key returns error" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-    const result = handler.handleCommand(makeRequest(.kv_get, "", "", ""));
-
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: get reserved key blocked" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
-    defer kv.deinit();
-
-    // Manually put a reserved key (bypass handler)
-    try kv.put("_sys:config", "secret", 1, 0, 1000, 0);
-
-    var handler = KVHandler.init(allocator, &kv);
-    const result = handler.handleCommand(makeRequest(.kv_get, "_sys:config", "", ""));
-
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.unauthorized, e.code),
-        else => return error.TestUnexpectedResult,
-    }
 }
 
 test "kv handler: put and get" {
@@ -1778,12 +1738,7 @@ test "kv handler: put and get" {
         else => return error.TestUnexpectedResult,
     }
 
-    // Get it back
-    const get_result = handler.handleCommand(makeRequest(.kv_get, "mykey", "", ""));
-    switch (get_result) {
-        .kv_value => |v| try testing.expectEqualStrings("myval", v.value),
-        else => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqualStrings("myval", stored(&handler, "mykey").?);
 }
 
 test "kv handler: put with CAS success" {
@@ -1808,12 +1763,7 @@ test "kv handler: put with CAS success" {
         else => return error.TestUnexpectedResult,
     }
 
-    // Verify updated
-    const get_res = handler.handleCommand(makeRequest(.kv_get, "k", "", ""));
-    switch (get_res) {
-        .kv_value => |v| try testing.expectEqualStrings("v2", v.value),
-        else => return error.TestUnexpectedResult,
-    }
+    try testing.expectEqualStrings("v2", stored(&handler, "k").?);
 }
 
 test "kv handler: put with CAS failure" {
@@ -2187,7 +2137,7 @@ test "kv handler: a key holding a NUL is refused, and a default scan lists only 
     _ = handler.handleCommand(makeRequest(.kv_put, "mine", "default-value", ""));
 
     // "default" keys are stored bare, so this spells b's "k".
-    for ([_]OpCode{ .kv_put, .kv_get, .kv_history, .kv_scan }) |op| {
+    for ([_]OpCode{ .kv_put, .kv_history, .kv_scan }) |op| {
         switch (handler.handleCommand(makeRequest(op, "b\x00k", "overwrite", ""))) {
             .err => |e| {
                 try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);

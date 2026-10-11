@@ -5,8 +5,9 @@
 const std = @import("std");
 const ops = @import("ops.zig");
 const entries = @import("entries.zig");
+const kv_ops = @import("kv_ops.zig");
 
-pub const op_table = [_]ops.Op{};
+pub const op_table = [_]ops.Op{ kv_ops.op("kv.get"), kv_ops.op("kv.set") };
 pub const entry_table = [_]entries.Entry{};
 
 comptime {
@@ -19,6 +20,13 @@ comptime {
 /// hash can't see those layouts, so without a bump a client or node built
 /// before the change would be misread instead of refused. It goes once every
 /// layout is declared in a table.
+/// Whether `code` is a table op: its request is `[namespace][key][body]`,
+/// the body coded by its schema.
+pub fn isOp(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return true;
+    return false;
+}
+
 pub const HAND_LAYOUT_EPOCH: u32 = 2;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);

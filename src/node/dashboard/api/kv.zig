@@ -17,6 +17,7 @@ const kv_mod = @import("../../../projection/kv.zig");
 const KVProjection = kv_mod.KVProjection;
 const ns_keys = @import("../../../namespace/handler.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
+const schema = @import("../../../protocol/schema.zig");
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -293,7 +294,7 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
         .string => |s| value = s,
         else => {},
     };
-    var opts = client_mod.kv.SetOptions{};
+    var opts: client_mod.kv.set_op.request.Value = .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null };
     // A TTL that can't be read is refused: ignored, the key would never
     // expire.
     if (obj_in.get("ttl_ms")) |t| switch (t) {
@@ -305,17 +306,20 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
         else => return try h.jsonError(allocator, "ttl_ms must be a whole number of milliseconds"),
     };
     if (obj_in.get("nx")) |n| switch (n) {
-        .bool => |b| opts.if_not_exists = b,
+        .bool => |b| opts.condition = if (b) .if_absent else .always,
         else => {},
     };
 
     var client = loopbackConnect(allocator, ctx) catch
         return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.kv.set(&client, namespace, key, value, opts) catch
+    var resp = client_mod.kv.set(&client, namespace, key, opts) catch
         return try h.jsonError(allocator, "KV set failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
+    var diag: schema.Diagnostic = .{};
+    const answer = client_mod.kv.set_op.response.decodeAll(resp.data, &diag) catch
+        return try h.jsonError(allocator, "KV set: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -325,7 +329,7 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
     try obj.boolField("ok", true);
-    try obj.intField("version", @as(i64, @intCast(resp.getVersion() orelse 0)));
+    try obj.intField("version", @as(i64, @intCast(answer.version orelse 0)));
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

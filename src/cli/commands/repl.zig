@@ -7,6 +7,7 @@
 //! This provides a redis-cli-like interactive experience.
 
 const std = @import("std");
+const schema = @import("../../protocol/schema.zig");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const cli_config = @import("../config.zig");
@@ -204,7 +205,7 @@ fn executeGet(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    var result = client_mod.kv.get(client, namespace, key, null, null, null, null) catch |err| {
+    var result = client_mod.kv.get(client, namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };
@@ -220,11 +221,12 @@ fn executeGet(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    if (result.asString()) |value| {
-        ctx.print("\"{s}\"\n", .{value});
+    var diag: schema.Diagnostic = .{};
+    const answer = client_mod.kv.get_op.response.decodeAll(result.data, &diag) catch {
+        ctx.print("(error) malformed get response\n", .{});
         return;
-    }
-    ctx.print("(nil)\n", .{});
+    };
+    ctx.print("\"{s}\"\n", .{answer.value});
 }
 
 fn executeSet(client: *Client, ctx: *commander.Context, namespace: []const u8, rest: []const u8) void {
@@ -243,7 +245,7 @@ fn executeSet(client: *Client, ctx: *commander.Context, namespace: []const u8, r
         return;
     }
 
-    var result = client_mod.kv.set(client, namespace, key, value, .{}) catch |err| {
+    var result = client_mod.kv.set(client, namespace, key, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };

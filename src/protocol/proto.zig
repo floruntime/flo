@@ -20,7 +20,9 @@ pub const VERSION: u8 = 0x02;
 
 /// The hash of the op and entry tables this build serves. Every request and
 /// answer header carries it; a server refuses a request carrying another.
-pub const TABLE_HASH: u64 = @import("table.zig").HASH;
+pub const TABLE_HASH: u64 = table.HASH;
+
+const table = @import("table.zig");
 
 /// Most records one stream append may carry; the server refuses more.
 pub const MAX_STREAM_BATCH_RECORDS: u32 = 1000;
@@ -248,7 +250,6 @@ pub const OptionTag = enum(u8) {
     priority = 0x10, // u8: Message priority (0-255; lower is taken first)
     count = 0x15, // u32: Number of messages to dequeue
     block_ms = 0x17, // u32: Block timeout - wait until exists (at most 5 min; 0 = don't wait)
-    wait_ms = 0x18, // u32: Watch timeout - wait for NEXT version change (at most 5 min; 0 = don't wait)
 
     // Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     // All stream positioning uses StreamID (timestamp_ms + sequence) - no legacy offset/timestamp modes
@@ -591,6 +592,10 @@ pub const ResponseHeader = extern struct {
 /// Request with namespace support and TLV options
 /// Payload format: [namespace_len: u16] [namespace] [key_len: u16] [key] [value_len: u32] [value] [options_len: u16] [options...]
 /// Options are TLV encoded: [tag: u8] [len: u8] [data: len bytes]
+///
+/// A table op's payload is `[namespace_len: u16] [namespace] [key_len: u16] [key] [body]`,
+/// the body coded by the op's request schema; `value` holds the body and
+/// `options` is empty.
 pub const Request = struct {
     header: RequestHeader,
     namespace: []const u8,
@@ -656,6 +661,13 @@ pub const Request = struct {
         const key = payload[offset..][0..key_len];
         offset += key_len;
 
+        if (table.isOp(header.op_code)) return Request{
+            .header = header,
+            .namespace = namespace,
+            .key = key,
+            .value = payload[offset..],
+        };
+
         // Value
         if (payload.len < offset + 4) return error.IncompletePayload;
         const value_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
@@ -685,17 +697,25 @@ pub const Request = struct {
         };
     }
 
+    /// The payload's size on the wire: `serialize` always writes the
+    /// options trailer of a hand-coded op.
+    fn payloadSize(self: Request) usize {
+        const envelope = 2 + self.namespace.len + 2 + self.key.len;
+        if (table.isOp(self.header.op_code)) return envelope + self.value.len;
+        return envelope + 4 + self.value.len + 2 + self.options.len;
+    }
+
+    /// The request's size once serialized.
+    pub fn wireSize(self: Request) usize {
+        return @sizeOf(RequestHeader) + self.payloadSize();
+    }
+
     /// Serialize request to wire format
     pub fn serialize(self: Request, buffer: []u8) ![]const u8 {
         const header_size = @sizeOf(RequestHeader);
-
-        // Calculate payload size (always include options_len field)
-        const payload_size = 2 + self.namespace.len + // namespace_len + namespace
-            2 + self.key.len + // key_len + key
-            4 + self.value.len + // value_len + value
-            2 + self.options.len; // options_len + options
-
+        const payload_size = self.payloadSize();
         const total_size = header_size + payload_size;
+        const table_op = table.isOp(self.header.op_code);
 
         if (buffer.len < total_size) {
             return error.BufferTooSmall;
@@ -717,20 +737,25 @@ pub const Request = struct {
         @memcpy(payload_buffer[payload_offset..][0..self.key.len], self.key);
         payload_offset += self.key.len;
 
-        // Write value
-        std.mem.writeInt(u32, payload_buffer[payload_offset..][0..4], @intCast(self.value.len), .little);
-        payload_offset += 4;
-        if (self.value.len > 0) {
+        if (table_op) {
             @memcpy(payload_buffer[payload_offset..][0..self.value.len], self.value);
             payload_offset += self.value.len;
-        }
+        } else {
+            // Write value
+            std.mem.writeInt(u32, payload_buffer[payload_offset..][0..4], @intCast(self.value.len), .little);
+            payload_offset += 4;
+            if (self.value.len > 0) {
+                @memcpy(payload_buffer[payload_offset..][0..self.value.len], self.value);
+                payload_offset += self.value.len;
+            }
 
-        // Write options
-        std.mem.writeInt(u16, payload_buffer[payload_offset..][0..2], @intCast(self.options.len), .little);
-        payload_offset += 2;
-        if (self.options.len > 0) {
-            @memcpy(payload_buffer[payload_offset..][0..self.options.len], self.options);
-            payload_offset += self.options.len;
+            // Write options
+            std.mem.writeInt(u16, payload_buffer[payload_offset..][0..2], @intCast(self.options.len), .little);
+            payload_offset += 2;
+            if (self.options.len > 0) {
+                @memcpy(payload_buffer[payload_offset..][0..self.options.len], self.options);
+                payload_offset += self.options.len;
+            }
         }
 
         // Write header with correct payload_length FIRST (needed for CRC32 computation)
@@ -819,16 +844,6 @@ pub const Request = struct {
         return null;
     }
 
-    /// The wait_ms option (watch for the next version change), or null for
-    /// no wait: 0 means do not wait, as if it were absent.
-    pub fn getWaitMs(self: Request) ?u32 {
-        if (self.findOption(.wait_ms)) |opt| {
-            const ms = opt.asU32() orelse return null;
-            return if (ms == 0) null else ms;
-        }
-        return null;
-    }
-
     /// Get if_not_exists option (NX - only set if key doesn't exist)
     pub fn getIfNotExists(self: Request) bool {
         if (self.findOption(.if_not_exists)) |opt| {
@@ -883,6 +898,17 @@ pub const Response = struct {
         @memcpy(buffer[0..header_size], std.mem.asBytes(&header));
 
         return buffer[0..total_size];
+    }
+
+    /// An ok answer whose body is already in `buffer` after the header's
+    /// room, `body_len` bytes of it: a body encoded in place, not copied.
+    pub fn sealOk(request_id: u64, buffer: []u8, body_len: usize) []const u8 {
+        const header_size = @sizeOf(ResponseHeader);
+        var header = Response.ok(request_id, "").header;
+        header.data_len = @intCast(body_len);
+        header.crc32 = header.computeCRC32(buffer[header_size..][0..body_len]);
+        @memcpy(buffer[0..header_size], std.mem.asBytes(&header));
+        return buffer[0 .. header_size + body_len];
     }
 
     /// An ok answer, serialized.
@@ -1078,7 +1104,7 @@ test "Request with TLV options serialization" {
     try builder.addU64(.ttl_ms, 86400); // 1 day
 
     const request = Request{
-        .header = RequestHeader.init(.kv_put, 42),
+        .header = RequestHeader.init(.kv_touch, 42),
         .namespace = "test",
         .key = "mykey",
         .value = "myvalue",

@@ -64,6 +64,10 @@ pub const HandlerFn = *const fn (shard: *anyopaque, conn: *anyopaque, req: proto
 /// Returns `null` to trigger ShardWalker (multi-shard scan).
 pub const PreRouteFn = *const fn (req: proto.Request) ?u64;
 
+/// The shard a request must run on whatever its key, or null to route it
+/// by key: a request inside a transaction runs where the transaction lives.
+pub const ShardRouteFn = *const fn (req: proto.Request) ?u16;
+
 /// Error callback — invoked when no handler is registered for an opcode.
 pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: u64, op_code: u16) void;
 
@@ -119,6 +123,9 @@ pub const Dispatcher = struct {
     /// Pre-route hooks — indexed by OpCode (u16).
     pre_route: [proto.MAX_OPCODES]?PreRouteFn,
 
+    /// Shard pins — indexed by OpCode (u16); consulted before `pre_route`.
+    shard_route: [proto.MAX_OPCODES]?ShardRouteFn,
+
     /// ShardWalker local-scan functions — indexed by OpCode (u16).
     /// Set for opcodes that need cross-shard walking (list/scan).
     /// Matches `NameWalker.LocalScanFn` signature.
@@ -140,6 +147,7 @@ pub const Dispatcher = struct {
         return .{
             .handlers = [_]?HandlerFn{null} ** proto.MAX_OPCODES,
             .pre_route = [_]?PreRouteFn{null} ** proto.MAX_OPCODES,
+            .shard_route = [_]?ShardRouteFn{null} ** proto.MAX_OPCODES,
             .walk_fn = [_]?NameWalker.LocalScanFn{null} ** proto.MAX_OPCODES,
             .walk_contexts = [_]?[]const *anyopaque{null} ** proto.MAX_OPCODES,
             .on_error = null,
@@ -162,6 +170,11 @@ pub const Dispatcher = struct {
         }
         self.handlers[idx] = handler;
         self.pre_route[idx] = pre_route_fn;
+    }
+
+    /// Pin `opcode`'s requests to the shard `route` names, when it names one.
+    pub fn setShardRoute(self: *Dispatcher, opcode: proto.OpCode, route: ShardRouteFn) void {
+        self.shard_route[@intFromEnum(opcode)] = route;
     }
 
     /// Register a walk (list/scan) opcode — handler + ShardWalker local-scan function.
@@ -259,6 +272,7 @@ pub const Dispatcher = struct {
         if (self.handlers[idx] != null) {
             self.handlers[idx] = null;
             self.pre_route[idx] = null;
+            self.shard_route[idx] = null;
             self.walk_fn[idx] = null;
             self.walk_contexts[idx] = null;
             self.handler_count -= 1;

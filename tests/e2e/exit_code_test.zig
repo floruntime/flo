@@ -23,13 +23,13 @@ test "e2e/exit: ok is 0, a missing key is 1, a bad flag is 2, a refusal is 3" {
     try expectExit(ctx, 1, &.{ "kv", "get", "absent" });
     try expectExit(ctx, 1, &.{ "kv", "delete", "absent" });
     try expectExit(ctx, 2, &.{ "kv", "get", "present", "--no-such-flag" });
-    try expectExit(ctx, 2, &.{ "kv", "set", "k", "v", "--nx", "--xx" });
+    try expectExit(ctx, 2, &.{ "kv", "set", "k", "v", "--condition", "maybe" });
     try expectExit(ctx, 2, &.{"bogus"});
     try expectExit(ctx, 2, &.{ "kv", "bogus" });
     try expectExit(ctx, 2, &.{ "auth", "login" });
     try expectExit(ctx, 2, &.{ "kv", "get", "a", "b", "c" });
     // The key exists, so a set-if-absent is refused.
-    try expectExit(ctx, 3, &.{ "kv", "set", "present", "w", "--nx" });
+    try expectExit(ctx, 3, &.{ "kv", "set", "present", "w", "--condition", "if_absent" });
     // A file the command was told to read is the command's input.
     try expectExit(ctx, 2, &.{ "workflow", "create", "-f", "/tmp/flo-exit-code-test-no-such-file.yaml" });
 }

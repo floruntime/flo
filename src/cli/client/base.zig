@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const proto = @import("../../protocol/proto.zig");
+const ops = @import("../../protocol/ops.zig");
 const RequestBuilder = @import("../../protocol/request_builder.zig").RequestBuilder;
 
 /// Default connection timeout in seconds
@@ -54,15 +55,6 @@ pub const Response = struct {
             }
             // If less than 8 bytes, something is wrong - return empty
             return null;
-        }
-        return null;
-    }
-
-    /// Get the version from a KV GET response
-    /// Wire format: [version: u64][value: bytes]
-    pub fn getVersion(self: Response) ?u64 {
-        if (self.status == .ok and self.data.len >= 8) {
-            return std.mem.readInt(u64, self.data[0..8], .little);
         }
         return null;
     }
@@ -240,6 +232,15 @@ pub const Client = struct {
         return self.sendRequestWithOptions(op_code, namespace, key, value, "");
     }
 
+    /// Send table op `op` with `body`, coded by its request schema. The
+    /// answer's body, when ok, decodes by its response schema.
+    pub fn call(self: *Self, comptime op: ops.Op, namespace: []const u8, key: []const u8, body: op.request.Value) !Response {
+        const buf = try self.allocator.alloc(u8, op.request.max_size);
+        defer self.allocator.free(buf);
+        const encoded = op.request.encodeInto(buf, body) catch return error.InvalidRequest;
+        return self.sendRequest(@enumFromInt(op.code), namespace, key, encoded);
+    }
+
     /// Send a request with options and receive response
     pub fn sendRequestWithOptions(
         self: *Self,
@@ -254,10 +255,7 @@ pub const Client = struct {
         // Build request using RequestBuilder
         const request = self.builder.build(op_code, namespace, key, value, options);
 
-        // Calculate required buffer size
-        const header_size = @sizeOf(proto.RequestHeader);
-        const payload_size = 2 + namespace.len + 2 + key.len + 4 + value.len + 2 + options.len;
-        const total_size = header_size + payload_size;
+        const total_size = request.wireSize();
 
         // Use stack buffer for small requests, heap for large (e.g., WASM uploads)
         if (total_size <= 8192) {

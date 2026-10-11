@@ -8,83 +8,20 @@ const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
+const kv_ops = @import("../../protocol/kv_ops.zig");
 
-/// Execute a GET command
-/// - wait_ms: Wait until exists (returns immediately if key exists, else waits)
-/// - block_ms: Block for changes (waits for NEXT version even if key exists) - like stream/queue --block
-/// - routing_key: Explicit routing override for shard co-location (same as {tag} in key)
-pub fn get(client: *Client, namespace: []const u8, key: []const u8, wait_ms: ?u32, block_ms: ?u32, routing_key: ?[]const u8, txn_id: ?u64) !Response {
-    if (wait_ms != null or block_ms != null or routing_key != null or txn_id != null) {
-        // A blocking request waits N ms on the server: read for that long
-        // plus 5 s. 0 does not wait, so the default timeout stands.
-        const effective_ms: u32 = wait_ms orelse block_ms orelse 0;
-        if (effective_ms > 0) {
-            const timeout_sec: u32 = effective_ms / 1000 + 5; // requested + 5s buffer
-            client.setReadTimeoutSec(timeout_sec);
-        }
+pub const get_op = kv_ops.op("kv.get");
+pub const set_op = kv_ops.op("kv.set");
 
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (wait_ms) |ms| {
-            // wire .block_ms = wait-until-exists semantics
-            builder.addU32(.block_ms, ms) catch return error.OptionsBufferTooSmall;
-        }
-        if (block_ms) |ms| {
-            // wire .wait_ms = watch-for-changes semantics
-            builder.addU32(.wait_ms, ms) catch return error.OptionsBufferTooSmall;
-        }
-        if (routing_key) |rk| {
-            builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        }
-        if (txn_id) |tid| {
-            builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        }
-        return client.sendRequestWithOptions(.kv_get, namespace, key, "", builder.getOptions());
-    }
-    return client.sendRequest(.kv_get, namespace, key, "");
+/// Read a key. A read that waits is read for as long plus 5 s.
+pub fn get(client: *Client, namespace: []const u8, key: []const u8, body: get_op.request.Value) !Response {
+    if (body.wait_ms > 0) client.setReadTimeoutSec(@intCast(body.wait_ms / 1000 + 5));
+    return client.call(get_op, namespace, key, body);
 }
 
-/// Options for SET command
-pub const SetOptions = struct {
-    /// Milliseconds; 0 or null is no expiry.
-    ttl_ms: ?u64 = null,
-    if_not_exists: bool = false,
-    if_exists: bool = false,
-    cas_version: ?u64 = null,
-    routing_key: ?[]const u8 = null,
-    txn_id: ?u64 = null,
-};
-
-/// Execute a SET command with options
-pub fn set(client: *Client, namespace: []const u8, key: []const u8, value: []const u8, opts: SetOptions) !Response {
-    var options_buf: [128]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (opts.ttl_ms) |ttl| {
-        builder.addU64(.ttl_ms, ttl) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.if_not_exists) {
-        builder.addFlag(.if_not_exists) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.if_exists) {
-        builder.addFlag(.if_exists) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.cas_version) |ver| {
-        builder.addU64(.cas_version, ver) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.routing_key) |rk| {
-        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-    }
-
-    if (opts.txn_id) |tid| {
-        builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-    }
-
-    return client.sendRequestWithOptions(.kv_put, namespace, key, value, builder.getOptions());
+/// Write a key.
+pub fn set(client: *Client, namespace: []const u8, key: []const u8, body: set_op.request.Value) !Response {
+    return client.call(set_op, namespace, key, body);
 }
 
 /// Execute a DEL command
@@ -264,19 +201,17 @@ pub fn beginTxn(client: *Client, namespace: []const u8, routing_key: []const u8)
 /// COMMIT — atomically apply all buffered ops in the transaction.
 /// `routing_key` must be the same one used at BEGIN so the request reaches
 /// the txn's pinned shard.
-pub fn commitTxn(client: *Client, namespace: []const u8, routing_key: []const u8, txn_id: u64) !Response {
-    var options_buf: [96]u8 = undefined;
+pub fn commitTxn(client: *Client, namespace: []const u8, txn_id: u64) !Response {
+    var options_buf: [16]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-    if (routing_key.len > 0) builder.addString(.routing_key, routing_key) catch return error.OptionsBufferTooSmall;
     builder.addU64(.txn_id, txn_id) catch return error.OptionsBufferTooSmall;
-    return client.sendRequestWithOptions(.kv_commit_txn, namespace, routing_key, "", builder.getOptions());
+    return client.sendRequestWithOptions(.kv_commit_txn, namespace, "", "", builder.getOptions());
 }
 
 /// ROLLBACK — discard the in-memory write set without committing.
-pub fn rollbackTxn(client: *Client, namespace: []const u8, routing_key: []const u8, txn_id: u64) !Response {
-    var options_buf: [96]u8 = undefined;
+pub fn rollbackTxn(client: *Client, namespace: []const u8, txn_id: u64) !Response {
+    var options_buf: [16]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
-    if (routing_key.len > 0) builder.addString(.routing_key, routing_key) catch return error.OptionsBufferTooSmall;
     builder.addU64(.txn_id, txn_id) catch return error.OptionsBufferTooSmall;
-    return client.sendRequestWithOptions(.kv_rollback_txn, namespace, routing_key, "", builder.getOptions());
+    return client.sendRequestWithOptions(.kv_rollback_txn, namespace, "", "", builder.getOptions());
 }

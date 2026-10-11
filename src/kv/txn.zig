@@ -107,12 +107,27 @@ pub const AppendError = error{
 
 // ─── TxnTable ─────────────────────────────────────────────────────────────
 
+/// The shard a transaction id names: its top 16 bits, so a request inside
+/// a transaction routes to the shard holding it. The rest count the shard's
+/// transactions.
+pub fn idShard(id: u64) u16 {
+    return @intCast(id >> 48);
+}
+
+pub fn makeId(shard: u16, counter: u64) u64 {
+    return (@as(u64, shard) << 48) | (counter & ID_COUNTER_MASK);
+}
+
+pub const ID_COUNTER_MASK: u64 = (1 << 48) - 1;
+
 pub const TxnTable = struct {
     allocator: Allocator,
     /// Active transactions keyed by txn_id.
     map: std.AutoHashMap(u64, TxnState),
-    /// Monotonically increasing per-table id source.
+    /// Counts this table's transactions: the low bits of their ids.
     next_id: u64,
+    /// The shard this table belongs to: the high bits of its ids.
+    shard_id: u16 = 0,
 
     pub fn init(allocator: Allocator) TxnTable {
         return .{
@@ -135,8 +150,9 @@ pub const TxnTable = struct {
     pub fn begin(self: *TxnTable, pinned_hash: u64, namespace_hash: u32, owner_conn_id: u32) !u64 {
         if (self.map.count() >= MAX_OPEN_TXNS) return error.TooManyOpenTxns;
 
-        const id = self.next_id;
-        self.next_id +%= 1;
+        const id = makeId(self.shard_id, self.next_id);
+        // Never 0, so no id is all zeros below its shard.
+        self.next_id = @max(1, (self.next_id + 1) & ID_COUNTER_MASK);
         try self.map.put(id, .{
             .txn_id = id,
             .pinned_hash = pinned_hash,
@@ -484,4 +500,16 @@ test "iterateBatch rejects unknown version" {
     const t = std.testing;
     const bad = [_]u8{ 99, 0, 0 };
     try t.expectEqual(@as(?BatchIterator, null), iterateBatch(&bad));
+}
+
+test "txn: an id names its shard" {
+    const id = makeId(3, 42);
+    try std.testing.expectEqual(@as(u16, 3), idShard(id));
+    try std.testing.expectEqual(@as(u64, 42), id & ID_COUNTER_MASK);
+    try std.testing.expectEqual(@as(u16, 0xffff), idShard(makeId(0xffff, ID_COUNTER_MASK + 5)));
+
+    var t = TxnTable.init(std.testing.allocator);
+    defer t.deinit();
+    t.shard_id = 7;
+    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, 0, 0)));
 }
