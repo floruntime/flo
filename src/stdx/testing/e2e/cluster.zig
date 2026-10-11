@@ -30,38 +30,9 @@
 
 const std = @import("std");
 const stdx = @import("../../mod.zig");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ServerProcess = @import("server.zig").ServerProcess;
 const CliRunner = @import("client.zig").CliRunner;
-
-/// Kill servers a crashed earlier run of this checkout left holding ports.
-/// Only those started from this checkout's own binary: a pattern any flo
-/// matches kills other checkouts' test runs and hand-started servers too,
-/// which then die with status 9 mid-test.
-fn cleanupStaleProcesses() void {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
-    const binary = @import("server.zig").findFloBinary(std.heap.page_allocator) catch return;
-    defer std.heap.page_allocator.free(binary);
-    // pkill -f takes an extended regex: escape the path so it matches only itself.
-    var pattern: std.ArrayListUnmanaged(u8) = .empty;
-    defer pattern.deinit(std.heap.page_allocator);
-    pattern.append(std.heap.page_allocator, '^') catch return;
-    for (binary) |c| {
-        if (std.mem.indexOfScalar(u8, "\\.^$|?*+()[]{}", c) != null) pattern.append(std.heap.page_allocator, '\\') catch return;
-        pattern.append(std.heap.page_allocator, c) catch return;
-    }
-    pattern.appendSlice(std.heap.page_allocator, " server ") catch return;
-    const io = stdx.io.instance();
-    if (std.process.run(std.heap.page_allocator, io, .{
-        .argv = &.{ "pkill", "-9", "-f", pattern.items },
-    })) |r| {
-        std.heap.page_allocator.free(r.stdout);
-        std.heap.page_allocator.free(r.stderr);
-    } else |_| {}
-    // Brief wait for processes to terminate and release resources
-    stdx.time.sleep(500 * std.time.ns_per_ms);
-}
 
 /// Start a server with retry: under heavy test load, port allocation
 /// or readiness checks can transiently fail.
@@ -107,9 +78,6 @@ pub const ClusterConfig = struct {
     /// Tiered-log config applied to every node (e.g. a small hot_buffer_capacity
     /// to force hot-ring wrap/spill in replication tests).
     tiered_log: ServerProcess.TieredLogConfig = .{},
-    /// Pre-test cleanup: kill lingering flo processes from crashed tests
-    /// Set to false only if you're sure no stale processes exist
-    cleanup_stale_processes: bool = true,
     /// Pre-test cooldown: wait for TCP TIME_WAIT sockets to clear
     /// Helps when running tests repeatedly - set to 0 to skip
     pre_test_cooldown_ms: u64 = 2000,
@@ -132,11 +100,6 @@ pub const ClusterContext = struct {
     pub fn init(allocator: Allocator, config: ClusterConfig) !Self {
         if (config.node_count < 2 or config.node_count > MAX_NODES) {
             return error.InvalidNodeCount;
-        }
-
-        // Pre-test cleanup: kill any stale flo processes from crashed tests
-        if (config.cleanup_stale_processes) {
-            cleanupStaleProcesses();
         }
 
         // Pre-test cooldown: wait for TCP TIME_WAIT sockets to clear

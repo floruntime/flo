@@ -35,6 +35,8 @@ const Allocator = std.mem.Allocator;
 
 // Re-export framework components
 pub const ServerProcess = @import("server.zig").ServerProcess;
+pub const takeRunLock = @import("server.zig").takeRunLock;
+pub const checkoutOf = @import("server.zig").checkoutOf;
 pub const ServerConfig = ServerProcess.ServerConfig;
 pub const CliRunner = @import("client.zig").CliRunner;
 pub const CommandResult = @import("client.zig").CommandResult;
