@@ -32,6 +32,7 @@
 //! locks needed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const stdx_time = @import("stdx").time;
@@ -120,11 +121,37 @@ pub fn makeId(shard: u16, counter: u64) u64 {
 
 pub const ID_COUNTER_MASK: u64 = (1 << 48) - 1;
 
+/// A counter start no earlier table is likely to have used: 48 random bits,
+/// never 0.
+fn randomCounter() u64 {
+    var bytes: [8]u8 = undefined;
+    switch (builtin.os.tag) {
+        .linux => {
+            var got: usize = 0;
+            while (got < bytes.len) {
+                const n = std.os.linux.getrandom(bytes[got..].ptr, bytes.len - got, 0);
+                switch (std.os.linux.errno(n)) {
+                    .SUCCESS => got += n,
+                    .INTR => {},
+                    // No getrandom: the clock still differs from any
+                    // earlier start.
+                    else => return @max(1, @as(u64, @truncate(@as(u128, @bitCast(stdx_time.nanoTimestamp())))) & ID_COUNTER_MASK),
+                }
+            }
+        },
+        else => std.c.arc4random_buf(&bytes, bytes.len),
+    }
+    return @max(1, std.mem.readInt(u64, &bytes, .little) & ID_COUNTER_MASK);
+}
+
 pub const TxnTable = struct {
     allocator: Allocator,
     /// Active transactions keyed by txn_id.
     map: std.AutoHashMap(u64, TxnState),
-    /// Counts this table's transactions: the low bits of their ids.
+    /// Counts this table's transactions: the low bits of their ids. It
+    /// starts at random: the table is in memory, so a restart or a new
+    /// leader starts it again, and a client still holding an id from
+    /// before must not reach a new transaction with it.
     next_id: u64,
     /// The shard this table belongs to: the high bits of its ids.
     shard_id: u16 = 0,
@@ -133,7 +160,7 @@ pub const TxnTable = struct {
         return .{
             .allocator = allocator,
             .map = std.AutoHashMap(u64, TxnState).init(allocator),
-            .next_id = 1,
+            .next_id = randomCounter(),
         };
     }
 
@@ -389,6 +416,18 @@ pub fn iterateBatch(payload: []const u8) ?BatchIterator {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
+
+test "TxnTable: two tables start their ids at different counters" {
+    var a = TxnTable.init(std.testing.allocator);
+    defer a.deinit();
+    var b = TxnTable.init(std.testing.allocator);
+    defer b.deinit();
+    const first = try a.begin(0, 0, 0);
+    // A restart's table: the id a client held from before isn't open in it.
+    try std.testing.expect(b.get(first) == null);
+    try std.testing.expect(try b.begin(0, 0, 0) != first);
+    try std.testing.expect(first & ID_COUNTER_MASK != 0);
+}
 
 test "TxnTable: begin / appendOp / drop lifecycle" {
     const t = std.testing;
