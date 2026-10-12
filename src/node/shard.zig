@@ -8414,7 +8414,7 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8486,7 +8486,7 @@ test "Shard: a KV commit answered with a failure instead of its batch drops its 
         defer _ = std.c.close(pipe_fds[1]);
         var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
         defer rn.deinit();
-        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
         defer shard.deinit();
         shard.raft_network = &rn;
         shard.wireHandlerShardPtrs();
