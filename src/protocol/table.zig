@@ -7,7 +7,7 @@ const ops = @import("ops.zig");
 const entries = @import("entries.zig");
 const kv_ops = @import("kv_ops.zig");
 
-pub const op_table = [_]ops.Op{ kv_ops.op("kv.get"), kv_ops.op("kv.set") };
+pub const op_table = kv_ops.table;
 pub const entry_table = [_]entries.Entry{};
 
 comptime {
@@ -19,6 +19,12 @@ comptime {
 /// the body coded by its schema.
 pub fn isOp(code: u16) bool {
     inline for (op_table) |op| if (op.code == code) return true;
+    return false;
+}
+
+/// Whether table op `code` may create its namespace.
+pub fn creates(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return op.creates;
     return false;
 }
 

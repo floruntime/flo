@@ -1,8 +1,8 @@
 //! Per-Shard KV Transactions.
 //!
-//! A transaction is pinned to one shard's partition at BEGIN time. All ops
-//! inside the txn must hash to the same partition (cross-shard ops fail fast
-//! with `kv_txn_cross_shard`). On COMMIT, the entire write set is appended
+//! A transaction is pinned to one shard's partition at BEGIN time, and every
+//! op inside it gives the routing key it was begun with (or is refused with
+//! `wrong_routing_key`). On COMMIT, the entire write set is appended
 //! to the UAL as a single `kv_batch` entry — atomicity is the same as any
 //! single Raft propose.
 //!

@@ -41,6 +41,7 @@
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
 const run_mod = @import("run.zig");
+const table = @import("../protocol/table.zig");
 const shard_walker_mod = @import("shard_walker.zig");
 
 /// ShardWalker specialized for name-list operations (ts_list, stream_list, etc.).
@@ -86,7 +87,6 @@ pub fn opWrites(op: proto.OpCode) bool {
         // Membership changes are made by the leader; a follower carries
         // them there like any write.
         .cluster_promote, .cluster_remove => true,
-        .kv_put, .kv_delete, .kv_incr, .kv_json_set, .kv_json_del, .kv_begin_txn, .kv_commit_txn, .kv_rollback_txn, .kv_touch, .kv_persist => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
         .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
@@ -101,10 +101,10 @@ pub fn opWrites(op: proto.OpCode) bool {
 
 /// Whether a write can bring a namespace's first data into being, and so
 /// may create the namespace. The other writes act on data that must
-/// already exist, and create no namespace.
+/// already exist, and create no namespace. A table op says so itself.
 pub fn opCreates(op: proto.OpCode) bool {
+    if (table.isOp(@intFromEnum(op))) return table.creates(@intFromEnum(op));
     return switch (op) {
-        .kv_put, .kv_incr, .kv_json_set, .kv_begin_txn => true,
         .stream_append, .stream_create, .stream_group_create => true,
         .queue_enqueue => true,
         .ts_write => true,

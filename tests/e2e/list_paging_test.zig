@@ -51,10 +51,37 @@ fn listPage(ctx: *stdx.testing.TestContext, op: proto.OpCode, cursor: []const u8
 }
 
 fn listPageOn(fd: std.c.fd_t, op: proto.OpCode, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
+    if (op == .kv_scan) return kvScanPage(fd, limit, cursor, out);
     var value: [4 + 256]u8 = undefined;
     std.mem.writeInt(u32, value[0..4], limit, .little);
     @memcpy(value[4..][0..cursor.len], cursor);
     return call(fd, op, "", value[0 .. 4 + cursor.len], out);
+}
+
+/// A kv.scan page, sent as the table op it is and given back in the other
+/// families' layout, so one pager reads them all.
+fn kvScanPage(fd: std.c.fd_t, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
+    const op = kv_ops.op("kv.scan");
+    var body_buf: [op.request.max_size]u8 = undefined;
+    const body = try op.request.encodeInto(&body_buf, .{ .limit = limit, .cursor = cursor });
+    var answer_buf: [256 * 1024]u8 = undefined;
+    const data = try call(fd, .kv_scan, "", body, &answer_buf);
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    const page = try op.response.decodeAll(data, &diag);
+    var pos: usize = 4;
+    std.mem.writeInt(u32, out[0..4], page.names.count, .little);
+    var it = page.names.iterator();
+    while (try it.next()) |name| {
+        std.mem.writeInt(u16, out[pos..][0..2], @intCast(name.len), .little);
+        @memcpy(out[pos + 2 ..][0..name.len], name);
+        std.mem.writeInt(u32, out[pos + 2 + name.len ..][0..4], 0, .little);
+        pos += 2 + name.len + 4;
+    }
+    const next = page.cursor orelse "";
+    out[pos] = @intFromBool(page.cursor != null);
+    std.mem.writeInt(u16, out[pos + 1 ..][0..2], @intCast(next.len), .little);
+    @memcpy(out[pos + 3 ..][0..next.len], next);
+    return out[0 .. pos + 3 + next.len];
 }
 
 /// Sends one request on `fd` and returns the data of its ok answer.
@@ -256,12 +283,9 @@ test "e2e/list: each CLI list client sends its limit in the value" {
         fn ts(c: *cli.Client) anyerror!cli.Response {
             return cli.ts.list(c, "default", 3, null);
         }
-        fn kv(c: *cli.Client) anyerror!cli.Response {
-            return cli.kv.scan(c, "default", "", null, 3);
-        }
     };
+    // kv.scan is a table op: its limit is a field of its body.
     try expectLimitInValue(Calls.stream, .stream_list);
     try expectLimitInValue(Calls.queue, .queue_list);
     try expectLimitInValue(Calls.ts, .ts_list);
-    try expectLimitInValue(Calls.kv, .kv_scan);
 }

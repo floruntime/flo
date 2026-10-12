@@ -31,12 +31,6 @@ pub const CommandResult = union(enum) {
     // Layer 1: KV Responses
     // =========================================================================
 
-    /// Value response (for GET, with optional version for time-travel)
-    kv_value: struct {
-        value: []const u8,
-        version: u64,
-    },
-
     /// Value not found
     kv_not_found: void,
 
@@ -53,45 +47,6 @@ pub const CommandResult = union(enum) {
     /// Conditional put failed (if_not_exists or if_exists condition not met)
     /// Returns conflict status to client
     kv_condition_not_met: void,
-
-    /// Scan response with key-value pairs (pre-serialized)
-    /// Wire format: [count:u32] ([key_len:u16][key][value_len:u32][value][version:u64])* [has_more:u8] [cursor_len:u16][cursor]?
-    /// If keys_only=true, version is omitted from wire format.
-    kv_scan_result: struct {
-        /// Pre-serialized wire data
-        data: []const u8,
-    },
-
-    /// History response with version entries (pre-serialized)
-    /// Wire format: [count:u32] ([value_len:u32][value][version:u64])*
-    kv_history_result: struct {
-        /// Pre-serialized wire data
-        data: []const u8,
-    },
-
-    /// Multi-GET response (pre-serialized)
-    /// Wire format: [count:u32] ([status:u8][key_len:u16][key][version:u64][value_len:u32][value])*
-    /// status: 0 = found, 2 = not_found (value_len=0, version=0 when not found)
-    kv_mget_result: struct {
-        /// Pre-serialized wire data
-        data: []const u8,
-    },
-
-    /// kv_begin_txn reply.
-    /// Wire format: [txn_id:u64 LE][pinned_hash:u64 LE]
-    kv_txn_begin_ok: struct {
-        txn_id: u64,
-        pinned_hash: u64,
-    },
-
-    /// kv_commit_txn reply (success). Carries the index assigned by Raft to
-    /// the batched UAL entry — clients can use it as a watermark for "all my
-    /// writes are now visible".
-    /// Wire format: [commit_index:u64 LE][op_count:u16 LE]
-    kv_txn_commit_ok: struct {
-        commit_index: u64,
-        op_count: u16,
-    },
 
     // =========================================================================
     // Layer 1: Stream Responses
@@ -508,13 +463,6 @@ pub const CommandResult = union(enum) {
 
         // KV errors (0x0100-0x01FF)
         kv_key_too_large = 0x0100,
-        kv_value_too_large = 0x0101,
-        kv_namespace_not_found = 0x0102,
-        kv_txn_unknown = 0x0110, // unknown or already-finalized txn id
-        kv_txn_cross_shard = 0x0111, // op key doesn't hash to txn's pinned partition
-        kv_txn_too_large = 0x0112, // exceeded ops/payload cap inside txn
-        kv_txn_timeout = 0x0113, // txn idle/total timeout reached server-side
-        kv_txn_unsupported_op = 0x0114, // op not allowed inside a txn (scan, mget, json, history)
 
         // Stream errors (0x0200-0x02FF)
         stream_not_found = 0x0200,
@@ -559,18 +507,12 @@ pub const CommandResult = union(enum) {
             return switch (code) {
                 .invalid_request,
                 .kv_key_too_large,
-                .kv_value_too_large,
-                .kv_txn_cross_shard,
-                .kv_txn_too_large,
-                .kv_txn_unsupported_op,
                 .stream_offset_out_of_range,
                 .queue_message_too_large,
                 .workflow_disabled,
                 => .bad_request,
                 .unauthorized => .unauthorized,
                 .not_found,
-                .kv_namespace_not_found,
-                .kv_txn_unknown,
                 .stream_not_found,
                 .stream_partition_not_found,
                 .queue_not_found,
@@ -600,7 +542,6 @@ pub const CommandResult = union(enum) {
                 .timeout,
                 .internal_error,
                 .committed_not_applied,
-                .kv_txn_timeout,
                 .group_rebalancing,
                 => .internal_error,
             };

@@ -14,8 +14,9 @@
 //!    notification path which projection to query and how to serialize the
 //!    response.  Handlers call `pool.notify(kind, key)` after mutations.
 //!
-//! 3. **Fixed-capacity, zero alloc** — The pool is a flat array with
-//!    swap-remove.  No heap allocations on the hot path.
+//! 3. **Fixed-capacity** — The pool is a flat array with swap-remove. A
+//!    key that fits the waiter's inline buffer allocates nothing; a longer
+//!    one is copied to the heap and freed when its waiter goes.
 //!
 //! 4. **Connection-safe** — Waiters name their connection by owner shard, fd
 //!    and conn id; if it closes before the waiter fires, `removeByConnection()`

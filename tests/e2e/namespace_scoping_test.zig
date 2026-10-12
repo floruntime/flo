@@ -126,7 +126,8 @@ test "e2e/scoping: a transaction is committed or rolled back only from its own n
     for ([_][]const u8{ "commit", "rollback" }) |verb| {
         var r = try ctx.cli.run(&.{ "kv", verb, tid, "-n", "b" });
         defer r.deinit();
-        try stdx.testing.assertContains(r, "transaction not found");
+        try testing.expectEqual(@as(u8, 1), r.exit_code);
+        try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, "\n"), "[not_found/no_such_transaction]"));
     }
     // A write in it from elsewhere learns no more: not found.
     var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "--routing-key", "k", "--txn", tid, "-n", "b" });

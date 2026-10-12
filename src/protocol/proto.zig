@@ -95,16 +95,14 @@ pub const OpCode = enum(u16) {
     kv_json_set = 0x10D,
     kv_json_del = 0x10E,
     // ── KV Per-Shard Transactions ───────────────────────────────────────
-    // Pinned to a single partition at BEGIN (via routing_key on the request key).
-    // All ops inside a txn carry txn_id (TLV option 0x09). Cross-shard ops
-    // fail fast with kv_txn_cross_shard. COMMIT emits one batched UAL entry
-    // (EntryType.kv_batch); ROLLBACK discards the in-memory write set.
+    // Pinned at BEGIN to the shard the request's key routes to; the id names
+    // that shard. COMMIT emits one batched UAL entry (EntryType.kv_batch);
+    // ROLLBACK discards the in-memory write set.
     kv_begin_txn = 0x110,
     kv_commit_txn = 0x111,
     kv_rollback_txn = 0x112,
-    // ── KV Extended (TTL lifecycle, exists) ─────────────────────────────
-    kv_touch = 0x113,
-    kv_persist = 0x114,
+    // ── KV Extended (TTL, exists) ───────────────────────────────────────
+    kv_expire = 0x113,
     kv_exists = 0x115,
 
     // ── Streams (0x130 – 0x14F) ──────────────────────────────────────────────
@@ -243,8 +241,6 @@ pub const OptionTag = enum(u8) {
     if_not_exists = 0x03, // void: Only set if key doesn't exist (NX)
     if_exists = 0x04, // void: Only set if key exists (XX)
     limit = 0x05, // u32: Maximum number of results for scan/list operations
-    routing_key = 0x08, // string: Explicit routing key for shard co-location (overrides key-based routing)
-    txn_id = 0x09, // u64: Per-shard transaction ID (returned by kv_begin_txn)
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255; lower is taken first)
@@ -836,14 +832,6 @@ pub const Request = struct {
         return null;
     }
 
-    /// Get routing_key option if present (convenience method for shard co-location)
-    pub fn getRoutingKey(self: Request) ?[]const u8 {
-        if (self.findOption(.routing_key)) |opt| {
-            return opt.asString();
-        }
-        return null;
-    }
-
     /// Get if_not_exists option (NX - only set if key doesn't exist)
     pub fn getIfNotExists(self: Request) bool {
         if (self.findOption(.if_not_exists)) |opt| {
@@ -1044,7 +1032,7 @@ test "TLV OptionsBuilder and Iterator" {
     // Build some options
     try builder.addU64(.ttl_ms, 3600);
     try builder.addU8(.priority, 5);
-    try builder.addString(.routing_key, "abc123");
+    try builder.addString(.partition_key, "abc123");
     try builder.addFlag(.if_not_exists);
 
     const options = builder.getOptions();
@@ -1062,9 +1050,9 @@ test "TLV OptionsBuilder and Iterator" {
     try std.testing.expectEqual(OptionTag.priority, priority_opt.tag);
     try std.testing.expectEqual(@as(u8, 5), priority_opt.asU8().?);
 
-    // Dedup key
+    // A string
     const dedup_opt = iter.next().?;
-    try std.testing.expectEqual(OptionTag.routing_key, dedup_opt.tag);
+    try std.testing.expectEqual(OptionTag.partition_key, dedup_opt.tag);
     try std.testing.expectEqualStrings("abc123", dedup_opt.asString());
 
     // Flag
@@ -1104,7 +1092,7 @@ test "Request with TLV options serialization" {
     try builder.addU64(.ttl_ms, 86400); // 1 day
 
     const request = Request{
-        .header = RequestHeader.init(.kv_touch, 42),
+        .header = RequestHeader.init(.queue_enqueue, 42),
         .namespace = "test",
         .key = "mykey",
         .value = "myvalue",

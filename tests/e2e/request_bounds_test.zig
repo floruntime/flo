@@ -90,12 +90,12 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
 
-    // [ns_len=0][key_len=2]"kN"[value_len=0], and no options_len; 16 keys so
-    // some route to another of the 4 shards. kv_exists is coded by hand, so
-    // its frame has the trailer to leave out.
+    // [ns_len=0][key_len=2]"qN"[value_len=1]"m", and no options_len; 16
+    // queues so some route to another of the 4 shards. queue_enqueue is coded
+    // by hand, so its frame has the trailer to leave out.
     for (0..16) |i| {
-        var h = header(.kv_exists);
-        const payload = [_]u8{ 0, 0, 2, 0, 'k', 'a' + @as(u8, @intCast(i)), 0, 0, 0, 0 };
+        var h = header(.queue_enqueue);
+        const payload = [_]u8{ 0, 0, 2, 0, 'q', 'a' + @as(u8, @intCast(i)), 1, 0, 0, 0, 'm' };
         h.payload_length = payload.len;
         h.crc32 = h.computeCRC32(&payload);
         var frame: [@sizeOf(proto.RequestHeader) + payload.len]u8 = undefined;
