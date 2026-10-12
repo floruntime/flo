@@ -520,7 +520,7 @@ test "e2e/kv: delete non-existent key" {
     try testing.expectEqual(@as(u8, 0), result.exit_code);
     try testing.expectEqualStrings("OK existed=false\n", result.stdout);
     try ctx.exec(&.{ "kv", "set", "existed", "v" });
-    try testing.expectEqualStrings("OK existed=true\n", try ctx.execCapture(&.{ "kv", "delete", "existed" }));
+    try testing.expectEqualStrings("OK existed=true", try ctx.execCapture(&.{ "kv", "delete", "existed" }));
 }
 
 test "e2e/kv: delete then get returns nil" {
@@ -1351,8 +1351,11 @@ test "e2e/kv: history shows multiple versions after overwrites" {
         try testing.expect(std.mem.endsWith(u8, line, value));
     }
     try testing.expect(lines.next() == null);
-    const one = try ctx.execCapture(&.{ "kv", "history", "hist_key", "--limit", "1", "-o", "raw" });
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "\n"));
+    var one = try ctx.cli.run(&.{ "kv", "history", "hist_key", "--limit", "1", "-o", "raw" });
+    defer one.deinit();
+    try testing.expectEqual(@as(u8, 0), one.exit_code);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, one.stdout, "\n"));
+    try testing.expect(std.mem.startsWith(u8, one.stdout, "3\t"));
 }
 
 test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
@@ -1395,7 +1398,10 @@ test "e2e/kv: history after delete preserves prior versions" {
     try ctx.exec(&.{ "kv", "delete", "del_hist" });
 
     // The delete is a version too, and the value before it is still there.
-    const output = try ctx.execCapture(&.{ "kv", "history", "del_hist", "-o", "raw" });
+    var result = try ctx.cli.run(&.{ "kv", "history", "del_hist", "-o", "raw" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    const output = result.stdout;
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "\n"));
     try testing.expect(std.mem.indexOf(u8, output, "alive_value") != null);
 }
@@ -1806,14 +1812,14 @@ test "e2e/kv: expire sets a TTL, --ttl-ms 0 clears it, and --cas-version guards 
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "session", "active" });
-    try testing.expectEqualStrings("OK\n", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "1h" }));
-    try testing.expectEqualStrings("OK\n", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "0" }));
+    try testing.expectEqualStrings("OK", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "1h" }));
+    try testing.expectEqualStrings("OK", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "0" }));
     var stale = try ctx.cli.run(&.{ "kv", "expire", "session", "--ttl-ms", "1h", "--cas-version", "99" });
     defer stale.deinit();
     try testing.expectEqual(@as(u8, 3), stale.exit_code);
     try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, stale.stderr, "\n"), "[conflict/cas_mismatch]"));
     const value = try ctx.execCapture(&.{ "kv", "get", "session", "-o", "raw" });
-    try testing.expectEqualStrings("active\n", value);
+    try testing.expectEqualStrings("active", value);
 }
 
 test "e2e/kv: expire on a missing key is not found, and --ttl-ms is required" {
