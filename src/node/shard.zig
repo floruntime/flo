@@ -118,7 +118,7 @@ pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
-/// Maximum single-request size we handle on the stack.
+/// The largest request a connection takes; `parse_buf` holds one whole.
 pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
 /// How much `readFromClient` reads from a socket at once.
 const READ_CHUNK: usize = 64 * 1024;
