@@ -409,14 +409,14 @@ test "e2e/kv: set with TTL expires after timeout" {
     try stdx.testing.assertContains(after, "(nil)");
 }
 
-test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it doesn't know, and touch --ttl 0 clears" {
+test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it doesn't know, and expire --ttl-ms 0 clears" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // Read as seconds, either TTL would outlive the test.
     try ctx.exec(&.{ "kv", "set", "ms_key", "ms_value", "--ttl-ms", "800ms" });
     try ctx.exec(&.{ "kv", "set", "touched_key", "touched_value" });
-    try ctx.exec(&.{ "kv", "touch", "touched_key", "--ttl", "800ms" });
+    try ctx.exec(&.{ "kv", "expire", "touched_key", "--ttl-ms", "800ms" });
     var early = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
     defer early.deinit();
     try testing.expect(early.stdoutContains("ms_value"));
@@ -442,7 +442,7 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it 
 
     // 0 is the one bare number: it clears.
     try ctx.exec(&.{ "kv", "set", "cleared_key", "kept", "--ttl-ms", "1s" });
-    try ctx.exec(&.{ "kv", "touch", "cleared_key", "--ttl", "0" });
+    try ctx.exec(&.{ "kv", "expire", "cleared_key", "--ttl-ms", "0" });
     @import("stdx").time.sleep(1500 * std.time.ns_per_ms);
     var kept = try ctx.cli.run(&.{ "kv", "get", "cleared_key", "--output", "table" });
     defer kept.deinit();
@@ -514,11 +514,13 @@ test "e2e/kv: delete non-existent key" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv delete never_existed
-    // Deleting non-existent key should not error (idempotent)
+    // Deleting a key that doesn't exist succeeds, and says it didn't.
     var result = try ctx.cli.run(&.{ "kv", "delete", "never_existed" });
     defer result.deinit();
-    // May succeed or return not found - both are acceptable
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expectEqualStrings("OK existed=false\n", result.stdout);
+    try ctx.exec(&.{ "kv", "set", "existed", "v" });
+    try testing.expectEqualStrings("OK existed=true\n", try ctx.execCapture(&.{ "kv", "delete", "existed" }));
 }
 
 test "e2e/kv: delete then get returns nil" {
@@ -1340,13 +1342,39 @@ test "e2e/kv: history shows multiple versions after overwrites" {
     try ctx.exec(&.{ "kv", "set", "hist_key", "version_two" });
     try ctx.exec(&.{ "kv", "set", "hist_key", "version_three" });
 
-    // Request history
-    const output = try ctx.execCapture(&.{ "kv", "history", "hist_key" });
+    // Newest first: version, when (ms), value.
+    const output = try ctx.execCapture(&.{ "kv", "history", "hist_key", "-o", "raw" });
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    for ([_][]const u8{ "3\t", "2\t", "1\t" }, [_][]const u8{ "version_three", "version_two", "version_one" }) |version, value| {
+        const line = lines.next() orelse return error.TooFewVersions;
+        try testing.expect(std.mem.startsWith(u8, line, version));
+        try testing.expect(std.mem.endsWith(u8, line, value));
+    }
+    try testing.expect(lines.next() == null);
+    const one = try ctx.execCapture(&.{ "kv", "history", "hist_key", "--limit", "1", "-o", "raw" });
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, one, "\n"));
+}
 
-    // Should mention the key
-    try testing.expect(std.mem.indexOf(u8, output, "hist_key") != null);
-    // Should contain data (non-empty history output)
-    try testing.expect(output.len > 0);
+test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    // Sixteen keys spread across the shards; each is read from a client
+    // connection on whichever shard accepted it.
+    var key_buf: [16]u8 = undefined;
+    for (0..16) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "spread-{d}", .{i});
+        try ctx.exec(&.{ "kv", "set", key, "one" });
+        try ctx.exec(&.{ "kv", "set", key, "two" });
+    }
+    for (0..16) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "spread-{d}", .{i});
+        var result = try ctx.cli.run(&.{ "kv", "history", key, "-o", "raw" });
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 0), result.exit_code);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.stdout, "\n"));
+        try testing.expect(std.mem.startsWith(u8, result.stdout, "2\t"));
+    }
 }
 
 test "e2e/kv: history for non-existent key fails" {
@@ -1366,9 +1394,10 @@ test "e2e/kv: history after delete preserves prior versions" {
     try ctx.exec(&.{ "kv", "set", "del_hist", "alive_value" });
     try ctx.exec(&.{ "kv", "delete", "del_hist" });
 
-    // History should still return data (tombstone + prior version)
-    const output = try ctx.execCapture(&.{ "kv", "history", "del_hist" });
-    try testing.expect(std.mem.indexOf(u8, output, "del_hist") != null);
+    // The delete is a version too, and the value before it is still there.
+    const output = try ctx.execCapture(&.{ "kv", "history", "del_hist", "-o", "raw" });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "\n"));
+    try testing.expect(std.mem.indexOf(u8, output, "alive_value") != null);
 }
 
 // =============================================================================
@@ -1703,7 +1732,7 @@ test "e2e/kv/cluster: mget after node failure" {
 }
 
 // =============================================================================
-// New KV Operations: INCR / TOUCH / PERSIST / EXISTS / JSON.*
+// KV Operations: INCR / EXPIRE / EXISTS / JSON.*
 // Drives the CLI binary against a live server (CLI → TCP → handler → projection).
 // =============================================================================
 
@@ -1719,12 +1748,12 @@ test "e2e/kv: incr creates and increments counter" {
     const v2 = try ctx.execCapture(&.{ "kv", "incr", "counter" });
     try testing.expect(std.mem.indexOf(u8, v2, "2") != null);
 
-    // --by adds an explicit delta.
-    const v3 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--by", "40" });
+    // --delta adds an explicit delta.
+    const v3 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--delta", "40" });
     try testing.expect(std.mem.indexOf(u8, v3, "42") != null);
 
     // Negative delta decrements.
-    const v4 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--by", "-2" });
+    const v4 = try ctx.execCapture(&.{ "kv", "incr", "counter", "--delta", "-2" });
     try testing.expect(std.mem.indexOf(u8, v4, "40") != null);
 }
 
@@ -1737,7 +1766,8 @@ test "e2e/kv: incr rejects non-counter values" {
 
     var result = try ctx.cli.run(&.{ "kv", "incr", "not_a_counter" });
     defer result.deinit();
-    try stdx.testing.assertFailed(result);
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
+    try testing.expectEqualStrings("Error: bad request: the key's value isn't an 8-byte counter [bad_request/wrong_type]", std.mem.trimEnd(u8, result.stderr, "\n"));
 }
 
 test "e2e/kv: incr on a string whose TTL has run out starts a new counter" {
@@ -1771,45 +1801,32 @@ test "e2e/kv: exists returns 1 for existing, 0 for missing" {
     try stdx.testing.assertStdoutContains(missing, "0");
 }
 
-test "e2e/kv: touch sets ttl, persist clears it" {
+test "e2e/kv: expire sets a TTL, --ttl-ms 0 clears it, and --cas-version guards it" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     try ctx.exec(&.{ "kv", "set", "session", "active" });
-
-    // touch with --ttl 1h (server-side; we don't sleep — just verify ack).
-    var touch_ok = try ctx.cli.run(&.{ "kv", "touch", "session", "--ttl", "1h" });
-    defer touch_ok.deinit();
-    try stdx.testing.assertSucceeded(touch_ok);
-    try stdx.testing.assertStdoutContains(touch_ok, "OK");
-
-    // persist removes the TTL.
-    var persist_ok = try ctx.cli.run(&.{ "kv", "persist", "session" });
-    defer persist_ok.deinit();
-    try stdx.testing.assertSucceeded(persist_ok);
-    try stdx.testing.assertStdoutContains(persist_ok, "OK");
-
-    // Value still readable.
-    const value = try ctx.execCapture(&.{ "kv", "get", "session" });
-    try testing.expect(std.mem.indexOf(u8, value, "active") != null);
+    try testing.expectEqualStrings("OK\n", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "1h" }));
+    try testing.expectEqualStrings("OK\n", try ctx.execCapture(&.{ "kv", "expire", "session", "--ttl-ms", "0" }));
+    var stale = try ctx.cli.run(&.{ "kv", "expire", "session", "--ttl-ms", "1h", "--cas-version", "99" });
+    defer stale.deinit();
+    try testing.expectEqual(@as(u8, 3), stale.exit_code);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, stale.stderr, "\n"), "[conflict/cas_mismatch]"));
+    const value = try ctx.execCapture(&.{ "kv", "get", "session", "-o", "raw" });
+    try testing.expectEqualStrings("active\n", value);
 }
 
-test "e2e/kv: touch on missing key fails" {
+test "e2e/kv: expire on a missing key is not found, and --ttl-ms is required" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    var result = try ctx.cli.run(&.{ "kv", "touch", "nosuch", "--ttl", "1m" });
+    var result = try ctx.cli.run(&.{ "kv", "expire", "nosuch", "--ttl-ms", "1m" });
     defer result.deinit();
-    try stdx.testing.assertFailed(result);
-}
-
-test "e2e/kv: persist on missing key fails" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.run(&.{ "kv", "persist", "nosuch" });
-    defer result.deinit();
-    try stdx.testing.assertFailed(result);
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try testing.expectEqualStrings("Error: not found [not_found/not_found]", std.mem.trimEnd(u8, result.stderr, "\n"));
+    var bare = try ctx.cli.run(&.{ "kv", "expire", "nosuch" });
+    defer bare.deinit();
+    try testing.expectEqual(@as(u8, 2), bare.exit_code);
 }
 
 test "e2e/kv: jset + jget round trip" {
@@ -1886,15 +1903,17 @@ test "e2e/kv: jget invalid path errors" {
 
     try ctx.exec(&.{ "kv", "jset", "doc2", "{\"a\":1}" });
 
-    // Path missing leading $ is rejected.
+    // Path missing leading $ is refused by name.
     var bad = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "no.dollar" });
     defer bad.deinit();
-    try stdx.testing.assertFailed(bad);
+    try testing.expectEqual(@as(u8, 3), bad.exit_code);
+    try testing.expectEqualStrings("Error: bad request: path isn't a JSON path [bad_request/malformed]", std.mem.trimEnd(u8, bad.stderr, "\n"));
 
-    // Missing field returns failure.
+    // Nothing at the path is not found.
     var missing = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "$.nope" });
     defer missing.deinit();
-    try stdx.testing.assertFailed(missing);
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
+    try testing.expectEqualStrings("Error: not found: nothing at that path in the document [not_found/not_found]", std.mem.trimEnd(u8, missing.stderr, "\n"));
 }
 
 test "e2e/kv: jdel root removes whole key" {

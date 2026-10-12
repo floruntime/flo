@@ -339,10 +339,10 @@ pub fn deleteKVKey(allocator: Allocator, namespace: []const u8, key: []const u8,
     var client = loopbackConnect(allocator, ctx) catch
         return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.kv.delete(&client, namespace, key, null, null, null) catch
+    var resp = client_mod.kv.call(&client, "kv.delete", namespace, key, .{ .cas_version = null, .routing_key = null, .txn = null }) catch
         return try h.jsonError(allocator, "KV delete failed");
     defer resp.deinit();
-    if (resp.isError() and !resp.isNotFound()) return try h.jsonError(allocator, resp.errorMessage());
+    if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();

@@ -57,7 +57,8 @@ test "e2e/kv: a key holding a NUL is refused, and a default listing shows only d
         const value = switch (op) {
             .kv_put => try kv_ops.plainSetBody(&body_buf, "overwrite"),
             .kv_get => try kv_ops.plainGetBody(&body_buf),
-            else => "overwrite",
+            // kv.delete: no cas_version, routing key or txn.
+            else => &[_]u8{ 0, 0, 0 },
         };
         const r = try rawCall(ctx, op, "", "b\x00k", value, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);

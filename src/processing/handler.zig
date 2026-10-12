@@ -1748,7 +1748,6 @@ pub const ProcessingHandler = struct {
         };
         const kv = self.resolveKvHandler(shard.kv_handler, snk.namespace, full_key);
         const result = kv.sinkPut(req);
-        defer kv.freeResult(result);
         if (result == .err) self.noteSinkDrop(shard, "kv", full_key, result.err.message);
     }
 

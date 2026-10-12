@@ -1,217 +1,32 @@
 //! KV Client Operations
 //!
-//! Key-Value operations for the Flo CLI client.
-//! All functions take a *Client and namespace as parameters.
+//! Every KV op is a table op: its body is the op's request schema, and its
+//! answer, when ok, is the op's response schema.
 
 const std = @import("std");
 const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
-const proto = @import("../../protocol/proto.zig");
 const kv_ops = @import("../../protocol/kv_ops.zig");
 
 pub const get_op = kv_ops.op("kv.get");
 pub const set_op = kv_ops.op("kv.set");
 
-/// Read a key. A read that waits is read for as long plus 5 s.
+/// Send KV op `name` with `body`. A get that waits is read for as long plus
+/// 5 s.
+pub fn call(client: *Client, comptime name: []const u8, namespace: []const u8, key: []const u8, body: kv_ops.op(name).request.Value) !Response {
+    if (comptime std.mem.eql(u8, name, "kv.get")) {
+        if (body.wait_ms > 0) client.setReadTimeoutSec(@intCast(body.wait_ms / 1000 + 5));
+    }
+    return client.call(kv_ops.op(name), namespace, key, body);
+}
+
+/// Read a key.
 pub fn get(client: *Client, namespace: []const u8, key: []const u8, body: get_op.request.Value) !Response {
-    if (body.wait_ms > 0) client.setReadTimeoutSec(@intCast(body.wait_ms / 1000 + 5));
-    return client.call(get_op, namespace, key, body);
+    return call(client, "kv.get", namespace, key, body);
 }
 
 /// Write a key.
 pub fn set(client: *Client, namespace: []const u8, key: []const u8, body: set_op.request.Value) !Response {
-    return client.call(set_op, namespace, key, body);
-}
-
-/// Execute a DEL command
-pub fn delete(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
-    if (routing_key != null or txn_id != null or cas_version != null) {
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_delete, namespace, key, "", builder.getOptions());
-    }
-    return client.sendRequest(.kv_delete, namespace, key, "");
-}
-
-/// One page of a key scan; value [limit:u32][cursor] like every list op.
-pub fn scan(client: *Client, namespace: []const u8, prefix: []const u8, cursor: ?[]const u8, limit: ?u32) !Response {
-    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
-    return client.sendRequest(.kv_scan, namespace, prefix, try base.walkValue(&value_buf, limit, cursor));
-}
-
-/// Execute a HISTORY command (get version history for a key)
-pub fn history(client: *Client, namespace: []const u8, key: []const u8, limit: ?u32) !Response {
-    if (limit) |l| {
-        var options_buf: [16]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        builder.addU32(.limit, l) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_history, namespace, key, "", builder.getOptions());
-    }
-    return client.sendRequest(.kv_history, namespace, key, "");
-}
-
-/// Execute a batch GET (MGET) command — multiple keys in one request.
-/// Keys are packed in the value field: [count:u16]([key_len:u16][key])*
-pub fn mget(client: *Client, namespace: []const u8, keys: []const []const u8) !Response {
-    if (keys.len == 0) return error.EmptyBatch;
-    if (keys.len > 256) return error.BatchTooLarge;
-
-    // Pack keys into value field: [count:u16]([key_len:u16][key])*
-    var value_buf: [64 * 1024]u8 = undefined; // 64KB for up to 256 keys
-    var offset: usize = 0;
-
-    // Write count
-    std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(keys.len), .little);
-    offset += 2;
-
-    for (keys) |key| {
-        if (offset + 2 + key.len > value_buf.len) return error.BatchTooLarge;
-        std.mem.writeInt(u16, value_buf[offset..][0..2], @intCast(key.len), .little);
-        offset += 2;
-        @memcpy(value_buf[offset..][0..key.len], key);
-        offset += key.len;
-    }
-
-    return client.sendRequest(.kv_mget, namespace, "", value_buf[0..offset]);
-}
-
-// ── Extended KV Operations (KV_ENHANCEMENTS phase 1) ─────────────────────
-
-/// INCR — atomic counter increment. Wire format: value is 8-byte i64 LE delta.
-/// Pass delta=0 to read-only increment-by-zero is rejected; default to 1 if 0.
-/// Returns kv_value with 8-byte i64 LE counter value.
-pub fn incr(client: *Client, namespace: []const u8, key: []const u8, delta: i64, routing_key: ?[]const u8, txn_id: ?u64) !Response {
-    var val_buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &val_buf, delta, .little);
-
-    if (routing_key != null or txn_id != null) {
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_incr, namespace, key, &val_buf, builder.getOptions());
-    }
-    return client.sendRequest(.kv_incr, namespace, key, &val_buf);
-}
-
-/// TOUCH — update an existing key's TTL, in milliseconds. 0 clears the TTL
-/// (same as PERSIST).
-pub fn touch(client: *Client, namespace: []const u8, key: []const u8, ttl_ms: u64, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
-    var val_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &val_buf, ttl_ms, .little);
-
-    if (routing_key != null or txn_id != null or cas_version != null) {
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_touch, namespace, key, &val_buf, builder.getOptions());
-    }
-    return client.sendRequest(.kv_touch, namespace, key, &val_buf);
-}
-
-/// PERSIST — clear the TTL on an existing key. No value payload required.
-pub fn persist(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64, cas_version: ?u64) !Response {
-    if (routing_key != null or txn_id != null or cas_version != null) {
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        if (cas_version) |cv| builder.addU64(.cas_version, cv) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_persist, namespace, key, "", builder.getOptions());
-    }
-    return client.sendRequest(.kv_persist, namespace, key, "");
-}
-
-/// EXISTS — check whether a key exists. Returns kv_value with a single byte: 0x01 if present, 0x00 if absent.
-pub fn exists(client: *Client, namespace: []const u8, key: []const u8, routing_key: ?[]const u8, txn_id: ?u64) !Response {
-    if (routing_key != null or txn_id != null) {
-        var options_buf: [96]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        if (routing_key) |rk| builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        if (txn_id) |tid| builder.addU64(.txn_id, tid) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_exists, namespace, key, "", builder.getOptions());
-    }
-    return client.sendRequest(.kv_exists, namespace, key, "");
-}
-
-/// JSON.GET — extract a JSONPath subtree from a JSON-encoded value.
-/// Path syntax: $, $.field, $.a.b, $.arr[0]. Defaults to "$" if empty.
-pub fn jsonGet(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, routing_key: ?[]const u8) !Response {
-    if (routing_key) |rk| {
-        var options_buf: [64]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_json_get, namespace, key, path, builder.getOptions());
-    }
-    return client.sendRequest(.kv_json_get, namespace, key, path);
-}
-
-/// JSON.SET — set a JSON value at `path` (read-modify-write).
-/// Wire format: value = [path_len:u16][path][json].
-pub fn jsonSet(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, json_value: []const u8, routing_key: ?[]const u8) !Response {
-    if (path.len > 0xFFFF) return error.PathTooLong;
-    const total = 2 + path.len + json_value.len;
-    const buf = try client.allocator.alloc(u8, total);
-    defer client.allocator.free(buf);
-
-    std.mem.writeInt(u16, buf[0..2], @intCast(path.len), .little);
-    @memcpy(buf[2 .. 2 + path.len], path);
-    @memcpy(buf[2 + path.len ..], json_value);
-
-    if (routing_key) |rk| {
-        var options_buf: [64]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_json_set, namespace, key, buf, builder.getOptions());
-    }
-    return client.sendRequest(.kv_json_set, namespace, key, buf);
-}
-
-/// JSON.DEL — remove the value at `path`. Path "$" deletes the entire key.
-pub fn jsonDel(client: *Client, namespace: []const u8, key: []const u8, path: []const u8, routing_key: ?[]const u8) !Response {
-    if (routing_key) |rk| {
-        var options_buf: [64]u8 = undefined;
-        var builder = proto.OptionsBuilder.init(&options_buf);
-        builder.addString(.routing_key, rk) catch return error.OptionsBufferTooSmall;
-        return client.sendRequestWithOptions(.kv_json_del, namespace, key, path, builder.getOptions());
-    }
-    return client.sendRequest(.kv_json_del, namespace, key, path);
-}
-
-// ── Per-Shard Transactions ───────────────────────────────────────────────
-
-/// BEGIN — open a per-shard transaction pinned to `routing_key`'s partition.
-/// On success the response carries the new txn_id.
-/// Use `Response.getTxnId()` to extract it.
-pub fn beginTxn(client: *Client, namespace: []const u8, routing_key: []const u8) !Response {
-    var options_buf: [96]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-    if (routing_key.len > 0) {
-        builder.addString(.routing_key, routing_key) catch return error.OptionsBufferTooSmall;
-    }
-    return client.sendRequestWithOptions(.kv_begin_txn, namespace, routing_key, "", builder.getOptions());
-}
-
-/// COMMIT — atomically apply all buffered ops in the transaction.
-/// `routing_key` must be the same one used at BEGIN so the request reaches
-/// the txn's pinned shard.
-pub fn commitTxn(client: *Client, namespace: []const u8, txn_id: u64) !Response {
-    var options_buf: [16]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-    builder.addU64(.txn_id, txn_id) catch return error.OptionsBufferTooSmall;
-    return client.sendRequestWithOptions(.kv_commit_txn, namespace, "", "", builder.getOptions());
-}
-
-/// ROLLBACK — discard the in-memory write set without committing.
-pub fn rollbackTxn(client: *Client, namespace: []const u8, txn_id: u64) !Response {
-    var options_buf: [16]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-    builder.addU64(.txn_id, txn_id) catch return error.OptionsBufferTooSmall;
-    return client.sendRequestWithOptions(.kv_rollback_txn, namespace, "", "", builder.getOptions());
+    return call(client, "kv.set", namespace, key, body);
 }

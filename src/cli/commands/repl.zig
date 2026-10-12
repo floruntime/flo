@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const schema = @import("../../protocol/schema.zig");
+const kv_ops = @import("../../protocol/kv_ops.zig");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const cli_config = @import("../config.zig");
@@ -265,7 +266,7 @@ fn executeDel(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    var result = client_mod.kv.delete(client, namespace, key, null, null, null) catch |err| {
+    var result = client_mod.kv.call(client, "kv.delete", namespace, key, .{ .cas_version = null, .routing_key = null, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };
@@ -275,12 +276,16 @@ fn executeDel(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         ctx.print("(error) {s}\n", .{result.errorMessage()});
         return;
     }
-
-    ctx.print("(integer) 1\n", .{});
+    var diag: schema.Diagnostic = .{};
+    const answer = kv_ops.op("kv.delete").response.decodeAll(result.data, &diag) catch {
+        ctx.print("(error) malformed delete response\n", .{});
+        return;
+    };
+    ctx.print("(integer) {d}\n", .{@intFromBool(answer.existed orelse true)});
 }
 
 fn executeKeys(client: *Client, ctx: *commander.Context, namespace: []const u8) void {
-    var result = client_mod.kv.scan(client, namespace, "", null, 100) catch |err| {
+    var result = client_mod.kv.call(client, "kv.scan", namespace, "", .{ .limit = 100, .cursor = "" }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };
@@ -290,13 +295,15 @@ fn executeKeys(client: *Client, ctx: *commander.Context, namespace: []const u8) 
         ctx.print("(error) {s}\n", .{result.errorMessage()});
         return;
     }
-
-    // Parse response - scan returns raw binary data
-    if (result.data.len > 0) {
-        ctx.print("(response: {d} bytes)\n", .{result.data.len});
-    } else {
-        ctx.print("(empty array)\n", .{});
-    }
+    var diag: schema.Diagnostic = .{};
+    const answer = kv_ops.op("kv.scan").response.decodeAll(result.data, &diag) catch {
+        ctx.print("(error) malformed scan response\n", .{});
+        return;
+    };
+    if (answer.names.count == 0) return ctx.print("(empty array)\n", .{});
+    var it = answer.names.iterator();
+    var i: usize = 1;
+    while (it.next() catch null) |name| : (i += 1) ctx.print("{d}) \"{s}\"\n", .{ i, name });
 }
 
 // ==================== Testing ====================

@@ -242,6 +242,18 @@ pub fn printJson(ctx: anytype, allocator: Allocator, value: anytype, comptime op
     ctx.print("{s}\n", .{aw.written()});
 }
 
+/// Print any value as compact JSON with no newline after it: one element
+/// of a list printed a piece at a time.
+pub fn printInline(ctx: anytype, allocator: Allocator, value: anytype) void {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    aw.writer.print("{f}", .{std.json.fmt(value, .{})}) catch |err| {
+        ctx.print("Error serializing JSON: {}\n", .{err});
+        return;
+    };
+    ctx.print("{s}", .{aw.written()});
+}
+
 /// Print any value as compact JSON (no whitespace)
 pub fn printCompact(ctx: anytype, allocator: Allocator, value: anytype) void {
     printJson(ctx, allocator, value, .{});

@@ -1697,6 +1697,8 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .unavailable, down.offlineMessage(&buf));
             return;
         }
+        // A table op decodes its own page request and walks from its handler.
+        if (table.isOp(op_idx)) return self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
 
         // Drive ShardWalker — sequential shard scan with cursor pagination
         const walker = NameWalker.init(scan_fn, @intCast(contexts.len));
@@ -1750,8 +1752,6 @@ pub const Shard = struct {
         // Serialize and send — select wire format based on opcode
         const op_enum: proto.OpCode = @enumFromInt(op_idx);
         const data = switch (op_enum) {
-            // kv_scan uses scan wire format: [count:u32]([key_len:u16][key][value_len:u32(=0)])*[has_more:u8][cursor_len:u16][cursor]
-            .kv_scan => serializeWalkKeysAsScan(self.allocator, deduped[0..dedup_count], result.next_cursor),
             // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
             .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream, req.namespace),
             // queue_list uses rich binary format with per-queue stats
@@ -4960,49 +4960,6 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
     return buf;
 }
 
-/// Serialize walk results in KV scan wire format (keys_only mode).
-///
-/// Wire format: [count:u32] ([key_len:u16][key][value_len:u32(=0)])* [has_more:u8] [cursor_len:u16][cursor]
-///
-/// This matches the KV scan response format that the CLI expects, with
-/// value_len=0 for each entry (keys-only walk).
-fn serializeWalkKeysAsScan(allocator: std.mem.Allocator, keys: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-
-    var total: usize = 4; // count: u32
-    for (keys) |k| {
-        total += 2 + k.len; // key_len: u16 + key bytes
-        total += 4; // value_len: u32 (always 0)
-    }
-    total += 1; // has_more: u8
-    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    std.mem.writeInt(u32, buf[0..4], @intCast(keys.len), .little);
-    var pos: usize = 4;
-    for (keys) |k| {
-        // Key
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(k.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..k.len], k);
-        pos += k.len;
-        // Value length = 0 (keys-only)
-        std.mem.writeInt(u32, buf[pos..][0..4], 0, .little);
-        pos += 4;
-    }
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-    return buf;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Waiter Callbacks — used by WaiterPool for timeout and resolution
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -6394,12 +6351,12 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
             .shard => |t| try std.testing.expectEqual(case.to.?, t.shard_id),
         }
     }
-    for ([_]proto.OpCode{ .kv_commit_txn, .kv_rollback_txn }) |op| {
-        var opt_buf: [16]u8 = undefined;
-        var ob = proto.OptionsBuilder.init(&opt_buf);
-        try ob.addU64(.txn_id, makeId(1, 3));
-        const req = testReq(op, 4, "", "", "", ob.getOptions());
-        switch (a.resolveTarget(@intFromEnum(op), req)) {
+    inline for (.{ "kv.txn_commit", "kv.txn_rollback" }) |name| {
+        const op = table_run.op(name);
+        var body_buf: [16]u8 = undefined;
+        const body = try op.request.encodeInto(&body_buf, .{ .txn = makeId(1, 3) });
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(@enumFromInt(op.code), 4), .namespace = "", .key = "", .value = body };
+        switch (a.resolveTarget(op.code, req)) {
             .local => return error.TestUnexpectedResult,
             .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
         }

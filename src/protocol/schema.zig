@@ -428,6 +428,41 @@ fn ListOf(comptime T: type, comptime max: u32, comptime max_bytes: ?u32) type {
             try w.int(P, @intCast(v.count));
             try w.put(v.bytes);
         }
+
+        /// Builds a list an element at a time into `buf`, taking each only
+        /// while the list stays within its bounds and `buf`: how an answer
+        /// fills a list as far as one frame allows.
+        pub const Builder = struct {
+            w: Writer,
+            count: u32 = 0,
+
+            pub fn init(buf: []u8) Builder {
+                return .{ .w = .{ .buf = buf } };
+            }
+
+            /// Adds `item`; false, with nothing added, when it wouldn't fit.
+            pub fn add(b: *Builder, item: T.Value) EncodeError!bool {
+                if (b.count == max) return false;
+                const before = b.w.pos;
+                T.encode(&b.w, item) catch |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        b.w.pos = before;
+                        return false;
+                    },
+                    else => return err,
+                };
+                if (max_bytes) |bytes| if (b.w.pos > bytes) {
+                    b.w.pos = before;
+                    return false;
+                };
+                b.count += 1;
+                return true;
+            }
+
+            pub fn value(b: *const Builder) Value {
+                return .{ .bytes = b.w.written(), .count = b.count };
+            }
+        };
     };
 }
 
@@ -862,4 +897,30 @@ test "schema: the rules refuse a tail anywhere but last, a zero-size or tail lis
     try testing.expect(comptime recordRule(&.{.{ .name = "Bad", .T = Bool }}) != null);
     try testing.expect(comptime fitsRule(String(100), 101, "s") == null);
     try testing.expect(comptime fitsRule(String(100), 100, "s") != null);
+}
+
+test "schema: a list builder takes elements until the next one wouldn't fit, and round-trips" {
+    const L = BoundedList(Bytes(8), 3, 12);
+    var buf: [64]u8 = undefined;
+    var b = L.Builder.init(&buf);
+    try std.testing.expect(try b.add("abcd")); // 1 + 4
+    try std.testing.expect(try b.add("ef")); // 1 + 2: 8 bytes
+    try std.testing.expect(!try b.add("ghijk")); // 14 > 12: refused, nothing added
+    try std.testing.expect(try b.add("g")); // 10
+    try std.testing.expect(!try b.add("")); // a fourth is past the count
+    const v = b.value();
+    try std.testing.expectEqual(@as(u32, 3), v.count);
+    var out: [64]u8 = undefined;
+    var w: Writer = .{ .buf = &out };
+    try L.encode(&w, v);
+    var diag: Diagnostic = .{};
+    var r: Reader = .{ .bytes = w.written(), .diag = &diag };
+    var it = (try L.decode(&r, "")).iterator();
+    for ([_][]const u8{ "abcd", "ef", "g" }) |want| try std.testing.expectEqualStrings(want, (try it.next()).?);
+
+    // A buffer too small for the next element stops the list there too.
+    var tiny: [3]u8 = undefined;
+    var t = L.Builder.init(&tiny);
+    try std.testing.expect(try t.add("ab"));
+    try std.testing.expect(!try t.add("c"));
 }

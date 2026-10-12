@@ -21,7 +21,8 @@ test "e2e/exit: ok is 0, a missing key is 1, a bad flag is 2, a refusal is 3" {
     try expectExit(ctx, 0, &.{ "kv", "set", "present", "v" });
     try expectExit(ctx, 0, &.{ "kv", "get", "present" });
     try expectExit(ctx, 1, &.{ "kv", "get", "absent" });
-    try expectExit(ctx, 1, &.{ "kv", "delete", "absent" });
+    // Deleting a key that doesn't exist succeeds.
+    try expectExit(ctx, 0, &.{ "kv", "delete", "absent" });
     try expectExit(ctx, 2, &.{ "kv", "get", "present", "--no-such-flag" });
     try expectExit(ctx, 2, &.{ "kv", "set", "k", "v", "--condition", "maybe" });
     try expectExit(ctx, 2, &.{"bogus"});

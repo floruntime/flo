@@ -63,36 +63,13 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
     try ctx.exec(&.{ "kv", "set", "doc", "{\"a\":1}" });
 
     var out: [4096]u8 = undefined;
-    var obuf: [32]u8 = undefined;
-    const huge = try option(&obuf, .ttl_ms, u64, std.math.maxInt(u64));
     // kv.set's body: "v2", then ttl_ms present and past its bound, condition
     // always, no cas, routing key or txn.
     const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ [_]u8{0xff} ** 8 ++ [_]u8{ 1, 0, 0, 0, 0 };
     try expectRefused(try rawCall(ctx, .kv_put, "k", &set_body, "", &out), "kv.set: ttl_ms is out of range");
-    var ttl: [8]u8 = undefined;
-    std.mem.writeInt(u64, &ttl, std.math.maxInt(u64), .little);
-    try expectRefused(try rawCall(ctx, .kv_touch, "k", &ttl, "", &out), "ttl too large");
-    // [path_len][path][json]
-    const set = [_]u8{ 3, 0 } ++ "$.a".* ++ "2".*;
-    try expectRefused(try rawCall(ctx, .kv_json_set, "doc", &set, huge, &out), "ttl too large");
-
-    try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
-    try testing.expectEqualStrings("{\"a\":1}", try kvValue(ctx, "doc", &out));
-}
-
-test "e2e/time: a TTL option that isn't 8 bytes is refused, and the key keeps its value" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-    try ctx.exec(&.{ "kv", "set", "k", "v" });
-    try ctx.exec(&.{ "kv", "set", "doc", "{\"a\":1}" });
-
-    var out: [4096]u8 = undefined;
-    // [tag][len][u32 ms]: read as no TTL, the key would never expire. (A
-    // kv.set's ttl_ms is a fixed u64 field, so only the hand-coded ops take
-    // the option.)
-    const short = [_]u8{ @intFromEnum(proto.OptionTag.ttl_ms), 4, 0xe8, 0x03, 0, 0 };
-    const set = [_]u8{ 3, 0 } ++ "$.a".* ++ "2".*;
-    try expectRefused(try rawCall(ctx, .kv_json_set, "doc", &set, &short, &out), "ttl_ms must be 8 bytes");
+    // kv.expire's body: ttl_ms past its bound, then no cas, routing key or txn.
+    const expire_body = [_]u8{0xff} ** 8 ++ [_]u8{ 0, 0, 0 };
+    try expectRefused(try rawCall(ctx, .kv_expire, "k", &expire_body, "", &out), "kv.expire: ttl_ms is out of range");
 
     try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
     try testing.expectEqualStrings("{\"a\":1}", try kvValue(ctx, "doc", &out));

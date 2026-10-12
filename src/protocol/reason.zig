@@ -61,6 +61,11 @@ pub const Reason = enum(u16) {
     writes_stopped = 22,
     /// Too many writes wait for commit.
     too_many_proposals = 23,
+    /// The key holds a value the op doesn't work on: a counter that isn't
+    /// 8 bytes, a document that isn't JSON.
+    wrong_type = 24,
+    /// The shard holds as many open transactions as it may.
+    too_many_transactions = 25,
 };
 
 /// Whether a refused request took effect.

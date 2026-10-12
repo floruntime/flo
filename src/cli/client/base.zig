@@ -38,29 +38,7 @@ pub const Response = struct {
         return self.status == .not_found;
     }
 
-    /// Check if this is a conflict response (CAS failure or condition not met)
-    pub fn isConflict(self: Response) bool {
-        return self.status == .conflict;
-    }
-
-    /// Get the data as a string (for KV values)
-    /// Wire format for KV GET response: [version: u64][value: bytes]
-    /// The version is an 8-byte prefix before the actual value
-    pub fn asString(self: Response) ?[]const u8 {
-        if (self.status == .ok and self.data.len > 0) {
-            // KV GET response has 8-byte version prefix before the value
-            if (self.data.len >= 8) {
-                // Skip the 8-byte version prefix, return remaining bytes as value
-                return self.data[8..];
-            }
-            // If less than 8 bytes, something is wrong - return empty
-            return null;
-        }
-        return null;
-    }
-
-    /// Get raw response data without parsing (for scan/history responses)
-    /// Use this for responses that don't have the 8-byte version prefix
+    /// The answer's data as it came, when ok and not empty.
     pub fn asRawData(self: Response) ?[]const u8 {
         if (self.status == .ok and self.data.len > 0) {
             return self.data;
@@ -99,27 +77,6 @@ pub const Response = struct {
             .rate_limited => "Rate limit exceeded",
             .unavailable => "Unavailable",
             _ => "Unknown error",
-        };
-    }
-
-    /// Decode a transaction begin answer.
-    /// Wire payload: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE].
-    /// Returns null if the response is not a valid begin-ok envelope.
-    pub fn getTxnBeginResult(self: Response) ?struct { txn_id: u64, pinned_hash: u64 } {
-        if (self.status != .ok or self.data.len < 17 or self.data[0] != 0) return null;
-        return .{
-            .txn_id = std.mem.readInt(u64, self.data[1..9], .little),
-            .pinned_hash = std.mem.readInt(u64, self.data[9..17], .little),
-        };
-    }
-
-    /// Decode a transaction commit answer.
-    /// Wire payload: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE].
-    pub fn getTxnCommitResult(self: Response) ?struct { commit_index: u64, op_count: u16 } {
-        if (self.status != .ok or self.data.len < 11 or self.data[0] != 1) return null;
-        return .{
-            .commit_index = std.mem.readInt(u64, self.data[1..9], .little),
-            .op_count = std.mem.readInt(u16, self.data[9..11], .little),
         };
     }
 };
