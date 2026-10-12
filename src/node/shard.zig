@@ -64,6 +64,7 @@ const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
+const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
@@ -119,6 +120,11 @@ const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 
 /// Maximum single-request size we handle on the stack.
 pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
+/// How much `readFromClient` reads from a socket at once.
+const READ_CHUNK: usize = 64 * 1024;
+/// The largest answer or payload a handler builds in `scratch`: a whole
+/// kv.get answer, header included.
+pub const SCRATCH_SIZE: usize = @sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size;
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
@@ -388,6 +394,18 @@ pub const Shard = struct {
     /// handler proposes. Allocated at boot so an out-of-memory is a boot
     /// failure, not a committed write that never reaches the projection.
     apply_buf: []u8,
+    /// The per-request buffers, owned here rather than declared on the
+    /// stack: a safe build fills a stack buffer declared `undefined` on
+    /// every call, which for these sizes cost more than the request. Each
+    /// is used by one function, which no handler re-enters.
+    /// Socket bytes on their way into a connection's read ring.
+    read_buf: []u8,
+    /// A whole request, copied out of the ring to parse.
+    parse_buf: []u8,
+    /// The entry `persistence.proposeEntry` builds.
+    entry_buf: []u8,
+    /// One buffer for a handler's answer or payload; see `Scratch`.
+    scratch: Scratch,
     /// True while `applyCommitted` is draining, so a waiter woken by an
     /// apply that proposes in turn cannot start a nested drain.
     applying: bool,
@@ -620,6 +638,14 @@ pub const Shard = struct {
 
         const apply_buf = try allocator.alloc(u8, kv_handler_mod.MAX_APPLY_PAYLOAD);
         errdefer allocator.free(apply_buf);
+        const read_buf = try allocator.alloc(u8, READ_CHUNK);
+        errdefer allocator.free(read_buf);
+        const parse_buf = try allocator.alloc(u8, MAX_REQUEST_SIZE);
+        errdefer allocator.free(parse_buf);
+        const entry_buf = try allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
+        errdefer allocator.free(entry_buf);
+        var scratch = try Scratch.init(allocator, SCRATCH_SIZE);
+        errdefer scratch.deinit(allocator);
 
         if (data_dir) |dir| {
             // Build shard-specific data directory: data_dir/00000/
@@ -894,6 +920,10 @@ pub const Shard = struct {
             .forward_proxy = forward_proxy,
             .replay_registry = replay_registry,
             .apply_buf = apply_buf,
+            .read_buf = read_buf,
+            .parse_buf = parse_buf,
+            .entry_buf = entry_buf,
+            .scratch = scratch,
             .applying = false,
             .last_entry_applied = true,
             .wake_workers = false,
@@ -1117,6 +1147,10 @@ pub const Shard = struct {
         self.allocator.free(self.rpc_arena);
         self.allocator.free(self.rpc_out);
         self.allocator.free(self.apply_buf);
+        self.allocator.free(self.read_buf);
+        self.allocator.free(self.parse_buf);
+        self.allocator.free(self.entry_buf);
+        self.scratch.deinit(self.allocator);
 
         // Clean up partitions (each owns UAL + all projections)
         for (self.partitions) |p| {
@@ -3696,7 +3730,7 @@ pub const Shard = struct {
 
             // Read no more than the read buffer has room for: bytes read and
             // not kept would be requests silently lost.
-            var tmp_buf: [65536]u8 = undefined;
+            const tmp_buf = self.read_buf;
             if (conn.read_buf.writable() == 0) {
                 // A request may be larger than the buffer: grow it to hold one
                 // whole request. Full at that size, the client sent more than a
@@ -3786,7 +3820,7 @@ pub const Shard = struct {
 
             // A contiguous copy to parse; bytes are consumed only once a
             // whole request is taken, so the rest stay in order.
-            var parse_buf: [MAX_REQUEST_SIZE]u8 = undefined;
+            const parse_buf = self.parse_buf;
             const copied = conn.read_buf.copyOut(parse_buf[0..to_copy]);
             if (copied < header_size) break;
 
@@ -5033,8 +5067,10 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// Answers a waiting `kv.get`.
 fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
     const Response = table_run.op("kv.get").response;
-    var buf: [@sizeOf(proto.ResponseHeader) + Response.max_size]u8 = undefined;
-    if (table_run.encodeAnswer(Response, &buf, waiter.request_id, .{ .version = version, .value = value })) |bytes| {
+    const size = @sizeOf(proto.ResponseHeader) + Response.max_size;
+    const buf = shard.scratch.borrow(size)[0..size];
+    defer shard.scratch.release(buf);
+    if (table_run.encodeAnswer(Response, buf, waiter.request_id, .{ .version = version, .value = value })) |bytes| {
         shard.deliverDeferred(waiter.reply_to, bytes);
     } else {
         // The waiter is gone once this returns; an asker left without an

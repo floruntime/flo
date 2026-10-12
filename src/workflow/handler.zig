@@ -4282,6 +4282,8 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.replay_registry = .{};
     actions.registerReplay(&shard.replay_registry);
     shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
+    shard.entry_buf = try std.testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
+    shard.scratch = try @import("../node/scratch.zig").Scratch.init(std.testing.allocator, shard_mod.SCRATCH_SIZE);
     shard.durability = .async_flush;
     shard.pending = try std.testing.allocator.alloc(shard_mod.Pending, shard_mod.PENDING_SLOTS);
     @memset(shard.pending, .{});
@@ -4302,6 +4304,8 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.destroy(shard.partitions[0]);
     std.testing.allocator.free(shard.partitions);
     std.testing.allocator.free(shard.apply_buf);
+    std.testing.allocator.free(shard.entry_buf);
+    shard.scratch.deinit(std.testing.allocator);
     std.testing.allocator.free(shard.pending);
 }
 
