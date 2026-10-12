@@ -109,7 +109,9 @@ pub fn proposeEntry(
     if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
     const ns_hash = router.namespaceHash(namespace);
 
-    var payload_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
+    // The shard's own buffer: one on the stack is filled on every call in
+    // a safe build.
+    const payload_buf = shard.entry_buf;
     const cmd = CommandPayload{
         .namespace_hash = ns_hash,
         .key_length = @intCast(key.len),
@@ -117,7 +119,7 @@ pub fn proposeEntry(
         .key = key,
         .value = value,
     };
-    const payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
+    const payload_len = cmd.serialize(payload_buf) orelse return error.PayloadTooLarge;
     return shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
 }
 
@@ -187,7 +189,8 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
             return error.NotLeader;
         }
     };
-    const shard = struct { raft_node: FakeRaft }{ .raft_node = .{} };
+    var entry_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
+    const shard = struct { raft_node: FakeRaft, entry_buf: []u8 }{ .raft_node = .{}, .entry_buf = &entry_buf };
     const long = @as([(MAX_ENTRY_KEY + 1)]u8, @splat('k'));
     try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
     try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
