@@ -578,40 +578,39 @@ pub const Runtime = struct {
         self.health = node_health;
         try self.startHttp(bind_ip);
 
-        // 2. Create shards
+        // 2. Create shards, replaying each one's log, several at once.
         const shards = try self.allocator.alloc(Shard, self.shard_count);
-        var shards_created: usize = 0;
-        errdefer {
-            for (0..shards_created) |i| {
-                shards[i].deinit();
+        var boot: ShardBoot = .{
+            .runtime = self,
+            .shards = shards,
+            .health = node_health,
+            .data_dir = data_dir,
+            .pipes = pipes,
+            .cluster_node_id = cluster_node_id,
+            .shard0_role = shard0_role,
+            .raft_config = raft_config,
+            .failed = try self.allocator.alloc(?anyerror, self.shard_count),
+        };
+        defer self.allocator.free(boot.failed);
+        @memset(boot.failed, null);
+        boot.run();
+        if (boot.firstError()) |err| {
+            for (shards, boot.failed) |*shard, failed| {
+                if (failed == null) shard.deinit();
             }
+            self.allocator.free(shards);
+            self.stopHttp();
+            return err;
+        }
+        errdefer {
+            for (shards) |*shard| shard.deinit();
             self.allocator.free(shards);
             self.shards = null;
         }
         // Runs before the shards are freed: the dashboard reads them.
         errdefer self.stopHttp();
-
-        for (0..self.shard_count) |i| {
-            node_health.shards[i].set(.replaying);
-            shards[i] = try Shard.init(
-                self.allocator,
-                @intCast(i),
-                self.shard_count,
-                self.config.partition_count,
-                pipes[i][0],
-                data_dir,
-                self.config.tiered_log.hot_buffer_capacity,
-                self.config.tiered_log.max_hot_entries,
-                self.config.tiered_log.hot_flush_seconds,
-                self.config.durability,
-                cluster_node_id,
-                if (i == 0) shard0_role else .single,
-                raft_config,
-            );
-            shards_created += 1;
-            shards[i].health = &node_health.shards[i];
-        }
         self.shards = shards;
+        const shards_created = shards.len;
 
         try self.wireWalkContexts(shards);
 
@@ -1094,6 +1093,97 @@ pub const Runtime = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Booting the shards
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Initialises every shard, replaying each one's log, on up to one worker
+/// per CPU. Each worker takes the next shard and builds it in its slot.
+/// What a shard creates (its reactor, io_uring ring or kqueue, mailbox and
+/// files) is tied to no thread, so it can be built on a worker and run on
+/// its own thread after. A failure stops the other replays early.
+const ShardBoot = struct {
+    runtime: *Runtime,
+    shards: []Shard,
+    health: *NodeHealth,
+    data_dir: []const u8,
+    pipes: []const [2]i32,
+    cluster_node_id: u32,
+    shard0_role: shard_mod.ClusterRole,
+    raft_config: RaftNodeConfig,
+    /// Per shard: why its init failed, or null once it is built.
+    failed: []?anyerror,
+    next: std.atomic.Value(usize) = .init(0),
+    cancel: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ShardBoot) void {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        const workers = @max(1, @min(self.shards.len, cpus));
+        var threads: [server_config.MAX_SHARDS]std.Thread = undefined;
+        var spawned: usize = 0;
+        // This thread is one of the workers.
+        while (spawned + 1 < workers) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, work, .{self}) catch break;
+        }
+        self.work();
+        for (threads[0..spawned]) |t| t.join();
+    }
+
+    fn work(self: *ShardBoot) void {
+        const rt = self.runtime;
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.shards.len) return;
+            if (self.cancel.load(.monotonic)) {
+                self.failed[i] = error.BootCancelled;
+                continue;
+            }
+            const slot = &self.health.shards[i];
+            slot.set(.replaying);
+            if (Shard.init(
+                rt.allocator,
+                @intCast(i),
+                rt.shard_count,
+                rt.config.partition_count,
+                self.pipes[i][0],
+                self.data_dir,
+                rt.config.tiered_log.hot_buffer_capacity,
+                rt.config.tiered_log.max_hot_entries,
+                rt.config.tiered_log.hot_flush_seconds,
+                rt.config.durability,
+                self.cluster_node_id,
+                if (i == 0) self.shard0_role else .single,
+                self.raft_config,
+                .{ .health = slot, .cancel = &self.cancel },
+            )) |shard| {
+                self.shards[i] = shard;
+                self.failed[i] = null;
+                // Replayed: say so now, not when every shard is done. Its
+                // thread has not started, so publishing here races nothing.
+                self.shards[i].publishHealth();
+            } else |err| {
+                self.failed[i] = err;
+                if (err != error.BootCancelled) {
+                    log.err("shard {d} could not start: {s}", .{ i, @errorName(err) });
+                    self.cancel.store(true, .monotonic);
+                }
+            }
+        }
+    }
+
+    /// The error that failed the boot: the first that was not another
+    /// shard stopping because of it.
+    fn firstError(self: *const ShardBoot) ?anyerror {
+        var cancelled = false;
+        for (self.failed) |f| {
+            const err = f orelse continue;
+            if (err != error.BootCancelled) return err;
+            cancelled = true;
+        }
+        return if (cancelled) error.BootCancelled else null;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Thread entry points
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1249,6 +1339,34 @@ test "Runtime: boot 2 shards and shutdown" {
 
     runtime.stop();
     try std.testing.expect(!runtime.started);
+}
+
+test "Runtime: a shard that cannot boot fails the start with its own error, and nothing is left behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(data_dir);
+    // Shard 2's directory is a file, so its init fails; the others boot,
+    // or stop early, and are freed.
+    {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
+        defer std.testing.allocator.free(path);
+        const f = try stdx.fs.createFileAbsolute(path, .{});
+        stdx.fs.closeFile(f);
+    }
+
+    var runtime = try Runtime.init(std.testing.allocator, .{
+        .num_shards = 4,
+        .listen_port = 0,
+        .data_dir = data_dir,
+        .metrics_enabled = false,
+        .dashboard_enabled = false,
+    });
+    defer runtime.deinit();
+    // Shard 2's own error, not the others' stopping because of it.
+    try std.testing.expectError(error.NotDir, runtime.start());
+    try std.testing.expect(!runtime.started);
+    try std.testing.expect(runtime.shards == null);
 }
 
 test "RuntimeConfig: single-node does not want a Raft listener" {

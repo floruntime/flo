@@ -445,6 +445,16 @@ pub const Shard = struct {
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
 
+    /// What booting a shard needs from the runtime. Both are optional: a
+    /// shard built in a test has neither.
+    pub const Boot = struct {
+        /// Where replay progress is published while the shard boots.
+        health: ?*health_mod.ShardSlot = null,
+        /// Set when another shard's boot failed: replay stops early, so the
+        /// failure is reported without waiting for every replay to finish.
+        cancel: ?*const std.atomic.Value(bool) = null,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         shard_id: u16,
@@ -459,6 +469,7 @@ pub const Shard = struct {
         node_id: u32,
         cluster_role: ClusterRole,
         raft_config: raft_node_mod.Config,
+        boot: Boot,
     ) !Shard {
         var reactor = try Reactor.init(allocator);
         errdefer reactor.deinit();
@@ -733,7 +744,8 @@ pub const Shard = struct {
                 const log_files = durable_log.?;
                 if (listDurable(log_files)) |files| {
                     for (files) |f| watermark = @max(watermark, f.commit_index_at_seal);
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id, &losses);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id, &losses, boot);
+                    if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
                     // A snapshot covers its prefix already; draining from
                     // below it would apply those entries a second time.
@@ -862,6 +874,7 @@ pub const Shard = struct {
             .offline = if (cluster_role == .single) boot_damage else null,
             .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
+            .health = boot.health,
             .conflicts_seen = 0,
             .join_first_asked_ms = 0,
             .join_warned_ms = 0,
@@ -5522,7 +5535,16 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
 const ReplayOutcome = struct {
     applied_through: u64 = 0,
     damage: ?silent_loss.Damage = null,
+    /// Another shard's boot failed, and this one stopped early.
+    cancelled: bool = false,
+    /// Entries read back, for the progress lines.
+    entries: u64 = 0,
+    started_ms: u64 = 0,
+    next_line_ms: u64 = 0,
 };
+
+/// How often a long replay says how far it has got.
+const REPLAY_PROGRESS_MS: u64 = 5_000;
 
 /// Replay all .flseg segment files in `dir_path`: every entry is restored
 /// into the Raft log and applied through `applyEntryCore`, exactly as when
@@ -5542,13 +5564,21 @@ fn replaySegments(
     raft_log: *RaftLog,
     shard_id: u16,
     losses: *silent_loss.Counts,
+    boot: Shard.Boot,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
     // guard does not skip lower-index entries.
-    var out: ReplayOutcome = .{};
+    const now = Shard.nowMs();
+    var out: ReplayOutcome = .{ .started_ms = now, .next_line_ms = now + REPLAY_PROGRESS_MS };
+    var last: u64 = 0;
+    for (files) |sf| last = @max(last, sf.last_index);
+    if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
     for (files) |sf| {
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id, losses, &out);
-        if (out.damage != null) break;
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id, losses, boot, last, &out);
+        if (out.damage != null or out.cancelled) break;
+    }
+    if (out.entries > 0 and !out.cancelled) {
+        log.info("shard {d}: replayed {d} entries in {d} ms", .{ shard_id, out.entries, Shard.nowMs() -| out.started_ms });
     }
     return out;
 }
@@ -5563,6 +5593,8 @@ fn replaySegmentFile(
     raft_log: *RaftLog,
     shard_id: u16,
     losses: *silent_loss.Counts,
+    boot: Shard.Boot,
+    last: u64,
     out: *ReplayOutcome,
 ) void {
     const name = std.fs.path.basename(full_path);
@@ -5584,6 +5616,22 @@ fn replaySegmentFile(
             return;
         };
         offset += seg_entry.totalSize();
+
+        if (boot.cancel) |cancel| {
+            if (cancel.load(.monotonic)) {
+                out.cancelled = true;
+                return;
+            }
+        }
+        out.entries += 1;
+        if (boot.health) |slot| slot.replay_index.store(seg_entry.header.index, .monotonic);
+        if (out.entries % 4096 == 0) {
+            const now = Shard.nowMs();
+            if (now >= out.next_line_ms) {
+                out.next_line_ms = now + REPLAY_PROGRESS_MS;
+                log.info("shard {d} replaying: index {d} of {d}", .{ shard_id, seg_entry.header.index, last });
+            }
+        }
 
         // Every durable entry is part of the Raft log, snapshot or not.
         if (restoreRaftEntry(shard_id, raft_log, &seg_entry, replay_from)) |damage| {
@@ -5610,7 +5658,7 @@ test "Shard: init and deinit" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
@@ -5623,7 +5671,7 @@ test "Shard: add and remove connections" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     // Create test pipes to use as fake connection fds
@@ -5644,7 +5692,7 @@ test "Shard: dispatch ping via pipe-based connection" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     // Track dispatched pings
@@ -5689,7 +5737,7 @@ test "Shard: inbox shutdown message" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     shard.running = true;
@@ -5717,7 +5765,7 @@ test "Shard: a first member leads a group of itself from the log; a joiner waits
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var first = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{});
+    var first = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{}, .{});
     defer first.deinit();
     try std.testing.expectEqual(raft_node_mod.Role.leader, first.raft_node.role);
     // The term's noop, then the config naming this node; both committed.
@@ -5729,7 +5777,7 @@ test "Shard: a first member leads a group of itself from the log; a joiner waits
     try std.testing.expectEqual(@as(u8, 1), first.raft_node.committed_config.member_count);
     try std.testing.expectEqual(@as(u32, 7), first.raft_node.committed_config.members[0].id);
 
-    var joiner = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+    var joiner = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
     defer joiner.deinit();
     try std.testing.expectEqual(raft_node_mod.Role.follower, joiner.raft_node.role);
     try std.testing.expect(!joiner.raft_node.timer_enabled);
@@ -5741,7 +5789,7 @@ test "Shard: a joiner enters as a replica the lone voter commits alone; caught u
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     const raft = shard.raft_node;
@@ -5795,7 +5843,7 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
 
@@ -5826,7 +5874,7 @@ test "Shard: a node with a stale config takes a promoted voter's append and vote
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 3, .join, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 3, .join, .{}, .{});
     defer shard.deinit();
     const raft = shard.raft_node;
     // Its latest config: 1 votes, 2 and 3 are replicas. 1 has since made 2
@@ -5858,7 +5906,7 @@ test "Shard: a frame from a node the membership does not name is dropped, a join
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     const raft = shard.raft_node;
@@ -5903,7 +5951,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     var pair: [2]std.posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
@@ -5953,7 +6001,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -5995,7 +6043,7 @@ test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minut
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -6034,7 +6082,7 @@ test "Shard: a proxy answer comes out whole; one the proxy refused comes out as 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const proxy = shard.forward_proxy;
     var err_buf: [256]u8 = undefined;
@@ -6145,7 +6193,7 @@ test "Shard: a client that sends without reading is paced: its requests wait unt
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -6200,7 +6248,7 @@ test "Shard: a client that sends its whole pipeline before reading is unpaced on
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -6290,7 +6338,7 @@ test "Shard: a connection marked closing runs no more of its requests and is clo
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -6323,7 +6371,7 @@ const TwoShards = struct {
     fn init(self: *TwoShards) !void {
         for (&self.pipes, 0..) |*p, i| {
             p.* = try @import("stdx").io.pipe();
-            self.shards[i] = try Shard.init(std.testing.allocator, @intCast(i), 2, 4096, p[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+            self.shards[i] = try Shard.init(std.testing.allocator, @intCast(i), 2, 4096, p[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         }
         for (0..2) |i| {
             self.mailboxes[i] = self.shards[i].mailbox;
@@ -7330,10 +7378,10 @@ test "Shard: a shard keeps waiter room for reads from elsewhere — other shards
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var lone = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var lone = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer lone.deinit();
     try std.testing.expect(!lone.waiter_pool.split);
-    var member = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+    var member = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
     defer member.deinit();
     try std.testing.expect(member.waiter_pool.split);
 }
@@ -7342,7 +7390,7 @@ test "Shard: a connection's blocking reads on its own shard count toward its 8: 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -7491,7 +7539,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -7547,7 +7595,7 @@ test "Shard: a first frame in another protocol is answered as an invalid request
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     // A Redis command gets what stray HTTP gets: Flo does not speak it.
@@ -7577,7 +7625,7 @@ test "Shard: a client from another table or protocol is answered in its own vers
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
     var want_table: [128]u8 = undefined;
@@ -7619,7 +7667,7 @@ test "Shard: a request with a header flag set is refused, naming the flags" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -7644,7 +7692,7 @@ test "Shard: requests resumed at the end of a tick run, and keep the next poll f
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -7673,7 +7721,7 @@ test "Shard: an answer too large to frame is answered with an error" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
@@ -7694,7 +7742,7 @@ test "Shard: a wake flag from another shard is acted on at the next drain, once 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.workflow_handler.triggers_dirty = false;
     for (0..5) |_| shard.mailbox.wake.set(.stream_appended);
@@ -7710,7 +7758,7 @@ test "Shard: the inbox gauges follow the drain" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     var sm = ShardMetrics{ .shard_id = 0 };
     shard.shard_metrics = &sm;
@@ -7736,7 +7784,7 @@ test "Shard: a forwarded write that cannot be parsed is answered, so its forward
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     shard.raft_network = &rn;
@@ -7766,7 +7814,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     shard.raft_network = &rn;
@@ -7803,7 +7851,7 @@ test "Shard: a diverged node refuses writes even if it led" {
     defer rn.deinit();
     var q = try RaftQueue.init(std.testing.allocator, 2048);
     defer q.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.raft_queue = &q;
@@ -7833,7 +7881,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     const raft = shard.raft_node;
@@ -7969,8 +8017,8 @@ test "Shard: a data directory that belonged to a group refuses to run alone, and
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    try std.testing.expectError(error.DataDirWasClustered, Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}));
-    var member = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    try std.testing.expectError(error.DataDirWasClustered, Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{}));
+    var member = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
     defer member.deinit();
     try std.testing.expectEqual(raft_node_mod.Role.follower, member.raft_node.role);
     try std.testing.expect(member.raft_node.timer_enabled);
@@ -7990,18 +8038,18 @@ test "Shard: a member with no log starts guarded, durably, and one with hard sta
     defer _ = std.c.close(pipe_fds[1]);
 
     {
-        var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+        var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
         defer joiner.deinit();
         try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, joiner.raft_node.lost_log);
     }
     // On disk before the shard answers anything, so a restart keeps it.
     try std.testing.expect((try hard_state_mod.load(shard_dir)).?.lost_log);
     {
-        var again = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+        var again = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
         defer again.deinit();
         try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, again.raft_node.lost_log);
     }
-    try std.testing.expectError(error.LostLogFounding, Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}));
+    try std.testing.expectError(error.LostLogFounding, Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{}));
 
     // Restarted part way through catching up: a log, and still guarded.
     const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/segs", .{shard_dir});
@@ -8017,7 +8065,7 @@ test "Shard: a member with no log starts guarded, durably, and one with hard sta
     try w.addEntry(&cfg);
     w.commit_index_at_seal = 2;
     try w.writeToFile(segs);
-    var midway = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    var midway = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
     defer midway.deinit();
     try std.testing.expectEqual(@as(u64, 2), midway.raft_node.log.lastIndex());
     try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, midway.raft_node.lost_log);
@@ -8048,7 +8096,7 @@ test "Shard: a member that kept its log but lost its hard state confirms the ter
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var member = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    var member = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
     defer member.deinit();
     try std.testing.expectEqual(raft_node_mod.LostLog.confirming, member.raft_node.lost_log);
     try std.testing.expect((try hard_state_mod.load(shard_dir)).?.lost_log);
@@ -8076,7 +8124,7 @@ test "Shard: --join with a log but no config entry and no hard state is guarded 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{});
+    var joiner = try Shard.init(std.testing.allocator, 0, 2, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
     defer joiner.deinit();
     try std.testing.expectEqual(raft_node_mod.LostLog.catching_up, joiner.raft_node.lost_log);
 }
@@ -8140,7 +8188,7 @@ test "Shard: a parked write that committed but didn't apply says so, with ran = 
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8182,7 +8230,7 @@ const RanTest = struct {
     fn init(t: *RanTest) !void {
         t.pipe_fds = try @import("stdx").io.pipe();
         t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
         t.shard.raft_network = &t.rn;
         t.shard.wireHandlerShardPtrs();
         try ParkTest.joinPeer(&t.shard);
@@ -8277,7 +8325,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     shard.raft_network = &rn;
@@ -8307,7 +8355,7 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8467,7 +8515,7 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8529,7 +8577,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8629,7 +8677,7 @@ test "Shard: what the tick's workflow steps propose is sent to the followers in 
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8667,7 +8715,7 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8701,7 +8749,7 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8779,7 +8827,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8830,7 +8878,7 @@ test "Shard: park answers from its own entry when a later one has already commit
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -8872,7 +8920,7 @@ test "Shard: namespace settings are refused with their reason, and nothing is pr
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8902,7 +8950,7 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8933,7 +8981,7 @@ test "Shard: a blocking stream read wakes on its own namespace's append, even on
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -8989,7 +9037,7 @@ test "Shard: a blocking read on one partition skips other partitions' appends wi
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -9043,7 +9091,7 @@ test "Shard: a blocking group read wakes on its own namespace's append, not a sa
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -9083,7 +9131,7 @@ test "Shard: a deferred answer too large to frame reaches its client as an error
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
 
     var pair: [2]std.posix.fd_t = undefined;
@@ -9108,7 +9156,7 @@ test "Shard: a parked request leaves the pending table before its responder runs
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -9150,7 +9198,7 @@ test "Shard: a burst of first writes to a new namespace proposes one implicit cr
     defer _ = std.c.close(pipe_fds[1]);
     var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
     defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
     defer shard.deinit();
     shard.raft_network = &rn;
     shard.wireHandlerShardPtrs();
@@ -9240,7 +9288,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
@@ -9323,7 +9371,7 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
@@ -9357,7 +9405,7 @@ test "a truncated suffix is gone from the segments a restart replays" {
     defer _ = std.c.close(pipe_fds[1]);
 
     {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
 
@@ -9375,7 +9423,7 @@ test "a truncated suffix is gone from the segments a restart replays" {
         try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
     }
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
@@ -9405,7 +9453,7 @@ test "a committed entry the durable log cannot serve fails the drain instead of 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
@@ -9452,7 +9500,7 @@ test "a truncation the previous run recorded is finished before replay" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
@@ -9472,7 +9520,7 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
     defer _ = std.c.close(pipe_fds[1]);
 
     {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
         _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
@@ -9500,7 +9548,7 @@ test "a snapshot ahead of the commit watermark is not drained over at boot" {
         try ShardManifest.setLatestSnapshot(std.testing.allocator, shard_dir, name);
     }
 
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
@@ -9530,7 +9578,7 @@ test "a restarted node stamps after the last entry its log replays, though its c
     var ahead: Ahead = .{ .ns = @intCast(@import("stdx").time.nanoTimestamp() + std.time.ns_per_day) };
     var last: u64 = 0;
     {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
         shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
@@ -9540,7 +9588,7 @@ test "a restarted node stamps after the last entry its log replays, though its c
     }
 
     // Back on the true clock, a day behind what it stamped.
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
@@ -9553,7 +9601,7 @@ test "KV reads on a shard judge expiry by its Raft node's time, not the host's w
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -9591,7 +9639,7 @@ const ReadTest = struct {
 
     fn init(self: *ReadTest) !void {
         self.pipe_fds = try @import("stdx").io.pipe();
-        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         self.shard.wireHandlerShardPtrs();
         try std.testing.expect(self.shard.applyCommitted());
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
@@ -9681,7 +9729,7 @@ const SyncAlone = struct {
         self.data_dir = try testDataDir(tmp);
         self.segs_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/00000/segs", .{self.data_dir}, 0);
         self.pipe_fds = try @import("stdx").io.pipe();
-        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{ .self_counts_when_durable = true });
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{ .self_counts_when_durable = true }, .{});
         self.shard.wireHandlerShardPtrs();
         try std.testing.expect(self.shard.applyCommitted());
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
@@ -9821,7 +9869,7 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try shard.flushSegmentToDisk();
@@ -9864,7 +9912,7 @@ test "Shard: an await that claims a pending run at once gets exactly one answer,
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -9913,7 +9961,7 @@ test "Shard: a parked await and an invoke reusing its request id each get one an
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -9962,7 +10010,7 @@ test "Shard: a handler answering its own request as deferred is caught, and answ
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -9993,7 +10041,7 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10029,7 +10077,7 @@ test "Shard: a request whose handler answers nothing is answered internal_error 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10060,7 +10108,7 @@ test "Shard: an answer refused for a full write buffer is not taken for a missin
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     var sm = ShardMetrics{ .shard_id = 0 };
     shard.shard_metrics = &sm;
@@ -10152,7 +10200,7 @@ const AdminTest = struct {
     fn init(self: *AdminTest, node_id: u32, role: ClusterRole) !void {
         self.pipe_fds = try @import("stdx").io.pipe();
         self.rn = try RaftNetwork.init(std.testing.allocator, node_id, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, role, .{});
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, node_id, role, .{}, .{});
         self.shard.raft_network = &self.rn;
         self.shard.wireHandlerShardPtrs();
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
@@ -10315,7 +10363,7 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10347,7 +10395,7 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10399,7 +10447,7 @@ const DamageTest = struct {
     }
 
     fn open(self: *DamageTest) !Shard {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{});
         shard.wireHandlerShardPtrs();
         return shard;
     }
@@ -10551,7 +10599,7 @@ test "an entry no projection or applier can take is counted on its path, and its
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
     // A 4 KiB partition ring: an 8 KiB entry cannot enter it.
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, 4096, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, 4096, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10582,7 +10630,7 @@ test "a committed entry this node cannot read back takes its shard offline, and 
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
@@ -10649,7 +10697,7 @@ test "a client write whose entry does not apply is told so, whether it commits a
 
     // Alone, the entry commits as it is proposed and applies inside `park`.
     {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
         shard.dispatcher.register(.kv_put, UnappliedWrite.handle);
@@ -10666,7 +10714,7 @@ test "a client write whose entry does not apply is told so, whether it commits a
     {
         var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
         defer rn.deinit();
-        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
         defer shard.deinit();
         shard.raft_network = &rn;
         shard.wireHandlerShardPtrs();
@@ -10729,7 +10777,7 @@ test "Shard: the state it publishes follows the fields that decide it, the one n
     // Alone: each field, in turn, outranks the ones set before it.
     {
         var slot: health_mod.ShardSlot = .{};
-        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.health = &slot;
         shard.publishHealth();
@@ -10761,7 +10809,7 @@ test "Shard: the state it publishes follows the fields that decide it, the one n
         var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
         defer rn.deinit();
         var slot: health_mod.ShardSlot = .{};
-        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{});
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
         defer shard.deinit();
         shard.raft_network = &rn;
         shard.health = &slot;
@@ -10784,4 +10832,31 @@ test "Shard: the state it publishes follows the fields that decide it, the one n
         shard.publishHealth();
         try std.testing.expectEqual(health_mod.ShardState.ok, slot.get());
     }
+}
+
+test "Shard: boot replay publishes how far it has got, and reaches the segments' last index" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var slot: health_mod.ShardSlot = .{};
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{ .health = &slot });
+    defer shard.deinit();
+    // Replay reads back every entry the segments hold; the log may hold
+    // more after boot, proposed once replay was done.
+    const last = slot.replay_last.load(.monotonic);
+    try std.testing.expect(last >= DamageTest.ENQUEUES);
+    try std.testing.expect(last <= shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(last, slot.replay_index.load(.monotonic));
+    try std.testing.expectEqual(&slot, shard.health.?);
+}
+
+test "Shard: a boot told another shard failed stops its replay and frees what it built" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var slot: health_mod.ShardSlot = .{};
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.BootCancelled, Shard.init(std.testing.allocator, 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{ .health = &slot, .cancel = &cancel }));
+    // Stopped at the first entry: nothing past it was read back.
+    try std.testing.expectEqual(@as(u64, 0), slot.replay_index.load(.monotonic));
 }

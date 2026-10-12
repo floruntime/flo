@@ -26,7 +26,7 @@ pub const ShardState = enum(u8) {
     /// On a lone node, its data is damaged: it refuses its own requests and
     /// the other shards serve.
     offline,
-    /// Waiting for an earlier shard to finish replaying.
+    /// Waiting for an init worker to take it.
     loading,
     /// Replaying its log.
     replaying,
@@ -56,6 +56,10 @@ pub const ShardSlot = struct {
     role: Atomic(u8) = .init(@backingInt(Role.follower)),
     last_applied: Atomic(u64) = .init(0),
     commit_index: Atomic(u64) = .init(0),
+    /// While replaying: the index of the last entry read back, and the last
+    /// index the segments hold, which it reaches when replay is done.
+    replay_index: Atomic(u64) = .init(0),
+    replay_last: Atomic(u64) = .init(0),
     /// Written once, before the state first reads `offline`.
     reason_len: Atomic(u16) = .init(0),
     reason_buf: [REASON_MAX]u8 = undefined,
@@ -137,6 +141,9 @@ pub const NodeHealth = struct {
                 try w.writeAll(",\"reason\":");
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
+            if (state == .replaying) {
+                try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
+            }
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
             inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, p| {

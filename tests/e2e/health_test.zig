@@ -253,3 +253,73 @@ test "e2e/health: a node replaying its log answers /ready with 503 replaying, th
         return error.TestUnexpectedResult;
     }
 }
+
+/// The body of GET `path`, read into `buf`, or null when nothing answers.
+fn getBody(port: u16, comptime path: []const u8, buf: []u8) ?[]const u8 {
+    const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 200) catch return null;
+    defer _ = std.c.close(fd);
+    const req = "GET " ++ path ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    if (std.c.write(fd, req, req.len) != req.len) return null;
+    var got: usize = 0;
+    // The socket does not block: read until the server closes it.
+    const deadline = stdx.time.milliTimestamp() + 1000;
+    while (got < buf.len and stdx.time.milliTimestamp() < deadline) {
+        const rc = std.c.read(fd, buf[got..].ptr, buf.len - got);
+        if (rc == 0) break;
+        if (rc < 0) {
+            stdx.time.sleep(std.time.ns_per_ms / 4);
+            continue;
+        }
+        got += @intCast(rc);
+    }
+    const i = std.mem.indexOf(u8, buf[0..got], "\r\n\r\n") orelse return null;
+    return buf[i + 4 .. got];
+}
+
+test "e2e/health: shards replay side by side, each one's progress only moving forward" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 4, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    // Keys hash across all four shards.
+    try putMany(ctx.getPort(), 40_000, 512);
+
+    ctx.server.stop();
+    try ctx.server.spawn();
+    const started_ms = stdx.time.milliTimestamp();
+
+    var last_index: [4]u64 = @splat(0);
+    var most_at_once: usize = 0;
+    var went_back = false;
+    var ready = false;
+    var buf: [16 * 1024]u8 = undefined;
+    while (!ready and stdx.time.milliTimestamp() - started_ms < 120_000) {
+        if (probe(ctx.server.metrics_port, "/ready")) |word| ready = std.mem.eql(u8, word, "200 ready");
+        const body = getBody(ctx.server.metrics_port, "/status", &buf) orelse {
+            stdx.time.sleep(std.time.ns_per_ms);
+            continue;
+        };
+        const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{}) catch continue;
+        defer parsed.deinit();
+        var replaying: usize = 0;
+        for (parsed.value.object.get("shards").?.array.items, 0..) |shard, i| {
+            const replay = shard.object.get("replay") orelse continue;
+            replaying += 1;
+            const index: u64 = @intCast(replay.object.get("index").?.integer);
+            if (index < last_index[i]) went_back = true;
+            last_index[i] = index;
+        }
+        most_at_once = @max(most_at_once, replaying);
+        stdx.time.sleep(2 * std.time.ns_per_ms);
+    }
+    try ctx.server.awaitReady(stdx.testing.ServerProcess.DEFAULT_READY_TIMEOUT_MS);
+
+    try testing.expect(ready);
+    try testing.expect(!went_back);
+    // Several shards replay at once wherever there are cores for them.
+    const cpus = std.Thread.getCpuCount() catch 1;
+    if (cpus >= 2 and most_at_once < 2) {
+        std.debug.print("{d} CPUs, but at most {d} shard replaying at once; last indexes {any}\n", .{ cpus, most_at_once, last_index });
+        return error.TestUnexpectedResult;
+    }
+}
