@@ -220,9 +220,7 @@ test "e2e/namespace: delete is refused, with or without --force, and the namespa
 
 // An empty namespace and "default" are one namespace everywhere: a KV key
 // set under one is read under the other whichever shard it lands on, and a
-// stream appended under one is the same stream under the other. Before the
-// server folded "" into "default" at decode, the router hashed the two
-// spellings apart, so on several shards most such keys were unreadable.
+// stream appended under one is the same stream under the other.
 test "e2e/namespace: an empty namespace is the default namespace on every shard" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();

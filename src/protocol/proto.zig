@@ -636,7 +636,7 @@ pub const Request = struct {
         if (payload.len == 0) {
             return Request{
                 .header = header,
-                .namespace = "",
+                .namespace = DEFAULT_NAMESPACE,
                 .key = "",
                 .value = "",
                 .options = "",

@@ -2275,7 +2275,10 @@ pub const Shard = struct {
         if (leader == 0 or leader == self.cluster_node_id) return;
         const rn = self.raft_network orelse return;
         const session = rn.linkSession(leader) orelse return;
-        var buf: [FORWARD_PREFIX + MAX_REQUEST_SIZE]u8 = undefined;
+        // A forward is the request re-encoded, which can outgrow what the
+        // client sent by the namespace an empty one decodes as and the
+        // options trailer a client may omit.
+        var buf: [FORWARD_PREFIX + MAX_REQUEST_SIZE + proto.DEFAULT_NAMESPACE.len + 2]u8 = undefined;
         if (FORWARD_PREFIX + f.bytes.len > buf.len) {
             self.finishForward(f, .internal_error, "request too large to forward");
             return;
