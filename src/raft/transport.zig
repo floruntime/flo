@@ -594,11 +594,12 @@ test "transport: VoteRequest roundtrip" {
 /// that drops a field, one added later included, fails.
 fn everyFieldSet(comptime T: type) T {
     var v: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
-        @field(v, f.name) = switch (@typeInfo(f.type)) {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, 0..) |name, ftype, i| {
+        @field(v, name) = switch (@typeInfo(ftype)) {
             .bool => true,
             .int => @intCast(1000 + i * 7),
-            else => @compileError("everyFieldSet: add a case for " ++ @typeName(f.type)),
+            else => @compileError("everyFieldSet: add a case for " ++ @typeName(ftype)),
         };
     }
     return v;

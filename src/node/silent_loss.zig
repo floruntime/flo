@@ -30,7 +30,7 @@ pub const Path = enum {
     snapshot_unloadable,
 };
 
-pub const PATH_COUNT = @typeInfo(Path).@"enum".fields.len;
+pub const PATH_COUNT = @typeInfo(Path).@"enum".field_names.len;
 
 /// How often each path may log a line while it keeps happening.
 pub const WARN_INTERVAL_MS: u64 = 30_000;

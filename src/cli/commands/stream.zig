@@ -20,6 +20,7 @@
 //!   flo stream group info <stream> --group <name>
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
@@ -1245,7 +1246,7 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
         ctx.print("Consumer Group: {s}/{s}\n  Pending: {d} message(s)\n\n", .{ stream, group, count });
         if (count > 0) {
             ctx.print("  {s:<24} {s:<16} {s}\n", .{ "ID", "CONSUMER", "DELIVERIES" });
-            ctx.print("  {s:<24} {s:<16} {s}\n", .{ "─" ** 24, "─" ** 16, "─" ** 10 });
+            ctx.print("  {s:<24} {s:<16} {s}\n", .{ stdx.repeat("─", 24), stdx.repeat("─", 16), stdx.repeat("─", 10) });
         }
     }
 
@@ -1546,10 +1547,10 @@ test "stream read: records cut short are Truncated, not fewer records" {
     var q = try outcome.QuietContext.init(std.testing.allocator);
     defer q.deinit();
     // [count:u32] then [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload][headers:u32]
-    const record = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++ [_]u8{0} ** 4;
+    const record = [_]u8{1} ++ @as([7]u8, @splat(0)) ++ [_]u8{2} ++ @as([7]u8, @splat(0)) ++ [_]u8{0} ++ @as([4]u8, @splat(0)) ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++ @as([4]u8, @splat(0));
     // The second record carries one header, [klen u32][k][vlen u32][v], so a
     // cut inside a header's value is caught too.
-    const with_header = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
+    const with_header = [_]u8{1} ++ @as([7]u8, @splat(0)) ++ [_]u8{2} ++ @as([7]u8, @splat(0)) ++ [_]u8{0} ++ @as([4]u8, @splat(0)) ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
         [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 3, 0, 0, 0 } ++ "val".*;
     const answer = [_]u8{ 2, 0, 0, 0 } ++ record ++ with_header;
     const data = try std.testing.allocator.dupe(u8, &answer);
@@ -1582,7 +1583,7 @@ test "stream read --follow ends with retryable (exit 4) on an unavailable answer
 
 test "stream group read: records cut short are Truncated before anything prints" {
     // [count:u32] then [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload][headers:u32]([klen:u32][k][vlen:u32][v])*
-    const record = [_]u8{1} ++ [_]u8{0} ** 7 ++ [_]u8{2} ++ [_]u8{0} ** 7 ++ [_]u8{0} ++ [_]u8{0} ** 4 ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
+    const record = [_]u8{1} ++ @as([7]u8, @splat(0)) ++ [_]u8{2} ++ @as([7]u8, @splat(0)) ++ [_]u8{0} ++ @as([4]u8, @splat(0)) ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
         [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 1, 0, 0, 0 } ++ "v".*;
     const answer = [_]u8{ 2, 0, 0, 0 } ++ record ++ record;
     try printGroupRecords(null, &answer, "s", false);

@@ -437,7 +437,7 @@ test "kv table: a get waits on a key past the waiter's inline buffer" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const key = [_]u8{'k'} ** 300;
+    const key = @as([300]u8, @splat('k'));
     try testing.expect((try h.get(&key, getBody(.{ .wait_ms = 5000 }))) == null);
     try testing.expectEqual(@as(u16, 1), h.shard.waiter_pool.countByKind(.kv_get));
     try h.setWaking(&key, setBody("w", .{}), h.next_id - 1, 1);
@@ -546,7 +546,7 @@ test "kv ops: scan pages long names without dropping any, though they overflow a
         try expectSet(try h.set(key, setBody("v", .{})), 1);
     }
 
-    var seen = [_]bool{false} ** 80;
+    var seen = @as([80]bool, @splat(false));
     var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
     var cursor: []const u8 = "";
     var pages: usize = 0;

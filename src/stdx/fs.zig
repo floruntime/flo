@@ -312,7 +312,7 @@ test "makePathDurable syncs the parent only for a directory it created, so a par
     try std.testing.expectEqual(before + 1, dir_syncs.load(.monotonic));
 
     // Write and search, but no read: opening it to sync would be refused.
-    const parent_z = try std.testing.allocator.dupeZ(u8, parent);
+    const parent_z = try std.testing.allocator.dupeSentinel(u8, parent, 0);
     defer std.testing.allocator.free(parent_z);
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(parent_z, 0o311));
     defer _ = std.c.chmod(parent_z, 0o700);

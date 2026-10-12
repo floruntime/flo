@@ -323,7 +323,7 @@ pub fn writeTempYaml(allocator: Allocator, yaml: []const u8, filename: []const u
 
     // Create directory if needed (best-effort — ignore if it exists)
     var path_buf: [256]u8 = undefined;
-    const path0 = try std.fmt.bufPrintZ(&path_buf, "{s}", .{tmp_dir});
+    const path0 = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{tmp_dir}, 0);
     _ = std.c.mkdir(path0.ptr, 0o755);
 
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, filename });

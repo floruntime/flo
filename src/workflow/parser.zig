@@ -15,6 +15,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("stdx");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -1208,7 +1209,7 @@ test "parseWorkflow: a breaker threshold past what a failure count holds is refu
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
-    const name = "T" ** (MAX_TERMINAL_NAME + 1);
+    const name = comptime stdx.repeat("T", (MAX_TERMINAL_NAME + 1));
     try expectRefused(wrap("", "\"terminals\": { \"" ++ name ++ "\": { \"status\": \"cancelled\" } },"), ParseError.InvalidFieldType, "a terminal name is at most 256 bytes, not 257 at terminals");
 }
 

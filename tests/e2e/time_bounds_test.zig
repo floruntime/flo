@@ -65,10 +65,10 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
     var out: [4096]u8 = undefined;
     // kv.set's body: "v2", then ttl_ms present and past its bound, condition
     // always, no cas, routing key or txn.
-    const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ [_]u8{0xff} ** 8 ++ [_]u8{ 1, 0, 0, 0, 0 };
+    const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ @as([8]u8, @splat(0xff)) ++ [_]u8{ 1, 0, 0, 0, 0 };
     try expectRefused(try rawCall(ctx, .kv_put, "k", &set_body, "", &out), "kv.set: ttl_ms is out of range");
     // kv.expire's body: ttl_ms past its bound, then no cas, routing key or txn.
-    const expire_body = [_]u8{0xff} ** 8 ++ [_]u8{ 0, 0, 0 };
+    const expire_body = @as([8]u8, @splat(0xff)) ++ [_]u8{ 0, 0, 0 };
     try expectRefused(try rawCall(ctx, .kv_expire, "k", &expire_body, "", &out), "kv.expire: ttl_ms is out of range");
 
     try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));

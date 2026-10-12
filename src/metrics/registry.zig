@@ -1539,15 +1539,16 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_inbox_processed_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_processed });
     try writer.print("flo_shard_inbox_pending{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.inbox_pending });
     try writer.print("flo_shard_cross_shard_requests_in_flight{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_in_flight });
-    inline for (std.meta.fields(ShardMetrics.CrossShardClass)) |c| {
-        try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ c.name ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[c.value] });
+    const cinfo = @typeInfo(ShardMetrics.CrossShardClass).@"enum";
+    inline for (cinfo.field_names, cinfo.field_values) |cname, cvalue| {
+        try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ cname ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[cvalue] });
     }
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
     try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
-    inline for (@typeInfo(silent_loss.Path).@"enum".fields, 0..) |f, i| {
-        try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ f.name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
+    inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, i| {
+        try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
     }
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     const skew = @abs(snap.stamp_skew_ms);

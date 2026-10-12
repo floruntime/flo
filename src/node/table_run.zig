@@ -47,11 +47,11 @@ pub fn handler(comptime name: []const u8, comptime Family: type, comptime functi
     const the_op = op(name);
     const Request = the_op.request;
     const fields = Request.field_list;
-    const params = @typeInfo(@TypeOf(function)).@"fn".params;
+    const params = @typeInfo(@TypeOf(function)).@"fn".param_types;
     if (params.len != 3 + fields.len)
         @compileError(std.fmt.comptimePrint("{s}: its function takes {d} fields, the op declares {d}", .{ name, params.len - 3, fields.len }));
     inline for (fields, 0..) |f, i| {
-        if (params[3 + i].type != f.T.Value) @compileError(name ++ ": parameter " ++ std.fmt.comptimePrint("{d}", .{i + 3}) ++ " isn't field '" ++ f.name ++ "'s type");
+        if (params[3 + i] != f.T.Value) @compileError(name ++ ": parameter " ++ std.fmt.comptimePrint("{d}", .{i + 3}) ++ " isn't field '" ++ f.name ++ "'s type");
     }
     return struct {
         fn run(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {

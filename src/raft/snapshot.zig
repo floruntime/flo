@@ -20,6 +20,7 @@
 //!   term:u64 | success:u8 | from:u32 | bytes_received:u64
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const node_mod = @import("node.zig");
 const snapshot_mod = @import("../storage/snapshot.zig");
@@ -535,7 +536,7 @@ test "snapshot: sender single-chunk transfer" {
 
 test "snapshot: sender multi-chunk transfer" {
     // 100 bytes with 30-byte chunks → 4 chunks (30+30+30+10)
-    const data = "A" ** 100;
+    const data = stdx.repeat("A", 100);
     var sender = SnapshotSender.init(data, 200, 3, 30);
 
     try testing.expectEqual(@as(u32, 4), sender.totalChunksExpected());

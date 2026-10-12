@@ -386,18 +386,18 @@ pub const RaftNetwork = struct {
             .advertise_ip4 = bind_ip4,
             .listener_fd = fd,
             .secret = owned_secret,
-            .peers = [_]PeerState{.{}} ** MAX_PEERS,
+            .peers = @as([MAX_PEERS]PeerState, @splat(.{})),
             .peer_count = 0,
-            .links = [_]Link{.{}} ** MAX_LINKS,
-            .known = [_]Known{.{}} ** MAX_KNOWN,
+            .links = @as([MAX_LINKS]Link, @splat(.{})),
+            .known = @as([MAX_KNOWN]Known, @splat(.{})),
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .mutex = .{},
             .outbound = .empty,
-            .linked_ids = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MAX_PEERS,
-            .linked_sessions = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_PEERS,
-            .linked_clients = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_PEERS,
-            .voter_ids = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** (MAX_PEERS + 1),
+            .linked_ids = @as([MAX_PEERS]std.atomic.Value(u32), @splat(std.atomic.Value(u32).init(0))),
+            .linked_sessions = @as([MAX_PEERS]std.atomic.Value(u64), @splat(std.atomic.Value(u64).init(0))),
+            .linked_clients = @as([MAX_PEERS]std.atomic.Value(u64), @splat(std.atomic.Value(u64).init(0))),
+            .voter_ids = @as([(MAX_PEERS + 1)]std.atomic.Value(u32), @splat(std.atomic.Value(u32).init(0))),
             .voters_known = std.atomic.Value(bool).init(false),
             .dialing_stopped = std.atomic.Value(bool).init(false),
             .dial_mutex = .{},
@@ -1781,7 +1781,7 @@ test "raft network: a stranger that speaks garbage is dropped at the handshake w
     try seed.start();
     const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, try boundPort(&seed), 1000);
     defer _ = std.c.close(fd);
-    const junk = [_]u8{0x41} ** 64;
+    const junk = @as([64]u8, @splat(0x41));
     _ = std.c.write(fd, &junk, junk.len);
     var waited: u64 = 0;
     while (waited < 3000 and seed.handshake_failures.load(.monotonic) == 0) : (waited += 20) stdx.time.sleep(20 * std.time.ns_per_ms);
@@ -1864,7 +1864,7 @@ test "raft network: forwarded frames go out sealed behind Raft's, only while the
     defer p.fwd.deinit(testing.allocator);
     // Half the socket queue already taken: forwards wait in their own.
     var big: [HEADER_SIZE + 64]u8 = undefined;
-    const n = transport.frameMessage(.forward_write, 0, 1, "y" ** 64, &big);
+    const n = transport.frameMessage(.forward_write, 0, 1, stdx.repeat("y", 64), &big);
     try p.fwd.append(testing.allocator, big[0..n]);
     rn.mutex.lock();
     rn.forwardBytes(2).?.* = .{ .node_id = 2, .bytes = n };
@@ -1882,7 +1882,7 @@ test "raft network: forwarded frames go out sealed behind Raft's, only while the
     try testing.expectEqual(n + seal.TAG_LEN, p.out.pending().len);
     try testing.expectEqual(@as(usize, 0), rn.forward_bytes[0].bytes);
     // Sealed: the plaintext is not on the wire.
-    try testing.expect(std.mem.indexOf(u8, p.out.pending(), "y" ** 16) == null);
+    try testing.expect(std.mem.indexOf(u8, p.out.pending(), stdx.repeat("y", 16)) == null);
 }
 
 test "raft network: each direction of a link seals under its own key, which the far end opens with" {
@@ -1915,7 +1915,7 @@ fn readFrame(fd: posix.socket_t, buf: []u8) !void {
 fn rawDial(port: u16, sent_ip4: [4]u8, proved_ip4: [4]u8) !void {
     const fd = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
     defer _ = std.c.close(fd);
-    const nonce = [_]u8{9} ** handshake.NONCE_LEN;
+    const nonce = @as([handshake.NONCE_LEN]u8, @splat(9));
     var sent: [handshake.Hello.SIZE]u8 = undefined;
     (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = sent_ip4, .nonce = nonce }).encode(&sent);
     var proved: [handshake.Hello.SIZE]u8 = undefined;
@@ -1984,7 +1984,7 @@ test "raft network: a sealed frame that arrives in the same read as the verdict 
     try readFrame(fd, &hello);
     t.add(&hello);
     var ours: [handshake.HELLO_BACK_SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{5} ** handshake.NONCE_LEN }).encode(ours[0..handshake.Hello.SIZE]);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = @as([handshake.NONCE_LEN]u8, @splat(5)) }).encode(ours[0..handshake.Hello.SIZE]);
     var with_ours = t;
     with_ours.add(ours[0..handshake.Hello.SIZE]);
     ours[handshake.Hello.SIZE..].* = handshake.proof("s", &with_ours.peek(), 3, 1);
@@ -2074,7 +2074,7 @@ fn v2Hello(node_id: u32, raft_port: u16) [46]u8 {
     std.mem.writeInt(u16, b[6..8], raft_port, .little);
     std.mem.writeInt(u16, b[8..10], 9002, .little);
     b[10..14].* = .{ 127, 0, 0, 1 };
-    b[14..46].* = [_]u8{7} ** handshake.NONCE_LEN;
+    b[14..46].* = @as([handshake.NONCE_LEN]u8, @splat(7));
     return b;
 }
 
@@ -2083,8 +2083,8 @@ test "raft network: a hello from a node on another protocol version or table is 
     defer seed.deinit();
     try seed.start();
     var hellos: [2][handshake.Hello.SIZE]u8 = undefined;
-    (handshake.Hello{ .version = handshake.VERSION +% 1, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{7} ** handshake.NONCE_LEN }).encode(&hellos[0]);
-    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{7} ** handshake.NONCE_LEN }).encode(&hellos[1]);
+    (handshake.Hello{ .version = handshake.VERSION +% 1, .table_hash = handshake.TABLE_HASH, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = @as([handshake.NONCE_LEN]u8, @splat(7)) }).encode(&hellos[0]);
+    (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 2, .raft_port = 9001, .main_port = 9002, .ip4 = .{ 127, 0, 0, 1 }, .nonce = @as([handshake.NONCE_LEN]u8, @splat(7)) }).encode(&hellos[1]);
     const old = v2Hello(2, 9001);
     // A node on the last release sends its own, shorter hello: it is still
     // told which version it speaks, not just that the frame was wrong.
@@ -2131,7 +2131,7 @@ test "raft network: a dialer refuses an acceptor built from another table or ver
         var wire: [512]u8 = undefined;
         const n = if (case == 0) foreign: {
             var theirs: [handshake.HELLO_BACK_SIZE]u8 = undefined;
-            (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = [_]u8{5} ** handshake.NONCE_LEN }).encode(theirs[0..handshake.Hello.SIZE]);
+            (handshake.Hello{ .version = handshake.VERSION, .table_hash = handshake.TABLE_HASH +% 1, .node_id = 3, .raft_port = listener.port, .main_port = 9003, .ip4 = .{ 127, 0, 0, 1 }, .nonce = @as([handshake.NONCE_LEN]u8, @splat(5)) }).encode(theirs[0..handshake.Hello.SIZE]);
             t.add(theirs[0..handshake.Hello.SIZE]);
             theirs[handshake.Hello.SIZE..].* = handshake.proof("s", &t.peek(), 3, 1);
             break :foreign transport.frameMessage(.hello_back, 0, 3, &theirs, &wire);

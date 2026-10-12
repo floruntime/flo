@@ -283,11 +283,11 @@ fn hashNum(comptime h: *std.hash.Wyhash, comptime n: anytype) void {
 }
 
 fn hashEnum(comptime h: *std.hash.Wyhash, comptime E: type) void {
-    const tags = @typeInfo(E).@"enum".fields;
-    hashNum(h, tags.len);
-    for (tags) |f| {
-        hashStr(h, f.name);
-        hashNum(h, f.value);
+    const info = @typeInfo(E).@"enum";
+    hashNum(h, info.field_names.len);
+    for (info.field_names, info.field_values) |name, value| {
+        hashStr(h, name);
+        hashNum(h, value);
     }
 }
 

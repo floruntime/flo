@@ -892,7 +892,7 @@ test "action status: a run status cut short is Truncated" {
     defer q.deinit();
     // [run_id_len:u32][run_id][status:u8][created_at:i64][has_started:u8][has_completed:u8]
     // [has_output:u8][has_error:u8][retry_count:u32]
-    const answer = [_]u8{ 1, 0, 0, 0 } ++ "r".* ++ [_]u8{2} ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{0} ** 4;
+    const answer = [_]u8{ 1, 0, 0, 0 } ++ "r".* ++ [_]u8{2} ++ @as([8]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 } ++ @as([4]u8, @splat(0));
     try printRunFields(&q.ctx, &answer);
     for (0..answer.len) |n| {
         try std.testing.expectError(error.Truncated, printRunFields(&q.ctx, answer[0..n]));

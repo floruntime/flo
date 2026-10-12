@@ -800,7 +800,7 @@ test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps
     try ctx.exec(&.{ "workflow", "create", "-f", path });
     try ctx.exec(&.{ "workflow", "start", "cancel-reason-wf", "{}", "--run-id", "cancel-reason-run" });
 
-    const too_long = [_]u8{'r'} ** 1025;
+    const too_long = @as([1025]u8, @splat('r'));
     var refused = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &too_long });
     defer refused.deinit();
     try testing.expectEqual(@as(u8, 3), refused.exit_code);
@@ -811,7 +811,7 @@ test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps
     try testing.expectEqual(@as(u8, 0), still.exit_code);
     try testing.expect(still.stdoutContains("Status:   waiting"));
 
-    const longest = [_]u8{'r'} ** 1024;
+    const longest = @as([1024]u8, @splat('r'));
     var ok = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &longest });
     defer ok.deinit();
     try testing.expectEqual(@as(u8, 0), ok.exit_code);
@@ -3207,7 +3207,7 @@ fn expectOneRunPerInput(ctx: *stdx.testing.TestContext, workflow: []const u8, in
     }
     try testing.expectEqual(inputs.len, std.mem.count(u8, ids, "\"run_id\""));
 
-    var seen = [_]usize{0} ** 16;
+    var seen = @as([16]usize, @splat(0));
     var it = std.mem.splitSequence(u8, ids, "\"run_id\":\"");
     _ = it.next();
     while (it.next()) |rest| {

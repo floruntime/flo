@@ -215,7 +215,7 @@ pub const ServerProcess = struct {
         /// Every node of a test cluster shares the default; a test that wants a
         /// stranger sets its own.
         /// In the form `flo server secret` prints; a cluster takes no other.
-        cluster_secret: []const u8 = "flo-secret-" ++ "e2e0" ** 16,
+        cluster_secret: []const u8 = "flo-secret-" ++ @import("../../mod.zig").repeat("e2e0", 16),
         /// Written to `[cluster] secret_file` when set, beside `secret` if
         /// that is set too.
         cluster_secret_file: ?[]const u8 = null,

@@ -29,6 +29,7 @@
 //! and adds it to the pool.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const builtin = @import("builtin");
 const posix = std.posix;
 const log = @import("stdx").log;
@@ -431,7 +432,7 @@ pub const Shard = struct {
     /// them.
     queued: [2][@import("../config/server.zig").MAX_SHARDS]u32 = .{ @splat(0), @splat(0) },
     /// When a refusal after waiting was last logged, per wait reason.
-    wait_warn_ms: [@typeInfo(Connection.WaitReason).@"enum".fields.len]u64 = @splat(0),
+    wait_warn_ms: [@typeInfo(Connection.WaitReason).@"enum".field_names.len]u64 = @splat(0),
     /// Connections paused now, and when the stall check next runs.
     paused_count: u32 = 0,
     stall_check_ms: u64 = 0,
@@ -870,9 +871,9 @@ pub const Shard = struct {
             .late_apply_warn_ms = 0,
             .election_warn_ms = 0,
             .elections_unlogged = 0,
-            .peer_silent_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .peer_silent_warn_ms = @as([raft_node_mod.MAX_PEERS]u64, @splat(0)),
             .flush_fail_warn_ms = 0,
-            .peer_batch_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .peer_batch_warn_ms = @as([raft_node_mod.MAX_PEERS]u64, @splat(0)),
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
             .durable_log = durable_log,
@@ -1229,7 +1230,7 @@ pub const Shard = struct {
     /// (`sendPendingCancels`). The slots stay held until answered, so they
     /// never count for less than what is parked.
     fn releaseForwardsFor(self: *Shard, conn: *Connection) void {
-        var told = std.StaticBitSet(@import("../config/server.zig").MAX_SHARDS).initEmpty();
+        var told = std.bit_set.Static(@import("../config/server.zig").MAX_SHARDS).empty;
         const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
         for (conn.blocking_slots[0..conn.blocking_in_flight]) |t| {
             const target = self.reply_pool.orphan(t) orelse continue;
@@ -1475,7 +1476,7 @@ pub const Shard = struct {
     fn answeredAsDeferred(self: *Shard, req: proto.Request) void {
         self.answered_as_deferred += 1;
         log.err("shard {d}: request {d} (op 0x{x}) was answered as deferred without being parked. This is a bug", .{ self.id, req.header.request_id, req.header.op_code });
-        if (builtin.mode == .Debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
+        if (builtin.mode == .debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
     }
 
     /// Run a request on this shard — unless it writes and this shard's
@@ -3928,9 +3929,9 @@ pub const Shard = struct {
 
     comptime {
         // PAUSE_REASONS: the wait reasons in order, then unsent_answers.
-        const reasons = @typeInfo(Connection.WaitReason).@"enum".fields;
+        const reasons = @typeInfo(Connection.WaitReason).@"enum".field_names;
         std.debug.assert(reasons.len + 1 == ShardMetrics.PAUSE_REASONS.len);
-        for (reasons, ShardMetrics.PAUSE_REASONS[0..reasons.len]) |r, label| std.debug.assert(std.mem.eql(u8, r.name, label));
+        for (reasons, ShardMetrics.PAUSE_REASONS[0..reasons.len]) |r, label| std.debug.assert(std.mem.eql(u8, r, label));
     }
 
     /// Stop reading `conn` until its next request has room to go where it is
@@ -4550,7 +4551,7 @@ pub const Shard = struct {
         const name = if (std.enums.tagName(proto.OpCode, @enumFromInt(req.header.op_code))) |n| n else "?";
         log.err("shard {d}: request {d} ({s}) got no answer from its handler. This is a bug", .{ self.id, req.header.request_id, name });
         if (self.shard_metrics) |sm| sm.recordHandlerNoAnswer();
-        if (builtin.mode == .Debug and !builtin.is_test) @panic("a handler produced no answer");
+        if (builtin.mode == .debug and !builtin.is_test) @panic("a handler produced no answer");
         return "internal error: the handler produced no answer";
     }
 
@@ -5450,15 +5451,16 @@ fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
         log.err("shard {d}: entry type {s} was registered twice; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, @tagName(etype) });
         return error.EntryTypeRegisteredTwice;
     }
-    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
-        const etype: entry_mod.EntryType = @enumFromInt(f.value);
+    const einfo = @typeInfo(entry_mod.EntryType).@"enum";
+    inline for (einfo.field_names, einfo.field_values) |fname, fvalue| {
+        const etype: entry_mod.EntryType = @enumFromInt(fvalue);
         const routed = routedToProjection(etype);
         if (routed and registry.has(etype)) {
-            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasTwoAppliers;
         }
         if (!routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
-            log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasNoApplier;
         }
     }
@@ -6202,7 +6204,7 @@ test "Shard: a client that sends its whole pipeline before reading is unpaced on
     _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(c.pair[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
 
-    const value = [_]u8{'v'} ** 1024;
+    const value = @as([1024]u8, @splat('v'));
     const put = try testRequest(.kv_put, 1, "k", &value);
     defer std.testing.allocator.free(put);
     try std.testing.expectEqual(put.len, feedClient(c.pair[1], &shard, c.conn.fd, put));
@@ -7528,7 +7530,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     // too large.
     const j = try TestClient.open(&shard);
     defer _ = std.c.close(j.pair[1]);
-    var junk: [@sizeOf(proto.RequestHeader)]u8 = [_]u8{0xff} ** @sizeOf(proto.RequestHeader);
+    var junk: [@sizeOf(proto.RequestHeader)]u8 = @as([@sizeOf(proto.RequestHeader)]u8, @splat(0xff));
     try std.testing.expectEqual(@as(isize, junk.len), std.c.write(j.pair[1], &junk, junk.len));
     shard.readFromClient(j.conn.fd);
     try std.testing.expect(j.conn.closing);
@@ -9206,8 +9208,8 @@ test "every entry type has exactly one applier, or is listed as needing none, or
     var ctx: u8 = 0;
     // Every type the router does not own and no list excuses.
     var full: ReplayRegistry = .{};
-    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
-        const t: entry_mod.EntryType = @enumFromInt(f.value);
+    inline for (@typeInfo(entry_mod.EntryType).@"enum".field_values) |value| {
+        const t: entry_mod.EntryType = @enumFromInt(value);
         if (!routedToProjection(t) and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
     }
     try checkAppliers(0, &full);
@@ -9999,7 +10001,7 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
         fn handle(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
             const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
             const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-            sh.sendErrorResponse(conn, req.header.request_id, .bad_request, "€" ** 666 ++ "xx");
+            sh.sendErrorResponse(conn, req.header.request_id, .bad_request, stdx.repeat("€", 666) ++ "xx");
         }
     };
     shard.dispatcher.register(.queue_peek, Long.handle);
@@ -10550,7 +10552,7 @@ test "an entry no projection or applier can take is counted on its path, and its
     try std.testing.expect(shard.applyCommitted());
 
     const Case = struct { entry_type: entry_mod.EntryType, payload: []const u8, path: silent_loss.Path };
-    const big = [_]u8{'x'} ** 8192;
+    const big = @as([8192]u8, @splat('x'));
     for ([_]Case{
         // The registry applier cannot decode it.
         .{ .entry_type = .action_invoke, .payload = "not a command payload", .path = .applier_failed },

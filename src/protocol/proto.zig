@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const reason_mod = @import("reason.zig");
 pub const Refusal = reason_mod.Refusal;
@@ -1139,7 +1140,7 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
     const room = 64 - Refusal.HEADER_LEN;
 
     // Exactly the room: sent whole.
-    const exact = "a" ** room;
+    const exact = stdx.repeat("a", room);
     var r = try Response.parse(Response.serializeRefusal(.bad_request, 7, notRun(exact), &buf));
     var body = try r.refused();
     try std.testing.expectEqualStrings(exact, body.message);
@@ -1148,7 +1149,7 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
     try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
 
     // One over: cut and marked, still a refusal body.
-    r = try Response.parse(Response.serializeRefusal(.unavailable, 7, unclassified(.unavailable, "a" ** (room + 1)), &buf));
+    r = try Response.parse(Response.serializeRefusal(.unavailable, 7, unclassified(.unavailable, stdx.repeat("a", (room + 1))), &buf));
     body = try r.refused();
     try std.testing.expect(std.mem.endsWith(u8, body.message, reason_mod.TRUNCATED_MARKER));
     try std.testing.expectEqual(Ran.unknown, body.ran);
@@ -1156,8 +1157,8 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
 }
 
 test "ranOf: only a status that can follow a write in the log is unknown" {
-    inline for (@typeInfo(StatusCode).@"enum".fields) |f| {
-        const status: StatusCode = @enumFromInt(f.value);
+    inline for (@typeInfo(StatusCode).@"enum".field_values) |value| {
+        const status: StatusCode = @enumFromInt(value);
         const want: Ran = if (status == .unavailable or status == .internal_error) .unknown else .no;
         try std.testing.expectEqual(want, ranOf(status));
     }

@@ -84,7 +84,7 @@ test "config: -n wins whenever given, FLO_NAMESPACE fills in, then default" {
     // Put back whatever the process had, on every exit: later tests must
     // not inherit this one's value.
     var before_buf: [256:0]u8 = undefined;
-    const before: ?[:0]const u8 = if (@import("stdx").io.getenv("FLO_NAMESPACE")) |v| (std.fmt.bufPrintZ(&before_buf, "{s}", .{v}) catch null) else null;
+    const before: ?[:0]const u8 = if (@import("stdx").io.getenv("FLO_NAMESPACE")) |v| (std.fmt.bufPrintSentinel(&before_buf, "{s}", .{v}, 0) catch null) else null;
     defer _ = if (before) |v| libc.setenv("FLO_NAMESPACE", v.ptr, 1) else libc.unsetenv("FLO_NAMESPACE");
     _ = libc.unsetenv("FLO_NAMESPACE");
     try root.executeSlice(&.{ "flo", "probe" });

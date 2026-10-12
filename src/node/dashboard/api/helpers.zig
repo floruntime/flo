@@ -188,7 +188,7 @@ pub fn parseQueryParam(comptime T: type, query_string: ?[]const u8, key: []const
 /// `buf`. Checked first, so the route's own reads see each name at most once.
 pub fn queryRefusal(buf: []u8, query_string: ?[]const u8, comptime allowed: []const []const u8) ?[]const u8 {
     const qs = query_string orelse return null;
-    var seen = [_]bool{false} ** allowed.len;
+    var seen = @as([allowed.len]bool, @splat(false));
     var pairs = std.mem.splitScalar(u8, qs, '&');
     next: while (pairs.next()) |pair| {
         if (pair.len == 0) continue;

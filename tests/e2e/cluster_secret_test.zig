@@ -9,13 +9,13 @@ const CliRunner = stdx.testing.CliRunner;
 
 test "e2e/cluster: a joiner with the wrong secret never links, and both sides log the refusal" {
     const allocator = testing.allocator;
-    const seed = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ "1" ** 64 });
+    const seed = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("1", 64) });
     defer seed.deinit();
     try seed.start();
     const seed_raft = try seed.getRaftEndpoint(allocator);
     defer allocator.free(seed_raft);
 
-    const stranger = try ServerProcess.initWithConfig(allocator, .{ .join_addresses = seed_raft, .shards = 1, .cluster_secret = "flo-secret-" ++ "2" ** 64 });
+    const stranger = try ServerProcess.initWithConfig(allocator, .{ .join_addresses = seed_raft, .shards = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("2", 64) });
     defer stranger.deinit();
     try stranger.start();
     errdefer {
@@ -98,9 +98,9 @@ test "e2e/cluster: a secret file is used only when its owner alone can read it, 
     {
         const f = try stdx.fs.createFileAbsolute(path, .{});
         defer stdx.fs.closeFile(f);
-        try stdx.fs.writeAll(f, "flo-secret-" ++ "3" ** 64 ++ "\n");
+        try stdx.fs.writeAll(f, "flo-secret-" ++ stdx.repeat("3", 64) ++ "\n");
     }
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     // Readable by others: refused, and the log says how to fix it.

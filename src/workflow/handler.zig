@@ -5121,7 +5121,7 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
 
 /// Fills a run's history past what a completion record holds.
 fn overfillHistory(handler: *WorkflowHandler, run: *WorkflowHandler.RunRecord) !void {
-    const detail = [_]u8{'d'} ** 2000;
+    const detail = @as([2000]u8, @splat('d'));
     for (0..40) |i| handler.addHistoryEvent(run, "signal_received", &detail, @intCast(i));
 }
 
@@ -5362,7 +5362,7 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
     defer destroyTestShard(&shard);
 
     // A long key, so a limit that forgot it would let through a record the log refuses.
-    const run_id = [_]u8{'k'} ** 3000;
+    const run_id = @as([3000]u8, @splat('k'));
     const key = "default:" ++ run_id;
     for ([_]usize{ 0, 1 }) |over| {
         var handler = WorkflowHandler.init(allocator);
@@ -5441,7 +5441,7 @@ test "an engine-reached cancel with a detail past the cancel-reason cap is trimm
     const run = handler.runs.getPtr("default:big").?;
     try overfillHistory(&handler, run);
 
-    const detail = [_]u8{'t'} ** 2000;
+    const detail = @as([2000]u8, @splat('t'));
     handler.completeRun(&shard, "default:big", run, .cancelled, &detail, 5);
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     const last = run.history.items[run.history.items.len - 1].detail_owned;

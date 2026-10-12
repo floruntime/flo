@@ -113,7 +113,7 @@ test "e2e/bounds: a percent-encoded dashboard key path longer than any key is no
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
 
-    var long = try http.get("/api/v1/kv/namespaces/default/keys/" ++ "a" ** 5000 ++ "%41");
+    var long = try http.get("/api/v1/kv/namespaces/default/keys/" ++ stdx.repeat("a", 5000) ++ "%41");
     defer long.deinit();
     try testing.expectEqual(@as(u16, 404), long.status);
 

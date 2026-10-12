@@ -1994,7 +1994,7 @@ test "ts: a tag filter is parsed strictly and canonically" {
     var n: usize = 0;
     for (0..MAX_TAGS + 1) |i| n += (std.fmt.bufPrint(many[n..], "{c}=v,", .{@as(u8, @intCast('A' + i))}) catch unreachable).len;
     try testing.expect(parseTagFilter(many[0..n], &canon, &preds) == .too_many);
-    const long = [_]u8{'a'} ** (MAX_TAG_STRING + 1);
+    const long = @as([(MAX_TAG_STRING + 1)]u8, @splat('a'));
     try testing.expect(parseTagFilter(&long, &canon, &preds) == .too_long);
 }
 

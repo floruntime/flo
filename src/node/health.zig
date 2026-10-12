@@ -139,10 +139,10 @@ pub const NodeHealth = struct {
             };
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
-            inline for (@typeInfo(silent_loss.Path).@"enum".fields, 0..) |f, p| {
+            inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, p| {
                 if (p > 0) try w.writeByte(',');
                 const n = if (sm) |m| m.silent_loss[p].load(.monotonic) else 0;
-                try w.print("\"{s}\":{d}", .{ f.name, n });
+                try w.print("\"{s}\":{d}", .{ name, n });
             }
             try w.writeAll("}}");
         }

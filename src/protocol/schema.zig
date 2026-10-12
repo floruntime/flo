@@ -188,7 +188,7 @@ pub const Bool = struct {
 /// An enum carried as its tag; a tag the enum doesn't name is refused.
 pub fn Enum(comptime E: type) type {
     const Tag = @typeInfo(E).@"enum".tag_type;
-    if (@typeInfo(E).@"enum".is_exhaustive == false) @compileError("a schema enum is exhaustive, so an unknown value can be refused");
+    if (@typeInfo(E).@"enum".mode != .exhaustive) @compileError("a schema enum is exhaustive, so an unknown value can be refused");
     if (@typeInfo(Tag).int.bits % 8 != 0 or @typeInfo(Tag).int.bits > 64) @compileError("a schema enum's tag is 8 to 64 bits, whole bytes");
     return struct {
         pub const Value = E;
@@ -532,7 +532,7 @@ pub fn Record(comptime fields: []const Field) type {
     const RecordValue = blk: {
         var names: [fields.len][]const u8 = undefined;
         var types: [fields.len]type = undefined;
-        var attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+        var attrs: [fields.len]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (fields, 0..) |f, i| {
             names[i] = f.name;
             types[i] = f.T.Value;

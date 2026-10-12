@@ -67,7 +67,7 @@ pub const Key = struct {
     }
 
     fn nonce(self: *const Key) [Aead.nonce_length]u8 {
-        var n = [_]u8{0} ** Aead.nonce_length;
+        var n = @as([Aead.nonce_length]u8, @splat(0));
         std.mem.writeInt(u64, n[4..12], self.counter, .little);
         return n;
     }

@@ -145,11 +145,11 @@ pub const Dispatcher = struct {
     /// Initialize with empty tables.
     pub fn init() Dispatcher {
         return .{
-            .handlers = [_]?HandlerFn{null} ** proto.MAX_OPCODES,
-            .pre_route = [_]?PreRouteFn{null} ** proto.MAX_OPCODES,
-            .shard_route = [_]?ShardRouteFn{null} ** proto.MAX_OPCODES,
-            .walk_fn = [_]?NameWalker.LocalScanFn{null} ** proto.MAX_OPCODES,
-            .walk_contexts = [_]?[]const *anyopaque{null} ** proto.MAX_OPCODES,
+            .handlers = @as([proto.MAX_OPCODES]?HandlerFn, @splat(null)),
+            .pre_route = @as([proto.MAX_OPCODES]?PreRouteFn, @splat(null)),
+            .shard_route = @as([proto.MAX_OPCODES]?ShardRouteFn, @splat(null)),
+            .walk_fn = @as([proto.MAX_OPCODES]?NameWalker.LocalScanFn, @splat(null)),
+            .walk_contexts = @as([proto.MAX_OPCODES]?[]const *anyopaque, @splat(null)),
             .on_error = null,
             .handler_count = 0,
         };

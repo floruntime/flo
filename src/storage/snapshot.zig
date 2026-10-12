@@ -176,7 +176,7 @@ pub const SnapshotBuilder = struct {
             .timestamp_ns = self.timestamp_ns,
             .section_count = @intCast(self.sections.items.len),
             .total_size = @intCast(total_size),
-            .reserved = .{0} ** 14,
+            .reserved = @splat(0),
         };
         @memcpy(buf[0..HEADER_SIZE], header.asBytes());
 
@@ -185,7 +185,7 @@ pub const SnapshotBuilder = struct {
         for (self.sections.items) |s| {
             const sh = SectionHeader{
                 .section_type = @intFromEnum(s.section_type),
-                ._reserved = .{0} ** 3,
+                ._reserved = @splat(0),
                 .section_size = @intCast(s.data.len),
             };
             @memcpy(buf[offset..][0..SECTION_HEADER_SIZE], sh.asBytes());
@@ -199,7 +199,7 @@ pub const SnapshotBuilder = struct {
         const footer = SnapshotFooter{
             .crc32c = crc,
             .magic = FOOTER_MAGIC,
-            ._padding = .{0} ** 4,
+            ._padding = @splat(0),
         };
         @memcpy(buf[offset..][0..FOOTER_SIZE], footer.asBytes());
 
@@ -548,7 +548,7 @@ test "snapshot: CRC validation — corrupt data detected" {
 }
 
 test "snapshot: invalid header magic" {
-    var buf: [HEADER_SIZE + FOOTER_SIZE]u8 = .{0} ** (HEADER_SIZE + FOOTER_SIZE);
+    var buf: [HEADER_SIZE + FOOTER_SIZE]u8 = @splat(0);
     buf[0] = 'X'; // wrong magic
 
     const result = SnapshotReader.init(&buf);
@@ -572,7 +572,7 @@ test "snapshot: invalid footer magic" {
 }
 
 test "snapshot: too small input" {
-    const buf = [_]u8{0} ** 10;
+    const buf = @as([10]u8, @splat(0));
     const result = SnapshotReader.init(&buf);
     try testing.expectError(error.TooSmall, result);
 }

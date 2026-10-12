@@ -63,7 +63,7 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
         .{ .name = "json_set", .op = .kv_json_set, .key = "k", .value = &.{ 0xfe, 0xff }, .status = .bad_request },
         // An unknown worker type.
         .{ .name = "worker", .op = .worker_register, .key = "w", .value = &.{2}, .status = .bad_request },
-        .{ .name = "info", .op = .namespace_info, .key = "a" ** 129, .value = "", .status = .bad_request },
+        .{ .name = "info", .op = .namespace_info, .key = stdx.repeat("a", 129), .value = "", .status = .bad_request },
     };
     var out: [4096]u8 = undefined;
     for (cases) |c| {

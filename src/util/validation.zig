@@ -5,6 +5,7 @@
 //! throughout the system.
 
 const std = @import("std");
+const stdx = @import("stdx");
 
 /// Validates a resource identifier (worker IDs, action names, queue names, etc.).
 /// Allowed: a-z, A-Z, 0-9, hyphen, underscore, dot. Length 1..128.
@@ -36,9 +37,9 @@ test "isValidIdentifier: empty" {
 }
 
 test "isValidIdentifier: too long" {
-    const long = "a" ** 129;
+    const long = stdx.repeat("a", 129);
     try std.testing.expect(!isValidIdentifier(long));
-    const max = "a" ** 128;
+    const max = stdx.repeat("a", 128);
     try std.testing.expect(isValidIdentifier(max));
 }
 

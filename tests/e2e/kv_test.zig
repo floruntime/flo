@@ -2080,7 +2080,7 @@ test "e2e/kv: a 5 KiB value is stored and read back whole" {
 
     // Larger than the CLI's 4 KiB print buffer. Exact equality: a truncated
     // or empty value must fail, not pass on a substring.
-    const value = "v" ** 5000;
+    const value = stdx.repeat("v", 5000);
     try ctx.exec(&.{ "kv", "set", "five_kib", value });
     const got = try ctx.execCapture(&.{ "kv", "get", "five_kib", "-o", "raw" });
     try testing.expectEqualStrings(value, got);
@@ -2156,7 +2156,7 @@ test "e2e/kv: a 90 KB transaction batch is applied, not just acked" {
     const id_start = (std.mem.indexOf(u8, begin, "txn_id=") orelse return error.NoTxnId) + "txn_id=".len;
     const id_end = std.mem.indexOfScalarPos(u8, begin, id_start, ' ') orelse begin.len;
     const txn_id = begin[id_start..id_end];
-    const value = "t" ** 30_000;
+    const value = stdx.repeat("t", 30_000);
     try ctx.exec(&.{ "kv", "set", "txn_a", value, "-t", txn_id, "-r", "rk" });
     try ctx.exec(&.{ "kv", "set", "txn_b", value, "-t", txn_id, "-r", "rk" });
     try ctx.exec(&.{ "kv", "set", "txn_c", value, "-t", txn_id, "-r", "rk" });

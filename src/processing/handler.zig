@@ -2073,7 +2073,7 @@ test "ProcessingHandler: a savepoint is created at its entry's stamp, not the ho
         var handler = ProcessingHandler.init(std.testing.allocator);
         defer handler.deinit();
         // [job_id_len=3][job][records_at=0]
-        const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ [_]u8{0} ** 8;
+        const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ @as([8]u8, @splat(0));
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies it.
         try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_savepoint, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "sp-1", &value, &pbuf).?));
@@ -2119,7 +2119,7 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     defer handler.deinit();
 
     // [status=0xee][parallelism][batch_size][ns_len=0]
-    var val = [_]u8{0} ** 13;
+    var val = @as([13]u8, @splat(0));
     val[0] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());

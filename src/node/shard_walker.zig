@@ -271,7 +271,7 @@ const TestItem = struct {
     shard: u16,
 
     fn fromInt(n: u32, shard: u16) TestItem {
-        var key: [8]u8 = .{0} ** 8;
+        var key: [8]u8 = @splat(0);
         std.mem.writeInt(u32, key[0..4], n, .little);
         return .{ .key = key, .shard = shard };
     }
@@ -523,7 +523,7 @@ test "ShardWalker: a scan returning more than fits resumes by offset, losing not
     var contexts = [_]*anyopaque{ @ptrCast(&ctx0), @ptrCast(&ctx1) };
     const walker = Walker.init(mockScanAll, 2);
 
-    var seen: [6]usize = .{0} ** 6;
+    var seen: [6]usize = @splat(0);
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
     var cursor_copy: [64]u8 = undefined;
@@ -553,7 +553,7 @@ test "ShardWalker: a scan that caps at its limit without a cursor loses nothing"
     var contexts = [_]*anyopaque{@ptrCast(&ctx0)};
     const walker = Walker.init(mockScanCapped, 1);
 
-    var seen: [6]usize = .{0} ** 6;
+    var seen: [6]usize = @splat(0);
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
     var cursor_copy: [64]u8 = undefined;

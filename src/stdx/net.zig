@@ -49,7 +49,7 @@ pub const Address = struct {
                     .family = posix.AF.INET,
                     .port = std.mem.nativeToBig(u16, a.port),
                     .addr = @bitCast(a.bytes),
-                    .zero = .{0} ** 8,
+                    .zero = @splat(0),
                 };
                 return @sizeOf(posix.sockaddr.in);
             },
@@ -199,9 +199,9 @@ pub fn getAddressList(gpa: std.mem.Allocator, host: []const u8, port: u16) !Addr
     hints.family = posix.AF.UNSPEC;
     hints.socktype = posix.SOCK.STREAM;
 
-    const host_z = try aalloc.dupeZ(u8, host);
+    const host_z = try aalloc.dupeSentinel(u8, host, 0);
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+    const port_str = try std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0);
 
     var res: ?*std.c.addrinfo = null;
     const rc = std.c.getaddrinfo(host_z.ptr, port_str.ptr, &hints, &res);
@@ -249,7 +249,7 @@ pub const SocketAddrV4 = struct {
             .family = posix.AF.INET,
             .port = std.mem.nativeToBig(u16, port),
             .addr = @bitCast(ip4),
-            .zero = .{0} ** 8,
+            .zero = @splat(0),
         } };
     }
 

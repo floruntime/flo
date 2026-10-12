@@ -14,6 +14,7 @@
 //!   flo workflow list
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
@@ -714,7 +715,7 @@ fn extractWorkflowName(content: []const u8) ?[]const u8 {
 
 test "workflow: a run status parses, and a cut-short one is Truncated" {
     const answer = "\x02\x00r1" ++ "\x02\x00wf" ++ "\x01\x00" ++ "1" ++ "\x02" ++ "\x01\x00s" ++
-        "\x02\x00\x00\x00{}" ++ "\x0a" ++ "\x00" ** 7 ++ "\x01" ++ "\x0b" ++ "\x00" ** 7 ++ "\x00" ++
+        "\x02\x00\x00\x00{}" ++ "\x0a" ++ stdx.repeat("\x00", 7) ++ "\x01" ++ "\x0b" ++ stdx.repeat("\x00", 7) ++ "\x00" ++
         "\x01" ++ "\x02\x00go";
     const st = try parseRunStatus(answer);
     try std.testing.expectEqualStrings("wf", st.workflow);

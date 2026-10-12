@@ -183,7 +183,7 @@ pub const WaiterPool = struct {
     /// Waiters answering another shard or node.
     forwarded: u16 = 0,
     /// Waiters of each kind, so a change nobody waits on skips the scan.
-    of_kind: [@typeInfo(WaiterKind).@"enum".fields.len]u16 = @splat(0),
+    of_kind: [@typeInfo(WaiterKind).@"enum".field_names.len]u16 = @splat(0),
     full_warn_ms: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !WaiterPool {

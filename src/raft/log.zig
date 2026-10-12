@@ -11,6 +11,7 @@
 //! term lookup, and index management on top.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const ual_mod = @import("../storage/ual/ual.zig");
@@ -400,7 +401,7 @@ test "raft log: term lookup survives ring eviction" {
     defer log.deinit();
 
     for (1..41) |i| {
-        var e = makeEntry(.kv_put, @intCast(i), if (i < 20) 1 else 2, "0123456789" ** 4);
+        var e = makeEntry(.kv_put, @intCast(i), if (i < 20) 1 else 2, stdx.repeat("0123456789", 4));
         _ = try log.append(&e);
     }
     try testing.expect(log.getEntry(1) == null); // evicted
@@ -511,7 +512,7 @@ test "raft log: truncate then refill then evict does not wedge the ring" {
     defer log.deinit();
 
     for (1..6) |i| {
-        var e = makeEntry(.kv_put, @intCast(i), 1, "0123456789" ** 4);
+        var e = makeEntry(.kv_put, @intCast(i), 1, stdx.repeat("0123456789", 4));
         _ = try log.append(&e);
     }
     log.truncateAfter(2);
@@ -519,14 +520,14 @@ test "raft log: truncate then refill then evict does not wedge the ring" {
     // past the ring's capacity, which forces eviction through the region
     // the truncation reclaimed.
     for (3..40) |i| {
-        var e = makeEntry(.kv_put, @intCast(i), 2, "abcdefghij" ** 4);
+        var e = makeEntry(.kv_put, @intCast(i), 2, stdx.repeat("abcdefghij", 4));
         _ = try log.append(&e);
     }
     try testing.expectEqual(@as(u64, 39), log.lastIndex());
     try testing.expectEqual(@as(u64, 2), log.lastTerm());
     var buf: [128]u8 = undefined;
     const tip = log.getEntryCopy(39, &buf) orelse return error.TipUnreadable;
-    try testing.expectEqualStrings("abcdefghij" ** 4, tip.payload);
+    try testing.expectEqualStrings(stdx.repeat("abcdefghij", 4), tip.payload);
     try testing.expectEqual(@as(u64, 1), log.entryTerm(2).?);
     try testing.expectEqual(@as(u64, 2), log.entryTerm(3).?);
     try testing.expectEqual(log.ual.entry_count * (entry_mod.HEADER_SIZE + 40), log.ual.used());
@@ -751,7 +752,7 @@ test "raft log: reads below the ring come from the catch-up source, bounded by t
     log.catch_up = .{ .ctx = @ptrCast(&source), .read_range = TestSource.readRange };
 
     for (1..41) |i| {
-        var e = makeEntry(.kv_put, @intCast(i), 1, "0123456789" ** 4);
+        var e = makeEntry(.kv_put, @intCast(i), 1, stdx.repeat("0123456789", 4));
         try source.record(allocator, &e);
         _ = try log.append(&e);
     }

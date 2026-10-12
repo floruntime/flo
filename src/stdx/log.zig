@@ -1011,10 +1011,10 @@ test "an overlong message is cut at a character boundary, and its JSON line stil
 test "a cut that would split a character drops the whole character" {
     // ASCII up to one byte before the cut, then a 4-byte character across it.
     const room = max_message_len - cut_marker.len;
-    const msg_in = ("a" ** (room - 1)) ++ "😀" ++ ("b" ** 100);
+    const msg_in = (@import("mod.zig").repeat("a", (room - 1))) ++ "😀" ++ (@import("mod.zig").repeat("b", 100));
     var msg_buf: [max_message_len]u8 = undefined;
     const msg = formatMessage(&msg_buf, "{s}", .{msg_in});
-    try std.testing.expectEqualStrings(("a" ** (room - 1)) ++ cut_marker, msg);
+    try std.testing.expectEqualStrings((@import("mod.zig").repeat("a", (room - 1))) ++ cut_marker, msg);
 }
 
 test "a formatted JSON message is kept, not replaced by its format string" {
@@ -1023,7 +1023,7 @@ test "a formatted JSON message is kept, not replaced by its format string" {
     var buf: [line_buf_len]u8 = undefined;
 
     // Fits: kept whole.
-    const fits = "y" ** 2000;
+    const fits = @import("mod.zig").repeat("y", 2000);
     var w: std.Io.Writer = .fixed(&buf);
     formatFmtJsonEntry(&w, .info, "n={s}", .{fits}, 0, null, .{});
     const whole = try parseLine(w.buffered());
@@ -1031,7 +1031,7 @@ test "a formatted JSON message is kept, not replaced by its format string" {
     try std.testing.expectEqualStrings("n=" ++ fits, whole.value.object.get("msg").?.string);
 
     // Longer than a message may be: cut and marked, never the format string.
-    const long = "z" ** (max_message_len + 500);
+    const long = @import("mod.zig").repeat("z", (max_message_len + 500));
     w = .fixed(&buf);
     formatFmtJsonEntry(&w, .info, "n={s}", .{long}, 0, null, .{});
     const cut = try parseLine(w.buffered());
@@ -1045,7 +1045,7 @@ test "a formatted JSON message is kept, not replaced by its format string" {
 test "the installed std.log function keeps a message over the limit, cut and marked" {
     const saved = withGlobal(.json, true);
     defer global = saved;
-    const long = "q" ** (max_message_len + 1000);
+    const long = @import("mod.zig").repeat("q", (max_message_len + 1000));
     var buf: [line_buf_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     renderStdLine(&w, .info, "reactor", "{s}", .{long}, 0);
@@ -1057,7 +1057,7 @@ test "the installed std.log function keeps a message over the limit, cut and mar
 }
 
 test "a message exactly at the limit is not cut" {
-    const exact = "e" ** max_message_len;
+    const exact = @import("mod.zig").repeat("e", max_message_len);
     var msg_buf: [max_message_len]u8 = undefined;
     try std.testing.expectEqualStrings(exact, formatMessage(&msg_buf, "{s}", .{exact}));
 }

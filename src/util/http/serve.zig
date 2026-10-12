@@ -358,11 +358,11 @@ test "serve: a request past the limits is answered 413 or 431 and never handled,
     const big = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, big, &out), "HTTP/1.1 413"));
 
-    const huge_head = "GET / HTTP/1.1\r\nX: " ++ "h" ** (MAX_HEAD + 10) ++ "\r\n\r\n";
+    const huge_head = "GET / HTTP/1.1\r\nX: " ++ stdx.repeat("h", (MAX_HEAD + 10)) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, huge_head, &out), "HTTP/1.1 431"));
 
     // A head that never ends is not buffered past the limit either.
-    const endless_head = "GET / HTTP/1.1\r\nX: " ++ "h" ** (MAX_HEAD + 10);
+    const endless_head = "GET / HTTP/1.1\r\nX: " ++ stdx.repeat("h", (MAX_HEAD + 10));
     try testing.expect(std.mem.startsWith(u8, try exchange(srv.l.port, endless_head, &out), "HTTP/1.1 431"));
 
     const bad_length = "POST / HTTP/1.1\r\nContent-Length: lots\r\n\r\n";
