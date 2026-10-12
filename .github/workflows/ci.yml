@@ -70,6 +70,17 @@ jobs:
       - name: Build
         run: zig build
 
+      # CI otherwise runs only unfiltered, which never exercises the filter
+      # checks: a filtered step must compile exactly what the build predicted,
+      # and a filter that matches nothing must fail the step.
+      - name: Filtered tests
+        run: zig build test-unit -Dtest-filter=kv
+      - name: A filter that matches nothing fails
+        run: |
+          if zig build test-unit -Dtest-filter=no_test_is_named_this; then
+            echo "::error::a test filter that matched nothing passed"; exit 1
+          fi
+
   test:
     name: ${{ matrix.step }}
     needs: web

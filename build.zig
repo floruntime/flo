@@ -293,7 +293,9 @@ fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, f
     var msg: std.Io.Writer.Allocating = .init(b.allocator);
     msg.writer.print("no test in {s} matched", .{name}) catch @panic("out of memory");
     for (filters) |f| msg.writer.print(" -Dtest-filter={s}", .{f}) catch @panic("out of memory");
-    msg.writer.writeAll(" (filters are plain substrings of the test name)") catch @panic("out of memory");
+    msg.writer.writeAll(" (filters are plain substrings of the test name") catch @panic("out of memory");
+    if (std.mem.eql(u8, name, "test")) msg.writer.writeAll("; test-e2e and test-integration are separate steps") catch @panic("out of memory");
+    msg.writer.writeAll(")") catch @panic("out of memory");
     step.dependOn(&b.addFail(msg.written()).step);
 }
 
@@ -333,6 +335,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
                 const content = root_dir.readFileAlloc(io, entry.path, b.allocator, .unlimited) catch |err|
                     std.debug.panic("cannot read {s}/{s} to find its tests: {t}", .{ dir, entry.path, err });
                 if (!hasTestDecl(content)) continue;
+                refuseUnpredictableTests(dir, entry.path, content);
                 declared += countTopLevelTestDecls(content);
                 matched += countMatchingTests(b, entry.path, content, filters);
                 files.append(b.allocator, b.dupe(entry.path)) catch @panic("out of memory");
@@ -408,10 +411,29 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     return .{ .path = b.fmt("{s}/{s}", .{ dir, out_name }), .options = options, .matched = matched };
 }
 
+/// `countMatchingTests` reads a test's full name off its line, which holds
+/// only for `test "…"` at the top level: a decltest is named `X.decltest.y`
+/// and a nested test carries its container's name, so a filter could match
+/// one without the build knowing. Refuse both rather than miscount.
+fn refuseUnpredictableTests(dir: []const u8, path: []const u8, content: []const u8) void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!isTestDecl(trimmed)) continue;
+        const rest = trimmed["test ".len..];
+        if (rest[0] != '"' and rest[0] != '{')
+            std.process.fatal("{s}/{s}:{d}: a decltest's name can't be predicted for -Dtest-filter; write it as test \"…\"", .{ dir, path, line_no });
+        if (rest[0] == '"' and trimmed.len != line.len)
+            std.process.fatal("{s}/{s}:{d}: a test nested in a container can't be predicted for -Dtest-filter; move it to the top level", .{ dir, path, line_no });
+    }
+}
+
 /// Named tests in `content` whose full name contains one of `filters`. Zig
 /// names a test `<path, with . for / and no .zig>.test.<its string>` and
-/// filters by substring of that; flo has no decltests or tests nested in
-/// containers, so the name is fully known from the line.
+/// filters by substring of that; `refuseUnpredictableTests` keeps decltests
+/// and nested tests out, so the name is fully known from the line.
 fn countMatchingTests(b: *std.Build, path: []const u8, content: []const u8, filters: []const []const u8) usize {
     if (filters.len == 0) return 0;
     const stem = b.allocator.dupe(u8, path[0 .. path.len - ".zig".len]) catch @panic("out of memory");
