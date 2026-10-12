@@ -187,8 +187,9 @@ pub const Shard = struct {
     /// Pipe read-end fd — receives hand-offs from Acceptor.
     acceptor_pipe_rd: i32,
 
-    /// Whether the shard is running.
-    running: bool,
+    /// Set once, from any thread, to stop the shard's loop; never cleared,
+    /// so a stop asked for before the loop starts still stops it.
+    stop_requested: std.atomic.Value(bool),
 
     /// Next connection ID.
     next_conn_id: u32,
@@ -873,7 +874,7 @@ pub const Shard = struct {
             .router = Router.init(partition_count, shard_count, shard_id),
             .slab = slab,
             .acceptor_pipe_rd = acceptor_pipe_rd,
-            .running = false,
+            .stop_requested = .init(false),
             .next_conn_id = 1,
             .requests_dispatched = 0,
             .inbox_messages_processed = 0,
@@ -1872,7 +1873,7 @@ pub const Shard = struct {
 
     fn handleInboxMessage(self: *Shard, msg: InboxMessage) void {
         switch (msg.tag) {
-            .shutdown => self.running = false,
+            .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -3503,13 +3504,12 @@ pub const Shard = struct {
 
     /// Enter the main reactor loop. Blocks until `shutdown()` is called.
     pub fn run(self: *Shard) !void {
-        self.running = true;
         log.debug("Shard {d} entering reactor loop", .{self.id});
 
         var last_warn_ms: u64 = 0;
         var unsaid: u64 = 0;
         var failing = false;
-        while (self.running) {
+        while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
             const busy = self.more_work or self.resume_fds.items.len > 0;
             _ = self.tick(if (busy) 0 else 100) catch |err| {
@@ -3536,11 +3536,25 @@ pub const Shard = struct {
         }
 
         log.debug("Shard {d} reactor loop exited", .{self.id});
+        self.answerAtShutdown();
     }
 
-    /// Signal the shard to stop.
+    /// Signal the shard to stop; safe from any thread.
     pub fn shutdown(self: *Shard) void {
-        self.running = false;
+        self.stop_requested.store(true, .release);
+    }
+
+    /// What the reply to a write still waiting for commit says when the
+    /// server stops: it was proposed, so it may yet apply.
+    pub const SHUTTING_DOWN = "unavailable: the server is shutting down; this write may have been applied — check before resending";
+
+    /// The loop has stopped: answer the writes still waiting for commit,
+    /// and send every connection what it was owed, before the runtime
+    /// frees the shard and closes them.
+    fn answerAtShutdown(self: *Shard) void {
+        self.resolvePending(SHUTTING_DOWN);
+        var it = self.connections.keyIterator();
+        while (it.next()) |fd| self.flushToClient(fd.*);
     }
 
     // ─── Background tasks ────────────────────────────────────────────────
@@ -5708,7 +5722,7 @@ test "Shard: init and deinit" {
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
     try std.testing.expectEqual(@as(u32, 0), shard.connectionCount());
-    try std.testing.expect(!shard.running);
+    try std.testing.expect(!shard.stop_requested.load(.acquire));
 }
 
 test "Shard: add and remove connections" {
@@ -5785,8 +5799,7 @@ test "Shard: inbox shutdown message" {
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
-    shard.running = true;
-    try std.testing.expect(shard.running);
+    try std.testing.expect(!shard.stop_requested.load(.acquire));
 
     // Send shutdown via inbox
     const sent = shard.mailbox.inbox.send(.{
@@ -5803,7 +5816,7 @@ test "Shard: inbox shutdown message" {
     // Drain inbox
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
-    try std.testing.expect(!shard.running);
+    try std.testing.expect(shard.stop_requested.load(.acquire));
 }
 
 test "Shard: a first member leads a group of itself from the log; a joiner waits to be named" {
@@ -10904,4 +10917,39 @@ test "Shard: a boot told another shard failed stops its replay and frees what it
     try std.testing.expectError(error.BootCancelled, Shard.init(std.testing.allocator, 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{ .health = &slot, .cancel = &cancel }));
     // Stopped at the first entry: nothing past it was read back.
     try std.testing.expectEqual(@as(u64, 0), slot.replay_index.load(.monotonic));
+}
+
+test "Shard: a write still waiting for commit when the shard stops is told it may have applied, and the answer goes out" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Proposed, and waiting for the peer's ack that never comes.
+    try ParkTest.send(&shard, conn, .queue_enqueue, 9, "q", "m1");
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+    // Told to stop before its next turn: the loop ends without one.
+    shard.shutdown();
+    try shard.run();
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+    var one: [1]proto.Response = undefined;
+    var buf: [1024]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    const told = try one[0].refused();
+    try std.testing.expectEqual(proto.Ran.unknown, told.ran);
+    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN, told.message);
 }
