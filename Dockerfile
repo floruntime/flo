@@ -38,9 +38,6 @@ WORKDIR /build
 # Copy source code
 COPY build.zig build.zig.zon ./
 COPY src/ ./src/
-# build.zig generates its test roots by walking these directories, and stops
-# if one is missing, so they are copied even though the image runs no tests.
-COPY tests/ ./tests/
 
 # Copy built web dashboard from previous stage
 RUN mkdir -p src/node/dashboard/dist

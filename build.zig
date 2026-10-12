@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path(unit_root.path),
+            .root_source_file = unit_root.source,
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -147,7 +147,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path(e2e_root.path),
+            .root_source_file = e2e_root.source,
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path(integration_root.path),
+            .root_source_file = integration_root.source,
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -186,19 +186,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_stdx_tests.step);
     failIfNoTestMatched(b, test_step, "test", test_filters, &.{ unit_root, stdx_root });
+    failIfMissing(b, test_step, "test", &.{ unit_root, stdx_root });
 
     const unit_test_step = b.step("test-unit", "Run unit tests only");
     unit_test_step.dependOn(&run_unit_tests.step);
     unit_test_step.dependOn(&run_stdx_tests.step);
     failIfNoTestMatched(b, unit_test_step, "test-unit", test_filters, &.{ unit_root, stdx_root });
+    failIfMissing(b, unit_test_step, "test-unit", &.{ unit_root, stdx_root });
 
     const e2e_test_step = b.step("test-e2e", "Run end-to-end tests");
     e2e_test_step.dependOn(&run_e2e_tests.step);
     failIfNoTestMatched(b, e2e_test_step, "test-e2e", test_filters, &.{e2e_root});
+    failIfMissing(b, e2e_test_step, "test-e2e", &.{e2e_root});
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
     failIfNoTestMatched(b, integration_test_step, "test-integration", test_filters, &.{integration_root});
+    failIfMissing(b, integration_test_step, "test-integration", &.{integration_root});
 
     // ── VOPR simulator ──
 
@@ -273,8 +277,8 @@ pub fn build(b: *std.Build) void {
 // ── Test Roots ──
 
 const TestRoot = struct {
-    /// The generated root, relative to the build root.
-    path: []const u8,
+    /// The generated root.
+    source: std.Build.LazyPath,
     /// `declared` (top-level test declarations the walk found), for the
     /// root's check that every one of them was compiled; `filters` and
     /// `matched`, for its check that a filtered build compiled exactly the
@@ -282,14 +286,23 @@ const TestRoot = struct {
     options: *std.Build.Step.Options,
     /// Named tests under this root whose name contains a filter.
     matched: usize,
+    /// The directory, when this checkout doesn't have it.
+    missing: ?[]const u8 = null,
 };
+
+/// A checkout without a test directory (a source tarball, an image build)
+/// still builds the binary; a step that would run those tests fails instead.
+fn failIfMissing(b: *std.Build, step: *std.Build.Step, name: []const u8, roots: []const TestRoot) void {
+    for (roots) |root| if (root.missing) |dir|
+        step.dependOn(&b.addFail(b.fmt("{s} needs {s}, which this checkout doesn't have", .{ name, dir })).step);
+}
 
 /// A filtered test step whose roots hold no test matching any filter would
 /// run only the nameless tests and pass, so fail it instead, naming the
 /// filters.
 fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, filters: []const []const u8, roots: []const TestRoot) void {
     if (filters.len == 0) return;
-    for (roots) |root| if (root.matched > 0) return;
+    for (roots) |root| if (root.matched > 0 or root.missing != null) return;
     var msg: std.Io.Writer.Allocating = .init(b.allocator);
     msg.writer.print("no test in {s} matched", .{name}) catch @panic("out of memory");
     for (filters) |f| msg.writer.print(" -Dtest-filter={s}", .{f}) catch @panic("out of memory");
@@ -305,12 +318,21 @@ fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, f
 /// directories down (`test_root_sentinel/nested/sentinel.zig`) was compiled
 /// and at least as many tests as the walk counted at the top level.
 /// Called at configure time, like the dashboard assets; the file is
-/// gitignored.
+/// gitignored. A missing `dir` gives an empty root marked `missing`.
 fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filters: []const []const u8) TestRoot {
     const io = buildIo();
     const out_name = "all_tests.zig";
-    var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
-        std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err });
+    var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            const options = b.addOptions();
+            options.addOption(usize, "declared", 0);
+            options.addOption([]const []const u8, "filters", filters);
+            options.addOption(usize, "matched", 0);
+            const stub = b.addWriteFiles().add(out_name, "test {}\n");
+            return .{ .source = stub, .options = options, .matched = 0, .missing = dir };
+        },
+        else => std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err }),
+    };
     defer root_dir.close(io);
 
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -408,7 +430,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     // The root's own named test is compiled when a filter matches its name.
     matched += countMatchingTests(b, out_name, "test \"every test declared under this directory is compiled\" {", filters);
     options.addOption(usize, "matched", matched);
-    return .{ .path = b.fmt("{s}/{s}", .{ dir, out_name }), .options = options, .matched = matched };
+    return .{ .source = b.path(b.fmt("{s}/{s}", .{ dir, out_name })), .options = options, .matched = matched };
 }
 
 /// `countMatchingTests` reads a test's full name off its line, which holds
