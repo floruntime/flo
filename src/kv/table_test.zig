@@ -33,7 +33,7 @@ const Harness = struct {
 
     fn init(h: *Harness) !void {
         h.pipe = try @import("stdx").io.pipe();
-        h.shard = try Shard.init(testing.allocator, 0, 1, 4096, h.pipe[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{});
+        h.shard = try Shard.init(testing.allocator, 0, 1, 4096, h.pipe[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         try testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &h.pair));
         // As an accepted socket is: a full kernel buffer must not block the
         // shard's flush.
