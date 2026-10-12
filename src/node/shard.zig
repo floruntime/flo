@@ -1026,6 +1026,7 @@ pub const Shard = struct {
         for (self.pending) |*slot| {
             if (!slot.active or slot.index <= index) continue;
             self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
+            self.pendingFailed(slot.bytes);
             self.allocator.free(slot.bytes);
             slot.active = false;
             self.pending_count -= 1;
@@ -2175,10 +2176,12 @@ pub const Shard = struct {
         // write never committed, whatever became of that one.
         if (term != 0 and slot.term != term) {
             self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .unavailable, proto.notRun("unavailable: leader changed, write not applied — retry"));
+            self.pendingFailed(slot.bytes);
             return;
         }
         if (!applied) {
             self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
+            self.pendingFailed(slot.bytes);
             return;
         }
         const req = proto.Request.parse(slot.bytes) catch {
@@ -2199,12 +2202,23 @@ pub const Shard = struct {
         }
     }
 
+    /// A parked request answered with a failure instead of its responder.
+    /// A KV commit's transaction was closed when its batch was proposed and
+    /// waits on that responder to drop it; without this it would hold its
+    /// slot forever.
+    fn pendingFailed(self: *Shard, bytes: []const u8) void {
+        const req = proto.Request.parse(bytes) catch return;
+        if (req.header.op_code != @intFromEnum(proto.OpCode.kv_commit_txn)) return;
+        self.kv_handler.commitFailed(req);
+    }
+
     fn resolvePending(self: *Shard, message: []const u8) void {
         if (self.pending_count == 0) return;
         log.warn("shard {d}: {d} write(s) were waiting for commit; answering each: {s}", .{ self.id, self.pending_count, message });
         for (self.pending) |*slot| {
             if (!slot.active) continue;
             self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
+            self.pendingFailed(slot.bytes);
             self.allocator.free(slot.bytes);
             slot.active = false;
             self.pending_count -= 1;
@@ -8399,6 +8413,45 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
     const kv = &shard.defaultPartition().kv;
     try std.testing.expectEqualStrings("v", kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?.value);
     try std.testing.expect(kv.get(try handler_mod.qualifyKey(&qbuf, "", "k2")) == null);
+}
+
+test "Shard: a KV commit answered with a failure instead of its batch drops its transaction" {
+    for ([_]bool{ true, false }) |by_index| {
+        const pipe_fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(pipe_fds[0]);
+        defer _ = std.c.close(pipe_fds[1]);
+        var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        defer rn.deinit();
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+        defer shard.deinit();
+        shard.raft_network = &rn;
+        shard.wireHandlerShardPtrs();
+        try ParkTest.joinPeer(&shard);
+
+        var pair: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+        defer _ = std.c.close(pair[1]);
+        const conn = try shard.addConnection(pair[0]);
+        var buf: [2048]u8 = undefined;
+        var one: [1]proto.Response = undefined;
+
+        const table_ = &shard.kv_handler.txn_table;
+        const commit = table_run.op("kv.txn_commit");
+        var txn_buf: [16]u8 = undefined;
+        const id2 = try table_.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""), 0);
+        try table_.appendOp(id2, .put, "k", "v", 0);
+        shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.kv_commit_txn, 2), .namespace = "", .key = "", .value = try commit.request.encodeInto(&txn_buf, .{ .txn = id2 }) }, .client);
+        try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+        try std.testing.expect(table_.get(id2).?.committing);
+
+        // The batch won't be answered for: the transaction goes with it.
+        if (by_index) shard.failPendingAbove(shard.raft_node.log.lastIndex() - 1, Shard.NOT_ON_DISK) else shard.resolvePending("unavailable: stepped down");
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.StatusCode.unavailable)), one[0].header.status);
+        try std.testing.expect(table_.get(id2) == null);
+        try std.testing.expectEqual(@as(usize, 0), table_.count());
+    }
 }
 
 test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {

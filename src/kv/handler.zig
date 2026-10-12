@@ -738,6 +738,15 @@ pub const KVHandler = struct {
         table_run.answer(TxnCommitResponse, shard, conn, req.header.request_id, .{ .commit_index = shard.raft_node.last_applied, .ops = count });
     }
 
+    /// A commit whose batch won't be answered for (a leader change, a
+    /// failed flush): drop its transaction. If the batch still applies it
+    /// applies whole, on its own.
+    pub fn commitFailed(self: *KVHandler, req: Request) void {
+        var diag: schema.Diagnostic = .{};
+        const body = table_run.op("kv.txn_commit").request.decodeAll(req.value, &diag) catch return;
+        self.txn_table.drop(body.txn);
+    }
+
     /// Drop a transaction and its buffered writes.
     fn txnRollback(shard: *Shard, _: *Connection, req: Request, txn: u64) Error!table_run.Outcome(TxnRollbackResponse) {
         const table = &shard.kv_handler.*.txn_table;
