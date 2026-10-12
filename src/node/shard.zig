@@ -1198,6 +1198,7 @@ pub const Shard = struct {
         self.forward_proxy.deinit();
         self.allocator.destroy(self.forward_proxy);
 
+        self.freeUndelivered();
         self.mailbox.destroy(self.allocator);
         self.reply_pool.deinit(self.allocator);
         self.waiter_pool.deinit(self.allocator);
@@ -3588,8 +3589,8 @@ pub const Shard = struct {
             self.dropForward(f);
         }
         self.waiter_pool.expireAll(handleWaiterTimeout, @ptrCast(self));
+        self.refuseUnrunRequests();
         self.takeAnswersUntilAllStopped();
-        self.dropUnrunRequests();
         const Stopped = struct {
             shard: *Shard,
             pub fn late(ctx: *@This(), slot: ReplyPool.Slot) void {
@@ -3627,18 +3628,53 @@ pub const Shard = struct {
         }
     }
 
-    /// Requests other shards sent here that will never run: each asker
-    /// answers its own from the reply slot it holds, so only the copies are
-    /// freed here.
-    fn dropUnrunRequests(self: *Shard) void {
+    /// Requests other shards sent here that the stop leaves unrun: each is
+    /// told it did not run, before this shard counts itself stopped, so the
+    /// answer reaches its asker. One arriving later is freed by `deinit`,
+    /// and its asker answers it from the slot it holds.
+    fn refuseUnrunRequests(self: *Shard) void {
         var buf: [64]InboxMessage = undefined;
         while (true) {
             const count = self.mailbox.inbox.drain(&buf);
             if (count == 0) return;
-            for (buf[0..count]) |msg| {
-                if (msg.tag != .forward_request) continue;
-                const ptr = msg.payload_ptr orelse continue;
-                if (msg.payload_len > 0) self.allocator.free(@as([*]u8, @ptrCast(ptr))[0..msg.payload_len]);
+            for (buf[0..count]) |msg| switch (msg.tag) {
+                .forward_request => {
+                    const bytes = inboxPayload(msg);
+                    defer if (bytes.len > 0) self.allocator.free(bytes);
+                    const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
+                    const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
+                    const held = msg.replySlot();
+                    const reply_to: ReplyTo = .{ .socket = .{ .shard = msg.src_shard, .fd = fd, .conn_id = @truncate(msg.sequence >> 32), .slot = held.slot, .gen = held.gen } };
+                    self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
+                },
+                .reply => self.deliverReply(msg),
+                .action_start => {
+                    const bytes = inboxPayload(msg);
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                },
+                .shutdown, .cancel_reads => {},
+            };
+        }
+    }
+
+    /// The bytes a message carries on the heap, if any.
+    fn inboxPayload(msg: InboxMessage) []u8 {
+        const ptr = msg.payload_ptr orelse return &.{};
+        return @as([*]u8, @ptrCast(ptr))[0..msg.payload_len];
+    }
+
+    /// Whatever is still on this shard's rings once every shard has
+    /// stopped: nothing will read it, so its heap copies are freed.
+    fn freeUndelivered(self: *Shard) void {
+        var buf: [64]InboxMessage = undefined;
+        for ([_]*@TypeOf(self.mailbox.inbox){ &self.mailbox.inbox, &self.mailbox.replies }) |ring| {
+            while (true) {
+                const count = ring.drain(&buf);
+                if (count == 0) break;
+                for (buf[0..count]) |msg| {
+                    const bytes = inboxPayload(msg);
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                }
             }
         }
     }
@@ -11142,13 +11178,53 @@ test "Shard: stopping shards answer each other's clients: a blocking read anothe
     // Shard 1's own answer to the read, carried over shard 0's reply ring.
     const read = try answerFor(answers[0..n], 51);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), read.header.status);
+    // Still in shard 1's inbox when it stopped: it provably did not run.
     const write = try answerFor(answers[0..n], 52);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), write.header.status);
-    try std.testing.expectEqual(proto.Ran.unknown, (try write.refused()).ran);
-    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN, (try write.refused()).message);
+    try std.testing.expectEqual(proto.Ran.no, (try write.refused()).ran);
+    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN_NOT_RUN, (try write.refused()).message);
     const unrun = try answerFor(answers[0..n], 53);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), unrun.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try unrun.refused()).ran);
+}
+
+test "Shard: a write reaching a shard after it stopped is answered by its asker, as one that may have applied" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+
+    var stopping: Shard.Stopping = .{ .of = 2 };
+    for (&two.shards) |*s| {
+        s.stopping = &stopping;
+        s.shutdown();
+    }
+    const Run = struct {
+        fn run(s: *Shard) void {
+            s.run() catch {};
+        }
+    };
+    // Shard 1 has counted itself stopped, so it has refused what it held.
+    const tb = try std.Thread.spawn(.{}, Run.run, .{b});
+    while (stopping.stopped.load(.acquire) < 1) std.Thread.yield() catch {};
+    const put = try testRequest(.kv_put, 61, "k", "v");
+    defer std.testing.allocator.free(put);
+    try forwardForTest(a, 1, c.conn, put);
+    try a.run();
+    tb.join();
+
+    var out: [1024]u8 = undefined;
+    var answers: [4]proto.Response = undefined;
+    const n = try answersUntilEnd(c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    const late = try answerFor(answers[0..n], 61);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), late.header.status);
+    try std.testing.expectEqual(proto.Ran.unknown, (try late.refused()).ran);
+    // Its copy, unrun in shard 1's inbox, is freed with the shard.
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.pending());
 }
 
 test "Shard: a stopping node answers its writes forwarded to a leader: one sent may have applied, one not yet sent did not run" {

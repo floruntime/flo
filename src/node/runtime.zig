@@ -462,6 +462,8 @@ pub const Runtime = struct {
 
     /// Start the runtime: create shards, spawn threads, start acceptor.
     pub fn start(self: *Runtime) !void {
+        // A runtime started again counts its shards' stop afresh.
+        self.stopping = .{};
         // Expand a leading `~` to $HOME at the single point where the configured
         // data dir first becomes real directories. Without this, a default or
         // CLI-bypassing `~/.flo/data` would have `makePath` create a literal `~`
