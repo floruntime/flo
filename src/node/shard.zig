@@ -8330,6 +8330,77 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
 }
 
+test "Shard: a KV transaction whose commit waits on a peer takes no second commit, write or rollback" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var diag: schema.Diagnostic = .{};
+    // Bodies already schema-coded, sent as they are.
+    const send = struct {
+        fn run(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, body: []const u8) void {
+            sh.runRequest(c, .{ .header = proto.RequestHeader.init(op, id), .namespace = "", .key = key, .value = body }, .client);
+        }
+    }.run;
+
+    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""), 0);
+    const set = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    const in_txn = try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
+    send(&shard, conn, .kv_put, 1, "k", in_txn);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+
+    // The commit proposes its batch and waits on the peer's ack.
+    const commit = table_run.op("kv.txn_commit");
+    var txn_buf: [16]u8 = undefined;
+    const by_id = try commit.request.encodeInto(&txn_buf, .{ .txn = id });
+    send(&shard, conn, .kv_commit_txn, 2, "", by_id);
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &.{});
+
+    // Until it applies, the transaction is closed: a second commit would
+    // propose the batch again, and a write or rollback would change what
+    // the first commit answers for.
+    const later_set = try set.request.encodeInto(&set_buf, .{ .value = "w", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
+    for ([_]struct { op: proto.OpCode, key: []const u8, body: []const u8 }{
+        .{ .op = .kv_commit_txn, .key = "", .body = by_id },
+        .{ .op = .kv_rollback_txn, .key = "", .body = by_id },
+        .{ .op = .kv_put, .key = "k2", .body = later_set },
+    }, 3..) |c, rid| {
+        send(&shard, conn, c.op, rid, c.key, c.body);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+        try std.testing.expectEqual(@as(u64, rid), one[0].header.request_id);
+        const r = try one[0].refused();
+        try std.testing.expectEqual(proto.Reason.no_such_transaction, r.reason);
+        try std.testing.expectEqual(proto.Ran.no, r.ran);
+    }
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+    // The batch applies once; the first commit answers for its one write.
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+    try std.testing.expectEqual(@as(u16, 1), (try commit.response.decodeAll(one[0].data, &diag)).ops);
+    try std.testing.expect(shard.kv_handler.txn_table.get(id) == null);
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const kv = &shard.defaultPartition().kv;
+    try std.testing.expectEqualStrings("v", kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?.value);
+    try std.testing.expect(kv.get(try handler_mod.qualifyKey(&qbuf, "", "k2")) == null);
+}
+
 test "Shard: appends, enqueues and a time-series write parked behind a peer's ack each answer from their own entry" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
