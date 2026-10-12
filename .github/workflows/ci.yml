@@ -103,7 +103,10 @@ jobs:
           path: src/node/dashboard/dist
 
       - name: zig build ${{ matrix.step }}
-        run: zig build ${{ matrix.step }} --test-timeout ${{ matrix.test_timeout }}
+        env:
+          STEP: ${{ matrix.step }}
+          TEST_TIMEOUT: ${{ matrix.test_timeout }}
+        run: zig build "$STEP" --test-timeout "$TEST_TIMEOUT"
         timeout-minutes: 30
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
