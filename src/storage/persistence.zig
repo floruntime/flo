@@ -65,7 +65,7 @@ pub const ReplayRegistry = struct {
 
     /// Register a handler for a specific entry type.
     pub fn register(self: *ReplayRegistry, etype: EntryType, ctx: *anyopaque, func: ReplayFn) void {
-        const slot = &self.callbacks[@intFromEnum(etype)];
+        const slot = &self.callbacks[@backingInt(etype)];
         if (slot.* != null) {
             if (self.duplicate == null) self.duplicate = etype;
             return;
@@ -74,7 +74,7 @@ pub const ReplayRegistry = struct {
     }
 
     pub fn has(self: *const ReplayRegistry, etype: EntryType) bool {
-        return self.callbacks[@intFromEnum(etype)] != null;
+        return self.callbacks[@backingInt(etype)] != null;
     }
 
     /// Dispatch an entry to its registered handler. Null when its type has

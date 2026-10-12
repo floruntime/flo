@@ -1027,7 +1027,7 @@ pub const TSProjection = struct {
     // ─── UAL Entry application ─────────────────────────────────────────────
 
     pub fn applyEntry(self: *TSProjection, ual_entry: *const Entry) !void {
-        const entry_type: EntryType = @enumFromInt(ual_entry.header.entry_type);
+        const entry_type: EntryType = @fromBackingInt(@intCast(ual_entry.header.entry_type));
 
         switch (entry_type) {
             .ts_write, .ts_write_batch => {

@@ -204,7 +204,7 @@ test "e2e/processing: protocol request building - submit" {
         "",
     );
 
-    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_submit), req.header.op_code);
+    try testing.expectEqual(@backingInt(proto.OpCode.processing_submit), req.header.op_code);
     try testing.expect(req.header.request_id > 0);
 }
 
@@ -221,7 +221,7 @@ test "e2e/processing: protocol request building - stop" {
         "",
     );
 
-    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_stop), req.header.op_code);
+    try testing.expectEqual(@backingInt(proto.OpCode.processing_stop), req.header.op_code);
     try testing.expect(req.header.request_id > 0);
 }
 
@@ -238,7 +238,7 @@ test "e2e/processing: protocol request building - list" {
         "",
     );
 
-    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_list), req.header.op_code);
+    try testing.expectEqual(@backingInt(proto.OpCode.processing_list), req.header.op_code);
 }
 
 test "e2e/processing: protocol request building - rescale" {
@@ -254,7 +254,7 @@ test "e2e/processing: protocol request building - rescale" {
         "",
     );
 
-    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_rescale), req.header.op_code);
+    try testing.expectEqual(@backingInt(proto.OpCode.processing_rescale), req.header.op_code);
 }
 
 test "e2e/processing: protocol request building - restore" {
@@ -270,7 +270,7 @@ test "e2e/processing: protocol request building - restore" {
         "",
     );
 
-    try testing.expectEqual(@intFromEnum(proto.OpCode.processing_restore), req.header.op_code);
+    try testing.expectEqual(@backingInt(proto.OpCode.processing_restore), req.header.op_code);
 }
 
 // =============================================================================
@@ -285,14 +285,14 @@ test "e2e/processing: processing opcodes are defined" {
     const proto = src.protocol.proto;
 
     // Processing opcodes must exist and have stable values (wire contract)
-    try testing.expectEqual(@as(u16, 0x360), @intFromEnum(proto.OpCode.processing_submit));
-    try testing.expectEqual(@as(u16, 0x361), @intFromEnum(proto.OpCode.processing_stop));
-    try testing.expectEqual(@as(u16, 0x362), @intFromEnum(proto.OpCode.processing_cancel));
-    try testing.expectEqual(@as(u16, 0x363), @intFromEnum(proto.OpCode.processing_status));
-    try testing.expectEqual(@as(u16, 0x364), @intFromEnum(proto.OpCode.processing_list));
-    try testing.expectEqual(@as(u16, 0x365), @intFromEnum(proto.OpCode.processing_savepoint));
-    try testing.expectEqual(@as(u16, 0x366), @intFromEnum(proto.OpCode.processing_restore));
-    try testing.expectEqual(@as(u16, 0x367), @intFromEnum(proto.OpCode.processing_rescale));
+    try testing.expectEqual(@as(u16, 0x360), @backingInt(proto.OpCode.processing_submit));
+    try testing.expectEqual(@as(u16, 0x361), @backingInt(proto.OpCode.processing_stop));
+    try testing.expectEqual(@as(u16, 0x362), @backingInt(proto.OpCode.processing_cancel));
+    try testing.expectEqual(@as(u16, 0x363), @backingInt(proto.OpCode.processing_status));
+    try testing.expectEqual(@as(u16, 0x364), @backingInt(proto.OpCode.processing_list));
+    try testing.expectEqual(@as(u16, 0x365), @backingInt(proto.OpCode.processing_savepoint));
+    try testing.expectEqual(@as(u16, 0x366), @backingInt(proto.OpCode.processing_restore));
+    try testing.expectEqual(@as(u16, 0x367), @backingInt(proto.OpCode.processing_rescale));
 }
 
 // =============================================================================
@@ -1973,8 +1973,8 @@ test "e2e/processing: SourceKind values are stable" {
     const SourceKind = src.processing.definition.SourceKind;
 
     // Enum backing values must remain stable for wire compatibility
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(SourceKind.stream));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(SourceKind.ts));
+    try testing.expectEqual(@as(u8, 0), @backingInt(SourceKind.stream));
+    try testing.expectEqual(@as(u8, 1), @backingInt(SourceKind.ts));
 }
 
 test "e2e/processing: TS source definition parser roundtrip" {

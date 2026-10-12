@@ -122,7 +122,7 @@ pub const RaftLog = struct {
             self.first_idx = idx;
         }
         self.last_idx = idx;
-        if (e.header.entry_type == @intFromEnum(EntryType.raft_config)) self.last_config_index = idx;
+        if (e.header.entry_type == @backingInt(EntryType.raft_config)) self.last_config_index = idx;
         self.last_stamp = e.header.timestamp_ns;
 
         return idx;
@@ -642,7 +642,7 @@ test "raft log: raft_noop entry type" {
     try testing.expectEqual(@as(u64, 3), log.lastTerm());
 
     const read = log.getEntry(1).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(EntryType.raft_noop)), read.header.entry_type);
+    try testing.expectEqual(@as(u8, @backingInt(EntryType.raft_noop)), read.header.entry_type);
 }
 
 test "raft log: getRange" {

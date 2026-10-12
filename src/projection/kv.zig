@@ -560,7 +560,7 @@ pub const KVProjection = struct {
 
     /// Apply a committed UAL entry to this projection.
     pub fn applyEntry(self: *KVProjection, entry: *const Entry) !void {
-        const entry_type: EntryType = @enumFromInt(entry.header.entry_type);
+        const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
 
         switch (entry_type) {
             .kv_put => {
@@ -784,7 +784,7 @@ pub const KVProjection = struct {
             offset += 8;
             buf[offset] = if (entry.tombstone) FLAG_TOMBSTONE else 0;
             offset += 1;
-            buf[offset] = @intFromEnum(entry.value_type);
+            buf[offset] = @backingInt(entry.value_type);
             offset += 1;
 
             @memcpy(buf[offset..][0..entry.key.len], entry.key);

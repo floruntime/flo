@@ -132,7 +132,7 @@ pub const QueueHandler = struct {
     fn respondQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .queue_enqueue => {
                 // Dequeue waiters are woken by the applier on every node; the
@@ -231,7 +231,7 @@ pub const QueueHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         return switch (op) {
             .queue_enqueue => self.handleEnqueue(req),
             .queue_dequeue => self.handleDequeue(req),

@@ -228,7 +228,7 @@ pub const ActionsHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const h = shard.actions_handler;
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         var ver_buf: [12]u8 = undefined;
         const result: CommandResult = blk: {
             h.runs_mu.lock();
@@ -273,7 +273,7 @@ pub const ActionsHandler = struct {
     fn dispatchActionTaskCmd(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .action_complete, .action_fail => {
                 const outcome = if (op == .action_complete) shard.actions_handler.handleActionComplete(shard, req) else shard.actions_handler.handleActionFail(shard, req);
@@ -302,7 +302,7 @@ pub const ActionsHandler = struct {
     fn respondTask(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         const action_name = parseLeadingName(req.value);
         const ws = resolveWorkerShard(shard, req.namespace, req.key);
         if (op == .action_complete) ws.worker_handler.recordCompletion(req.namespace, req.key, action_name) else ws.worker_handler.recordFailure(req.namespace, req.key, action_name);
@@ -516,7 +516,7 @@ pub const ActionsHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     fn handleCommand(self: *ActionsHandler, shard: ?*Shard, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         // The registry key is "ns\x00name" ("name" in "default"), so a name
         // holding a NUL could spell another namespace's key.
         switch (op) {
@@ -808,7 +808,7 @@ pub const ActionsHandler = struct {
             off += run.action_name_owned.len;
 
             // status
-            buf[off] = @intFromEnum(run.status);
+            buf[off] = @backingInt(run.status);
             off += 1;
 
             // created_at
@@ -1095,7 +1095,7 @@ pub const ActionsHandler = struct {
             // value_len + value (type + version + enabled)
             std.mem.writeInt(u32, buf[offset..][0..4], @intCast(value_size), .little);
             offset += 4;
-            buf[offset] = @intFromEnum(rec.action_type);
+            buf[offset] = @backingInt(rec.action_type);
             offset += 1;
             std.mem.writeInt(u32, buf[offset..][0..4], rec.version, .little);
             offset += 4;
@@ -1254,7 +1254,7 @@ pub const ActionsHandler = struct {
         var off: usize = 0;
         if (!putLenPrefixed(value_buf, &off, u16, action_name)) return null;
         if (off + 1 > value_buf.len) return null;
-        value_buf[off] = @intFromEnum(ActionRunStatus.pending);
+        value_buf[off] = @backingInt(ActionRunStatus.pending);
         off += 1;
         if (!putLenPrefixed(value_buf, &off, u32, input)) return null;
         if (!putLenPrefixed(value_buf, &off, u32, labels orelse "")) return null;
@@ -1270,7 +1270,7 @@ pub const ActionsHandler = struct {
     fn encodeRunUpdateValue(value_buf: []u8, u: RunUpdate) ?[]const u8 {
         var off: usize = 0;
         if (off + 1 + 9 > value_buf.len) return null;
-        value_buf[off] = @intFromEnum(u.status);
+        value_buf[off] = @backingInt(u.status);
         off += 1;
         if (u.started_at_ms) |sa| {
             value_buf[off] = 1;
@@ -1309,7 +1309,7 @@ pub const ActionsHandler = struct {
 
     /// Dispatch a replayed entry to the appropriate replay handler.
     pub fn replayEntry(self: *ActionsHandler, e: *const Entry) persistence.ApplyOutcome {
-        const etype: EntryType = @enumFromInt(e.header.entry_type);
+        const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
         // Workflows on other shard threads read the runs map under this
         // lock. Nothing holds it across an apply, so taking it here cannot
         // nest.
@@ -1971,7 +1971,7 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             writer.writeInt(u32, @intCast(s.run_id.len), .little) catch return;
             writer.writeAll(s.run_id) catch return;
             // status
-            writer.writeByte(@intFromEnum(s.status)) catch return;
+            writer.writeByte(@backingInt(s.status)) catch return;
             // created_at
             writer.writeInt(i64, s.created_at, .little) catch return;
             // started_at (optional i64)

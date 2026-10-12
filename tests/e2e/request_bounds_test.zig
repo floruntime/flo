@@ -47,9 +47,9 @@ fn kvAlive(ctx: *stdx.testing.TestContext) !bool {
     const get = try request(.kv_get, "", "alive", try kv_ops.plainGetBody(&get_buf));
     defer testing.allocator.free(get);
     var out: [4096]u8 = undefined;
-    if ((try send(ctx, put, &out)).status != @intFromEnum(proto.StatusCode.ok)) return false;
+    if ((try send(ctx, put, &out)).status != @backingInt(proto.StatusCode.ok)) return false;
     const r = try send(ctx, get, &out);
-    return r.status == @intFromEnum(proto.StatusCode.ok) and std.mem.endsWith(u8, r.data, "yes");
+    return r.status == @backingInt(proto.StatusCode.ok) and std.mem.endsWith(u8, r.data, "yes");
 }
 
 test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and the log still replays" {
@@ -78,7 +78,7 @@ test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and
         const frame = try request(c.op, "", c.key, c.value);
         defer testing.allocator.free(frame);
         const r = try send(ctx, frame, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, c.why) != null);
     }
     try testing.expect(try kvAlive(ctx));
@@ -102,7 +102,7 @@ test "e2e/bounds: a request without the options trailer is answered when it is f
         @memcpy(frame[0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&h));
         @memcpy(frame[@sizeOf(proto.RequestHeader)..], &payload);
         var out: [4096]u8 = undefined;
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), (try send(ctx, &frame, &out)).status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.ok), (try send(ctx, &frame, &out)).status);
     }
     try testing.expect(try kvAlive(ctx));
 }
@@ -142,7 +142,7 @@ test "e2e/bounds: a ts write value that isn't one finite f64 is refused by name"
         const frame = try request(.ts_write, "", "m", c.value);
         defer testing.allocator.free(frame);
         const r = try send(ctx, frame, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expectEqualStrings(c.why, r.data);
     }
 
@@ -185,7 +185,7 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
     // 0x0FFE and 0xFFFF lie past the op table.
     for ([_]u16{ 0x0FFE, 0xFFFF }) |op| {
         const r = try roundTrip(fd, op, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
         var want: [32]u8 = undefined;
         const refusal = try r.refused();
         try testing.expectEqualStrings(std.fmt.bufPrint(&want, "unknown op 0x{x}", .{op}) catch unreachable, refusal.message);
@@ -193,8 +193,8 @@ test "e2e/bounds: an op no handler serves is refused as unknown, and the connect
         try testing.expectEqual(proto.Ran.no, refusal.ran);
     }
     // The same connection still answers.
-    const pong = try roundTrip(fd, @intFromEnum(proto.OpCode.ping), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), pong.header.status);
+    const pong = try roundTrip(fd, @backingInt(proto.OpCode.ping), &out);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), pong.header.status);
     try testing.expectEqualStrings("PONG", pong.data);
 }
 
@@ -221,7 +221,7 @@ test "e2e/bounds: a stream append of more than 1000 records, or not a batch, is 
         const frame = try request(.stream_append, "", "s", c.value);
         defer testing.allocator.free(frame);
         const r = try send(ctx, frame, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expectEqualStrings(c.why, r.data);
     }
 

@@ -96,7 +96,7 @@ pub const Welcome = struct {
     pub const SIZE: usize = 1 + 4;
 
     pub fn encode(self: Welcome, buf: *[SIZE]u8) void {
-        buf[0] = @intFromEnum(self.verdict);
+        buf[0] = @backingInt(self.verdict);
         std.mem.writeInt(u32, buf[1..5], self.node_id, .little);
     }
 

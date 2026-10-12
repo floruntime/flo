@@ -632,7 +632,7 @@ pub const RaftNode = struct {
     /// A config entry is the membership from the moment it is in the log,
     /// on the leader that wrote it and on every follower that took it.
     fn noteAppended(self: *RaftNode, e: *const Entry) void {
-        if (e.header.entry_type != @intFromEnum(EntryType.raft_config)) return;
+        if (e.header.entry_type != @backingInt(EntryType.raft_config)) return;
         const cfg = membership.decode(e.payload) orelse {
             log.err("Raft: config entry at index {d} is not a membership; membership unchanged", .{e.header.index});
             return;
@@ -1125,14 +1125,14 @@ pub const RaftNode = struct {
                     self.truncatedBelowMembership(e.header.index - 1);
                     _ = try self.log.append(e);
                     if (first_new == null) first_new = e.header.index;
-                    has_config = has_config or e.header.entry_type == @intFromEnum(EntryType.raft_config);
+                    has_config = has_config or e.header.entry_type == @backingInt(EntryType.raft_config);
                 }
                 // Same term, same index — already have it, skip
             } else {
                 // New entry
                 _ = try self.log.append(e);
                 if (first_new == null) first_new = e.header.index;
-                has_config = has_config or e.header.entry_type == @intFromEnum(EntryType.raft_config);
+                has_config = has_config or e.header.entry_type == @backingInt(EntryType.raft_config);
             }
         }
         if (has_config) {
@@ -1293,7 +1293,7 @@ pub const RaftNode = struct {
             self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
         }
 
-        log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @intFromEnum(entry_type), payload.len });
+        log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @backingInt(entry_type), payload.len });
         return .{ .index = idx, .term = self.current_term, .timestamp_ns = timestamp_ns };
     }
 
@@ -3233,10 +3233,10 @@ test "raft node: a config entry is the membership from the moment it is appended
     defer follower.deinit();
     follower.timer_enabled = false;
     var noop = testEntry(1, 1, "");
-    noop.header.entry_type = @intFromEnum(EntryType.raft_noop);
+    noop.header.entry_type = @backingInt(EntryType.raft_noop);
     noop.header.crc32c = noop.computeCrc();
     var cfg = testEntry(1, 2, three);
-    cfg.header.entry_type = @intFromEnum(EntryType.raft_config);
+    cfg.header.entry_type = @backingInt(EntryType.raft_config);
     cfg.header.crc32c = cfg.computeCrc();
     const resp = try follower.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{ noop, cfg }, .leader_commit = 0 });
     try testing.expect(resp.success);
@@ -3850,7 +3850,7 @@ test "raft node: a config is the membership only once it is on disk, on the lead
     frec.node = &follower;
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var cfg = testEntry(1, 1, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
-    cfg.header.entry_type = @intFromEnum(EntryType.raft_config);
+    cfg.header.entry_type = @backingInt(EntryType.raft_config);
     cfg.header.crc32c = cfg.computeCrc();
     const req: AppendRequest = .{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{cfg}, .leader_commit = 0 };
     try testing.expectError(error.ConfigNotDurable, follower.handleAppendEntries(req));

@@ -202,7 +202,7 @@ pub fn Enum(comptime E: type) type {
         }
 
         pub fn encode(w: *Writer, v: Value) EncodeError!void {
-            try w.int(Tag, @intFromEnum(v));
+            try w.int(Tag, @backingInt(v));
         }
     };
 }

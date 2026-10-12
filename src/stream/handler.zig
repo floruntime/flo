@@ -216,7 +216,7 @@ pub const StreamHandler = struct {
         if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
 
         // Track namespace data for stream create operations
-        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (op == .stream_create) {
             switch (cmd_result) {
                 .ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
@@ -231,7 +231,7 @@ pub const StreamHandler = struct {
     fn respondStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
         const cmd_result: CommandResult = switch (op) {
             .stream_append => shard.stream_handler.respondAppend(),
             .stream_trim => shard.stream_handler.respondTrim(req),
@@ -420,7 +420,7 @@ pub const StreamHandler = struct {
 
     /// Dispatch a stream command to the appropriate handler.
     fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
         return switch (op) {
             // Stream operations
@@ -1720,7 +1720,7 @@ pub const StreamHandler = struct {
     /// the UAL index for stream lookups.
     fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
-        const etype: EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
 
         if (etype == .stream_append) {
             self.last_append = null;

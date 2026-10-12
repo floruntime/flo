@@ -425,7 +425,7 @@ pub const KVHandler = struct {
         const NameWalker = dispatcher_mod.NameWalker;
         const self = shard.kv_handler;
         const local = [_]*anyopaque{@ptrCast(self.kv)};
-        const contexts = shard.dispatcher.walk_contexts[@intFromEnum(OpCode.kv_scan)] orelse &local;
+        const contexts = shard.dispatcher.walk_contexts[@backingInt(OpCode.kv_scan)] orelse &local;
         const walker = NameWalker.init(localScanKeys, @intCast(contexts.len));
         var found: [NameWalker.MAX_BATCH][]const u8 = undefined;
         const from = if (cursor.len == 0) null else cursor;
@@ -1183,7 +1183,7 @@ test "kv handler: every KV op in the table has a handler, and the key-routed one
         try testing.expectEqual(routed, dispatcher.pre_route[o.code] != null);
         try testing.expectEqual(o.txn != null, dispatcher.shard_route[o.code] != null);
     }
-    try testing.expect(dispatcher.isWalkOp(@intFromEnum(OpCode.kv_scan)));
+    try testing.expect(dispatcher.isWalkOp(@backingInt(OpCode.kv_scan)));
     try testing.expectEqual(@as(u16, kv_ops.table.len), dispatcher.handler_count);
 }
 

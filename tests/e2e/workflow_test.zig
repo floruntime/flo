@@ -3145,16 +3145,16 @@ test "e2e/workflow: list-runs and signal requests whose lengths overrun them are
     var out: [512]u8 = undefined;
     // The status length claims one byte, which pushes the search length past the end.
     const list = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), list.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), list.status);
     try testing.expectEqualStrings("invalid list-runs request", list.data);
 
     // A signal type length of 0xFFFF on a two-byte value.
     const sig = try rawCall(ctx, .workflow_signal, "default", "overrun-run", &[_]u8{ 0xff, 0xff }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), sig.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), sig.status);
     try testing.expectEqualStrings("malformed signal", sig.data);
 
     const ok = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), ok.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), ok.status);
 }
 
 test "e2e/workflow: a batched append starts one run per record" {

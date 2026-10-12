@@ -264,7 +264,7 @@ pub const HttpClient = struct {
         };
 
         // Convert status
-        const status_code = @intFromEnum(http_response.head.status);
+        const status_code = @backingInt(http_response.head.status);
 
         // Parse response headers (empty for now - requires more complex parsing)
         const headers = std.StringHashMap([]const u8).init(self.allocator);

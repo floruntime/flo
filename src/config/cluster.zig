@@ -140,7 +140,7 @@ pub fn readSecretFile(allocator: Allocator, path: []const u8) ![]u8 {
         log.err("[cluster] secret_file {s} cannot be read: {s}", .{ path, @errorName(err) });
         return error.InvalidSetting;
     };
-    const mode: u32 = @intCast(@intFromEnum(st.permissions));
+    const mode: u32 = @intCast(@backingInt(st.permissions));
     if (mode & 0o077 != 0) {
         log.err("[cluster] secret_file {s} can be read or written by others (mode {o}); chmod 600 it", .{ path, mode & 0o777 });
         return error.InvalidSetting;

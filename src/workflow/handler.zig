@@ -502,7 +502,7 @@ pub const WorkflowHandler = struct {
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         h.mu.lock();
         defer h.mu.unlock();
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .workflow_create => h.respondCreate(shard, conn, req),
             .workflow_start => h.respondStart(shard, conn, req),
@@ -516,7 +516,7 @@ pub const WorkflowHandler = struct {
     fn handleCommand(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         self.mu.lock();
         defer self.mu.unlock();
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .workflow_create => return self.handleCreate(shard, conn, req),
             .workflow_start => return self.handleStart(shard, conn, req),
@@ -1107,7 +1107,7 @@ pub const WorkflowHandler = struct {
         w.writeAll(run.workflow_name_owned) catch unreachable;
         w.writeInt(u16, @intCast(run.workflow_version_owned.len), .little) catch unreachable;
         w.writeAll(run.workflow_version_owned) catch unreachable;
-        w.writeByte(@intFromEnum(run.status)) catch unreachable;
+        w.writeByte(@backingInt(run.status)) catch unreachable;
         w.writeInt(u16, @intCast(current_step.len), .little) catch unreachable;
         w.writeAll(current_step) catch unreachable;
         w.writeInt(u32, @intCast(run.input_owned.len), .little) catch unreachable;
@@ -3495,7 +3495,7 @@ pub const WorkflowHandler = struct {
         @memcpy(value_buf[off .. off + version.len], version);
         off += version.len;
         // The run is created at the entry's stamp, by the applier.
-        value_buf[off] = @intFromEnum(RunStatus.running);
+        value_buf[off] = @backingInt(RunStatus.running);
         off += 1;
         std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(event_type.len), .little);
         off += 2;
@@ -3577,7 +3577,7 @@ pub const WorkflowHandler = struct {
         // total <= limit < 64 KiB, so every length and count below fits its field.
         const buf = try allocator.alloc(u8, total);
         var w: std.Io.Writer = .fixed(buf);
-        w.writeByte(@intFromEnum(c.status)) catch unreachable;
+        w.writeByte(@backingInt(c.status)) catch unreachable;
         if (c.output) |o| {
             w.writeByte(1) catch unreachable;
             w.writeInt(u32, @intCast(o.len), .little) catch unreachable;
@@ -3703,7 +3703,7 @@ pub const WorkflowHandler = struct {
 
     /// Apply a workflow entry: live commit, replicated entry or boot replay alike.
     pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
-        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         // Other shard threads walk these maps under this lock. Nothing
         // holds it across an apply, so taking it here cannot nest.
         self.mu.lock();
@@ -5265,7 +5265,7 @@ test "a signal that would leave the completion no headroom is refused, holding n
     const value = [_]u8{ 2, 0 } ++ "go".* ++ "payload".*;
     handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "s", &value));
     const answer = try queuedAnswer(&conn);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
     try testing.expectEqualStrings("run history is full", (try answer.refused()).message);
     try testing.expectEqual(@as(usize, 0), run.signals.items.len);
     try testing.expectEqual(events, run.history.items.len);
@@ -5422,7 +5422,7 @@ test "cancelling a run that already finished is refused and keeps its result" {
 
     handler.handleCancel(&shard, &conn, makeRequest(.workflow_cancel, "r", ""));
     const answer = try queuedAnswer(&conn);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
     try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqual(events, run.history.items.len);
@@ -5520,7 +5520,7 @@ test "a signal to a finished run is refused and leaves its history alone" {
     const value = [_]u8{ 2, 0 } ++ "go".*;
     handler.handleSignal(&shard, &conn, makeRequest(.workflow_signal, "r", &value));
     const answer = try queuedAnswer(&conn);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
     try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
     try testing.expectEqual(events, run.history.items.len);
     try testing.expectEqual(@as(usize, 0), run.signals.items.len);

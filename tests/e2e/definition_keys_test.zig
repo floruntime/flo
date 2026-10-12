@@ -73,7 +73,7 @@ test "definition keys: a workflow with an unknown key is refused by name, raw an
     defer ctx.deinit();
 
     const raw = try sendRaw(ctx, .workflow_create, "typo", bad_workflow);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_workflow_message, raw.message());
 
     const cli = try sendCli(ctx, &.{ "workflow", "create", "-f" }, bad_workflow, "typo.yaml", 2);
@@ -97,7 +97,7 @@ test "definition keys: a nested unknown key and a camelCase spelling are refused
         \\                       "transitions": { "success": "flo.Completed" } } } }
     ;
     const a = try sendRaw(ctx, .workflow_create, "nested", nested);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), a.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), a.status);
     try testing.expectEqualStrings("unknown key \"timeoutMs\" at steps.wait.wait_for_signal", a.message());
 }
 
@@ -119,7 +119,7 @@ test "definition keys: a pipeline with an unknown key is refused by name, raw an
     defer ctx.deinit();
 
     const raw = try sendRaw(ctx, .processing_submit, "", bad_pipeline);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_pipeline_message, raw.message());
 
     const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_pipeline, "typo-job.yaml", 3);
@@ -132,7 +132,7 @@ test "definition keys: a pipeline with an unknown key is refused by name, raw an
         \\  "sinks": [ { "stream": { "name": "out" } } ] }
     ;
     const unknown_op = try sendRaw(ctx, .processing_submit, "", op);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), unknown_op.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), unknown_op.status);
     try testing.expectEqualStrings("unknown operator type \"fliter\" (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify) at operators[0]", unknown_op.message());
 }
 
@@ -156,7 +156,7 @@ test "definition keys: a filter condition the operator can't evaluate is refused
     defer ctx.deinit();
 
     const raw = try sendRaw(ctx, .processing_submit, "", bad_condition);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), raw.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), raw.status);
     try testing.expectEqualStrings(bad_condition_message, raw.message());
 
     const cli = try sendCli(ctx, &.{ "processing", "submit" }, bad_condition, "typo-filter.yaml", 3);

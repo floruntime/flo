@@ -559,8 +559,8 @@ pub const ServerProcess = struct {
             return std.fmt.bufPrint(buf, "exited with code {d}", .{code}) catch "exited with a non-zero code";
         }
         if (low == 0x7f) return null; // stopped, not ended
-        if (low == @intFromEnum(std.posix.SIG.TERM) and self.sent_term) return null;
-        if (low == @intFromEnum(std.posix.SIG.KILL)) {
+        if (low == @backingInt(std.posix.SIG.TERM) and self.sent_term) return null;
+        if (low == @backingInt(std.posix.SIG.KILL)) {
             if (self.sent_kill) return null;
             return "killed by a SIGKILL the harness didn't send (memory pressure, or another run's cleanup?)";
         }

@@ -315,7 +315,7 @@ fn logFmtImpl(
     // Skip logging in test builds to avoid interfering with test runner
     if (builtin.is_test) return;
 
-    if (@intFromEnum(level) < @intFromEnum(global.level)) {
+    if (@backingInt(level) < @backingInt(global.level)) {
         return;
     }
 
@@ -337,7 +337,7 @@ fn logFmtWithContext(
     // Skip logging in test builds to avoid interfering with test runner
     if (builtin.is_test) return;
 
-    if (@intFromEnum(level) < @intFromEnum(global.level)) {
+    if (@backingInt(level) < @backingInt(global.level)) {
         return;
     }
 
@@ -362,7 +362,7 @@ fn logImpl(
     if (builtin.is_test) return;
 
     // Early exit if below threshold
-    if (@intFromEnum(level) < @intFromEnum(global.level)) {
+    if (@backingInt(level) < @backingInt(global.level)) {
         return;
     }
 
@@ -387,7 +387,7 @@ fn logWithContext(
     // Skip logging in test builds to avoid interfering with test runner
     if (builtin.is_test) return;
 
-    if (@intFromEnum(level) < @intFromEnum(global.level)) {
+    if (@backingInt(level) < @backingInt(global.level)) {
         return;
     }
 
@@ -747,7 +747,7 @@ pub fn stdLogFn(
     args: anytype,
 ) void {
     const log_level = Level.fromStd(level);
-    if (@intFromEnum(log_level) < @intFromEnum(global.level)) {
+    if (@backingInt(log_level) < @backingInt(global.level)) {
         return;
     }
 

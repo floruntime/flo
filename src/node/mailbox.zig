@@ -38,7 +38,7 @@ pub const Flag = enum(u5) {
     share_returned,
 
     pub fn bit(self: Flag) u32 {
-        return @as(u32, 1) << @intFromEnum(self);
+        return @as(u32, 1) << @backingInt(self);
     }
 };
 

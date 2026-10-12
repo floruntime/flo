@@ -89,8 +89,8 @@ pub const Refusal = struct {
     /// UTF-8 code-point boundary and marked, so every refusal is sent.
     pub fn encode(r: Refusal, buf: []u8) []const u8 {
         std.debug.assert(buf.len >= HEADER_LEN + TRUNCATED_MARKER.len);
-        std.mem.writeInt(u16, buf[0..2], @intFromEnum(r.reason), .little);
-        buf[2] = @intFromEnum(r.ran);
+        std.mem.writeInt(u16, buf[0..2], @backingInt(r.reason), .little);
+        buf[2] = @backingInt(r.ran);
         const room = buf.len - HEADER_LEN;
         if (r.message.len <= room) {
             @memcpy(buf[HEADER_LEN..][0..r.message.len], r.message);

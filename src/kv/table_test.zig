@@ -56,7 +56,7 @@ const Harness = struct {
     fn send(h: *Harness, code: u16, key: []const u8, body: []const u8) u64 {
         const id = h.next_id;
         h.next_id += 1;
-        var header = proto.RequestHeader.init(@enumFromInt(code), id);
+        var header = proto.RequestHeader.init(@fromBackingInt(@intCast(code)), id);
         header.payload_length = 0;
         h.conn.response_deferred = false;
         h.shard.runRequest(h.conn, .{ .header = header, .namespace = "", .key = key, .value = body }, .client);
@@ -119,7 +119,7 @@ const Harness = struct {
     /// `call`, which must answer ok: its decoded answer.
     fn ok(h: *Harness, comptime name: []const u8, key: []const u8, body: table_run.op(name).request.Value) !table_run.op(name).response.Value {
         const resp = try h.call(name, key, body);
-        if (resp.header.status != @intFromEnum(proto.StatusCode.ok)) {
+        if (resp.header.status != @backingInt(proto.StatusCode.ok)) {
             std.debug.print("{s} refused: {s}\n", .{ name, (try resp.refused()).message });
             return error.TestUnexpectedResult;
         }
@@ -148,7 +148,7 @@ fn setBody(value: []const u8, fields: struct { ttl_ms: ?u64 = null, condition: k
 }
 
 fn expectValue(resp: proto.Response, version: u64, value: []const u8) !void {
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     var diag: schema.Diagnostic = .{};
     const got = try get_op.response.decodeAll(resp.data, &diag);
     try testing.expectEqual(version, got.version);
@@ -156,13 +156,13 @@ fn expectValue(resp: proto.Response, version: u64, value: []const u8) !void {
 }
 
 fn expectSet(resp: proto.Response, version: ?u64) !void {
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     var diag: schema.Diagnostic = .{};
     try testing.expectEqual(version, (try set_op.response.decodeAll(resp.data, &diag)).version);
 }
 
 fn expectRefused(resp: proto.Response, status: proto.StatusCode, reason: proto.Reason) !proto.Refusal {
-    try testing.expectEqual(@intFromEnum(status), resp.header.status);
+    try testing.expectEqual(@backingInt(status), resp.header.status);
     const r = try resp.refused();
     try testing.expectEqual(reason, r.reason);
     try testing.expectEqual(proto.Ran.no, r.ran);
@@ -319,7 +319,7 @@ test "kv table: routing_key routes the request in place of its key" {
         if (@hasField(op.request.Value, "routing_key")) {
             routed += 1;
             const route = table_run.routeByKey(op.name);
-            const header = proto.RequestHeader.init(@enumFromInt(op.code), 1);
+            const header = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 1);
             var given = plainBody(op);
             given.routing_key = "user:1";
             const req: proto.Request = .{ .header = header, .namespace = "ns", .key = "balance", .value = try op.request.encodeInto(&buf, given) };

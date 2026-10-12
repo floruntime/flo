@@ -501,7 +501,7 @@ pub const NamespaceHandler = struct {
     fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
         if (op == .namespace_config_set or op == .namespace_config_get) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, SETTINGS_REFUSAL);
@@ -612,7 +612,7 @@ pub const NamespaceHandler = struct {
         const name = cmd.key;
         if (name.len == 0) return .failed;
 
-        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .namespace_create => {
                 self.last_create = self.applyCreateAt(name, entry.header.timestamp_ns);
@@ -635,7 +635,7 @@ pub const NamespaceHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     fn handleCommand(self: *NamespaceHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         return switch (op) {
             .namespace_create => self.handleCreate(req),
             .namespace_delete => self.handleDelete(req),

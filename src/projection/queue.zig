@@ -573,7 +573,7 @@ pub const QueueProjection = struct {
     // ─── UAL Entry application ─────────────────────────────────────────────
 
     pub fn applyEntry(self: *QueueProjection, entry: *const Entry) !void {
-        const entry_type: EntryType = @enumFromInt(entry.header.entry_type);
+        const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
 
         switch (entry_type) {
             .queue_enqueue => {
@@ -725,7 +725,7 @@ pub const QueueProjection = struct {
             offset += 8;
             std.mem.writeInt(u32, buf[offset..][0..4], msg.priority, .little);
             offset += 4;
-            buf[offset] = @intFromEnum(msg.state);
+            buf[offset] = @backingInt(msg.state);
             offset += 1;
             std.mem.writeInt(u32, buf[offset..][0..4], msg.attempts, .little);
             offset += 4;

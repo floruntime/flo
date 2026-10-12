@@ -114,7 +114,7 @@ fn keys() struct { send: seal.Key, recv: seal.Key } {
 
 /// Frame and seal `payload` into `buf` as a sender holding `key` would.
 fn frameInto(buf: []u8, key: *seal.Key, msg_type: transport.MsgType, source: u32, payload: []const u8) usize {
-    var hdr = RaftHeader{ .msg_type = @intFromEnum(msg_type), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = source, .payload_len = @intCast(payload.len), .crc32 = 0 };
+    var hdr = RaftHeader{ .msg_type = @backingInt(msg_type), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = source, .payload_len = @intCast(payload.len), .crc32 = 0 };
     @memcpy(buf[0..HEADER_SIZE], hdr.asBytes());
     key.seal(buf[0..HEADER_SIZE], payload, buf[HEADER_SIZE..][0 .. payload.len + seal.TAG_LEN]);
     return HEADER_SIZE + payload.len + seal.TAG_LEN;
@@ -175,7 +175,7 @@ test "framer: oversize, unknown type, wrong source, and a frame altered, replaye
     defer f.deinit();
 
     // Oversize is refused from the header alone, before the payload arrives.
-    var hdr = RaftHeader{ .msg_type = @intFromEnum(transport.MsgType.append_entries), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = 1, .payload_len = @intCast(transport.MAX_PAYLOAD_SIZE + 1), .crc32 = 0 };
+    var hdr = RaftHeader{ .msg_type = @backingInt(transport.MsgType.append_entries), ._pad = .{ 0, 0, 0 }, .group_id = 0, .source_node = 1, .payload_len = @intCast(transport.MAX_PAYLOAD_SIZE + 1), .crc32 = 0 };
     @memcpy(f.space()[0..HEADER_SIZE], hdr.asBytes());
     f.commit(HEADER_SIZE);
     try testing.expectError(error.Oversize, f.next(1));

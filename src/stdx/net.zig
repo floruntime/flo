@@ -205,7 +205,7 @@ pub fn getAddressList(gpa: std.mem.Allocator, host: []const u8, port: u16) !Addr
 
     var res: ?*std.c.addrinfo = null;
     const rc = std.c.getaddrinfo(host_z.ptr, port_str.ptr, &hints, &res);
-    if (@intFromEnum(rc) != 0) return error.UnknownHostName;
+    if (@backingInt(rc) != 0) return error.UnknownHostName;
     defer std.c.freeaddrinfo(res.?);
 
     var list: std.ArrayList(Address) = .empty;

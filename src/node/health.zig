@@ -44,7 +44,7 @@ pub const ShardState = enum(u8) {
     removed,
 
     pub fn serves(self: ShardState) bool {
-        return @intFromEnum(self) <= @intFromEnum(ShardState.offline);
+        return @backingInt(self) <= @backingInt(ShardState.offline);
     }
 };
 
@@ -52,8 +52,8 @@ pub const ShardState = enum(u8) {
 pub const REASON_MAX = 256;
 
 pub const ShardSlot = struct {
-    state: Atomic(u8) = .init(@intFromEnum(ShardState.loading)),
-    role: Atomic(u8) = .init(@intFromEnum(Role.follower)),
+    state: Atomic(u8) = .init(@backingInt(ShardState.loading)),
+    role: Atomic(u8) = .init(@backingInt(Role.follower)),
     last_applied: Atomic(u64) = .init(0),
     commit_index: Atomic(u64) = .init(0),
     /// Written once, before the state first reads `offline`.
@@ -61,15 +61,15 @@ pub const ShardSlot = struct {
     reason_buf: [REASON_MAX]u8 = undefined,
 
     pub fn get(self: *const ShardSlot) ShardState {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 
     pub fn set(self: *ShardSlot, state: ShardState) void {
-        self.state.store(@intFromEnum(state), .release);
+        self.state.store(@backingInt(state), .release);
     }
 
     pub fn publish(self: *ShardSlot, state: ShardState, role: Role, last_applied: u64, commit_index: u64) void {
-        self.role.store(@intFromEnum(role), .monotonic);
+        self.role.store(@backingInt(role), .monotonic);
         self.last_applied.store(last_applied, .monotonic);
         self.commit_index.store(commit_index, .monotonic);
         self.set(state);
@@ -117,7 +117,7 @@ pub const NodeHealth = struct {
         var worst: ShardState = .ok;
         for (self.shards) |*s| {
             const state = s.get();
-            if (@intFromEnum(state) > @intFromEnum(worst)) worst = state;
+            if (@backingInt(state) > @backingInt(worst)) worst = state;
         }
         if (!worst.serves()) return .{ .ready = false, .word = @tagName(worst) };
         if (!self.accepting.load(.acquire)) return .{ .ready = false, .word = @tagName(ShardState.loading) };
@@ -131,7 +131,7 @@ pub const NodeHealth = struct {
         for (self.shards, 0..) |*s, i| {
             if (i > 0) try w.writeByte(',');
             const state = s.get();
-            const role: Role = @enumFromInt(s.role.load(.monotonic));
+            const role: Role = @fromBackingInt(@intCast(s.role.load(.monotonic)));
             try w.print("{{\"id\":{d},\"state\":\"{s}\"", .{ i, @tagName(state) });
             if (state == .offline) if (s.reason()) |why| {
                 try w.writeAll(",\"reason\":");
@@ -204,7 +204,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     var registry = MetricsRegistry.init(testing.allocator);
     defer registry.deinit();
     try registry.initShards(2);
-    registry.shardMetrics(1).?.silent_loss[@intFromEnum(silent_loss.Path.segment_unreadable)].store(3, .monotonic);
+    registry.shardMetrics(1).?.silent_loss[@backingInt(silent_loss.Path.segment_unreadable)].store(3, .monotonic);
 
     var h = try NodeHealth.init(testing.allocator, 42, 2);
     defer h.deinit(testing.allocator);

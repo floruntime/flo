@@ -92,7 +92,7 @@ pub fn frameInPlace(msg_type: MsgType, group_id: u32, source_node: u32, payload_
     const total = HEADER_SIZE + payload_len;
     if (buf.len < total) return 0;
     var hdr = RaftHeader{
-        .msg_type = @intFromEnum(msg_type),
+        .msg_type = @backingInt(msg_type),
         ._pad = .{ 0, 0, 0 },
         .group_id = group_id,
         .source_node = source_node,
@@ -477,7 +477,7 @@ pub fn encodeMessage(
     if (buf.len < total) return null;
 
     var header = RaftHeader{
-        .msg_type = @intFromEnum(msg_type),
+        .msg_type = @backingInt(msg_type),
         ._pad = .{ 0, 0, 0 },
         .group_id = group_id,
         .source_node = source_node,
@@ -547,7 +547,7 @@ test "transport: RaftHeader is exactly 20 bytes" {
 
 test "transport: header roundtrip" {
     var header = RaftHeader{
-        .msg_type = @intFromEnum(MsgType.request_vote),
+        .msg_type = @backingInt(MsgType.request_vote),
         ._pad = .{ 0, 0, 0 },
         .group_id = 1000,
         .source_node = 42,
@@ -691,7 +691,7 @@ test "transport: full message framing roundtrip" {
 
     // Decode
     const decoded = decodeMessage(msg_buf[0..total]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.request_vote)), decoded.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.request_vote)), decoded.header.msg_type);
     try testing.expectEqual(@as(u32, 1000), decoded.header.group_id);
     try testing.expectEqual(@as(u32, 2), decoded.header.source_node);
     try testing.expectEqual(@as(usize, plen), decoded.payload.len);
@@ -752,15 +752,15 @@ test "transport: multiple messages in a stream" {
     var read_off: usize = 0;
 
     const d1 = decodeMessage(stream_buf[read_off..offset]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.request_vote)), d1.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.request_vote)), d1.header.msg_type);
     read_off += HEADER_SIZE + d1.payload.len;
 
     const d2 = decodeMessage(stream_buf[read_off..offset]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.request_vote_response)), d2.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.request_vote_response)), d2.header.msg_type);
     read_off += HEADER_SIZE + d2.payload.len;
 
     const d3 = decodeMessage(stream_buf[read_off..offset]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.append_entries_response)), d3.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.append_entries_response)), d3.header.msg_type);
 }
 
 test "transport: raft port calculation" {
@@ -791,7 +791,7 @@ test "transport: 2-shard message exchange simulation" {
 
     // Shard 0 / Node 2: receives and decodes
     const decoded = decodeMessage(wire[0..msg_len]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.append_entries)), decoded.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.append_entries)), decoded.header.msg_type);
     try testing.expectEqual(@as(u32, 1000), decoded.header.group_id);
     try testing.expectEqual(@as(u32, 1), decoded.header.source_node);
 
@@ -814,7 +814,7 @@ test "transport: 2-shard message exchange simulation" {
 
     // Node 1 receives response
     const resp_decoded = decodeMessage(wire2[0..resp_msg_len]).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(MsgType.append_entries_response)), resp_decoded.header.msg_type);
+    try testing.expectEqual(@as(u8, @backingInt(MsgType.append_entries_response)), resp_decoded.header.msg_type);
 
     const ar = deserializeAppendResponse(resp_decoded.payload).?;
     try testing.expectEqual(@as(u64, 3), ar.term);

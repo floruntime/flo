@@ -55,7 +55,7 @@ pub const CheckpointMeta = struct {
         pos += @sizeOf(u64);
         @memcpy(buf[pos..][0..@sizeOf(i64)], std.mem.asBytes(&self.timestamp_ms));
         pos += @sizeOf(i64);
-        buf[pos] = @intFromEnum(self.status);
+        buf[pos] = @backingInt(self.status);
         pos += 1;
         @memcpy(buf[pos..][0..@sizeOf(u32)], std.mem.asBytes(&self.acked_operators));
         pos += @sizeOf(u32);
@@ -76,7 +76,7 @@ pub const CheckpointMeta = struct {
         pos += @sizeOf(u64);
         const timestamp_ms = std.mem.bytesToValue(i64, data[pos..][0..@sizeOf(i64)]);
         pos += @sizeOf(i64);
-        const status: CheckpointStatus = @enumFromInt(data[pos]);
+        const status: CheckpointStatus = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
         const acked = std.mem.bytesToValue(u32, data[pos..][0..@sizeOf(u32)]);
         pos += @sizeOf(u32);

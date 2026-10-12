@@ -275,7 +275,7 @@ test "e2e/scoping: a name holding a NUL, which could spell another namespace's k
     var out: [512]u8 = undefined;
     for ([_]proto.OpCode{ .action_register, .action_delete }) |op| {
         const r = try rawCall(ctx, op, "", "b\x00x", "", &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "must not contain NUL") != null);
     }
     // b's action x is still there, as it was registered.
@@ -287,9 +287,9 @@ test "e2e/scoping: a name holding a NUL, which could spell another namespace's k
     std.mem.writeInt(u16, group[0..2], 8, .little);
     @memcpy(group[2..], "orders\x00g");
     const g = try rawCall(ctx, proto.OpCode.stream_group_create, "", "b", &group, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), g.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), g.status);
     const w = try rawCall(ctx, proto.OpCode.worker_register, "", "b\x00w", "", &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), w.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), w.status);
 }
 
 test "e2e/scoping: a worker id in two namespaces is two workers" {

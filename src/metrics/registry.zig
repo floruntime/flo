@@ -672,7 +672,7 @@ pub const ShardMetrics = struct {
     }
 
     pub fn recordCrossShardOverloaded(self: *ShardMetrics, class: CrossShardClass) void {
-        _ = self.cross_shard_overloaded[@intFromEnum(class)].fetchAdd(1, .monotonic);
+        _ = self.cross_shard_overloaded[@backingInt(class)].fetchAdd(1, .monotonic);
     }
 
     pub fn setOldestCrossShardWait(self: *ShardMetrics, seconds: u64) void {

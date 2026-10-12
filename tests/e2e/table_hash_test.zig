@@ -47,7 +47,7 @@ test "e2e/table: a client from another table or protocol is refused readably and
         try testing.expectEqual(proto.MAGIC, answer.magic);
         try testing.expectEqual(case.version, answer.version);
         try testing.expectEqual(proto.TABLE_HASH, answer.table_hash);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.status);
         try testing.expectEqual(@as(u64, 11), answer.request_id);
         const refusal = try proto.Refusal.decode(out[@sizeOf(proto.ResponseHeader)..n]);
         try testing.expectEqualStrings(case.text, refusal.message);

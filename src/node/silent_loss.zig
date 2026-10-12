@@ -45,7 +45,7 @@ pub const Counts = struct {
     /// within `WARN_INTERVAL_MS`; then the next line says how many went
     /// unsaid.
     pub fn note(self: *Counts, path: Path, now_ms: u64, shard_id: u16, comptime fmt: []const u8, args: anytype) void {
-        const i = @intFromEnum(path);
+        const i = @backingInt(path);
         self.counts[i] += 1;
         if (self.last_line_ms[i] != 0 and now_ms -| self.last_line_ms[i] < WARN_INTERVAL_MS) {
             self.unlogged[i] += 1;
@@ -57,7 +57,7 @@ pub const Counts = struct {
     }
 
     pub fn total(self: *const Counts, path: Path) u64 {
-        return self.counts[@intFromEnum(path)];
+        return self.counts[@backingInt(path)];
     }
 };
 
@@ -87,8 +87,8 @@ test "silent loss: every loss is counted, and a path speaks at most once per int
     c.note(.segment_unreadable, 1_000, 3, "segment {s}", .{"a.flseg"});
     c.note(.segment_unreadable, 2_000, 3, "segment {s}", .{"b.flseg"});
     try std.testing.expectEqual(@as(u64, 2), c.total(.segment_unreadable));
-    try std.testing.expectEqual(@as(u64, 1), c.unlogged[@intFromEnum(Path.segment_unreadable)]);
+    try std.testing.expectEqual(@as(u64, 1), c.unlogged[@backingInt(Path.segment_unreadable)]);
     c.note(.segment_unreadable, 1_000 + WARN_INTERVAL_MS, 3, "segment {s}", .{"c.flseg"});
-    try std.testing.expectEqual(@as(u64, 0), c.unlogged[@intFromEnum(Path.segment_unreadable)]);
+    try std.testing.expectEqual(@as(u64, 0), c.unlogged[@backingInt(Path.segment_unreadable)]);
     try std.testing.expectEqual(@as(u64, 0), c.total(.index_hole));
 }

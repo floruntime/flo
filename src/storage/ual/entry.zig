@@ -336,7 +336,7 @@ pub fn buildEntry(
         .header = .{
             .magic = ENTRY_MAGIC,
             .version = ENTRY_VERSION,
-            .entry_type = @intFromEnum(entry_type),
+            .entry_type = @backingInt(entry_type),
             .flags = flags,
             .term = term,
             .index = index,

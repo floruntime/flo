@@ -190,7 +190,7 @@ pub const SegmentWriter = struct {
             .data_size = @intCast(self.data.items.len),
             // Nothing compresses yet; the header keeps the byte for when
             // something does.
-            .compression = @intFromEnum(segment.Compression.none),
+            .compression = @backingInt(segment.Compression.none),
             .commit_index_at_seal = self.commit_index_at_seal,
             .reserved = .{0},
         };

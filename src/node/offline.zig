@@ -94,7 +94,7 @@ pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
         if (n == 0) return error.LogUnreadable;
         for (batch[0..n]) |*e| {
             sum.last_term = e.header.term;
-            if (e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config)) continue;
+            if (e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config)) continue;
             sum.config = membership.decode(e.payload) orelse continue;
             sum.member_count = sum.config.ids(&sum.members).len;
             sum.config_index = e.header.index;

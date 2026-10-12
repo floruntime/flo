@@ -1677,7 +1677,7 @@ pub const StreamProjection = struct {
                 offset += member.id.len;
                 std.mem.writeInt(u64, buf[offset..][0..8], member.joined_at_ns, .little);
                 offset += 8;
-                buf[offset] = @intFromEnum(member.state);
+                buf[offset] = @backingInt(member.state);
                 offset += 1;
             }
         }

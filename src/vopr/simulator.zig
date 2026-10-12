@@ -147,7 +147,7 @@ const SimDisk = struct {
             if (used + de.payload.len > arena.len) break;
             @memcpy(arena[used..][0..de.payload.len], de.payload);
             buf[n] = entry_mod.buildEntry(
-                @enumFromInt(de.entry_type),
+                @fromBackingInt(@intCast(de.entry_type)),
                 de.flags,
                 de.term,
                 start + n,
@@ -694,7 +694,7 @@ pub const Simulator = struct {
         // active during replay would re-feed the disk.
         for (node.disk.entries.items[0..node.disk.durable_len], 1..) |e, idx| {
             var entry = entry_mod.buildEntry(
-                @enumFromInt(e.entry_type),
+                @fromBackingInt(@intCast(e.entry_type)),
                 e.flags,
                 e.term,
                 @intCast(idx),
@@ -704,7 +704,7 @@ pub const Simulator = struct {
             entry.header.crc32c = entry.computeCrc();
             _ = node.raft.log.append(&entry) catch @panic("sim replay append");
             // The configs the log holds, as production's boot records them.
-            if (e.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+            if (e.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
                 if (membership.decode(e.payload)) |cfg| {
                     node.raft.recordConfig(@intCast(idx), e.term, &cfg);
                     // The latest config in the log is the membership, as
@@ -834,7 +834,7 @@ pub const Simulator = struct {
                 var entries: [MAX_BATCH]entry_mod.Entry = undefined;
                 for (req.entries, 0..) |e, i| {
                     entries[i] = entry_mod.buildEntry(
-                        @enumFromInt(e.entry_type),
+                        @fromBackingInt(@intCast(e.entry_type)),
                         e.flags,
                         e.term,
                         e.index,
@@ -1187,7 +1187,7 @@ pub const Simulator = struct {
                 };
                 // The group's own entries (noops, configs) are history too,
                 // but carry no workload op.
-                const is_op = e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_noop) and e.header.entry_type != @intFromEnum(entry_mod.EntryType.raft_config);
+                const is_op = e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config);
                 if (stamp_before != null and e.header.timestamp_ns <= stamp_before.?) self.checker.fail(.{
                     .invariant = .stamp_order,
                     .node = node.id,
@@ -1201,7 +1201,7 @@ pub const Simulator = struct {
                 self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
                 // A config applied is committed, as production's applier
                 // records it.
-                if (e.header.entry_type == @intFromEnum(entry_mod.EntryType.raft_config)) {
+                if (e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
                     if (membership.decode(e.payload)) |cfg| {
                         // Each committed config follows from the one before:
                         // what one change at a time, after an own-term

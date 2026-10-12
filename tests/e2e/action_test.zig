@@ -1191,7 +1191,7 @@ test "e2e/action: each await on one connection gets its own task and nothing els
 
         const r = (try readFrame(fd, &buf, 3000)) orelse return error.NoAnswer;
         try testing.expectEqual(@as(u64, 100 + i), r.header.request_id);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.header.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
         // The input closes the assignment body.
         const input = if (std.mem.endsWith(u8, r.data, "first-input")) "first-input" else if (std.mem.endsWith(u8, r.data, "second-input")) "second-input" else return error.NoTask;
         @memcpy(copies[i][0..input.len], input);
@@ -1240,18 +1240,18 @@ test "e2e/action: an invoke value is a has_labels byte, the labels if set, then 
 
     // The labelled run first: a worker without the label must skip it.
     const labelled = try rawCall(fd, .action_invoke, "layout", "\x01\x0c\x00{\"gpu\":true}xy", &buf);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), labelled.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), labelled.header.status);
     const plain = try rawCall(fd, .action_invoke, "layout", "\x00z", &buf);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), plain.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), plain.header.status);
 
     // await value: [count:u32][type_len:u16][type]
     const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 6, 0 } ++ "layout";
     const to_plain = try rawCall(fd, .action_await, "w-plain", await_value, &buf);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), to_plain.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), to_plain.header.status);
     try testing.expectEqualStrings("z", try assignedPayload(to_plain.data));
 
     const to_gpu = try rawCall(fd, .action_await, "w-gpu", await_value, &buf);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), to_gpu.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), to_gpu.header.status);
     try testing.expectEqualStrings("xy", try assignedPayload(to_gpu.data));
 
     // Malformed values are refused, not read some other way.
@@ -1262,6 +1262,6 @@ test "e2e/action: an invoke value is a has_labels byte, the labels if set, then 
         "\x01\x04\x00true",
     }) |value| {
         const r = try rawCall(fd, .action_invoke, "layout", value, &buf);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.header.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
     }
 }

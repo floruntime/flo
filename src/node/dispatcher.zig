@@ -103,7 +103,7 @@ pub fn opWrites(op: proto.OpCode) bool {
 /// may create the namespace. The other writes act on data that must
 /// already exist, and create no namespace. A table op says so itself.
 pub fn opCreates(op: proto.OpCode) bool {
-    if (table.isOp(@intFromEnum(op))) return table.creates(@intFromEnum(op));
+    if (table.isOp(@backingInt(op))) return table.creates(@backingInt(op));
     return switch (op) {
         .stream_append, .stream_create, .stream_group_create => true,
         .queue_enqueue => true,
@@ -164,7 +164,7 @@ pub const Dispatcher = struct {
 
     /// Register a handler with an optional pre-route hook.
     pub fn registerWithRoute(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, pre_route_fn: ?PreRouteFn) void {
-        const idx = @intFromEnum(opcode);
+        const idx = @backingInt(opcode);
         if (self.handlers[idx] == null) {
             self.handler_count += 1;
         }
@@ -174,14 +174,14 @@ pub const Dispatcher = struct {
 
     /// Pin `opcode`'s requests to the shard `route` names, when it names one.
     pub fn setShardRoute(self: *Dispatcher, opcode: proto.OpCode, route: ShardRouteFn) void {
-        self.shard_route[@intFromEnum(opcode)] = route;
+        self.shard_route[@backingInt(opcode)] = route;
     }
 
     /// Register a walk (list/scan) opcode — handler + ShardWalker local-scan function.
     /// The handler is used as fallback for single-shard mode (walk_contexts not set).
     /// When walk_contexts are wired, Shard.executeWalk() drives ShardWalker with scan_fn.
     pub fn registerWalk(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn) void {
-        const idx = @intFromEnum(opcode);
+        const idx = @backingInt(opcode);
         if (self.handlers[idx] == null) {
             self.handler_count += 1;
         }
@@ -194,7 +194,7 @@ pub const Dispatcher = struct {
     /// When pre_route returns a hash → single-shard dispatch via handler.
     /// When pre_route returns null → multi-shard walk via scan_fn.
     pub fn registerWalkWithRoute(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn, pre_route_fn: PreRouteFn) void {
-        const idx = @intFromEnum(opcode);
+        const idx = @backingInt(opcode);
         if (self.handlers[idx] == null) {
             self.handler_count += 1;
         }
@@ -206,7 +206,7 @@ pub const Dispatcher = struct {
     /// Set walk contexts for a walk-registered opcode (called by runtime).
     /// contexts is a slice of per-shard *anyopaque — one projection per shard.
     pub fn setWalkContexts(self: *Dispatcher, opcode: proto.OpCode, contexts: []const *anyopaque) void {
-        self.walk_contexts[@intFromEnum(opcode)] = contexts;
+        self.walk_contexts[@backingInt(opcode)] = contexts;
     }
 
     /// Check if an opcode is a walk (list/scan) operation.
@@ -258,17 +258,17 @@ pub const Dispatcher = struct {
 
     /// Check if an opcode has a registered handler.
     pub fn hasHandler(self: *const Dispatcher, opcode: proto.OpCode) bool {
-        return self.handlers[@intFromEnum(opcode)] != null;
+        return self.handlers[@backingInt(opcode)] != null;
     }
 
     /// Get the pre-route function for an opcode (if any).
     pub fn getPreRoute(self: *const Dispatcher, opcode: proto.OpCode) ?PreRouteFn {
-        return self.pre_route[@intFromEnum(opcode)];
+        return self.pre_route[@backingInt(opcode)];
     }
 
     /// Unregister a handler (for testing).
     pub fn unregister(self: *Dispatcher, opcode: proto.OpCode) void {
-        const idx = @intFromEnum(opcode);
+        const idx = @backingInt(opcode);
         if (self.handlers[idx] != null) {
             self.handlers[idx] = null;
             self.pre_route[idx] = null;
@@ -341,7 +341,7 @@ test "Dispatcher: register and dispatch single opcode" {
     var ctx = TestContext{};
     d.dispatch(testAuth(makeRequest(.ping)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.ping));
     try std.testing.expectEqual(@as(u32, 1), ctx.dispatch_count);
-    try std.testing.expectEqual(@intFromEnum(proto.OpCode.ping), ctx.last_opcode);
+    try std.testing.expectEqual(@backingInt(proto.OpCode.ping), ctx.last_opcode);
 }
 
 test "Dispatcher: unrecognized opcode calls error handler" {
@@ -353,7 +353,7 @@ test "Dispatcher: unrecognized opcode calls error handler" {
     d.dispatch(testAuth(makeRequest(.kv_get)), @ptrCast(&ctx), @ptrCast(&ctx), makeRequest(.kv_get));
     try std.testing.expectEqual(@as(u32, 0), ctx.dispatch_count);
     try std.testing.expectEqual(@as(u32, 1), ctx.error_count);
-    try std.testing.expectEqual(@intFromEnum(proto.OpCode.kv_get), ctx.last_error_opcode);
+    try std.testing.expectEqual(@backingInt(proto.OpCode.kv_get), ctx.last_error_opcode);
 }
 
 test "Dispatcher: an opcode past the table calls the error handler" {

@@ -184,7 +184,7 @@ pub const SnapshotBuilder = struct {
         var offset: usize = HEADER_SIZE;
         for (self.sections.items) |s| {
             const sh = SectionHeader{
-                .section_type = @intFromEnum(s.section_type),
+                .section_type = @backingInt(s.section_type),
                 ._reserved = @splat(0),
                 .section_size = @intCast(s.data.len),
             };
@@ -312,7 +312,7 @@ pub const SnapshotReader = struct {
     /// Find first section matching the given type.
     pub fn findSection(self: *const SnapshotReader, section_type: SectionType) ?SectionRef {
         for (0..self.section_count) |i| {
-            if (self.section_refs[i].section_type == @intFromEnum(section_type)) {
+            if (self.section_refs[i].section_type == @backingInt(section_type)) {
                 return self.section_refs[i];
             }
         }

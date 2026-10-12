@@ -141,7 +141,7 @@ pub const ProjectionRouter = struct {
             return .skipped_already_applied;
         }
 
-        const entry_type: EntryType = @enumFromInt(entry.header.entry_type);
+        const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         const target = routeTarget(entry_type);
 
         const result = switch (target) {
