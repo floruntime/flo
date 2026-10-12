@@ -102,16 +102,18 @@ pub fn build(b: *std.Build) void {
 
     // ── Test Filter ──
 
-    const test_filter = b.option([]const u8, "test-filter", "Filter tests by name pattern");
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains this substring; repeat to match any of several") orelse &.{};
+    for (test_filters) |f| if (std.mem.indexOfScalar(u8, f, '|') != null)
+        std.process.fatal("-Dtest-filter={s}: filters are plain substrings; repeat -Dtest-filter to match several", .{f});
 
     // ── Unit Tests ──
 
     // Each test root is generated from a walk of its directory, so a file
     // with tests can't be left out of a hand-kept list and never run.
-    const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filter != null);
-    const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filter != null);
-    const e2e_root = generateTestRoot(b, "tests/e2e", &.{}, test_filter != null);
-    const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filter != null);
+    const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filters);
+    const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filters);
+    const e2e_root = generateTestRoot(b, "tests/e2e", &.{}, test_filters);
+    const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filters);
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -120,7 +122,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
     });
     unit_tests.root_module.addImport("src", src_module);
     unit_tests.root_module.addImport("stdx", stdx_module);
@@ -137,7 +139,7 @@ pub fn build(b: *std.Build) void {
     stdx_module.addOptions("test_root", stdx_root.options);
     const stdx_tests = b.addTest(.{
         .root_module = stdx_module,
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
     });
     const run_stdx_tests = b.addRunArtifact(stdx_tests);
 
@@ -150,7 +152,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
     });
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
@@ -169,7 +171,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
     });
     integration_tests.root_module.addImport("src", src_module);
     integration_tests.root_module.addImport("stdx", stdx_module);
@@ -183,16 +185,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_stdx_tests.step);
+    failIfNoTestMatched(b, test_step, "test", test_filters, &.{ unit_root, stdx_root });
 
     const unit_test_step = b.step("test-unit", "Run unit tests only");
     unit_test_step.dependOn(&run_unit_tests.step);
     unit_test_step.dependOn(&run_stdx_tests.step);
+    failIfNoTestMatched(b, unit_test_step, "test-unit", test_filters, &.{ unit_root, stdx_root });
 
     const e2e_test_step = b.step("test-e2e", "Run end-to-end tests");
     e2e_test_step.dependOn(&run_e2e_tests.step);
+    failIfNoTestMatched(b, e2e_test_step, "test-e2e", test_filters, &.{e2e_root});
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+    failIfNoTestMatched(b, integration_test_step, "test-integration", test_filters, &.{integration_root});
 
     // ── VOPR simulator ──
 
@@ -269,10 +275,29 @@ pub fn build(b: *std.Build) void {
 const TestRoot = struct {
     /// The generated root, relative to the build root.
     path: []const u8,
-    /// `declared` (top-level test declarations the walk found) and
-    /// `filtered`, for the root's check that every one of them was compiled.
+    /// `declared` (top-level test declarations the walk found), for the
+    /// root's check that every one of them was compiled; `filters` and
+    /// `matched`, for its check that a filtered build compiled exactly the
+    /// tests predicted here.
     options: *std.Build.Step.Options,
+    /// Named tests under this root whose name contains a filter.
+    matched: usize,
 };
+
+/// A filtered test step whose roots hold no test matching any filter would
+/// run only the nameless tests and pass, so fail it instead, naming the
+/// filters.
+fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, filters: []const []const u8, roots: []const TestRoot) void {
+    if (filters.len == 0) return;
+    for (roots) |root| if (root.matched > 0) return;
+    var msg: std.Io.Writer.Allocating = .init(b.allocator);
+    msg.writer.print("no test in {s} matched", .{name}) catch @panic("out of memory");
+    for (filters) |f| msg.writer.print(" -Dtest-filter={s}", .{f}) catch @panic("out of memory");
+    msg.writer.writeAll(" (filters are plain substrings of the test name") catch @panic("out of memory");
+    if (std.mem.eql(u8, name, "test")) msg.writer.writeAll("; test-e2e and test-integration are separate steps") catch @panic("out of memory");
+    msg.writer.writeAll(")") catch @panic("out of memory");
+    step.dependOn(&b.addFail(msg.written()).step);
+}
 
 /// Write `<dir>/all_tests.zig`, a test root importing every .zig file under
 /// `dir` (sorted, skipping `skip` subdirectories and build output) that
@@ -281,7 +306,7 @@ const TestRoot = struct {
 /// and at least as many tests as the walk counted at the top level.
 /// Called at configure time, like the dashboard assets; the file is
 /// gitignored.
-fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filtered: bool) TestRoot {
+fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filters: []const []const u8) TestRoot {
     const io = buildIo();
     const out_name = "all_tests.zig";
     var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
@@ -290,6 +315,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
 
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     var declared: usize = 0;
+    var matched: usize = 0;
     var walker = root_dir.walkSelectively(b.allocator) catch @panic("out of memory");
     defer walker.deinit();
     while (walker.next(io) catch |err| std.debug.panic("cannot walk {s}: {t}", .{ dir, err })) |entry| {
@@ -309,7 +335,9 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
                 const content = root_dir.readFileAlloc(io, entry.path, b.allocator, .unlimited) catch |err|
                     std.debug.panic("cannot read {s}/{s} to find its tests: {t}", .{ dir, entry.path, err });
                 if (!hasTestDecl(content)) continue;
+                refuseUnpredictableTests(dir, entry.path, content);
                 declared += countTopLevelTestDecls(content);
+                matched += countMatchingTests(b, entry.path, content, filters);
                 files.append(b.allocator, b.dupe(entry.path)) catch @panic("out of memory");
             },
             else => {},
@@ -337,10 +365,24 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     ) catch @panic("out of memory");
     for (files.items) |f| w.print("    _ = @import(\"{s}\");\n", .{f}) catch @panic("out of memory");
     w.writeAll(
+        \\    // A filter drops named tests at compile time; this nameless test
+        \\    // stays. The build predicted from their names which tests the
+        \\    // filters keep; a different count here means that prediction, and
+        \\    // the step's "no test matched" check built on it, is wrong.
+        \\    if (test_root.filters.len > 0) {
+        \\        var compiled: usize = 0;
+        \\        for (builtin.test_functions) |t| {
+        \\            if (std.mem.indexOf(u8, t.name, ".test.") != null) compiled += 1;
+        \\        }
+        \\        if (compiled != test_root.matched) {
+        \\            std.debug.print("the build predicted {d} tests matching the filters here, but {d} were compiled\n", .{ test_root.matched, compiled });
+        \\            return error.TestFilterPredictionWrong;
+        \\        }
+        \\    }
         \\}
         \\
         \\test "every test declared under this directory is compiled" {
-        \\    if (test_root.filtered) return error.SkipZigTest;
+        \\    if (test_root.filters.len > 0) return error.SkipZigTest;
         \\    // The sentinel sits two directories down, so a walk that finds
         \\    // nothing, or doesn't descend, fails here: the count below would
         \\    // shrink with it.
@@ -362,8 +404,57 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
 
     const options = b.addOptions();
     options.addOption(usize, "declared", declared);
-    options.addOption(bool, "filtered", filtered);
-    return .{ .path = b.fmt("{s}/{s}", .{ dir, out_name }), .options = options };
+    options.addOption([]const []const u8, "filters", filters);
+    // The root's own named test is compiled when a filter matches its name.
+    matched += countMatchingTests(b, out_name, "test \"every test declared under this directory is compiled\" {", filters);
+    options.addOption(usize, "matched", matched);
+    return .{ .path = b.fmt("{s}/{s}", .{ dir, out_name }), .options = options, .matched = matched };
+}
+
+/// `countMatchingTests` reads a test's full name off its line, which holds
+/// only for `test "…"` at the top level: a decltest is named `X.decltest.y`
+/// and a nested test carries its container's name, so a filter could match
+/// one without the build knowing. Refuse both rather than miscount.
+fn refuseUnpredictableTests(dir: []const u8, path: []const u8, content: []const u8) void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (!isTestDecl(trimmed)) continue;
+        const rest = trimmed["test ".len..];
+        if (rest[0] != '"' and rest[0] != '{')
+            std.process.fatal("{s}/{s}:{d}: a decltest's name can't be predicted for -Dtest-filter; write it as test \"…\"", .{ dir, path, line_no });
+        if (rest[0] == '"' and trimmed.len != line.len)
+            std.process.fatal("{s}/{s}:{d}: a test nested in a container can't be predicted for -Dtest-filter; move it to the top level", .{ dir, path, line_no });
+    }
+}
+
+/// Named tests in `content` whose full name contains one of `filters`. Zig
+/// names a test `<path, with . for / and no .zig>.test.<its string>` and
+/// filters by substring of that; `refuseUnpredictableTests` keeps decltests
+/// and nested tests out, so the name is fully known from the line.
+fn countMatchingTests(b: *std.Build, path: []const u8, content: []const u8, filters: []const []const u8) usize {
+    if (filters.len == 0) return 0;
+    const stem = b.allocator.dupe(u8, path[0 .. path.len - ".zig".len]) catch @panic("out of memory");
+    std.mem.replaceScalar(u8, stem, '/', '.');
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "test \"")) continue;
+        var str: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = "test \"".len;
+        while (i < line.len and line[i] != '"') : (i += 1) {
+            if (line[i] == '\\' and i + 1 < line.len) i += 1;
+            str.append(b.allocator, line[i]) catch @panic("out of memory");
+        }
+        const name = b.fmt("{s}.test.{s}", .{ stem, str.items });
+        for (filters) |f| if (std.mem.indexOf(u8, name, f) != null) {
+            n += 1;
+            break;
+        };
+    }
+    return n;
 }
 
 /// Whether `content` declares a test anywhere: `test "…"`, `test {` or a
