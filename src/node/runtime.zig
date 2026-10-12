@@ -204,6 +204,9 @@ pub const Runtime = struct {
 
     /// Shard threads.
     shard_threads: ?[]std.Thread,
+    /// What the shards share while they stop, so each can answer the
+    /// others' clients before any closes its sockets.
+    stopping: Shard.Stopping,
 
     /// Acceptor.
     acceptor: ?Acceptor,
@@ -280,6 +283,7 @@ pub const Runtime = struct {
             .shards = null,
             .pipes = null,
             .shard_threads = null,
+            .stopping = .{},
             .acceptor = null,
             .acceptor_thread = null,
             .pipe_write_ends = null,
@@ -666,6 +670,7 @@ pub const Runtime = struct {
         // error into an SIGABRT crash.  Zig errdefers fire in LIFO order, so this
         // one runs first (threads stop), then the shard errdefer runs (deinit ok).
         errdefer {
+            self.stopping.of = @intCast(threads_spawned);
             for (0..threads_spawned) |i| shards[i].shutdown();
             for (0..threads_spawned) |i| threads[i].join();
             self.allocator.free(threads);
@@ -922,6 +927,7 @@ pub const Runtime = struct {
         self.peer_mailboxes_slice = mailboxes;
         for (0..n) |i| {
             shards[i].peer_mailboxes = mailboxes;
+            shards[i].stopping = &self.stopping;
         }
     }
 
@@ -1073,6 +1079,7 @@ pub const Runtime = struct {
 
         // 3. Send shutdown to each shard
         if (self.shards) |shards| {
+            self.stopping.of = @intCast(shards.len);
             for (shards) |*shard| {
                 _ = shard.mailbox.inbox.send(.{
                     .tag = .shutdown,
