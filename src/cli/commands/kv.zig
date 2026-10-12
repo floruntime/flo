@@ -429,6 +429,8 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
         var it = a.value.entries.iterator();
         var i = from;
         while (it.next() catch return outcome.malformed(ctx, "kv.mget answer")) |e| : (i += 1) {
+            // More entries than keys sent would name keys never asked for.
+            if (i - from == list.count) return outcome.malformed(ctx, "kv.mget answer");
             const value: ?[]const u8 = if (e.found) e.value else null;
             switch (format) {
                 .json => {
