@@ -188,8 +188,15 @@ pub const table = [_]ops.Op{
         .name = "kv.mget",
         .code = 0x102,
         .class = .read,
-        .route = .local,
-        .request = Record(&.{.{ .name = "keys", .T = schema.BoundedList(Bytes(ops.MAX_KEY), MAX_MGET, ops.MAX_REQUEST_BODY - 2) }}),
+        // With a routing key the batch is answered on its shard; without
+        // one it runs where it lands and looks each key up on its own.
+        .route = .{ .field = "routing_key" },
+        .request = Record(&.{
+            .{ .name = "keys", .T = schema.BoundedList(Bytes(ops.MAX_KEY), MAX_MGET, ops.MAX_REQUEST_BODY - 2 - RoutingKey.max_size) },
+            // Every key was written with this routing key: all are looked
+            // up on its shard. Without it, each key is on its own.
+            .{ .name = "routing_key", .T = RoutingKey },
+        }),
         .response = Record(&.{
             // In the order asked, as many as fit one answer.
             .{ .name = "entries", .T = schema.BoundedList(MgetEntry, MAX_MGET, listRoom(2 + 1 + 2)) },
