@@ -372,6 +372,8 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     return failures.items.len == 0;
 }
 
+// std's default gpa is SafeAllocator in ReleaseSafe, which flo's own main
+// avoids for speed; the simulator keeps it so CI's swarms catch misuse.
 pub fn main(init: std.process.Init) !void {
     stdx.io.bootFromInit(init.io);
     const raw_args = try init.minimal.args.toSlice(init.arena.allocator());

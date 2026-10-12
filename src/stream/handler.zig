@@ -27,6 +27,7 @@
 //! Consumer groups use a Pending Entry List (PEL) for per-message ack tracking.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
@@ -215,7 +216,7 @@ pub const StreamHandler = struct {
         if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
 
         // Track namespace data for stream create operations
-        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (op == .stream_create) {
             switch (cmd_result) {
                 .ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
@@ -230,7 +231,7 @@ pub const StreamHandler = struct {
     fn respondStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: proto.OpCode = @enumFromInt(req.header.op_code);
+        const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
         const cmd_result: CommandResult = switch (op) {
             .stream_append => shard.stream_handler.respondAppend(),
             .stream_trim => shard.stream_handler.respondTrim(req),
@@ -419,7 +420,7 @@ pub const StreamHandler = struct {
 
     /// Dispatch a stream command to the appropriate handler.
     fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
         return switch (op) {
             // Stream operations
@@ -1719,7 +1720,7 @@ pub const StreamHandler = struct {
     /// the UAL index for stream lookups.
     fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
-        const etype: EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
 
         if (etype == .stream_append) {
             self.last_append = null;
@@ -2862,8 +2863,8 @@ test "stream handler: a trim bound round-trips, and a key of any other shape is 
     try testing.expectEqual(id, TrimBound.decode(id.encode(&buf)).?);
     const age: TrimBound = .{ .age_ms = 60_000 };
     try testing.expectEqual(age, TrimBound.decode(age.encode(&buf)).?);
-    try testing.expect(TrimBound.decode(&[_]u8{0} ** 16) == null);
-    try testing.expect(TrimBound.decode(&([_]u8{2} ++ [_]u8{0} ** 8)) == null);
+    try testing.expect(TrimBound.decode(&@as([16]u8, @splat(0))) == null);
+    try testing.expect(TrimBound.decode(&([_]u8{2} ++ @as([8]u8, @splat(0)))) == null);
 }
 
 test "stream handler: a retention age past 100 years is refused at create and alter" {
@@ -3327,14 +3328,14 @@ test "stream handler: a stream or group name too long to qualify, or holding a N
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const long = "s" ** (ns_keys.MAX_QUALIFIED_KEY - 1); // "b\x00" + this is one byte over
+    const long = stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 1)); // "b\x00" + this is one byte over
     for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
         var req = makeRequest(op, long, groupWire("g"), "");
         req.namespace = "b";
         try testing.expect(handler.handleCommand(req) == .err);
     }
     // The stream fits qualified ("b\x00" + 4090), but not with its group.
-    var near = makeRequest(.stream_group_create, "s" ** (ns_keys.MAX_QUALIFIED_KEY - 6), groupWire("g" ** 8), "");
+    var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
     near.namespace = "b";
     try testing.expect(handler.handleCommand(near) == .err);
     // A NUL in either name could spell another namespace's key.

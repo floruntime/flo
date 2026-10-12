@@ -19,7 +19,7 @@
 #     instruction that the aarch64 baseline target does not enable.
 set -euo pipefail
 
-IMAGE=flo-linux:0.16.0
+IMAGE=flo-linux:0.17.0
 VOLUME=flo-zigcache
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARCH="$(uname -m)"; [ "$ARCH" = "arm64" ] && ARCH=aarch64

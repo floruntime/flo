@@ -64,8 +64,8 @@ test "e2e/definitions: a workflow whose retry count doesn't fit is refused at cr
     const proto = @import("src").protocol.proto;
     try ctx.exec(&.{ "action", "register", "act" });
 
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), try createRaw(ctx, "good-retry", retryWorkflow("good-retry", "3")));
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), try createRaw(ctx, "bad-retry", retryWorkflow("bad-retry", "-1")));
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), try createRaw(ctx, "good-retry", retryWorkflow("good-retry", "3")));
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), try createRaw(ctx, "bad-retry", retryWorkflow("bad-retry", "-1")));
     try alive(ctx);
 }
 

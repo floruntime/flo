@@ -38,7 +38,7 @@ fn option(buf: []u8, tag: proto.OptionTag, comptime T: type, value: T) ![]const 
 }
 
 fn expectRefused(r: Reply, why: []const u8) !void {
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
     try testing.expect(std.mem.indexOf(u8, r.data, why) != null);
 }
 
@@ -46,13 +46,13 @@ fn expectRefused(r: Reply, why: []const u8) !void {
 fn kvValue(ctx: *stdx.testing.TestContext, key: []const u8, out: []u8) ![]const u8 {
     var body: [16]u8 = undefined;
     const r = try rawCall(ctx, .kv_get, key, try kv_ops.plainGetBody(&body), "", out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
     return r.data[12..];
 }
 
 /// The point or series count leading a ts read or query answer.
 fn leadingCount(r: Reply) !u32 {
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
     return std.mem.readInt(u32, r.data[0..4], .little);
 }
 
@@ -65,10 +65,10 @@ test "e2e/time: a TTL too large to represent is refused, and the key keeps its v
     var out: [4096]u8 = undefined;
     // kv.set's body: "v2", then ttl_ms present and past its bound, condition
     // always, no cas, routing key or txn.
-    const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ [_]u8{0xff} ** 8 ++ [_]u8{ 1, 0, 0, 0, 0 };
+    const set_body = [_]u8{ 2, 0, 0, 0, 'v', '2', 1 } ++ @as([8]u8, @splat(0xff)) ++ [_]u8{ 1, 0, 0, 0, 0 };
     try expectRefused(try rawCall(ctx, .kv_put, "k", &set_body, "", &out), "kv.set: ttl_ms is out of range");
     // kv.expire's body: ttl_ms past its bound, then no cas, routing key or txn.
-    const expire_body = [_]u8{0xff} ** 8 ++ [_]u8{ 0, 0, 0 };
+    const expire_body = @as([8]u8, @splat(0xff)) ++ [_]u8{ 0, 0, 0 };
     try expectRefused(try rawCall(ctx, .kv_expire, "k", &expire_body, "", &out), "kv.expire: ttl_ms is out of range");
 
     try testing.expectEqualStrings("v", try kvValue(ctx, "k", &out));
@@ -123,17 +123,17 @@ test "e2e/time: a lower bound past the clock matches nothing, and an age past it
     var out: [4096]u8 = undefined;
     var obuf: [32]u8 = undefined;
     const trim = try rawCall(ctx, .stream_trim, "s", "", try option(&obuf, .max_age_seconds, u64, AGE_PAST_CLOCK_S), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), trim.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), trim.status);
     // An age no clock could reach is a mistake, refused rather than saturated.
     const absurd = try rawCall(ctx, .stream_trim, "s", "", try option(&obuf, .max_age_seconds, u64, std.math.maxInt(u64)), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), absurd.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), absurd.status);
 
     // The point is there from zero; from past the clock, nothing is.
     try testing.expectEqual(@as(u32, 1), try leadingCount(try rawCall(ctx, .ts_read, "m", "", try option(&obuf, .ts_from_ms, i64, 1), &out)));
     try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_read, "m", "", try option(&obuf, .ts_from_ms, i64, std.math.maxInt(i64)), &out)));
     try testing.expectEqual(@as(u32, 0), try leadingCount(try rawCall(ctx, .ts_query, "m", "", try option(&obuf, .ts_from_ms, i64, std.math.maxInt(i64)), &out)));
     const query = try rawCall(ctx, .ts_floql, "", "m[20000000000000]", "", &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), query.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), query.status);
 
     var r = try ctx.cli.run(&.{ "stream", "read", "s", "--start", "0-0" });
     defer r.deinit();
@@ -167,7 +167,7 @@ test "e2e/time: a FloQL duration too large to represent is refused" {
 
     var out: [4096]u8 = undefined;
     const query = try rawCall(ctx, .ts_floql, "", "m[106751991168d]", "", &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), query.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), query.status);
     try expectRefused(try rawCall(ctx, .ts_retention, "m", "106751991168d", "", &out), "invalid retention duration");
 
     try ctx.exec(&.{ "kv", "set", "alive", "yes" });
@@ -183,9 +183,9 @@ test "e2e/time: a stream retention age past the clock trims nothing when the swe
     var partitions: [4]u8 = undefined;
     std.mem.writeInt(u32, &partitions, 1, .little);
     const absurd = try rawCall(ctx, .stream_create, "aged", &partitions, try option(&obuf, .retention_age, u64, std.math.maxInt(u64)), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), absurd.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), absurd.status);
     const created = try rawCall(ctx, .stream_create, "aged", &partitions, try option(&obuf, .retention_age, u64, AGE_PAST_CLOCK_S), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), created.status);
     try ctx.exec(&.{ "stream", "append", "aged", "kept" });
 
     // The sweeper runs every 10 s.

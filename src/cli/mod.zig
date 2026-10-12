@@ -7,6 +7,7 @@ const build_options = @import("build_options");
 const commander = @import("commander/mod.zig");
 const commands = @import("commands/mod.zig");
 const proto = @import("../protocol/proto.zig");
+const build_info = @import("../build_info.zig");
 
 // Re-export useful modules
 pub const output = @import("output.zig");
@@ -305,9 +306,10 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
     ctx.print("Created flo.toml with default configuration\n", .{});
 }
 
-/// The release, and the protocol version and op table this build speaks: a
-/// client or SDK must carry the same table hash to be served.
-const version_line = std.fmt.comptimePrint("{s} (protocol {d}, table 0x{x:0>16})", .{ build_options.version, proto.VERSION, proto.TABLE_HASH });
+/// The release, the protocol version and op table this build speaks (a
+/// client or SDK must carry the same table hash to be served), and how it
+/// was built.
+const version_line = std.fmt.comptimePrint("{s} (protocol {d}, table 0x{x:0>16}; {s})", .{ build_options.version, proto.VERSION, proto.TABLE_HASH, build_info.line });
 
 fn showVersion(ctx: *commander.Context) commander.Error!void {
     ctx.print("flo version {s}\n", .{version_line});

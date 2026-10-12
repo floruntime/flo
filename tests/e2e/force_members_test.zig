@@ -10,7 +10,7 @@ const CliRunner = stdx.testing.CliRunner;
 
 test "e2e/cluster: force-members makes a stopped node the only voter and retires its secret, which the server then refuses" {
     const allocator = testing.allocator;
-    const node = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ "4" ** 64 });
+    const node = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("4", 64) });
     defer node.deinit();
     try node.start();
     errdefer node.dumpLogTail();
@@ -61,7 +61,7 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     try testing.expect(try node.logsContain("retired by force-members"));
 
     // A new secret: the node leads alone, and the data is still there.
-    node.config.cluster_secret = "flo-secret-" ++ "5" ** 64;
+    node.config.cluster_secret = "flo-secret-" ++ stdx.repeat("5", 64);
     node.dump_log_on_failure = true;
     try node.start();
     const ep = try node.getEndpoint(allocator);

@@ -61,7 +61,7 @@ test "e2e/kv: a key holding a NUL is refused, and a default listing shows only d
             else => &[_]u8{ 0, 0, 0 },
         };
         const r = try rawCall(ctx, op, "", "b\x00k", value, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "key must not contain NUL") != null);
     }
     try testing.expect(try bKeyUnchanged(ctx));
@@ -157,7 +157,7 @@ test "e2e/stream: a stream name holding a NUL is refused, so one namespace can't
         .{ .op = .stream_delete, .value = "" },
     }) |c| {
         const r = try rawCall(ctx, c.op, "a", "b\x00orders", c.value, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "stream name must not contain NUL") != null);
     }
 

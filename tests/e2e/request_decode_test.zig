@@ -40,7 +40,7 @@ fn alive(ctx: *stdx.testing.TestContext) !void {
     var get_buf: [16]u8 = undefined;
     _ = try rawCall(ctx, .kv_put, "", "alive", try kv_ops.plainSetBody(&set_buf, "yes"), &out);
     const r = try rawCall(ctx, .kv_get, "", "alive", try kv_ops.plainGetBody(&get_buf), &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
     try testing.expect(std.mem.endsWith(u8, r.data, "yes"));
 }
 
@@ -63,7 +63,7 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
         .{ .name = "json_set", .op = .kv_json_set, .key = "k", .value = &.{ 0xfe, 0xff }, .status = .bad_request },
         // An unknown worker type.
         .{ .name = "worker", .op = .worker_register, .key = "w", .value = &.{2}, .status = .bad_request },
-        .{ .name = "info", .op = .namespace_info, .key = "a" ** 129, .value = "", .status = .bad_request },
+        .{ .name = "info", .op = .namespace_info, .key = stdx.repeat("a", 129), .value = "", .status = .bad_request },
     };
     var out: [4096]u8 = undefined;
     for (cases) |c| {
@@ -71,8 +71,8 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
             std.debug.print("case {s}: {}\n", .{ c.name, err });
             return err;
         };
-        if (r.status != @intFromEnum(c.status)) std.debug.print("case {s}: status {d} {s}\n", .{ c.name, r.status, r.data });
-        try testing.expectEqual(@intFromEnum(c.status), r.status);
+        if (r.status != @backingInt(c.status)) std.debug.print("case {s}: status {d} {s}\n", .{ c.name, r.status, r.data });
+        try testing.expectEqual(@backingInt(c.status), r.status);
     }
     try alive(ctx);
 }
@@ -85,7 +85,7 @@ test "e2e/decode: namespace settings are refused with their reason, and the node
     // A block the old settings format would have applied: queue_max_lease_s=60.
     for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }) |op| {
         const r = try rawCall(ctx, op, "", "default", &.{ 1, 6, 60, 0, 0, 0 }, &out);
-        try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
+        try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expectEqualStrings("namespace settings aren't supported yet: none would take effect", r.data);
     }
     try alive(ctx);

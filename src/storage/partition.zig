@@ -181,7 +181,7 @@ pub const Partition = struct {
         // which fetches record payloads by index. The KV projection holds its
         // own values and nothing reads a KV payload back from the partition
         // log, so KV entries skip both copies.
-        const is_kv = router_mod.routeTarget(@enumFromInt(e.header.entry_type)) == .kv;
+        const is_kv = router_mod.routeTarget(@fromBackingInt(@intCast(e.header.entry_type))) == .kv;
         const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
@@ -541,7 +541,7 @@ test "partition: apply and read entries" {
     // The stream entry reads back from the ring; the KV entry is held by the
     // projection alone and never enters it.
     const read2 = part.read(2).?;
-    try testing.expectEqual(@as(u8, @intFromEnum(EntryType.stream_append)), read2.header.entry_type);
+    try testing.expectEqual(@as(u8, @backingInt(EntryType.stream_append)), read2.header.entry_type);
     try testing.expect(part.read(1) == null);
 
     try testing.expectEqual(@as(u64, 2), part.appliedIndex());

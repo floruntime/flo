@@ -300,7 +300,7 @@ test "integration: cold tier — on-demand stream read from cold" {
         const parsed = parseEntryAt(seg_data, pos) orelse break;
         pos = parsed.next_pos;
 
-        if (parsed.hdr.entry_type == @intFromEnum(entry_mod.EntryType.stream_append)) {
+        if (parsed.hdr.entry_type == @backingInt(entry_mod.EntryType.stream_append)) {
             stream_entries_found += 1;
 
             // Verify the stream record payload is parseable

@@ -112,9 +112,9 @@ pub const ClusterContext = struct {
         var self = Self{
             .allocator = allocator,
             .config = config,
-            .servers = [_]?*ServerProcess{null} ** MAX_NODES,
-            .clis = [_]?*CliRunner{null} ** MAX_NODES,
-            .endpoints = [_]?[]const u8{null} ** MAX_NODES,
+            .servers = @as([MAX_NODES]?*ServerProcess, @splat(null)),
+            .clis = @as([MAX_NODES]?*CliRunner, @splat(null)),
+            .endpoints = @as([MAX_NODES]?[]const u8, @splat(null)),
             .node_count = config.node_count,
         };
 

@@ -1684,7 +1684,7 @@ test "e2e/ts: retention takes only --raw-ttl, and the server refuses a downsampl
         stdx.time.sleep(10 * std.time.ns_per_ms);
     } else null;
     try testing.expect(resp != null);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.?.header.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.?.header.status);
     try testing.expect(std.mem.indexOf(u8, (try resp.?.refused()).message, "downsampling isn't supported") != null);
 }
 

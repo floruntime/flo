@@ -195,7 +195,7 @@ pub const ActionMeta = struct {
         try writer.writeLengthPrefixed(u16, self.name);
         try writer.writeLengthPrefixed(u16, self.namespace);
         try writer.writeLengthPrefixed(u16, self.version);
-        try writer.writeU8(@intFromEnum(self.action_type));
+        try writer.writeU8(@backingInt(self.action_type));
         try writer.writeLengthPrefixed(u16, self.owner);
 
         // Optional description
@@ -260,7 +260,7 @@ pub const ActionMeta = struct {
         const name = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
         const namespace = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
         const ver = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
-        const action_type: ActionType = @enumFromInt(reader.readU8() orelse return error.InvalidData);
+        const action_type: ActionType = @fromBackingInt(@intCast(reader.readU8() orelse return error.InvalidData));
         const owner = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
 
         // Optional description
@@ -458,7 +458,7 @@ pub const ActionRun = struct {
         try writer.writeLengthPrefixed(u16, self.run_id);
         try writer.writeLengthPrefixed(u16, self.action_name);
         try writer.writeLengthPrefixed(u16, self.namespace);
-        try writer.writeU8(@intFromEnum(self.status));
+        try writer.writeU8(@backingInt(self.status));
         try writer.writeLengthPrefixed(u32, self.input);
 
         // Optional output
@@ -524,7 +524,7 @@ pub const ActionRun = struct {
         }
 
         // Outcome and correlation_id (version 4+)
-        try writer.writeU8(@intFromEnum(self.outcome));
+        try writer.writeU8(@backingInt(self.outcome));
         if (self.correlation_id) |cid| {
             try writer.writeU8(1);
             try writer.writeLengthPrefixed(u16, cid);
@@ -553,7 +553,7 @@ pub const ActionRun = struct {
         const run_id = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
         const action_name = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
         const namespace = reader.readLengthPrefixed(u16) orelse return error.InvalidData;
-        const status: RunStatus = @enumFromInt(reader.readU8() orelse return error.InvalidData);
+        const status: RunStatus = @fromBackingInt(@intCast(reader.readU8() orelse return error.InvalidData));
         const input = reader.readLengthPrefixed(u32) orelse return error.InvalidData;
 
         // Optional output
@@ -611,7 +611,7 @@ pub const ActionRun = struct {
             null;
 
         // Outcome and correlation_id
-        const outcome: Outcome = @enumFromInt(reader.readU8() orelse return error.InvalidData);
+        const outcome: Outcome = @fromBackingInt(@intCast(reader.readU8() orelse return error.InvalidData));
         const has_correlation = reader.readU8() orelse return error.InvalidData;
         const correlation_id: ?[]const u8 = if (has_correlation == 1)
             reader.readLengthPrefixed(u16) orelse return error.InvalidData

@@ -315,7 +315,7 @@ test "Acceptor: round-robin routing" {
 test "Acceptor: a header at an odd offset in the peek buffer is read, not trapped on" {
     var pipes: [2]i32 = .{ -1, -1 };
     var acceptor = Acceptor.init(&pipes, Router.init(4096, 2, 0));
-    const header = proto.RequestHeader.init(@enumFromInt(0x01), 0);
+    const header = proto.RequestHeader.init(@fromBackingInt(@intCast(0x01)), 0);
     // One byte past an 8-byte boundary: a cast would trap in a safe build.
     var buf: [128]u8 align(8) = undefined;
     @memcpy(buf[1..][0..@sizeOf(proto.RequestHeader)], std.mem.asBytes(&header));

@@ -34,6 +34,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("stdx");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -2159,7 +2160,7 @@ test "parser: a stream or queue name holding a NUL, or too long for its namespac
         defer def.deinit(allocator);
         try std.testing.expectEqualStrings("stream or queue name must not contain NUL", def.namespaceRefusal().?);
     }
-    const long = "s" ** 4096;
+    const long = stdx.repeat("s", 4096);
     const too_long = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"" ++ long ++ "\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}";
     var def = try parseJobDefinitionWithNamespace(allocator, too_long, "acme", null);
     defer def.deinit(allocator);

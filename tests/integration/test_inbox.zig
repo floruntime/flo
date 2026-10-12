@@ -14,7 +14,7 @@ fn makeMsg(tag: Tag, shard: u8, seq: u64) Message {
         .payload_len = 0,
         .sequence = seq,
         .payload_ptr = null,
-        ._padding = .{0} ** 8,
+        ._padding = @splat(0),
     };
 }
 

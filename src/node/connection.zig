@@ -619,7 +619,7 @@ test "Connection: an answer larger than the buffer is queued whole, in order, an
     var conn = try Connection.init(std.testing.allocator, -1, 1, 0);
     defer conn.deinit();
     // Wrap the ring first so growth has to keep a split tail in order.
-    const head = [_]u8{'h'} ** (RingBuffer.DEFAULT_CAPACITY - 10);
+    const head = @as([(RingBuffer.DEFAULT_CAPACITY - 10)]u8, @splat('h'));
     try std.testing.expectEqual(head.len, conn.queueWrite(&head));
     conn.consumeWritten(head.len - 5);
     const big = try std.testing.allocator.alloc(u8, 200 * 1024);

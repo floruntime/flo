@@ -38,7 +38,7 @@ fn pollUntilStdout(cli: *CliRunner, args: []const []const u8, expected: []const 
 
 test "e2e/cluster: peers are reached at the address they advertise" {
     // All of 127.0.0.0/8 is loopback on Linux; macOS needs an alias per address.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = testing.allocator;
 
     // One shard: only shard 0 has a peer network, so a key hashed elsewhere

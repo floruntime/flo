@@ -7,6 +7,7 @@
 //! never failed.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const JsonValue = std.json.Value;
 
 pub const Diagnostic = struct {
@@ -186,14 +187,14 @@ test "Diagnostic: path and message" {
 
 test "Diagnostic: an overlong path or message is cut, not failed" {
     var d: Diagnostic = .{};
-    const long = "k" ** 100;
+    const long = stdx.repeat("k", 100);
     _ = d.push(long);
     _ = d.push(long);
     _ = d.push(long);
     try std.testing.expect(d.path_cut);
     try std.testing.expectEqual(error.X, d.fail(error.X, "unknown key \"{s}\"", .{long}));
     try std.testing.expect(std.mem.endsWith(u8, d.message(), "…"));
-    try std.testing.expectEqual(error.X, d.fail(error.X, "{s}", .{"m" ** 400}));
+    try std.testing.expectEqual(error.X, d.fail(error.X, "{s}", .{stdx.repeat("m", 400)}));
     try std.testing.expectEqual(d.msg_buf.len, d.msg_len);
     try std.testing.expect(std.mem.endsWith(u8, d.message(), "…"));
 }

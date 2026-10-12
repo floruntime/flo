@@ -183,7 +183,7 @@ pub const WaiterPool = struct {
     /// Waiters answering another shard or node.
     forwarded: u16 = 0,
     /// Waiters of each kind, so a change nobody waits on skips the scan.
-    of_kind: [@typeInfo(WaiterKind).@"enum".fields.len]u16 = @splat(0),
+    of_kind: [@typeInfo(WaiterKind).@"enum".field_names.len]u16 = @splat(0),
     full_warn_ms: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !WaiterPool {
@@ -256,7 +256,7 @@ pub const WaiterPool = struct {
         w.active = true;
         self.count += 1;
         if (forwarded) self.forwarded += 1;
-        self.of_kind[@intFromEnum(opts.kind)] += 1;
+        self.of_kind[@backingInt(opts.kind)] += 1;
         return true;
     }
 
@@ -285,7 +285,7 @@ pub const WaiterPool = struct {
     /// shard.waiter_pool.notify(.kv_get, key, resolveKVWaiter, shard);
     /// ```
     pub fn notify(self: *WaiterPool, kind: WaiterKind, notify_key: []const u8, resolver: ResolverFn, ctx: *anyopaque) void {
-        if (self.of_kind[@intFromEnum(kind)] == 0) return;
+        if (self.of_kind[@backingInt(kind)] == 0) return;
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
@@ -309,7 +309,7 @@ pub const WaiterPool = struct {
     /// Wake ALL waiters of a given kind (no key filter).
     /// Used for action_await where any pending task should wake the first waiter.
     pub fn notifyAny(self: *WaiterPool, kind: WaiterKind, resolver: ResolverFn, ctx: *anyopaque) void {
-        if (self.of_kind[@intFromEnum(kind)] == 0) return;
+        if (self.of_kind[@backingInt(kind)] == 0) return;
         var i: u16 = 0;
         while (i < self.count) {
             const w = &self.waiters[i];
@@ -403,7 +403,7 @@ pub const WaiterPool = struct {
         const gone = &self.waiters[index];
         if (gone.key_heap) |k| self.allocator.free(k);
         if (self.isForwarded(gone.reply_to)) self.forwarded -= 1;
-        self.of_kind[@intFromEnum(gone.kind)] -= 1;
+        self.of_kind[@backingInt(gone.kind)] -= 1;
         if (index < self.count - 1) {
             self.waiters[index] = self.waiters[self.count - 1];
         }
@@ -525,9 +525,9 @@ test "WaiterPool: this shard's clients and other shards' each have their part of
     // One gone, one comes back in its place.
     pool.removeByConnection(0, 0, 1, null, @ptrCast(&pool));
     try std.testing.expect(pool.register(.{ .kind = .stream_read, .reply_to = ReplyTo.socketOf(1, 1, 1), .request_id = 0, .key = "s", .timeout_ms = 1_000 }));
-    try std.testing.expectEqual(@as(u16, 0), pool.of_kind[@intFromEnum(WaiterKind.queue_dequeue)]);
-    try std.testing.expectEqual(LOCAL_WAITERS, pool.of_kind[@intFromEnum(WaiterKind.kv_get)]);
-    try std.testing.expectEqual(MAX_WAITERS - LOCAL_WAITERS, pool.of_kind[@intFromEnum(WaiterKind.stream_read)]);
+    try std.testing.expectEqual(@as(u16, 0), pool.of_kind[@backingInt(WaiterKind.queue_dequeue)]);
+    try std.testing.expectEqual(LOCAL_WAITERS, pool.of_kind[@backingInt(WaiterKind.kv_get)]);
+    try std.testing.expectEqual(MAX_WAITERS - LOCAL_WAITERS, pool.of_kind[@backingInt(WaiterKind.stream_read)]);
     const Never = struct {
         fn resolve(_: *Waiter, _: *anyopaque) bool {
             unreachable;

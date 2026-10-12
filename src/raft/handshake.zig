@@ -96,7 +96,7 @@ pub const Welcome = struct {
     pub const SIZE: usize = 1 + 4;
 
     pub fn encode(self: Welcome, buf: *[SIZE]u8) void {
-        buf[0] = @intFromEnum(self.verdict);
+        buf[0] = @backingInt(self.verdict);
         std.mem.writeInt(u32, buf[1..5], self.node_id, .little);
     }
 
@@ -138,7 +138,7 @@ const testing = std.testing;
 
 test "handshake: hello and welcome round-trip" {
     var buf: [Hello.SIZE]u8 = undefined;
-    const h = Hello{ .version = VERSION, .table_hash = TABLE_HASH, .node_id = 7, .raft_port = 9500, .main_port = 9000, .ip4 = .{ 10, 0, 1, 12 }, .nonce = [_]u8{0x11} ** NONCE_LEN };
+    const h = Hello{ .version = VERSION, .table_hash = TABLE_HASH, .node_id = 7, .raft_port = 9500, .main_port = 9000, .ip4 = .{ 10, 0, 1, 12 }, .nonce = @as([NONCE_LEN]u8, @splat(0x11)) };
     h.encode(&buf);
     const d = Hello.decode(&buf);
     try testing.expectEqual(h.node_id, d.node_id);
@@ -159,8 +159,8 @@ test "handshake: hello and welcome round-trip" {
 }
 
 test "handshake: a proof verifies only with the same secret, transcript and ids, and each side's differs" {
-    const t1 = [_]u8{1} ** 32;
-    const t2 = [_]u8{2} ** 32;
+    const t1 = @as([32]u8, @splat(1));
+    const t2 = @as([32]u8, @splat(2));
     // The acceptor (id 2) proves to the dialer (id 1); the dialer checks it
     // with the same inputs.
     const from_acceptor = proof("s3cret", &t1, 2, 1);

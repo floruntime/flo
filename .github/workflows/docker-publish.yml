@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push the image. Off: build both platforms only'
+        type: boolean
+        default: true
 
 env:
   REGISTRY: ghcr.io
@@ -63,13 +68,13 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' || inputs.publish }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            ZIG_VERSION=0.16.0
+            ZIG_VERSION=0.17.0
             FLO_VERSION=${{ steps.version.outputs.VERSION }}
 
       # Attestation disabled - GITHUB_TOKEN lacks permission to create attestations

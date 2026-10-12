@@ -97,7 +97,7 @@ fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, ou
         const rc = std.c.read(fd, out[got..].ptr, out.len - got);
         if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
         if (proto.Response.parse(out[0..got])) |r| {
-            try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.header.status);
+            try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
             return r.data;
         } else |_| {}
         stdx.time.sleep(10 * std.time.ns_per_ms);
@@ -107,7 +107,7 @@ fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, ou
 
 /// Pages `op` two at a time and checks each of `want` comes back once.
 fn expectPagesThrough(ctx: *stdx.testing.TestContext, op: proto.OpCode, entry: Entry, want: []const []const u8) !void {
-    var seen = [_]usize{0} ** 16;
+    var seen = @as([16]usize, @splat(0));
     var cursor_buf: [256]u8 = undefined;
     var cursor: []const u8 = "";
     var pages: usize = 0;
@@ -217,7 +217,7 @@ fn expectBigShardListed(ctx: *stdx.testing.TestContext, write: proto.OpCode, val
         _ = try call(fd, write, try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i}), sent, &out);
     }
 
-    var seen = [_]u8{0} ** BIG;
+    var seen = @as([BIG]u8, @splat(0));
     var cursor_buf: [256]u8 = undefined;
     var cursor: []const u8 = "";
     for (0..20) |_| {
@@ -267,7 +267,7 @@ fn expectLimitInValue(comptime list: fn (*cli.Client) anyerror!cli.Response, op:
     const n = std.c.read(pair[1], &sent, sent.len);
     try testing.expect(n > 0);
     const req = try proto.Request.parse(sent[0..@intCast(n)]);
-    try testing.expectEqual(@intFromEnum(op), req.header.op_code);
+    try testing.expectEqual(@backingInt(op), req.header.op_code);
     try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, req.value);
     try testing.expectEqual(@as(usize, 0), req.options.len);
 }

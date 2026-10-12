@@ -49,7 +49,7 @@ pub const Address = struct {
                     .family = posix.AF.INET,
                     .port = std.mem.nativeToBig(u16, a.port),
                     .addr = @bitCast(a.bytes),
-                    .zero = .{0} ** 8,
+                    .zero = @splat(0),
                 };
                 return @sizeOf(posix.sockaddr.in);
             },
@@ -199,13 +199,13 @@ pub fn getAddressList(gpa: std.mem.Allocator, host: []const u8, port: u16) !Addr
     hints.family = posix.AF.UNSPEC;
     hints.socktype = posix.SOCK.STREAM;
 
-    const host_z = try aalloc.dupeZ(u8, host);
+    const host_z = try aalloc.dupeSentinel(u8, host, 0);
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+    const port_str = try std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0);
 
     var res: ?*std.c.addrinfo = null;
     const rc = std.c.getaddrinfo(host_z.ptr, port_str.ptr, &hints, &res);
-    if (@intFromEnum(rc) != 0) return error.UnknownHostName;
+    if (@backingInt(rc) != 0) return error.UnknownHostName;
     defer std.c.freeaddrinfo(res.?);
 
     var list: std.ArrayList(Address) = .empty;
@@ -249,7 +249,7 @@ pub const SocketAddrV4 = struct {
             .family = posix.AF.INET,
             .port = std.mem.nativeToBig(u16, port),
             .addr = @bitCast(ip4),
-            .zero = .{0} ** 8,
+            .zero = @splat(0),
         } };
     }
 
@@ -268,7 +268,7 @@ pub fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.s
     // macOS rejects SOCK.NONBLOCK / SOCK.CLOEXEC in the socket() type field
     // (returns EPROTONOSUPPORT). Strip them and apply via fcntl after creation.
     const builtin = @import("builtin");
-    const strip_mask: u32 = if (builtin.os.tag == .macos)
+    const strip_mask: u32 = if (builtin.target.os.tag == .macos)
         posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC
     else
         0;
@@ -280,7 +280,7 @@ pub fn sysSocket(family: u32, sock_type: u32, protocol: u32) SocketError!posix.s
     if (rc < 0) return error.SocketCreateFailed;
     const fd: posix.socket_t = @intCast(rc);
 
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         if (want_nonblock) {
             const F_GETFL: c_int = 3;
             const F_SETFL: c_int = 4;

@@ -140,7 +140,7 @@ pub fn readSecretFile(allocator: Allocator, path: []const u8) ![]u8 {
         log.err("[cluster] secret_file {s} cannot be read: {s}", .{ path, @errorName(err) });
         return error.InvalidSetting;
     };
-    const mode: u32 = @intCast(@intFromEnum(st.permissions));
+    const mode: u32 = @intCast(@backingInt(st.permissions));
     if (mode & 0o077 != 0) {
         log.err("[cluster] secret_file {s} can be read or written by others (mode {o}); chmod 600 it", .{ path, mode & 0o777 });
         return error.InvalidSetting;
@@ -330,17 +330,17 @@ test "cluster: only the form `flo server secret` prints is a secret, and it prin
     try testing.expect(!std.mem.eql(u8, &out, &again));
     try testing.expect(!secretWellFormed("s3cret"));
     try testing.expect(!secretWellFormed(""));
-    try testing.expect(!secretWellFormed("flo-secret-" ++ "0" ** 63));
-    try testing.expect(!secretWellFormed("flo-secret-" ++ "0" ** 65));
-    try testing.expect(!secretWellFormed("flo-secret-" ++ "A" ** 64));
-    try testing.expect(!secretWellFormed("xyz-secret-" ++ "0" ** 64));
-    try testing.expect(secretWellFormed("flo-secret-" ++ "0123456789abcdef" ** 4));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ stdx.repeat("0", 63)));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ stdx.repeat("0", 65)));
+    try testing.expect(!secretWellFormed("flo-secret-" ++ stdx.repeat("A", 64)));
+    try testing.expect(!secretWellFormed("xyz-secret-" ++ stdx.repeat("0", 64)));
+    try testing.expect(secretWellFormed("flo-secret-" ++ stdx.repeat("0123456789abcdef", 4)));
 }
 
 test "cluster: a secret file is read only when its owner alone can read it" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const secret = "flo-secret-" ++ "ab" ** 32;
+    const secret = "flo-secret-" ++ stdx.repeat("ab", 32);
     const dir_path = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
     defer testing.allocator.free(dir_path);
     const path = try std.fs.path.join(testing.allocator, &.{ dir_path, "s" });
@@ -350,7 +350,7 @@ test "cluster: a secret file is read only when its owner alone can read it" {
         try stdx.fs.writeAll(f, secret ++ "\n");
     }
     defer testing.allocator.free(path);
-    const path_z = try testing.allocator.dupeZ(u8, path);
+    const path_z = try testing.allocator.dupeSentinel(u8, path, 0);
     defer testing.allocator.free(path_z);
 
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o644));

@@ -115,7 +115,7 @@ pub const ApiKey = struct {
         pos += 32;
 
         // role
-        buf[pos] = @intFromEnum(self.role);
+        buf[pos] = @backingInt(self.role);
         pos += 1;
 
         // created_at (i64 LE)

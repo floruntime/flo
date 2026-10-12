@@ -176,7 +176,7 @@ test "hard state: a short file refuses to load" {
     var file_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&file_buf, "{s}/{s}", .{ dir, FILENAME });
     const file = try stdx.fs.createFile(path, .{});
-    try stdx.fs.writeAll(file, &[_]u8{0} ** (SIZE - 4));
+    try stdx.fs.writeAll(file, &@as([(SIZE - 4)]u8, @splat(0)));
     stdx.fs.closeFile(file);
     try testing.expectError(error.Truncated, load(dir));
 }

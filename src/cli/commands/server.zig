@@ -10,6 +10,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
+const build_info = @import("../../build_info.zig");
 const server_config = @import("../../config/mod.zig").server;
 const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
@@ -232,7 +233,7 @@ fn setupSignalHandlers() void {
                 std.posix.SIG.HUP => "SIGHUP",
                 else => "UNKNOWN",
             };
-            std.debug.print("\n=== CRASH SIGNAL {s} (sig={d}) received by PID {d} ===\n", .{ sig_name, @intFromEnum(sig), pid });
+            std.debug.print("\n=== CRASH SIGNAL {s} (sig={d}) received by PID {d} ===\n", .{ sig_name, @backingInt(sig), pid });
             // Re-raise the signal to get core dump/default behavior
             const default_act = std.posix.Sigaction{
                 .handler = .{ .handler = std.posix.SIG.DFL },
@@ -242,7 +243,7 @@ fn setupSignalHandlers() void {
             std.posix.sigaction(sig, &default_act, null);
             _ = std.posix.raise(sig) catch {};
             // If raise failed, just exit
-            std.c.exit(@as(c_int, @intCast(128 + @intFromEnum(sig))));
+            std.c.exit(@as(c_int, @intCast(128 + @backingInt(sig))));
         }
     }.handle;
 
@@ -324,7 +325,7 @@ fn removePidFile(data_dir: []const u8) void {
 
 fn isProcessRunning(pid: posix.pid_t) bool {
     // Send signal 0 to check if process exists
-    posix.kill(pid, @enumFromInt(0)) catch |err| {
+    posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| {
         // ESRCH means process doesn't exist
         return err != error.NoSuchProcess;
     };
@@ -573,6 +574,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const bound_port = runtime.boundPort();
     ctx.print("\n", .{});
     ctx.print("Flo server ready on {s}:{d}\n", .{ config.bind, bound_port });
+    ctx.print("Build: {s}\n", .{build_info.line});
     ctx.print("Press Ctrl+C to stop.\n", .{});
     ctx.print("\n", .{});
 

@@ -89,7 +89,7 @@ pub const TaskScheduler = struct {
         if (self.task_count >= MAX_TASKS) return error.TaskLimitReached;
 
         var task: Task = .{
-            .name = .{0} ** 32,
+            .name = @splat(0),
             .name_len = 0,
             .callback = callback,
             .context = context,

@@ -40,7 +40,7 @@ test "integration: UAL append and read back" {
         try testing.expectEqual(index, entry.header.index);
         try testing.expectEqual(entry_mod.ENTRY_MAGIC, entry.header.magic);
         try testing.expectEqual(@as(u8, 1), entry.header.version);
-        try testing.expectEqual(@as(u8, @intFromEnum(EntryType.kv_put)), entry.header.entry_type);
+        try testing.expectEqual(@as(u8, @backingInt(EntryType.kv_put)), entry.header.entry_type);
 
         // Verify payload content
         var expected_buf: [32]u8 = undefined;

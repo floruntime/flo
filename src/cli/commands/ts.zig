@@ -11,6 +11,7 @@
 //!   flo ts retention <measurement> --raw-ttl <duration>
 
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
@@ -914,8 +915,8 @@ test "parseDuration" {
 }
 
 test "ts: a read answer parses, and a cut-short one is Truncated" {
-    const answer = "\x02\x00\x00\x00" ++ "\x05" ++ "\x00" ** 7 ++ "\x00" ** 6 ++ "\xf0\x3f" ++
-        "\x06" ++ "\x00" ** 7 ++ "\x00" ** 8;
+    const answer = "\x02\x00\x00\x00" ++ "\x05" ++ stdx.repeat("\x00", 7) ++ stdx.repeat("\x00", 6) ++ "\xf0\x3f" ++
+        "\x06" ++ stdx.repeat("\x00", 7) ++ stdx.repeat("\x00", 8);
     const points = try parsePoints(answer);
     try std.testing.expectEqual(@as(usize, 2), points.len());
     try std.testing.expectEqual(@as(i64, 5), points.at(0).ms);
@@ -926,7 +927,7 @@ test "ts: a read answer parses, and a cut-short one is Truncated" {
 
 test "ts: query and floql answers parse, and cut-short ones are Truncated" {
     const a = std.testing.allocator;
-    const point = "\x09" ++ "\x00" ** 7 ++ "\x00" ** 8;
+    const point = "\x09" ++ stdx.repeat("\x00", 7) ++ stdx.repeat("\x00", 8);
     const query = "\x01\x00\x00\x00" ++ "\x03\x00\x00\x00cpu" ++ "\x01\x00\x00\x00" ++ point;
     const floql = "\x01\x00\x00\x00" ++ "\x03\x00\x00\x00cpu" ++ "\x05\x00\x00\x00value" ++ "\x01\x00\x00\x00" ++ point;
 

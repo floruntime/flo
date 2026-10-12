@@ -14,7 +14,7 @@ fn listed(ctx: *stdx.testing.TestContext, name: []const u8) !bool {
 
 const Bad = struct { name: []const u8, says: []const u8 };
 const bad_names = [_]Bad{
-    .{ .name = "n" ** 300, .says = "namespace name too long" },
+    .{ .name = stdx.repeat("n", 300), .says = "namespace name too long" },
     .{ .name = "_flo", .says = "reserved namespace name" },
     .{ .name = "Prod", .says = "lowercase only" },
     .{ .name = "v1.0", .says = "letters, digits, '_' and '-' only" },
@@ -36,7 +36,7 @@ test "e2e/namespace: a write naming a namespace outside the rule is refused, say
         try testing.expect(!try listed(ctx, b.name));
     }
     // The longest name, and one starting with a digit, are names.
-    const longest = "n" ** 63;
+    const longest = stdx.repeat("n", 63);
     try ctx.exec(&.{ "kv", "set", "k", "v", "-n", longest });
     try ctx.exec(&.{ "kv", "set", "k", "v", "-n", "9lives" });
     try testing.expect(try listed(ctx, longest));
@@ -86,7 +86,7 @@ test "e2e/namespace: the dashboard refuses an invalid namespace name, and the no
     defer ctx.deinit();
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-    const long = "n" ** 5000;
+    const long = stdx.repeat("n", 5000);
     for ([_][]const u8{
         "/api/v1/streams?namespace=" ++ long,
         "/api/v1/kv/namespaces/" ++ long ++ "/keys",

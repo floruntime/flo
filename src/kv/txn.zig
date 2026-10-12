@@ -326,7 +326,7 @@ pub fn serializeBatch(buf: []u8, namespace_hash: u32, ops: []const TxnOp) !usize
 
     for (ops) |op| {
         const has_ttl = op.kind == .put and op.ttl_ms != 0;
-        buf[off] = @intFromEnum(op.kind);
+        buf[off] = @backingInt(op.kind);
         off += 1;
         buf[off] = if (has_ttl) FLAG_HAS_TTL else 0;
         off += 1;

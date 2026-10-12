@@ -87,8 +87,8 @@ pub const Child = struct {
         self.inner = null;
         return switch (term) {
             .exited => |c| .{ .Exited = c },
-            .signal => |s| .{ .Signal = @intCast(@intFromEnum(s)) },
-            .stopped => |s| .{ .Stopped = @intCast(@intFromEnum(s)) },
+            .signal => |s| .{ .Signal = @intCast(@backingInt(s)) },
+            .stopped => |s| .{ .Stopped = @intCast(@backingInt(s)) },
             .unknown => |c| .{ .Unknown = c },
         };
     }

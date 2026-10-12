@@ -510,8 +510,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
 test "queue: a dequeue answer cut short is Truncated, not fewer messages" {
     // count 2: seq, len 1, "a", enqueued_at, delivery_count, priority; then the same with "b".
-    const one = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "a".* ++ [_]u8{0} ** 8 ++ [_]u8{0} ** 4 ++ [_]u8{0};
-    const two = one[0..8].* ++ [_]u8{ 1, 0, 0, 0 } ++ "b".* ++ [_]u8{0} ** 13;
+    const one = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "a".* ++ @as([8]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{0};
+    const two = one[0..8].* ++ [_]u8{ 1, 0, 0, 0 } ++ "b".* ++ @as([13]u8, @splat(0));
     const answer = [_]u8{ 2, 0, 0, 0 } ++ one ++ two;
 
     var m = try Messages.init(&answer);

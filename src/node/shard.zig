@@ -29,6 +29,7 @@
 //! and adds it to the pool.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const builtin = @import("builtin");
 const posix = std.posix;
 const log = @import("stdx").log;
@@ -431,7 +432,7 @@ pub const Shard = struct {
     /// them.
     queued: [2][@import("../config/server.zig").MAX_SHARDS]u32 = .{ @splat(0), @splat(0) },
     /// When a refusal after waiting was last logged, per wait reason.
-    wait_warn_ms: [@typeInfo(Connection.WaitReason).@"enum".fields.len]u64 = @splat(0),
+    wait_warn_ms: [@typeInfo(Connection.WaitReason).@"enum".field_names.len]u64 = @splat(0),
     /// Connections paused now, and when the stall check next runs.
     paused_count: u32 = 0,
     stall_check_ms: u64 = 0,
@@ -870,9 +871,9 @@ pub const Shard = struct {
             .late_apply_warn_ms = 0,
             .election_warn_ms = 0,
             .elections_unlogged = 0,
-            .peer_silent_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .peer_silent_warn_ms = @as([raft_node_mod.MAX_PEERS]u64, @splat(0)),
             .flush_fail_warn_ms = 0,
-            .peer_batch_warn_ms = [_]u64{0} ** raft_node_mod.MAX_PEERS,
+            .peer_batch_warn_ms = @as([raft_node_mod.MAX_PEERS]u64, @splat(0)),
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
             .durable_log = durable_log,
@@ -1229,7 +1230,7 @@ pub const Shard = struct {
     /// (`sendPendingCancels`). The slots stay held until answered, so they
     /// never count for less than what is parked.
     fn releaseForwardsFor(self: *Shard, conn: *Connection) void {
-        var told = std.StaticBitSet(@import("../config/server.zig").MAX_SHARDS).initEmpty();
+        var told = std.bit_set.Static(@import("../config/server.zig").MAX_SHARDS).empty;
         const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
         for (conn.blocking_slots[0..conn.blocking_in_flight]) |t| {
             const target = self.reply_pool.orphan(t) orelse continue;
@@ -1238,7 +1239,7 @@ pub const Shard = struct {
             if (self.sendCancel(target, seq)) continue;
             // At most one ask per slot that is still to be answered; past
             // that, or without memory, the reads end at their block time.
-            if (self.pending_cancels.items.len < self.reply_pool.classes[@intFromEnum(reply_pool_mod.Class.blocking)].free.len) {
+            if (self.pending_cancels.items.len < self.reply_pool.classes[@backingInt(reply_pool_mod.Class.blocking)].free.len) {
                 self.pending_cancels.append(self.allocator, .{ .target = target, .seq = seq }) catch {};
             }
         }
@@ -1371,10 +1372,10 @@ pub const Shard = struct {
     /// group read's records, a claimed or awaited task.
     fn takesItems(op: u16) bool {
         return switch (op) {
-            @intFromEnum(proto.OpCode.queue_dequeue),
-            @intFromEnum(proto.OpCode.stream_group_read),
-            @intFromEnum(proto.OpCode.stream_group_claim),
-            @intFromEnum(proto.OpCode.action_await),
+            @backingInt(proto.OpCode.queue_dequeue),
+            @backingInt(proto.OpCode.stream_group_read),
+            @backingInt(proto.OpCode.stream_group_claim),
+            @backingInt(proto.OpCode.action_await),
             => true,
             else => false,
         };
@@ -1384,7 +1385,7 @@ pub const Shard = struct {
     /// transaction.
     fn requestWrites(req: proto.Request) bool {
         if (table.isOp(req.header.op_code)) return table_run.writes(req);
-        return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@enumFromInt(req.header.op_code));
+        return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@fromBackingInt(@intCast(req.header.op_code)));
     }
 
     /// How long a read may wait on purpose for its data, or null for any
@@ -1394,7 +1395,7 @@ pub const Shard = struct {
     fn blockingWait(req: proto.Request) ?u64 {
         if (table.isOp(req.header.op_code)) return table_run.waitMs(req);
         if (req.getBlockMs()) |ms| return ms;
-        if (req.header.op_code != @intFromEnum(proto.OpCode.action_await)) return null;
+        if (req.header.op_code != @backingInt(proto.OpCode.action_await)) return null;
         const opt = req.findOption(.block_ms) orelse return 30_000;
         const ms = opt.asU32() orelse 30_000;
         return if (ms == 0) null else ms;
@@ -1475,14 +1476,14 @@ pub const Shard = struct {
     fn answeredAsDeferred(self: *Shard, req: proto.Request) void {
         self.answered_as_deferred += 1;
         log.err("shard {d}: request {d} (op 0x{x}) was answered as deferred without being parked. This is a bug", .{ self.id, req.header.request_id, req.header.op_code });
-        if (builtin.mode == .Debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
+        if (builtin.mode == .debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
     }
 
     /// Run a request on this shard — unless it writes and this shard's
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
     fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
-        const status_op = req.header.op_code == @intFromEnum(proto.OpCode.cluster_status) or req.header.op_code == @intFromEnum(proto.OpCode.cluster_members);
+        const status_op = req.header.op_code == @backingInt(proto.OpCode.cluster_status) or req.header.op_code == @backingInt(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.removed_message));
             return;
@@ -1517,7 +1518,7 @@ pub const Shard = struct {
         // create nothing, wherever they are sent, and nor does a request
         // that names nothing to write to. A job submit names its targets in
         // its definition: its handler reserves once the definition passes.
-        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@enumFromInt(req.header.op_code))) {
+        if (req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(req.header.op_code)))) {
             if (self.namespace_handler.admission(req.namespace)) |r| {
                 self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
                 return;
@@ -1751,7 +1752,7 @@ pub const Shard = struct {
         }
 
         // Serialize and send — select wire format based on opcode
-        const op_enum: proto.OpCode = @enumFromInt(op_idx);
+        const op_enum: proto.OpCode = @fromBackingInt(@intCast(op_idx));
         const data = switch (op_enum) {
             // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
             .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream, req.namespace),
@@ -2208,7 +2209,7 @@ pub const Shard = struct {
     /// slot forever.
     fn pendingFailed(self: *Shard, bytes: []const u8) void {
         const req = proto.Request.parse(bytes) catch return;
-        if (req.header.op_code != @intFromEnum(proto.OpCode.kv_commit_txn)) return;
+        if (req.header.op_code != @backingInt(proto.OpCode.kv_commit_txn)) return;
         self.kv_handler.commitFailed(req);
     }
 
@@ -3277,7 +3278,7 @@ pub const Shard = struct {
     /// applied. Keyed from the entry itself, never from the request, so a
     /// follower's blocking read wakes on the same event a leader's does.
     fn notifyApplied(self: *Shard, entry: *const entry_mod.Entry) void {
-        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .kv_put, .kv_delete, .kv_incr, .kv_touch => {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
@@ -3928,9 +3929,9 @@ pub const Shard = struct {
 
     comptime {
         // PAUSE_REASONS: the wait reasons in order, then unsent_answers.
-        const reasons = @typeInfo(Connection.WaitReason).@"enum".fields;
+        const reasons = @typeInfo(Connection.WaitReason).@"enum".field_names;
         std.debug.assert(reasons.len + 1 == ShardMetrics.PAUSE_REASONS.len);
-        for (reasons, ShardMetrics.PAUSE_REASONS[0..reasons.len]) |r, label| std.debug.assert(std.mem.eql(u8, r.name, label));
+        for (reasons, ShardMetrics.PAUSE_REASONS[0..reasons.len]) |r, label| std.debug.assert(std.mem.eql(u8, r, label));
     }
 
     /// Stop reading `conn` until its next request has room to go where it is
@@ -4009,7 +4010,7 @@ pub const Shard = struct {
         // those refused behind it are counted.
         const waited = waited_ms orelse return;
         const now = nowMs();
-        const last = &self.wait_warn_ms[@intFromEnum(w.reason)];
+        const last = &self.wait_warn_ms[@backingInt(w.reason)];
         if (now -| last.* < WARN_INTERVAL_MS) return;
         last.* = now;
         const why = switch (w.reason) {
@@ -4054,7 +4055,7 @@ pub const Shard = struct {
             if (conn.closing) continue;
             const class: reply_pool_mod.Class = if (w.blocking) .blocking else .ordinary;
             var why = self.stillWaits(conn, .{ .target = w.target, .blocking = w.blocking }, w.reason);
-            const slots = &slot_room[@intFromEnum(class)][w.target];
+            const slots = &slot_room[@backingInt(class)][w.target];
             const inbox = &inbox_room[w.target];
             // A blocking read here waits on nothing shared.
             const shared = w.target != self.id;
@@ -4128,7 +4129,7 @@ pub const Shard = struct {
             const conn = self.getConnection(entry.fd) orelse continue;
             if (conn.wait_seq != entry.seq) continue;
             const w = conn.waiting orelse continue;
-            counts[@intFromEnum(w.reason)] += 1;
+            counts[@backingInt(w.reason)] += 1;
         }
         counts[counts.len - 1] = self.paused_count;
         sm.setConnectionsPaused(counts);
@@ -4547,10 +4548,10 @@ pub const Shard = struct {
     /// bug, answered internal_error so the client isn't left waiting.
     /// Returns the answer's text.
     fn noAnswer(self: *Shard, req: proto.Request) []const u8 {
-        const name = if (std.enums.tagName(proto.OpCode, @enumFromInt(req.header.op_code))) |n| n else "?";
+        const name = if (std.enums.tagName(proto.OpCode, @fromBackingInt(@intCast(req.header.op_code)))) |n| n else "?";
         log.err("shard {d}: request {d} ({s}) got no answer from its handler. This is a bug", .{ self.id, req.header.request_id, name });
         if (self.shard_metrics) |sm| sm.recordHandlerNoAnswer();
-        if (builtin.mode == .Debug and !builtin.is_test) @panic("a handler produced no answer");
+        if (builtin.mode == .debug and !builtin.is_test) @panic("a handler produced no answer");
         return "internal error: the handler produced no answer";
     }
 
@@ -5414,7 +5415,7 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 /// router owns — KV, queue, TS) and then the registry appliers for every
 /// other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry) ApplyResult {
-    const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+    const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.route == .apply_error) .router_error else .applied;
     const outcome = registry.dispatch(entry) orelse return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
@@ -5424,7 +5425,7 @@ pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, en
 /// Count and say why an entry did not apply. Its applier, where it had one,
 /// has said what went wrong with the entry itself.
 fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *const entry_mod.Entry, result: ApplyResult) void {
-    const type_name = @tagName(@as(entry_mod.EntryType, @enumFromInt(entry.header.entry_type)));
+    const type_name = @tagName(@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type))));
     const index = entry.header.index;
     switch (result) {
         .applied => {},
@@ -5450,15 +5451,16 @@ fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
         log.err("shard {d}: entry type {s} was registered twice; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, @tagName(etype) });
         return error.EntryTypeRegisteredTwice;
     }
-    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
-        const etype: entry_mod.EntryType = @enumFromInt(f.value);
+    const einfo = @typeInfo(entry_mod.EntryType).@"enum";
+    inline for (einfo.field_names, einfo.field_values) |fname, fvalue| {
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(fvalue));
         const routed = routedToProjection(etype);
         if (routed and registry.has(etype)) {
-            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasTwoAppliers;
         }
         if (!routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
-            log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, f.name });
+            log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasNoApplier;
         }
     }
@@ -5812,7 +5814,7 @@ test "Shard: a write on a node that does not lead waits for a leader, then is an
     const n = std.c.read(pair[1], &out, out.len);
     try std.testing.expect(n > 0);
     const resp = try proto.Response.parse(out[0..@intCast(n)]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "electing a leader") != null);
 }
@@ -5917,7 +5919,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     var out: [512]u8 = undefined;
     const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
     const resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), resp.header.status);
     try std.testing.expectEqual(@as(u64, 77), resp.header.request_id);
 
     // A 200 KB value read through the forward path comes back whole.
@@ -5940,7 +5942,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     defer std.testing.allocator.free(big_out);
     const got = try readAnswer(pair[1], &shard, conn.fd, big_out, @sizeOf(proto.ResponseHeader) + value.len);
     const answer = try proto.Response.parse(big_out[0..got]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), answer.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), answer.header.status);
     try std.testing.expect(std.mem.indexOf(u8, answer.data, value) != null);
 }
 
@@ -5970,7 +5972,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
     var n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader) + 8 + 2);
     var resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "v1"));
     try std.testing.expectEqual(version, std.mem.readInt(u64, resp.data[0..8], .little));
@@ -5982,7 +5984,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
     n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
     resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.not_found), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), resp.header.status);
     try std.testing.expectEqual(@as(u64, 8), resp.header.request_id);
 }
 
@@ -6021,7 +6023,7 @@ test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minut
         const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
         const resp = try proto.Response.parse(out[0..n]);
         try std.testing.expectEqual(@as(u64, 30 + i), resp.header.request_id);
-        try std.testing.expectEqual(@intFromEnum(case.status), resp.header.status);
+        try std.testing.expectEqual(@backingInt(case.status), resp.header.status);
     }
 }
 
@@ -6044,7 +6046,7 @@ test "Shard: a proxy answer comes out whole; one the proxy refused comes out as 
     const refused = shard.takeProxyAnswer(proxy, 2, &err_buf).?;
     defer refused.free(std.testing.allocator);
     const resp = try proto.Response.parse(refused.bytes());
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), resp.header.status);
     try std.testing.expectEqual(@as(u64, 2), resp.header.request_id);
     try std.testing.expect(!proxy.write_overflow);
     try std.testing.expectEqual(@as(usize, 0), proxy.write_buf.readable());
@@ -6081,7 +6083,7 @@ var test_body_next: usize = 0;
 /// server.
 fn testReq(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []const u8, options: []const u8) proto.Request {
     const header = proto.RequestHeader.init(op, id);
-    if (!table.isOp(@intFromEnum(op))) return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
+    if (!table.isOp(@backingInt(op))) return .{ .header = header, .namespace = ns, .key = key, .value = value, .options = options };
     const buf = &test_bodies[test_body_next % test_bodies.len];
     test_body_next += 1;
     return .{ .header = header, .namespace = ns, .key = key, .value = testBody(buf, op, value, options) };
@@ -6096,7 +6098,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             if (if (opts.findOption(.block_ms)) |o| o.asU32() else null) |ms| {
                 w.put(&.{1}) catch unreachable;
                 w.int(u64, ms) catch unreachable;
-                w.put(&.{ 1, @intFromEnum(kv_ops.WaitFor.exists) }) catch unreachable;
+                w.put(&.{ 1, @backingInt(kv_ops.WaitFor.exists) }) catch unreachable;
             } else w.put(&.{ 0, 0 }) catch unreachable;
             w.put(&.{ 0, 0 }) catch unreachable; // no routing key, no txn
             return w.written();
@@ -6184,7 +6186,7 @@ test "Shard: a client that sends without reading is paced: its requests wait unt
     try std.testing.expectEqual(out.len, got);
     for (0..3) |i| {
         const resp = try proto.Response.parse(out[i * answer_len ..][0..answer_len]);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
         try std.testing.expectEqual(@as(u64, 11 + i), resp.header.request_id);
     }
     try std.testing.expect(!c.conn.reads_paused);
@@ -6202,7 +6204,7 @@ test "Shard: a client that sends its whole pipeline before reading is unpaced on
     _ = std.c.setsockopt(c.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(c.pair[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&small), @sizeOf(c_int));
 
-    const value = [_]u8{'v'} ** 1024;
+    const value = @as([1024]u8, @splat('v'));
     const put = try testRequest(.kv_put, 1, "k", &value);
     defer std.testing.allocator.free(put);
     try std.testing.expectEqual(put.len, feedClient(c.pair[1], &shard, c.conn.fd, put));
@@ -6365,7 +6367,7 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
         .{ .id = makeId(0, 7), .to = null },
         .{ .id = makeId(9, 7), .to = null },
     }) |case| {
-        switch (a.resolveTarget(@intFromEnum(proto.OpCode.kv_get), txnGet(&buf, case.id))) {
+        switch (a.resolveTarget(@backingInt(proto.OpCode.kv_get), txnGet(&buf, case.id))) {
             .local => try std.testing.expectEqual(@as(?u16, null), case.to),
             .shard => |t| try std.testing.expectEqual(case.to.?, t.shard_id),
         }
@@ -6374,7 +6376,7 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
         const op = table_run.op(name);
         var body_buf: [16]u8 = undefined;
         const body = try op.request.encodeInto(&body_buf, .{ .txn = makeId(1, 3) });
-        const req: proto.Request = .{ .header = proto.RequestHeader.init(@enumFromInt(op.code), 4), .namespace = "", .key = "", .value = body };
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 4), .namespace = "", .key = "", .value = body };
         switch (a.resolveTarget(op.code, req)) {
             .local => return error.TestUnexpectedResult,
             .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
@@ -6394,7 +6396,7 @@ test "Shard: a transaction id naming a shard that exists but doesn't hold it is 
     const id = try a.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""), 0);
     const forged = txn.makeId(1, id & txn.ID_COUNTER_MASK);
     var buf: [64]u8 = undefined;
-    switch (a.resolveTarget(@intFromEnum(proto.OpCode.kv_get), txnGet(&buf, forged))) {
+    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_get), txnGet(&buf, forged))) {
         .local => return error.TestUnexpectedResult,
         .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
     }
@@ -6403,7 +6405,7 @@ test "Shard: a transaction id naming a shard that exists but doesn't hold it is 
     b.runRequest(c.conn, txnGet(&buf, forged), .shard);
     var out: [512]u8 = undefined;
     const resp = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.not_found), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), resp.header.status);
     try std.testing.expectEqual(proto.Reason.no_such_transaction, (try resp.refused()).reason);
 }
 
@@ -6428,7 +6430,7 @@ test "Shard: a request another shard routed here meets the same checks as a clie
     var out: [512]u8 = undefined;
     const resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 44), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqual(proto.Reason.out_of_range, (try resp.refused()).reason);
 }
 
@@ -6518,7 +6520,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
     var resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 51), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), resp.header.status);
 
     // Shard 1 holding its full share: the next request for it is refused
     // at once, and told it did not run.
@@ -6528,9 +6530,9 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     try forwardForTest(a, 1, c.conn, p2);
     resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 52), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "was not run") != null);
-    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_overloaded[@intFromEnum(ShardMetrics.CrossShardClass.client_forward)]);
+    try std.testing.expectEqual(@as(u64, 1), sm.snapshot().cross_shard_overloaded[@backingInt(ShardMetrics.CrossShardClass.client_forward)]);
     for (a.reply_pool.slots, 0..) |s, i| {
         if (s.active) _ = a.reply_pool.release(.{ .slot = @intCast(i), .gen = s.gen }, 1);
     }
@@ -6585,13 +6587,13 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     const read_told = if (told[0].header.request_id == 53) told[0] else told[1];
     const write_told = if (told[0].header.request_id == 54) told[0] else told[1];
     try std.testing.expectEqual(@as(u64, 53), read_told.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), read_told.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), read_told.header.status);
     try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — retry", (try read_told.refused()).message);
     // A read that timed out ran or not, it changed nothing; a write may yet.
     try std.testing.expectEqual(proto.Ran.no, (try read_told.refused()).ran);
     try std.testing.expectEqual(proto.Ran.unknown, (try write_told.refused()).ran);
     try std.testing.expectEqual(@as(u64, 54), write_told.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), write_told.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), write_told.header.status);
     try std.testing.expectEqualStrings("unavailable: shard 1 did not answer in 3 s — the request may still apply", (try write_told.refused()).message);
     try std.testing.expectEqual(@as(u64, 2), sm.snapshot().cross_shard_timeouts);
     // The late answers free the slots and reach no one.
@@ -6616,8 +6618,8 @@ test "Shard: an answer the other shard could not send, a request no slot is left
         try std.testing.expectEqual(s.due_ms, s.answer_due_ms);
         try std.testing.expect(s.writes);
     }
-    for ([_]proto.OpCode{ .queue_dequeue, .stream_group_read, .stream_group_claim, .action_await }) |op| try std.testing.expect(Shard.takesItems(@intFromEnum(op)));
-    for ([_]proto.OpCode{ .kv_get, .stream_read, .kv_put, .queue_complete }) |op| try std.testing.expect(!Shard.takesItems(@intFromEnum(op)));
+    for ([_]proto.OpCode{ .queue_dequeue, .stream_group_read, .stream_group_claim, .action_await }) |op| try std.testing.expect(Shard.takesItems(@backingInt(op)));
+    for ([_]proto.OpCode{ .kv_get, .stream_read, .kv_put, .queue_complete }) |op| try std.testing.expect(!Shard.takesItems(@backingInt(op)));
     while (b.drainInbox() > 0) {}
     _ = a.drainInbox();
     try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
@@ -6640,7 +6642,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
     try std.testing.expectEqual(@as(u64, 0), sm.snapshot().oldest_cross_shard_wait_s);
     resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 55), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     _ = b.drainInbox();
     _ = a.drainInbox();
     a.flushToClient(c.conn.fd);
@@ -6684,7 +6686,7 @@ fn answersOn(c: TestClient, shard: *Shard, out: []u8, into: []proto.Response) !v
 }
 
 fn pausedFor(sm: *const ShardMetrics, why: Connection.WaitReason) u64 {
-    return sm.snapshot().connections_paused[@intFromEnum(why)];
+    return sm.snapshot().connections_paused[@backingInt(why)];
 }
 
 test "Shard: a connection with 64 requests waiting on other shards is not read until one is answered; its next request then goes" {
@@ -6825,7 +6827,7 @@ test "Shard: a connection has at most 8 blocking reads on other shards; the next
     try answersOn(c, a, &out, &answers);
     for (answers[0..2], 0..) |r, i| {
         try std.testing.expectEqual(@as(u64, 200 + Connection.MAX_BLOCKING_IN_FLIGHT + i), r.header.request_id);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), r.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), r.header.status);
         try std.testing.expect(std.mem.indexOf(u8, r.data, "was not run") != null);
     }
     try std.testing.expectEqual(@as(u64, 300), answers[2].header.request_id);
@@ -7475,7 +7477,7 @@ fn feedClient(client_fd: std.posix.fd_t, shard: *Shard, conn_fd: i32, data: []co
 /// Bytes the kernel holds for `fd` that nobody has read yet.
 fn unreadBytes(fd: std.posix.fd_t) c_int {
     // std's Darwin table has no FIONREAD; it is _IOR('f', 127, int) there.
-    const fionread: c_int = if (@import("builtin").os.tag == .linux) @intCast(std.os.linux.T.FIONREAD) else 0x4004667f;
+    const fionread: c_int = if (@import("builtin").target.os.tag == .linux) @intCast(std.os.linux.T.FIONREAD) else 0x4004667f;
     var n: c_int = 0;
     _ = std.c.ioctl(fd, fionread, &n);
     return n;
@@ -7503,7 +7505,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     var n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
     var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const stored = shard.defaultPartition().kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?;
     try std.testing.expectEqualSlices(u8, value, stored.value);
@@ -7520,7 +7522,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     try std.testing.expect(conn.closing);
     n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
     resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
     try std.testing.expectEqualStrings("bad request: request over 256 KiB", (try resp.refused()).message);
 
@@ -7528,7 +7530,7 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     // too large.
     const j = try TestClient.open(&shard);
     defer _ = std.c.close(j.pair[1]);
-    var junk: [@sizeOf(proto.RequestHeader)]u8 = [_]u8{0xff} ** @sizeOf(proto.RequestHeader);
+    var junk: [@sizeOf(proto.RequestHeader)]u8 = @as([@sizeOf(proto.RequestHeader)]u8, @splat(0xff));
     try std.testing.expectEqual(@as(isize, junk.len), std.c.write(j.pair[1], &junk, junk.len));
     shard.readFromClient(j.conn.fd);
     try std.testing.expect(j.conn.closing);
@@ -7559,7 +7561,7 @@ test "Shard: a first frame in another protocol is answered as an invalid request
         var out: [256]u8 = undefined;
         const n = try readAnswer(c.pair[1], &shard, fd, &out, @sizeOf(proto.ResponseHeader));
         const resp = try proto.Response.parse(out[0..n]);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
         try std.testing.expectEqual(@as(u64, 0), resp.header.request_id);
         try std.testing.expectEqualStrings("Invalid request", (try resp.refused()).message);
         shard.settleConnections();
@@ -7600,7 +7602,7 @@ test "Shard: a client from another table or protocol is answered in its own vers
         const answer = std.mem.bytesToValue(proto.ResponseHeader, out[0..@sizeOf(proto.ResponseHeader)]);
         try std.testing.expectEqual(case.version, answer.version);
         try std.testing.expectEqual(proto.TABLE_HASH, answer.table_hash);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), answer.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.status);
         try std.testing.expectEqual(@as(u64, 9), answer.request_id);
         const body = out[@sizeOf(proto.ResponseHeader)..n];
         try std.testing.expectEqualStrings(case.text, (try proto.Refusal.decode(body)).message);
@@ -7628,7 +7630,7 @@ test "Shard: a request with a header flag set is refused, naming the flags" {
     var out: [256]u8 = undefined;
     const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
     const resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
     try std.testing.expectEqualStrings("bad request: header flags 0x04 are set; no flag is defined", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Reason.unknown_flag, (try resp.refused()).reason);
@@ -7680,7 +7682,7 @@ test "Shard: an answer too large to frame is answered with an error" {
     var out: [512]u8 = undefined;
     const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
     const resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), resp.header.status);
     try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
 }
 
@@ -7748,7 +7750,7 @@ test "Shard: a forwarded write that cannot be parsed is answered, so its forward
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     try std.testing.expectEqual(@as(u32, 91), std.mem.readInt(u32, reply[0..4], .little));
     const resp = try proto.Response.parse(reply[12..]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), resp.header.status);
     try std.testing.expectEqual(@as(u64, 5), resp.header.request_id);
     // It waits in the forward queue, not Raft's.
     try std.testing.expect(rn.outbound.items[0].forward);
@@ -7817,7 +7819,7 @@ test "Shard: a diverged node refuses writes even if it led" {
     var out: [512]u8 = undefined;
     const n = conn.write_buf.read(&out);
     const resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "diverged") != null);
 }
 
@@ -7873,7 +7875,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     shard.raft_network = &rn;
     n = std.c.read(pair[1], &out, out.len);
     resp = try proto.Response.parse(out[0..@intCast(n)]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     // Sent, then the term moved on: it may still have applied.
     const lost = try resp.refused();
     try std.testing.expectEqualStrings("unavailable: lost leadership before commit — write may still apply", lost.message);
@@ -7936,7 +7938,7 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
     n = std.c.read(pair[1], &out, out.len);
     resp = try proto.Response.parse(out[0..@intCast(n)]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expectEqual(@as(u64, 6), resp.header.request_id);
 }
 
@@ -8157,7 +8159,7 @@ test "Shard: a parked write that committed but didn't apply says so, with ran = 
     var one: [1]proto.Response = undefined;
     var buf: [512]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
     const r = try one[0].refused();
     try std.testing.expectEqual(proto.Reason.committed_not_applied, r.reason);
     try std.testing.expectEqual(proto.Ran.yes, r.ran);
@@ -8218,7 +8220,7 @@ test "Shard: ran is no for a parked write whose index another term took, and unk
         // Another leader's entry committed at this index: this write didn't.
         t.shard.answerPending(slot.index, slot.term + 1, 0, true);
         const got = try t.refusal(&buf);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), got.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), got.status);
         try std.testing.expectEqual(proto.Ran.no, got.r.ran);
     }
     {
@@ -8260,7 +8262,7 @@ test "Shard: a nack batch the log fills up partway says it may have run" {
     std.mem.writeInt(u64, value[12..20], seqs[1], .little);
     try ParkTest.send(&t.shard, t.conn, .queue_fail, 30, "q", &value);
     const got = try t.refusal(&buf);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), got.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), got.status);
     try std.testing.expectEqual(proto.Ran.unknown, got.r.ran);
 }
 
@@ -8289,7 +8291,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     const resp = try proto.Response.parse(reply[12..]);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqualStrings("bad request: only writes are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
@@ -8319,7 +8321,7 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     var created: [1]proto.Response = undefined;
     var created_buf: [256]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &created_buf, &created);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), created[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), created[0].header.status);
 
     // One namespace short of the limit.
     var name_buf: [16]u8 = undefined;
@@ -8339,7 +8341,7 @@ test "Shard: a write to a new namespace holds its room before it commits, so wri
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 40), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     try std.testing.expect(shard.namespace_handler.namespaces.contains("first"));
     try std.testing.expect(!shard.namespace_handler.namespaces.contains("second"));
 }
@@ -8448,7 +8450,7 @@ test "Shard: a KV commit answered with a failure instead of its batch drops its 
         if (by_index) shard.failPendingAbove(shard.raft_node.log.lastIndex() - 1, Shard.NOT_ON_DISK) else shard.resolvePending("unavailable: stepped down");
         try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
         try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.StatusCode.unavailable)), one[0].header.status);
+        try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), one[0].header.status);
         try std.testing.expect(table_.get(id2) == null);
         try std.testing.expectEqual(@as(usize, 0), table_.count());
     }
@@ -8498,7 +8500,7 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     for (rs, 0..) |resp, i| {
         // Answered in log order.
         try std.testing.expectEqual(@as(u64, 10 + i), resp.header.request_id);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     }
     const first_seq = std.mem.readInt(u64, rs[0].data[0..8], .little);
     const first_ts = std.mem.readInt(u64, rs[0].data[8..16], .little);
@@ -8545,13 +8547,13 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.send(&shard, conn, .workflow_create, 20, "flow", def);
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
 
     // The start is answered once it applies; its first step waits.
     try ParkTest.send(&shard, conn, .workflow_start, 21, "flow", "");
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     const wf = shard.workflow_handler;
     const Run = struct {
         fn byId(h: *WorkflowHandler, id: []const u8) *WorkflowHandler.RunRecord {
@@ -8589,7 +8591,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, shard.actions_handler.runs.get(action_run).?.status);
     wf.advanceStartedRuns(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, one[0].data).status);
@@ -8611,7 +8613,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 24), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     wf.checkPendingActions(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, Run.byId(wf, a_id).status);
 }
@@ -8740,16 +8742,16 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     var big: [4096]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &big, &rs);
     // One key in two namespaces is two runs.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[1].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[1].header.status);
     try std.testing.expect(!std.mem.eql(u8, rs[0].data, rs[1].data));
     // The run id is the first start's; the second is refused.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[2].header.status);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.conflict), rs[3].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[2].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), rs[3].header.status);
     // Key and run id together: the retry is answered with the first run.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[5].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[5].header.status);
     try std.testing.expectEqualStrings(rs[4].data, rs[5].data);
     // A long key: one run, both answered with it.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[7].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[7].header.status);
     try std.testing.expectEqualStrings(rs[6].data, rs[7].data);
     try std.testing.expectEqual(@as(usize, 5), shard.workflow_handler.runs.count());
 
@@ -8760,8 +8762,8 @@ test "Shard: an idempotency key of any length is scoped to its namespace, a retr
     shard.runRequest(conn, try ParkTest.request(.workflow_create, 90, "a:b", "gate", def, ""), .client);
     shard.runRequest(conn, try ParkTest.request(.workflow_start, 91, "a:b", "gate", &keyed, ""), .client);
     try ParkTest.responses(&shard, conn, pair[1], &big, &two);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[0].header.status);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), two[1].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), two[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), two[1].header.status);
     try std.testing.expect(std.mem.startsWith(u8, (try two[1].refused()).message, "invalid namespace name"));
     try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
@@ -8806,16 +8808,16 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     var rs: [6]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &rs);
     // The second start is answered with the first's run, and created none.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[0].header.status);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[1].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[1].header.status);
     try std.testing.expectEqualStrings(rs[0].data, rs[1].data);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.runs.count());
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
     // The second create finds the namespace there.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[2].header.status);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.conflict), rs[3].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[2].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), rs[3].header.status);
     // Two registers are two versions.
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), rs[5].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[5].header.status);
     try std.testing.expectEqual(@as(u32, 2), shard.actions_handler.actions.get("act").?.version);
 }
 
@@ -8883,7 +8885,7 @@ test "Shard: namespace settings are refused with their reason, and nothing is pr
     for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }, 0..) |op, i| {
         try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
         try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
         try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, (try one[0].refused()).message);
     }
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
@@ -8913,7 +8915,7 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     var buf: [256]u8 = undefined;
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     var q_buf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const names = shard.stream_handler.stream.stream_names;
     try std.testing.expect(names.contains(try handler_mod.qualifyKey(&q_buf, "fresh", "s")));
@@ -8969,7 +8971,7 @@ test "Shard: a blocking stream read wakes on its own namespace's append, even on
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
     const read = if (two[0].header.request_id == 3) two[0] else two[1];
     try std.testing.expectEqual(@as(u64, 3), read.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), read.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), read.header.status);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, read.data[0..4], .little));
     try std.testing.expect(std.mem.indexOf(u8, read.data, "second-record") != null);
     try std.testing.expect(std.mem.indexOf(u8, read.data, "first-record") == null);
@@ -9092,7 +9094,7 @@ test "Shard: a deferred answer too large to frame reaches its client as an error
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
 }
 
 test "Shard: a parked request leaves the pending table before its responder runs, so a sweep during it answers the client once" {
@@ -9133,7 +9135,7 @@ test "Shard: a parked request leaves the pending table before its responder runs
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 30), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     try std.testing.expectEqualStrings("answered", one[0].data);
 }
 
@@ -9156,7 +9158,7 @@ test "Shard: a burst of first writes to a new namespace proposes one implicit cr
             var n: u32 = 0;
             var i = from;
             while (i <= r.log.lastIndex()) : (i += 1) {
-                if (r.log.getEntry(i).?.header.entry_type == @intFromEnum(entry_mod.EntryType.namespace_create)) n += 1;
+                if (r.log.getEntry(i).?.header.entry_type == @backingInt(entry_mod.EntryType.namespace_create)) n += 1;
             }
             return n;
         }
@@ -9206,15 +9208,15 @@ test "every entry type has exactly one applier, or is listed as needing none, or
     var ctx: u8 = 0;
     // Every type the router does not own and no list excuses.
     var full: ReplayRegistry = .{};
-    inline for (@typeInfo(entry_mod.EntryType).@"enum".fields) |f| {
-        const t: entry_mod.EntryType = @enumFromInt(f.value);
+    inline for (@typeInfo(entry_mod.EntryType).@"enum".field_values) |value| {
+        const t: entry_mod.EntryType = @fromBackingInt(@intCast(value));
         if (!routedToProjection(t) and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
     }
     try checkAppliers(0, &full);
 
     // One of them missing: dropped at apply, so refused at boot.
     var missing = full;
-    missing.callbacks[@intFromEnum(entry_mod.EntryType.stream_trim)] = null;
+    missing.callbacks[@backingInt(entry_mod.EntryType.stream_trim)] = null;
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliers(0, &missing));
 
     // Registered twice: one handler's applier would never run.
@@ -9878,7 +9880,7 @@ test "Shard: an await that claims a pending run at once gets exactly one answer,
         _ = shard.applyCommitted();
         const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
         const resp = try proto.Response.parse(out[0..n]);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     }
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
 
@@ -9892,7 +9894,7 @@ test "Shard: an await that claims a pending run at once gets exactly one answer,
     const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
     const resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job-input"));
     // [task_id_len:u16][task_id][task_type_len:u16]"act"…
     const id_len = std.mem.readInt(u16, resp.data[0..2], .little);
@@ -9944,7 +9946,7 @@ test "Shard: a parked await and an invoke reusing its request id each get one an
     var tasks: usize = 0;
     for (rs) |r| {
         try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), r.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
         if (std.mem.endsWith(u8, r.data, "job")) tasks += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), tasks);
@@ -9999,7 +10001,7 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
         fn handle(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
             const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
             const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-            sh.sendErrorResponse(conn, req.header.request_id, .bad_request, "€" ** 666 ++ "xx");
+            sh.sendErrorResponse(conn, req.header.request_id, .bad_request, stdx.repeat("€", 666) ++ "xx");
         }
     };
     shard.dispatcher.register(.queue_peek, Long.handle);
@@ -10011,7 +10013,7 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
     var buf: [2048]u8 = undefined;
     try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 11), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
     const body = try one[0].refused();
     try std.testing.expect(std.unicode.utf8ValidateSlice(body.message));
     try std.testing.expect(std.mem.endsWith(u8, body.message, proto.TRUNCATED_MARKER));
@@ -10044,7 +10046,7 @@ test "Shard: a request whose handler answers nothing is answered internal_error 
     var buf: [1024]u8 = undefined;
     try ParkTest.responses(&shard, c.conn, c.pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 12), one[0].header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
     try std.testing.expectEqualStrings("internal error: the handler produced no answer", (try one[0].refused()).message);
     try std.testing.expectEqual(@as(u64, 1), sm.snapshot().handler_no_answer);
 }
@@ -10107,7 +10109,7 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
         _ = feedClient(ca.pair[1], owner, ca.conn.fd, frame);
         _ = owner.applyCommitted();
         const resp = try nextAnswer(ca, owner, &out);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     }
 
     // Claimed, as by an await whose task then couldn't be built. The
@@ -10130,7 +10132,7 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     _ = other.drainInbox();
     const resp = try nextAnswer(cb, other, &out);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
 }
 
@@ -10332,7 +10334,7 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
     var out: [1024]u8 = undefined;
     const resp = try nextAnswer(c, &shard, &out);
     try std.testing.expectEqual(@as(u64, 14), resp.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
     try std.testing.expect(!dispatcher_mod.takeScanShort());
 }
 
@@ -10550,7 +10552,7 @@ test "an entry no projection or applier can take is counted on its path, and its
     try std.testing.expect(shard.applyCommitted());
 
     const Case = struct { entry_type: entry_mod.EntryType, payload: []const u8, path: silent_loss.Path };
-    const big = [_]u8{'x'} ** 8192;
+    const big = @as([8192]u8, @splat('x'));
     for ([_]Case{
         // The registry applier cannot decode it.
         .{ .entry_type = .action_invoke, .payload = "not a command payload", .path = .applier_failed },
@@ -10603,7 +10605,7 @@ test "a committed entry this node cannot read back takes its shard offline, and 
     var one: [1]proto.Response = undefined;
     var buf: [512]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@intFromEnum(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
     try std.testing.expect(std.mem.indexOf(u8, one[0].data, "shard 0 is offline on this node: committed entry") != null);
 }
 
@@ -10626,7 +10628,7 @@ const UnappliedWrite = struct {
         var one: [1]proto.Response = undefined;
         var buf: [512]u8 = undefined;
         try ParkTest.responses(sh, conn, fd, &buf, &one);
-        try std.testing.expectEqual(@intFromEnum(proto.StatusCode.internal_error), one[0].header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
         const r = try one[0].refused();
         try std.testing.expectEqualStrings(persistence_mod.COMMITTED_NOT_APPLIED, r.message);
         try std.testing.expectEqual(proto.Reason.committed_not_applied, r.reason);

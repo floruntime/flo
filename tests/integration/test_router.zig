@@ -11,7 +11,7 @@ test "integration: router distributes keys across shards" {
     const router = Router.init(partition_count, shard_count, 0);
 
     // Route 10000 random-ish keys and count per-shard distribution
-    var per_shard = [_]usize{0} ** 4;
+    var per_shard = @as([4]usize, @splat(0));
     var key_buf: [32]u8 = undefined;
 
     for (0..10000) |i| {

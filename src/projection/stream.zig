@@ -1677,7 +1677,7 @@ pub const StreamProjection = struct {
                 offset += member.id.len;
                 std.mem.writeInt(u64, buf[offset..][0..8], member.joined_at_ns, .little);
                 offset += 8;
-                buf[offset] = @intFromEnum(member.state);
+                buf[offset] = @backingInt(member.state);
                 offset += 1;
             }
         }
@@ -2684,7 +2684,7 @@ test "BatchIterator: refuses malformed blobs and too many records" {
     };
     for (bad) |b| try testing.expectError(error.Malformed, BatchIterator.init(b));
 
-    const payloads = [_][]const u8{"x"} ** (MAX_BATCH_RECORDS + 1);
+    const payloads = @as([(MAX_BATCH_RECORDS + 1)][]const u8, @splat("x"));
     var buf: [4 + (MAX_BATCH_RECORDS + 1) * 7]u8 = undefined;
     const over = testBatch(&buf, &payloads);
     try testing.expectError(error.TooManyRecords, BatchIterator.init(over));
@@ -2692,7 +2692,7 @@ test "BatchIterator: refuses malformed blobs and too many records" {
 }
 
 test "BatchIterator: accepts exactly the record limit" {
-    const payloads = [_][]const u8{"x"} ** MAX_BATCH_RECORDS;
+    const payloads = @as([MAX_BATCH_RECORDS][]const u8, @splat("x"));
     var buf: [4 + MAX_BATCH_RECORDS * 7]u8 = undefined;
     var it = try BatchIterator.init(testBatch(&buf, &payloads));
     var n: u32 = 0;

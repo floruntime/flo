@@ -426,7 +426,7 @@ pub const ProcessingHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const h = shard.processing_handler;
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .processing_submit => {
                 shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
@@ -459,7 +459,7 @@ pub const ProcessingHandler = struct {
     // ── Command Routing ─────────────────────────────────────────────────
 
     fn handleCommand(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .processing_submit => self.handleSubmit(shard, conn, req),
             .processing_stop => self.handleStop(shard, conn, req),
@@ -623,7 +623,7 @@ pub const ProcessingHandler = struct {
             w.writeAll(job.job_id_owned) catch unreachable;
             w.writeInt(u16, @intCast(job.name_owned.len), .little) catch unreachable;
             w.writeAll(job.name_owned) catch unreachable;
-            w.writeByte(@intFromEnum(job.status)) catch unreachable;
+            w.writeByte(@backingInt(job.status)) catch unreachable;
             w.writeInt(u32, job.parallelism, .little) catch unreachable;
             w.writeInt(u32, job.batch_size, .little) catch unreachable;
             w.writeInt(u64, job.records_processed, .little) catch unreachable;
@@ -823,7 +823,7 @@ pub const ProcessingHandler = struct {
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         var off: usize = 0;
 
-        value_buf[off] = @intFromEnum(status);
+        value_buf[off] = @backingInt(status);
         off += 1;
         std.mem.writeInt(u32, value_buf[off..][0..4], parallelism, .little);
         off += 4;
@@ -854,7 +854,7 @@ pub const ProcessingHandler = struct {
             .cancelled => .processing_cancel,
             else => return error.NotATerminalStatus,
         };
-        const value = &[_]u8{@intFromEnum(status)};
+        const value = &[_]u8{@backingInt(status)};
         return persistence_mod.proposeEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
     }
 
@@ -904,7 +904,7 @@ pub const ProcessingHandler = struct {
 
     /// Apply a processing entry (live commit and boot replay alike).
     pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
-        const etype: EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .processing_submit => self.last_submitted_job_id = null,
             .processing_savepoint => self.last_savepoint_id = null,
@@ -2073,7 +2073,7 @@ test "ProcessingHandler: a savepoint is created at its entry's stamp, not the ho
         var handler = ProcessingHandler.init(std.testing.allocator);
         defer handler.deinit();
         // [job_id_len=3][job][records_at=0]
-        const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ [_]u8{0} ** 8;
+        const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ @as([8]u8, @splat(0));
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies it.
         try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_savepoint, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "sp-1", &value, &pbuf).?));
@@ -2101,7 +2101,7 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
         defer handler.deinit();
         // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
         var value: [512]u8 = undefined;
-        value[0] = @intFromEnum(ProcessingHandler.JobStatus.stopped);
+        value[0] = @backingInt(ProcessingHandler.JobStatus.stopped);
         std.mem.writeInt(u32, value[1..5], 1, .little);
         std.mem.writeInt(u32, value[5..9], 0, .little);
         std.mem.writeInt(u16, value[9..11], 7, .little);
@@ -2119,7 +2119,7 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     defer handler.deinit();
 
     // [status=0xee][parallelism][batch_size][ns_len=0]
-    var val = [_]u8{0} ** 13;
+    var val = @as([13]u8, @splat(0));
     val[0] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());

@@ -11,6 +11,7 @@
 //!   flo help            Show help
 
 const std = @import("std");
+const build_info = @import("build_info.zig");
 const cli = @import("cli/mod.zig");
 pub const log = @import("stdx").log;
 
@@ -20,16 +21,31 @@ pub const std_options: std.Options = .{
     .log_level = .debug, // Allow all at compile time; filter at runtime
 };
 
-pub fn main(init: std.process.Init) !void {
-    // Bind the stdx.io facade to the Init-provided Io for boundary code.
-    @import("stdx").io.bootFromInit(init.io);
+pub fn main(minimal: std.process.Init.Minimal) !void {
+    // One root for every allocation, std's `Io` included: left to std, the
+    // `Io` would take a `SafeAllocator` whatever `main` chose, and the two
+    // would share buffers.
+    const gpa = build_info.gpa();
+    defer build_info.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
+    defer threaded.deinit();
+
+    // Bind the stdx.io facade to this Io for boundary code.
+    @import("stdx").io.bootFromInit(threaded.io());
 
     // Convert process arguments into the [][]const u8 slice form that the
     // existing CLI expects.
-    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
-    const args = try init.gpa.alloc([]const u8, raw_args.len);
-    defer init.gpa.free(args);
+    const raw_args = try minimal.args.toSlice(arena.allocator());
+    const args = try gpa.alloc([]const u8, raw_args.len);
+    defer gpa.free(args);
     for (raw_args, 0..) |a, i| args[i] = a;
 
-    try cli.run(init.gpa, args);
+    try cli.run(gpa, args);
 }

@@ -71,7 +71,7 @@ test "harness: only an exit the harness caused is normal" {
     var buf: [160]u8 = undefined;
     const sig = struct {
         fn n(s: std.posix.SIG) c_int {
-            return @intCast(@intFromEnum(s));
+            return @intCast(@backingInt(s));
         }
     };
 
@@ -107,8 +107,8 @@ test "harness: only an exit the harness caused is normal" {
 /// `kill(pid, 0)` keeps succeeding. On Linux a zombie (or dead) state in
 /// /proc counts as gone.
 fn processGone(pid: std.c.pid_t) bool {
-    if (std.c.kill(pid, @enumFromInt(0)) != 0) return true;
-    if (@import("builtin").os.tag != .linux) return false;
+    if (std.c.kill(pid, @fromBackingInt(@intCast(0))) != 0) return true;
+    if (@import("builtin").target.os.tag != .linux) return false;
     var path_buf: [32]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
     var stat_buf: [512]u8 = undefined;

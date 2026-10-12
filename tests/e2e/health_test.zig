@@ -150,7 +150,7 @@ fn putMany(port: u16, count: usize, batch: usize) !void {
         var off: usize = 0;
         while (answered < n) {
             if (proto.Response.parse(in[off..got])) |r| {
-                if (r.header.status != @intFromEnum(proto.StatusCode.ok)) return error.PutRefused;
+                if (r.header.status != @backingInt(proto.StatusCode.ok)) return error.PutRefused;
                 off += @sizeOf(proto.ResponseHeader) + r.header.data_len;
                 answered += 1;
                 continue;
@@ -164,7 +164,7 @@ fn putMany(port: u16, count: usize, batch: usize) !void {
             if (rc == 0) return error.ConnectionClosed;
             if (rc < 0) {
                 // The socket does not block; wait for the answers.
-                if (std.c._errno().* != @intFromEnum(std.c.E.AGAIN)) return error.ReadFailed;
+                if (std.c._errno().* != @backingInt(std.c.E.AGAIN)) return error.ReadFailed;
                 stdx.time.sleep(std.time.ns_per_ms / 4);
                 continue;
             }

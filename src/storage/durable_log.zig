@@ -704,7 +704,7 @@ test "durable log: a truncation that cannot reach the files wedges flushing unti
 
     // The directory refuses new files, so not even the intent can be
     // recorded; the cut is still remembered.
-    const path_z = try testing.allocator.dupeZ(u8, td.path);
+    const path_z = try testing.allocator.dupeSentinel(u8, td.path, 0);
     defer testing.allocator.free(path_z);
     defer _ = std.c.chmod(path_z, 0o700);
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o500));
@@ -802,7 +802,7 @@ test "durable log: a cut that cannot even list the files is remembered" {
     try writer.addEntry(&testEntry(3, 1, "c"));
     try dl.flush(3);
 
-    const path_z = try testing.allocator.dupeZ(u8, td.path);
+    const path_z = try testing.allocator.dupeSentinel(u8, td.path, 0);
     defer testing.allocator.free(path_z);
     defer _ = std.c.chmod(path_z, 0o700);
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(path_z, 0o000));

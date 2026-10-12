@@ -4,7 +4,7 @@
 # reactor, /proc host stats), so that breakage is invisible on a Mac.
 FROM debian:bookworm-slim
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG ZIG_ARCH=aarch64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

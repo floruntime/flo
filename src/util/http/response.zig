@@ -32,7 +32,7 @@ pub const StatusCode = enum(u16) {
     gateway_timeout = 504,
 
     pub fn code(self: StatusCode) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn phrase(self: StatusCode) []const u8 {
@@ -185,7 +185,7 @@ pub const HttpResponse = struct {
 
         // Status line
         try writer.print("HTTP/1.1 {d} {s}\r\n", .{
-            @intFromEnum(self.status),
+            @backingInt(self.status),
             self.status.phrase(),
         });
 
@@ -249,7 +249,7 @@ pub fn jsonError(allocator: std.mem.Allocator, status: StatusCode, message: []co
     // Build error JSON - allocate body through response's allocator
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try aw.writer.print("{{\"error\":\"{s}\",\"status\":{d}}}", .{ message, @intFromEnum(status) });
+    try aw.writer.print("{{\"error\":\"{s}\",\"status\":{d}}}", .{ message, @backingInt(status) });
 
     // Dupe the body so response owns the memory
     const body = try allocator.dupe(u8, aw.written());

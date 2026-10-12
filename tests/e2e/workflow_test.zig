@@ -800,7 +800,7 @@ test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps
     try ctx.exec(&.{ "workflow", "create", "-f", path });
     try ctx.exec(&.{ "workflow", "start", "cancel-reason-wf", "{}", "--run-id", "cancel-reason-run" });
 
-    const too_long = [_]u8{'r'} ** 1025;
+    const too_long = @as([1025]u8, @splat('r'));
     var refused = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &too_long });
     defer refused.deinit();
     try testing.expectEqual(@as(u8, 3), refused.exit_code);
@@ -811,7 +811,7 @@ test "e2e/workflow: a cancel reason past 1024 bytes is refused and the run keeps
     try testing.expectEqual(@as(u8, 0), still.exit_code);
     try testing.expect(still.stdoutContains("Status:   waiting"));
 
-    const longest = [_]u8{'r'} ** 1024;
+    const longest = @as([1024]u8, @splat('r'));
     var ok = try ctx.cli.run(&.{ "workflow", "cancel", "cancel-reason-run", "--reason", &longest });
     defer ok.deinit();
     try testing.expectEqual(@as(u8, 0), ok.exit_code);
@@ -3145,16 +3145,16 @@ test "e2e/workflow: list-runs and signal requests whose lengths overrun them are
     var out: [512]u8 = undefined;
     // The status length claims one byte, which pushes the search length past the end.
     const list = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 0, 0, 0, 0, 1, 0, 'x', 0, 0, 0 }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), list.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), list.status);
     try testing.expectEqualStrings("invalid list-runs request", list.data);
 
     // A signal type length of 0xFFFF on a two-byte value.
     const sig = try rawCall(ctx, .workflow_signal, "default", "overrun-run", &[_]u8{ 0xff, 0xff }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), sig.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), sig.status);
     try testing.expectEqualStrings("malformed signal", sig.data);
 
     const ok = try rawCall(ctx, .workflow_list_runs, "", "", &[_]u8{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &out);
-    try testing.expectEqual(@intFromEnum(proto.StatusCode.ok), ok.status);
+    try testing.expectEqual(@backingInt(proto.StatusCode.ok), ok.status);
 }
 
 test "e2e/workflow: a batched append starts one run per record" {
@@ -3207,7 +3207,7 @@ fn expectOneRunPerInput(ctx: *stdx.testing.TestContext, workflow: []const u8, in
     }
     try testing.expectEqual(inputs.len, std.mem.count(u8, ids, "\"run_id\""));
 
-    var seen = [_]usize{0} ** 16;
+    var seen = @as([16]usize, @splat(0));
     var it = std.mem.splitSequence(u8, ids, "\"run_id\":\"");
     _ = it.next();
     while (it.next()) |rest| {

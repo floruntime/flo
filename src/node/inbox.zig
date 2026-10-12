@@ -53,7 +53,7 @@ pub const Message = extern struct {
     payload_len: u32 = 0, // u32 — offset 4  (payload size for dealloc)
     sequence: u64 = 0, // u64 — offset 8
     payload_ptr: ?*anyopaque = null, // ptr — offset 16
-    _padding: [8]u8 = .{0} ** 8, // [8]u8 — offset 24
+    _padding: [8]u8 = @splat(0), // [8]u8 — offset 24
 
     comptime {
         assert(@sizeOf(Message) == 32);
@@ -221,7 +221,7 @@ fn makeMsg(tag: Tag, shard: u8, seq: u64) Message {
         .payload_len = 0,
         .sequence = seq,
         .payload_ptr = null,
-        ._padding = .{0} ** 8,
+        ._padding = @splat(0),
     };
 }
 
@@ -303,7 +303,7 @@ test "Inbox: multi-producer, single consumer" {
     // Drain everything
     var total: usize = 0;
     var batch: [64]Message = undefined;
-    var per_shard = [_]usize{0} ** num_producers;
+    var per_shard = @as([num_producers]usize, @splat(0));
 
     while (total < msgs_per_producer * num_producers) {
         const n = inbox.drain(&batch);

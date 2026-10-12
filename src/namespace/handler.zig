@@ -38,6 +38,7 @@
 //! ```
 
 const std = @import("std");
+const stdx = @import("stdx");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
@@ -500,7 +501,7 @@ pub const NamespaceHandler = struct {
     fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
         if (op == .namespace_config_set or op == .namespace_config_get) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, SETTINGS_REFUSAL);
@@ -611,7 +612,7 @@ pub const NamespaceHandler = struct {
         const name = cmd.key;
         if (name.len == 0) return .failed;
 
-        const etype: entry_mod.EntryType = @enumFromInt(entry.header.entry_type);
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .namespace_create => {
                 self.last_create = self.applyCreateAt(name, entry.header.timestamp_ns);
@@ -634,7 +635,7 @@ pub const NamespaceHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     fn handleCommand(self: *NamespaceHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         return switch (op) {
             .namespace_create => self.handleCreate(req),
             .namespace_delete => self.handleDelete(req),
@@ -985,7 +986,7 @@ test "namespace handler: info non-existing" {
 }
 
 test "namespace handler: the name grammar, with a reason for each refusal" {
-    for ([_][]const u8{ "production", "test-env", "stage_2", "0starts-with-digit", "a", "9", "default", "a" ** 63 }) |ok| {
+    for ([_][]const u8{ "production", "test-env", "stage_2", "0starts-with-digit", "a", "9", "default", stdx.repeat("a", 63) }) |ok| {
         if (nameRefusal(ok)) |why| {
             std.debug.print("{s}: {s}\n", .{ ok, why });
             return error.TestUnexpectedResult;
@@ -994,7 +995,7 @@ test "namespace handler: the name grammar, with a reason for each refusal" {
     const Case = struct { name: []const u8, starts: []const u8 };
     for ([_]Case{
         .{ .name = "", .starts = "namespace name is required" },
-        .{ .name = "a" ** 64, .starts = "namespace name too long" },
+        .{ .name = stdx.repeat("a", 64), .starts = "namespace name too long" },
         .{ .name = "_private", .starts = "reserved" },
         .{ .name = "_sys:meta", .starts = "reserved" },
         .{ .name = "MyNs", .starts = "invalid namespace name: lowercase only" },
@@ -1020,7 +1021,7 @@ test "namespace handler: the name grammar, with a reason for each refusal" {
 test "namespace handler: the applier refuses a bad name and a full registry, whatever proposed it" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
-    try testing.expectEqual(NamespaceHandler.CreateOutcome.invalid, handler.applyCreate("a" ** 300));
+    try testing.expectEqual(NamespaceHandler.CreateOutcome.invalid, handler.applyCreate(stdx.repeat("a", 300)));
     try testing.expectEqual(NamespaceHandler.CreateOutcome.invalid, handler.applyCreate("_flo"));
     try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
 
@@ -1111,7 +1112,7 @@ test "qualifyKey: non-default namespace prefixes correctly" {
 
 test "qualifyKey: oversized key returns KeyTooLarge" {
     var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const big_key = &[_]u8{'x'} ** (MAX_QUALIFIED_KEY); // exactly fills buffer
+    const big_key = &@as([(MAX_QUALIFIED_KEY)]u8, @splat('x')); // exactly fills buffer
     const result = qualifyKey(&buf, "ns", big_key);
     try testing.expectError(error.KeyTooLarge, result);
 }
@@ -1158,12 +1159,12 @@ test "validateKeySize: empty key" {
 }
 
 test "validateKeySize: oversized key with namespace" {
-    const big = &[_]u8{'x'} ** MAX_QUALIFIED_KEY;
+    const big = &@as([MAX_QUALIFIED_KEY]u8, @splat('x'));
     try testing.expect(validateKeySize("ns", big) != null);
 }
 
 test "validateKeySize: oversized key without namespace" {
-    const big = &[_]u8{'x'} ** (MAX_QUALIFIED_KEY + 1);
+    const big = &@as([(MAX_QUALIFIED_KEY + 1)]u8, @splat('x'));
     try testing.expect(validateKeySize("", big) != null);
 }
 

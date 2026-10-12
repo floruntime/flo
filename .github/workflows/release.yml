@@ -9,12 +9,16 @@ on:
       tag:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
+      publish:
+        description: 'Create the GitHub release. Off: build and package only'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   build:
@@ -29,11 +33,11 @@ jobs:
             arch: aarch64
             platform: linux
             target: aarch64-linux
-          - os: macos-14
+          - os: macos-15
             arch: x86_64
             platform: macos
             target: x86_64-macos
-          - os: macos-14
+          - os: macos-15
             arch: aarch64
             platform: macos
             target: aarch64-macos
@@ -100,6 +104,7 @@ jobs:
 
   release:
     needs: build
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

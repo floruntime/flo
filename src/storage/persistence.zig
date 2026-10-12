@@ -53,7 +53,7 @@ pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry) ApplyOutco
 /// Maps EntryType → applier. Handlers register their owned entry types
 /// during init; every committed entry of such a type is dispatched here.
 pub const ReplayRegistry = struct {
-    callbacks: [256]?ReplayEntry = [_]?ReplayEntry{null} ** 256,
+    callbacks: [256]?ReplayEntry = @as([256]?ReplayEntry, @splat(null)),
     /// A type registered twice. The first applier is kept; the shard
     /// refuses to start, since one of the two would never run.
     duplicate: ?EntryType = null,
@@ -65,7 +65,7 @@ pub const ReplayRegistry = struct {
 
     /// Register a handler for a specific entry type.
     pub fn register(self: *ReplayRegistry, etype: EntryType, ctx: *anyopaque, func: ReplayFn) void {
-        const slot = &self.callbacks[@intFromEnum(etype)];
+        const slot = &self.callbacks[@backingInt(etype)];
         if (slot.* != null) {
             if (self.duplicate == null) self.duplicate = etype;
             return;
@@ -74,7 +74,7 @@ pub const ReplayRegistry = struct {
     }
 
     pub fn has(self: *const ReplayRegistry, etype: EntryType) bool {
-        return self.callbacks[@intFromEnum(etype)] != null;
+        return self.callbacks[@backingInt(etype)] != null;
     }
 
     /// Dispatch an entry to its registered handler. Null when its type has
@@ -188,7 +188,7 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
         }
     };
     const shard = struct { raft_node: FakeRaft }{ .raft_node = .{} };
-    const long = [_]u8{'k'} ** (MAX_ENTRY_KEY + 1);
+    const long = @as([(MAX_ENTRY_KEY + 1)]u8, @splat('k'));
     try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
     try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
     try std.testing.expectEqual(proto.StatusCode.bad_request, failureStatus(error.KeyTooLarge));

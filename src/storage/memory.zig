@@ -155,20 +155,20 @@ pub const MemoryController = struct {
 
     /// Register an eviction callback for a component.
     pub fn registerEviction(self: *MemoryController, id: ComponentId, ctx: *anyopaque, evict_fn: EvictFn) void {
-        self.allocations[@intFromEnum(id)].evict_fn = evict_fn;
-        self.allocations[@intFromEnum(id)].evict_ctx = ctx;
+        self.allocations[@backingInt(id)].evict_fn = evict_fn;
+        self.allocations[@backingInt(id)].evict_ctx = ctx;
     }
 
     /// Register a usage reporter for a component.
     pub fn registerUsage(self: *MemoryController, id: ComponentId, ctx: *anyopaque, usage_fn: UsageFn) void {
-        self.allocations[@intFromEnum(id)].usage_fn = usage_fn;
-        self.allocations[@intFromEnum(id)].usage_ctx = ctx;
+        self.allocations[@backingInt(id)].usage_fn = usage_fn;
+        self.allocations[@backingInt(id)].usage_ctx = ctx;
     }
 
     /// Set custom watermarks for a component.
     pub fn setWatermarks(self: *MemoryController, id: ComponentId, high: f32, low: f32) void {
-        self.allocations[@intFromEnum(id)].high_watermark = high;
-        self.allocations[@intFromEnum(id)].low_watermark = low;
+        self.allocations[@backingInt(id)].high_watermark = high;
+        self.allocations[@backingInt(id)].low_watermark = low;
     }
 
     // ── Memory Operations ───────────────────────────────────────────────
@@ -176,7 +176,7 @@ pub const MemoryController = struct {
     /// Request memory for a component. Returns error if budget exceeded
     /// and eviction + reserve cannot accommodate.
     pub fn requestMemory(self: *MemoryController, id: ComponentId, bytes: usize) error{ShardMemoryPressure}!void {
-        const idx = @intFromEnum(id);
+        const idx = @backingInt(id);
         var alloc = &self.allocations[idx];
 
         // Level 0: fits within budget
@@ -224,7 +224,7 @@ pub const MemoryController = struct {
 
     /// Release memory back from a component.
     pub fn releaseMemory(self: *MemoryController, id: ComponentId, bytes: usize) void {
-        const idx = @intFromEnum(id);
+        const idx = @backingInt(id);
         var alloc = &self.allocations[idx];
 
         const actual = @min(bytes, alloc.used);
@@ -243,7 +243,7 @@ pub const MemoryController = struct {
 
     /// Check if a component is under pressure (above high watermark).
     pub fn isUnderPressure(self: *const MemoryController, id: ComponentId) bool {
-        const alloc = &self.allocations[@intFromEnum(id)];
+        const alloc = &self.allocations[@backingInt(id)];
         return alloc.used > alloc.highThreshold();
     }
 
@@ -293,7 +293,7 @@ pub const MemoryController = struct {
 
     /// Get allocation info for a component.
     pub fn getAllocation(self: *const MemoryController, id: ComponentId) *const Allocation {
-        return &self.allocations[@intFromEnum(id)];
+        return &self.allocations[@backingInt(id)];
     }
 
     /// Total memory used across all components.

@@ -208,7 +208,7 @@ pub const PipelineMetrics = struct {
 pub const ThroughputHistory = struct {
     const CAPACITY = 60; // last 60 data points (~1 min at 1/sec)
 
-    entries: [CAPACITY]ThroughputPoint = [_]ThroughputPoint{.{ .timestamp_ms = 0, .records_per_sec = 0 }} ** CAPACITY,
+    entries: [CAPACITY]ThroughputPoint = @as([CAPACITY]ThroughputPoint, @splat(.{ .timestamp_ms = 0, .records_per_sec = 0 })),
     head: usize = 0,
     count: usize = 0,
 

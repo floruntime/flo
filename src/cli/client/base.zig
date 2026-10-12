@@ -195,7 +195,7 @@ pub const Client = struct {
         const buf = try self.allocator.alloc(u8, op.request.max_size);
         defer self.allocator.free(buf);
         const encoded = op.request.encodeInto(buf, body) catch return error.InvalidRequest;
-        return self.sendRequest(@enumFromInt(op.code), namespace, key, encoded);
+        return self.sendRequest(@fromBackingInt(@intCast(op.code)), namespace, key, encoded);
     }
 
     /// Send a request with options and receive response
@@ -253,7 +253,7 @@ pub const Client = struct {
         }
 
         return Response{
-            .status = @enumFromInt(response_header.status),
+            .status = @fromBackingInt(@intCast(response_header.status)),
             .data = data,
             .allocator = self.allocator,
         };

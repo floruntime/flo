@@ -338,7 +338,7 @@ pub const WaitContext = struct {
         writer.writeByte(WIRE_VERSION) catch return error.OutOfMemory;
 
         // Wait type
-        writer.writeByte(@intFromEnum(self.wait_type)) catch return error.OutOfMemory;
+        writer.writeByte(@backingInt(self.wait_type)) catch return error.OutOfMemory;
 
         // Signal type
         writer.writeInt(u16, @intCast(self.signal_type.len), .big) catch return error.OutOfMemory;
@@ -433,7 +433,7 @@ pub const WaitContext = struct {
 
         // Wait type
         if (pos >= data.len) return error.InvalidData;
-        const wait_type: WaitType = @enumFromInt(data[pos]);
+        const wait_type: WaitType = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
 
         // Signal type
@@ -1007,7 +1007,7 @@ pub const RunSnapshot = struct {
         try writeString(&buf, allocator, self.run_id);
 
         // Status
-        try buf.append(allocator, @intFromEnum(self.status));
+        try buf.append(allocator, @backingInt(self.status));
 
         // Current state
         try writeString(&buf, allocator, self.current_state);
@@ -1097,7 +1097,7 @@ pub const RunSnapshot = struct {
 
         // Status
         if (pos >= data.len) return error.InvalidData;
-        const status: RunStatus = @enumFromInt(data[pos]);
+        const status: RunStatus = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
 
         // Current state
@@ -1368,7 +1368,7 @@ pub const Timer = struct {
 
         try buf.append(allocator, WIRE_VERSION);
         try writeString(&buf, allocator, self.timer_id);
-        try buf.append(allocator, @intFromEnum(self.timer_type));
+        try buf.append(allocator, @backingInt(self.timer_type));
         try writeI64(&buf, allocator, self.scheduled_for_ms);
         try buf.append(allocator, if (self.fired) 1 else 0);
         try writeOptionalLargeString(&buf, allocator, self.payload);
@@ -1388,7 +1388,7 @@ pub const Timer = struct {
         errdefer allocator.free(timer_id);
 
         if (pos >= data.len) return error.InvalidData;
-        const timer_type: TimerType = @enumFromInt(data[pos]);
+        const timer_type: TimerType = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
 
         const scheduled_for_ms = try readI64(data, &pos);

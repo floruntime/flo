@@ -190,7 +190,7 @@ pub const SegmentWriter = struct {
             .data_size = @intCast(self.data.items.len),
             // Nothing compresses yet; the header keeps the byte for when
             // something does.
-            .compression = @intFromEnum(segment.Compression.none),
+            .compression = @backingInt(segment.Compression.none),
             .commit_index_at_seal = self.commit_index_at_seal,
             .reserved = .{0},
         };
@@ -220,7 +220,7 @@ pub const SegmentWriter = struct {
             .entry_type_bitmap = self.entry_type_bitmap,
             .bloom_filter_offset = 0, // no bloom filter yet
             .crc32c = crc,
-            ._padding = .{0} ** 4,
+            ._padding = @splat(0),
             .magic = segment.FOOTER_MAGIC,
         };
         const footer_bytes = footer.asBytes();

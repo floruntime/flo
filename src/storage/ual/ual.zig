@@ -34,6 +34,7 @@
 //! The ring is non-overlapping: eviction must happen before write.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const entry_mod = @import("entry.zig");
 const log = @import("stdx").log;
 const Positions = @import("positions.zig").Positions;
@@ -642,7 +643,7 @@ test "UAL: entry too large for ring" {
     defer ual.deinit();
 
     // Entry needs 40 (header) + 100 (payload) = 140 > 64
-    const big_payload = "x" ** 100;
+    const big_payload = stdx.repeat("x", 100);
     const entry = makeEntry(1, big_payload);
     try testing.expectError(error.EntryTooLarge, ual.append(&entry));
 }
@@ -665,7 +666,7 @@ test "UAL: truncateAfter reclaims ring space and survives re-append + eviction" 
 
     // Five 100-byte entries fill the ring; then drop the last three.
     for (1..6) |i| {
-        var e = makeEntry(@intCast(i), "0123456789" ** 6);
+        var e = makeEntry(@intCast(i), stdx.repeat("0123456789", 6));
         _ = try ual.append(&e);
     }
     const one_entry = HEADER_SIZE + 60;
@@ -681,22 +682,22 @@ test "UAL: truncateAfter reclaims ring space and survives re-append + eviction" 
     // Re-append 3..5 with different payloads: they land where the dropped
     // bytes were and read back as the new content.
     for (3..6) |i| {
-        var e = makeEntry(@intCast(i), "new-payload-" ** 5);
+        var e = makeEntry(@intCast(i), stdx.repeat("new-payload-", 5));
         _ = try ual.append(&e);
     }
     try testing.expectEqual(@as(u64, 5 * one_entry), ual.used());
-    try testing.expectEqualStrings("new-payload-" ** 5, ual.read(4).?.payload);
-    try testing.expectEqualStrings("0123456789" ** 6, ual.read(1).?.payload);
+    try testing.expectEqualStrings(stdx.repeat("new-payload-", 5), ual.read(4).?.payload);
+    try testing.expectEqualStrings(stdx.repeat("0123456789", 6), ual.read(1).?.payload);
 
     // Force eviction past the truncated region: the oldest entries go in
     // index order and every surviving index still reads correctly.
     for (6..12) |i| {
-        var e = makeEntry(@intCast(i), "later-entry-" ** 5);
+        var e = makeEntry(@intCast(i), stdx.repeat("later-entry-", 5));
         _ = try ual.append(&e);
     }
     try testing.expect(!ual.contains(1));
     try testing.expect(ual.contains(11));
-    try testing.expectEqualStrings("later-entry-" ** 5, ual.read(11).?.payload);
+    try testing.expectEqualStrings(stdx.repeat("later-entry-", 5), ual.read(11).?.payload);
     try testing.expect(ual.entry_count <= 5);
     try testing.expectEqual(ual.entry_count * one_entry, ual.used());
     var live: u64 = 0;
@@ -719,7 +720,7 @@ test "UAL: truncateAfter below the oldest live index empties the ring" {
 
     // Ring holds ~3 entries; after 6 appends indices 1-3 are evicted.
     for (1..7) |i| {
-        var e = makeEntry(@intCast(i), "0123456789" ** 6);
+        var e = makeEntry(@intCast(i), stdx.repeat("0123456789", 6));
         _ = try ual.append(&e);
     }
     try testing.expect(!ual.contains(1));

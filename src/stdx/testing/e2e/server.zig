@@ -68,7 +68,7 @@ fn claimCheckout() !void {
         .refused => return error.E2eRunInProgress,
         .pending => {},
     }
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) {
         claim = .held;
         return;
     }
@@ -215,7 +215,7 @@ pub const ServerProcess = struct {
         /// Every node of a test cluster shares the default; a test that wants a
         /// stranger sets its own.
         /// In the form `flo server secret` prints; a cluster takes no other.
-        cluster_secret: []const u8 = "flo-secret-" ++ "e2e0" ** 16,
+        cluster_secret: []const u8 = "flo-secret-" ++ @import("../../mod.zig").repeat("e2e0", 16),
         /// Written to `[cluster] secret_file` when set, beside `secret` if
         /// that is set too.
         cluster_secret_file: ?[]const u8 = null,
@@ -559,8 +559,8 @@ pub const ServerProcess = struct {
             return std.fmt.bufPrint(buf, "exited with code {d}", .{code}) catch "exited with a non-zero code";
         }
         if (low == 0x7f) return null; // stopped, not ended
-        if (low == @intFromEnum(std.posix.SIG.TERM) and self.sent_term) return null;
-        if (low == @intFromEnum(std.posix.SIG.KILL)) {
+        if (low == @backingInt(std.posix.SIG.TERM) and self.sent_term) return null;
+        if (low == @backingInt(std.posix.SIG.KILL)) {
             if (self.sent_kill) return null;
             return "killed by a SIGKILL the harness didn't send (memory pressure, or another run's cleanup?)";
         }
@@ -851,11 +851,11 @@ pub fn findFloBinary(allocator: Allocator) ![]const u8 {
     // Try to find from current exe path (best-effort, macOS via _NSGetExecutablePath)
     var exe_buf: [4096]u8 = undefined;
     const self_exe = blk: {
-        if (builtin.os.tag == .macos) {
+        if (builtin.target.os.tag == .macos) {
             var len: u32 = exe_buf.len;
             if (std.c._NSGetExecutablePath(&exe_buf, &len) != 0) return error.FloBinaryNotFound;
             break :blk std.mem.sliceTo(&exe_buf, 0);
-        } else if (builtin.os.tag == .linux) {
+        } else if (builtin.target.os.tag == .linux) {
             const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
             if (n <= 0) return error.FloBinaryNotFound;
             break :blk exe_buf[0..@intCast(n)];

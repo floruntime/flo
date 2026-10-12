@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const reason_mod = @import("reason.zig");
 pub const Refusal = reason_mod.Refusal;
@@ -353,7 +354,7 @@ pub const OptionsBuilder = struct {
     /// Add a u8 option
     pub fn addU8(self: *OptionsBuilder, tag: OptionTag, value: u8) !void {
         try self.ensureCapacity(3);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 1; // length
         self.buffer[self.offset + 2] = value;
         self.offset += 3;
@@ -362,7 +363,7 @@ pub const OptionsBuilder = struct {
     /// Add a u16 option
     pub fn addU16(self: *OptionsBuilder, tag: OptionTag, value: u16) !void {
         try self.ensureCapacity(4);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 2; // length
         std.mem.writeInt(u16, self.buffer[self.offset + 2 ..][0..2], value, .little);
         self.offset += 4;
@@ -371,7 +372,7 @@ pub const OptionsBuilder = struct {
     /// Add a u32 option
     pub fn addU32(self: *OptionsBuilder, tag: OptionTag, value: u32) !void {
         try self.ensureCapacity(6);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 4; // length
         std.mem.writeInt(u32, self.buffer[self.offset + 2 ..][0..4], value, .little);
         self.offset += 6;
@@ -380,7 +381,7 @@ pub const OptionsBuilder = struct {
     /// Add a u64 option
     pub fn addU64(self: *OptionsBuilder, tag: OptionTag, value: u64) !void {
         try self.ensureCapacity(10);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 8; // length
         std.mem.writeInt(u64, self.buffer[self.offset + 2 ..][0..8], value, .little);
         self.offset += 10;
@@ -389,7 +390,7 @@ pub const OptionsBuilder = struct {
     /// Add an i64 option
     pub fn addI64(self: *OptionsBuilder, tag: OptionTag, value: i64) !void {
         try self.ensureCapacity(10);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 8; // length
         std.mem.writeInt(i64, self.buffer[self.offset + 2 ..][0..8], value, .little);
         self.offset += 10;
@@ -399,7 +400,7 @@ pub const OptionsBuilder = struct {
     pub fn addString(self: *OptionsBuilder, tag: OptionTag, value: []const u8) !void {
         if (value.len > 255) return error.OptionValueTooLarge;
         try self.ensureCapacity(2 + value.len);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = @intCast(value.len);
         @memcpy(self.buffer[self.offset + 2 ..][0..value.len], value);
         self.offset += 2 + value.len;
@@ -413,7 +414,7 @@ pub const OptionsBuilder = struct {
     /// Add a flag option (presence indicates true)
     pub fn addFlag(self: *OptionsBuilder, tag: OptionTag) !void {
         try self.ensureCapacity(2);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 0; // length = 0 for flags
         self.offset += 2;
     }
@@ -422,7 +423,7 @@ pub const OptionsBuilder = struct {
     /// StreamID is encoded in big-endian for lexicographic sorting
     pub fn addStreamId(self: *OptionsBuilder, tag: OptionTag, timestamp_ms: u64, sequence: u64) !void {
         try self.ensureCapacity(2 + 16);
-        self.buffer[self.offset] = @intFromEnum(tag);
+        self.buffer[self.offset] = @backingInt(tag);
         self.buffer[self.offset + 1] = 16; // length
         std.mem.writeInt(u64, self.buffer[self.offset + 2 ..][0..8], timestamp_ms, .big);
         std.mem.writeInt(u64, self.buffer[self.offset + 10 ..][0..8], sequence, .big);
@@ -453,7 +454,7 @@ pub const OptionsIterator = struct {
     pub fn next(self: *OptionsIterator) ?Option {
         if (self.offset + 2 > self.data.len) return null;
 
-        const tag: OptionTag = @enumFromInt(self.data[self.offset]);
+        const tag: OptionTag = @fromBackingInt(@intCast(self.data[self.offset]));
         const len = self.data[self.offset + 1];
 
         if (self.offset + 2 + len > self.data.len) return null;
@@ -497,7 +498,7 @@ pub const RequestHeader = extern struct {
             .payload_length = 0,
             .request_id = request_id,
             .crc32 = 0,
-            .op_code = @intFromEnum(op),
+            .op_code = @backingInt(op),
             .version = VERSION,
             .flags = 0,
             .table_hash = TABLE_HASH,
@@ -769,7 +770,7 @@ pub const Request = struct {
     }
 
     pub fn getOpCode(self: Request) OpCode {
-        return @enumFromInt(self.header.op_code);
+        return @fromBackingInt(@intCast(self.header.op_code));
     }
 
     /// Get an iterator over the TLV options
@@ -945,7 +946,7 @@ pub const Response = struct {
     }
 
     pub fn getStatus(self: Response) StatusCode {
-        return @enumFromInt(self.header.status);
+        return @fromBackingInt(@intCast(self.header.status));
     }
 
     /// An ok answer carrying `data`.
@@ -967,7 +968,7 @@ pub const Response = struct {
             .header = .{
                 .magic = MAGIC,
                 .version = VERSION,
-                .status = @intFromEnum(status),
+                .status = @backingInt(status),
                 .flags = 0,
                 ._pad = 0,
                 .table_hash = TABLE_HASH,
@@ -982,7 +983,7 @@ pub const Response = struct {
     /// A refusal's reason, `ran` and message; an error for an ok answer or
     /// a body that isn't a refusal.
     pub fn refused(self: Response) error{Malformed}!Refusal {
-        if (self.header.status == @intFromEnum(StatusCode.ok)) return error.Malformed;
+        if (self.header.status == @backingInt(StatusCode.ok)) return error.Malformed;
         return Refusal.decode(self.data);
     }
 };
@@ -1139,7 +1140,7 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
     const room = 64 - Refusal.HEADER_LEN;
 
     // Exactly the room: sent whole.
-    const exact = "a" ** room;
+    const exact = stdx.repeat("a", room);
     var r = try Response.parse(Response.serializeRefusal(.bad_request, 7, notRun(exact), &buf));
     var body = try r.refused();
     try std.testing.expectEqualStrings(exact, body.message);
@@ -1148,7 +1149,7 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
     try std.testing.expectEqual(@as(u64, 7), r.header.request_id);
 
     // One over: cut and marked, still a refusal body.
-    r = try Response.parse(Response.serializeRefusal(.unavailable, 7, unclassified(.unavailable, "a" ** (room + 1)), &buf));
+    r = try Response.parse(Response.serializeRefusal(.unavailable, 7, unclassified(.unavailable, stdx.repeat("a", (room + 1))), &buf));
     body = try r.refused();
     try std.testing.expect(std.mem.endsWith(u8, body.message, reason_mod.TRUNCATED_MARKER));
     try std.testing.expectEqual(Ran.unknown, body.ran);
@@ -1156,8 +1157,8 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
 }
 
 test "ranOf: only a status that can follow a write in the log is unknown" {
-    inline for (@typeInfo(StatusCode).@"enum".fields) |f| {
-        const status: StatusCode = @enumFromInt(f.value);
+    inline for (@typeInfo(StatusCode).@"enum".field_values) |value| {
+        const status: StatusCode = @fromBackingInt(@intCast(value));
         const want: Ran = if (status == .unavailable or status == .internal_error) .unknown else .no;
         try std.testing.expectEqual(want, ranOf(status));
     }

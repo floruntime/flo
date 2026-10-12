@@ -1,5 +1,12 @@
 const std = @import("std");
 
+// Another compiler fails on this file with a wall of unrelated-looking errors.
+comptime {
+    const v = @import("builtin").zig_version;
+    if (v.major != 0 or v.minor != 17)
+        @compileError(std.fmt.comptimePrint("flo needs Zig 0.17.x, found {d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
+}
+
 /// A single-threaded `std.Io` instance used at build configure time for
 /// `std.process.run`, `std.Io.Dir`, etc. Constructed once per build.zig run.
 var build_threaded_io: std.Io.Threaded = .init_single_threaded;
@@ -9,6 +16,11 @@ fn buildIo() std.Io {
 }
 
 pub fn build(b: *std.Build) void {
+    // Configure does I/O the build system can't see (git describe, the test
+    // root and dashboard asset walks), so a cached configuration would miss
+    // new test files and assets. Re-run it every build.
+    b.graph.poisonCache();
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
@@ -57,9 +69,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
@@ -72,7 +82,7 @@ pub fn build(b: *std.Build) void {
 
     const system_install_step = b.step("install-system", "Install flo to system PATH directory (default: /usr/local/bin on Linux, /opt/homebrew/bin on macOS)");
     const install_cmd = b.addSystemCommand(&.{ "sh", "-c" });
-    const build_root_str = b.pathFromRoot("zig-out/bin/flo");
+    const build_root_str = b.root.joinString(b.allocator, "zig-out/bin/flo") catch @panic("OOM");
     const install_script = std.fmt.allocPrint(b.allocator,
         \\mkdir -p "{s}" && cp "{s}" "{s}/flo" && chmod +x "{s}/flo" && echo "✓ Installed flo to {s}/flo"
     , .{ install_dir, build_root_str, install_dir, install_dir, install_dir }) catch unreachable;
@@ -201,7 +211,7 @@ pub fn build(b: *std.Build) void {
 
     const run_vopr = b.addRunArtifact(vopr_exe);
     run_vopr.step.dependOn(b.getInstallStep());
-    if (b.args) |vopr_args| run_vopr.addArgs(vopr_args);
+    run_vopr.addPassthruArgs();
 
     const vopr_step = b.step("vopr", "Run the deterministic cluster simulator (-- --seed=N | --iterations=K)");
     vopr_step.dependOn(&run_vopr.step);
@@ -274,7 +284,7 @@ const TestRoot = struct {
 fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filtered: bool) TestRoot {
     const io = buildIo();
     const out_name = "all_tests.zig";
-    var root_dir = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
+    var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
         std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err });
     defer root_dir.close(io);
 
@@ -415,7 +425,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
 
     const dist_path = "src/node/dashboard/dist";
     const io = buildIo();
-    var dist_dir = b.build_root.handle.openDir(io, dist_path, .{ .iterate = true }) catch |err| {
+    var dist_dir = b.root.root_dir.handle.openDir(io, dist_path, .{ .iterate = true }) catch |err| {
         std.debug.print("Warning: Cannot open {s}: {}. Run 'zake build.dashboard' first.\n", .{ dist_path, err });
         // Return a minimal stub so compilation succeeds without assets.
         writer.writeAll(
@@ -543,7 +553,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
 fn writeAssetsFile(b: *std.Build, content: []const u8) void {
     const assets_path = "src/node/dashboard/assets.zig";
     const io = buildIo();
-    var file = b.build_root.handle.createFile(io, assets_path, .{}) catch unreachable;
+    var file = b.root.root_dir.handle.createFile(io, assets_path, .{}) catch unreachable;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var fw = file.writer(io, &buf);

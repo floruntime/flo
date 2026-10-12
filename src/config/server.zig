@@ -528,7 +528,7 @@ pub fn loadWithOverrides(
     if (durability_override) |d| {
         if (d.len > 0) {
             const requested = try Durability.parseDurability(d);
-            if (@intFromEnum(requested) > @intFromEnum(config.durability)) {
+            if (@backingInt(requested) > @backingInt(config.durability)) {
                 std.debug.print(
                     "warning: --durability {s} is LESS durable than configured ({s}); data loss possible on restart\n",
                     .{ d, @tagName(config.durability) },

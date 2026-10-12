@@ -127,7 +127,7 @@ pub const ReplyPool = struct {
             allocator.free(c.in_use);
         };
         for (&classes, counts, 0..) |*c, count, k| {
-            const class: Class = @enumFromInt(k);
+            const class: Class = @fromBackingInt(@intCast(k));
             const free = try allocator.alloc(u16, count);
             errdefer allocator.free(free);
             // Ordinary slots come first, blocking ones follow.
@@ -158,7 +158,7 @@ pub const ReplyPool = struct {
 
     /// Whether a request of `class` to `target` would get a slot now.
     pub fn canTake(self: *const ReplyPool, class: Class, target: u16) bool {
-        const c = &self.classes[@intFromEnum(class)];
+        const c = &self.classes[@backingInt(class)];
         return c.in_use[target] < c.share and c.free_len > 0;
     }
 
@@ -169,7 +169,7 @@ pub const ReplyPool = struct {
     /// long on the target once it gets there.
     pub fn take(self: *ReplyPool, class: Class, target: u16, fd: i32, conn_id: u32, request_id: u64, writes: bool, since_ms: u64, now_ms: u64, allowance_ms: u64, block_ms: u64) TargetBusy!Ticket {
         if (!self.canTake(class, target)) return error.TargetBusy;
-        const c = &self.classes[@intFromEnum(class)];
+        const c = &self.classes[@backingInt(class)];
         c.free_len -= 1;
         const i = c.free[c.free_len];
         const slot = &self.slots[i];
@@ -186,7 +186,7 @@ pub const ReplyPool = struct {
         const slot = &self.slots[ticket.slot];
         if (!slot.active or slot.gen != ticket.gen or slot.target != from) return null;
         slot.active = false;
-        const c = &self.classes[@intFromEnum(slot.class)];
+        const c = &self.classes[@backingInt(slot.class)];
         c.in_use[slot.target] -= 1;
         c.free[c.free_len] = ticket.slot;
         c.free_len += 1;
@@ -240,7 +240,7 @@ pub const ReplyPool = struct {
 
     /// Slots of `class` `target` could still take.
     pub fn room(self: *const ReplyPool, class: Class, target: u16) i32 {
-        const c = &self.classes[@intFromEnum(class)];
+        const c = &self.classes[@backingInt(class)];
         return @intCast(@min(c.share -| c.in_use[target], c.free_len));
     }
 
@@ -253,11 +253,11 @@ pub const ReplyPool = struct {
 
     /// Slots of `class` held toward `target`.
     pub fn heldBy(self: *const ReplyPool, class: Class, target: u16) u16 {
-        return self.classes[@intFromEnum(class)].in_use[target];
+        return self.classes[@backingInt(class)].in_use[target];
     }
 
     pub fn share(self: *const ReplyPool, class: Class) u16 {
-        return self.classes[@intFromEnum(class)].share;
+        return self.classes[@backingInt(class)].share;
     }
 };
 

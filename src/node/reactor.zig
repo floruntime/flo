@@ -20,9 +20,9 @@ const linux = if (is_linux) std.os.linux else void;
 
 const log = std.log.scoped(.reactor);
 
-const is_linux = builtin.os.tag == .linux;
-const is_bsd = builtin.os.tag == .macos or builtin.os.tag == .freebsd or
-    builtin.os.tag == .openbsd or builtin.os.tag == .netbsd;
+const is_linux = builtin.target.os.tag == .linux;
+const is_bsd = builtin.target.os.tag == .macos or builtin.target.os.tag == .freebsd or
+    builtin.target.os.tag == .openbsd or builtin.target.os.tag == .netbsd;
 
 /// Sentinel user_data for poll timeout SQEs — filtered out from results.
 const TIMEOUT_SENTINEL: u64 = std.math.maxInt(u64);

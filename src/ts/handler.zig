@@ -119,7 +119,7 @@ pub const TSHandler = struct {
         const result = shard.ts_handler.handleCommand(req);
         defer shard.ts_handler.freeResult(result);
         if (result == .parked) {
-            const op: OpCode = @enumFromInt(req.header.op_code);
+            const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
             return shard.park(conn, req, result.parked, if (op == .ts_write) respondTS else respondApplied);
         }
         switch (result) {
@@ -159,7 +159,7 @@ pub const TSHandler = struct {
     // ── Core Command Logic ──────────────────────────────────────────────
 
     fn handleCommand(self: *TSHandler, req: Request) CommandResult {
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         return switch (op) {
             .ts_write => self.handleWrite(req),
             .ts_read => self.handleRead(req),

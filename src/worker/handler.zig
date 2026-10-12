@@ -155,7 +155,7 @@ pub const WorkerHandler = struct {
     fn dispatchWorkerCmd(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @enumFromInt(req.header.op_code);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
         // A worker id is part of the registry key ("ns\x00id"), so one
         // holding a NUL could spell another namespace's worker.
@@ -174,7 +174,7 @@ pub const WorkerHandler = struct {
             },
             .worker_heartbeat => {
                 if (shard.worker_handler.handleHeartbeat(req)) |status| {
-                    var status_buf: [1]u8 = .{@intFromEnum(status)};
+                    var status_buf: [1]u8 = .{@backingInt(status)};
                     shard.sendOkResponse(conn, req.header.request_id, &status_buf);
                 } else {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
@@ -504,9 +504,9 @@ pub const WorkerHandler = struct {
         @memcpy(buf[offset .. offset + w.id_owned.len], w.id_owned);
         offset += w.id_owned.len;
         // type + status
-        buf[offset] = @intFromEnum(w.worker_type);
+        buf[offset] = @backingInt(w.worker_type);
         offset += 1;
-        buf[offset] = @intFromEnum(w.status);
+        buf[offset] = @backingInt(w.status);
         offset += 1;
         // counters
         std.mem.writeInt(u64, buf[offset..][0..8], w.tasks_completed, .little);
@@ -530,7 +530,7 @@ pub const WorkerHandler = struct {
             offset += 2;
             @memcpy(buf[offset .. offset + p.name_owned.len], p.name_owned);
             offset += p.name_owned.len;
-            buf[offset] = @intFromEnum(p.kind);
+            buf[offset] = @backingInt(p.kind);
             offset += 1;
             std.mem.writeInt(u64, buf[offset..][0..8], p.run_count, .little);
             offset += 8;

@@ -330,7 +330,7 @@ test "outcome: each status has its exit code" {
         try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(s)));
     inline for (.{ .overloaded, .rate_limited, .unavailable }) |s|
         try std.testing.expectEqual(@as(u8, 4), exitCode(ofStatus(s)));
-    try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(@enumFromInt(200))));
+    try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(@fromBackingInt(@intCast(200)))));
     try std.testing.expectEqual(@as(u8, 0), exitCode({}));
     try std.testing.expectEqual(@as(u8, 2), exitCode(error.UnknownFlag));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.Transport));
