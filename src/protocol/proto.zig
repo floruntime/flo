@@ -586,6 +586,12 @@ pub const ResponseHeader = extern struct {
     }
 };
 
+/// The namespace a request names when it names none. Decoding writes it in
+/// place of an empty namespace, so routing, storage and metrics see one
+/// spelling: the router hashes the bytes as given, so two spellings would
+/// send one key to two shards.
+pub const DEFAULT_NAMESPACE = "default";
+
 /// Request with namespace support and TLV options
 /// Payload format: [namespace_len: u16] [namespace] [key_len: u16] [key] [value_len: u32] [value] [options_len: u16] [options...]
 /// Options are TLV encoded: [tag: u8] [len: u8] [data: len bytes]
@@ -630,7 +636,7 @@ pub const Request = struct {
         if (payload.len == 0) {
             return Request{
                 .header = header,
-                .namespace = "",
+                .namespace = DEFAULT_NAMESPACE,
                 .key = "",
                 .value = "",
                 .options = "",
@@ -646,7 +652,7 @@ pub const Request = struct {
         offset += 2;
 
         if (payload.len < offset + namespace_len) return error.IncompletePayload;
-        const namespace = payload[offset..][0..namespace_len];
+        const namespace = if (namespace_len == 0) DEFAULT_NAMESPACE else payload[offset..][0..namespace_len];
         offset += namespace_len;
 
         // Key
@@ -1110,6 +1116,17 @@ test "Request with TLV options serialization" {
     try std.testing.expectEqualStrings("mykey", parsed.key);
     try std.testing.expectEqualStrings("myvalue", parsed.value);
     try std.testing.expectEqual(@as(?u64, 86400), try parsed.getTtlMs());
+}
+
+test "an empty namespace decodes as default" {
+    var buffer: [256]u8 = undefined;
+    const empty = Request{ .header = RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = "v" };
+    const named = Request{ .header = RequestHeader.init(.kv_put, 1), .namespace = DEFAULT_NAMESPACE, .key = "k", .value = "v" };
+    const a = try Request.parse(try empty.serialize(&buffer));
+    try std.testing.expectEqualStrings(DEFAULT_NAMESPACE, a.namespace);
+    var buffer2: [256]u8 = undefined;
+    const b = try Request.parse(try named.serialize(&buffer2));
+    try std.testing.expectEqualStrings(a.namespace, b.namespace);
 }
 
 test "Response with prefix_u64 serialization" {

@@ -2275,7 +2275,10 @@ pub const Shard = struct {
         if (leader == 0 or leader == self.cluster_node_id) return;
         const rn = self.raft_network orelse return;
         const session = rn.linkSession(leader) orelse return;
-        var buf: [FORWARD_PREFIX + MAX_REQUEST_SIZE]u8 = undefined;
+        // A forward is the request re-encoded, which can outgrow what the
+        // client sent by the namespace an empty one decodes as and the
+        // options trailer a client may omit.
+        var buf: [FORWARD_PREFIX + MAX_REQUEST_SIZE + proto.DEFAULT_NAMESPACE.len + 2]u8 = undefined;
         if (FORWARD_PREFIX + f.bytes.len > buf.len) {
             self.finishForward(f, .internal_error, "request too large to forward");
             return;
@@ -6108,7 +6111,8 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
 }
 
 test "Shard: a forward's copy of a request keeps the client's table hash, and a foreign one doesn't parse" {
-    const put = try testRequest(.kv_put, 3, "k", "v");
+    // Named, as decoding names every request: an empty namespace decodes as "default", so its copy is longer.
+    const put = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 3, proto.DEFAULT_NAMESPACE, "k", "v", ""));
     defer std.testing.allocator.free(put);
     const copy = try Shard.serializeRequest(std.testing.allocator, try proto.Request.parse(put));
     defer std.testing.allocator.free(copy);
@@ -8106,7 +8110,8 @@ const ParkTest = struct {
     }
 
     fn send(sh: *Shard, c: *Connection, op: proto.OpCode, id: u64, key: []const u8, value: []const u8) !void {
-        sh.runRequest(c, try request(op, id, "", key, value, ""), .client);
+        // Named as decoding names it: a parked request is decoded again when answered.
+        sh.runRequest(c, try request(op, id, proto.DEFAULT_NAMESPACE, key, value, ""), .client);
     }
 
     /// Every response the shard has for `c`, flushed and read from `fd`
