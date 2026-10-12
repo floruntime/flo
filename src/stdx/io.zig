@@ -6,8 +6,8 @@
 //! the hot path, and tests.
 //!
 //! This module exposes a single process-wide `std.Io` instance.
-//! In production, `bootFromInit()` is called by `main()` to bind the
-//! facade to the `Io` provided by the Juicy Main `Init` parameter.
+//! In production, `main()` builds its own `std.Io.Threaded` on the process
+//! allocator and binds the facade to it with `bootFromInit()`.
 //! In tests or other contexts, `bootThreaded(gpa)` constructs a fresh
 //! `std.Io.Threaded` instance.
 //!
