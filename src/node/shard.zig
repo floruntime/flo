@@ -5457,7 +5457,12 @@ fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *co
     const index = entry.header.index;
     switch (result) {
         .applied => {},
-        .partition_reject => |err| counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
+        .partition_reject => |err| if (err == error.IndexNotIncreasing)
+            // The first entry at this index applied; this one is refused,
+            // and nothing is missing.
+            counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} repeats an index the partition already holds; refused", .{ index, type_name })
+        else
+            counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
         .router_error => counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection; the projection is missing it", .{ index, type_name }),
         .applier_failed => counts.note(.applier_failed, now_ms, shard_id, "entry index={d} type={s} could not be applied; its state is missing it", .{ index, type_name }),
         .no_applier => counts.note(.no_applier, now_ms, shard_id, "entry index={d} type={s} has no applier on this build", .{ index, type_name }),
