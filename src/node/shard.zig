@@ -453,6 +453,11 @@ pub const Shard = struct {
         /// Set when another shard's boot failed: replay stops early, so the
         /// failure is reported without waiting for every replay to finish.
         cancel: ?*const std.atomic.Value(bool) = null,
+
+        fn cancelled(self: Boot) bool {
+            const cancel = self.cancel orelse return false;
+            return cancel.load(.monotonic);
+        }
     };
 
     pub fn init(
@@ -700,6 +705,7 @@ pub const Shard = struct {
 
                     // Step 1: Load snapshot if referenced
                     if (sm.latest_snapshot) |snap_name| {
+                        if (boot.cancelled()) return error.BootCancelled;
                         if (restoreSnapshot(allocator, snaps_dir_path, snap_name, partition)) |snap_index| {
                             replay_from = snap_index;
                         } else |err| {
@@ -5574,6 +5580,11 @@ fn replaySegments(
     for (files) |sf| last = @max(last, sf.last_index);
     if (boot.health) |slot| slot.replay_last.store(last, .monotonic);
     for (files) |sf| {
+        // Before reading and checksumming a whole segment it would not use.
+        if (boot.cancelled()) {
+            out.cancelled = true;
+            break;
+        }
         replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id, losses, boot, last, &out);
         if (out.damage != null or out.cancelled) break;
     }
@@ -5617,11 +5628,9 @@ fn replaySegmentFile(
         };
         offset += seg_entry.totalSize();
 
-        if (boot.cancel) |cancel| {
-            if (cancel.load(.monotonic)) {
-                out.cancelled = true;
-                return;
-            }
+        if (boot.cancelled()) {
+            out.cancelled = true;
+            return;
         }
         out.entries += 1;
         if (boot.health) |slot| slot.replay_index.store(seg_entry.header.index, .monotonic);

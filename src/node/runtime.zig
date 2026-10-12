@@ -580,6 +580,12 @@ pub const Runtime = struct {
 
         // 2. Create shards, replaying each one's log, several at once.
         const shards = try self.allocator.alloc(Shard, self.shard_count);
+        // Until the boot below has run and its outcome is handled.
+        var boot_handled = false;
+        errdefer if (!boot_handled) {
+            self.allocator.free(shards);
+            self.stopHttp();
+        };
         var boot: ShardBoot = .{
             .runtime = self,
             .shards = shards,
@@ -594,6 +600,7 @@ pub const Runtime = struct {
         defer self.allocator.free(boot.failed);
         @memset(boot.failed, null);
         boot.run();
+        boot_handled = true;
         if (boot.firstError()) |err| {
             for (shards, boot.failed) |*shard, failed| {
                 if (failed == null) shard.deinit();
@@ -1367,6 +1374,89 @@ test "Runtime: a shard that cannot boot fails the start with its own error, and 
     try std.testing.expectError(error.NotDir, runtime.start());
     try std.testing.expect(!runtime.started);
     try std.testing.expect(runtime.shards == null);
+}
+
+/// A shard log of `entries` queue enqueues in `data_dir`, as shard `id` of
+/// `shard_count`, flushed to segments.
+fn writeShardLog(data_dir: []const u8, id: u16, shard_count: u16, entries: usize) !void {
+    const persistence = @import("../storage/persistence.zig");
+    const entry_mod = @import("../storage/ual/entry.zig");
+    const pipe_fds = try stdx.io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, id, shard_count, 0, pipe_fds[0], data_dir, @import("../storage/partition.zig").Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    for (0..entries) |i| {
+        _ = try persistence.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'x' });
+        _ = shard.applyCommitted();
+        if (i % 2000 == 1999) try shard.flushSegmentToDisk();
+    }
+    try shard.flushSegmentToDisk();
+}
+
+test "Runtime: each shard says it is done replaying as soon as it is, not when every shard is" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(data_dir);
+    for (0..2) |i| try writeShardLog(data_dir, @intCast(i), 2, 100);
+
+    var runtime = try Runtime.init(std.testing.allocator, .{ .num_shards = 2, .listen_port = 0, .data_dir = data_dir, .metrics_enabled = false, .dashboard_enabled = false });
+    defer runtime.deinit();
+    var health = try NodeHealth.init(std.testing.allocator, 1, 2);
+    defer health.deinit(std.testing.allocator);
+    var pipes: [2][2]i32 = undefined;
+    for (&pipes) |*p| p.* = try stdx.io.pipe();
+    defer for (pipes) |p| {
+        _ = std.c.close(p[0]);
+        _ = std.c.close(p[1]);
+    };
+    var shards: [2]Shard = undefined;
+    var failed: [2]?anyerror = .{ null, null };
+    var boot: ShardBoot = .{
+        .runtime = &runtime,
+        .shards = &shards,
+        .health = &health,
+        .data_dir = data_dir,
+        .pipes = &pipes,
+        .cluster_node_id = 1,
+        .shard0_role = .single,
+        .raft_config = .{},
+        .failed = &failed,
+    };
+    boot.run();
+    defer for (&shards) |*shard| shard.deinit();
+    try std.testing.expect(boot.firstError() == null);
+    // Published by its worker, before anything after the boot runs.
+    for (health.shards) |*slot| try std.testing.expect(slot.get() != .replaying and slot.get() != .loading);
+}
+
+test "Runtime: a shard that cannot boot stops the others' replays before they finish" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(data_dir);
+    for ([_]u16{ 0, 1, 3 }) |id| try writeShardLog(data_dir, id, 4, 20_000);
+    {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
+        defer std.testing.allocator.free(path);
+        const f = try stdx.fs.createFileAbsolute(path, .{});
+        stdx.fs.closeFile(f);
+    }
+
+    var runtime = try Runtime.init(std.testing.allocator, .{ .num_shards = 4, .listen_port = 0, .data_dir = data_dir, .metrics_enabled = false, .dashboard_enabled = false });
+    defer runtime.deinit();
+    try std.testing.expectError(error.NotDir, runtime.start());
+    // However many ran at once, one of the others never reached its last
+    // index: it stopped early, or was never started.
+    var stopped_early = false;
+    for ([_]usize{ 0, 1, 3 }) |i| {
+        const slot = &runtime.health.?.shards[i];
+        const last = slot.replay_last.load(.monotonic);
+        if (last == 0 or slot.replay_index.load(.monotonic) < last) stopped_early = true;
+    }
+    try std.testing.expect(stopped_early);
 }
 
 test "RuntimeConfig: single-node does not want a Raft listener" {

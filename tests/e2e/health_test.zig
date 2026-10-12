@@ -306,7 +306,8 @@ test "e2e/health: shards replay side by side, each one's progress only moving fo
             const replay = shard.object.get("replay") orelse continue;
             replaying += 1;
             const index: u64 = @intCast(replay.object.get("index").?.integer);
-            if (index < last_index[i]) went_back = true;
+            const last: u64 = @intCast(replay.object.get("last").?.integer);
+            if (index < last_index[i] or index > last) went_back = true;
             last_index[i] = index;
         }
         most_at_once = @max(most_at_once, replaying);
@@ -316,6 +317,8 @@ test "e2e/health: shards replay side by side, each one's progress only moving fo
 
     try testing.expect(ready);
     try testing.expect(!went_back);
+    // Each shard was seen getting somewhere, not stuck at its first entry.
+    for (last_index) |index| try testing.expect(index > 0);
     // Several shards replay at once wherever there are cores for them.
     const cpus = std.Thread.getCpuCount() catch 1;
     if (cpus >= 2 and most_at_once < 2) {
