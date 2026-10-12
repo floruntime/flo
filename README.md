@@ -4,7 +4,7 @@
   <p align="center">
     <a href="https://github.com/floruntime/flo/actions"><img alt="CI" src="https://github.com/floruntime/flo/actions/workflows/release.yml/badge.svg"></a>
     <a href="https://github.com/floruntime/flo/releases"><img alt="Release" src="https://img.shields.io/github/v/release/floruntime/flo?include_prereleases"></a>
-    <a href="https://github.com/floruntime/flo/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+    <a href="https://github.com/floruntime/flo/blob/dev/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
     <a href="https://ziglang.org"><img alt="Built with Zig" src="https://img.shields.io/badge/built%20with-Zig-F7A41D.svg"></a>
   </p>
 </p>
@@ -624,4 +624,4 @@ zig fmt src/
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](./LICENSE).
