@@ -557,9 +557,13 @@ zig build -Doptimize=ReleaseFast       # Release build
 ./zig-out/bin/flo server start
 
 # Test
-zig build test --summary all               # Unit tests (1040 tests)
+zig build test --summary all               # Unit tests
 zig build test-integration --summary all   # Integration tests
 zig build test-e2e --summary all           # E2E acceptance tests
+
+# Only tests whose name contains a substring; repeat to run several.
+# A filter that matches no test in the step fails it; `|` is refused.
+zig build test-e2e -Dtest-filter=kv -Dtest-filter=queue
 
 # Benchmarks
 zig build bench                        # Build benchmarks (ReleaseFast)
