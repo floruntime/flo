@@ -1378,6 +1378,17 @@ test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.stdout, "\n"));
         try testing.expect(std.mem.startsWith(u8, result.stdout, "2\t"));
     }
+    // A key written with a routing key lives on that key's shard; history
+    // given the same routing key finds it there.
+    for (0..16) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "routed-{d}", .{i});
+        try ctx.exec(&.{ "kv", "set", key, "one", "-r", "tenant-7" });
+        var result = try ctx.cli.run(&.{ "kv", "history", key, "-r", "tenant-7", "-o", "raw" });
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 0), result.exit_code);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.stdout, "\n"));
+        try testing.expect(std.mem.endsWith(u8, result.stdout, "\tone\n"));
+    }
 }
 
 test "e2e/kv: history for non-existent key fails" {
@@ -1535,6 +1546,37 @@ test "e2e/kv: mget after delete shows nil" {
 // =============================================================================
 // Multi-GET (mget) — Multi-Shard
 // =============================================================================
+
+test "e2e/kv: mget asks for every key when they overflow one request" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const a = testing.allocator;
+
+    // 256 keys of 2000 bytes: twice what one request holds.
+    var keys: [256][]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = try a.alloc(u8, 2000);
+        @memset(k.*, 'k');
+        _ = try std.fmt.bufPrint(k.*[0..3], "{d:0>3}", .{i});
+    }
+    defer for (keys) |k| a.free(k);
+    for ([_]usize{ 0, 130, 255 }) |i| try ctx.exec(&.{ "kv", "set", keys[i], "here" });
+
+    var args: [4 + 256][]const u8 = undefined;
+    args[0..4].* = .{ "kv", "mget", "-o", "raw" };
+    for (keys, 0..) |k, i| args[4 + i] = k;
+    var result = try ctx.cli.run(&args);
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, result.stdout, "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        try testing.expect(std.mem.startsWith(u8, line, keys[n]));
+        const want: []const u8 = if (n == 0 or n == 130 or n == 255) "\there" else "\t(nil)";
+        try testing.expect(std.mem.endsWith(u8, line, want));
+    }
+    try testing.expectEqual(@as(usize, 256), n);
+}
 
 test "e2e/kv: mget across shards returns all results" {
     // 4 shards — keys hash to different shards via Wyhash
@@ -1794,17 +1836,17 @@ test "e2e/kv: exists returns 1 for existing, 0 for missing" {
 
     try ctx.exec(&.{ "kv", "set", "present", "yes" });
 
-    // Present key → exit 0, stdout "1".
+    // Present key → exit 0, "1" and its version.
     var ok = try ctx.cli.run(&.{ "kv", "exists", "present" });
     defer ok.deinit();
-    try stdx.testing.assertSucceeded(ok);
-    try stdx.testing.assertStdoutContains(ok, "1");
+    try testing.expectEqual(@as(u8, 0), ok.exit_code);
+    try testing.expectEqualStrings("1 version=1\n", ok.stdout);
 
     // Missing key → exit 1, stdout "0".
     var missing = try ctx.cli.run(&.{ "kv", "exists", "absent" });
     defer missing.deinit();
-    try stdx.testing.assertFailed(missing);
-    try stdx.testing.assertStdoutContains(missing, "0");
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
+    try testing.expectEqualStrings("0\n", missing.stdout);
 }
 
 test "e2e/kv: expire sets a TTL, --ttl-ms 0 clears it, and --cas-version guards it" {

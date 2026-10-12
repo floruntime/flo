@@ -97,8 +97,8 @@ pub const KVHandler = struct {
     kv: *KVProjection,
     allocator: Allocator,
 
-    /// Counter for direct-write path (handleCommand used in tests and internal ops).
-    /// Production writes use the Raft log index as their version.
+    /// Version counter for the processing sink's direct writes. Writes
+    /// through the log use the log index as their version.
     next_lsn: u64,
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
@@ -179,6 +179,7 @@ pub const KVHandler = struct {
         WritesStopped,
         TooManyProposals,
         TooLarge,
+        AnswerTooLarge,
         NotACounter,
         CounterOverflow,
         PathNotFound,
@@ -207,6 +208,7 @@ pub const KVHandler = struct {
             error.LeaderUnknown => refused(.unavailable, .leader_unknown, persistence_mod.failureMessage(error.NotLeader, "")),
             error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
+            error.AnswerTooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the JSON at that path is more than an answer holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
             error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key and value are too large to write: at most {d} bytes together", .{MAX_ENTRY_PAYLOAD})),
             error.NotACounter => refused(.bad_request, .wrong_type, "bad request: the key's value isn't an 8-byte counter"),
             error.CounterOverflow => refused(.bad_request, .out_of_range, "bad request: delta would take the counter past an i64"),
@@ -426,24 +428,36 @@ pub const KVHandler = struct {
         const contexts = shard.dispatcher.walk_contexts[@intFromEnum(OpCode.kv_scan)] orelse &local;
         const walker = NameWalker.init(localScanKeys, @intCast(contexts.len));
         var found: [NameWalker.MAX_BATCH][]const u8 = undefined;
-        _ = dispatcher_mod.takeScanShort();
-        const page = walker.walk(contexts, req.namespace, req.key, if (cursor.len == 0) null else cursor, @min(limit, NameWalker.MAX_BATCH), &found, &self.cursor_buf);
-        if (dispatcher_mod.takeScanShort()) return error.ScanShort;
-
+        const from = if (cursor.len == 0) null else cursor;
+        var want: u32 = @min(limit, NameWalker.MAX_BATCH);
         const Names = ScanResponse.field_list[0].T;
-        var names = Names.Builder.init(&self.answer_buf);
-        for (page.items, 0..) |name, i| {
-            // A name two shards both hold is listed once.
-            for (page.items[0..i]) |earlier| {
-                if (std.mem.eql(u8, earlier, name)) break;
-            } else if (!(names.add(name) catch return error.Internal)) break;
+        while (true) {
+            _ = dispatcher_mod.takeScanShort();
+            const page = walker.walk(contexts, req.namespace, req.key, from, want, &found, &self.cursor_buf);
+            if (dispatcher_mod.takeScanShort()) return error.ScanShort;
+
+            var names = Names.Builder.init(&self.answer_buf);
+            const full: ?usize = for (page.items, 0..) |name, i| {
+                // A name two shards both hold is listed once.
+                for (page.items[0..i]) |earlier| {
+                    if (std.mem.eql(u8, earlier, name)) break;
+                } else if (!(names.add(name) catch return error.Internal)) break i;
+            } else null;
+            // The page's cursor resumes after every name walked, so a page
+            // the answer can't hold is walked again, short enough to fit:
+            // the same first names, and a cursor after the last one sent.
+            if (full) |fit| {
+                std.debug.assert(fit > 0 and fit < want);
+                want = @intCast(fit);
+                continue;
+            }
+            return .{ .answer = .{ .names = names.value(), .cursor = page.next_cursor } };
         }
-        return .{ .answer = .{ .names = names.value(), .cursor = page.next_cursor } };
     }
 
     /// A key's versions, newest first, as many as `limit` and one answer
     /// hold.
-    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32) Error!table_run.Outcome(HistoryResponse) {
+    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, _: ?[]const u8) Error!table_run.Outcome(HistoryResponse) {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const self = shard.kv_handler;
@@ -596,7 +610,7 @@ pub const KVHandler = struct {
         const at = json_path.jsonPathGet(self.allocator, e.value, path) catch |err| return jsonError(err);
         defer self.allocator.free(at);
         // The answer outlives this call; the handler's answer buffer holds it.
-        if (at.len > self.answer_buf.len) return error.TooLarge;
+        if (at.len > kv_ops.MAX_VALUE) return error.AnswerTooLarge;
         @memcpy(self.answer_buf[0..at.len], at);
         return .{ .answer = .{ .version = e.version, .document = self.answer_buf[0..at.len] } };
     }

@@ -206,6 +206,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.delete", .field = "txn", .tests = &.{"kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one"} },
     .{ .op = "kv.scan", .field = "limit", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
     .{ .op = "kv.scan", .field = "cursor", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
+    .{ .op = "kv.history", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.history", .field = "limit", .tests = &.{"kv ops: history answers versions newest first, at most limit; a missing key is not found"} },
     .{ .op = "kv.mget", .field = "keys", .tests = &.{"kv ops: mget answers each key in order, found or not, and next when they don't all fit"} },
     .{ .op = "kv.incr", .field = "delta", .tests = &.{"kv ops: incr adds delta to a counter from 0, and refuses a value that isn't one or a sum past i64"} },

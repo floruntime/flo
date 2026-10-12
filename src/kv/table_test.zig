@@ -233,6 +233,28 @@ test "kv table: a key empty, holding a NUL, or in a reserved prefix is refused b
     _ = try expectRefused((try h.get("_flo:x", getBody(.{}))).?, .unauthorized, .reserved_key);
 }
 
+test "kv table: every op that takes a key refuses one in a reserved prefix" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var checked: usize = 0;
+    inline for (kv_ops.table) |op| {
+        // scan's key is a prefix and mget's keys are in its body (both
+        // tested on their own); a transaction's begin key is its routing
+        // key, and commit and rollback take none.
+        const skip = comptime for ([_][]const u8{ "kv.scan", "kv.mget", "kv.txn_begin", "kv.txn_commit", "kv.txn_rollback" }) |name| {
+            if (std.mem.eql(u8, op.name, name)) break true;
+        } else false;
+        if (!skip) {
+            var body = plainBody(op);
+            if (@hasField(op.request.Value, "document")) body.document = "{}";
+            try h.no(op.name, "_flo:x", body, .unauthorized, .reserved_key);
+            checked += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 10), checked);
+}
+
 test "kv table: wait_ms with wait_for exists answers at once when the key exists, else when it is written" {
     var h: Harness = undefined;
     try h.init();
@@ -306,7 +328,7 @@ test "kv table: routing_key routes the request in place of its key" {
             try testing.expectEqual(router.hashKeyWithNamespace("ns", "balance"), route(plain).?);
         }
     }
-    try testing.expectEqual(@as(usize, 9), routed);
+    try testing.expectEqual(@as(usize, 10), routed);
 }
 
 /// A body for `op` with every field absent, at its default, or empty.
@@ -510,12 +532,46 @@ test "kv ops: scan pages names by limit and cursor, under a prefix, without rese
     try testing.expectEqual(@as(u32, 6), all.names.count);
 }
 
+test "kv ops: scan pages long names without dropping any, though they overflow an answer" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const a = testing.allocator;
+    // 80 names of 4000 bytes: more than one answer holds, fewer than the limit.
+    const key = try a.alloc(u8, 4000);
+    defer a.free(key);
+    @memset(key, 'k');
+    for (0..80) |i| {
+        _ = try std.fmt.bufPrint(key[0..2], "{d:0>2}", .{i});
+        try expectSet(try h.set(key, setBody("v", .{})), 1);
+    }
+
+    var seen = [_]bool{false} ** 80;
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    var cursor: []const u8 = "";
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        const page = try h.ok("kv.scan", "", .{ .limit = kv_ops.MAX_SCAN, .cursor = cursor });
+        var it = page.names.iterator();
+        while (try it.next()) |name| {
+            const i = try std.fmt.parseInt(usize, name[0..2], 10);
+            try testing.expect(!seen[i]);
+            seen[i] = true;
+        }
+        const next = page.cursor orelse break;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    for (seen) |s| try testing.expect(s);
+    try testing.expect(pages >= 1);
+}
+
 test "kv ops: history answers versions newest first, at most limit; a missing key is not found" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
     for ([_][]const u8{ "v1", "v2", "v3" }) |v| _ = try h.set("k", setBody(v, .{}));
-    const two = try h.ok("kv.history", "k", .{ .limit = 2 });
+    const two = try h.ok("kv.history", "k", .{ .limit = 2, .routing_key = null });
     try testing.expectEqual(@as(u32, 2), two.versions.count);
     var it = two.versions.iterator();
     for ([_]struct { version: u64, value: []const u8 }{ .{ .version = 3, .value = "v3" }, .{ .version = 2, .value = "v2" } }) |want| {
@@ -524,8 +580,8 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
         try testing.expectEqualStrings(want.value, v.value);
         try testing.expect(v.at_ms > 0);
     }
-    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10 })).versions.count);
-    try h.no("kv.history", "absent", .{ .limit = 10 }, .not_found, .not_found);
+    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .routing_key = null })).versions.count);
+    try h.no("kv.history", "absent", .{ .limit = 10, .routing_key = null }, .not_found, .not_found);
 }
 
 test "kv ops: mget answers each key in order, found or not, and next when they don't all fit" {

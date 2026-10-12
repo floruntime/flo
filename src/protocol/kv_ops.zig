@@ -177,7 +177,10 @@ pub const table = [_]ops.Op{
         .name = "kv.history",
         .code = 0x105,
         .class = .read,
-        .request = Record(&.{.{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_HISTORY), 10) }}),
+        .request = Record(&.{
+            .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_HISTORY), 10) },
+            .{ .name = "routing_key", .T = RoutingKey },
+        }),
         .response = Record(&.{.{ .name = "versions", .T = schema.BoundedList(HistoryEntry, MAX_HISTORY, listRoom(1)) }}),
         .doc = "A key's versions, newest first, as many as fit one answer.",
     },

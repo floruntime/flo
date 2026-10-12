@@ -123,6 +123,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"hist"})
                 .arg("key", "Key to show history for")
                 .uintFlag("limit", 'l', 10, std.fmt.comptimePrint("Most versions to show, at most {d}", .{kv_ops.MAX_HISTORY}))
+                .stringFlag("routing-key", 'r', "", "Routing key for shard co-location")
                 .action(wrapHandler(runHistory)),
         )
         .subcommand(
@@ -386,7 +387,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     if (limit == 0 or limit > kv_ops.MAX_HISTORY) return outcome.usage(ctx, "--limit is 1 to {d}", .{kv_ops.MAX_HISTORY});
     var client = try dialClient(ctx);
     defer client.deinit();
-    var a = try send(ctx, &client, "kv.history", cli_config.getNamespace(ctx), key, .{ .limit = limit });
+    var a = try send(ctx, &client, "kv.history", cli_config.getNamespace(ctx), key, .{ .limit = limit, .routing_key = optionalRoutingKey(ctx) });
     defer a.deinit();
     const format = output.getFormat(ctx);
     if (format == .json) ctx.print("[", .{});
@@ -443,9 +444,11 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
                 .raw => ctx.print("{s}\t{s}\n", .{ keys[i], value orelse "(nil)" }),
             }
         }
-        const next = a.value.next orelse break;
-        if (next == 0) return outcome.malformed(ctx, "kv.mget answer (no progress)");
-        from += next;
+        // A request holds as many keys as fit it; the answer, as many of
+        // those as fit an answer. Go on from the first key either left out.
+        const answered = a.value.next orelse list.count;
+        if (answered == 0 or answered > list.count or i - from != answered) return outcome.malformed(ctx, "kv.mget answer");
+        from += answered;
     }
     if (format == .json) ctx.print("]\n", .{});
 }
@@ -560,7 +563,8 @@ fn runExists(ctx: *commander.Context) commander.Error!void {
         ctx.print("0\n", .{});
         return error.NotFound; // exit 1, for shell `if`
     }
-    ctx.print("1\n", .{});
+    // A write buffered in a transaction has no version until it commits.
+    if (a.value.version == 0) ctx.print("1\n", .{}) else ctx.print("1 version={d}\n", .{a.value.version});
 }
 
 fn runJsonGet(ctx: *commander.Context) commander.Error!void {
