@@ -90,6 +90,9 @@ pub const TxnState = struct {
     ops: std.ArrayListUnmanaged(TxnOp),
     /// Total bytes buffered (sum of key.len + value.len across ops).
     payload_bytes: usize,
+    /// Its batch is proposed and hasn't applied yet. It takes no more ops,
+    /// and no second commit or rollback: the batch is already in the log.
+    committing: bool = false,
 
     fn deinit(self: *TxnState, allocator: Allocator) void {
         for (self.ops.items) |op| {

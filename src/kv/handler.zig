@@ -720,8 +720,9 @@ pub const KVHandler = struct {
         defer self.allocator.free(payload);
         const written = txn_mod.serializeBatch(payload, t.namespace_hash, t.ops.items) catch return error.Internal;
         const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload[0..written]) catch |err| return proposeError(err);
-        // The transaction stays until its batch applies; the responder
-        // drops it.
+        // The transaction stays until its batch applies, and the responder
+        // drops it; until then a second commit would propose it again.
+        t.committing = true;
         return .{ .park = .{ .proposed = proposed, .responder = respondCommitted } };
     }
 
@@ -735,6 +736,15 @@ pub const KVHandler = struct {
         const count: u16 = if (table.get(body.txn)) |t| @intCast(t.ops.items.len) else 0;
         table.drop(body.txn);
         table_run.answer(TxnCommitResponse, shard, conn, req.header.request_id, .{ .commit_index = shard.raft_node.last_applied, .ops = count });
+    }
+
+    /// A commit whose batch won't be answered for (a leader change, a
+    /// failed flush): drop its transaction. If the batch still applies it
+    /// applies whole, on its own.
+    pub fn commitFailed(self: *KVHandler, req: Request) void {
+        var diag: schema.Diagnostic = .{};
+        const body = table_run.op("kv.txn_commit").request.decodeAll(req.value, &diag) catch return;
+        self.txn_table.drop(body.txn);
     }
 
     /// Drop a transaction and its buffered writes.
@@ -881,11 +891,12 @@ pub const KVHandler = struct {
         return try shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
     }
 
-    /// Transaction `txn_id`, if it was begun in `namespace`. Ids are small
-    /// per-shard counters, so one begun in another namespace is not found
-    /// from this one.
+    /// Transaction `txn_id`, if it is open and was begun in `namespace`.
+    /// Ids are small per-shard counters, so one begun in another namespace
+    /// is not found from this one. One whose commit is in the log is closed.
     fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
         const t = txn_table.get(txn_id) orelse return null;
+        if (t.committing) return null;
         return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
     }
 

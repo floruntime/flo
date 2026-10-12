@@ -44,8 +44,9 @@ pub const Reason = enum(u16) {
     cas_mismatch = 15,
     /// The write's `condition` didn't hold.
     condition_failed = 16,
-    /// No open transaction has this id here: it committed, rolled back,
-    /// was begun in another namespace, or never existed.
+    /// No open transaction has this id here: it committed or is
+    /// committing, rolled back, was begun in another namespace, or never
+    /// existed.
     no_such_transaction = 17,
     /// The request's routing key (its key, when it gives none) isn't the
     /// one its transaction was begun with.
