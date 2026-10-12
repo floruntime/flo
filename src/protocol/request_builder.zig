@@ -50,96 +50,18 @@ pub const RequestBuilder = struct {
             .options = options,
         };
     }
-
-    /// Build a request without options (convenience wrapper)
-    pub fn buildSimple(
-        self: *RequestBuilder,
-        op_code: OpCode,
-        namespace: []const u8,
-        key: []const u8,
-        value: []const u8,
-    ) Request {
-        return self.build(op_code, namespace, key, value, "");
-    }
-
-    // =========================================================================
-    // Simple API: use "default" namespace (common case)
-    // =========================================================================
-
-    pub fn get(self: *RequestBuilder, key: []const u8) Request {
-        return self.getNamespace("default", key);
-    }
-
-    pub fn put(self: *RequestBuilder, key: []const u8, value: []const u8) Request {
-        return self.putNamespace("default", key, value);
-    }
-
-    pub fn delete(self: *RequestBuilder, key: []const u8) Request {
-        return self.deleteNamespace("default", key);
-    }
-
-    // =========================================================================
-    // Namespace-aware API
-    // =========================================================================
-
-    pub fn getNamespace(self: *RequestBuilder, namespace: []const u8, key: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = proto.RequestHeader.init(.kv_get, request_id),
-            .namespace = namespace,
-            .key = key,
-            .value = &[_]u8{},
-        };
-    }
-
-    pub fn putNamespace(self: *RequestBuilder, namespace: []const u8, key: []const u8, value: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = proto.RequestHeader.init(.kv_put, request_id),
-            .namespace = namespace,
-            .key = key,
-            .value = value,
-        };
-    }
-
-    pub fn deleteNamespace(self: *RequestBuilder, namespace: []const u8, key: []const u8) Request {
-        const request_id = self.nextId();
-
-        return Request{
-            .header = proto.RequestHeader.init(.kv_delete, request_id),
-            .namespace = namespace,
-            .key = key,
-            .value = &[_]u8{},
-        };
-    }
 };
 
 // =============================================================================
 // Tests
 // =============================================================================
 
-test "RequestBuilder basic operations" {
-    const allocator = std.testing.allocator;
-    var builder = RequestBuilder.init(allocator);
-
-    // Test auto-incrementing IDs
-    const req1 = builder.get("key1");
-    try std.testing.expectEqual(@as(u64, 1), req1.header.request_id);
-
-    const req2 = builder.put("key2", "value2");
-    try std.testing.expectEqual(@as(u64, 2), req2.header.request_id);
-
-    const req3 = builder.delete("key3");
-    try std.testing.expectEqual(@as(u64, 3), req3.header.request_id);
-}
-
-test "RequestBuilder namespace operations" {
-    const allocator = std.testing.allocator;
-    var builder = RequestBuilder.init(allocator);
-
-    const req = builder.getNamespace("prod", "mykey");
-    try std.testing.expectEqualStrings("prod", req.namespace);
-    try std.testing.expectEqualStrings("mykey", req.key);
+test "RequestBuilder numbers its requests and keeps what it's given" {
+    var builder = RequestBuilder.init(std.testing.allocator);
+    const first = builder.build(.kv_delete, "prod", "mykey", "", "");
+    const second = builder.build(.kv_exists, "prod", "other", "", "");
+    try std.testing.expectEqual(@as(u64, 1), first.header.request_id);
+    try std.testing.expectEqual(@as(u64, 2), second.header.request_id);
+    try std.testing.expectEqualStrings("prod", first.namespace);
+    try std.testing.expectEqualStrings("mykey", first.key);
 }

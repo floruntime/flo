@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const kv_ops = @import("src").protocol.kv_ops;
 const proto = @import("src").protocol.proto;
 
 /// How one entry of a family's list answer is laid out; returns the name
@@ -182,9 +183,11 @@ fn expectBigShardListed(ctx: *stdx.testing.TestContext, write: proto.OpCode, val
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
     var out: [256 * 1024]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    const sent = if (write == .kv_put) try kv_ops.plainSetBody(&body_buf, value) else value;
     for (0..BIG) |i| {
         var key_buf: [16]u8 = undefined;
-        _ = try call(fd, write, try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i}), value, &out);
+        _ = try call(fd, write, try std.fmt.bufPrint(&key_buf, "big-{d:0>4}", .{i}), sent, &out);
     }
 
     var seen = [_]u8{0} ** BIG;

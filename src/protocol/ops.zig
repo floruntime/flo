@@ -87,6 +87,11 @@ pub const Op = struct {
     wait: ?Wait = null,
     fanout: Fanout = .none,
     route: Route = .key,
+    /// The request field naming a transaction. When it is present the
+    /// request goes wherever that transaction lives, its pinned shard's
+    /// leader, whatever the op's class: a read in a transaction sees the
+    /// transaction's writes.
+    txn: ?[]const u8 = null,
     /// The request body: a `schema.Record`. The namespace and key are the
     /// envelope's, so they aren't listed.
     request: type,
@@ -195,6 +200,12 @@ fn opRule(comptime op: Op, comptime before: []const Op) ?[]const u8 {
         if (f.T.kind == .defaulted and f.T.default_value != w.default_ms) return std.fmt.comptimePrint("wait default {d} ms disagrees with field '{s}', which defaults to {d}", .{ w.default_ms, w.field, f.T.default_value });
     }
     if (op.fanout == .walk and op.route != .key) return "a walk runs on every shard, so it has no route";
+    if (op.txn) |name| {
+        const f = fieldOf(op.request, name) orelse return "names transaction field '" ++ name ++ "', which its request doesn't have";
+        const T = if (f.T.kind == .optional) f.T.Inner else f.T;
+        if (T.kind != .integer or T.Value != u64) return "transaction field '" ++ name ++ "' must be a u64";
+        if (op.fanout != .none) return "a transaction lives on one shard, so a walk can't take one";
+    }
     if (op.doc.len == 0) return "has no doc line";
     return null;
 }
@@ -242,6 +253,7 @@ pub fn tableHash(comptime ops: []const Op, comptime entries: anytype) u64 {
             hashNum(&h, @intFromEnum(op.fanout));
             hashStr(&h, @tagName(op.route));
             if (op.route == .field) hashStr(&h, op.route.field);
+            hashStr(&h, op.txn orelse "no txn");
             if (op.wait) |w| {
                 hashStr(&h, w.field);
                 hashNum(&h, w.default_ms);
@@ -292,6 +304,7 @@ fn hashSchema(comptime h: *std.hash.Wyhash, comptime T: type) void {
     }
     if (@hasDecl(T, "Inner")) hashSchema(h, T.Inner);
     if (@hasDecl(T, "Element")) hashSchema(h, T.Element);
+    if (@hasDecl(T, "byte_bound")) hashNum(h, @as(i128, T.byte_bound orelse -1));
     if (T.kind == .enumeration) hashEnum(h, T.Value);
     if (@hasDecl(T, "lo")) {
         hashNum(h, T.lo);
@@ -460,7 +473,7 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0x822fa2404f0ec623), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0x473ddfbb2a68065b), comptime tableHash(&test_table, NoEntries));
 }
 
 test "ops: the hash covers which field a route names and a wait's default" {

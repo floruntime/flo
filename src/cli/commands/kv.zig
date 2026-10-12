@@ -1,8 +1,8 @@
 //! KV (Key-Value) commands for Flo CLI using Commander framework
 //!
 //! Usage:
-//!   flo kv get <key> [--wait <ms>] [--block <ms>] [--output json|table|raw]
-//!   flo kv set <key> <value> [--ttl <duration>] [--nx] [--xx]
+//!   flo kv get <key> [--wait-ms <ms>] [--wait-for exists|change] [--output json|table|raw]
+//!   flo kv set <key> <value> [--ttl-ms <ms>] [--condition always|if_absent|if_present] [--cas-version <v>]
 //!   flo kv delete <key>
 //!   flo kv list [--prefix <prefix>]
 
@@ -16,6 +16,8 @@ const output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const cli_config = @import("../config.zig");
 const time_units = @import("../../util/time_units.zig");
+const kv_ops = @import("../../protocol/kv_ops.zig");
+const schema = @import("../../protocol/schema.zig");
 const WireReader = wire.WireReader;
 
 /// Wrapper to cast *anyopaque to *Context
@@ -47,14 +49,14 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo kv get mykey",
                     "flo kv get mykey --output json",
-                    "flo kv get mykey --wait 5000",
-                    "flo kv get mykey --block 5000",
+                    "flo kv get mykey --wait-ms 5s",
+                    "flo kv get mykey --wait-ms 5s --wait-for change",
                     "flo kv get user:123 --namespace users",
                     "flo kv get balance:alice --routing-key user:123",
                 })
                 .arg("key", "Key to retrieve")
-                .uintFlag("wait", 'w', 0, "Wait until key exists (ms, at most 300000; 0 = don't wait)")
-                .uintFlag("block", 'b', 0, "Block for changes (ms, at most 300000; 0 = don't wait). On timeout, prints the unchanged value")
+                .stringFlag("wait-ms", 'w', "", "How long to wait: milliseconds, or a number and a unit (500ms, 30s, 5m); at most 5m; 0 or omitted doesn't wait")
+                .stringFlag("wait-for", 0, "exists", "What to wait for: exists (answers at once if the key exists) or change (the next version). On timeout, a change wait prints the unchanged value")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runGet)),
@@ -77,19 +79,18 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .about("Set a key-value pair")
                 .examples(&.{
                     "flo kv set mykey myvalue",
-                    "flo kv set mykey myvalue --ttl 1h",
-                    "flo kv set lock:job myvalue --ttl 500ms",
-                    "flo kv set mykey myvalue --nx",
-                    "flo kv set counter 0 --xx",
-                    "flo kv set mykey newvalue --cas 42",
+                    "flo kv set mykey myvalue --ttl-ms 1h",
+                    "flo kv set lock:job myvalue --ttl-ms 500",
+                    "flo kv set mykey myvalue --condition if_absent",
+                    "flo kv set counter 0 --condition if_present",
+                    "flo kv set mykey newvalue --cas-version 42",
                     "flo kv set balance:alice 500 --routing-key user:123",
                 })
                 .arg("key", "Key to set")
                 .arg("value", "Value to store")
-                .stringFlag("ttl", 0, "", "Time to live: a number and a unit (500ms, 30s, 5m, 1h, 1d); omit for none")
-                .boolFlag("nx", 0, "Only set if key does NOT exist")
-                .boolFlag("xx", 0, "Only set if key DOES exist")
-                .uint64Flag("cas", 0, 0, "Compare-and-swap version (only set if current version matches)")
+                .stringFlag("ttl-ms", 0, "", "Time to live: milliseconds, or a number and a unit (500ms, 30s, 5m, 1h, 1d); 0 or omitted for none")
+                .stringFlag("condition", 0, "always", "always, if_absent (only if the key doesn't exist) or if_present (only if it does)")
+                .uint64Flag("cas-version", 0, 0, "Only set if the key's version is this; 0 means the key doesn't exist")
                 .stringFlag("routing-key", 'r', "", "Routing key for shard co-location (same as {tag} in key)")
                 .uint64Flag("txn", 't', 0, "Transaction ID (omit for non-txn ops)")
                 .action(wrapHandler(runSet)),
@@ -233,10 +234,9 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .name("commit")
                 .about("Commit a per-shard transaction (atomic batch apply)")
                 .examples(&.{
-                    "flo kv commit 42 --routing-key user:123",
+                    "flo kv commit 281474976710657",
                 })
                 .arg("txn-id", "Transaction ID returned by `kv begin`")
-                .stringFlag("routing-key", 'r', "", "Routing key used at BEGIN (required)")
                 .action(wrapHandler(runTxnCommit)),
         )
         .subcommand(
@@ -244,7 +244,6 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
                 .name("rollback")
                 .about("Discard a per-shard transaction's buffered ops")
                 .arg("txn-id", "Transaction ID returned by `kv begin`")
-                .stringFlag("routing-key", 'r', "", "Routing key used at BEGIN (required)")
                 .action(wrapHandler(runTxnRollback)),
         )
         .build();
@@ -252,115 +251,84 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
 
 fn runGet(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
-
-    // --wait: Wait until key exists (returns immediately if present)
-    // --block: Block for changes (waits for NEXT version even if key exists) - like stream/queue --block
-    const wait_ms = ctx.getChangedUint("wait");
-    const block_ms = ctx.getChangedUint("block");
     const namespace = cli_config.getNamespace(ctx);
-
-    // --routing-key: explicit shard co-location (same routing as {tag} in key name)
-    const routing_key: ?[]const u8 = blk: {
-        const rk = ctx.getString("routing-key") orelse break :blk null;
-        break :blk if (rk.len > 0) rk else null;
+    const wait_for = try enumFlag(ctx, kv_ops.WaitFor, "wait-for");
+    const body: client_mod.kv.get_op.request.Value = .{
+        .wait_ms = (try durationMsFlag(ctx, "wait-ms")) orelse 0,
+        .wait_for = wait_for,
+        .routing_key = optionalRoutingKey(ctx),
+        .txn = optionalTxnId(ctx),
     };
-    const txn_id = optionalTxnId(ctx);
-
-    // Cannot use both --wait and --block
-    if (wait_ms != null and block_ms != null) {
-        ctx.printErr("Error: Cannot use both --wait and --block\n", .{});
-        ctx.printErr("  --wait: returns immediately if key exists, else waits for creation\n", .{});
-        ctx.printErr("  --block: blocks for changes (waits for NEXT version even if key exists)\n", .{});
-        return error.Usage;
-    }
-
+    if (body.wait_ms > kv_ops.MAX_WAIT_MS) return outcome.usage(ctx, "--wait-ms is at most {d} (5m)", .{kv_ops.MAX_WAIT_MS});
     const format = output.getFormat(ctx);
 
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    if (output.isVerbose(ctx)) {
-        ctx.printErr("[verbose] GET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, endpoint });
-    }
-
-    var client = Client.init(ctx.allocator, endpoint);
+    var client = try dialClient(ctx);
     defer client.deinit();
+    if (output.isVerbose(ctx)) ctx.printErr("[verbose] GET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, client.endpoint });
 
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.kv.get(&client, namespace, key, wait_ms, block_ms, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.kv.get(&client, namespace, key, body) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
-    if (result.isNotFound()) {
+    if (result.isNotFound() and result.reason() == .not_found) {
         try outputKvResult(ctx, format, key, null, null);
         return error.NotFound;
     }
-
     try outcome.check(ctx, result);
-
-    // [version:u64][value]; an empty value is still 8 bytes.
-    if (result.data.len < 8) return outcome.malformed(ctx, "get response");
-    try outputKvResult(ctx, format, key, result.data[8..], result.getVersion());
+    var diag: schema.Diagnostic = .{};
+    const answer = client_mod.kv.get_op.response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "get response");
+    try outputKvResult(ctx, format, key, answer.value, answer.version);
 }
 
 fn runSet(ctx: *commander.Context) commander.Error!void {
     const key = ctx.getPositional("key").?; // validated by commander
     const value = ctx.getPositional("value").?; // validated by commander
-
-    const ttl = try ttlFlag(ctx);
-    const nx = ctx.getBool("nx");
-    const xx = ctx.getBool("xx");
-    const cas = ctx.getChangedUint64("cas");
     const namespace = cli_config.getNamespace(ctx);
-
-    // --routing-key: explicit shard co-location (same routing as {tag} in key name)
-    const routing_key: ?[]const u8 = blk: {
-        const rk = ctx.getString("routing-key") orelse break :blk null;
-        break :blk if (rk.len > 0) rk else null;
+    const ttl_ms = try durationMsFlag(ctx, "ttl-ms");
+    const body: client_mod.kv.set_op.request.Value = .{
+        .value = value,
+        .ttl_ms = if (ttl_ms) |t| if (t > 0) t else null else null,
+        .condition = try enumFlag(ctx, kv_ops.Condition, "condition"),
+        .cas_version = ctx.getChangedUint64("cas-version"),
+        .routing_key = optionalRoutingKey(ctx),
+        .txn = optionalTxnId(ctx),
     };
 
-    if (nx and xx) {
-        return outcome.usage(ctx, "Cannot use both --nx and --xx", .{});
-    }
+    if (value.len > kv_ops.MAX_VALUE) return outcome.usage(ctx, "the value is {d} bytes; at most {d}", .{ value.len, kv_ops.MAX_VALUE });
+    if ((body.ttl_ms orelse 0) > kv_ops.MAX_TTL_MS) return outcome.usage(ctx, "--ttl-ms is at most {d}", .{kv_ops.MAX_TTL_MS});
 
-    if (cas != null and nx) {
-        return outcome.usage(ctx, "Cannot use --cas with --nx", .{});
-    }
-
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    if (output.isVerbose(ctx)) {
-        ctx.printErr("[verbose] SET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, endpoint });
-    }
-
-    var client = Client.init(ctx.allocator, endpoint);
+    var client = try dialClient(ctx);
     defer client.deinit();
+    if (output.isVerbose(ctx)) ctx.printErr("[verbose] SET key={s} namespace={s} endpoint={s}\n", .{ key, namespace, client.endpoint });
 
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    const ttl_val: ?u64 = if (ttl) |t| if (t > 0) t else null else null;
-
-    var result = client_mod.kv.set(&client, namespace, key, value, .{
-        .ttl_ms = ttl_val,
-        .if_not_exists = nx,
-        .if_exists = xx,
-        .cas_version = cas,
-        .routing_key = routing_key,
-        .txn_id = optionalTxnId(ctx),
-    }) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.kv.set(&client, namespace, key, body) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
-    if (result.isConflict()) {
-        if (cas != null) {
-            ctx.printErr("Version mismatch\n", .{});
-        } else {
-            ctx.printErr("Condition not met (key {s})\n", .{if (nx) "already exists" else "does not exist"});
-        }
-        return error.Refused;
-    }
-
     try outcome.check(ctx, result);
+    var diag: schema.Diagnostic = .{};
+    const answer = client_mod.kv.set_op.response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "set response");
+    if (answer.version) |v| ctx.print("OK version={d}\n", .{v}) else ctx.print("OK\n", .{});
+}
 
-    ctx.print("OK\n", .{});
+/// A `*-ms` flag: milliseconds, or a number and a unit; null when not
+/// given. The flag's name says the unit, so a bare number is read as it.
+fn durationMsFlag(ctx: *commander.Context, comptime name: []const u8) commander.Error!?u64 {
+    const text = ctx.getString(name) orelse return null;
+    if (text.len == 0) return null;
+    if (std.fmt.parseInt(u64, text, 10)) |ms| return ms else |_| {}
+    return time_units.parseDurationMs(text) orelse
+        outcome.usage(ctx, "--" ++ name ++ " {s} is not a duration; give milliseconds, or a number and a unit (500ms, 30s, 5m, 1h, 1d)", .{text});
+}
+
+/// A flag naming one value of `E`.
+fn enumFlag(ctx: *commander.Context, comptime E: type, comptime name: []const u8) commander.Error!E {
+    const text = ctx.getString(name) orelse "";
+    return std.meta.stringToEnum(E, text) orelse
+        outcome.usage(ctx, "--" ++ name ++ " {s} is not one of: " ++ comptime enumNames(E), .{text});
+}
+
+fn enumNames(comptime E: type) []const u8 {
+    var out: []const u8 = "";
+    for (std.meta.fieldNames(E), 0..) |n, i| out = out ++ (if (i == 0) "" else ", ") ++ n;
+    return out;
 }
 
 fn runDelete(ctx: *commander.Context) commander.Error!void {
@@ -927,7 +895,6 @@ fn runTxnBegin(ctx: *commander.Context) commander.Error!void {
 
 fn runTxnCommit(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
-    const routing_key = try requireRoutingKey(ctx);
     const txn_str = ctx.getPositional("txn-id").?;
     const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
         return outcome.usage(ctx, "invalid txn-id '{s}'", .{txn_str});
@@ -936,7 +903,7 @@ fn runTxnCommit(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.commitTxn(&client, namespace, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.kv.commitTxn(&client, namespace, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
@@ -949,7 +916,6 @@ fn runTxnCommit(ctx: *commander.Context) commander.Error!void {
 
 fn runTxnRollback(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
-    const routing_key = try requireRoutingKey(ctx);
     const txn_str = ctx.getPositional("txn-id").?;
     const txn_id = std.fmt.parseInt(u64, txn_str, 10) catch {
         return outcome.usage(ctx, "invalid txn-id '{s}'", .{txn_str});
@@ -958,7 +924,7 @@ fn runTxnRollback(ctx: *commander.Context) commander.Error!void {
     var client = try dialClient(ctx);
     defer client.deinit();
 
-    var result = client_mod.kv.rollbackTxn(&client, namespace, routing_key, txn_id) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.kv.rollbackTxn(&client, namespace, txn_id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);

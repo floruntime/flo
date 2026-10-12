@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const kv_ops = @import("src").protocol.kv_ops;
 
 /// Send one request over the client protocol and return its status and
 /// message: a key holding a NUL cannot be passed as a command-line argument.
@@ -51,8 +52,14 @@ test "e2e/kv: a key holding a NUL is refused, and a default listing shows only d
     try ctx.exec(&.{ "kv", "set", "mine", "default-value" });
 
     var out: [512]u8 = undefined;
+    var body_buf: [32]u8 = undefined;
     for ([_]proto.OpCode{ .kv_put, .kv_get, .kv_delete }) |op| {
-        const r = try rawCall(ctx, op, "", "b\x00k", "overwrite", &out);
+        const value = switch (op) {
+            .kv_put => try kv_ops.plainSetBody(&body_buf, "overwrite"),
+            .kv_get => try kv_ops.plainGetBody(&body_buf),
+            else => "overwrite",
+        };
+        const r = try rawCall(ctx, op, "", "b\x00k", value, &out);
         try testing.expectEqual(@intFromEnum(proto.StatusCode.bad_request), r.status);
         try testing.expect(std.mem.indexOf(u8, r.data, "key must not contain NUL") != null);
     }

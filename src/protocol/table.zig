@@ -5,13 +5,21 @@
 const std = @import("std");
 const ops = @import("ops.zig");
 const entries = @import("entries.zig");
+const kv_ops = @import("kv_ops.zig");
 
-pub const op_table = [_]ops.Op{};
+pub const op_table = [_]ops.Op{ kv_ops.op("kv.get"), kv_ops.op("kv.set") };
 pub const entry_table = [_]entries.Entry{};
 
 comptime {
     ops.check(&op_table);
     entries.check(&entry_table);
+}
+
+/// Whether `code` is a table op: its request is `[namespace][key][body]`,
+/// the body coded by its schema.
+pub fn isOp(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return true;
+    return false;
 }
 
 /// Bump this in any change to a request, answer or log-entry layout that is

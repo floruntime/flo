@@ -36,6 +36,31 @@ pub const Reason = enum(u16) {
     /// A refusal from an op family not yet on the op table; its status and
     /// message say what happened. Goes once every family is on the table.
     unclassified = 12,
+    /// What the request names doesn't exist.
+    not_found = 13,
+    /// The key is in a prefix the server keeps for itself.
+    reserved_key = 14,
+    /// The write's `cas_version` isn't the key's version.
+    cas_mismatch = 15,
+    /// The write's `condition` didn't hold.
+    condition_failed = 16,
+    /// No open transaction has this id here: it committed, rolled back,
+    /// was begun in another namespace, or never existed.
+    no_such_transaction = 17,
+    /// The request's routing key (its key, when it gives none) isn't the
+    /// one its transaction was begun with.
+    wrong_routing_key = 18,
+    /// The transaction holds as many ops or bytes as it may.
+    txn_too_large = 19,
+    /// The shard holds as many waiting reads as it may.
+    too_many_waiters = 20,
+    /// Two fields given together that don't go together.
+    conflicting_fields = 21,
+    /// The shard stopped taking writes: one left memory before it reached
+    /// disk. It takes them again once the node restarts.
+    writes_stopped = 22,
+    /// Too many writes wait for commit.
+    too_many_proposals = 23,
 };
 
 /// Whether a refused request took effect.

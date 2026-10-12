@@ -344,14 +344,35 @@ pub fn Defaulted(comptime T: type, comptime default: T.Value) type {
 /// view: every element is checked before decode returns, and none is
 /// copied.
 pub fn List(comptime T: type, comptime max: u32) type {
+    return ListOf(T, max, null);
+}
+
+/// A list of at most `max` elements whose elements together take at most
+/// `max_bytes`: for an answer whose elements can each be large, so its
+/// worst case is the byte bound, not the count times the largest element.
+/// A server fills one until the next element wouldn't fit (`fits`).
+pub fn BoundedList(comptime T: type, comptime max: u32, comptime max_bytes: u32) type {
+    return ListOf(T, max, max_bytes);
+}
+
+fn ListOf(comptime T: type, comptime max: u32, comptime max_bytes: ?u32) type {
     if (listRule(T)) |message| @compileError(message);
+    if (max_bytes) |b| if (T.max_size > b) @compileError(std.fmt.comptimePrint("a bounded list of {d} bytes can't hold even one element of up to {d}", .{ b, T.max_size }));
     const P = PrefixFor(max);
+    const by_count = @as(usize, max) * T.max_size;
     return struct {
         pub const min_size = @sizeOf(P);
-        pub const max_size = @sizeOf(P) + @as(usize, max) * T.max_size;
+        pub const max_size = @sizeOf(P) + if (max_bytes) |b| @min(by_count, b) else by_count;
         pub const Element = T;
         pub const bound = max;
+        pub const byte_bound = max_bytes;
         pub const kind = .list;
+
+        /// Whether `count` more elements of `bytes` encoded bytes keep the
+        /// list within both its bounds.
+        pub fn fits(count: usize, bytes: usize) bool {
+            return count <= max and (if (max_bytes) |b| bytes <= b else true);
+        }
 
         /// The list's elements, already validated.
         pub const Value = struct {
@@ -389,6 +410,7 @@ pub fn List(comptime T: type, comptime max: u32) type {
             if (least > r.remaining()) return r.refuse(.malformed, field, count);
             const start = r.pos;
             for (0..count) |_| _ = try T.decode(r, field);
+            if (max_bytes) |b| if (r.pos - start > b) return r.refuse(.field_too_long, field, b);
             return .{ .bytes = r.bytes[start..r.pos], .count = count };
         }
 
@@ -396,7 +418,9 @@ pub fn List(comptime T: type, comptime max: u32) type {
         pub fn encodeSlice(w: *Writer, items: []const T.Value) EncodeError!void {
             if (items.len > max) return error.TooLong;
             try w.int(P, @intCast(items.len));
+            const start = w.pos;
             for (items) |item| try T.encode(w, item);
+            if (max_bytes) |b| if (w.pos - start > b) return error.TooLong;
         }
 
         /// Re-encodes a decoded view (for forwarding or round-trip checks).
@@ -468,6 +492,7 @@ pub const Field = struct {
 /// these functions build each type from finished ones, so a schema type is
 /// never recursive.
 pub fn Record(comptime fields: []const Field) type {
+    @setEvalBranchQuota(100_000);
     if (recordRule(fields)) |message| @compileError(message);
     const RecordValue = blk: {
         var names: [fields.len][]const u8 = undefined;
