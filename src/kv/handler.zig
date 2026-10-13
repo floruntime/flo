@@ -62,7 +62,7 @@ const Connection = connection_mod.Connection;
 const RaftNetwork = network_mode.RaftNetwork;
 
 /// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
-const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
+pub const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
 /// The largest entry any handler proposes: a full transaction batch. The
 /// shard's apply buffer and the Raft ring floor are both sized from it,
 /// because an entry that fits the ring but not the buffer would be acked
@@ -865,7 +865,6 @@ pub const KVHandler = struct {
         ttl_ms: u64,
     ) !@import("../raft/node.zig").ProposeResult {
         // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
-        var payload_buf: [MAX_ENTRY_PAYLOAD]u8 = undefined;
         const cmd = entry_mod.CommandPayload{
             .namespace_hash = router.namespaceHash(req.namespace),
             .key_length = @intCast(qualified_key.len),
@@ -873,7 +872,12 @@ pub const KVHandler = struct {
             .key = qualified_key,
             .value = value,
         };
-        var payload_len = cmd.serialize(&payload_buf) orelse return error.PayloadTooLarge;
+        const has_ttl = entry_type == .kv_put and ttl_ms > 0;
+        const size = cmd.serializedSize() + if (has_ttl) @as(usize, 8) else 0;
+        if (size > MAX_ENTRY_PAYLOAD) return error.PayloadTooLarge;
+        const payload_buf = shard.scratch.borrow(size);
+        defer shard.scratch.release(payload_buf);
+        var payload_len = cmd.serialize(payload_buf).?; // sized above
 
         // Set flags and append TTL if present
         var flags: u16 = entry_mod.Flags.NONE;
@@ -881,7 +885,7 @@ pub const KVHandler = struct {
             flags |= entry_mod.Flags.TOMBSTONE;
         }
 
-        if (entry_type == .kv_put and ttl_ms > 0) {
+        if (has_ttl) {
             flags |= entry_mod.Flags.HAS_TTL;
             if (time_units.msToNs(ttl_ms) == null) return error.TtlTooLarge;
             std.mem.writeInt(u64, payload_buf[payload_len..][0..8], ttl_ms, .little);

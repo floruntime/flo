@@ -123,8 +123,8 @@ pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
 /// How much `readFromClient` reads from a socket at once.
 const READ_CHUNK: usize = 64 * 1024;
 /// The largest answer or payload a handler builds in `scratch`: a whole
-/// kv.get answer, header included.
-pub const SCRATCH_SIZE: usize = @sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size;
+/// kv.get answer, header included, or a KV entry's payload.
+pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size, kv_handler_mod.MAX_ENTRY_PAYLOAD);
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
@@ -4652,12 +4652,29 @@ pub const Shard = struct {
     /// The connection's generation is checked against the live connection
     /// before writing, so that fd reuse (close + accept at the same fd)
     /// cannot misdirect a stale answer to the wrong client.
-    pub fn deliverDeferred(self: *Shard, reply_to: ReplyTo, bytes: []const u8) void {
-        // Noted for `dispatchNoted`, which checks the request was parked.
-        if (self.dispatching) |*d| if (bytes.len >= @sizeOf(proto.ResponseHeader)) {
-            const id = std.mem.readInt(u64, bytes[@offsetOf(proto.ResponseHeader, "request_id")..][0..8], .little);
-            if (id == d.request_id and std.meta.eql(reply_to, d.reply_to)) d.answered_deferred = true;
+    /// Noted for `dispatchNoted`, which checks the request was parked.
+    fn noteDeferred(self: *Shard, reply_to: ReplyTo, request_id: u64) void {
+        if (self.dispatching) |*d| {
+            if (request_id == d.request_id and std.meta.eql(reply_to, d.reply_to)) d.answered_deferred = true;
+        }
+    }
+
+    /// The connection `reply_to` names, when it is this shard's and still
+    /// the same client.
+    fn localConnection(self: *Shard, reply_to: ReplyTo) ?*Connection {
+        const to = switch (reply_to) {
+            .remote => return null,
+            .socket => |s| s,
         };
+        if (to.shard != self.id) return null;
+        const conn = self.getConnection(to.fd) orelse return null;
+        return if (conn.id == to.conn_id) conn else null;
+    }
+
+    pub fn deliverDeferred(self: *Shard, reply_to: ReplyTo, bytes: []const u8) void {
+        if (bytes.len >= @sizeOf(proto.ResponseHeader)) {
+            self.noteDeferred(reply_to, std.mem.readInt(u64, bytes[@offsetOf(proto.ResponseHeader, "request_id")..][0..8], .little));
+        }
         const my_id: u16 = @intCast(self.id);
         const to = switch (reply_to) {
             .remote => |r| return self.sendForwardReply(r.node, r.forward_id, bytes),
@@ -4704,15 +4721,24 @@ pub const Shard = struct {
 
     /// Serialize an ok answer and deliver it via `deliverDeferred`.
     pub fn deliverDeferredOk(self: *Shard, reply_to: ReplyTo, request_id: u64, data: []const u8) void {
-        var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // Same rule as `sendOkResponse`: a parked client is answered, never
         // left to its own timeout because the answer is too large to frame
         // (and on another shard, never left holding its reply slot).
-        const serialized = proto.Response.serializeOk(request_id, data, &buf) catch blk: {
+        if (data.len > MAX_REQUEST_SIZE) {
             log.warn("shard {d}: deferred answer to request {d} is {d} bytes, over the frame limit; answered with an error", .{ self.id, request_id, data.len });
-            break :blk proto.Response.serializeRefusal(.internal_error, request_id, TOO_LARGE, &buf);
-        };
-        self.deliverDeferred(reply_to, serialized);
+            return self.deliverDeferredRefusal(reply_to, request_id, .internal_error, TOO_LARGE);
+        }
+        if (self.localConnection(reply_to)) |conn| {
+            self.noteDeferred(reply_to, request_id);
+            self.sendOkResponse(conn, request_id, data);
+            self.flushToClient(conn.fd);
+            return;
+        }
+        const size = @sizeOf(proto.ResponseHeader) + data.len;
+        const buf = self.scratch.borrow(size);
+        defer self.scratch.release(buf);
+        @memcpy(buf[@sizeOf(proto.ResponseHeader)..], data);
+        self.deliverDeferred(reply_to, proto.Response.sealOk(request_id, buf, data.len));
     }
 
     /// A refusal from a site not yet on the op table, delivered via
@@ -4732,13 +4758,17 @@ pub const Shard = struct {
 
     /// Send an OK response with data payload on a connection.
     pub fn sendOkResponse(self: *Shard, conn: *Connection, request_id: u64, data: []const u8) void {
-        _ = self;
-        var buf: [MAX_REQUEST_SIZE + @sizeOf(proto.ResponseHeader)]u8 = undefined;
         // A client waits for every request's answer: one too large to
         // frame is answered with an error, never left out.
-        const serialized = proto.Response.serializeOk(request_id, data, &buf) catch
-            proto.Response.serializeRefusal(.internal_error, request_id, TOO_LARGE, &buf);
-        _ = conn.queueWrite(serialized);
+        if (data.len > MAX_REQUEST_SIZE) return self.sendRefusal(conn, request_id, .internal_error, TOO_LARGE);
+        const header_size = @sizeOf(proto.ResponseHeader);
+        // Written in place; null only where `queueWrite` would refuse it too.
+        const out = conn.reserveWrite(header_size + data.len) orelse {
+            conn.write_overflow = true;
+            return;
+        };
+        @memcpy(out[header_size..], data);
+        conn.commitWrite(proto.Response.sealOk(request_id, out, data.len).len);
     }
 
     /// A request whose handler neither answered nor parked it: a handler
@@ -5227,10 +5257,18 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// Answers a waiting `kv.get`.
 fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
     const Response = table_run.op("kv.get").response;
+    const answer: Response.Value = .{ .version = version, .value = value };
+    // This shard's own client: written in place.
+    if (shard.localConnection(waiter.reply_to)) |conn| {
+        shard.noteDeferred(waiter.reply_to, waiter.request_id);
+        table_run.answer(Response, shard, conn, waiter.request_id, answer);
+        shard.flushToClient(conn.fd);
+        return;
+    }
     const size = @sizeOf(proto.ResponseHeader) + Response.max_size;
     const buf = shard.scratch.borrow(size)[0..size];
     defer shard.scratch.release(buf);
-    if (table_run.encodeAnswer(Response, buf, waiter.request_id, .{ .version = version, .value = value })) |bytes| {
+    if (table_run.encodeAnswer(Response, buf, waiter.request_id, answer)) |bytes| {
         shard.deliverDeferred(waiter.reply_to, bytes);
     } else {
         // The waiter is gone once this returns; an asker left without an

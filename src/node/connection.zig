@@ -153,6 +153,20 @@ pub const RingBuffer = struct {
         self.write_pos = held;
     }
 
+    /// Free bytes in one run at the write end.
+    pub fn contiguousWritable(self: *const RingBuffer) usize {
+        return @min(self.writable(), self.buf.len - (self.write_pos & (self.buf.len - 1)));
+    }
+
+    /// Moves the held bytes to the front, in place, so the free space is
+    /// one run after them.
+    pub fn linearize(self: *RingBuffer) void {
+        const held = self.readable();
+        std.mem.rotate(u8, self.buf, self.read_pos & (self.buf.len - 1));
+        self.read_pos = 0;
+        self.write_pos = held;
+    }
+
     /// Compact: if both cursors have advanced far, reset them.
     pub fn compact(self: *RingBuffer) void {
         if (self.read_pos >= self.buf.len) {
@@ -283,6 +297,8 @@ pub const Connection = struct {
     /// `queueWrite` refused an answer: a client connection is closed at its
     /// next flush.
     write_overflow: bool = false,
+    /// What `reserveWrite` handed out and `commitWrite` hasn't taken back.
+    reserved: ?usize = null,
 
     /// Set when the connection must close; the shard closes it once the
     /// tick's events are handled, never while code up the stack still holds
@@ -419,6 +435,7 @@ pub const Connection = struct {
     /// queued and `write_overflow` is set, because a frame cut short would
     /// desynchronise the client for good. Returns the bytes queued.
     pub fn queueWrite(self: *Connection, data: []const u8) usize {
+        std.debug.assert(self.reserved == null);
         if (data.len > self.write_buf.writable()) {
             const need = self.write_buf.readable() + data.len;
             const cap = std.math.ceilPowerOfTwo(usize, need) catch need;
@@ -432,6 +449,38 @@ pub const Connection = struct {
             };
         }
         return self.write_buf.write(data);
+    }
+
+    /// Room for `n` bytes after the unsent ones, to write an answer in place
+    /// rather than build it elsewhere and copy it; `commitWrite` then
+    /// queues what was written, and nothing else may write in between. The
+    /// held bytes move to the front when the free space wraps, and the buffer
+    /// grows as `queueWrite`'s does. Null past `MAX_WRITE_BUFFER`: the caller
+    /// builds the answer in the shard's scratch and hands it to `queueWrite`,
+    /// which sets `write_overflow`.
+    pub fn reserveWrite(self: *Connection, n: usize) ?[]u8 {
+        std.debug.assert(self.reserved == null);
+        const ring = &self.write_buf;
+        if (ring.contiguousWritable() < n) {
+            if (ring.writable() >= n) {
+                ring.linearize();
+            } else {
+                const cap = std.math.ceilPowerOfTwo(usize, ring.readable() + n) catch return null;
+                if (cap > MAX_WRITE_BUFFER) return null;
+                ring.resize(cap) catch return null;
+            }
+        }
+        std.debug.assert(ring.contiguousWritable() >= n);
+        self.reserved = n;
+        const start = ring.write_pos & (ring.buf.len - 1);
+        return ring.buf[start..][0..n];
+    }
+
+    /// Queues the first `used` bytes `reserveWrite` gave.
+    pub fn commitWrite(self: *Connection, used: usize) void {
+        std.debug.assert(used <= self.reserved.?);
+        self.write_buf.write_pos += used;
+        self.reserved = null;
     }
 
     /// Once everything is sent, give back a buffer grown for a large answer.
@@ -657,4 +706,114 @@ test "Connection: past the cap nothing is queued and the connection is marked, n
     try std.testing.expectEqual(@as(usize, 0), conn.queueWrite(huge));
     try std.testing.expect(conn.write_overflow);
     try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
+}
+
+/// The unsent bytes, in order, however the ring holds them.
+fn unsent(conn: *const Connection, out: []u8) []const u8 {
+    return out[0..conn.write_buf.copyOut(out)];
+}
+
+test "Connection: reserveWrite writes after what is queued, without allocating when it fits" {
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
+    defer conn.deinit();
+    const before = conn.write_buf.buf;
+    _ = conn.queueWrite("head:");
+    const out = conn.reserveWrite(8).?;
+    @memcpy(out[0..5], "tail!");
+    // Only what was written is queued.
+    conn.commitWrite(5);
+    try std.testing.expect(conn.reserved == null);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("head:tail!", unsent(&conn, &buf));
+    try std.testing.expectEqual(before.ptr, conn.write_buf.buf.ptr);
+    try std.testing.expectEqual(before.len, conn.write_buf.buf.len);
+}
+
+test "Connection: reserveWrite moves held bytes to the front, in place, when the free space wraps" {
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
+    defer conn.deinit();
+    const ring = &conn.write_buf;
+    const cap = ring.buf.len;
+    const before = ring.buf.ptr;
+    // Unsent bytes in the middle: the free space is two runs, after them
+    // and before them, each smaller than the answer.
+    const fill = try std.testing.allocator.alloc(u8, cap - 4000);
+    defer std.testing.allocator.free(fill);
+    for (fill, 0..) |*b, i| b.* = @truncate(i *% 7);
+    _ = conn.queueWrite(fill);
+    conn.consumeWritten(1000);
+    const held = ring.readable();
+    const want = cap - held - 500;
+    try std.testing.expect(ring.contiguousWritable() < want);
+
+    const out = conn.reserveWrite(want).?;
+    @memset(out, 0xab);
+    conn.commitWrite(want);
+    try std.testing.expectEqual(before, ring.buf.ptr);
+    try std.testing.expectEqual(held + want, ring.readable());
+    const all = try std.testing.allocator.alloc(u8, cap);
+    defer std.testing.allocator.free(all);
+    const got = unsent(&conn, all);
+    try std.testing.expectEqualSlices(u8, fill[1000..], got[0..held]);
+    for (got[held..]) |b| try std.testing.expectEqual(@as(u8, 0xab), b);
+}
+
+test "Connection: reserveWrite grows like queueWrite, and refuses past MAX_WRITE_BUFFER" {
+    var conn = try Connection.init(std.testing.allocator, 42, 1, 0);
+    defer conn.deinit();
+    _ = conn.queueWrite("first");
+    const big = RingBuffer.DEFAULT_CAPACITY * 2;
+    const out = conn.reserveWrite(big).?;
+    @memset(out, 'x');
+    conn.commitWrite(big);
+    try std.testing.expect(conn.write_buf.buf.len >= 5 + big);
+    var head: [6]u8 = undefined;
+    try std.testing.expectEqualStrings("firstx", unsent(&conn, &head));
+
+    try std.testing.expect(conn.reserveWrite(Connection.MAX_WRITE_BUFFER) == null);
+    try std.testing.expect(conn.reserved == null);
+    try std.testing.expectEqual(@as(usize, 5 + big), conn.write_buf.readable());
+}
+
+test "Connection: queued and reserved writes, sent in pieces, come out in order (randomized)" {
+    const gpa = std.testing.allocator;
+    var conn = try Connection.init(gpa, 42, 1, 0);
+    defer conn.deinit();
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(gpa);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var next: u8 = 0;
+    var src: [70 * 1024]u8 = undefined;
+    for (0..200_000) |_| {
+        switch (r.uintLessThan(u8, 3)) {
+            0, 1 => {
+                // Mostly small answers, sometimes one past the ring.
+                const n = if (r.uintLessThan(u8, 50) == 0) r.uintLessThan(usize, src.len) else r.uintLessThan(usize, 512);
+                for (src[0..n]) |*b| {
+                    b.* = next;
+                    next +%= 1;
+                }
+                if (r.boolean()) {
+                    try std.testing.expectEqual(n, conn.queueWrite(src[0..n]));
+                } else {
+                    const out = conn.reserveWrite(n + r.uintLessThan(usize, 64)).?;
+                    @memcpy(out[0..n], src[0..n]);
+                    conn.commitWrite(n);
+                }
+                try model.appendSlice(gpa, src[0..n]);
+            },
+            else => {
+                // A send takes part of the first contiguous run.
+                const data = conn.pendingWriteData();
+                if (data.len == 0) continue;
+                const n = 1 + r.uintLessThan(usize, data.len);
+                try std.testing.expectEqualSlices(u8, model.items[0..n], data[0..n]);
+                conn.consumeWritten(n);
+                model.replaceRangeAssumeCapacity(0, n, &.{});
+                if (conn.write_buf.readable() == 0) conn.shrinkWriteBuffer();
+            },
+        }
+        try std.testing.expectEqual(model.items.len, conn.write_buf.readable());
+    }
 }
