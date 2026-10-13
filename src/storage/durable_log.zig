@@ -172,6 +172,33 @@ pub const DurableLog = struct {
         self.pending_cut = null;
     }
 
+    pub const Dropped = struct { files: usize = 0, bytes: u64 = 0 };
+
+    /// Delete the sealed segments wholly at or below `through`, oldest
+    /// first, each unlink synced before the next: a crash leaves the newer
+    /// files contiguous, and one whose unlink was lost is dropped again
+    /// next time. A segment straddling `through` is kept. Refused above
+    /// the watermark, the commit a boot trusts, and while a cut is pending,
+    /// since the files then disagree with the log.
+    pub fn dropThrough(self: *DurableLog, through: u64) !Dropped {
+        if (self.pending_cut != null) return error.CutPending;
+        if (through > try self.watermark()) return error.AboveWatermark;
+        const files = try self.listSegments(true);
+        defer self.freeSegments(files);
+        self.invalidate();
+        var dropped: Dropped = .{};
+        for (files) |f| {
+            if (f.last_index > through) break;
+            const size = if (stdx.fs.statFile(f.path, .{})) |st| st.size else |_| 0;
+            try stdx.fs.deleteFile(f.path);
+            try stdx.fs.syncDir(self.segs_path);
+            dropped.files += 1;
+            dropped.bytes += size;
+        }
+        if (dropped.files > 0) log.info("durable log: dropped {d} segment(s), {d} bytes, through index {d}", .{ dropped.files, dropped.bytes, through });
+        return dropped;
+    }
+
     fn applyCut(self: *DurableLog, files: []SegmentFile, after_index: u64) !void {
         // The rewrite needs room for a second copy; it goes first so a full
         // disk fails before anything is deleted.
@@ -602,6 +629,57 @@ test "durable log: truncateAfter inside the writer buffer keeps the prefix and i
 
     writer.truncateAfter(0);
     try testing.expectEqual(@as(u32, 0), writer.entry_count);
+}
+
+test "durable log: dropThrough deletes whole segments oldest first, keeps one straddling the index, and stays done after a reopen" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    {
+        var writer = SegmentWriter.init(testing.allocator, 0);
+        defer writer.deinit();
+        var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+        defer dl.deinit();
+        // Sealed 1-3, 4-6 and 7-8, under commits 3, 6 and 8.
+        for (1..9) |i| {
+            try writer.addEntry(&testEntry(i, 1, "x"));
+            if (i == 3 or i == 6 or i == 8) try dl.flush(i);
+        }
+        // Nothing above the watermark goes, and a pending cut stops it.
+        try testing.expectError(error.AboveWatermark, dl.dropThrough(9));
+        dl.pending_cut = 8;
+        try testing.expectError(error.CutPending, dl.dropThrough(5));
+        dl.pending_cut = null;
+
+        // Through 5: 1-3 goes, 4-6 straddles and stays; one directory
+        // sync per file.
+        const before = stdx.fs.dir_syncs.load(.monotonic);
+        const dropped = try dl.dropThrough(5);
+        try testing.expectEqual(@as(usize, 1), dropped.files);
+        try testing.expect(dropped.bytes > 0);
+        try testing.expectEqual(before + 1, stdx.fs.dir_syncs.load(.monotonic));
+        var buf: [8]Entry = undefined;
+        var arena: [256]u8 = undefined;
+        try testing.expectEqual(@as(usize, 0), dl.readRange(2, &buf, &arena));
+        try testing.expectEqual(@as(usize, 3), dl.readRange(4, &buf, &arena));
+    }
+    // Reopened: the listing starts at 4, and dropping through 6 takes 4-6.
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(usize, 2), files.len);
+    try testing.expectEqual(@as(u64, 4), files[0].first_index);
+    try testing.expectEqual(@as(usize, 1), (try dl.dropThrough(6)).files);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |nm| testing.allocator.free(nm);
+        names.deinit(testing.allocator);
+    }
+    try fileNames(td.path, &names);
+    try testing.expectEqual(@as(usize, 1), names.items.len);
+    try testing.expectEqualStrings("0000000007.flseg", names.items[0]);
 }
 
 test "durable log: a truncation the previous run did not finish is completed before replay" {
