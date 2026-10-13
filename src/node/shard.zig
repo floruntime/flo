@@ -187,8 +187,12 @@ pub const Shard = struct {
     /// Pipe read-end fd — receives hand-offs from Acceptor.
     acceptor_pipe_rd: i32,
 
-    /// Whether the shard is running.
-    running: bool,
+    /// Set once, from any thread, to stop the shard's loop; never cleared,
+    /// so a stop asked for before the loop starts still stops it.
+    stop_requested: std.atomic.Value(bool),
+    /// Shared by the node's shards while they stop; null for a shard run
+    /// alone.
+    stopping: ?*Stopping,
 
     /// Next connection ID.
     next_conn_id: u32,
@@ -873,7 +877,8 @@ pub const Shard = struct {
             .router = Router.init(partition_count, shard_count, shard_id),
             .slab = slab,
             .acceptor_pipe_rd = acceptor_pipe_rd,
-            .running = false,
+            .stop_requested = .init(false),
+            .stopping = null,
             .next_conn_id = 1,
             .requests_dispatched = 0,
             .inbox_messages_processed = 0,
@@ -1193,6 +1198,7 @@ pub const Shard = struct {
         self.forward_proxy.deinit();
         self.allocator.destroy(self.forward_proxy);
 
+        self.freeUndelivered();
         self.mailbox.destroy(self.allocator);
         self.reply_pool.deinit(self.allocator);
         self.waiter_pool.deinit(self.allocator);
@@ -1872,7 +1878,7 @@ pub const Shard = struct {
 
     fn handleInboxMessage(self: *Shard, msg: InboxMessage) void {
         switch (msg.tag) {
-            .shutdown => self.running = false,
+            .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -3503,13 +3509,12 @@ pub const Shard = struct {
 
     /// Enter the main reactor loop. Blocks until `shutdown()` is called.
     pub fn run(self: *Shard) !void {
-        self.running = true;
         log.debug("Shard {d} entering reactor loop", .{self.id});
 
         var last_warn_ms: u64 = 0;
         var unsaid: u64 = 0;
         var failing = false;
-        while (self.running) {
+        while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
             const busy = self.more_work or self.resume_fds.items.len > 0;
             _ = self.tick(if (busy) 0 else 100) catch |err| {
@@ -3536,11 +3541,165 @@ pub const Shard = struct {
         }
 
         log.debug("Shard {d} reactor loop exited", .{self.id});
+        self.answerAtShutdown();
     }
 
-    /// Signal the shard to stop.
+    /// Signal the shard to stop; safe from any thread.
     pub fn shutdown(self: *Shard) void {
-        self.running = false;
+        self.stop_requested.store(true, .release);
+    }
+
+    /// The node's shards stopping together: each counts itself once it has
+    /// answered what it holds, and keeps taking answers from the others
+    /// until every shard has.
+    pub const Stopping = struct {
+        stopped: std.atomic.Value(u32) = .init(0),
+        /// The shards running; set before any is told to stop.
+        of: u32 = 0,
+    };
+
+    /// How long a stopping shard waits for the others' answers, and then
+    /// for its clients to take theirs.
+    const STOP_WAIT_MS: u64 = 1_000;
+    const STOP_FLUSH_MS: u64 = 200;
+
+    /// What the reply to a write still waiting for commit says when the
+    /// server stops: it was proposed, so it may yet apply.
+    pub const SHUTTING_DOWN = "unavailable: the server is shutting down; this write may have been applied — check before resending";
+    /// The reply to a request the stop leaves unrun.
+    pub const SHUTTING_DOWN_NOT_RUN = "unavailable: the server is shutting down; this request did not run — retry";
+
+    /// The loop has stopped. Everything a client still waits on gets an
+    /// answer before the runtime frees the shard and closes the sockets:
+    /// writes waiting for commit or for the leader, blocking reads, and,
+    /// once every shard has answered what it holds, requests sent to other
+    /// shards whose answer never came.
+    fn answerAtShutdown(self: *Shard) void {
+        self.resolvePending(SHUTTING_DOWN);
+        for (self.forwards) |*f| {
+            if (!f.active) continue;
+            if (f.reply) |r| {
+                // The leader answered; it was only held for this node to catch up.
+                self.deliverDeferred(f.reply_to, r);
+            } else if (f.sent_to != 0) {
+                self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = SHUTTING_DOWN });
+            } else {
+                self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
+            }
+            self.dropForward(f);
+        }
+        self.waiter_pool.expireAll(handleWaiterTimeout, @ptrCast(self));
+        self.refuseUnrunRequests();
+        self.takeAnswersUntilAllStopped();
+        const Stopped = struct {
+            shard: *Shard,
+            pub fn late(ctx: *@This(), slot: ReplyPool.Slot) void {
+                const conn = ctx.shard.forwardAnswered(slot) orelse return;
+                const r: proto.Refusal = if (slot.writes) .{ .reason = .unclassified, .ran = .unknown, .message = SHUTTING_DOWN } else proto.notRun(SHUTTING_DOWN_NOT_RUN);
+                ctx.shard.sendRefusal(conn, slot.request_id, .unavailable, r);
+            }
+        };
+        var unanswered = Stopped{ .shard = self };
+        _ = self.reply_pool.expire(std.math.maxInt(u64), &unanswered);
+        self.flushAtShutdown();
+    }
+
+    /// Count this shard stopped, and deliver the other shards' answers to
+    /// its clients until every shard has counted itself: an answer one sends
+    /// before counting is on this shard's reply ring by then.
+    fn takeAnswersUntilAllStopped(self: *Shard) void {
+        const stopping = self.stopping orelse return;
+        _ = stopping.stopped.fetchAdd(1, .acq_rel);
+        const give_up = nowMs() + STOP_WAIT_MS;
+        var buf: [64]InboxMessage = undefined;
+        while (true) {
+            const all = stopping.stopped.load(.acquire) >= stopping.of;
+            while (true) {
+                const count = self.mailbox.replies.drain(&buf);
+                if (count == 0) break;
+                for (buf[0..count]) |msg| self.deliverReply(msg);
+            }
+            if (all) return;
+            if (nowMs() >= give_up) {
+                log.warn("shard {d}: {d} of {d} shards stopped after {d} ms; answers still due from the rest are told unavailable", .{ self.id, stopping.stopped.load(.acquire), stopping.of, STOP_WAIT_MS });
+                return;
+            }
+            @import("stdx").time.sleep(std.time.ns_per_ms);
+        }
+    }
+
+    /// Requests other shards sent here that the stop leaves unrun: each is
+    /// told it did not run, before this shard counts itself stopped, so the
+    /// answer reaches its asker. One arriving later is freed by `deinit`,
+    /// and its asker answers it from the slot it holds.
+    fn refuseUnrunRequests(self: *Shard) void {
+        var buf: [64]InboxMessage = undefined;
+        while (true) {
+            const count = self.mailbox.inbox.drain(&buf);
+            if (count == 0) return;
+            for (buf[0..count]) |msg| switch (msg.tag) {
+                .forward_request => {
+                    const bytes = inboxPayload(msg);
+                    defer if (bytes.len > 0) self.allocator.free(bytes);
+                    const request_id: u64 = if (bytes.len >= 16) std.mem.readInt(u64, bytes[8..16], .little) else 0;
+                    const fd: i32 = @bitCast(@as(u32, @truncate(msg.sequence)));
+                    const held = msg.replySlot();
+                    const reply_to: ReplyTo = .{ .socket = .{ .shard = msg.src_shard, .fd = fd, .conn_id = @truncate(msg.sequence >> 32), .slot = held.slot, .gen = held.gen } };
+                    self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
+                },
+                .reply => self.deliverReply(msg),
+                .action_start => {
+                    const bytes = inboxPayload(msg);
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                },
+                .shutdown, .cancel_reads => {},
+            };
+        }
+    }
+
+    /// The bytes a message carries on the heap, if any.
+    fn inboxPayload(msg: InboxMessage) []u8 {
+        const ptr = msg.payload_ptr orelse return &.{};
+        return @as([*]u8, @ptrCast(ptr))[0..msg.payload_len];
+    }
+
+    /// Whatever is still on this shard's rings once every shard has
+    /// stopped: nothing will read it, so its heap copies are freed.
+    fn freeUndelivered(self: *Shard) void {
+        var buf: [64]InboxMessage = undefined;
+        for ([_]*@TypeOf(self.mailbox.inbox){ &self.mailbox.inbox, &self.mailbox.replies }) |ring| {
+            while (true) {
+                const count = ring.drain(&buf);
+                if (count == 0) break;
+                for (buf[0..count]) |msg| {
+                    const bytes = inboxPayload(msg);
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                }
+            }
+        }
+    }
+
+    /// Send each client what it is owed, for a short while, then end the
+    /// stream: a half-close puts a FIN after the answers, and discarding
+    /// what the client sent that will never be read keeps the close that
+    /// follows from resetting the connection, which can drop answers the
+    /// client has not read yet.
+    fn flushAtShutdown(self: *Shard) void {
+        const give_up = nowMs() + STOP_FLUSH_MS;
+        var it = self.connections.iterator();
+        while (it.next()) |e| {
+            const fd = e.key_ptr.*;
+            const conn = e.value_ptr.*;
+            while (true) {
+                self.flushToClient(fd);
+                if (!conn.hasPendingWrites() or conn.closing or nowMs() >= give_up) break;
+                @import("stdx").time.sleep(std.time.ns_per_ms);
+            }
+            _ = std.c.shutdown(fd, std.c.SHUT.WR);
+            var unread: [4096]u8 = undefined;
+            var rounds: u32 = 0;
+            while (rounds < 64 and std.c.recv(fd, &unread, unread.len, std.c.MSG.DONTWAIT) > 0) : (rounds += 1) {}
+        }
     }
 
     // ─── Background tasks ────────────────────────────────────────────────
@@ -5708,7 +5867,7 @@ test "Shard: init and deinit" {
 
     try std.testing.expectEqual(@as(u16, 0), shard.id);
     try std.testing.expectEqual(@as(u32, 0), shard.connectionCount());
-    try std.testing.expect(!shard.running);
+    try std.testing.expect(!shard.stop_requested.load(.acquire));
 }
 
 test "Shard: add and remove connections" {
@@ -5785,8 +5944,7 @@ test "Shard: inbox shutdown message" {
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
 
-    shard.running = true;
-    try std.testing.expect(shard.running);
+    try std.testing.expect(!shard.stop_requested.load(.acquire));
 
     // Send shutdown via inbox
     const sent = shard.mailbox.inbox.send(.{
@@ -5803,7 +5961,7 @@ test "Shard: inbox shutdown message" {
     // Drain inbox
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
-    try std.testing.expect(!shard.running);
+    try std.testing.expect(shard.stop_requested.load(.acquire));
 }
 
 test "Shard: a first member leads a group of itself from the log; a joiner waits to be named" {
@@ -10904,4 +11062,202 @@ test "Shard: a boot told another shard failed stops its replay and frees what it
     try std.testing.expectError(error.BootCancelled, Shard.init(std.testing.allocator, 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{ .health = &slot, .cancel = &cancel }));
     // Stopped at the first entry: nothing past it was read back.
     try std.testing.expectEqual(@as(u64, 0), slot.replay_index.load(.monotonic));
+}
+
+test "Shard: a write still waiting for commit when the shard stops is told it may have applied, and the answer goes out" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Proposed, and waiting for the peer's ack that never comes.
+    try ParkTest.send(&shard, conn, .queue_enqueue, 9, "q", "m1");
+    try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
+
+    // Told to stop before its next turn: the loop ends without one.
+    shard.shutdown();
+    try shard.run();
+    try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
+    var one: [1]proto.Response = undefined;
+    var buf: [1024]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 9), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    const told = try one[0].refused();
+    try std.testing.expectEqual(proto.Ran.unknown, told.ran);
+    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN, told.message);
+}
+
+/// Every answer on a client's socket until the server ends the stream.
+fn answersUntilEnd(fd: std.posix.fd_t, out: []u8, answers: []proto.Response) !usize {
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (tries < 10_000) : (tries += 1) {
+        const n = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (n == 0) break;
+        if (n > 0) got += @intCast(n);
+    }
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off < got) : (count += 1) {
+        const r = try proto.Response.parse(out[off..got]);
+        answers[count] = r;
+        off += @sizeOf(proto.ResponseHeader) + r.header.data_len;
+    }
+    return count;
+}
+
+fn answerFor(answers: []const proto.Response, id: u64) !proto.Response {
+    var found: ?proto.Response = null;
+    for (answers) |r| if (r.header.request_id == id) {
+        if (found != null) return error.AnsweredTwice;
+        found = r;
+    };
+    return found orelse error.NotAnswered;
+}
+
+test "Shard: stopping shards answer each other's clients: a blocking read another shard holds, and requests it never ran" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+
+    // A read waiting on shard 1 for a key that never comes.
+    var opts: [8]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts);
+    try ob.addU32(.block_ms, 10_000);
+    const get = try testRequestWith(.kv_get, 51, "k", "", ob.getOptions());
+    defer std.testing.allocator.free(get);
+    try forwardForTest(a, 1, c.conn, get);
+    try std.testing.expectEqual(@as(usize, 1), b.drainInbox());
+    try std.testing.expectEqual(@as(u16, 1), b.waiter_pool.totalActive());
+    // A write and a read shard 1 has not taken from its inbox yet.
+    const put = try testRequest(.kv_put, 52, "k", "v");
+    defer std.testing.allocator.free(put);
+    try forwardForTest(a, 1, c.conn, put);
+    const ping = try testRequest(.ping, 53, "", "");
+    defer std.testing.allocator.free(ping);
+    try forwardForTest(a, 1, c.conn, ping);
+    try std.testing.expectEqual(@as(usize, 3), a.reply_pool.taken());
+
+    var stopping: Shard.Stopping = .{ .of = 2 };
+    for (&two.shards) |*s| {
+        s.stopping = &stopping;
+        s.shutdown();
+    }
+    const Run = struct {
+        fn run(s: *Shard) void {
+            s.run() catch {};
+        }
+    };
+    const tb = try std.Thread.spawn(.{}, Run.run, .{b});
+    const ta = try std.Thread.spawn(.{}, Run.run, .{a});
+    tb.join();
+    ta.join();
+    try std.testing.expectEqual(@as(u32, 2), stopping.stopped.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+
+    var out: [4096]u8 = undefined;
+    var answers: [8]proto.Response = undefined;
+    const n = try answersUntilEnd(c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    // Shard 1's own answer to the read, carried over shard 0's reply ring.
+    const read = try answerFor(answers[0..n], 51);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), read.header.status);
+    // Still in shard 1's inbox when it stopped: it provably did not run.
+    const write = try answerFor(answers[0..n], 52);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), write.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try write.refused()).ran);
+    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN_NOT_RUN, (try write.refused()).message);
+    const unrun = try answerFor(answers[0..n], 53);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), unrun.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try unrun.refused()).ran);
+}
+
+test "Shard: a write reaching a shard after it stopped is answered by its asker, as one that may have applied" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+
+    var stopping: Shard.Stopping = .{ .of = 2 };
+    for (&two.shards) |*s| {
+        s.stopping = &stopping;
+        s.shutdown();
+    }
+    const Run = struct {
+        fn run(s: *Shard) void {
+            s.run() catch {};
+        }
+    };
+    // Shard 1 has counted itself stopped, so it has refused what it held.
+    const tb = try std.Thread.spawn(.{}, Run.run, .{b});
+    while (stopping.stopped.load(.acquire) < 1) std.Thread.yield() catch {};
+    const put = try testRequest(.kv_put, 61, "k", "v");
+    defer std.testing.allocator.free(put);
+    try forwardForTest(a, 1, c.conn, put);
+    try a.run();
+    tb.join();
+
+    var out: [1024]u8 = undefined;
+    var answers: [4]proto.Response = undefined;
+    const n = try answersUntilEnd(c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    const late = try answerFor(answers[0..n], 61);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), late.header.status);
+    try std.testing.expectEqual(proto.Ran.unknown, (try late.refused()).ran);
+    // Its copy, unrun in shard 1's inbox, is freed with the shard.
+    try std.testing.expectEqual(@as(usize, 1), b.mailbox.inbox.pending());
+}
+
+test "Shard: a stopping node answers its writes forwarded to a leader: one sent may have applied, one not yet sent did not run" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+
+    shard.runRequest(c.conn, testReq(.kv_put, 5, "", "k", "v", ""), .client);
+    shard.runRequest(c.conn, testReq(.kv_put, 6, "", "k", "w", ""), .client);
+    try std.testing.expectEqual(@as(u32, 2), shard.forward_count);
+    for (shard.forwards) |*f| if (f.active and f.request_id == 6) {
+        f.sent_to = 2;
+        f.sent_term = shard.raft_node.current_term;
+    };
+
+    shard.shutdown();
+    try shard.run();
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    var out: [2048]u8 = undefined;
+    var answers: [4]proto.Response = undefined;
+    const n = try answersUntilEnd(c.pair[1], &out, &answers);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    const unsent = try answerFor(answers[0..n], 5);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), unsent.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try unsent.refused()).ran);
+    const sent = try answerFor(answers[0..n], 6);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), sent.header.status);
+    try std.testing.expectEqual(proto.Ran.unknown, (try sent.refused()).ran);
 }

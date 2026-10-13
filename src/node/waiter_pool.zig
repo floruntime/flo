@@ -352,6 +352,20 @@ pub const WaiterPool = struct {
         }
     }
 
+    /// Expire every waiter, due or not: the shard is stopping.
+    pub fn expireAll(self: *WaiterPool, on_timeout: TimeoutFn, ctx: *anyopaque) void {
+        var i: u16 = 0;
+        while (i < self.count) {
+            const w = &self.waiters[i];
+            if (!w.active) {
+                i += 1;
+                continue;
+            }
+            on_timeout(w, ctx);
+            self.swapRemove(i);
+        }
+    }
+
     // ── Connection Cleanup ──────────────────────────────────────────────
 
     /// Remove the waiters of one closed connection, named by the shard that
