@@ -140,12 +140,27 @@ const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 // Shard
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// The replica's clock, and what it reaches its shard for. It holds
-/// nothing: the shard is moved by value after init, so a pointer kept here
-/// would dangle; each call finds the shard from the replica's address.
+/// The replica's clock, its links, and what it reaches its shard for. It
+/// holds nothing: the shard is moved by value after init, so a pointer kept
+/// here would dangle; each call finds the shard from the replica's address.
 const ShardIo = struct {
     pub fn nowMs() u64 {
         return Shard.nowMs();
+    }
+
+    /// A lone node has no peers: no frames go out, and no Raft clock runs.
+    pub fn networked(r: *Replica) bool {
+        return Host.of(r).raft_network != null;
+    }
+
+    pub fn send(r: *Replica, peer: u32, msg_type: transport.MsgType, group: u32, payload: []const u8) bool {
+        const rn = Host.of(r).raft_network orelse return false;
+        return rn.sendTo(peer, msg_type, group, payload);
+    }
+
+    /// The voters the network lets dial in and votes among.
+    pub fn setVoters(r: *Replica, ids: []const u32) void {
+        if (Host.of(r).raft_network) |rn| rn.setVoters(ids);
     }
 
     pub const Host = struct {
@@ -155,10 +170,6 @@ const ShardIo = struct {
 
         pub fn raftNode(r: *Replica) *RaftNode {
             return of(r).raftNode();
-        }
-
-        pub fn network(r: *Replica) ?*RaftNetwork {
-            return of(r).network();
         }
 
         pub fn durableCommits(r: *Replica) bool {
@@ -2804,14 +2815,10 @@ pub const Shard = struct {
 
     pub const REMOVED_MESSAGE = "unavailable: this node was removed from the cluster";
 
-    /// The Raft node, network and durability, read where the replica reads
-    /// them: the runtime, and tests, set them after init.
+    /// The Raft node and durability, read where the replica reads them:
+    /// the runtime, and tests, set them after init.
     fn raftNode(self: *Shard) *RaftNode {
         return self.raft_node;
-    }
-
-    fn network(self: *Shard) ?*RaftNetwork {
-        return self.raft_network;
     }
 
     /// An ack means "in my log, on disk".

@@ -2,15 +2,15 @@
 //! its peers, its clock (elections, check-quorum, the leader loop), and
 //! what a leader sends each peer.
 //!
-//! `Io` is its clock, and its host: a shard, which owns the log, the state
-//! machine and the clients. Until applying entries and the membership steps
-//! move in here, the replica reaches the shard for them through `Io.Host`.
+//! `Io` is its clock, its links to the peers, and its host: a shard, which
+//! owns the log, the state machine and the clients. Until applying entries
+//! and the membership steps move in here, the replica reaches the shard for
+//! them through `Io.Host`.
 
 const std = @import("std");
 const log = @import("stdx").log;
 const RaftNode = @import("../raft/node.zig").RaftNode;
 const raft_node_mod = @import("../raft/node.zig");
-const RaftNetwork = @import("../raft/network.zig").RaftNetwork;
 const RaftFrame = @import("../raft/raft_queue.zig").Frame;
 const transport = @import("../raft/transport.zig");
 const membership = @import("../raft/membership.zig");
@@ -55,10 +55,6 @@ pub fn Replica(comptime Io: type) type {
 
         fn raftNode(self: *Self) *RaftNode {
             return Io.Host.raftNode(self);
-        }
-
-        fn network(self: *Self) ?*RaftNetwork {
-            return Io.Host.network(self);
         }
 
         fn durableCommits(self: *Self) bool {
@@ -122,8 +118,8 @@ pub fn Replica(comptime Io: type) type {
         }
 
         fn trySendRaft(self: *Self, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
-            const rn = self.network() orelse return false;
-            if (rn.sendTo(peer, msg_type, self.id, payload)) return true;
+            if (!Io.networked(self)) return false;
+            if (Io.send(self, peer, msg_type, self.id, payload)) return true;
             log.warn("shard {d}: could not queue a {s} for node {d}", .{ self.id, @tagName(msg_type), peer });
             return false;
         }
@@ -306,7 +302,7 @@ pub fn Replica(comptime Io: type) type {
         /// The Raft clock: elections, check-quorum, the leader loop, and a
         /// joiner's request to be let in.
         pub fn tickRaft(self: *Self) void {
-            if (self.network() == null or self.diverged) return;
+            if (!Io.networked(self) or self.diverged) return;
             const raft = self.raftNode();
             const now = Io.nowMs();
             if (self.checkRemoved(now)) return;
@@ -317,7 +313,7 @@ pub fn Replica(comptime Io: type) type {
             if (raft.membership_index != self.voters_published_index and raft.latest_config.member_count > 0) {
                 self.voters_published_index = raft.membership_index;
                 var voters: [membership.MAX_MEMBERS]u32 = undefined;
-                if (self.network()) |rn| rn.setVoters(raft.latest_config.voterIds(&voters));
+                Io.setVoters(self, raft.latest_config.voterIds(&voters));
             }
             const r = raft.tick(now);
             // A leader found or won ends the outage the attempt lines count.
