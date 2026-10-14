@@ -178,13 +178,16 @@ pub const DurableLog = struct {
     /// first, each unlink synced before the next: a crash leaves the newer
     /// files contiguous, and one whose unlink was lost is dropped again
     /// next time. A segment straddling `through` is kept. Refused above
-    /// the watermark, the commit a boot trusts, and while a cut is pending,
-    /// since the files then disagree with the log.
+    /// the watermark, the commit a boot trusts; at or past the newest
+    /// segment's end, since that segment carries the watermark; and while a
+    /// cut is pending, since the files then disagree with the log. What it
+    /// drops is gone: a snapshot must already cover `through`.
     pub fn dropThrough(self: *DurableLog, through: u64) !Dropped {
         if (self.pending_cut != null) return error.CutPending;
         if (through > try self.watermark()) return error.AboveWatermark;
         const files = try self.listSegments(true);
         defer self.freeSegments(files);
+        if (files.len > 0 and through >= files[files.len - 1].last_index) return error.WouldDropNewest;
         self.invalidate();
         var dropped: Dropped = .{};
         for (files) |f| {
@@ -644,8 +647,10 @@ test "durable log: dropThrough deletes whole segments oldest first, keeps one st
             try writer.addEntry(&testEntry(i, 1, "x"));
             if (i == 3 or i == 6 or i == 8) try dl.flush(i);
         }
-        // Nothing above the watermark goes, and a pending cut stops it.
+        // Nothing above the watermark goes, the newest segment always stays,
+        // and a pending cut stops it.
         try testing.expectError(error.AboveWatermark, dl.dropThrough(9));
+        try testing.expectError(error.WouldDropNewest, dl.dropThrough(8));
         dl.pending_cut = 8;
         try testing.expectError(error.CutPending, dl.dropThrough(5));
         dl.pending_cut = null;

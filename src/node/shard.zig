@@ -3094,7 +3094,9 @@ pub const Shard = struct {
             if (!want_data and !want_heartbeat) continue;
             const prev_index = next - 1;
             const known_term: ?u64 = if (prev_index == 0) 0 else raft.log.entryTerm(prev_index);
-            p.below_log = known_term == null;
+            // Below where this log starts, even index 0's known term places
+            // nothing: the entries after it are gone.
+            p.below_log = known_term == null or next < raft.log.start();
             if (p.below_log) {
                 // No append can reach this peer. Heartbeats still go, with
                 // no term (no entry has term 0), so it does not campaign.
@@ -11406,5 +11408,16 @@ test "Shard: a peer below everything the leader knows the term of gets heartbeat
     try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
     clearOutbound(&rn);
     shard.pump(later + 1);
+    try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
+
+    // At index 1, below where the log now starts: index 0's term is known,
+    // but nothing after it can be sent.
+    p.next_index = 1;
+    p.heartbeat_at_ms = 0;
+    shard.pump(later + 2);
+    try std.testing.expect(p.below_log);
+    try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
+    clearOutbound(&rn);
+    shard.pump(later + 3);
     try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
 }
