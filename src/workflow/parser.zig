@@ -201,8 +201,10 @@ pub fn parseWorkflow(allocator: Allocator, content: []const u8, diag: ?*Diagnost
     }
 
     // Not JSON: YAML, converted to JSON.
-    const json_content = yaml_to_json.convert(allocator, content) catch
-        return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{});
+    const json_content = yaml_to_json.convert(allocator, content) catch |err| return switch (err) {
+        error.NestingTooDeep => d.fail(ParseError.InvalidFormat, "YAML nesting is limited to {d} levels", .{yaml_to_json.MAX_DEPTH}),
+        else => d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{}),
+    };
     defer allocator.free(json_content);
 
     const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch |err| switch (err) {

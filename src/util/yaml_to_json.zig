@@ -24,7 +24,12 @@ pub const ConvertError = error{
     UnexpectedToken,
     OutOfMemory,
     InvalidFormat,
+    /// Maps and sequences nested deeper than `MAX_DEPTH`.
+    NestingTooDeep,
 };
+
+/// Deepest nesting of maps and sequences a document may have.
+pub const MAX_DEPTH: usize = 64;
 
 /// Convert YAML content to JSON
 pub fn convert(allocator: Allocator, yaml: []const u8) ConvertError![]const u8 {
@@ -43,6 +48,7 @@ const Converter = struct {
     allocator: Allocator,
     output: std.ArrayList(u8),
     lines: std.ArrayList(Line),
+    depth: usize = 0,
 
     fn init(allocator: Allocator) Converter {
         return .{
@@ -92,7 +98,15 @@ const Converter = struct {
         return self.output.toOwnedSlice(self.allocator) catch return ConvertError.OutOfMemory;
     }
 
+    /// Each map and sequence is one level, so the recursion is bounded.
+    fn enter(self: *Converter) ConvertError!void {
+        if (self.depth >= MAX_DEPTH) return ConvertError.NestingTooDeep;
+        self.depth += 1;
+    }
+
     fn processObject(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -157,6 +171,8 @@ const Converter = struct {
     }
 
     fn processArray(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -222,6 +238,8 @@ const Converter = struct {
     /// Process an array item that starts an object on the same line
     /// e.g., "- name: value" followed by more properties
     fn processArrayItemObject(self: *Converter, start: usize, array_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         const line = self.lines.items[start];
@@ -391,6 +409,8 @@ const Converter = struct {
 
     /// Convert a YAML flow sequence `[item1, item2, ...]` to a JSON array.
     fn writeFlowSequence(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
@@ -422,6 +442,8 @@ const Converter = struct {
     /// Values are recursively converted, so nested flow maps/sequences and scalars
     /// all work (e.g. `{ name: events }`, `{ a: { b: c }, d: [1, 2] }`).
     fn writeFlowMapping(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
@@ -834,4 +856,41 @@ test "yaml_to_json: comments on list items and flow values" {
         \\msg: don't retry  # why
         \\say: he said "hi"  # quoted inside
     , "{\"items\":[\"one\",{\"name\":\"two\"},{\"name\":\"three\"}],\"flow\":[\"a\",\"b\"],\"url\":\"http://x/#frag\",\"msg\":\"don't retry\",\"say\":\"he said \\\"hi\\\"\"}");
+}
+
+test "yaml_to_json: nesting is limited to MAX_DEPTH levels" {
+    const allocator = std.testing.allocator;
+    // Flow sequences and mappings, MAX_DEPTH deep and one deeper, and very deep.
+    for ([_]usize{ MAX_DEPTH - 1, MAX_DEPTH, 60_000 }) |levels| {
+        for ([_][2]u8{ .{ '[', ']' }, .{ '{', '}' } }) |br| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try text.appendSlice(allocator, "a: ");
+            for (0..levels) |i| {
+                if (br[0] == '{' and i > 0) try text.appendSlice(allocator, "k: ");
+                try text.append(allocator, br[0]);
+            }
+            for (0..levels) |_| try text.append(allocator, br[1]);
+            // The top-level map is one level.
+            if (levels + 1 <= MAX_DEPTH) {
+                allocator.free(try convert(allocator, text.items));
+            } else {
+                try std.testing.expectError(ConvertError.NestingTooDeep, convert(allocator, text.items));
+            }
+        }
+    }
+    // Maps nested by indentation.
+    for ([_]usize{ MAX_DEPTH, MAX_DEPTH + 1 }) |levels| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
+        for (0..levels) |i| {
+            for (0..i) |_| try text.append(allocator, ' ');
+            try text.appendSlice(allocator, if (i + 1 == levels) "k: v\n" else "k:\n");
+        }
+        if (levels <= MAX_DEPTH) {
+            allocator.free(try convert(allocator, text.items));
+        } else {
+            try std.testing.expectError(ConvertError.NestingTooDeep, convert(allocator, text.items));
+        }
+    }
 }
