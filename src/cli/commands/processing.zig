@@ -267,7 +267,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.processing.list(&client, namespace, null) catch |err| return outcome.requestFailed(ctx, err);
+    const limit = ctx.getUint("limit") orelse 100;
+    var result = client_mod.processing.list(&client, namespace, limit, null) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);

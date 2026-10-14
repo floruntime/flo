@@ -509,13 +509,19 @@ test "e2e/processing: list shows submitted jobs" {
     _ = try ctx.execCapture(&.{ "processing", "submit", path1, "-n", "proc_list" });
     _ = try ctx.execCapture(&.{ "processing", "submit", path2, "-n", "proc_list" });
 
-    // List should show both jobs
     var list_result = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_list" });
     defer list_result.deinit();
+    try testing.expectEqual(@as(u8, 0), list_result.exit_code);
+    try testing.expectEqual(@as(usize, 1), list_result.stdoutCount("e2e-list-job1"));
+    try testing.expectEqual(@as(usize, 1), list_result.stdoutCount("e2e-list-job2"));
+    try testing.expectEqual(@as(usize, 2), list_result.stdoutCount("RUNNING"));
 
-    try stdx.testing.assertSucceeded(list_result);
-    // List returns JSON array with job status objects
-    try testing.expect(list_result.stdoutContains("RUNNING"));
+    // --limit reaches the server.
+    var one = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_list", "--limit", "1" });
+    defer one.deinit();
+    try testing.expectEqual(@as(u8, 0), one.exit_code);
+    try testing.expectEqual(@as(usize, 1), one.stdoutCount("RUNNING"));
+    try testing.expectEqual(@as(usize, 1), one.stdoutCount("e2e-list-job"));
 }
 
 test "e2e/processing: passthrough pipeline - data flows from source to sink stream" {
