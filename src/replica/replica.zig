@@ -2,10 +2,10 @@
 //! its peers, its clock (elections, check-quorum, the leader loop), and
 //! what a leader sends each peer.
 //!
-//! `Io` is its clock, its links to the peers, and its host: a shard, which
-//! owns the log, the state machine and the clients. Until applying entries
-//! and the membership steps move in here, the replica reaches the shard for
-//! them through `Io.Host`.
+//! `Io` is its clock, its links to the peers, its disk, and its host: a
+//! shard, which owns the log, the state machine and the clients. Until
+//! applying entries and the membership steps move in here, the replica
+//! reaches the shard for them through `Io.Host`.
 
 const std = @import("std");
 const log = @import("stdx").log;
@@ -51,14 +51,20 @@ pub fn Replica(comptime Io: type) type {
         peer_silent_warn_ms: [raft_node_mod.MAX_PEERS]u64 = @splat(0),
         peer_batch_warn_ms: [raft_node_mod.MAX_PEERS]u64 = @splat(0),
 
+        // ─── Disk ───────────────────────────────────────────────────────
+
+        fn durableCommits(self: *Self) bool {
+            return Io.durableCommits(self);
+        }
+
+        fn flushForAck(self: *Self) bool {
+            return Io.flushForAck(self);
+        }
+
         // ─── The host ────────────────────────────────────────────────────
 
         fn raftNode(self: *Self) *RaftNode {
             return Io.Host.raftNode(self);
-        }
-
-        fn durableCommits(self: *Self) bool {
-            return Io.Host.durableCommits(self);
         }
 
         fn isRemoved(self: *Self) bool {
@@ -67,10 +73,6 @@ pub fn Replica(comptime Io: type) type {
 
         fn checkRemoved(self: *Self, now: u64) bool {
             return Io.Host.checkRemoved(self, now);
-        }
-
-        fn flushForAck(self: *Self) bool {
-            return Io.Host.flushForAck(self);
         }
 
         fn tickMembership(self: *Self, now: u64) void {

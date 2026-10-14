@@ -140,9 +140,10 @@ const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 // Shard
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// The replica's clock, its links, and what it reaches its shard for. It
-/// holds nothing: the shard is moved by value after init, so a pointer kept
-/// here would dangle; each call finds the shard from the replica's address.
+/// The replica's clock, links and disk, and what it reaches its shard
+/// for. It holds nothing: the shard is moved by value after init, so a
+/// pointer kept here would dangle; each call finds the shard from the
+/// replica's address.
 const ShardIo = struct {
     pub fn nowMs() u64 {
         return Shard.nowMs();
@@ -156,6 +157,16 @@ const ShardIo = struct {
     pub fn send(r: *Replica, peer: u32, msg_type: transport.MsgType, group: u32, payload: []const u8) bool {
         const rn = Host.of(r).raft_network orelse return false;
         return rn.sendTo(peer, msg_type, group, payload);
+    }
+
+    /// An ack means "in my log, on disk" when commits are durable.
+    pub fn durableCommits(r: *Replica) bool {
+        return Host.of(r).durableCommits();
+    }
+
+    /// Flush the batch just taken before it is acked.
+    pub fn flushForAck(r: *Replica) bool {
+        return Host.of(r).flushForAck();
     }
 
     /// The voters the network lets dial in and votes among.
@@ -172,20 +183,12 @@ const ShardIo = struct {
             return of(r).raftNode();
         }
 
-        pub fn durableCommits(r: *Replica) bool {
-            return of(r).durableCommits();
-        }
-
         pub fn isRemoved(r: *Replica) bool {
             return of(r).isRemoved();
         }
 
         pub fn checkRemoved(r: *Replica, now: u64) bool {
             return of(r).checkRemoved(now);
-        }
-
-        pub fn flushForAck(r: *Replica) bool {
-            return of(r).flushForAck();
         }
 
         pub fn tickMembership(r: *Replica, now: u64) void {
