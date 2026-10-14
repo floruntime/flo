@@ -79,15 +79,13 @@ pub const KVMetrics = struct {
 };
 
 /// Tiered log metrics for observability
-/// Tracks read hit/miss statistics per storage tier (hot/warm/cold)
+/// Tracks read hit/miss statistics per storage tier (hot/warm)
 /// Thread-safe: Uses atomic operations for all counters
 pub const TieredLogMetrics = struct {
     /// Reads served from hot tier (RAM)
     hot_hits: Atomic(u64) = Atomic(u64).init(0),
     /// Reads served from warm tier (local disk)
     warm_hits: Atomic(u64) = Atomic(u64).init(0),
-    /// Reads served from cold tier (S3/Azure Blob)
-    cold_hits: Atomic(u64) = Atomic(u64).init(0),
     /// Reads that found no entry
     misses: Atomic(u64) = Atomic(u64).init(0),
     /// Total read operations
@@ -107,11 +105,6 @@ pub const TieredLogMetrics = struct {
         _ = self.total_reads.fetchAdd(1, .monotonic);
     }
 
-    pub fn recordColdHit(self: *TieredLogMetrics) void {
-        _ = self.cold_hits.fetchAdd(1, .monotonic);
-        _ = self.total_reads.fetchAdd(1, .monotonic);
-    }
-
     pub fn recordMiss(self: *TieredLogMetrics) void {
         _ = self.misses.fetchAdd(1, .monotonic);
         _ = self.total_reads.fetchAdd(1, .monotonic);
@@ -120,7 +113,6 @@ pub const TieredLogMetrics = struct {
     pub const Snapshot = struct {
         hot_hits: u64,
         warm_hits: u64,
-        cold_hits: u64,
         misses: u64,
         total_reads: u64,
 
@@ -136,12 +128,6 @@ pub const TieredLogMetrics = struct {
             return @as(f64, @floatFromInt(self.warm_hits)) / @as(f64, @floatFromInt(self.total_reads));
         }
 
-        /// Calculate cold tier hit rate (0.0 - 1.0)
-        pub fn coldHitRate(self: Snapshot) f64 {
-            if (self.total_reads == 0) return 0.0;
-            return @as(f64, @floatFromInt(self.cold_hits)) / @as(f64, @floatFromInt(self.total_reads));
-        }
-
         /// Calculate miss rate (0.0 - 1.0)
         pub fn missRate(self: Snapshot) f64 {
             if (self.total_reads == 0) return 0.0;
@@ -153,7 +139,6 @@ pub const TieredLogMetrics = struct {
         return .{
             .hot_hits = self.hot_hits.load(.monotonic),
             .warm_hits = self.warm_hits.load(.monotonic),
-            .cold_hits = self.cold_hits.load(.monotonic),
             .misses = self.misses.load(.monotonic),
             .total_reads = self.total_reads.load(.monotonic),
         };
@@ -163,7 +148,6 @@ pub const TieredLogMetrics = struct {
     pub fn reset(self: *TieredLogMetrics) void {
         self.hot_hits.store(0, .monotonic);
         self.warm_hits.store(0, .monotonic);
-        self.cold_hits.store(0, .monotonic);
         self.misses.store(0, .monotonic);
         self.total_reads.store(0, .monotonic);
     }
@@ -1399,10 +1383,6 @@ fn writeTieredLogMetrics(
     try writer.print("# HELP flo_tiered_log_warm_hits_total Reads served from warm tier (local disk)\n", .{});
     try writer.print("# TYPE flo_tiered_log_warm_hits_total counter\n", .{});
     try writer.print("flo_tiered_log_warm_hits_total{{group_id=\"{d}\"}} {d}\n", .{ group_id, snapshot.warm_hits });
-
-    try writer.print("# HELP flo_tiered_log_cold_hits_total Reads served from cold tier (S3/Azure)\n", .{});
-    try writer.print("# TYPE flo_tiered_log_cold_hits_total counter\n", .{});
-    try writer.print("flo_tiered_log_cold_hits_total{{group_id=\"{d}\"}} {d}\n", .{ group_id, snapshot.cold_hits });
 
     try writer.print("# HELP flo_tiered_log_misses_total Reads that found no entry\n", .{});
     try writer.print("# TYPE flo_tiered_log_misses_total counter\n", .{});

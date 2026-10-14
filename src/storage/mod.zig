@@ -1,4 +1,4 @@
-// Storage layer — UAL, Partition, Snapshot Manager, Memory Controller, Cold Storage
+// Storage layer — UAL, Partition, Snapshot Manager
 
 pub const ual = struct {
     pub const ual = @import("ual/ual.zig");
@@ -9,13 +9,7 @@ pub const ual = struct {
     pub const reader = @import("ual/reader.zig");
 };
 
-pub const cold = @import("cold/mod.zig");
-
-/// Convenience alias — cold manifest is part of the cold module.
-pub const cold_manifest = cold.manifest;
-
 pub const partition = @import("partition.zig");
 pub const tombstones = @import("tombstones.zig");
 pub const durable_log = @import("durable_log.zig");
 pub const snapshot = @import("snapshot.zig");
-pub const memory = @import("memory.zig");

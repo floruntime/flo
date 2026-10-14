@@ -197,7 +197,7 @@ pub const UAL = struct {
     ///      cannot be returned as a single contiguous slice.
     /// Case 3 is data-present, not data-gone: a caller that treats null as
     /// "skip / not found" silently drops a live entry. Only use `read` where a
-    /// null is safe to fall through (e.g. a tiered read that then tries warm/cold,
+    /// null is safe to fall through (e.g. a tiered read that then tries warm,
     /// or an existence probe via `contains`). Any path that must observe every
     /// entry (apply loops, replication, range scans) MUST use `readCopy` /
     /// `readRangeCopy`, which reconstruct wrapped payloads.

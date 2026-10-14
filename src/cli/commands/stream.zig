@@ -573,11 +573,10 @@ fn parseAndPrintRecords(
         const id_str = record_id.format(&id_buf) catch "0-0";
         last_id = record_id;
 
-        // Map tier byte to string: 0=hot, 1=warm, 2=cold
+        // Map tier byte to string: 0=hot, 1=warm
         const tier_str = switch (tier) {
             0 => "hot",
             1 => "warm",
-            2 => "cold",
             else => "unknown",
         };
 

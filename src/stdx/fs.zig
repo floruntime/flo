@@ -3,7 +3,7 @@
 //! so call sites don't need to thread an `Io` parameter through their signatures.
 //!
 //! This is **only** for boundary code (CLI, config loading, snapshots, manifests,
-//! cold storage, dashboard helpers). Hot-path code should not use these — the
+//! dashboard helpers). Hot-path code should not use these — the
 //! reactor stays on `std.posix.system.*` directly.
 
 const std = @import("std");

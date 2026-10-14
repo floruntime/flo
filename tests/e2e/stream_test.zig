@@ -1652,7 +1652,7 @@ test "e2e/stream: message count preserved after restart" {
 // Tiered Storage E2E Tests
 // =============================================================================
 // Tests the "Log is Data" architecture: ClusterHandler → PartitionRaft → TieredRaftLog
-// Verifies data flows correctly through hot (RAM) → warm (disk segments) → cold (FileBackend)
+// Verifies data flows correctly through hot (RAM) → warm (disk segments)
 
 test "e2e/stream: tiered storage - hot tier write and read" {
     // Test: Data written to stream is immediately readable from hot tier (RAM)
@@ -1789,12 +1789,12 @@ test "e2e/stream: tiered storage - every record readable with a tiny hot tier" {
     });
     defer ctx.deinit();
 
-    const stream_name = "tiered-cold-test";
+    const stream_name = "tiny-hot-test";
 
     // Write messages to fill hot and warm tiers
     for (0..30) |i| {
         var msg_buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&msg_buf, "cold-msg-{d:0>3}-with-extra-padding-to-increase-size", .{i});
+        const msg = try std.fmt.bufPrint(&msg_buf, "rec-{d:0>3}-with-extra-padding-to-increase-size", .{i});
         try ctx.exec(&.{ "stream", "append", stream_name, msg });
     }
 
@@ -1803,14 +1803,13 @@ test "e2e/stream: tiered storage - every record readable with a tiny hot tier" {
     defer result.deinit();
 
     // All messages should be readable regardless of tier
-    try testing.expect(result.contains("cold-msg-000"));
-    try testing.expect(result.contains("cold-msg-015"));
-    try testing.expect(result.contains("cold-msg-029"));
+    try testing.expect(result.contains("rec-000"));
+    try testing.expect(result.contains("rec-015"));
+    try testing.expect(result.contains("rec-029"));
 
     // Verify all 30 messages have tier info
     const total_tier_count = result.count("\"tier\":\"hot\"") +
-        result.count("\"tier\":\"warm\"") +
-        result.count("\"tier\":\"cold\"");
+        result.count("\"tier\":\"warm\"");
     try testing.expectEqual(@as(usize, 30), total_tier_count);
 }
 
@@ -1821,11 +1820,6 @@ test "e2e/stream: tiered storage - every record readable with a tiny hot tier" {
 // test "e2e/stream: tiered storage - restart with warm tier data" {
 //     // Test: Data persisted in warm tier survives server restart
 //     // TODO: Enable once PartitionRaft recovery from TieredRaftLog is complete
-// }
-
-// test "e2e/stream: tiered storage - cold tier read triggers restore" {
-//     // Test: Reading from cold tier should auto-restore segment to warm
-//     // TODO: Enable once cold tier restore path is wired through ClusterHandler
 // }
 
 test "e2e/stream: tiered storage - multiple streams independent" {
