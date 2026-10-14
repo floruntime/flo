@@ -883,7 +883,7 @@ pub const Simulator = struct {
         var ids: [network_mod.MAX_NODES]NodeId = undefined;
         for (0..self.scenario.node_count) |i| ids[i] = @intCast(i + 1);
         const cfg = membership.Config.ofVoters(ids[0..self.scenario.node_count]);
-        node.raft.commitMembership(&cfg);
+        node.raft.commitMembership(&cfg, 0);
     }
 
     /// A leader with no config writes one naming every node, as
@@ -1222,7 +1222,7 @@ pub const Simulator = struct {
                             });
                         }
                         node.applied_config = cfg;
-                        node.raft.commitMembership(&cfg);
+                        node.raft.commitMembership(&cfg, 0);
                         node.raft.recordConfig(idx, e.header.term, &cfg);
                     }
                 }

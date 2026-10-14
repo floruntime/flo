@@ -403,6 +403,9 @@ pub const RaftNode = struct {
     /// checked against the one, a truncation falls back to the other.
     latest_config: membership.Config = .{},
     committed_config: membership.Config = .{},
+    /// The config entry `committed_config` came from: a removal notice names
+    /// it, so a receiver can tell it from a config it already holds.
+    committed_config_index: u64 = 0,
     /// A leader whose committed config no longer makes it a voter stepped
     /// down; the owner says why.
     left_group: bool = false,
@@ -581,8 +584,9 @@ pub const RaftNode = struct {
     /// The config entry at `index` committed: it is now the membership a
     /// truncation falls back to. (A leader it drops has already stepped
     /// down, at commit: `advanceCommitIndex`.)
-    pub fn commitMembership(self: *RaftNode, cfg: *const membership.Config) void {
+    pub fn commitMembership(self: *RaftNode, cfg: *const membership.Config, index: u64) void {
         self.committed_config = cfg.*;
+        self.committed_config_index = index;
     }
 
     /// A voter campaigns. So does a voter of the committed config that a
@@ -3369,7 +3373,7 @@ test "raft node: membership is what the config entry says, and an unnamed node d
 
     // A truncation below the entry that named this node reverts to the
     // committed membership, which did not.
-    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }), 0);
     node.log.truncateAfter(5);
     node.truncatedBelowMembership(5);
     try testing.expect(!node.timer_enabled);
@@ -3587,7 +3591,7 @@ test "raft node: the latest committed config is checked as well as an uncommitte
     node.hard_state_sink = rec.sink();
     // {1,2,3} committed; {1,2,3,4} appended by a leader the group may
     // have replaced.
-    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    node.commitMembership(&membership.Config.ofVoters(&.{ 1, 2, 3 }), 0);
     node.setVoters(&.{ 1, 2, 3, 4 }, 9);
     node.membership_term = 3;
     node.current_term = 3;
@@ -3903,7 +3907,7 @@ test "raft node: membership changes go through proposeConfig, one at a time, aft
     defer node.deinit();
     const two = membership.Config.ofVoters(&.{ 1, 2 });
     node.setMembership(&two, 0);
-    node.commitMembership(&two);
+    node.commitMembership(&two, 0);
     _ = candidacy(&node);
     _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
@@ -3976,7 +3980,7 @@ test "raft node: a leader that removes itself leads on without counting itself, 
     ackAll(&leader, 3);
     try testing.expectEqual(p.index, leader.commit_index);
     // Applied, the change takes it out of office.
-    leader.commitMembership(&out);
+    leader.commitMembership(&out, 0);
     try testing.expectEqual(Role.follower, leader.role);
     try testing.expect(leader.left_group);
 }
@@ -4021,7 +4025,7 @@ test "raft node: a lone voter promoting a second does not commit the promotion o
 test "raft node: a leader that removed itself and lost office before the change committed may still stand, counting only the voters it leaves" {
     var leader = try leading(membership.Config.ofVoters(&.{ 1, 2, 3 }));
     defer leader.deinit();
-    leader.commitMembership(&leader.latest_config);
+    leader.commitMembership(&leader.latest_config, 0);
     _ = (try leader.proposeConfig(&leader.latest_config.without(1, 42))).proposed;
     // A higher term deposes it before the change commits.
     leader.handleAppendResponse(.{ .term = leader.current_term + 1, .success = false, .match_index = 0, .from = 2 });
@@ -4075,7 +4079,7 @@ test "raft node: a new leader changes membership only after committing in its te
     const c0 = membership.Config.ofVoters(&.{ 1, 2, 3, 4 }).withJoiner(5, true);
     for (&nodes) |*n| {
         n.setMembership(&c0, 0);
-        n.commitMembership(&c0);
+        n.commitMembership(&c0, 0);
     }
     const n1 = &nodes[0];
     const n2 = &nodes[1];
@@ -4128,7 +4132,7 @@ test "raft node: a leader leaves office when its removal commits, before any app
     defer for (&nodes) |*n| n.deinit();
     for (&nodes) |*n| {
         n.setMembership(&c0, 0);
-        n.commitMembership(&c0);
+        n.commitMembership(&c0, 0);
     }
     const n1 = &nodes[0];
     const n2 = &nodes[1];
@@ -4252,7 +4256,7 @@ test "raft node: a new leader stamps from the clocks its votes carried, and afte
     const c0 = membership.Config.ofVoters(&.{ 1, 2, 3 });
     for (&nodes) |*n| {
         n.setMembership(&c0, 0);
-        n.commitMembership(&c0);
+        n.commitMembership(&c0, 0);
     }
     const n1 = &nodes[0];
     const n2 = &nodes[1];

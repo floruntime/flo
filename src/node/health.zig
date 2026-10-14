@@ -51,6 +51,28 @@ pub const ShardState = enum(u8) {
 /// The longest reason kept for an offline shard.
 pub const REASON_MAX = 256;
 
+/// Removal notices a shard holds: while it counts toward a quorum, and the
+/// members that made one once it acted. Ids go first and the count last,
+/// so a reader that sees the count sees the ids it covers.
+pub const Removal = struct {
+    pub const MAX_FROM = @import("../raft/membership.zig").MAX_MEMBERS;
+    notices: Atomic(u8) = .init(0),
+    needed: Atomic(u8) = .init(0),
+    config_index: Atomic(u64) = .init(0),
+    /// The removing leader's clock, once the shard acted; 0 while counting.
+    at_ms: Atomic(u64) = .init(0),
+    from: [MAX_FROM]Atomic(u32) = @splat(.init(0)),
+
+    pub fn publish(self: *Removal, from: []const u32, needed: u8, config_index: u64, at_ms: u64) void {
+        self.notices.store(0, .release);
+        for (from, 0..) |id, i| self.from[i].store(id, .monotonic);
+        self.needed.store(needed, .monotonic);
+        self.config_index.store(config_index, .monotonic);
+        self.at_ms.store(at_ms, .monotonic);
+        self.notices.store(@intCast(from.len), .release);
+    }
+};
+
 pub const ShardSlot = struct {
     state: Atomic(u8) = .init(@backingInt(ShardState.loading)),
     role: Atomic(u8) = .init(@backingInt(Role.follower)),
@@ -63,6 +85,7 @@ pub const ShardSlot = struct {
     /// Written once, before the state first reads `offline`.
     reason_len: Atomic(u16) = .init(0),
     reason_buf: [REASON_MAX]u8 = undefined,
+    removal: Removal = .{},
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -143,6 +166,18 @@ pub const NodeHealth = struct {
             };
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
+            }
+            const notices = s.removal.notices.load(.acquire);
+            if (notices > 0) {
+                try w.print(",\"removal\":{{\"notices\":{d},\"of\":{d},\"config_index\":{d}", .{ notices, s.removal.needed.load(.monotonic), s.removal.config_index.load(.monotonic) });
+                const at = s.removal.at_ms.load(.monotonic);
+                if (at != 0) try w.print(",\"at_ms\":{d}", .{at});
+                try w.writeAll(",\"from\":[");
+                for (s.removal.from[0..notices], 0..) |*id, k| {
+                    if (k > 0) try w.writeByte(',');
+                    try w.print("{d}", .{id.load(.monotonic)});
+                }
+                try w.writeAll("]}");
             }
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
@@ -246,4 +281,23 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqualStrings("offline", s1.get("state").?.string);
     try testing.expectEqualStrings("segment 00000001.flseg failed its \"checksum\"", s1.get("reason").?.string);
     try testing.expectEqual(@as(i64, 3), s1.get("losses").?.object.get("segment_unreadable").?.integer);
+}
+
+test "health: /status shows removal notices held, and the quorum once acted on" {
+    var h = try NodeHealth.init(testing.allocator, 1, 1);
+    defer h.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "removal") == null);
+
+    h.shards[0].removal.publish(&.{2}, 2, 9, 0);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"removal\":{\"notices\":1,\"of\":2,\"config_index\":9,\"from\":[2]}") != null);
+
+    h.shards[0].removal.publish(&.{ 2, 3 }, 2, 10, 1000);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"removal\":{\"notices\":2,\"of\":2,\"config_index\":10,\"at_ms\":1000,\"from\":[2,3]}") != null);
 }
