@@ -3822,14 +3822,11 @@ pub const Shard = struct {
             if (total > self.parse_buf.len or conn.read_buf.readable() < total) return;
             _ = conn.read_buf.copyOut(self.parse_buf[0..total]);
             const req = proto.Request.parse(self.parse_buf[0..total]) catch return;
-            if (conn.write_buf.readable() + UNREAD_ANSWER_ROOM > Connection.MAX_WRITE_BUFFER) return;
+            if (conn.write_buf.readable() + REFUSAL_FRAME_MAX > Connection.MAX_WRITE_BUFFER) return;
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
             conn.read_buf.consume(total);
         }
     }
-
-    /// Room for one "did not run" answer, header and all.
-    const UNREAD_ANSWER_ROOM = 1024;
 
     // ─── Background tasks ────────────────────────────────────────────────
 
@@ -4798,11 +4795,14 @@ pub const Shard = struct {
         self.sendRefusal(conn, request_id, status, proto.unclassified(status, msg));
     }
 
+    /// The most a refusal's frame takes: one too long is cut to fit.
+    pub const REFUSAL_FRAME_MAX = 1024;
+
     /// A refusal is always sent: one too long for its frame is cut, never
     /// dropped (a dropped one left the client the no-answer fallback).
     pub fn sendRefusal(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
         _ = self;
-        var buf: [1024]u8 = undefined;
+        var buf: [REFUSAL_FRAME_MAX]u8 = undefined;
         _ = conn.queueWrite(proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
@@ -4913,7 +4913,7 @@ pub const Shard = struct {
     }
 
     pub fn deliverDeferredRefusal(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
-        var buf: [1024]u8 = undefined;
+        var buf: [REFUSAL_FRAME_MAX]u8 = undefined;
         self.deliverDeferred(reply_to, proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
