@@ -592,6 +592,9 @@ pub const ShardMetrics = struct {
     /// Entries and segments lost without anyone being told, by path
     /// (`silent_loss.Path`), as the shard last published them.
     silent_loss: [silent_loss.PATH_COUNT]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// Entries refused for repeating an index the partition holds: no loss,
+    /// but a writer bug.
+    duplicate_index: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
 
@@ -690,8 +693,9 @@ pub const ShardMetrics = struct {
         _ = self.handler_no_answer.fetchAdd(1, .monotonic);
     }
 
-    pub fn setSilentLoss(self: *ShardMetrics, counts: [silent_loss.PATH_COUNT]u64, offline: bool) void {
+    pub fn setSilentLoss(self: *ShardMetrics, counts: [silent_loss.PATH_COUNT]u64, duplicate_index: u64, offline: bool) void {
         for (counts, &self.silent_loss) |n, *c| c.store(n, .monotonic);
+        self.duplicate_index.store(duplicate_index, .monotonic);
         self.offline.store(@intFromBool(offline), .monotonic);
     }
 
@@ -730,6 +734,7 @@ pub const ShardMetrics = struct {
         connections_paused: [PAUSE_REASONS.len]u64,
         stamp_skew_ms: i64,
         silent_loss: [silent_loss.PATH_COUNT]u64,
+        duplicate_index: u64,
         offline: u8,
     };
 
@@ -760,6 +765,7 @@ pub const ShardMetrics = struct {
                 for (&out, &self.silent_loss) |*o, *c| o.* = c.load(.monotonic);
                 break :blk out;
             },
+            .duplicate_index = self.duplicate_index.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
@@ -1553,6 +1559,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, i| {
         try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
     }
+    try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
