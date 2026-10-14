@@ -42,8 +42,9 @@
 //!
 //! The operator does **not** call into KV storage directly — it has no
 //! reference to a Shard or Partition. Instead, the processing handler
-//! wires a `KvLookupFn` callback at job startup. During unit tests a
-//! simple HashMap stub is injected.
+//! wires a `KvLookupFn` callback at job startup. The callback reads only
+//! the KV of the shard the job runs on, so a key another shard owns is a
+//! miss. During unit tests a simple HashMap stub is injected.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
