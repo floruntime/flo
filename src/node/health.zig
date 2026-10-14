@@ -215,7 +215,7 @@ pub const NodeHealth = struct {
                 const n = if (sm) |m| m.silent_loss[p].load(.monotonic) else 0;
                 try w.print("\"{s}\":{d}", .{ name, n });
             }
-            try w.writeAll("}}");
+            try w.print("}},\"duplicate_index\":{d}}}", .{if (sm) |m| m.duplicate_index.load(.monotonic) else 0});
         }
         try w.writeAll("]}\n");
     }
@@ -276,6 +276,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     defer registry.deinit();
     try registry.initShards(2);
     registry.shardMetrics(1).?.silent_loss[@backingInt(silent_loss.Path.segment_unreadable)].store(3, .monotonic);
+    registry.shardMetrics(1).?.duplicate_index.store(2, .monotonic);
 
     var h = try NodeHealth.init(testing.allocator, 42, 2);
     defer h.deinit(testing.allocator);
@@ -310,6 +311,9 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqualStrings("offline", s1.get("state").?.string);
     try testing.expectEqualStrings("segment 00000001.flseg failed its \"checksum\"", s1.get("reason").?.string);
     try testing.expectEqual(@as(i64, 3), s1.get("losses").?.object.get("segment_unreadable").?.integer);
+    // A repeated index is shown beside the losses, not among them.
+    try testing.expectEqual(@as(i64, 0), s0.get("duplicate_index").?.integer);
+    try testing.expectEqual(@as(i64, 2), s1.get("duplicate_index").?.integer);
 }
 
 test "health: /status shows removal notices held, and the quorum once acted on" {

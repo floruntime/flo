@@ -2974,7 +2974,7 @@ pub const Shard = struct {
     /// Publish this shard's state and losses. The runtime calls it once
     /// before the client port opens, so the first answers are already right.
     pub fn publishHealth(self: *Shard) void {
-        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.offline != null);
+        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
         const slot = self.health orelse return;
         // The reason before the state: a reader that sees offline finds it.
         if (self.offline) |*damage| slot.setReason(damage.reason());
@@ -5866,9 +5866,7 @@ fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *co
     switch (result) {
         .applied => {},
         .partition_reject => |err| if (err == error.IndexNotIncreasing)
-            // The first entry at this index applied; this one is refused,
-            // and nothing is missing.
-            counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} repeats an index the partition already holds; refused", .{ index, type_name })
+            counts.noteDuplicate(now_ms, shard_id, index, type_name)
         else
             counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
         .router_error => counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection; the projection is missing it", .{ index, type_name }),
@@ -11938,4 +11936,31 @@ test "Shard: a stopping shard stops answering unread requests before its write b
     try std.testing.expectEqual(filler.len, conn.write_buf.readable());
     try std.testing.expect(!conn.write_overflow);
     try std.testing.expectEqual(req.len, conn.read_buf.readable());
+}
+
+test "an entry repeating an index the partition holds is counted as a duplicate, not as silent loss" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    var sm = ShardMetrics{ .shard_id = 0 };
+    shard.shard_metrics = &sm;
+    defer shard.shard_metrics = null;
+
+    var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
+    e.header.crc32c = e.computeCrc();
+    const first = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e);
+    try std.testing.expect(first == .applied);
+    const again = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e);
+    try std.testing.expect(again == .partition_reject);
+    noteApply(&shard.losses, shard.id, Shard.nowMs(), &e, again);
+
+    try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.partition_reject));
+    try std.testing.expectEqual(@as(u64, 1), shard.losses.duplicate_index);
+    shard.publishHealth();
+    const snap = sm.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.duplicate_index);
+    for (snap.silent_loss) |n| try std.testing.expectEqual(@as(u64, 0), n);
 }
