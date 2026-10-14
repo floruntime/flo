@@ -73,10 +73,11 @@ pub fn status(
 pub fn list(
     client: *Client,
     namespace: []const u8,
+    limit: ?u32,
     cursor: ?[]const u8,
 ) !Response {
     var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
-    return client.sendRequest(.processing_list, namespace, "", try base.walkValue(&value_buf, null, cursor));
+    return client.sendRequest(.processing_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }
 
 /// Trigger a savepoint for a processing job
