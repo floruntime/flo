@@ -128,6 +128,9 @@ pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + table_run.o
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
+    // `deliverDeferredOk` frames an answer of up to MAX_REQUEST_SIZE bytes
+    // in scratch for a client on another shard or node.
+    std.debug.assert(SCRATCH_SIZE >= @sizeOf(proto.ResponseHeader) + MAX_REQUEST_SIZE);
 }
 /// A read buffer grows to hold one whole request (and the start of the next).
 const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
@@ -4641,17 +4644,6 @@ pub const Shard = struct {
         _ = conn.queueWrite(proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
-    /// Deliver an already-serialized answer to wherever `reply_to` says.
-    ///
-    /// A connection's fd, buffers, and reactor registration belong to the
-    /// shard that owns it. When that is this shard, write directly;
-    /// otherwise marshal the bytes to that shard so the socket write happens
-    /// on its thread — never touch another shard's connection from here. A
-    /// node that forwarded the request gets the answer over the peer link.
-    ///
-    /// The connection's generation is checked against the live connection
-    /// before writing, so that fd reuse (close + accept at the same fd)
-    /// cannot misdirect a stale answer to the wrong client.
     /// Noted for `dispatchNoted`, which checks the request was parked.
     fn noteDeferred(self: *Shard, reply_to: ReplyTo, request_id: u64) void {
         if (self.dispatching) |*d| {
@@ -4671,6 +4663,17 @@ pub const Shard = struct {
         return if (conn.id == to.conn_id) conn else null;
     }
 
+    /// Deliver an already-serialized answer to wherever `reply_to` says.
+    ///
+    /// A connection's fd, buffers, and reactor registration belong to the
+    /// shard that owns it. When that is this shard, write directly;
+    /// otherwise marshal the bytes to that shard so the socket write happens
+    /// on its thread — never touch another shard's connection from here. A
+    /// node that forwarded the request gets the answer over the peer link.
+    ///
+    /// The connection's generation is checked against the live connection
+    /// before writing, so that fd reuse (close + accept at the same fd)
+    /// cannot misdirect a stale answer to the wrong client.
     pub fn deliverDeferred(self: *Shard, reply_to: ReplyTo, bytes: []const u8) void {
         if (bytes.len >= @sizeOf(proto.ResponseHeader)) {
             self.noteDeferred(reply_to, std.mem.readInt(u64, bytes[@offsetOf(proto.ResponseHeader, "request_id")..][0..8], .little));

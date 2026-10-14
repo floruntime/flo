@@ -87,6 +87,7 @@ pub fn answer(comptime Response: type, shard: *Shard, conn: *Connection, request
     const header_size = @sizeOf(proto.ResponseHeader);
     const body_size = Response.encodedSize(v) catch
         return shard.sendErrorResponse(conn, request_id, .internal_error, "internal error: an answer didn't fit its schema");
+    if (body_size > Response.max_size) return shard.sendErrorResponse(conn, request_id, .internal_error, "internal error: an answer didn't fit its schema");
     // Null only where `queueWrite` would refuse it too: the client isn't
     // reading, and is closed.
     const out = conn.reserveWrite(header_size + body_size) orelse {

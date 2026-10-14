@@ -166,14 +166,6 @@ pub const RingBuffer = struct {
         self.read_pos = 0;
         self.write_pos = held;
     }
-
-    /// Compact: if both cursors have advanced far, reset them.
-    pub fn compact(self: *RingBuffer) void {
-        if (self.read_pos >= self.buf.len) {
-            self.write_pos -= self.read_pos;
-            self.read_pos = 0;
-        }
-    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -455,9 +447,8 @@ pub const Connection = struct {
     /// rather than build it elsewhere and copy it; `commitWrite` then
     /// queues what was written, and nothing else may write in between. The
     /// held bytes move to the front when the free space wraps, and the buffer
-    /// grows as `queueWrite`'s does. Null past `MAX_WRITE_BUFFER`: the caller
-    /// builds the answer in the shard's scratch and hands it to `queueWrite`,
-    /// which sets `write_overflow`.
+    /// grows as `queueWrite`'s does. Null past `MAX_WRITE_BUFFER`, where
+    /// `queueWrite` would refuse too: the caller sets `write_overflow`.
     pub fn reserveWrite(self: *Connection, n: usize) ?[]u8 {
         std.debug.assert(self.reserved == null);
         const ring = &self.write_buf;
