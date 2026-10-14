@@ -155,6 +155,11 @@ pub const Inbox = struct {
             // Full check: compare against consumer's read position
             const consumer_pos = @atomicLoad(usize, &self.read_tail, .acquire);
             if (head -% consumer_pos >= self.capacity) {
+                // Between the two loads other producers may have claimed,
+                // and the consumer drained, past `head`: the difference
+                // then wraps and reads as full. Only a `head` still current
+                // is compared.
+                if (self.write_head.load(.acquire) != head) continue;
                 return false; // ring full — backpressure
             }
 
@@ -201,10 +206,12 @@ pub const Inbox = struct {
         return self.commit_tail.load(.seq_cst) -% self.read_tail;
     }
 
-    /// Returns the number of unread messages.
+    /// Returns the number of unread messages. Any thread may ask (the
+    /// metrics read it live): the tail is loaded first, since a drain
+    /// between the loads could take it past a commit loaded earlier.
     pub fn pending(self: *const Inbox) usize {
-        const committed = self.commit_tail.load(.acquire);
         const tail = @atomicLoad(usize, &self.read_tail, .acquire);
+        const committed = self.commit_tail.load(.acquire);
         return committed -% tail;
     }
 };
