@@ -155,6 +155,11 @@ pub const Inbox = struct {
             // Full check: compare against consumer's read position
             const consumer_pos = @atomicLoad(usize, &self.read_tail, .acquire);
             if (head -% consumer_pos >= self.capacity) {
+                // Between the two loads other producers may have claimed,
+                // and the consumer drained, past `head`: the difference
+                // then wraps and reads as full. Only a `head` still current
+                // is compared.
+                if (self.write_head.load(.acquire) != head) continue;
                 return false; // ring full — backpressure
             }
 
@@ -201,11 +206,16 @@ pub const Inbox = struct {
         return self.commit_tail.load(.seq_cst) -% self.read_tail;
     }
 
-    /// Returns the number of unread messages.
+    /// Returns the number of unread messages, never more than the ring
+    /// holds. Any thread may ask (the metrics read it live). Off the
+    /// consumer's thread the two loads are a moment apart: the tail is
+    /// loaded first so a drain between them can't take it past the commit,
+    /// and the count is capped, since a reader held up between them can
+    /// see the consumer drain and the producers refill more than a ring.
     pub fn pending(self: *const Inbox) usize {
-        const committed = self.commit_tail.load(.acquire);
         const tail = @atomicLoad(usize, &self.read_tail, .acquire);
-        return committed -% tail;
+        const committed = self.commit_tail.load(.acquire);
+        return @min(committed -% tail, self.capacity);
     }
 };
 
@@ -318,6 +328,20 @@ test "Inbox: multi-producer, single consumer" {
     for (per_shard) |count| {
         try std.testing.expectEqual(@as(usize, msgs_per_producer), count);
     }
+}
+
+test "Inbox: pending never reads more than the ring holds, whatever pair of cursors a reader sees" {
+    var inbox = try Inbox.init(std.testing.allocator, 16);
+    defer inbox.deinit();
+    // A reader held up between its loads: the commit more than a ring
+    // ahead of the tail it loaded, or a tail past the commit.
+    inbox.read_tail = 100;
+    inbox.commit_tail.store(100 + 3 * inbox.capacity, .seq_cst);
+    try std.testing.expectEqual(inbox.capacity, inbox.pending());
+    inbox.commit_tail.store(90, .seq_cst);
+    try std.testing.expectEqual(inbox.capacity, inbox.pending());
+    inbox.commit_tail.store(105, .seq_cst);
+    try std.testing.expectEqual(@as(usize, 5), inbox.pending());
 }
 
 test "Inbox: drain partial batch" {
