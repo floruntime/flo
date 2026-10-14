@@ -3063,3 +3063,47 @@ test "e2e/processing: a source reads every record of a batch over 100" {
     try testing.expectEqual(@as(usize, 150), n);
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_big" });
 }
+
+test "e2e/processing: ts sink drops a value past f64's range, and a ts source writes JSON" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_tsfin" });
+
+    // Into TS through a sink: the out-of-range value is dropped.
+    try ctx.exec(&.{ "stream", "append", "fin-in", "{\"v\":1e400}", "-n", "proc_tsfin" });
+    try ctx.exec(&.{ "stream", "append", "fin-in", "{\"v\":2.5}", "-n", "proc_tsfin" });
+    const sink_def =
+        \\kind: Processing
+        \\name: e2e-ts-finite
+        \\namespace: proc_tsfin
+        \\sources.[0].stream.name: fin-in
+        \\sinks.[0].ts.measurement: fin_m
+        \\sinks.[0].ts.value_field: v
+    ;
+    const sink_path = try writeDottedToTempYaml(testing.allocator, sink_def, "e2e-ts-finite.yaml");
+    defer cleanupTempFile(testing.allocator, sink_path);
+    _ = extractJobId(try ctx.execCapture(&.{ "processing", "submit", sink_path, "-n", "proc_tsfin" })) orelse return error.NoJobId;
+    if (!try readTsBlocking(ctx, "fin_m", "proc_tsfin", "value", 5000)) return error.PipelineTimeout;
+
+    // Out of TS through a source: every record is JSON.
+    const src_def =
+        \\kind: Processing
+        \\name: e2e-ts-source-json
+        \\namespace: proc_tsfin
+        \\sources.[0].ts.measurement: fin_m
+        \\sources.[0].ts.field: value
+        \\sources.[0].ts.poll_interval_ms: 200
+        \\sinks.[0].stream.name: fin-out
+    ;
+    const src_path = try writeDottedToTempYaml(testing.allocator, src_def, "e2e-ts-source-json.yaml");
+    defer cleanupTempFile(testing.allocator, src_path);
+    _ = extractJobId(try ctx.execCapture(&.{ "processing", "submit", src_path, "-n", "proc_tsfin" })) orelse return error.NoJobId;
+    if (!try readStreamBlocking(ctx, "fin-out", "proc_tsfin", "fin_m", "8000")) return error.PipelineTimeout;
+
+    var out = try ctx.cli.run(&.{ "stream", "read", "fin-out", "-n", "proc_tsfin", "--start", "0-0", "--limit", "20" });
+    defer out.deinit();
+    try testing.expectEqual(@as(u8, 0), out.exit_code);
+    try testing.expect(out.contains("2.5"));
+    try testing.expect(!out.contains("inf"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.stdout, "\"measurement\""));
+}

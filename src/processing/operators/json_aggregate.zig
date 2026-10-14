@@ -475,8 +475,7 @@ pub const JsonAggregateOperator = struct {
 
         return switch (current) {
             .integer => |n| @as(f64, @floatFromInt(n)),
-            // A number past f64's range is skipped like a non-numeric one.
-            .float => |f| if (std.math.isFinite(f)) f else null,
+            .float => |f| f,
             else => null,
         };
     }
@@ -869,7 +868,8 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
     const op = agg.operator();
     const key = "a\"b\\c\n";
 
-    // Past f64's range: skipped like a non-numeric value.
+    // Past f64's range std.json keeps the number as text: skipped like a
+    // non-numeric value.
     try op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx);
     try std.testing.expectEqual(@as(usize, 0), collector.count());
 

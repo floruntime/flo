@@ -1290,10 +1290,12 @@ pub const ProcessingHandler = struct {
     }
 
     /// `{"measurement":<name>,"value":<v>,"timestamp_ms":<ms>}`, the name
-    /// escaped as a JSON string; null when it doesn't fit `buf`.
+    /// escaped as a JSON string and a non-finite value as null; null when
+    /// it doesn't fit `buf`.
     fn tsPointJson(buf: []u8, measurement: []const u8, value: f64, ts_ms: i64) ?[]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        std.json.Stringify.value(.{ .measurement = measurement, .value = value, .timestamp_ms = ts_ms }, .{}, &w) catch return null;
+        const v: ?f64 = if (std.math.isFinite(value)) value else null;
+        std.json.Stringify.value(.{ .measurement = measurement, .value = v, .timestamp_ms = ts_ms }, .{}, &w) catch return null;
         return w.buffered();
     }
 
@@ -1716,6 +1718,10 @@ pub const ProcessingHandler = struct {
                     self.noteSinkDrop(shard, "ts", snk.measurement, "the record has no numeric field for it");
                     continue;
                 };
+                if (!std.math.isFinite(value)) {
+                    self.noteSinkDrop(shard, "ts", snk.measurement, "the value is not a finite number");
+                    continue;
+                }
                 const ual_idx = ts_h.nextUalIndex();
                 ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
                     self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
@@ -1728,6 +1734,7 @@ pub const ProcessingHandler = struct {
         // value_field shorthand — extract the named JSON field and store it as "value".
         const value = extractJsonFloat(payload, snk.value_field) orelse
             (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard, "ts", snk.measurement, "the record is not a number"));
+        if (!std.math.isFinite(value)) return self.noteSinkDrop(shard, "ts", snk.measurement, "the value is not a finite number");
         const ual_idx = ts_h.nextUalIndex();
         ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
     }
