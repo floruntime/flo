@@ -112,7 +112,6 @@ Storage tiers:
 |------|---------------|---------|
 | **Hot** | mmap'd ring buffer in RAM | Recent entries for active reads |
 | **Warm** | Disk segment files | Historical data, memory-mapped |
-| **Cold** | S3/GCS/Azure (planned) | Long-term archival |
 
 The Raft log IS the UAL — there is no separate write-ahead log.
 

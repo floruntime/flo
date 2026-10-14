@@ -303,23 +303,20 @@ If the UAL has been compacted and there's no snapshot covering the compacted ran
 ## Directory Layout
 
 ```
-data/{shard_id}/
-├── uat/
-│   └── {partition_id}/
-│       ├── head.ual                    # Active write buffer
-│       ├── seg-{first_index}.flseg     # Sealed warm segments
-│       └── MANIFEST                    # Segment inventory
-├── snapshots/
-│   └── {partition_id}/
-│       ├── snap-{idx}-{ts}.fsnap       # Latest snapshot
-│       └── MANIFEST                    # Points to current snapshot
-├── ts/
-│   └── {partition_id}/
-│       └── col-{file_id}.floc          # Columnar TS block files
-└── raft_meta                           # 64 bytes: term, voted_for, node_id
+{data_dir}/
+├── flo.lock                    # Held while a server uses the directory
+├── SYSTEM                      # Shard and partition counts, checked at every boot
+├── 00000/                      # One directory per shard
+│   ├── MANIFEST                # Names the latest snapshot
+│   ├── HARDSTATE               # Raft term and vote
+│   ├── segs/
+│   │   └── 0000000001.flseg    # Sealed log segments, named by first index
+│   └── snaps/
+│       └── {index}-{ts}.fsnap  # Snapshots
+└── 00001/
 ```
 
-Each partition's data is fully independent. A shard can manage dozens of partitions without any cross-partition file contention.
+Each shard's files are its own: no two shards write the same file.
 
 ---
 

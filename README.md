@@ -45,7 +45,7 @@ Flo takes a different approach. All five primitives share one Raft consensus log
 - **Stream Processing** — Real-time stateful pipelines with windowing, keyed state, checkpointing, watermarks, and WASM operators — no separate cluster needed
 - **Workflows** — Multi-step orchestration with YAML definitions, signals, timers, circuit breakers, and health-weighted routing
 - **Thread-per-Core** — Shared-nothing architecture with io_uring/kqueue per core. No locks, no GC pauses
-- **Raft Consensus** — Linearizable writes, tiered storage (hot RAM → warm disk → cold remote), automatic leader election
+- **Raft Consensus** — Linearizable writes, tiered storage (hot RAM → warm disk), automatic leader election
 - **Built-in Dashboard** — Real-time web UI for monitoring streams, keys, queues, and cluster health
 
 ## Quick Start
@@ -184,7 +184,6 @@ All writes go through the **Unified Append Log (UAL)**. The Raft consensus log a
 |------|--------|---------|---------|
 | Hot | RAM ring buffer | ~µs | Recent entries, active reads |
 | Warm | Local disk segments | ~ms | Historical data, memory-mapped I/O |
-| Cold | Remote (S3/GCS) | ~100ms | Long-term archival |
 
 ### Performance
 
@@ -611,7 +610,6 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Web Dashboard | ✅ Complete |
 | Cluster membership by the replicated log | ✅ Complete |
 | Writes forwarded to the leader | ✅ Complete |
-| Cold Storage (S3/GCS) | � Local backend complete, remote planned |
 
 ## Contributing
 
