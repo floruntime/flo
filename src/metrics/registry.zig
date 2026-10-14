@@ -564,6 +564,8 @@ pub const ShardMetrics = struct {
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
     replies_dropped: Atomic(u64) = Atomic(u64).init(0),
+    /// Removal notices received, by what became of each (`RemovalOutcome`).
+    removal_notices: [4]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Requests whose handler neither answered nor parked them; each was
     /// answered internal_error. A count is a handler bug.
     handler_no_answer: Atomic(u64) = Atomic(u64).init(0),
@@ -674,6 +676,12 @@ pub const ShardMetrics = struct {
         for (counts, &self.connections_paused) |n, *g| g.store(n, .monotonic);
     }
 
+    pub const RemovalOutcome = enum(u2) { counted, duplicate, ignored, conflict };
+
+    pub fn recordRemovalNotice(self: *ShardMetrics, outcome: RemovalOutcome) void {
+        _ = self.removal_notices[@backingInt(outcome)].fetchAdd(1, .monotonic);
+    }
+
     pub fn recordReplyDropped(self: *ShardMetrics) void {
         _ = self.replies_dropped.fetchAdd(1, .monotonic);
     }
@@ -713,6 +721,7 @@ pub const ShardMetrics = struct {
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [2]u64,
         replies_dropped: u64,
+        removal_notices: [4]u64,
         handler_no_answer: u64,
         stream_skipped_appends: u64,
         kv_txns_reaped: u64,
@@ -739,6 +748,7 @@ pub const ShardMetrics = struct {
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic) },
             .replies_dropped = self.replies_dropped.load(.monotonic),
+            .removal_notices = .{ self.removal_notices[0].load(.monotonic), self.removal_notices[1].load(.monotonic), self.removal_notices[2].load(.monotonic), self.removal_notices[3].load(.monotonic) },
             .handler_no_answer = self.handler_no_answer.load(.monotonic),
             .stream_skipped_appends = self.stream_skipped_appends.load(.monotonic),
             .kv_txns_reaped = self.kv_txns_reaped.load(.monotonic),
@@ -1535,6 +1545,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
+    const rinfo = @typeInfo(ShardMetrics.RemovalOutcome).@"enum";
+    inline for (rinfo.field_names, rinfo.field_values) |rname, rvalue| {
+        try writer.print("flo_shard_removal_notices_total{{shard_id=\"{d}\",outcome=\"" ++ rname ++ "\"}} {d}\n", .{ snap.shard_id, snap.removal_notices[rvalue] });
+    }
     try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
     inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, i| {
         try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });

@@ -51,6 +51,58 @@ pub const ShardState = enum(u8) {
 /// The longest reason kept for an offline shard.
 pub const REASON_MAX = 256;
 
+/// Removal notices a shard holds: while it counts toward a quorum, and the
+/// members that made one once it acted. A sequence count, odd while a
+/// publication is being written, lets a reader take one whole publication
+/// and never a mix of two.
+pub const Removal = struct {
+    pub const MAX_FROM = @import("../raft/membership.zig").MAX_MEMBERS;
+    seq: Atomic(u32) = .init(0),
+    notices: Atomic(u8) = .init(0),
+    needed: Atomic(u8) = .init(0),
+    config_index: Atomic(u64) = .init(0),
+    /// The removing leader's clock, once the shard acted; 0 while counting.
+    at_ms: Atomic(u64) = .init(0),
+    from: [MAX_FROM]Atomic(u32) = @splat(.init(0)),
+
+    pub fn publish(self: *Removal, from: []const u32, needed: u8, config_index: u64, at_ms: u64) void {
+        _ = self.seq.fetchAdd(1, .acq_rel);
+        for (from, 0..) |id, i| self.from[i].store(id, .release);
+        self.needed.store(needed, .release);
+        self.config_index.store(config_index, .release);
+        self.at_ms.store(at_ms, .release);
+        self.notices.store(@intCast(from.len), .release);
+        _ = self.seq.fetchAdd(1, .release);
+    }
+
+    pub const Read = struct {
+        notices: u8 = 0,
+        needed: u8 = 0,
+        config_index: u64 = 0,
+        at_ms: u64 = 0,
+        from: [MAX_FROM]u32 = undefined,
+    };
+
+    /// One whole publication, or nothing held if none settles in a few
+    /// tries (the shard is publishing as fast as it can be read).
+    pub fn read(self: *const Removal) Read {
+        for (0..8) |_| {
+            const before = self.seq.load(.acquire);
+            if (before % 2 == 1) continue;
+            var r: Read = .{
+                .notices = self.notices.load(.acquire),
+                .needed = self.needed.load(.acquire),
+                .config_index = self.config_index.load(.acquire),
+                .at_ms = self.at_ms.load(.acquire),
+            };
+            for (self.from[0..r.notices], 0..) |*id, i| r.from[i] = id.load(.acquire);
+            if (self.seq.load(.acquire) == before) return r;
+            r = .{};
+        }
+        return .{};
+    }
+};
+
 pub const ShardSlot = struct {
     state: Atomic(u8) = .init(@backingInt(ShardState.loading)),
     role: Atomic(u8) = .init(@backingInt(Role.follower)),
@@ -63,6 +115,7 @@ pub const ShardSlot = struct {
     /// Written once, before the state first reads `offline`.
     reason_len: Atomic(u16) = .init(0),
     reason_buf: [REASON_MAX]u8 = undefined,
+    removal: Removal = .{},
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -143,6 +196,17 @@ pub const NodeHealth = struct {
             };
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
+            }
+            const removal = s.removal.read();
+            if (removal.notices > 0) {
+                try w.print(",\"removal\":{{\"notices\":{d},\"of\":{d},\"config_index\":{d}", .{ removal.notices, removal.needed, removal.config_index });
+                if (removal.at_ms != 0) try w.print(",\"at_ms\":{d}", .{removal.at_ms});
+                try w.writeAll(",\"from\":[");
+                for (removal.from[0..removal.notices], 0..) |id, k| {
+                    if (k > 0) try w.writeByte(',');
+                    try w.print("{d}", .{id});
+                }
+                try w.writeAll("]}");
             }
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
@@ -246,4 +310,23 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqualStrings("offline", s1.get("state").?.string);
     try testing.expectEqualStrings("segment 00000001.flseg failed its \"checksum\"", s1.get("reason").?.string);
     try testing.expectEqual(@as(i64, 3), s1.get("losses").?.object.get("segment_unreadable").?.integer);
+}
+
+test "health: /status shows removal notices held, and the quorum once acted on" {
+    var h = try NodeHealth.init(testing.allocator, 1, 1);
+    defer h.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "removal") == null);
+
+    h.shards[0].removal.publish(&.{2}, 2, 9, 0);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"removal\":{\"notices\":1,\"of\":2,\"config_index\":9,\"from\":[2]}") != null);
+
+    h.shards[0].removal.publish(&.{ 2, 3 }, 2, 10, 1000);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"removal\":{\"notices\":2,\"of\":2,\"config_index\":10,\"at_ms\":1000,\"from\":[2,3]}") != null);
 }
