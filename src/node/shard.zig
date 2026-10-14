@@ -3095,8 +3095,10 @@ pub const Shard = struct {
             const prev_index = next - 1;
             const known_term: ?u64 = if (prev_index == 0) 0 else raft.log.entryTerm(prev_index);
             // Below where this log starts, even index 0's known term places
-            // nothing: the entries after it are gone.
-            p.below_log = known_term == null or next < raft.log.start();
+            // nothing: the entries after it are gone. A term recorded as 0
+            // past index 0 is a snapshot that didn't keep its term, which no
+            // follower can match.
+            p.below_log = known_term == null or (prev_index > 0 and known_term.? == 0) or next < raft.log.start();
             if (p.below_log) {
                 // No append can reach this peer. Heartbeats still go, with
                 // no term (no entry has term 0), so it does not campaign.
@@ -11409,6 +11411,19 @@ test "Shard: a peer below everything the leader knows the term of gets heartbeat
     clearOutbound(&rn);
     shard.pump(later + 1);
     try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
+
+    // At the floor itself, reset with no term: no follower can match a
+    // term of 0, so it is below the log too.
+    raft.log.resetToSnapshot(floor, 0);
+    p.next_index = floor + 1;
+    p.heartbeat_at_ms = 0;
+    clearOutbound(&rn);
+    shard.pump(later + 2);
+    try std.testing.expect(p.below_log);
+    try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
+    clearOutbound(&rn);
+    raft.log.resetToSnapshot(floor, raft.current_term);
+    _ = try raft.log.append(&above);
 
     // At index 1, below where the log now starts: index 0's term is known,
     // but nothing after it can be sent.

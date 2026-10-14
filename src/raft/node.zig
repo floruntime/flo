@@ -1088,9 +1088,10 @@ pub const RaftNode = struct {
                 // A known term that disagrees at or below a durable commit is
                 // committed history the leader does not hold: divergence, not
                 // a retry. Not so for one this node can't read (below a
-                // snapshot), nor for a heartbeat that carries no term (0: a
-                // leader that can't place this node).
-                if (self.config.durable_commits and req.prev_log_term != 0 and req.prev_log_index <= self.commit_index and self.log.entryTerm(req.prev_log_index) != null) return error.CommittedConflict;
+                // snapshot, or recorded as 0 by a snapshot that didn't keep
+                // its term: no entry has term 0), nor for a heartbeat that
+                // carries no term (a leader that can't place this node).
+                if (self.config.durable_commits and req.prev_log_term != 0 and req.prev_log_index <= self.commit_index and (self.log.entryTerm(req.prev_log_index) orelse 0) != 0) return error.CommittedConflict;
                 const tip = self.log.tip();
                 const run_start = if (req.prev_log_index > tip) tip else (self.log.runStart(req.prev_log_index) orelse req.prev_log_index) -| 1;
                 // Never below commit: a committed prefix and a conflicting
@@ -3211,6 +3212,21 @@ test "raft node: a rejection never hints below commit, and committed history tha
         const beat = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 0, .entries = &.{}, .leader_commit = 4 });
         try testing.expect(!beat.success);
         try testing.expectEqual(@as(u64, 4), beat.hint_index);
+    }
+}
+
+test "raft node: a follower reset to a snapshot that kept no term refuses the leader's retry at it, but never as divergence" {
+    for ([_]bool{ true, false }) |durable| {
+        var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{ .durable_commits = durable });
+        defer follower.deinit();
+        follower.log.resetToSnapshot(10, 0);
+        follower.commit_index = 10;
+        follower.current_term = 2;
+        // The leader holds index 10 in term 1: refused with a hint at 10,
+        // since nothing here can confirm the term, and not divergence.
+        const r = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 10, .prev_log_term = 1, .entries = &.{}, .leader_commit = 10 });
+        try testing.expect(!r.success);
+        try testing.expectEqual(@as(u64, 10), r.hint_index);
     }
 }
 
