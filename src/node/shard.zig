@@ -2795,11 +2795,13 @@ pub const Shard = struct {
     const REMOVAL_NOTICE_SIZE = 16;
 
     /// One member's word is not enough to stop this node: it acts once a
-    /// majority of the other voters in its own committed config have each
-    /// said so, naming the same removal in a config newer than its own.
-    /// A node that has no committed config yet, still joining, has no
-    /// voters to count, and stops on one notice from a linked peer: that is
-    /// all it can learn until links prove more than the cluster secret.
+    /// majority of the other voters in its own committed config each hold a
+    /// notice naming the same removal, in a config newer than its own. Each
+    /// sender's latest notice is what counts, so one sender changing its
+    /// word moves only its own vote. A node with no committed config yet,
+    /// still joining, has no voters to count, and stops on one notice from a
+    /// linked peer: that is all it can learn until links prove each node's
+    /// identity.
     fn takeRemovedNotice(self: *Shard, frame: RaftFrame) void {
         if (frame.payload.len != REMOVAL_NOTICE_SIZE) return self.badFrame(frame);
         const when_ms = std.mem.readInt(u64, frame.payload[0..8], .little);
@@ -2809,10 +2811,8 @@ pub const Shard = struct {
         const from = frame.source_node;
         if (committed.member_count == 0) {
             self.noteRemovalNotice(.counted);
-            self.removal.when_ms = when_ms;
-            self.removal.config_index = config_index;
-            self.removal.from[0] = from;
-            self.removal.count = 1;
+            self.removal = .{ .config_index = config_index };
+            self.removal.hold(from, when_ms);
             return self.enterRemovedBy(when_ms, 1);
         }
         const why: ?[]const u8 = if (from == self.cluster_node_id or !committed.isVoter(from))
@@ -2825,20 +2825,16 @@ pub const Shard = struct {
             self.noteRemovalNotice(.ignored);
             return self.warnRemovalNotice(from, reason);
         }
-        if (self.removal.count > 0 and self.removal.when_ms != when_ms) {
-            self.noteRemovalNotice(.conflict);
-            self.warnRemovalNotice(from, "it names another removal than the notices held; counting starts again");
-            self.removal = .{};
-        }
-        for (self.removal.from[0..self.removal.count]) |id| if (id == from) return;
-        self.noteRemovalNotice(.counted);
-        self.removal.when_ms = when_ms;
+        if (self.removal.held(from)) |w| if (w == when_ms) return self.noteRemovalNotice(.duplicate);
         self.removal.config_index = @max(self.removal.config_index, config_index);
-        self.removal.from[self.removal.count] = from;
-        self.removal.count += 1;
+        self.removal.hold(from, when_ms);
+        if (self.removal.disagree(when_ms)) {
+            self.noteRemovalNotice(.conflict);
+            self.warnRemovalNotice(from, "it names another removal than other members' notices");
+        } else self.noteRemovalNotice(.counted);
         const needed = self.removalQuorum();
-        if (self.removal.count >= needed) return self.enterRemovedBy(when_ms, needed);
-        self.publishRemoval(needed, 0);
+        if (self.removal.agreeing(when_ms) >= needed) return self.enterRemovedBy(when_ms, needed);
+        self.publishRemoval(when_ms, needed, 0);
     }
 
     /// A strict majority of the voters other than this node in its committed
@@ -2855,17 +2851,25 @@ pub const Shard = struct {
     fn clearRemovalNotices(self: *Shard) void {
         if (self.removal.count == 0) return;
         self.removal = .{};
-        self.publishRemoval(0, 0);
+        self.publishRemoval(0, 0, 0);
     }
 
     fn enterRemovedBy(self: *Shard, when_ms: u64, needed: u8) void {
-        self.publishRemoval(needed, when_ms);
+        self.publishRemoval(when_ms, needed, when_ms);
         self.enterRemoved(when_ms);
     }
 
-    fn publishRemoval(self: *Shard, needed: u8, at_ms: u64) void {
+    /// The senders whose notices name `when_ms`, for /status.
+    fn publishRemoval(self: *Shard, when_ms: u64, needed: u8, at_ms: u64) void {
         const slot = self.health orelse return;
-        slot.removal.publish(self.removal.from[0..self.removal.count], needed, self.removal.config_index, at_ms);
+        var ids: [membership.MAX_MEMBERS]u32 = undefined;
+        var n: usize = 0;
+        for (self.removal.from[0..self.removal.count], self.removal.when[0..self.removal.count]) |id, w| {
+            if (w != when_ms) continue;
+            ids[n] = id;
+            n += 1;
+        }
+        slot.removal.publish(ids[0..n], needed, self.removal.config_index, at_ms);
     }
 
     fn noteRemovalNotice(self: *Shard, outcome: ShardMetrics.RemovalOutcome) void {
@@ -5576,13 +5580,38 @@ pub const Pending = struct {
 pub const PENDING_SLOTS: usize = 2 * raft_node_mod.MAX_OUTSTANDING;
 
 /// A client's write sent to the leader, and what came back.
-/// Removal notices counted toward a quorum: the removal they name, the
-/// newest config index among them, and who sent them.
+/// Removal notices held toward a quorum: each sender's latest, by the
+/// removal it names, and the newest config index among them.
 const RemovalNotices = struct {
-    when_ms: u64 = 0,
     config_index: u64 = 0,
     from: [membership.MAX_MEMBERS]u32 = undefined,
+    when: [membership.MAX_MEMBERS]u64 = undefined,
     count: u8 = 0,
+
+    fn held(self: *const RemovalNotices, id: u32) ?u64 {
+        for (self.from[0..self.count], self.when[0..self.count]) |f, w| if (f == id) return w;
+        return null;
+    }
+
+    fn hold(self: *RemovalNotices, id: u32, when_ms: u64) void {
+        for (self.from[0..self.count], 0..) |f, i| if (f == id) {
+            self.when[i] = when_ms;
+            return;
+        };
+        self.from[self.count] = id;
+        self.when[self.count] = when_ms;
+        self.count += 1;
+    }
+
+    fn agreeing(self: *const RemovalNotices, when_ms: u64) u8 {
+        var n: u8 = 0;
+        for (self.when[0..self.count]) |w| n += @intFromBool(w == when_ms);
+        return n;
+    }
+
+    fn disagree(self: *const RemovalNotices, when_ms: u64) bool {
+        return self.agreeing(when_ms) != self.count;
+    }
 };
 
 const Forward = struct {
@@ -11661,21 +11690,22 @@ test "Shard: removal notices need a quorum of the other voters, all naming one r
     // One of the two others: held, not acted on, and shown as one of two.
     removalNotice(&t.shard, 2, 1000, 9);
     try std.testing.expect(t.shard.removed_at_ms == null);
-    try std.testing.expectEqual(@as(u8, 1), slot.removal.notices.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 2), slot.removal.needed.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 2), slot.removal.from[0].load(.monotonic));
+    var shown = slot.removal.read();
+    try std.testing.expectEqual(@as(u8, 1), shown.notices);
+    try std.testing.expectEqual(@as(u8, 2), shown.needed);
+    try std.testing.expectEqual(@as(u32, 2), shown.from[0]);
     // The same sender again counts once.
     removalNotice(&t.shard, 2, 1000, 9);
     try std.testing.expectEqual(@as(u8, 1), t.shard.removal.count);
-    // A replica isn't a voter, and a config no newer than this node's says nothing new.
+    // This node, a replica, and a config no newer than this node's say nothing.
+    removalNotice(&t.shard, 1, 1000, 9);
     removalNotice(&t.shard, 4, 1000, 9);
     removalNotice(&t.shard, 3, 1000, 5);
     try std.testing.expectEqual(@as(u8, 1), t.shard.removal.count);
     try std.testing.expect(t.shard.removed_at_ms == null);
-    // Another removal than the one held: counting starts again from it.
+    // Another removal than 2's: held as 3's word, and the two don't agree.
     removalNotice(&t.shard, 3, 2000, 9);
-    try std.testing.expectEqual(@as(u8, 1), t.shard.removal.count);
-    try std.testing.expectEqual(@as(u32, 3), t.shard.removal.from[0]);
+    try std.testing.expectEqual(@as(u8, 2), t.shard.removal.count);
     try std.testing.expect(t.shard.removed_at_ms == null);
 
     // A leader of this term sends to this node as a member: the notices are void.
@@ -11683,20 +11713,40 @@ test "Shard: removal notices need a quorum of the other voters, all naming one r
     const n = transport.serializeAppendRequest(.{ .term = raft.current_term, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} }, &abuf).?;
     t.shard.handleRaftFrame(.{ .source_node = 2, .group_id = 0, .msg_type = .append_entries, .payload = abuf[0..n] });
     try std.testing.expectEqual(@as(u8, 0), t.shard.removal.count);
-    try std.testing.expectEqual(@as(u8, 0), slot.removal.notices.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), slot.removal.read().notices);
 
     // Both others, naming one removal: removed, and the quorum is shown.
     removalNotice(&t.shard, 2, 1000, 9);
     removalNotice(&t.shard, 3, 1000, 10);
     try std.testing.expectEqual(@as(?u64, 1000), t.shard.removed_at_ms);
-    try std.testing.expectEqual(@as(u8, 2), slot.removal.notices.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1000), slot.removal.at_ms.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 10), slot.removal.config_index.load(.monotonic));
+    shown = slot.removal.read();
+    try std.testing.expectEqual(@as(u8, 2), shown.notices);
+    try std.testing.expectEqual(@as(u64, 1000), shown.at_ms);
+    try std.testing.expectEqual(@as(u64, 10), shown.config_index);
 
     const counts = sm.snapshot().removal_notices;
-    try std.testing.expectEqual(@as(u64, 4), counts[@backingInt(ShardMetrics.RemovalOutcome.counted)]);
-    try std.testing.expectEqual(@as(u64, 2), counts[@backingInt(ShardMetrics.RemovalOutcome.ignored)]);
+    try std.testing.expectEqual(@as(u64, 3), counts[@backingInt(ShardMetrics.RemovalOutcome.counted)]);
+    try std.testing.expectEqual(@as(u64, 1), counts[@backingInt(ShardMetrics.RemovalOutcome.duplicate)]);
+    try std.testing.expectEqual(@as(u64, 3), counts[@backingInt(ShardMetrics.RemovalOutcome.ignored)]);
     try std.testing.expectEqual(@as(u64, 1), counts[@backingInt(ShardMetrics.RemovalOutcome.conflict)]);
+}
+
+test "Shard: one member naming a different removal each time cannot hold off the others' quorum" {
+    var t: AdminTest = undefined;
+    try t.init(1, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2, 3, 4, 5 });
+    raft.setMembership(&cfg, 5);
+    raft.commitMembership(&cfg, 5);
+    raft.lost_log = .none;
+    removalNotice(&t.shard, 2, 1000, 9);
+    removalNotice(&t.shard, 5, 7, 9);
+    removalNotice(&t.shard, 3, 1000, 9);
+    removalNotice(&t.shard, 5, 8, 9);
+    try std.testing.expect(t.shard.removed_at_ms == null);
+    removalNotice(&t.shard, 4, 1000, 9);
+    try std.testing.expectEqual(@as(?u64, 1000), t.shard.removed_at_ms);
 }
 
 test "Shard: a node with no committed config yet stops on one removal notice, and a notice of the wrong size is not one" {

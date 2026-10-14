@@ -52,10 +52,12 @@ pub const ShardState = enum(u8) {
 pub const REASON_MAX = 256;
 
 /// Removal notices a shard holds: while it counts toward a quorum, and the
-/// members that made one once it acted. Ids go first and the count last,
-/// so a reader that sees the count sees the ids it covers.
+/// members that made one once it acted. A sequence count, odd while a
+/// publication is being written, lets a reader take one whole publication
+/// and never a mix of two.
 pub const Removal = struct {
     pub const MAX_FROM = @import("../raft/membership.zig").MAX_MEMBERS;
+    seq: Atomic(u32) = .init(0),
     notices: Atomic(u8) = .init(0),
     needed: Atomic(u8) = .init(0),
     config_index: Atomic(u64) = .init(0),
@@ -64,12 +66,40 @@ pub const Removal = struct {
     from: [MAX_FROM]Atomic(u32) = @splat(.init(0)),
 
     pub fn publish(self: *Removal, from: []const u32, needed: u8, config_index: u64, at_ms: u64) void {
-        self.notices.store(0, .release);
-        for (from, 0..) |id, i| self.from[i].store(id, .monotonic);
-        self.needed.store(needed, .monotonic);
-        self.config_index.store(config_index, .monotonic);
-        self.at_ms.store(at_ms, .monotonic);
+        _ = self.seq.fetchAdd(1, .acq_rel);
+        for (from, 0..) |id, i| self.from[i].store(id, .release);
+        self.needed.store(needed, .release);
+        self.config_index.store(config_index, .release);
+        self.at_ms.store(at_ms, .release);
         self.notices.store(@intCast(from.len), .release);
+        _ = self.seq.fetchAdd(1, .release);
+    }
+
+    pub const Read = struct {
+        notices: u8 = 0,
+        needed: u8 = 0,
+        config_index: u64 = 0,
+        at_ms: u64 = 0,
+        from: [MAX_FROM]u32 = undefined,
+    };
+
+    /// One whole publication, or nothing held if none settles in a few
+    /// tries (the shard is publishing as fast as it can be read).
+    pub fn read(self: *const Removal) Read {
+        for (0..8) |_| {
+            const before = self.seq.load(.acquire);
+            if (before % 2 == 1) continue;
+            var r: Read = .{
+                .notices = self.notices.load(.acquire),
+                .needed = self.needed.load(.acquire),
+                .config_index = self.config_index.load(.acquire),
+                .at_ms = self.at_ms.load(.acquire),
+            };
+            for (self.from[0..r.notices], 0..) |*id, i| r.from[i] = id.load(.acquire);
+            if (self.seq.load(.acquire) == before) return r;
+            r = .{};
+        }
+        return .{};
     }
 };
 
@@ -167,15 +197,14 @@ pub const NodeHealth = struct {
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
-            const notices = s.removal.notices.load(.acquire);
-            if (notices > 0) {
-                try w.print(",\"removal\":{{\"notices\":{d},\"of\":{d},\"config_index\":{d}", .{ notices, s.removal.needed.load(.monotonic), s.removal.config_index.load(.monotonic) });
-                const at = s.removal.at_ms.load(.monotonic);
-                if (at != 0) try w.print(",\"at_ms\":{d}", .{at});
+            const removal = s.removal.read();
+            if (removal.notices > 0) {
+                try w.print(",\"removal\":{{\"notices\":{d},\"of\":{d},\"config_index\":{d}", .{ removal.notices, removal.needed, removal.config_index });
+                if (removal.at_ms != 0) try w.print(",\"at_ms\":{d}", .{removal.at_ms});
                 try w.writeAll(",\"from\":[");
-                for (s.removal.from[0..notices], 0..) |*id, k| {
+                for (removal.from[0..removal.notices], 0..) |id, k| {
                     if (k > 0) try w.writeByte(',');
-                    try w.print("{d}", .{id.load(.monotonic)});
+                    try w.print("{d}", .{id});
                 }
                 try w.writeAll("]}");
             }

@@ -1222,7 +1222,7 @@ pub const Simulator = struct {
                             });
                         }
                         node.applied_config = cfg;
-                        node.raft.commitMembership(&cfg, 0);
+                        node.raft.commitMembership(&cfg, idx);
                         node.raft.recordConfig(idx, e.header.term, &cfg);
                     }
                 }
