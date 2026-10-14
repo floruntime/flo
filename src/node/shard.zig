@@ -2577,7 +2577,7 @@ pub const Shard = struct {
     }
 
     fn trySendRaft(self: *Shard, peer: u32, msg_type: transport.MsgType, payload: []const u8) bool {
-        const rn = self.raft_network orelse return false;
+        const rn = self.network() orelse return false;
         if (rn.sendTo(peer, msg_type, self.id, payload)) return true;
         log.warn("shard {d}: could not queue a {s} for node {d}", .{ self.id, @tagName(msg_type), peer });
         return false;
@@ -2588,8 +2588,8 @@ pub const Shard = struct {
     /// Once this node knows the membership, only members speak for the
     /// group; a node with the secret but no seat can still ask for one.
     fn handleRaftFrame(self: *Shard, frame: RaftFrame) void {
-        const raft = self.raft_node;
-        if (self.diverged or self.removed_at_ms != null) return;
+        const raft = self.raftNode();
+        if (self.diverged or self.isRemoved()) return;
         if (frame.msg_type != .join_request and (raft.peer_count > 0 or raft.self_named)) {
             // Members of the latest config, and of the committed one until
             // the change commits: a leader removing itself leads the group
@@ -2638,12 +2638,8 @@ pub const Shard = struct {
                 // A leader of this term still sends to this node as a member.
                 if (hdr.term == raft.current_term) self.clearRemovalNotices();
                 // An ack means "in my log, on disk" when commits are durable.
-                if (resp.success and count > 0 and self.durability == .sync) {
-                    self.flushSegmentToDisk() catch |err| {
-                        self.persist_failures += 1;
-                        log.err("shard {d}: sync flush failed: {s}; not acking the batch (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
-                        return;
-                    };
+                if (resp.success and count > 0 and self.durableCommits()) {
+                    if (!self.flushForAck()) return;
                     raft.markDurable(raft.log.lastIndex());
                 }
                 var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
@@ -2930,6 +2926,55 @@ pub const Shard = struct {
         self.stopTakingPart(DIVERGED_MESSAGE);
     }
 
+    /// The Raft node, network and durability, read where the replica reads
+    /// them: the runtime, and tests, set them after init.
+    fn raftNode(self: *Shard) *RaftNode {
+        return self.raft_node;
+    }
+
+    fn network(self: *Shard) ?*RaftNetwork {
+        return self.raft_network;
+    }
+
+    /// An ack means "in my log, on disk".
+    fn durableCommits(self: *const Shard) bool {
+        return self.durability == .sync;
+    }
+
+    fn isRemoved(self: *const Shard) bool {
+        return self.removed_at_ms != null;
+    }
+
+    /// Removed, or a committed config says so: the tick does nothing else.
+    fn checkRemoved(self: *Shard, now: u64) bool {
+        if (self.removed_at_ms != null) {
+            self.warnRemoved(now);
+            return true;
+        }
+        const when = self.raft_node.committed_config.removedAt(self.cluster_node_id) orelse return false;
+        self.enterRemoved(when);
+        return true;
+    }
+
+    /// Flush the batch just taken, before it is acked. False, counted and
+    /// logged, when the flush failed: the batch is not acked.
+    fn flushForAck(self: *Shard) bool {
+        self.flushSegmentToDisk() catch |err| {
+            self.persist_failures += 1;
+            log.err("shard {d}: sync flush failed: {s}; not acking the batch (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
+            return false;
+        };
+        return true;
+    }
+
+    /// The tick's membership steps: a leader's own changes, a joiner's
+    /// request to be let in, and writes waiting on the leader.
+    fn tickMembership(self: *Shard, now: u64) void {
+        if (self.raft_node.role == .leader) self.adjustMembership(now);
+        if (self.joinWanted(now)) self.askToJoin(now);
+        if (self.forward_count > 0) self.sweepForwards(now);
+    }
+
     /// This node's own data is damaged: the projections are missing what
     /// `damage` names and cannot be rebuilt here. On a lone node the shard
     /// goes offline and the others serve; a member stops taking part in
@@ -3021,11 +3066,10 @@ pub const Shard = struct {
     /// The Raft clock: elections, check-quorum, the leader loop, and a
     /// joiner's request to be let in.
     fn tickRaft(self: *Shard) void {
-        if (self.raft_network == null or self.diverged) return;
-        const raft = self.raft_node;
+        if (self.network() == null or self.diverged) return;
+        const raft = self.raftNode();
         const now = nowMs();
-        if (self.removed_at_ms != null) return self.warnRemoved(now);
-        if (raft.committed_config.removedAt(self.cluster_node_id)) |when| return self.enterRemoved(when);
+        if (self.checkRemoved(now)) return;
         if (raft.left_group) {
             raft.left_group = false;
             self.leadershipLost("this node is no longer a voter");
@@ -3033,7 +3077,7 @@ pub const Shard = struct {
         if (raft.membership_index != self.voters_published_index and raft.latest_config.member_count > 0) {
             self.voters_published_index = raft.membership_index;
             var voters: [membership.MAX_MEMBERS]u32 = undefined;
-            if (self.raft_network) |rn| rn.setVoters(raft.latest_config.voterIds(&voters));
+            if (self.network()) |rn| rn.setVoters(raft.latest_config.voterIds(&voters));
         }
         const r = raft.tick(now);
         // A leader found or won ends the outage the attempt lines count.
@@ -3072,12 +3116,8 @@ pub const Shard = struct {
         }
         if (raft.lost_log != .none) self.warnLostLog(now);
         if (r.step_down) self.leadershipLost("no contact with a majority");
-        if (raft.role == .leader) {
-            self.pump(now);
-            self.adjustMembership(now);
-        }
-        if (self.joinWanted(now)) self.askToJoin(now);
-        if (self.forward_count > 0) self.sweepForwards(now);
+        if (raft.role == .leader) self.pump(now);
+        self.tickMembership(now);
     }
 
     /// A guarded node that stays guarded says where it is waiting: with no
@@ -3092,7 +3132,7 @@ pub const Shard = struct {
             return;
         }
         self.lost_log_warn_ms = now;
-        const raft = self.raft_node;
+        const raft = self.raftNode();
         switch (raft.lost_log) {
             .none => {},
             .catching_up => if (raft.leader_id == 0) {
@@ -3127,12 +3167,12 @@ pub const Shard = struct {
     fn broadcastVote(self: *Shard, req: raft_node_mod.VoteRequest) void {
         var buf: [transport.VOTE_REQ_SIZE]u8 = undefined;
         const n = transport.serializeVoteRequest(req, &buf) orelse return;
-        const raft = self.raft_node;
+        const raft = self.raftNode();
         for (raft.peer_ids[0..raft.peer_count]) |peer| self.sendRaft(peer, .request_vote, buf[0..n]);
     }
 
     fn leadershipLost(self: *Shard, why: []const u8) void {
-        log.warn("shard {d}: stepped down ({s}); now following at term {d}", .{ self.id, why, self.raft_node.current_term });
+        log.warn("shard {d}: stepped down ({s}); now following at term {d}", .{ self.id, why, self.raftNode().current_term });
         self.stoppedLeading("unavailable: lost leadership before commit — write may still apply");
     }
 
@@ -3153,7 +3193,7 @@ pub const Shard = struct {
     /// from the peer's next index when it is behind and nothing is in
     /// flight or what was has gone unanswered for an RPC timeout.
     fn pump(self: *Shard, now: u64) void {
-        const raft = self.raft_node;
+        const raft = self.raftNode();
         const last = raft.log.lastIndex();
         for (0..raft.peer_count) |i| {
             const p = &raft.peers[i];
