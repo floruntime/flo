@@ -140,10 +140,14 @@ const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 // Shard
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// What the replica reaches its shard for. It holds nothing: the shard is
-/// moved by value after init, so a pointer kept here would dangle; each
-/// call finds the shard from the replica's address.
+/// The replica's clock, and what it reaches its shard for. It holds
+/// nothing: the shard is moved by value after init, so a pointer kept here
+/// would dangle; each call finds the shard from the replica's address.
 const ShardIo = struct {
+    pub fn nowMs() u64 {
+        return Shard.nowMs();
+    }
+
     pub const Host = struct {
         fn of(r: *Replica) *Shard {
             return @alignCast(@fieldParentPtr("replica", r));
