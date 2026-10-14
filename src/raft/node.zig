@@ -67,6 +67,10 @@ pub const PeerState = struct {
     /// Successful acks in a row at or past the commit index; three make
     /// it caught up (`membership.Progress`).
     caught_up_streak: u8 = 0,
+    /// The peer's next index is below anything this leader knows the term
+    /// of, so no append can reach it: it gets heartbeats that carry no
+    /// term, and its refusals of them are contact, never a hint.
+    below_log: bool = false,
     /// When this leader first saw the peer as a member that had not caught
     /// up: the aging clock. A new leader starts it again.
     joining_since_ms: u64 = 0,
@@ -1081,12 +1085,24 @@ pub const RaftNode = struct {
         // index per round trip.
         if (req.prev_log_index > 0) {
             if (!self.log.matchesTerm(req.prev_log_index, req.prev_log_term)) {
-                const last = self.log.lastIndex();
-                const hint = if (req.prev_log_index > last) last else (self.log.runStart(req.prev_log_index) orelse req.prev_log_index) -| 1;
+                // A known term that disagrees at or below a durable commit is
+                // committed history the leader does not hold: divergence, not
+                // a retry. Not so for one this node can't read (below a
+                // snapshot, or recorded as 0 by a snapshot that didn't keep
+                // its term: no entry has term 0), nor for a heartbeat that
+                // carries no term (a leader that can't place this node).
+                if (self.config.durable_commits and req.prev_log_term != 0 and req.prev_log_index <= self.commit_index and (self.log.entryTerm(req.prev_log_index) orelse 0) != 0) return error.CommittedConflict;
+                const tip = self.log.tip();
+                const run_start = if (req.prev_log_index > tip) tip else (self.log.runStart(req.prev_log_index) orelse req.prev_log_index) -| 1;
+                // Never below commit: a committed prefix and a conflicting
+                // tail can share one term run, and a hint at its start would
+                // have the leader resend the log from there. If commit itself
+                // does not match, the leader still steps back one at a time.
+                const hint = @max(run_start, @min(self.commit_index, tip));
                 return .{
                     .term = self.current_term,
                     .success = false,
-                    .match_index = last,
+                    .match_index = self.log.lastIndex(),
                     .from = self.id,
                     .hint_index = hint,
                 };
@@ -1223,6 +1239,9 @@ pub const RaftNode = struct {
                         const p = &self.peers[i];
                         p.caught_up_streak = if (acked >= resp.leader_commit) p.caught_up_streak +| 1 else 0;
                     }
+                } else if (self.peers[i].below_log) {
+                    // A refusal of a heartbeat that carried no term: contact
+                    // only, or each one would walk next_index down a step.
                 } else {
                     // Retry from where the follower says its log stops
                     // agreeing, never forward. Below the recorded match it
@@ -3160,6 +3179,87 @@ test "raft node: a rejection carries where the follower's log stops agreeing, an
     leader.peers[0].next_index = 9;
     leader.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2, .hint_index = std.math.maxInt(u64) });
     try testing.expectEqual(@as(u64, 8), leader.peers[0].next_index);
+}
+
+test "raft node: a rejection never hints below commit, and committed history that disagrees is divergence only when commits are durable" {
+    for ([_]bool{ true, false }) |durable| {
+        var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{ .durable_commits = durable });
+        defer follower.deinit();
+        // 1-6 in one term run, 1-4 committed: the tail shares the run.
+        for (1..7) |i| {
+            var e = testEntry(1, i, "f");
+            _ = try follower.log.append(&e);
+        }
+        follower.commit_index = 4;
+        follower.current_term = 2;
+        // A probe in a later term at 6: the run starts at 1, but the hint
+        // stops at commit, not 0.
+        const tail = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 6, .prev_log_term = 2, .entries = &.{}, .leader_commit = 4 });
+        try testing.expect(!tail.success);
+        try testing.expectEqual(@as(u64, 4), tail.hint_index);
+        // A known term that disagrees at or below commit is always checked:
+        // with durable commits it is divergence; without, history a quorum
+        // may have lost, refused with a hint at commit.
+        const below: AppendRequest = .{ .term = 2, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 9, .entries = &.{}, .leader_commit = 4 };
+        if (durable) {
+            try testing.expectError(error.CommittedConflict, follower.handleAppendEntries(below));
+        } else {
+            const r = try follower.handleAppendEntries(below);
+            try testing.expect(!r.success);
+            try testing.expectEqual(@as(u64, 4), r.hint_index);
+        }
+        // A heartbeat that carries no term is never divergence.
+        const beat = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 0, .entries = &.{}, .leader_commit = 4 });
+        try testing.expect(!beat.success);
+        try testing.expectEqual(@as(u64, 4), beat.hint_index);
+    }
+}
+
+test "raft node: a follower reset to a snapshot that kept no term refuses the leader's retry at it, but never as divergence" {
+    for ([_]bool{ true, false }) |durable| {
+        var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{ .durable_commits = durable });
+        defer follower.deinit();
+        follower.log.resetToSnapshot(10, 0);
+        follower.commit_index = 10;
+        follower.current_term = 2;
+        // The leader holds index 10 in term 1: refused with a hint at 10,
+        // since nothing here can confirm the term, and not divergence.
+        const r = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 10, .prev_log_term = 1, .entries = &.{}, .leader_commit = 10 });
+        try testing.expect(!r.success);
+        try testing.expectEqual(@as(u64, 10), r.hint_index);
+    }
+}
+
+test "raft node: a follower reset to a snapshot hints the snapshot, not 0" {
+    var follower = try RaftNode.init(testing.allocator, 2, 1, 16384, .{});
+    defer follower.deinit();
+    follower.log.resetToSnapshot(10, 1);
+    follower.commit_index = 10;
+    follower.current_term = 2;
+    try testing.expectEqual(@as(u64, 0), follower.log.lastIndex());
+    const past = try follower.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 15, .prev_log_term = 2, .entries = &.{}, .leader_commit = 10 });
+    try testing.expect(!past.success);
+    try testing.expectEqual(@as(u64, 10), past.hint_index);
+}
+
+test "raft node: a refusal from a peer below the leader's log is contact, never a hint" {
+    var leader = try RaftNode.init(testing.allocator, 1, 1, 16384, .{});
+    defer leader.deinit();
+    leader.addPeer(2);
+    leader.addPeer(3);
+    _ = candidacy(&leader).?;
+    _ = leader.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 3 });
+    leader.peers[0].next_index = 9;
+    leader.peers[0].match_index = 0;
+    leader.peers[0].below_log = true;
+    leader.current_time_ms = 5_000;
+    leader.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2, .hint_index = 2 });
+    try testing.expectEqual(@as(u64, 9), leader.peers[0].next_index);
+    try testing.expectEqual(@as(u64, 5_000), leader.peers[0].last_contact_ms);
+    // Placed again, the same refusal is a hint.
+    leader.peers[0].below_log = false;
+    leader.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .from = 2, .hint_index = 2 });
+    try testing.expectEqual(@as(u64, 3), leader.peers[0].next_index);
 }
 
 test "raft node: a conflict below the commit index is refused when commits are durable, and rewinds when they are not" {

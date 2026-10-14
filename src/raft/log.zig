@@ -234,6 +234,18 @@ pub const RaftLog = struct {
         return self.last_idx;
     }
 
+    /// The highest index this log answers for: its last entry, or the
+    /// snapshot it was reset to while it holds none above it.
+    pub fn tip(self: *const RaftLog) u64 {
+        return @max(self.last_idx, self.snapshot_index);
+    }
+
+    /// The first index this log can send: its oldest entry, or the one
+    /// after its snapshot while it holds none.
+    pub fn start(self: *const RaftLog) u64 {
+        return if (self.first_idx == 0) self.snapshot_index + 1 else self.first_idx;
+    }
+
     /// The term of the last log entry (0 if empty).
     pub fn lastTerm(self: *const RaftLog) u64 {
         if (self.last_idx == 0) return self.snapshot_term;

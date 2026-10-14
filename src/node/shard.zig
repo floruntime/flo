@@ -3075,13 +3075,24 @@ pub const Shard = struct {
             const want_heartbeat = now -| p.heartbeat_at_ms >= raft.config.heartbeat_interval_ms;
             if (!want_data and !want_heartbeat) continue;
             const prev_index = next - 1;
-            const prev_term = raft.log.entryTerm(prev_index) orelse blk: {
-                if (prev_index == 0) break :blk @as(u64, 0);
-                log.err("shard {d}: no term known for index {d}; cannot replicate to node {d}", .{ self.id, prev_index, raft.peer_ids[i] });
-                continue;
-            };
+            const known_term: ?u64 = if (prev_index == 0) 0 else raft.log.entryTerm(prev_index);
+            // Below where this log starts, even index 0's known term places
+            // nothing: the entries after it are gone. A term recorded as 0
+            // past index 0 is a snapshot that didn't keep its term, which no
+            // follower can match.
+            p.below_log = known_term == null or (prev_index > 0 and known_term.? == 0) or next < raft.log.start();
+            if (p.below_log) {
+                // No append can reach this peer. Heartbeats still go, with
+                // no term (no entry has term 0), so it does not campaign.
+                if (!want_heartbeat) continue;
+                if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
+                    self.peer_batch_warn_ms[i] = now;
+                    log.err("shard {d}: no term known for index {d}, below this leader's log; node {d} gets heartbeats but no entries", .{ self.id, prev_index, raft.peer_ids[i] });
+                }
+            }
+            const prev_term = known_term orelse 0;
             var entries: []const entry_mod.Entry = &.{};
-            if (want_data) {
+            if (want_data and !p.below_log) {
                 const count = raft.log.getRange(next, self.rpc_entries, self.rpc_arena);
                 if (count > 0) {
                     entries = self.rpc_entries[0..count];
@@ -11242,4 +11253,168 @@ test "Shard: a stopping node answers its writes forwarded to a leader: one sent 
     const sent = try answerFor(answers[0..n], 6);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), sent.header.status);
     try std.testing.expectEqual(proto.Ran.unknown, (try sent.refused()).ran);
+}
+
+/// Drop the frames a test's network queued.
+fn clearOutbound(rn: *RaftNetwork) void {
+    for (rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+    rn.outbound.clearRetainingCapacity();
+}
+
+/// The one append frame the leader queued, decoded.
+fn onlyAppend(rn: *RaftNetwork) !transport.AppendRequestHeader {
+    try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
+    return transport.deserializeAppendRequestHeader(rn.outbound.items[0].frame[transport.HEADER_SIZE..]) orelse error.BadFrame;
+}
+
+test "Shard: a follower whose uncommitted tail shares a term run with its commit is resent from its commit, not from index 1" {
+    for ([_]bool{ true, false }) |durable| {
+        const pipe_fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(pipe_fds[0]);
+        defer _ = std.c.close(pipe_fds[1]);
+        var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        defer rn.deinit();
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+        defer shard.deinit();
+        shard.raft_network = &rn;
+        shard.wireHandlerShardPtrs();
+        defer clearOutbound(&rn);
+        try ParkTest.joinPeer(&shard);
+        const raft = shard.raft_node;
+
+        // Committed in the first term; then a later term's two entries.
+        for (0..3) |_| _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "v");
+        try ParkTest.ack(&shard);
+        const committed = raft.commit_index;
+        const first_term = raft.current_term;
+        raft.current_term += 1;
+        for (0..2) |_| _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "w");
+        const last = raft.log.lastIndex();
+
+        // The follower holds the committed prefix, then a longer tail in
+        // the first term: one run from index 1 to its end.
+        var follower = try raft_node_mod.RaftNode.init(std.testing.allocator, 2, 1, 16384, .{ .durable_commits = durable });
+        defer follower.deinit();
+        var copies: [32]entry_mod.Entry = undefined;
+        var arena: [8192]u8 = undefined;
+        const got = raft.log.getRange(1, &copies, &arena);
+        try std.testing.expectEqual(committed, got - 2);
+        for (copies[0..committed]) |*e| {
+            try std.testing.expectEqual(first_term, e.header.term);
+            _ = try follower.log.append(e);
+        }
+        for (committed + 1..committed + 5) |i| {
+            var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, first_term, i, 0, "x");
+            e.header.crc32c = e.computeCrc();
+            _ = try follower.log.append(&e);
+        }
+        follower.commit_index = committed;
+        follower.current_term = raft.current_term;
+
+        // The leader probes the follower at its own end; the follower refuses.
+        raft.peers[0].next_index = last + 1;
+        raft.peers[0].inflight = false;
+        raft.peers[0].heartbeat_at_ms = 0;
+        clearOutbound(&rn);
+        shard.pump(Shard.nowMs());
+        const probe = try onlyAppend(&rn);
+        try std.testing.expectEqual(last, probe.prev_log_index);
+        const refusal = try follower.handleAppendEntries(.{ .term = probe.term, .leader_id = probe.leader_id, .prev_log_index = probe.prev_log_index, .prev_log_term = probe.prev_log_term, .entries = &.{}, .leader_commit = probe.leader_commit });
+        try std.testing.expect(!refusal.success);
+        raft.handleAppendResponse(refusal);
+
+        // What the pump sends next starts at the follower's commit.
+        clearOutbound(&rn);
+        shard.pump(Shard.nowMs());
+        const resend = try onlyAppend(&rn);
+        try std.testing.expectEqual(committed, resend.prev_log_index);
+        try std.testing.expect(resend.entry_count > 0);
+    }
+}
+
+test "Shard: a peer below everything the leader knows the term of gets heartbeats with no term, and its refusals leave it where it is" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    defer clearOutbound(&rn);
+    try ParkTest.joinPeer(&shard);
+    const raft = shard.raft_node;
+    const p = &raft.peers[0];
+
+    // No term is known for the index before this peer's next.
+    const stranded = raft.log.lastIndex() + 2;
+    p.next_index = stranded;
+    p.inflight = false;
+    p.heartbeat_at_ms = 0;
+    clearOutbound(&rn);
+    const now = Shard.nowMs();
+    shard.pump(now);
+    const beat = try onlyAppend(&rn);
+    try std.testing.expectEqual(stranded - 1, beat.prev_log_index);
+    try std.testing.expectEqual(@as(u64, 0), beat.prev_log_term);
+    try std.testing.expectEqual(@as(u32, 0), beat.entry_count);
+    try std.testing.expect(p.below_log);
+    const warned = shard.peer_batch_warn_ms[0];
+    try std.testing.expect(warned != 0);
+
+    // Before the next heartbeat is due, nothing goes, though it is behind.
+    clearOutbound(&rn);
+    shard.pump(now + 1);
+    try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
+
+    // Its refusal of the heartbeat moves nothing; the next one goes on time
+    // and the error is not repeated within its interval.
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = false, .match_index = 0, .from = raft.peer_ids[0], .hint_index = 1 });
+    try std.testing.expectEqual(stranded, p.next_index);
+    shard.pump(now + raft.config.heartbeat_interval_ms + 1);
+    try std.testing.expectEqual(@as(usize, 1), rn.outbound.items.len);
+    try std.testing.expectEqual(warned, shard.peer_batch_warn_ms[0]);
+
+    // Stranded inside the log, as below a snapshot: behind, yet it still
+    // hears only a heartbeat per interval, not a frame per pump.
+    const floor = raft.log.lastIndex() + 5;
+    raft.log.resetToSnapshot(floor, raft.current_term);
+    var above = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, raft.current_term, floor + 1, 0, "v");
+    above.header.crc32c = above.computeCrc();
+    _ = try raft.log.append(&above);
+    p.next_index = 3;
+    p.inflight = false;
+    p.heartbeat_at_ms = 0;
+    clearOutbound(&rn);
+    const later = now + 10 * raft.config.heartbeat_interval_ms;
+    shard.pump(later);
+    try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
+    clearOutbound(&rn);
+    shard.pump(later + 1);
+    try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
+
+    // At the floor itself, reset with no term: no follower can match a
+    // term of 0, so it is below the log too.
+    raft.log.resetToSnapshot(floor, 0);
+    p.next_index = floor + 1;
+    p.heartbeat_at_ms = 0;
+    clearOutbound(&rn);
+    shard.pump(later + 2);
+    try std.testing.expect(p.below_log);
+    try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
+    clearOutbound(&rn);
+    raft.log.resetToSnapshot(floor, raft.current_term);
+    _ = try raft.log.append(&above);
+
+    // At index 1, below where the log now starts: index 0's term is known,
+    // but nothing after it can be sent.
+    p.next_index = 1;
+    p.heartbeat_at_ms = 0;
+    shard.pump(later + 2);
+    try std.testing.expect(p.below_log);
+    try std.testing.expectEqual(@as(u32, 0), (try onlyAppend(&rn)).entry_count);
+    clearOutbound(&rn);
+    shard.pump(later + 3);
+    try std.testing.expectEqual(@as(usize, 0), rn.outbound.items.len);
 }
