@@ -246,12 +246,12 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(GetResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const kv = shard.kv_handler.*.kv;
-        if (txn) |id| {
+        if (in_txn) |t| {
             if (wait_ms > 0) return error.WaitInTxn;
-            const t = try openTxn(shard, req, id, routing_key);
             if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
                 .delete => return error.NotFound,
                 // Not committed, so no version yet.
@@ -299,6 +299,7 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(SetResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const current = shard.kv_handler.*.kv.get(qkey);
@@ -309,12 +310,8 @@ pub const KVHandler = struct {
             .if_present => if (current == null) return error.ConditionFailed,
         }
         const ttl = ttl_ms orelse 0;
-        if (txn) |id| {
-            const t = try openTxn(shard, req, id, routing_key);
-            shard.kv_handler.*.txn_table.appendOp(t.txn_id, .put, qkey, value, ttl) catch |err| return switch (err) {
-                error.TxnTooLarge => error.TxnTooLarge,
-                error.OutOfMemory => error.Internal,
-            };
+        if (in_txn) |t| {
+            try bufferInTxn(shard, t, qkey, .put, value, ttl);
             return .{ .answer = .{ .version = null } };
         }
         const proposed = proposeKV(shard, .kv_put, req, qkey, value, ttl) catch |err| return proposeError(err);
@@ -352,6 +349,13 @@ pub const KVHandler = struct {
         const t = txnIn(&shard.kv_handler.*.txn_table, id, req.namespace) orelse return error.NoSuchTransaction;
         if (t.pinned_hash != router.hashKeyWithNamespace(req.namespace, routing_key orelse req.key)) return error.WrongRoutingKey;
         return t;
+    }
+
+    /// The transaction a request names, if any. Looked up before any other
+    /// check: a request refused for its key or condition still uses the
+    /// transaction, and one that is gone is answered as gone.
+    fn txnOf(shard: *Shard, req: Request, txn: ?u64, routing_key: ?[]const u8) Error!?*txn_mod.TxnState {
+        return if (txn) |id| try openTxn(shard, req, id, routing_key) else null;
     }
 
     fn proposeError(err: anyerror) Error {
@@ -393,12 +397,13 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(DeleteResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const current = shard.kv_handler.*.kv.get(qkey);
         if (cas_version) |want| if ((if (current) |e| e.version else 0) != want) return error.CasMismatch;
-        if (txn) |id| {
-            try bufferInTxn(shard, req, id, routing_key, qkey, .delete, "", 0);
+        if (in_txn) |t| {
+            try bufferInTxn(shard, t, qkey, .delete, "", 0);
             return .{ .answer = .{ .existed = null } };
         }
         if (current == null) return .{ .answer = .{ .existed = false } };
@@ -509,6 +514,7 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(IncrResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         // A key whose TTL has run out is absent, as apply treats it.
@@ -518,8 +524,8 @@ pub const KVHandler = struct {
         }
         var delta_bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &delta_bytes, delta, .little);
-        if (txn) |id| {
-            try bufferInTxn(shard, req, id, routing_key, qkey, .incr, &delta_bytes, 0);
+        if (in_txn) |t| {
+            try bufferInTxn(shard, t, qkey, .incr, &delta_bytes, 0);
             return .{ .answer = .{ .version = null, .value = null } };
         }
         const proposed = proposeKV(shard, .kv_incr, req, qkey, &delta_bytes, 0) catch |err| return proposeError(err);
@@ -552,14 +558,15 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(ExpireResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const current = shard.kv_handler.*.kv.get(qkey) orelse return error.NotFound;
         if (cas_version) |want| if (current.version != want) return error.CasMismatch;
         var ttl_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &ttl_bytes, ttl_ms, .little);
-        if (txn) |id| {
-            try bufferInTxn(shard, req, id, routing_key, qkey, if (ttl_ms == 0) .persist else .touch, &ttl_bytes, 0);
+        if (in_txn) |t| {
+            try bufferInTxn(shard, t, qkey, if (ttl_ms == 0) .persist else .touch, &ttl_bytes, 0);
             return .{ .answer = .{} };
         }
         const proposed = proposeKV(shard, .kv_touch, req, qkey, &ttl_bytes, 0) catch |err| return proposeError(err);
@@ -581,10 +588,10 @@ pub const KVHandler = struct {
         routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(ExistsResponse) {
+        const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        if (txn) |id| {
-            const t = try openTxn(shard, req, id, routing_key);
+        if (in_txn) |t| {
             if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
                 .delete => return .{ .answer = .{ .exists = false, .version = 0 } },
                 .put => return .{ .answer = .{ .exists = true, .version = 0 } },
@@ -699,9 +706,7 @@ pub const KVHandler = struct {
     fn txnBegin(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(TxnBeginResponse) {
         if (req.key.len == 0) return error.KeyEmpty;
         const pinned = router.hashKeyWithNamespace(req.namespace, req.key);
-        // Unowned: a stateless client opens a connection per command, so a
-        // transaction outlives the one that began it.
-        const id = shard.kv_handler.*.txn_table.begin(pinned, router.namespaceHash(req.namespace), 0) catch |err| return switch (err) {
+        const id = shard.kv_handler.*.txn_table.begin(pinned, router.namespaceHash(req.namespace)) catch |err| return switch (err) {
             error.TooManyOpenTxns => error.TooManyTransactions,
             error.OutOfMemory => error.Internal,
         };
@@ -755,19 +760,15 @@ pub const KVHandler = struct {
         return .{ .answer = .{} };
     }
 
-    /// Buffer a write in transaction `id`, which the request's routing key
-    /// must be pinned by.
+    /// Buffer a write in transaction `t`.
     fn bufferInTxn(
         shard: *Shard,
-        req: Request,
-        id: u64,
-        routing_key: ?[]const u8,
+        t: *txn_mod.TxnState,
         qkey: []const u8,
         kind: txn_mod.TxnOpKind,
         value: []const u8,
         ttl_ms: u64,
     ) Error!void {
-        const t = try openTxn(shard, req, id, routing_key);
         shard.kv_handler.*.txn_table.appendOp(t.txn_id, kind, qkey, value, ttl_ms) catch |err| return switch (err) {
             error.TxnTooLarge => error.TxnTooLarge,
             error.OutOfMemory => error.Internal,
@@ -894,10 +895,13 @@ pub const KVHandler = struct {
     /// Transaction `txn_id`, if it is open and was begun in `namespace`.
     /// Ids are small per-shard counters, so one begun in another namespace
     /// is not found from this one. One whose commit is in the log is closed.
+    /// Marks it used, so the idle reaper leaves it.
     fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
         const t = txn_table.get(txn_id) orelse return null;
         if (t.committing) return null;
-        return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
+        if (t.namespace_hash != router.namespaceHash(namespace)) return null;
+        t.last_active_ms = @import("stdx").time.monotonicMs();
+        return t;
     }
 
     // ── Sink put ─────────────────────────────────────────────────────────

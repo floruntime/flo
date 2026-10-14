@@ -1235,8 +1235,6 @@ pub const Shard = struct {
     /// Remove and clean up a connection (does NOT close the fd).
     pub fn removeConnection(self: *Shard, fd: i32) void {
         if (self.connections.fetchRemove(fd)) |kv| {
-            // Roll back any KV transactions still owned by this connection.
-            _ = self.kv_handler.txn_table.dropByConnection(kv.value.id);
             if (kv.value.reads_paused) self.paused_count -= 1;
             self.endWait(kv.value);
             kv.value.deinit();
@@ -3728,6 +3726,13 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        self.task_scheduler.register(
+            "kv_txn_reap",
+            1_000,
+            kvTxnReapTask,
+            @ptrCast(self),
+        ) catch {};
+
         // Persist Raft log entries to .flseg files (async_flush durability).
         if (self.shard_data_dir != null and self.durability == .async_flush) {
             self.task_scheduler.register(
@@ -3737,6 +3742,17 @@ pub const Shard = struct {
                 @ptrCast(self),
             ) catch {};
         }
+    }
+
+    /// TaskScheduler callback: drop the KV transactions left idle.
+    fn kvTxnReapTask(ctx: *anyopaque) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        const n = self.kv_handler.txn_table.reapIdle(@import("stdx").time.monotonicMs());
+        if (n > 0) {
+            log.info("shard {d}: dropped {d} KV transaction(s) idle for {d} s", .{ self.id, n, txn_mod.IDLE_TIMEOUT_MS / std.time.ms_per_s });
+            if (self.shard_metrics) |sm| sm.recordKvTxnsReaped(n);
+        }
+        return n;
     }
 
     /// TaskScheduler callback: flush buffered Raft entries to disk.
@@ -6641,7 +6657,7 @@ test "Shard: a transaction id naming a shard that exists but doesn't hold it is 
     const txn = txn_mod;
 
     // Begun on shard 0; the same counter under shard 1's bits.
-    const id = try a.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""), 0);
+    const id = try a.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""));
     const forged = txn.makeId(1, id & txn.ID_COUNTER_MASK);
     var buf: [64]u8 = undefined;
     switch (a.resolveTarget(@backingInt(proto.OpCode.kv_get), txnGet(&buf, forged))) {
@@ -8621,7 +8637,7 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
         }
     }.run;
 
-    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""), 0);
+    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""));
     const set = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
     const in_txn = try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
@@ -8689,7 +8705,7 @@ test "Shard: a KV commit answered with a failure instead of its batch drops its 
         const table_ = &shard.kv_handler.txn_table;
         const commit = table_run.op("kv.txn_commit");
         var txn_buf: [16]u8 = undefined;
-        const id2 = try table_.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""), 0);
+        const id2 = try table_.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""));
         try table_.appendOp(id2, .put, "k", "v", 0);
         shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.kv_commit_txn, 2), .namespace = "", .key = "", .value = try commit.request.encodeInto(&txn_buf, .{ .txn = id2 }) }, .client);
         try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
@@ -9435,6 +9451,60 @@ test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), raftRingCapacity(32 * 1024 * 1024));
     try std.testing.expectEqual(RAFT_RING_MAX, raftRingCapacity(64 * 1024 * 1024));
     try std.testing.expectEqual(RAFT_RING_MAX, raftRingCapacity(1024 * 1024 * 1024));
+}
+
+test "Shard: a KV transaction left idle is dropped by the shard's background tasks, counted, and then answered as no transaction" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    shard.setMetricsRegistry(&registry);
+    shard.registerBackgroundTasks();
+
+    const table_ = &shard.kv_handler.txn_table;
+    const id = try table_.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""));
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    try table_.appendOp(id, .put, try handler_mod.qualifyKey(&qbuf, "", "k"), "v", 0);
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var buf: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    const now = @import("stdx").time.monotonicMs();
+
+    // A request in it, answered or refused, is a use that keeps it.
+    table_.get(id).?.last_active_ms = 0;
+    shard.runRequest(c.conn, txnGet(&buf, id), .client);
+    const kept = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), kept.header.status);
+    try std.testing.expectEqual(@as(usize, 0), table_.reapIdle(now));
+    table_.get(id).?.last_active_ms = 0;
+    const set_op = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    const failing = try set_op.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .if_present, .cas_version = null, .routing_key = null, .txn = id });
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 10), .namespace = "", .key = "k", .value = failing }, .client);
+    const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(proto.Reason.condition_failed, (try refused.refused()).reason);
+    try std.testing.expectEqual(@as(usize, 0), table_.reapIdle(now));
+
+    table_.get(id).?.last_active_ms = now -| txn_mod.IDLE_TIMEOUT_MS;
+    for (shard.task_scheduler.tasks[0..shard.task_scheduler.task_count]) |*task| task.last_run_ms = null;
+    _ = shard.task_scheduler.tick(std.math.maxInt(u64));
+    try std.testing.expect(table_.get(id) == null);
+    try std.testing.expectEqual(@as(u64, 1), registry.shardMetrics(0).?.kv_txns_reaped.load(.monotonic));
+
+    shard.runRequest(c.conn, txnGet(&buf, id), .client);
+    const gone = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(proto.Reason.no_such_transaction, (try gone.refused()).reason);
+    // Gone, not a failed condition.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 11), .namespace = "", .key = "k", .value = failing }, .client);
+    const gone_set = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(proto.Reason.no_such_transaction, (try gone_set.refused()).reason);
 }
 
 test "the Raft ring floor holds the largest transaction batch" {
