@@ -9464,13 +9464,24 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
     var buf: [64]u8 = undefined;
     var out: [512]u8 = undefined;
 
-    // Used just now: the tick leaves it, and it reads its own write.
-    _ = shard.task_scheduler.tick(std.math.maxInt(u64));
+    const now = @import("stdx").time.monotonicMs();
+
+    // A request in it, answered or refused, is a use that keeps it.
+    table_.get(id).?.last_active_ms = 0;
     shard.runRequest(c.conn, txnGet(&buf, id), .client);
     const kept = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), kept.header.status);
+    try std.testing.expectEqual(@as(usize, 0), table_.reapIdle(now));
+    table_.get(id).?.last_active_ms = 0;
+    const set_op = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    const failing = try set_op.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .if_present, .cas_version = null, .routing_key = null, .txn = id });
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 10), .namespace = "", .key = "k", .value = failing }, .client);
+    const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(proto.Reason.condition_failed, (try refused.refused()).reason);
+    try std.testing.expectEqual(@as(usize, 0), table_.reapIdle(now));
 
-    table_.get(id).?.last_active_ms = @import("stdx").time.monotonicMs() - txn_mod.IDLE_TIMEOUT_MS;
+    table_.get(id).?.last_active_ms = now -| txn_mod.IDLE_TIMEOUT_MS;
     for (shard.task_scheduler.tasks[0..shard.task_scheduler.task_count]) |*task| task.last_run_ms = null;
     _ = shard.task_scheduler.tick(std.math.maxInt(u64));
     try std.testing.expect(table_.get(id) == null);
@@ -9479,6 +9490,10 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
     shard.runRequest(c.conn, txnGet(&buf, id), .client);
     const gone = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
     try std.testing.expectEqual(proto.Reason.no_such_transaction, (try gone.refused()).reason);
+    // Gone, not a failed condition.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 11), .namespace = "", .key = "k", .value = failing }, .client);
+    const gone_set = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(proto.Reason.no_such_transaction, (try gone_set.refused()).reason);
 }
 
 test "the Raft ring floor holds the largest transaction batch" {
