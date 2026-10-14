@@ -80,12 +80,22 @@ pub fn handler(comptime name: []const u8, comptime Family: type, comptime functi
     }.run;
 }
 
-/// Answers `request_id` with `v`, encoded by `Response`.
+/// Answers `request_id` with `v`, encoded by `Response` straight into the
+/// connection's unsent bytes: sized first, so a small answer takes only its
+/// own bytes, whatever the op's largest.
 pub fn answer(comptime Response: type, shard: *Shard, conn: *Connection, request_id: u64, v: Response.Value) void {
-    var buf: [@sizeOf(proto.ResponseHeader) + Response.max_size]u8 = undefined;
-    const bytes = encodeAnswer(Response, &buf, request_id, v) orelse
+    const header_size = @sizeOf(proto.ResponseHeader);
+    const body_size = Response.encodedSize(v) catch
         return shard.sendErrorResponse(conn, request_id, .internal_error, "internal error: an answer didn't fit its schema");
-    _ = conn.queueWrite(bytes);
+    if (body_size > Response.max_size) return shard.sendErrorResponse(conn, request_id, .internal_error, "internal error: an answer didn't fit its schema");
+    // Null only where `queueWrite` would refuse it too: the client isn't
+    // reading, and is closed.
+    const out = conn.reserveWrite(header_size + body_size) orelse {
+        conn.write_overflow = true;
+        return;
+    };
+    const body = Response.encodeInto(out[header_size..], v) catch unreachable; // sized above
+    conn.commitWrite(proto.Response.sealOk(request_id, out, body.len).len);
 }
 
 /// `v` as a whole ok answer in `buf`, or null when it breaks `Response`'s

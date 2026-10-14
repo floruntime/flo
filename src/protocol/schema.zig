@@ -64,12 +64,18 @@ pub const Reader = struct {
     }
 };
 
-/// Writes into a fixed buffer.
+/// Writes into a fixed buffer, or with `counting` set only counts what it
+/// would write: the exact size of a value, found before there is room for it.
 pub const Writer = struct {
     buf: []u8,
     pos: usize = 0,
+    counting: bool = false,
 
     pub fn put(w: *Writer, bytes: []const u8) EncodeError!void {
+        if (w.counting) {
+            w.pos += bytes.len;
+            return;
+        }
         if (bytes.len > w.buf.len - w.pos) return error.NoSpaceLeft;
         @memcpy(w.buf[w.pos..][0..bytes.len], bytes);
         w.pos += bytes.len;
@@ -575,6 +581,13 @@ pub fn Record(comptime fields: []const Field) type {
             inline for (fields) |f| try f.T.encode(w, @field(v, f.name));
         }
 
+        /// The bytes `encodeInto` writes for `v`, or the error it returns.
+        pub fn encodedSize(v: Value) EncodeError!usize {
+            var w: Writer = .{ .buf = &.{}, .counting = true };
+            try encode(&w, v);
+            return w.pos;
+        }
+
         /// Encodes `v` into `buf`, returning the bytes written.
         pub fn encodeInto(buf: []u8, v: Value) EncodeError![]const u8 {
             var w: Writer = .{ .buf = buf };
@@ -923,4 +936,26 @@ test "schema: a list builder takes elements until the next one wouldn't fit, and
     var t = L.Builder.init(&tiny);
     try std.testing.expect(try t.add("ab"));
     try std.testing.expect(!try t.add("c"));
+}
+
+test "schema: encodedSize is what encodeInto writes, and refuses what it refuses" {
+    const Names = BoundedList(String(16), 8, 64);
+    const R = Record(&.{
+        .{ .name = "id", .T = Int(u64) },
+        .{ .name = "tag", .T = Optional(Bytes(300)) },
+        .{ .name = "limit", .T = Defaulted(Range(u32, 1, 10), 5) },
+        .{ .name = "names", .T = Names },
+        .{ .name = "flag", .T = Bool },
+    });
+    var list_buf: [64]u8 = undefined;
+    var names = Names.Builder.init(&list_buf);
+    for ([_][]const u8{ "a", "bb", "ccc" }) |n| try std.testing.expect(try names.add(n));
+    var buf: [512]u8 = undefined;
+    const long_tag: [301]u8 = @splat('x');
+    for ([_]R.Value{
+        .{ .id = 1, .tag = null, .limit = 5, .names = names.value(), .flag = true },
+        .{ .id = 2, .tag = long_tag[0..300], .limit = 10, .names = (Names.Builder.init(&list_buf)).value(), .flag = false },
+    }) |v| try std.testing.expectEqual((try R.encodeInto(&buf, v)).len, try R.encodedSize(v));
+    try std.testing.expectError(error.OutOfRange, R.encodedSize(.{ .id = 0, .tag = null, .limit = 11, .names = names.value(), .flag = true }));
+    try std.testing.expectError(error.TooLong, R.encodedSize(.{ .id = 0, .tag = &long_tag, .limit = 1, .names = names.value(), .flag = true }));
 }
