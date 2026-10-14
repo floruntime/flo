@@ -102,8 +102,7 @@ pub const ProcessingHandler = struct {
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
 
-    /// KV handlers — one per shard, wired by Runtime. KV sinks reach keys
-    /// on any shard; KV lookups read only `own_shard`'s.
+    /// KV handlers — one per shard, wired by Runtime.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
     /// The shard this handler runs on; kv_lookup reads only its KV.
     own_shard: u16 = 0,
@@ -506,6 +505,10 @@ pub const ProcessingHandler = struct {
         const home = if (req.namespace.len > 0) req.namespace else "default";
         var why_buf: [256]u8 = undefined;
         if (def.homeRefusal(home, &why_buf)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
@@ -1254,14 +1257,13 @@ pub const ProcessingHandler = struct {
         };
     }
 
-    /// KV lookup callback passed to KvLookupOperator. It reads only the KV
-    /// this shard owns, on this shard's thread; a key another shard owns
-    /// reads as not found.
+    /// KV lookup callback passed to KvLookupOperator. It reads this shard's
+    /// KV on this shard's thread. A job with a lookup is refused on a server
+    /// of more than one shard, so this KV is all there is.
     fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const handlers = self.peer_kv_handlers orelse return null;
         if (self.own_shard >= handlers.len) return null;
-        if (handlers.len > 1 and self.peer_partition_count > 0 and self.peerShardId(namespace, key) != self.own_shard) return null;
         const ns_handler = @import("../namespace/handler.zig");
         var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
@@ -2105,7 +2107,7 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }
 
-test "ProcessingHandler: kv_lookup reads only its own shard's KV" {
+test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key hashes to" {
     const allocator = std.testing.allocator;
     const KVProjection = @import("../projection/kv.zig").KVProjection;
     var kv0 = KVProjection.init(allocator, 0);
@@ -2122,19 +2124,17 @@ test "ProcessingHandler: kv_lookup reads only its own shard's KV" {
     handler.peer_shard_count = 2;
     handler.setPeerKvHandlers(&peers, 0);
 
-    // One key each shard owns, stored where it is owned.
-    var names: [2][]const u8 = .{ "", "" };
-    const candidates = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" };
-    for (candidates) |c| {
-        const owner = handler.peerShardId("default", c);
-        if (names[owner].len == 0) names[owner] = c;
+    // A key whose hash names shard 1, written here (as a routing key does).
+    var elsewhere: []const u8 = "";
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" }) |c| {
+        if (handler.peerShardId("default", c) == 1) elsewhere = c;
     }
-    try std.testing.expect(names[0].len > 0 and names[1].len > 0);
+    try std.testing.expect(elsewhere.len > 0);
     const ns_handler = @import("../namespace/handler.zig");
     var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
-    try kv0.put(try ns_handler.qualifyKey(&qbuf, "default", names[0]), "here", 1, 1, 0, 0);
-    try kv1.put(try ns_handler.qualifyKey(&qbuf, "default", names[1]), "there", 1, 1, 0, 0);
+    try kv0.put(try ns_handler.qualifyKey(&qbuf, "default", elsewhere), "here", 1, 1, 0, 0);
+    try kv1.put(try ns_handler.qualifyKey(&qbuf, "default", "only-there"), "there", 1, 1, 0, 0);
 
-    try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", names[0]).?);
-    try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", names[1]) == null);
+    try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
+    try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);
 }

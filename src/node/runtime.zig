@@ -874,8 +874,7 @@ pub const Runtime = struct {
         }
     }
 
-    /// Wire KV handler references: processing pipelines' KV sinks reach keys
-    /// on any shard, and their KV lookups read their own shard's.
+    /// Wire every shard's KV handler into each processing handler.
     fn wirePeerKvHandlers(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
         const handlers = try self.allocator.alloc(*KVHandler, n);
