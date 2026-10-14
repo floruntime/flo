@@ -454,7 +454,7 @@ fn appendSource(allocator: Allocator, sources: *std.ArrayList(SourceSpec), src: 
 ///     stream:
 ///       name: input-events
 ///       namespace: production
-///       partitions: all          # 2 | "0-63" | "0,3,7" | all (default)
+///       partitions: all          # the only value, and the default
 ///       batch_size: 100
 ///       poll_interval_ms: 1000
 ///   ```
@@ -537,7 +537,7 @@ fn appendTsSource(
     const bs = try optPositive(u32, d, ts_obj, "batch_size", ParseError.InvalidFormat) orelse default_batch_size;
     const poll_ms = try optPositive(u32, d, ts_obj, "poll_interval_ms", ParseError.InvalidFormat) orelse 1000;
 
-    var src: SourceSpec = .{ .kind = .ts, .name = "", .stream = "", .namespace = "", .partition = 0, .batch_size = bs, .ts_poll_interval_ms = poll_ms };
+    var src: SourceSpec = .{ .kind = .ts, .name = "", .stream = "", .namespace = "", .batch_size = bs, .ts_poll_interval_ms = poll_ms };
     errdefer freeSource(allocator, src);
     src.name = try dupe(allocator, source_name);
     src.namespace = try dupe(allocator, ns);
@@ -562,79 +562,14 @@ fn appendStreamSource(
     const bs = try optPositive(u32, d, stream_obj, "batch_size", ParseError.InvalidFormat) orelse default_batch_size;
     const poll_ms = try optPositive(u32, d, stream_obj, "poll_interval_ms", ParseError.InvalidFormat) orelse 1000;
 
-    const partitions = stream_obj.object.get("partitions") orelse JsonValue{ .string = "all" };
-    switch (partitions) {
-        .integer => |v| {
-            const p = std.math.cast(u32, v) orelse return d.fail(ParseError.InvalidPartitions, "\"partitions\" must be a partition number, a range like 0-63, a list like 0,3,7 or all, not {d}", .{v});
-            try appendStreamSpec(allocator, sources, source_name, null, stream_name, ns, p, bs, poll_ms);
-        },
-        .string => |s| try expandPartitions(allocator, d, source_name, stream_name, ns, bs, poll_ms, s, sources),
-        else => |v| return wrongKind(d, "partitions", "a partition number, a range, a list or all", v),
-    }
-}
-
-/// Expand a `partitions:` string into one SourceSpec per partition:
-///   - `"all"`   → one entry with partition = PARTITION_ALL (the handler resolves it)
-///   - `"0-63"`  → range, inclusive (64 entries)
-///   - `"0,3,7"` → list (3 entries)
-fn expandPartitions(
-    allocator: Allocator,
-    d: D,
-    base_name: []const u8,
-    stream_name: []const u8,
-    ns: []const u8,
-    bs: u32,
-    poll_ms: u32,
-    partitions_str: []const u8,
-    sources: *std.ArrayList(SourceSpec),
-) ParseError!void {
-    if (mem.eql(u8, partitions_str, "all")) {
-        return appendStreamSpec(allocator, sources, base_name, null, stream_name, ns, job_definition.PARTITION_ALL, bs, poll_ms);
-    }
-    const bad = "\"partitions\" must be a partition number, a range like 0-63, a list like 0,3,7 or all, not \"{s}\"";
-
-    if (mem.indexOfScalar(u8, partitions_str, '-')) |dash_pos| {
-        const start = std.fmt.parseInt(u32, partitions_str[0..dash_pos], 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
-        const end = std.fmt.parseInt(u32, partitions_str[dash_pos + 1 ..], 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
-        if (start > end) return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
-        var p = start;
-        while (true) : (p += 1) {
-            try appendStreamSpec(allocator, sources, base_name, p, stream_name, ns, p, bs, poll_ms);
-            if (p == end) break;
-        }
-        return;
+    // A stream source reads every partition, so `all` is the one value.
+    if (stream_obj.object.get("partitions")) |v| {
+        if (v != .string or !mem.eql(u8, v.string, "all")) return d.fail(ParseError.InvalidPartitions, "\"partitions\" must be all: a stream source reads every partition; to process part of a stream, filter on a field or write that part to its own stream", .{});
     }
 
-    var iter = mem.splitScalar(u8, partitions_str, ',');
-    var count: u32 = 0;
-    while (iter.next()) |seg| {
-        const trimmed = mem.trim(u8, seg, " ");
-        if (trimmed.len == 0) continue;
-        const p = std.fmt.parseInt(u32, trimmed, 10) catch return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
-        try appendStreamSpec(allocator, sources, base_name, p, stream_name, ns, p, bs, poll_ms);
-        count += 1;
-    }
-    if (count == 0) return d.fail(ParseError.InvalidPartitions, bad, .{partitions_str});
-}
-
-/// One stream SourceSpec; an expanded partition gets a "-p<N>" name suffix.
-fn appendStreamSpec(
-    allocator: Allocator,
-    sources: *std.ArrayList(SourceSpec),
-    base_name: []const u8,
-    suffix_partition: ?u32,
-    stream_name: []const u8,
-    ns: []const u8,
-    partition: u32,
-    bs: u32,
-    poll_ms: u32,
-) ParseError!void {
-    var src: SourceSpec = .{ .name = "", .stream = "", .namespace = "", .partition = partition, .batch_size = bs, .ts_poll_interval_ms = poll_ms };
+    var src: SourceSpec = .{ .name = "", .stream = "", .namespace = "", .batch_size = bs, .ts_poll_interval_ms = poll_ms };
     errdefer freeSource(allocator, src);
-    src.name = if (suffix_partition) |p|
-        std.fmt.allocPrint(allocator, "{s}-p{d}", .{ base_name, p }) catch return ParseError.OutOfMemory
-    else
-        try dupe(allocator, base_name);
+    src.name = try dupe(allocator, source_name);
     src.stream = try dupe(allocator, stream_name);
     src.namespace = try dupe(allocator, ns);
     try appendSource(allocator, sources, src);
@@ -802,7 +737,7 @@ test "parser: nested YAML full definition" {
         \\    stream:
         \\      name: input-events
         \\      namespace: production
-        \\      partitions: 2
+        \\      partitions: all
         \\sinks:
         \\  - name: output
         \\    stream:
@@ -823,7 +758,6 @@ test "parser: nested YAML full definition" {
     const src = def.primarySource().?;
     try std.testing.expectEqualStrings("input-events", src.stream);
     try std.testing.expectEqualStrings("production", src.namespace);
-    try std.testing.expectEqual(@as(u32, 2), src.partition);
     try std.testing.expectEqual(@as(u32, 500), src.batch_size);
 
     try std.testing.expectEqual(@as(usize, 1), def.sinks.items.len);
@@ -856,7 +790,6 @@ test "parser: nested YAML minimal with defaults" {
     const src = def.primarySource().?;
     try std.testing.expectEqualStrings("events", src.stream);
     try std.testing.expectEqualStrings("default", src.namespace);
-    try std.testing.expectEqual(job_definition.PARTITION_ALL, src.partition);
     try std.testing.expectEqual(@as(u32, 100), src.batch_size);
 
     const snk = def.primarySink().?;
@@ -876,7 +809,6 @@ test "parser: multi-source array" {
         \\    stream:
         \\      name: click-events
         \\      namespace: prod
-        \\      partitions: 1
         \\      batch_size: 250
         \\  - name: impressions
         \\    stream:
@@ -894,7 +826,6 @@ test "parser: multi-source array" {
     try std.testing.expectEqualStrings("clicks", def.sources.items[0].name);
     try std.testing.expectEqualStrings("click-events", def.sources.items[0].stream);
     try std.testing.expectEqualStrings("prod", def.sources.items[0].namespace);
-    try std.testing.expectEqual(@as(u32, 1), def.sources.items[0].partition);
     try std.testing.expectEqual(@as(u32, 250), def.sources.items[0].batch_size);
 
     try std.testing.expectEqualStrings("impressions", def.sources.items[1].name);
@@ -918,7 +849,7 @@ test "parser: stream source object form full" {
         \\    stream:
         \\      name: input-events
         \\      namespace: production
-        \\      partitions: 2
+        \\      partitions: all
         \\      batch_size: 500
         \\sinks:
         \\  - stream:
@@ -933,7 +864,6 @@ test "parser: stream source object form full" {
     try std.testing.expectEqualStrings("events-source", src.name);
     try std.testing.expectEqualStrings("input-events", src.stream);
     try std.testing.expectEqualStrings("production", src.namespace);
-    try std.testing.expectEqual(@as(u32, 2), src.partition);
     try std.testing.expectEqual(@as(u32, 500), src.batch_size);
     try std.testing.expect(src.kind == .stream);
 }
@@ -957,34 +887,7 @@ test "parser: stream source object form minimal" {
     const src = def.primarySource().?;
     try std.testing.expectEqualStrings("events", src.stream);
     try std.testing.expectEqualStrings("default", src.namespace);
-    try std.testing.expectEqual(job_definition.PARTITION_ALL, src.partition);
     try std.testing.expectEqual(@as(u32, 100), src.batch_size);
-}
-
-test "parser: stream source object form with partitions range" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - name: clicks
-        \\    stream:
-        \\      name: click-events
-        \\      namespace: prod
-        \\      partitions: "0-2"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), def.sources.items.len);
-    try std.testing.expectEqualStrings("clicks-p0", def.sources.items[0].name);
-    try std.testing.expectEqualStrings("click-events", def.sources.items[0].stream);
-    try std.testing.expectEqualStrings("prod", def.sources.items[0].namespace);
-    try std.testing.expectEqual(@as(u32, 0), def.sources.items[0].partition);
 }
 
 test "parser: stream source object form with partitions all" {
@@ -1006,7 +909,6 @@ test "parser: stream source object form with partitions all" {
     defer def.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
-    try std.testing.expectEqual(job_definition.PARTITION_ALL, def.sources.items[0].partition);
     try std.testing.expectEqualStrings("txn-events", def.sources.items[0].stream);
 }
 
@@ -1416,163 +1318,28 @@ test "parser: KV sink defaults" {
 }
 
 // =============================================================================
-// Partition Range Tests
+// Partitions
 // =============================================================================
 
-test "parser: partitions range expands to multiple sources" {
+test "parser: a stream source's partitions must be all" {
     const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - name: clicks
-        \\    stream:
-        \\      name: click-events
-        \\      partitions: "0-3"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 4), def.sources.items.len);
-    try std.testing.expectEqualStrings("clicks-p0", def.sources.items[0].name);
-    try std.testing.expectEqual(@as(u32, 0), def.sources.items[0].partition);
-    try std.testing.expectEqualStrings("clicks-p1", def.sources.items[1].name);
-    try std.testing.expectEqual(@as(u32, 1), def.sources.items[1].partition);
-    try std.testing.expectEqualStrings("clicks-p2", def.sources.items[2].name);
-    try std.testing.expectEqual(@as(u32, 2), def.sources.items[2].partition);
-    try std.testing.expectEqualStrings("clicks-p3", def.sources.items[3].name);
-    try std.testing.expectEqual(@as(u32, 3), def.sources.items[3].partition);
-
-    // All share stream name
-    for (def.sources.items) |src| {
-        try std.testing.expectEqualStrings("click-events", src.stream);
+    for ([_][]const u8{ "2", "-1", "\"0-3\"", "\"0-4294967295\"", "\"5-2\"", "\"0,5,10\"", "\"\"", "\"ALL\"", "[0, 1]" }) |value| {
+        const text = try std.fmt.allocPrint(allocator,
+            \\kind: Processing
+            \\sources:
+            \\  - name: clicks
+            \\    stream:
+            \\      name: click-events
+            \\      partitions: {s}
+            \\sinks:
+            \\  - stream:
+            \\      name: out
+        , .{value});
+        defer allocator.free(text);
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(error.InvalidPartitions, parseJobDefinition(allocator, text, &diag));
+        try std.testing.expect(mem.indexOf(u8, diag.message(), "\"partitions\" must be all") != null);
     }
-}
-
-test "parser: partitions comma list" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - name: sel
-        \\    stream:
-        \\      name: events
-        \\      partitions: "0,5,10"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), def.sources.items.len);
-    try std.testing.expectEqual(@as(u32, 0), def.sources.items[0].partition);
-    try std.testing.expectEqual(@as(u32, 5), def.sources.items[1].partition);
-    try std.testing.expectEqual(@as(u32, 10), def.sources.items[2].partition);
-    try std.testing.expectEqualStrings("sel-p0", def.sources.items[0].name);
-    try std.testing.expectEqualStrings("sel-p5", def.sources.items[1].name);
-    try std.testing.expectEqualStrings("sel-p10", def.sources.items[2].name);
-}
-
-test "parser: partitions all sentinel" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - name: full
-        \\    stream:
-        \\      name: txn-events
-        \\      partitions: "all"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
-    try std.testing.expectEqualStrings("full", def.sources.items[0].name);
-    try std.testing.expectEqual(job_definition.PARTITION_ALL, def.sources.items[0].partition);
-    try std.testing.expectEqualStrings("txn-events", def.sources.items[0].stream);
-}
-
-test "parser: partitions with batch_size" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\batch_size: 200
-        \\sources:
-        \\  - name: fast
-        \\    stream:
-        \\      name: events
-        \\      partitions: "0-1"
-        \\      batch_size: 500
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), def.sources.items.len);
-    try std.testing.expectEqual(@as(u32, 500), def.sources.items[0].batch_size);
-    try std.testing.expectEqual(@as(u32, 500), def.sources.items[1].batch_size);
-}
-
-test "parser: invalid partitions range" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - stream:
-        \\      name: events
-        \\      partitions: "5-2"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-    try std.testing.expectError(error.InvalidPartitions, parseJobDefinition(allocator, text, null));
-}
-
-test "parser: partitions mixed with single partition source" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - name: single
-        \\    stream:
-        \\      name: a
-        \\      partitions: 7
-        \\  - name: multi
-        \\    stream:
-        \\      name: b
-        \\      partitions: "0-2"
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-    ;
-
-    var def = try parseJobDefinition(allocator, text, null);
-    defer def.deinit(allocator);
-
-    // 1 single + 3 expanded = 4 total
-    try std.testing.expectEqual(@as(usize, 4), def.sources.items.len);
-    try std.testing.expectEqualStrings("single", def.sources.items[0].name);
-    try std.testing.expectEqual(@as(u32, 7), def.sources.items[0].partition);
-    try std.testing.expectEqualStrings("multi-p0", def.sources.items[1].name);
-    try std.testing.expectEqual(@as(u32, 0), def.sources.items[1].partition);
 }
 
 // =============================================================================

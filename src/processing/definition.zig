@@ -16,27 +16,8 @@
 //!     stream:
 //!       name: input-events
 //!       namespace: production
-//!       partitions: 0              # single partition (integer)
+//!       partitions: all            # every partition: the only value, and the default
 //!       batch_size: 500            # per-source override
-//!     # omitting `partitions:` defaults to all partitions
-//!
-//!   # Partition range — expands into one SourceSpec per partition
-//!   - name: all-partitions
-//!     stream:
-//!       name: click-events
-//!       partitions: "0-63"         # range: creates 64 internal sources
-//!
-//!   # Partition list — comma-separated
-//!   - name: selected
-//!     stream:
-//!       name: impressions
-//!       partitions: "0,3,7"        # explicit list
-//!
-//!   # All partitions — resolved at runtime from stream metadata
-//!   - name: full-stream
-//!     stream:
-//!       name: transactions
-//!       partitions: "all"          # sentinel, handler resolves partition count
 //!
 //! sinks:
 //!   - name: output
@@ -182,16 +163,9 @@ pub const SourceKind = enum(u8) {
 // SourceSpec — one logical source (Flo-Stream or Flo-TS)
 // =============================================================================
 
-/// Sentinel value for `partition` indicating "all partitions".
-/// The handler resolves the actual partition count from stream metadata at runtime.
-pub const PARTITION_ALL: u32 = std.math.maxInt(u32);
-
 /// Specification for a source endpoint in the processing topology.
 ///
-/// For **stream** sources the parser expands `partitions: "0-63"` or
-/// `partitions: "0,3,7"` into multiple SourceSpec entries (one per
-/// partition). The `partitions: "all"` form sets `partition = PARTITION_ALL`
-/// for runtime resolution.
+/// A **stream** source reads every partition of its stream.
 ///
 /// For **ts** sources the spec identifies a measurement + optional tags and
 /// field to read. The handler periodically polls `ts_read` to feed the
@@ -206,10 +180,6 @@ pub const SourceSpec = struct {
     stream: []const u8,
     /// Namespace (default: "default")
     namespace: []const u8,
-    /// Partition to read from (stream sources only, default: 0).
-    /// Set to `PARTITION_ALL` when `partitions: "all"` is specified;
-    /// the handler resolves the actual count from stream metadata.
-    partition: u32,
     /// Batch size for this source (default: inherited from top-level batch_size)
     batch_size: u32,
 

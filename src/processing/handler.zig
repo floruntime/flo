@@ -112,6 +112,10 @@ pub const ProcessingHandler = struct {
     peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
     peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
+    /// Most jobs a server holds. Jobs are never removed, so a submit past
+    /// it is refused. A field only so tests can reach it.
+    max_jobs: usize = MAX_JOBS,
+
     const MAX_JOBS: usize = 100_000;
 
     /// Sink configuration for a single sink in the pipeline.
@@ -483,6 +487,10 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job definition is required");
             return;
         }
+        if (self.jobLimitRefusal()) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
 
         // Parse the YAML/JSON definition, using the request namespace as fallback
         const req_ns: ?[]const u8 = if (req.namespace.len > 0) req.namespace else null;
@@ -545,6 +553,11 @@ pub const ProcessingHandler = struct {
             return;
         };
         shard.park(conn, req, proposed, respondProcessing);
+    }
+
+    fn jobLimitRefusal(self: *const ProcessingHandler) ?[]const u8 {
+        if (self.jobs.count() < self.max_jobs) return null;
+        return std.fmt.comptimePrint("job not submitted: this server holds at most {d} processing jobs", .{MAX_JOBS});
     }
 
     // ── Stop ─────────────────────────────────────────────────────────────
@@ -1934,7 +1947,6 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
         .name = "s",
         .stream = "raw",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
     };
     try handler.pipelines.put("job-cp", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
@@ -1967,7 +1979,6 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
         .name = "t",
         .stream = "",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
         .ts_measurement = "cpu",
         .ts_field = "value",
@@ -1993,7 +2004,7 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     const allocator = std.testing.allocator;
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
-    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .partition = 0, .batch_size = 0 };
+    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
     try handler.pipelines.put("job-fw", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     const pipe = handler.pipelines.getPtr("job-fw").?;
     pipe.stream_cursor_ts = 2000;
@@ -2123,4 +2134,59 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     val[0] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+}
+
+/// A processing_submit value: [status][parallelism=1][batch_size=0][ns_len]["default"][yaml].
+fn testSubmitValue(buf: []u8, status: ProcessingHandler.JobStatus, yaml: []const u8) []const u8 {
+    buf[0] = @backingInt(status);
+    std.mem.writeInt(u32, buf[1..5], 1, .little);
+    std.mem.writeInt(u32, buf[5..9], 0, .little);
+    std.mem.writeInt(u16, buf[9..11], 7, .little);
+    @memcpy(buf[11..18], "default");
+    @memcpy(buf[18 .. 18 + yaml.len], yaml);
+    return buf[0 .. 18 + yaml.len];
+}
+
+test "ProcessingHandler: a stored definition that lists partitions is not started" {
+    const yaml =
+        \\kind: Processing
+        \\name: ranged
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\      partitions: "0-4294967295"
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1));
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+    try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
+}
+
+test "ProcessingHandler: a submit past the job limit is refused" {
+    const yaml =
+        \\kind: Processing
+        \\name: one
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    handler.max_jobs = 1;
+    try std.testing.expect(handler.jobLimitRefusal() == null);
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", testSubmitValue(&buf, .stopped, yaml), 1));
+    try std.testing.expect(handler.jobLimitRefusal() != null);
 }
