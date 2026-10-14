@@ -414,14 +414,7 @@ pub const JsonAggregateOperator = struct {
     }
 
     fn emitResult(self: *Self, key: []const u8, group: *const Group, event_time_ms: i64, ctx: *OperatorContext) !void {
-        const result = group.getResult(self.function);
-
-        // Format output as JSON: {"key": "<key>", "value": <result>, "count": <n>}
-        const output = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"key\":\"{s}\",\"value\":{d},\"count\":{d}}}",
-            .{ key, result, group.count },
-        );
+        const output = try resultJson(self.allocator, key, group.getResult(self.function), group.count);
         errdefer self.allocator.free(output);
 
         // Dupe key to match owned-memory contract
@@ -436,6 +429,27 @@ pub const JsonAggregateOperator = struct {
             .headers = &.{},
             .owns_memory = true,
         });
+    }
+
+    /// `{"key":<key>,"value":<result>,"count":<n>}`, the key escaped as a JSON
+    /// string. A result past f64's range is written as null.
+    fn resultJson(allocator: Allocator, key: []const u8, result: f64, count: u64) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        writeResult(&jw, key, result, count) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    fn writeResult(jw: *std.json.Stringify, key: []const u8, result: f64, count: u64) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(key);
+        try jw.objectField("value");
+        if (std.math.isFinite(result)) try jw.print("{d}", .{result}) else try jw.write(null);
+        try jw.objectField("count");
+        try jw.write(count);
+        try jw.endObject();
     }
 
     fn extractNumericField(self: *const Self, value: []const u8) ?f64 {
@@ -461,7 +475,8 @@ pub const JsonAggregateOperator = struct {
 
         return switch (current) {
             .integer => |n| @as(f64, @floatFromInt(n)),
-            .float => |f| f,
+            // A number past f64's range is skipped like a non-numeric one.
+            .float => |f| if (std.math.isFinite(f)) f else null,
             else => null,
         };
     }
@@ -834,4 +849,40 @@ test "JsonAggregateOperator — snapshot and restore" {
     try std.testing.expectEqual(@as(f64, 20), agg2.getGroup("k2").?.sum);
 
     collector.clear();
+}
+
+test "JsonAggregateOperator — output is JSON for any key, and a value past f64's range is skipped or null" {
+    const allocator = std.testing.allocator;
+    var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.amount", .none);
+    defer agg.deinit();
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test-agg",
+    };
+    const op = agg.operator();
+    const key = "a\"b\\c\n";
+
+    // Past f64's range: skipped like a non-numeric value.
+    try op.processElement(ProcessingRecord.init(key, "{\"amount\":1e400}", 100), &ctx);
+    try std.testing.expectEqual(@as(usize, 0), collector.count());
+
+    // A sum that overflows is written as null.
+    try op.processElement(ProcessingRecord.init(key, "{\"amount\":1.5e308}", 200), &ctx);
+    try op.processElement(ProcessingRecord.init(key, "{\"amount\":1.5e308}", 300), &ctx);
+    const out = collector.drain();
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    for (out, [_]bool{ true, false }) |rec, finite| {
+        const Result = struct { key: []const u8, value: ?f64, count: u64 };
+        const parsed = try std.json.parseFromSlice(Result, allocator, rec.value, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(key, parsed.value.key);
+        try std.testing.expectEqual(if (finite) @as(?f64, 1.5e308) else null, parsed.value.value);
+    }
 }

@@ -1289,6 +1289,14 @@ pub const ProcessingHandler = struct {
         return null;
     }
 
+    /// `{"measurement":<name>,"value":<v>,"timestamp_ms":<ms>}`, the name
+    /// escaped as a JSON string; null when it doesn't fit `buf`.
+    fn tsPointJson(buf: []u8, measurement: []const u8, value: f64, ts_ms: i64) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        std.json.Stringify.value(.{ .measurement = measurement, .value = value, .timestamp_ms = ts_ms }, .{}, &w) catch return null;
+        return w.buffered();
+    }
+
     /// Helper to build a PipelineState with source/sink config (no operators).
     fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, tag_hash: u64) PipelineState {
         // Build SinkConfig array from all sink specs
@@ -1405,7 +1413,7 @@ pub const ProcessingHandler = struct {
             // Format TS point as JSON record
             var json_buf: [512]u8 = undefined;
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = std.fmt.bufPrint(&json_buf, "{{\"measurement\":\"{s}\",\"value\":{},\"timestamp_ms\":{d}}}", .{ pipe.src_measurement, pt.field_value, ts_ms }) catch continue;
+            const json = tsPointJson(&json_buf, pipe.src_measurement, pt.field_value, ts_ms) orelse continue;
 
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
@@ -2123,4 +2131,14 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     val[0] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+}
+
+test "ProcessingHandler: a TS source record is JSON for any measurement name" {
+    var buf: [512]u8 = undefined;
+    const json = ProcessingHandler.tsPointJson(&buf, "cp\"u\\", 1.5, 7).?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("cp\"u\\", parsed.value.object.get("measurement").?.string);
+    try std.testing.expectEqual(@as(f64, 1.5), parsed.value.object.get("value").?.float);
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("timestamp_ms").?.integer);
 }

@@ -362,42 +362,30 @@ pub const KvLookupOperator = struct {
         };
     }
 
-    /// Create enriched JSON by merging the KV value into the record.
+    /// The record with the KV value added as `enrich_field`. The record must
+    /// be a JSON object. A KV value that is a JSON object or array is added as
+    /// that value; any other is added as a JSON string.
     fn enrichRecord(self: *const Self, allocator: Allocator, record_value: []const u8, kv_value: []const u8) ![]const u8 {
-        // Build: {"original_field": ..., "<enrich_field>": "<kv_value>"}
-        // We do simple string concatenation to avoid full JSON parse/rebuild.
-        // The record_value should be a JSON object — we insert before the closing '}'.
-        if (record_value.len < 2) return record_value;
+        const body = std.mem.trim(u8, record_value, " \t\n\r");
+        if (body.len < 2 or body[0] != '{' or !try std.json.validate(allocator, body)) return error.NotAnObject;
+        const inside = std.mem.trim(u8, body[1 .. body.len - 1], " \t\n\r");
 
-        // Find last '}'
-        const last_brace = std.mem.lastIndexOfScalar(u8, record_value, '}') orelse return record_value;
-
-        // Build: <everything before }>, "<enrich_field>":"<kv_value>"}
-        const needs_comma = blk: {
-            // Check if there's content between '{' and '}'
-            var j: usize = last_brace;
-            while (j > 0) {
-                j -= 1;
-                if (record_value[j] == '{') break :blk false; // empty object
-                if (record_value[j] != ' ' and record_value[j] != '\n' and record_value[j] != '\t' and record_value[j] != '\r') break :blk true;
-            }
-            break :blk false;
-        };
-
-        const prefix = record_value[0..last_brace];
-        const comma = if (needs_comma) "," else "";
-
-        // If kv_value looks like a JSON object or array, embed it raw;
-        // otherwise wrap it as a JSON string.
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        w.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+        if (inside.len > 0) w.writeByte(',') catch return error.OutOfMemory;
+        std.json.Stringify.value(self.enrich_field, .{}, w) catch return error.OutOfMemory;
+        w.writeByte(':') catch return error.OutOfMemory;
         const trimmed = std.mem.trim(u8, kv_value, " \t\n\r");
-        const is_json = (trimmed.len >= 2) and ((trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') or
-            (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']'));
-
+        const is_json = trimmed.len >= 2 and (trimmed[0] == '{' or trimmed[0] == '[') and try std.json.validate(allocator, trimmed);
         if (is_json) {
-            return std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":{s}}}", .{ prefix, comma, self.enrich_field, trimmed });
+            w.writeAll(trimmed) catch return error.OutOfMemory;
         } else {
-            return std.fmt.allocPrint(allocator, "{s}{s}\"{s}\":\"{s}\"}}", .{ prefix, comma, self.enrich_field, kv_value });
+            std.json.Stringify.value(kv_value, .{}, w) catch return error.OutOfMemory;
         }
+        w.writeByte('}') catch return error.OutOfMemory;
+        return out.toOwnedSlice();
     }
 
     // =========================================================================
@@ -603,4 +591,59 @@ test "KvLookupOperator — slash separator" {
     const key = op.buildKeyForTest("{\"id\":\"u-001\"}");
     try std.testing.expect(key != null);
     try std.testing.expectEqualStrings("accounts/u-001", key.?);
+}
+
+test "KvLookupOperator — enrich output is JSON for any KV value" {
+    const allocator = std.testing.allocator;
+    const OutputCollector = @import("../collector.zig").OutputCollector;
+    const OperatorMetrics = @import("../context.zig").OperatorMetrics;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const StubKv = struct {
+        value: []const u8,
+        fn lookup(ctx_ptr: *anyopaque, _: []const u8, _: []const u8) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            return self.value;
+        }
+    };
+    var op = try KvLookupOperator.init(allocator, "enrich-kv", "user:${$.id}", "default", .enrich, "tier");
+    defer op.deinit(allocator);
+
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = @import("../context.zig").OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = arena.allocator(),
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test",
+    };
+    const iface = op.operator();
+
+    // A string with quotes and backslashes, and one that only looks like an
+    // object, are both added as strings; a JSON object is added as itself.
+    for ([_][]const u8{ "pre\"mium\\", "{\"a\":1},\"role\":\"admin\",\"z\":{}", "{\"level\":2}" }) |kv| {
+        var stub = StubKv{ .value = kv };
+        op.setLookupFn(StubKv.lookup, @ptrCast(&stub));
+        collector.clear();
+        try iface.processElement(ProcessingRecord.init("k", "{\"id\":\"u1\"}", 0), &ctx);
+        const out = collector.drain();
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out[0].value, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+        const tier = parsed.value.object.get("tier").?;
+        if (tier == .string) try std.testing.expectEqualStrings(kv, tier.string) else try std.testing.expectEqual(@as(i64, 2), tier.object.get("level").?.integer);
+    }
+
+    // A record that isn't a JSON object passes through unchanged.
+    var stub = StubKv{ .value = "x" };
+    op.setLookupFn(StubKv.lookup, @ptrCast(&stub));
+    collector.clear();
+    const not_object = "{\"id\":\"u1\"} trailing}";
+    try iface.processElement(ProcessingRecord.init("k", not_object, 0), &ctx);
+    try std.testing.expectEqualStrings(not_object, collector.drain()[0].value);
 }
