@@ -16,6 +16,7 @@
 //!                             falls back to committed projection state
 //! COMMIT(T)                 → propose kv_batch UAL entry, drop TxnState
 //! ROLLBACK(T)               → drop TxnState (no UAL write)
+//! (no request for IDLE_TIMEOUT_MS) → dropped by the shard's reaper
 //! ```
 //!
 //! ## Caps
@@ -23,13 +24,13 @@
 //! - `MAX_OPS_PER_TXN` (256): number of buffered ops
 //! - `MAX_PAYLOAD_PER_TXN` (1 MiB): total buffered key+value bytes
 //! - `MAX_OPEN_TXNS` (1024): per-shard concurrent txns
-//! - `IDLE_TIMEOUT_NS` (5 s): unused — txn idle reaper is follow-up work
+//! - `IDLE_TIMEOUT_MS` (30 s): a txn no request has used for this long is
+//!   dropped
 //!
 //! ## Threading
 //!
-//! TxnTable is owned by KVProjection (which is owned by a Partition, which
-//! lives on one Shard). All access is from the shard's reactor thread. No
-//! locks needed.
+//! TxnTable is owned by the shard's KVHandler. All access is from the
+//! shard's reactor thread. No locks needed.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -45,6 +46,13 @@ pub const MAX_PAYLOAD_PER_TXN: usize = 1 * 1024 * 1024;
 /// framing of every op (kind, flags, namespace, key len, value len, TTL).
 pub const MAX_BATCH_ENTRY_PAYLOAD: usize = 3 + MAX_OPS_PER_TXN * 20 + MAX_PAYLOAD_PER_TXN;
 pub const MAX_OPEN_TXNS: usize = 1024;
+/// A transaction isn't tied to a connection: a shell script may open it,
+/// write in it and commit it from separate `flo` runs. So the only sign its
+/// client is gone is that it stops being used, and without a limit a client
+/// that crashed mid-transaction would hold one of `MAX_OPEN_TXNS` for good.
+/// Long enough for a script's pauses; a txn reaped under one is answered
+/// no_such_transaction and nothing of it is written.
+pub const IDLE_TIMEOUT_MS: u64 = 30 * std.time.ms_per_s;
 
 // ─── Op record ────────────────────────────────────────────────────────────
 
@@ -82,11 +90,8 @@ pub const TxnState = struct {
     /// Wyhash of the namespace the txn was begun in; it is found only from
     /// there.
     namespace_hash: u32,
-    /// The connection that opened this txn (for cleanup on disconnect).
-    /// 0 = anonymous / not bound to a connection (e.g. tests).
-    owner_conn_id: u32,
-    /// Monotonic timestamp of last activity (ms). For idle reaper.
-    last_active_ms: i64,
+    /// When a request last used it, on the monotonic clock (ms).
+    last_active_ms: u64,
     /// Buffered ops in submission order.
     ops: std.ArrayListUnmanaged(TxnOp),
     /// Total bytes buffered (sum of key.len + value.len across ops).
@@ -177,7 +182,7 @@ pub const TxnTable = struct {
 
     /// Begin a new transaction pinned to `pinned_hash`. Returns the new id.
     /// Returns `error.TooManyOpenTxns` when the cap is reached.
-    pub fn begin(self: *TxnTable, pinned_hash: u64, namespace_hash: u32, owner_conn_id: u32) !u64 {
+    pub fn begin(self: *TxnTable, pinned_hash: u64, namespace_hash: u32) !u64 {
         if (self.map.count() >= MAX_OPEN_TXNS) return error.TooManyOpenTxns;
 
         const id = makeId(self.shard_id, self.next_id);
@@ -187,8 +192,7 @@ pub const TxnTable = struct {
             .txn_id = id,
             .pinned_hash = pinned_hash,
             .namespace_hash = namespace_hash,
-            .owner_conn_id = owner_conn_id,
-            .last_active_ms = stdx_time.milliTimestamp(),
+            .last_active_ms = stdx_time.monotonicMs(),
             .ops = .empty,
             .payload_bytes = 0,
         });
@@ -228,11 +232,10 @@ pub const TxnTable = struct {
             .ttl_ms = ttl_ms,
         });
         txn.payload_bytes += key.len + value.len;
-        txn.last_active_ms = stdx_time.milliTimestamp();
     }
 
     /// Drop a transaction (called by COMMIT after successful Raft propose,
-    /// or by ROLLBACK, or by connection-close cleanup).
+    /// by ROLLBACK, or by the idle reaper).
     pub fn drop(self: *TxnTable, txn_id: u64) void {
         if (self.map.fetchRemove(txn_id)) |kv| {
             var state = kv.value;
@@ -240,22 +243,28 @@ pub const TxnTable = struct {
         }
     }
 
-    /// Drop every txn owned by the given connection. Called on disconnect.
-    /// Txns with `owner_conn_id == 0` are treated as unowned and survive
-    /// connection close (used by stateless CLI clients).
-    pub fn dropByConnection(self: *TxnTable, conn_id: u32) usize {
-        if (conn_id == 0) return 0;
-        var to_drop: std.ArrayListUnmanaged(u64) = .empty;
-        defer to_drop.deinit(self.allocator);
-
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.owner_conn_id == conn_id) {
-                to_drop.append(self.allocator, entry.key_ptr.*) catch break;
+    /// Drop every transaction no request has used for `IDLE_TIMEOUT_MS` as
+    /// of `now_ms`, except one whose batch is proposed: its apply drops it.
+    /// Returns how many it dropped.
+    pub fn reapIdle(self: *TxnTable, now_ms: u64) usize {
+        var reaped: usize = 0;
+        // Ids are gathered before dropping: the map can't change under its
+        // iterator.
+        var ids: [64]u64 = undefined;
+        while (true) {
+            var n: usize = 0;
+            var it = self.map.iterator();
+            while (it.next()) |e| {
+                const t = e.value_ptr;
+                if (t.committing or now_ms -| t.last_active_ms < IDLE_TIMEOUT_MS) continue;
+                ids[n] = t.txn_id;
+                n += 1;
+                if (n == ids.len) break;
             }
+            for (ids[0..n]) |id| self.drop(id);
+            reaped += n;
+            if (n < ids.len) return reaped;
         }
-        for (to_drop.items) |id| self.drop(id);
-        return to_drop.items.len;
     }
 
     /// Number of currently open transactions.
@@ -425,10 +434,10 @@ test "TxnTable: two tables start their ids at different counters" {
     defer a.deinit();
     var b = TxnTable.init(std.testing.allocator);
     defer b.deinit();
-    const first = try a.begin(0, 0, 0);
+    const first = try a.begin(0, 0);
     // A restart's table: the id a client held from before isn't open in it.
     try std.testing.expect(b.get(first) == null);
-    try std.testing.expect(try b.begin(0, 0, 0) != first);
+    try std.testing.expect(try b.begin(0, 0) != first);
     try std.testing.expect(first & ID_COUNTER_MASK != 0);
 }
 
@@ -437,7 +446,7 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(0xDEADBEEF, 0xABCD, 7);
+    const id = try tt.begin(0xDEADBEEF, 0xABCD);
     try t.expectEqual(@as(usize, 1), tt.count());
 
     try tt.appendOp(id, .put, "default\x00k1", "v1", 0);
@@ -445,7 +454,6 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     const txn = tt.get(id).?;
     try t.expectEqual(@as(usize, 2), txn.ops.items.len);
     try t.expectEqual(@as(u64, 0xDEADBEEF), txn.pinned_hash);
-    try t.expectEqual(@as(u32, 7), txn.owner_conn_id);
 
     tt.drop(id);
     try t.expectEqual(@as(usize, 0), tt.count());
@@ -456,7 +464,7 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(1, 0, 0);
+    const id = try tt.begin(1, 0);
     try tt.appendOp(id, .put, "ns\x00k", "v1", 0);
     try tt.appendOp(id, .put, "ns\x00other", "x", 0);
     try tt.appendOp(id, .put, "ns\x00k", "v2", 0);
@@ -472,7 +480,7 @@ test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(1, 0, 0);
+    const id = try tt.begin(1, 0);
     const big = try t.allocator.alloc(u8, MAX_PAYLOAD_PER_TXN);
     defer t.allocator.free(big);
     @memset(big, 'a');
@@ -484,21 +492,31 @@ test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     try t.expectError(error.TxnTooLarge, tt.appendOp(id, .put, "k2", "more", 0));
 }
 
-test "TxnTable: dropByConnection removes only matching txns" {
+test "TxnTable: reapIdle drops idle transactions, but not a used or committing one" {
     const t = std.testing;
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const a = try tt.begin(1, 0, 100);
-    const b = try tt.begin(1, 0, 100);
-    const c = try tt.begin(1, 0, 200);
-    _ = a;
-    _ = b;
-    _ = c;
+    // More idle ones than one gathering pass holds.
+    var idle: [150]u64 = undefined;
+    for (&idle) |*id| {
+        id.* = try tt.begin(1, 0);
+        tt.get(id.*).?.last_active_ms = 1_000;
+    }
+    try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0);
+    const committing = try tt.begin(1, 0);
+    tt.get(committing).?.last_active_ms = 1_000;
+    tt.get(committing).?.committing = true;
+    const used = try tt.begin(1, 0);
+    tt.get(used).?.last_active_ms = 1_000 + IDLE_TIMEOUT_MS;
 
-    const dropped = tt.dropByConnection(100);
-    try t.expectEqual(@as(usize, 2), dropped);
-    try t.expectEqual(@as(usize, 1), tt.count());
+    const now = 1_000 + IDLE_TIMEOUT_MS;
+    try t.expectEqual(@as(usize, 0), tt.reapIdle(now - 1));
+    try t.expectEqual(idle.len, tt.reapIdle(now));
+    for (idle) |id| try t.expect(tt.get(id) == null);
+    try t.expect(tt.get(committing) != null);
+    try t.expect(tt.get(used) != null);
+    try t.expectEqual(@as(usize, 2), tt.count());
 }
 
 test "kv_batch: serializeBatch / iterateBatch round-trip" {
@@ -553,5 +571,5 @@ test "txn: an id names its shard" {
     var t = TxnTable.init(std.testing.allocator);
     defer t.deinit();
     t.shard_id = 7;
-    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, 0, 0)));
+    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, 0)));
 }

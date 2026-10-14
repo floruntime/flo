@@ -17,7 +17,7 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     var table = txn_mod.TxnTable.init(testing.allocator);
     defer table.deinit();
 
-    const tid = try table.begin(0xDEAD_BEEF, 42, 7);
+    const tid = try table.begin(0xDEAD_BEEF, 42);
     try testing.expect(tid != 0);
 
     // Stage put + delete + incr.
@@ -32,7 +32,6 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     try testing.expectEqual(@as(usize, 3), state.ops.items.len);
     try testing.expectEqual(@as(u64, 0xDEAD_BEEF), state.pinned_hash);
     try testing.expectEqual(@as(u32, 42), state.namespace_hash);
-    try testing.expectEqual(@as(u32, 7), state.owner_conn_id);
 
     // Last-op-for-key lookup powers RYW reads.
     try testing.expect(table.lastOpForKey(tid, "alice") != null);
@@ -44,27 +43,11 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     try testing.expect(table.get(tid) == null);
 }
 
-test "integration: kv_txn — connection cleanup drops owned txns" {
-    var table = txn_mod.TxnTable.init(testing.allocator);
-    defer table.deinit();
-
-    const owner: u32 = 100;
-    _ = try table.begin(1, 0, owner);
-    _ = try table.begin(2, 0, owner);
-    _ = try table.begin(3, 0, 999); // different owner
-
-    try testing.expectEqual(@as(usize, 3), table.count());
-
-    const dropped = table.dropByConnection(owner);
-    try testing.expectEqual(@as(usize, 2), dropped);
-    try testing.expectEqual(@as(usize, 1), table.count());
-}
-
 test "integration: kv_txn — batch payload round-trips through codec" {
     var table = txn_mod.TxnTable.init(testing.allocator);
     defer table.deinit();
 
-    const tid = try table.begin(0, 99, 1);
+    const tid = try table.begin(0, 99);
     try table.appendOp(tid, .put, "k1", "v1", 1_000);
     try table.appendOp(tid, .put, "k2", "v2", 0);
     try table.appendOp(tid, .delete, "k3", "", 0);

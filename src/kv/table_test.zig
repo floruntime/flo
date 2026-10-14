@@ -351,7 +351,7 @@ test "kv table: a set in a transaction is buffered, read back inside it, and uns
     try h.init();
     defer h.deinit();
     const txn_table = &h.shard.kv_handler.txn_table;
-    const id = try txn_table.begin(router.hashKeyWithNamespace("", "user:1"), router.namespaceHash(""), 0);
+    const id = try txn_table.begin(router.hashKeyWithNamespace("", "user:1"), router.namespaceHash(""));
 
     try expectSet(try h.set("bal", setBody("5", .{ .routing_key = "user:1", .txn = id })), null);
     try expectValue((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id }))).?, 0, "5");
@@ -367,7 +367,7 @@ test "kv table: a forged or stale transaction id is refused as no such transacti
     try h.init();
     defer h.deinit();
     const txn_table = &h.shard.kv_handler.txn_table;
-    const open = try txn_table.begin(router.hashKeyWithNamespace("", "k"), router.namespaceHash(""), 0);
+    const open = try txn_table.begin(router.hashKeyWithNamespace("", "k"), router.namespaceHash(""));
     // Another shard's bits on a live counter, a counter never handed out,
     // and one dropped.
     const forged = [_]u64{ txn_mod.makeId(5, open & txn_mod.ID_COUNTER_MASK), txn_mod.makeId(0, 999), open };

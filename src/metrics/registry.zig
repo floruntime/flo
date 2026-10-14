@@ -570,6 +570,9 @@ pub const ShardMetrics = struct {
     /// Stream appends a read had to skip: in neither hot nor warm storage,
     /// or not a well-formed batch.
     stream_skipped_appends: Atomic(u64) = Atomic(u64).init(0),
+    /// KV transactions dropped for going unused too long: a client began
+    /// one and neither committed nor rolled it back.
+    kv_txns_reaped: Atomic(u64) = Atomic(u64).init(0),
     /// Client requests another shard did not answer by their deadline;
     /// clients still connected were told.
     cross_shard_timeouts: Atomic(u64) = Atomic(u64).init(0),
@@ -692,6 +695,10 @@ pub const ShardMetrics = struct {
         _ = self.stream_skipped_appends.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordKvTxnsReaped(self: *ShardMetrics, n: u64) void {
+        _ = self.kv_txns_reaped.fetchAdd(n, .monotonic);
+    }
+
     pub const Snapshot = struct {
         shard_id: u16,
         connections: u64,
@@ -708,6 +715,7 @@ pub const ShardMetrics = struct {
         replies_dropped: u64,
         handler_no_answer: u64,
         stream_skipped_appends: u64,
+        kv_txns_reaped: u64,
         cross_shard_timeouts: u64,
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
@@ -733,6 +741,7 @@ pub const ShardMetrics = struct {
             .replies_dropped = self.replies_dropped.load(.monotonic),
             .handler_no_answer = self.handler_no_answer.load(.monotonic),
             .stream_skipped_appends = self.stream_skipped_appends.load(.monotonic),
+            .kv_txns_reaped = self.kv_txns_reaped.load(.monotonic),
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
             .stamp_skew_ms = self.stamp_skew_ms.load(.monotonic),
@@ -1534,6 +1543,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });
+    try writer.print("flo_kv_txns_reaped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.kv_txns_reaped });
     inline for (ShardMetrics.PAUSE_REASONS, 0..) |reason, i| {
         try writer.print("flo_shard_connections_paused{{shard_id=\"{d}\",reason=\"" ++ reason ++ "\"}} {d}\n", .{ snap.shard_id, snap.connections_paused[i] });
     }

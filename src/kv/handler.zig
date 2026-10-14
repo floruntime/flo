@@ -699,9 +699,7 @@ pub const KVHandler = struct {
     fn txnBegin(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(TxnBeginResponse) {
         if (req.key.len == 0) return error.KeyEmpty;
         const pinned = router.hashKeyWithNamespace(req.namespace, req.key);
-        // Unowned: a stateless client opens a connection per command, so a
-        // transaction outlives the one that began it.
-        const id = shard.kv_handler.*.txn_table.begin(pinned, router.namespaceHash(req.namespace), 0) catch |err| return switch (err) {
+        const id = shard.kv_handler.*.txn_table.begin(pinned, router.namespaceHash(req.namespace)) catch |err| return switch (err) {
             error.TooManyOpenTxns => error.TooManyTransactions,
             error.OutOfMemory => error.Internal,
         };
@@ -894,10 +892,13 @@ pub const KVHandler = struct {
     /// Transaction `txn_id`, if it is open and was begun in `namespace`.
     /// Ids are small per-shard counters, so one begun in another namespace
     /// is not found from this one. One whose commit is in the log is closed.
+    /// Marks it used, so the idle reaper leaves it.
     fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
         const t = txn_table.get(txn_id) orelse return null;
         if (t.committing) return null;
-        return if (t.namespace_hash == router.namespaceHash(namespace)) t else null;
+        if (t.namespace_hash != router.namespaceHash(namespace)) return null;
+        t.last_active_ms = @import("stdx").time.monotonicMs();
+        return t;
     }
 
     // ── Sink put ─────────────────────────────────────────────────────────
