@@ -77,10 +77,7 @@ pub const SegmentReader = struct {
         errdefer allocator.free(buf);
 
         const read = try stdx.fs.readAll(file, buf);
-        if (read != file_size) {
-            allocator.free(buf);
-            return error.ShortRead;
-        }
+        if (read != file_size) return error.ShortRead;
 
         const reader = try init(buf);
         return .{ .reader = reader, .buf = buf };
@@ -362,4 +359,26 @@ test "reader: individual entry CRC still valid" {
 
     // Validate the entry's own CRC
     try results[0].validate();
+}
+
+test "reader: a truncated segment file is refused, its buffer freed once" {
+    var w = writer_mod.SegmentWriter.init(std.testing.allocator, 0);
+    defer w.deinit();
+    try w.addEntry(&makeTestEntry(1, "hello"));
+    try w.addEntry(&makeTestEntry(2, "world"));
+    const sealed = try w.seal();
+    defer std.testing.allocator.free(sealed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cut.flseg", .{dir});
+    defer std.testing.allocator.free(path);
+    // Cut off its footer: the file reads whole, and doesn't parse.
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{});
+    try @import("stdx").fs.writeAll(f, sealed[0 .. sealed.len - 8]);
+    @import("stdx").fs.closeFile(f);
+    // The testing allocator fails the test on a leak or a double free.
+    try std.testing.expect(std.meta.isError(SegmentReader.initFromFile(std.testing.allocator, path)));
 }
