@@ -3781,6 +3781,7 @@ pub const Shard = struct {
         while (it.next()) |e| {
             const fd = e.key_ptr.*;
             const conn = e.value_ptr.*;
+            self.refuseUnread(fd, conn);
             while (true) {
                 self.flushToClient(fd);
                 if (!conn.hasPendingWrites() or conn.closing or nowMs() >= give_up) break;
@@ -3790,6 +3791,40 @@ pub const Shard = struct {
             var unread: [4096]u8 = undefined;
             var rounds: u32 = 0;
             while (rounds < 64 and std.c.recv(fd, &unread, unread.len, std.c.MSG.DONTWAIT) > 0) : (rounds += 1) {}
+        }
+    }
+
+    /// Every complete request a connection sent that this shard never read,
+    /// in its read buffer (waiting for room, or behind a pause) or still in
+    /// the kernel's, is told it did not run, after the answers already
+    /// queued and in the order sent. Only binary requests are framed. The
+    /// walk stops at a partial request, at one that doesn't decode (a stray
+    /// byte run never answers an id the client didn't send), and before the
+    /// answers would overflow the write buffer, which would drop them all.
+    fn refuseUnread(self: *Shard, fd: i32, conn: *Connection) void {
+        if (conn.closing or conn.write_overflow) return;
+        var rounds: u32 = 0;
+        while (rounds < 64) : (rounds += 1) {
+            const room = @min(conn.read_buf.writable(), self.read_buf.len);
+            if (room == 0) break;
+            const n = std.c.recv(fd, self.read_buf.ptr, room, std.c.MSG.DONTWAIT);
+            if (n <= 0) break;
+            _ = conn.read_buf.write(self.read_buf[0..@intCast(n)]);
+        }
+        if (conn.protocol == .unknown) conn.detectAndSetProtocol();
+        if (conn.protocol != .binary) return;
+        const header_size = @sizeOf(proto.RequestHeader);
+        while (conn.read_buf.readable() >= header_size) {
+            var hb: [header_size]u8 = undefined;
+            _ = conn.read_buf.copyOut(&hb);
+            const header = std.mem.bytesToValue(proto.RequestHeader, &hb);
+            const total = header_size + @as(usize, header.payload_length);
+            if (total > self.parse_buf.len or conn.read_buf.readable() < total) return;
+            _ = conn.read_buf.copyOut(self.parse_buf[0..total]);
+            const req = proto.Request.parse(self.parse_buf[0..total]) catch return;
+            if (conn.write_buf.readable() + REFUSAL_FRAME_MAX > Connection.MAX_WRITE_BUFFER) return;
+            self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
+            conn.read_buf.consume(total);
         }
     }
 
@@ -4760,11 +4795,14 @@ pub const Shard = struct {
         self.sendRefusal(conn, request_id, status, proto.unclassified(status, msg));
     }
 
+    /// The most a refusal's frame takes: one too long is cut to fit.
+    pub const REFUSAL_FRAME_MAX = 1024;
+
     /// A refusal is always sent: one too long for its frame is cut, never
     /// dropped (a dropped one left the client the no-answer fallback).
     pub fn sendRefusal(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
         _ = self;
-        var buf: [1024]u8 = undefined;
+        var buf: [REFUSAL_FRAME_MAX]u8 = undefined;
         _ = conn.queueWrite(proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
@@ -4875,7 +4913,7 @@ pub const Shard = struct {
     }
 
     pub fn deliverDeferredRefusal(self: *Shard, reply_to: ReplyTo, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
-        var buf: [1024]u8 = undefined;
+        var buf: [REFUSAL_FRAME_MAX]u8 = undefined;
         self.deliverDeferred(reply_to, proto.Response.serializeRefusal(status, request_id, r, &buf));
     }
 
@@ -11775,4 +11813,129 @@ test "Shard: in a group of five, a removal acts on three of the four others" {
     try std.testing.expect(t.shard.removed_at_ms == null);
     removalNotice(&t.shard, 4, 1000, 9);
     try std.testing.expectEqual(@as(?u64, 1000), t.shard.removed_at_ms);
+}
+
+/// A one-shard node with one client, for what it answers as it stops.
+const StopTest = struct {
+    pipe: [2]std.posix.fd_t,
+    shard: Shard,
+    client: TestClient,
+
+    fn init(self: *StopTest) !void {
+        self.pipe = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        self.client = try TestClient.open(&self.shard);
+    }
+
+    fn deinit(self: *StopTest) void {
+        self.shard.deinit();
+        _ = std.c.close(self.client.pair[1]);
+        _ = std.c.close(self.pipe[0]);
+        _ = std.c.close(self.pipe[1]);
+    }
+
+    /// What the client sends, as it sends it, without the shard reading it.
+    fn send(self: *StopTest, bytes: []const u8) !void {
+        try std.testing.expectEqual(@as(isize, @intCast(bytes.len)), std.c.write(self.client.pair[1], bytes.ptr, bytes.len));
+    }
+
+    fn stop(self: *StopTest, out: []u8, answers: []proto.Response) !usize {
+        self.shard.shutdown();
+        try self.shard.run();
+        return answersUntilEnd(self.client.pair[1], out, answers);
+    }
+};
+
+fn expectNotRun(r: proto.Response, id: u64) !void {
+    try std.testing.expectEqual(id, r.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), r.header.status);
+    const told = try r.refused();
+    try std.testing.expectEqual(proto.Ran.no, told.ran);
+    try std.testing.expectEqualStrings(Shard.SHUTTING_DOWN_NOT_RUN, told.message);
+}
+
+test "Shard: requests a stopping shard never read are told they did not run, in the order sent, after what was already answered" {
+    var t: StopTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // An answer already queued, and a request held unread in the read buffer.
+    var ok_buf: [64]u8 = undefined;
+    _ = t.client.conn.queueWrite(proto.Response.serializeOk(1, "", &ok_buf) catch unreachable);
+    const held = try testRequest(.kv_put, 2, "k", "v");
+    defer std.testing.allocator.free(held);
+    _ = t.client.conn.read_buf.write(held);
+    // Three more in the kernel's buffer, then the start of a fourth.
+    for ([_]u64{ 3, 4, 5 }) |id| {
+        const req = try testRequest(.kv_put, id, "k", "v");
+        defer std.testing.allocator.free(req);
+        try t.send(req);
+    }
+    const partial = try testRequest(.kv_put, 6, "k", "v");
+    defer std.testing.allocator.free(partial);
+    try t.send(partial[0 .. partial.len - 3]);
+
+    var out: [4096]u8 = undefined;
+    var answers: [8]proto.Response = undefined;
+    const n = try t.stop(&out, &answers);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(@as(u64, 1), answers[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), answers[0].header.status);
+    for (answers[1..5], [_]u64{ 2, 3, 4, 5 }) |r, id| try expectNotRun(r, id);
+}
+
+test "Shard: a stopping shard answers no request past one that doesn't decode" {
+    var t: StopTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const good = try testRequest(.kv_put, 7, "k", "v");
+    defer std.testing.allocator.free(good);
+    try t.send(good);
+    // The same frame with one payload byte flipped: its checksum fails.
+    const bad = try testRequest(.kv_put, 8, "k", "v");
+    defer std.testing.allocator.free(bad);
+    bad[bad.len - 1] ^= 0xff;
+    try t.send(bad);
+    const after = try testRequest(.kv_put, 9, "k", "v");
+    defer std.testing.allocator.free(after);
+    try t.send(after);
+
+    var out: [2048]u8 = undefined;
+    var answers: [4]proto.Response = undefined;
+    const n = try t.stop(&out, &answers);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try expectNotRun(answers[0], 7);
+}
+
+test "Shard: a stopping shard reads no binary requests out of an HTTP connection" {
+    var t: StopTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // Known to be HTTP from its first bytes, already consumed: what follows
+    // is never framed as a binary request, even one that would decode.
+    t.client.conn.protocol = .http;
+    const req = try testRequest(.kv_put, 10, "k", "v");
+    defer std.testing.allocator.free(req);
+    try t.send(req);
+    var out: [1024]u8 = undefined;
+    var answers: [4]proto.Response = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try t.stop(&out, &answers));
+}
+
+test "Shard: a stopping shard stops answering unread requests before its write buffer would overflow" {
+    var t: StopTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const conn = t.client.conn;
+    const filler = try std.testing.allocator.alloc(u8, Connection.MAX_WRITE_BUFFER - 512);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 0);
+    try std.testing.expectEqual(filler.len, conn.queueWrite(filler));
+    const req = try testRequest(.kv_put, 11, "k", "v");
+    defer std.testing.allocator.free(req);
+    try t.send(req);
+    t.shard.refuseUnread(conn.fd, conn);
+    // Nothing queued, nothing overflowed, and the request is left as it was.
+    try std.testing.expectEqual(filler.len, conn.write_buf.readable());
+    try std.testing.expect(!conn.write_overflow);
+    try std.testing.expectEqual(req.len, conn.read_buf.readable());
 }
