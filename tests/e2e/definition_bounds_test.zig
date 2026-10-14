@@ -122,11 +122,13 @@ test "e2e/definitions: a stream source's partitions other than all are refused a
     }) |def| {
         var r = try submit(ctx, &.{ "processing", "submit" }, def, "parts.yaml");
         defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
         try testing.expect(r.contains("\"partitions\" must be all"));
         try alive(ctx);
     }
     var listed = try ctx.cli.run(&.{ "processing", "list" });
     defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
     try testing.expect(!listed.contains("ranged") and !listed.contains("listed"));
 }
 

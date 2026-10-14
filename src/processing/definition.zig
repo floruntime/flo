@@ -163,6 +163,12 @@ pub const SourceKind = enum(u8) {
 // SourceSpec — one logical source (Flo-Stream or Flo-TS)
 // =============================================================================
 
+/// Most sources, sinks and operators one job may declare. Every source runs
+/// its own pipeline, holding every operator and sink.
+pub const MAX_SOURCES: usize = 64;
+pub const MAX_SINKS: usize = 64;
+pub const MAX_OPERATORS: usize = 256;
+
 /// Specification for a source endpoint in the processing topology.
 ///
 /// A **stream** source reads every partition of its stream.

@@ -220,6 +220,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     if (try optArray(d, root, "sources")) |arr| {
         const list_mark = d.push("sources");
         defer d.pop(list_mark);
+        if (arr.len > job_definition.MAX_SOURCES) return d.fail(ParseError.InvalidFormat, "a job has at most {d} sources, not {d}", .{ job_definition.MAX_SOURCES, arr.len });
         for (arr, 0..) |item, idx| {
             const mark = d.pushIndex(idx);
             defer d.pop(mark);
@@ -230,6 +231,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     if (try optArray(d, root, "sinks")) |arr| {
         const list_mark = d.push("sinks");
         defer d.pop(list_mark);
+        if (arr.len > job_definition.MAX_SINKS) return d.fail(ParseError.InvalidFormat, "a job has at most {d} sinks, not {d}", .{ job_definition.MAX_SINKS, arr.len });
         for (arr, 0..) |item, idx| {
             const mark = d.pushIndex(idx);
             defer d.pop(mark);
@@ -240,6 +242,7 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     if (try optArray(d, root, "operators")) |arr| {
         const list_mark = d.push("operators");
         defer d.pop(list_mark);
+        if (arr.len > job_definition.MAX_OPERATORS) return d.fail(ParseError.InvalidFormat, "a job has at most {d} operators, not {d}", .{ job_definition.MAX_OPERATORS, arr.len });
         for (arr, 0..) |item, idx| {
             const mark = d.pushIndex(idx);
             defer d.pop(mark);
@@ -248,6 +251,14 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     }
 
     if (def.sources.items.len == 0) return d.fail(ParseError.MissingSource, "a job needs at least one source", .{});
+    for (def.sources.items, 0..) |a, i| {
+        if (a.kind != .stream) continue;
+        for (def.sources.items[0..i]) |b| {
+            if (b.kind == .stream and mem.eql(u8, a.stream, b.stream) and mem.eql(u8, a.namespace, b.namespace)) {
+                return d.fail(ParseError.InvalidFormat, "sources '{s}' and '{s}' both read stream '{s}' in namespace '{s}'; a job reads a stream once", .{ b.name, a.name, a.stream, a.namespace });
+            }
+        }
+    }
     if (def.sinks.items.len == 0) return d.fail(ParseError.MissingSink, "a job needs at least one sink", .{});
 
     return def;
@@ -2027,4 +2038,55 @@ test "parser: a filter or classify condition the operator can't evaluate is refu
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"valeu_contains:x\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"valeu_contains:x\": unknown condition at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\", \"condition\": \"\" } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"\": the condition is empty at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"not_empty\", \"tag\": \"a\" }, { \"condition\": \"json:amount>lots\", \"tag\": \"b\" } ] } ],", "", ""), ParseError.InvalidFieldType, "bad condition \"json:amount>lots\": a json: >, >=, < or <= needs a finite decimal number at operators[0].rules[1]");
+}
+
+test "parser: a job's sources, sinks and operators are capped" {
+    const allocator = std.testing.allocator;
+    const Case = struct { list: []const u8, item: []const u8, max: usize };
+    const src = "{{\"stream\":{{\"name\":\"s{d}\"}}}}";
+    const snk = "{{\"stream\":{{\"name\":\"o{d}\"}}}}";
+    const op = "{{\"type\":\"passthrough\",\"name\":\"p{d}\"}}";
+    inline for ([_]Case{
+        .{ .list = "sources", .item = src, .max = job_definition.MAX_SOURCES },
+        .{ .list = "sinks", .item = snk, .max = job_definition.MAX_SINKS },
+        .{ .list = "operators", .item = op, .max = job_definition.MAX_OPERATORS },
+    }) |c| {
+        for ([_]usize{ c.max, c.max + 1 }) |n| {
+            var text: std.Io.Writer.Allocating = .init(allocator);
+            defer text.deinit();
+            const w = &text.writer;
+            try w.writeAll("{\"kind\":\"Processing\"");
+            if (!mem.eql(u8, c.list, "sources")) try w.writeAll(",\"sources\":[{\"stream\":{\"name\":\"in\"}}]");
+            if (!mem.eql(u8, c.list, "sinks")) try w.writeAll(",\"sinks\":[{\"stream\":{\"name\":\"out\"}}]");
+            try w.print(",\"{s}\":[", .{c.list});
+            for (0..n) |i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print(c.item, .{i});
+            }
+            try w.writeAll("]}");
+            var diag: Diagnostic = .{};
+            if (n == c.max) {
+                var def = try parseJobDefinition(allocator, text.written(), &diag);
+                def.deinit(allocator);
+            } else {
+                try std.testing.expectError(error.InvalidFormat, parseJobDefinition(allocator, text.written(), &diag));
+                try std.testing.expect(mem.indexOf(u8, diag.message(), "a job has at most") != null);
+            }
+        }
+    }
+}
+
+test "parser: two sources may not read the same stream in one namespace" {
+    const allocator = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidFormat, parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"name":"a","stream":{"name":"in"}},{"name":"b","stream":{"name":"in"}}],"sinks":[{"stream":{"name":"out"}}]}
+    , &diag));
+    try std.testing.expect(mem.indexOf(u8, diag.message(), "a job reads a stream once") != null);
+
+    // The same stream in another namespace is another stream.
+    var def = try parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"name":"a","stream":{"name":"in"}},{"name":"b","stream":{"name":"in","namespace":"other"}}],"sinks":[{"stream":{"name":"out"}}]}
+    , null);
+    def.deinit(allocator);
 }
