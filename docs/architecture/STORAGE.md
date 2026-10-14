@@ -2,7 +2,7 @@
 
 > How Flo stores data, and why it works the way it does.
 
-This document is a companion to the [Architecture Overview](OVERVIEW.md). Where that document covers the full system — Acceptor, Shards, Dispatcher, clustering — this one zooms in on the storage layer: the Unified Append Log, projection engines, snapshots, memory management, and cold storage.
+This document is a companion to the [Architecture Overview](OVERVIEW.md). Where that document covers the full system — Acceptor, Shards, Dispatcher, clustering — this one zooms in on the storage layer: the Unified Append Log, projection engines, and snapshots.
 
 If you're trying to understand why a KV put eventually lands on disk, or how a queue's priority heap survives a crash, this is the right document.
 
@@ -13,7 +13,7 @@ If you're trying to understand why a KV put eventually lands on disk, or how a q
 - [Philosophy: The Log Is the Database](#philosophy-the-log-is-the-database)
 - [Unified Append Log (UAL)](#unified-append-log-ual)
   - [Entry Format](#entry-format)
-  - [Three-Tier Storage](#three-tier-storage)
+  - [Two-Tier Storage](#two-tier-storage)
   - [Segment Format](#segment-format)
 - [Projections](#projections)
   - [KV Projection](#kv-projection)
@@ -27,13 +27,6 @@ If you're trying to understand why a KV put eventually lands on disk, or how a q
   - [Lifecycle](#lifecycle)
   - [Crash Safety](#crash-safety)
 - [Recovery](#recovery)
-- [Memory Controller](#memory-controller)
-  - [Budget Allocation](#budget-allocation)
-  - [Backpressure](#backpressure)
-- [Cold Storage](#cold-storage)
-  - [Tiered Read Path](#tiered-read-path)
-  - [Backends](#backends)
-  - [Segment Lifecycle](#segment-lifecycle)
 - [Directory Layout](#directory-layout)
 - [What's Not Here Yet](#whats-not-here-yet)
 
@@ -54,8 +47,6 @@ This has a few consequences that might feel strange at first:
 1. **Stream data has no projection at all.** Stream reads go directly to the UAL. The log entries *are* the stream records — there's nothing to project.
 
 2. **Snapshots don't capture the log.** They capture projection state. On recovery, you load the snapshot (to skip replaying ancient history) and then replay recent log entries to bring projections up to date.
-
-3. **Cold storage is about log segments, not projection state.** When old log segments move to S3, the projections that were derived from those entries stay in memory (or get snapshotted). Cold reads are for historical data that's fallen out of all local tiers.
 
 ---
 
@@ -78,15 +69,13 @@ The `entry_type` field tells you what kind of mutation this is: `kv_put`, `queue
 
 Payload layout varies by entry type. For KV operations, the payload is a `CommandPayload` with key length, value length, namespace hash, and then the key and value bytes inline. For queue operations, it includes priority and delay metadata. The projections know how to parse their own payloads.
 
-### Three-Tier Storage
+### Two-Tier Storage
 
-Entries live in one of three places, depending on age:
+Entries live in one of two places, depending on age:
 
 **Hot tier** — an mmap'd ring buffer in RAM. This is where writes land. The ring has a fixed capacity (default 64 MB) and evicts the oldest entries when full. Recent reads — the common case — hit this tier. The ring buffer is the fastest path: O(1) by index, no syscalls, no copies.
 
 **Warm tier** — sealed disk segments (`.flseg` files). When entries age out of the hot ring, they've typically already been flushed to a segment file. These are memory-mapped for read access. The warm tier is bounded by local disk space and a configurable segment count.
-
-**Cold tier** — object storage (S3, Azure Blob, GCS, or local filesystem for testing). Segments that exceed the local retention policy get uploaded to cold storage. Reading from cold requires downloading the segment on demand — it's slow, but it's there for historical queries and disaster recovery.
 
 The warm tier also maintains an in-process `warm_store` hash map: when the hot ring evicts an entry, a copy of its payload is kept in the warm store so reads don't have to go to disk immediately. The warm store is bounded (default 32 MB) and evicts lowest-index entries first when over budget.
 
@@ -300,11 +289,7 @@ When a node restarts, each partition recovers in this order:
    ├─ Feed each entry through ProjectionRouter.apply()
    └─ Same code path as normal operation
 
-4. Load cold manifest (metadata only)
-   ├─ Read the cold segment inventory
-   └─ No data fetched — cold reads happen on demand
-
-5. Ready for traffic
+4. Ready for traffic
 ```
 
 Step 3 is identical to the normal write path — the projections don't know or care whether they're processing a live entry or a replayed one. The idempotency guard in the router (`applied_index`) ensures replaying an already-applied entry is a no-op.
@@ -315,115 +300,23 @@ If the UAL has been compacted and there's no snapshot covering the compacted ran
 
 ---
 
-## Memory Controller
-
-Each shard gets a fixed memory budget. The Memory Controller divides that budget among components and enforces limits with eviction and backpressure.
-
-### Budget Allocation
-
-Default split for a 2 GB shard:
-
-| Component | Share | Default Budget |
-|---|---|---|
-| UAL Hot Ring | 12.5% | 256 MB |
-| KV Projection | 37.5% | 768 MB |
-| Queue Projection | 6.25% | 128 MB |
-| TS Projection | 12.5% | 256 MB |
-| I/O Buffers | 6.25% | 128 MB |
-| Snapshot Buffer | 3.125% | 64 MB |
-| Warm Store | 6.25% | 128 MB |
-| **Reserve** | **15.625%** | **320 MB** |
-
-The KV projection gets the largest share because it typically holds the most in-memory state (hash table entries, version chains, TTL tracking). The reserve pool exists for short-term rebalancing — if one component temporarily needs more than its budget, it can borrow from the reserve.
-
-These percentages are defaults. Deployments that are queue-heavy or TS-heavy can adjust the split in configuration.
-
-### Backpressure
-
-When a component requests memory beyond its budget, the controller escalates through four levels:
-
-1. **Eviction** — ask the component to free memory (e.g., drop old MVCC versions, spill entries to disk). Each component registers an eviction callback. The controller targets 10% extra headroom beyond the immediate request.
-
-2. **Reserve borrow** — if eviction didn't free enough, borrow from the reserve pool. This is tracked and repaid as the component's usage drops.
-
-3. **Client backpressure** — if the reserve is exhausted, return `ShardMemoryPressure`. The shard propagates this to the client as a retriable error. Clients should back off and retry.
-
-4. **Hard reject** — if usage exceeds budget + reserve share, the write is rejected immediately. This is the last line of defense against OOM.
-
-The warm store has its own simpler budget enforcement: it evicts the lowest-index (oldest) entries when `warm_bytes_used` exceeds `warm_budget`. This runs inline on every `apply()`, so the warm store never grows unbounded.
-
----
-
-## Cold Storage
-
-### Tiered Read Path
-
-When a read arrives for a UAL index, the partition tries three tiers in order:
-
-1. **Hot ring** — O(1) lookup by index. If the entry is still in the ring buffer, return it. Zero copy.
-2. **Warm store** — hash map lookup. If the entry was evicted from hot but its payload was copied into the warm store, use that.
-3. **Cold** — download the segment containing this index from object storage, parse it, find the entry. Slow (network I/O), but the data is still accessible.
-
-Cold reads are on-demand. The cold manifest (a local metadata file listing which segments are in cold storage and what index ranges they cover) is loaded at startup, but no cold data is fetched until a read actually needs it. The system never blocks recovery on cold storage availability.
-
-### Backends
-
-Cold storage is accessed through a `ColdBackend` interface with five operations: upload, download, exists, delete, list. There are four implementations:
-
-- **FileBackend** — writes to local filesystem, useful for testing and single-node deployments
-- **S3Backend** — AWS S3 with SigV4 authentication
-- **AzureBackend** — Azure Blob Storage
-- **NoopBackend** — discards everything, for benchmarking without I/O
-
-The `ColdTierManager` sits above the backend and handles:
-
-- Segment upload (warm → cold transition)
-- Manifest tracking (which segments are cold, what their index ranges are)
-- On-demand download for cold reads
-- Manifest persistence to disk
-
-### Segment Lifecycle
-
-A UAL segment moves through tiers over its lifetime:
-
-```
-Hot (RAM ring buffer)
-  ↓  ring eviction
-Warm (disk .flseg + in-process warm_store)
-  ↓  retention policy / compaction trigger
-Cold (object storage)
-  ↓  retention expires
-Deleted
-```
-
-Compaction of warm segments is gated on snapshots: a segment can only be deleted if a persistent snapshot covers all entries in that segment. This ensures no data loss from premature compaction.
-
-Cold segments follow a configurable retention policy (e.g., keep 90 days). After retention expires, segment metadata is removed from the manifest and the object is deleted from storage.
-
----
-
 ## Directory Layout
 
 ```
-data/{shard_id}/
-├── uat/
-│   └── {partition_id}/
-│       ├── head.ual                    # Active write buffer
-│       ├── seg-{first_index}.flseg     # Sealed warm segments
-│       └── MANIFEST                    # Segment inventory
-├── snapshots/
-│   └── {partition_id}/
-│       ├── snap-{idx}-{ts}.fsnap       # Latest snapshot
-│       └── MANIFEST                    # Points to current snapshot
-├── ts/
-│   └── {partition_id}/
-│       └── col-{file_id}.floc          # Columnar TS block files
-├── cold/
-│   └── MANIFEST                        # Cold segment inventory
-└── raft_meta                           # 64 bytes: term, voted_for, node_id
+{data_dir}/
+├── flo.lock                    # Held while a server uses the directory
+├── SYSTEM                      # Shard and partition counts, checked at every boot
+├── 00000/                      # One directory per shard
+│   ├── MANIFEST                # Names the latest snapshot
+│   ├── HARDSTATE               # Raft term and vote
+│   ├── segs/
+│   │   └── 0000000001.flseg    # Sealed log segments, named by first index
+│   └── snaps/
+│       └── {index}-{ts}.fsnap  # Snapshots
+└── 00001/
 ```
 
-Each partition's data is fully independent. A shard can manage dozens of partitions without any cross-partition file contention.
+Each shard's files are its own: no two shards write the same file.
 
 ---
 

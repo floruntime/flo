@@ -1653,8 +1653,6 @@ pub const StreamHandler = struct {
                 return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 1 };
             }
         }
-        // Neither tier had it. Cold is not consulted here, so cold_hits stays 0
-        // for this path by design rather than for want of instrumentation.
         if (self.tiered_metrics) |tm| tm.recordMiss();
         return .{ .payload = "", .tier = 0 };
     }

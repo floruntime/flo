@@ -721,9 +721,7 @@ pub const Shard = struct {
             raft_node.hard_state_sink = .{ .ctx = @ptrCast(store), .persist = HardStateStore.persist };
 
             // ── Recovery from shard MANIFEST ────────────────────────────
-            // The MANIFEST is the single source of truth for:
-            //   - latest_snapshot: which .fsnap to load from snaps/
-            //   - cold_segments: what's been archived to object storage
+            // The MANIFEST names the latest snapshot to load from snaps/.
             var replay_from: u64 = 0;
 
             // A MANIFEST or snapshot that will not load is damage: a full
@@ -733,28 +731,12 @@ pub const Shard = struct {
                     var sm = sm_val;
                     defer sm.deinit(allocator);
 
-                    // Step 1: Load snapshot if referenced
                     if (sm.latest_snapshot) |snap_name| {
                         if (boot.cancelled()) return error.BootCancelled;
                         if (restoreSnapshot(allocator, snaps_dir_path, snap_name, partition)) |snap_index| {
                             replay_from = snap_index;
                         } else |err| {
                             boot_damage = silent_loss.Damage.init(.snapshot_unloadable, "snapshot {s} would not load ({s})", .{ snap_name, @errorName(err) });
-                        }
-                    }
-
-                    // Step 2: Load cold segment entries into partition
-                    if (partition.cold_tier) |ct| {
-                        for (sm.cold_segments.items) |seg| {
-                            ct.manifest.addEntry(.{
-                                .min_index = seg.min_index,
-                                .max_index = seg.max_index,
-                                .min_timestamp_ns = seg.min_ts,
-                                .max_timestamp_ns = seg.max_ts,
-                                .location = seg.location,
-                                .size_bytes = seg.size,
-                                .checksum = seg.crc,
-                            }) catch {};
                         }
                     }
                 }

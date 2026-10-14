@@ -215,7 +215,6 @@ const sections = [_]Section{
 const removed = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "auth", .why = "[auth] was removed: clients aren't authenticated yet. Remove the section, and keep the client port on a private interface." },
     .{ .name = "websocket", .why = "[websocket] was removed along with the WebSocket endpoint. Remove the section." },
-    .{ .name = "cold_storage", .why = "[cold_storage] isn't wired up: nothing reads it, so no data would move to cold storage. Remove the section." },
     .{ .name = "background_tasks", .why = "[background_tasks] was removed: namespace delete is refused, so there is no deletion task to tune. Remove the section." },
     .{ .name = "kv", .why = "[kv] expose_internal_keys was never read: internal keys stay hidden. Remove the section." },
     .{ .name = "storage.max_local_segments", .why = "[storage] max_local_segments isn't wired up: nothing reads it. Remove the line." },
