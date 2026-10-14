@@ -206,13 +206,16 @@ pub const Inbox = struct {
         return self.commit_tail.load(.seq_cst) -% self.read_tail;
     }
 
-    /// Returns the number of unread messages. Any thread may ask (the
-    /// metrics read it live): the tail is loaded first, since a drain
-    /// between the loads could take it past a commit loaded earlier.
+    /// Returns the number of unread messages, never more than the ring
+    /// holds. Any thread may ask (the metrics read it live). Off the
+    /// consumer's thread the two loads are a moment apart: the tail is
+    /// loaded first so a drain between them can't take it past the commit,
+    /// and the count is capped, since a reader held up between them can
+    /// see the consumer drain and the producers refill more than a ring.
     pub fn pending(self: *const Inbox) usize {
         const tail = @atomicLoad(usize, &self.read_tail, .acquire);
         const committed = self.commit_tail.load(.acquire);
-        return committed -% tail;
+        return @min(committed -% tail, self.capacity);
     }
 };
 
@@ -325,6 +328,20 @@ test "Inbox: multi-producer, single consumer" {
     for (per_shard) |count| {
         try std.testing.expectEqual(@as(usize, msgs_per_producer), count);
     }
+}
+
+test "Inbox: pending never reads more than the ring holds, whatever pair of cursors a reader sees" {
+    var inbox = try Inbox.init(std.testing.allocator, 16);
+    defer inbox.deinit();
+    // A reader held up between its loads: the commit more than a ring
+    // ahead of the tail it loaded, or a tail past the commit.
+    inbox.read_tail = 100;
+    inbox.commit_tail.store(100 + 3 * inbox.capacity, .seq_cst);
+    try std.testing.expectEqual(inbox.capacity, inbox.pending());
+    inbox.commit_tail.store(90, .seq_cst);
+    try std.testing.expectEqual(inbox.capacity, inbox.pending());
+    inbox.commit_tail.store(105, .seq_cst);
+    try std.testing.expectEqual(@as(usize, 5), inbox.pending());
 }
 
 test "Inbox: drain partial batch" {

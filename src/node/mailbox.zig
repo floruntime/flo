@@ -369,17 +369,15 @@ test "Mailbox: a sender has only its share of the inbox, gets it back as the con
     try std.testing.expectEqual(@as(u16, 0), mb.shares[0].unread.load(.seq_cst));
 }
 
-test "Mailbox: a sender with share left is never refused, and the inbox never reads more than it holds, however the senders and the consumer interleave" {
+test "Mailbox: a sender with share left is never refused, however the senders and the consumer interleave" {
     const mb = try Mailbox.create(std.testing.allocator, 1024, 16, 4);
     defer mb.destroy(std.testing.allocator);
 
     const Refusal = struct { unread: u16 = 0, pending: usize = 0 };
     const Producer = struct {
-        fn run(m: *Mailbox, from: u8, n: usize, refused: *std.atomic.Value(usize), last: *Refusal, overread: *std.atomic.Value(usize)) void {
+        fn run(m: *Mailbox, from: u8, n: usize, refused: *std.atomic.Value(usize), last: *Refusal) void {
             var i: usize = 0;
             while (i < n) {
-                // Read off the consumer's thread, as the metrics do.
-                if (m.inbox.pending() > m.inbox.capacity) _ = overread.fetchAdd(1, .seq_cst);
                 // As `Shard.forwardWait` then `forwardToShard`: only a
                 // sender with room sends, and only it raises its count.
                 if (!m.hasShare(from)) {
@@ -399,10 +397,9 @@ test "Mailbox: a sender with share left is never refused, and the inbox never re
     };
     const N: usize = 300_000;
     var refused = std.atomic.Value(usize).init(0);
-    var overread = std.atomic.Value(usize).init(0);
     var last: [3]Refusal = @splat(.{});
     var threads: [3]std.Thread = undefined;
-    for (&threads, 0..) |*t, k| t.* = try std.Thread.spawn(.{}, Producer.run, .{ mb, @as(u8, @intCast(k + 1)), N, &refused, &last[k], &overread });
+    for (&threads, 0..) |*t, k| t.* = try std.Thread.spawn(.{}, Producer.run, .{ mb, @as(u8, @intCast(k + 1)), N, &refused, &last[k] });
 
     var got: usize = 0;
     var batch: [64]inbox_mod.Message = undefined;
@@ -420,5 +417,4 @@ test "Mailbox: a sender with share left is never refused, and the inbox never re
     for (&threads) |*t| t.join();
     if (refused.load(.seq_cst) != 0) std.debug.print("refused {d}; last {any}\n", .{ refused.load(.seq_cst), last });
     try std.testing.expectEqual(@as(usize, 0), refused.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 0), overread.load(.seq_cst));
 }
