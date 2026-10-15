@@ -79,7 +79,7 @@ pub const TrimBound = union(enum) {
 pub const StreamIdGenerator = stream_id_mod.StreamIdGenerator;
 
 /// Default consumer-group ack timeout: a delivered-but-unacked entry idle this
-/// long is re-nacked by the background sweeper (made claimable again).
+/// long is made ready by the background sweeper: the group's next read serves it.
 pub const DEFAULT_ACK_TIMEOUT_MS: u32 = 30_000;
 /// Default max delivery attempts before the sweeper drops a poison entry.
 pub const DEFAULT_MAX_DELIVER: u8 = 10;
@@ -123,7 +123,9 @@ pub const PendingEntry = struct {
     delivery_count: u32,
     /// Nacked, or idle past the group's ack timeout: the group's next read
     /// serves it, to whichever consumer reads, before any new record.
-    ready: bool = false,
+    ready: Ready = .no,
+
+    pub const Ready = enum(u8) { no, nacked, expired };
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -572,8 +574,8 @@ pub const ConsumerGroup = struct {
     /// past this. In-memory only (not serialized / not recovered) — on restart
     /// it resets to MIN, so the first post-restart ack re-persists the floor.
     last_committed_floor: StreamID = StreamID.MIN,
-    /// Idle time (ms) after which the background sweeper re-nacks a pending
-    /// entry (makes it claimable again). 0 = sweeper disabled for this group.
+    /// Idle time (ms) after which the background sweeper makes a pending
+    /// entry ready for the group's next read. 0 = sweeper disabled for this group.
     /// Durable via cg_commit; set at group create or by
     /// stream_group_configure_sweeper.
     ack_timeout_ms: u32 = DEFAULT_ACK_TIMEOUT_MS,
@@ -751,7 +753,7 @@ pub const ConsumerGroup = struct {
             if (self.exhausted(pe)) {
                 self.dropEntry(key);
             } else {
-                pe.ready = true;
+                pe.ready = .nacked;
             }
             nacked += 1;
         }
@@ -779,7 +781,7 @@ pub const ConsumerGroup = struct {
         var it = self.pel.iterator();
         while (it.next()) |kv| {
             if (n >= out.len) break;
-            if (kv.value_ptr.ready) {
+            if (kv.value_ptr.ready != .no) {
                 out[n] = kv.value_ptr.id;
                 n += 1;
             }
@@ -791,7 +793,7 @@ pub const ConsumerGroup = struct {
     pub fn serveReady(self: *ConsumerGroup, consumer: []const u8, ids: []const StreamID, now_ms: u64) void {
         for (ids) |id| {
             const pe = self.pel.getPtr(id.order()) orelse continue;
-            if (!pe.ready) continue;
+            if (pe.ready == .no) continue;
             if (!std.mem.eql(u8, pe.consumer, consumer)) {
                 if (self.members.getPtr(pe.consumer)) |m| {
                     if (m.pending_count > 0) m.pending_count -= 1;
@@ -799,7 +801,7 @@ pub const ConsumerGroup = struct {
                 pe.consumer = self.internConsumer(consumer);
                 if (self.members.getPtr(consumer)) |m| m.pending_count += 1;
             }
-            pe.ready = false;
+            pe.ready = .no;
             pe.delivery_count += 1;
             pe.last_delivery_ms = now_ms;
         }
@@ -826,7 +828,7 @@ pub const ConsumerGroup = struct {
                     pe.consumer = self.internConsumer(new_consumer);
                     pe.last_delivery_ms = now_ms;
                     pe.delivery_count += 1;
-                    pe.ready = false;
+                    pe.ready = .no;
                     // Increment new consumer count
                     if (self.members.getPtr(new_consumer)) |m| {
                         m.pending_count += 1;
@@ -891,7 +893,7 @@ pub const ConsumerGroup = struct {
                 }
                 pe.last_delivery_ms = now_ms;
                 pe.delivery_count += 1;
-                pe.ready = false;
+                pe.ready = .no;
                 out[result_count] = pe.id;
                 result_count += 1;
             }
@@ -900,12 +902,16 @@ pub const ConsumerGroup = struct {
     }
 
     /// Touch pending entries — reset their idle timer.
-    pub fn touch(self: *ConsumerGroup, ids: []const StreamID, now_ms: u64) u32 {
+    /// Touch pending entries — reset their idle timer. An entry that went
+    /// ready by expiring goes back to the consumer touching it, if it is
+    /// that consumer's: it is still being worked on.
+    pub fn touch(self: *ConsumerGroup, ids: []const StreamID, consumer: []const u8, now_ms: u64) u32 {
         var touched: u32 = 0;
         for (ids) |id| {
             const key = id.order();
             if (self.pel.getPtr(key)) |pe| {
                 pe.last_delivery_ms = now_ms;
+                if (pe.ready == .expired and std.mem.eql(u8, pe.consumer, consumer)) pe.ready = .no;
                 touched += 1;
             }
         }
@@ -937,20 +943,30 @@ pub const ConsumerGroup = struct {
     pub fn configure(self: *ConsumerGroup, ack_timeout_ms: ?u32, max_deliver: ?u8) void {
         if (ack_timeout_ms) |v| self.ack_timeout_ms = v;
         if (max_deliver) |v| self.max_deliver = v;
+        // A ready entry already delivered as often as a lowered limit allows
+        // is dropped now, not served once more.
+        var i: usize = 0;
+        while (i < self.pel.count()) {
+            const pe = &self.pel.values()[i];
+            if (pe.ready != .no and self.exhausted(pe)) {
+                self.dropEntry(self.pel.keys()[i]);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Result of a sweeper pass over one group's PEL.
     pub const SweepResult = struct {
-        /// Entries re-nacked (idle ≥ ack_timeout_ms): made claimable, delivery_count bumped.
-        renacked: u32 = 0,
+        /// Entries idle ≥ ack_timeout_ms made ready for the group's next read.
+        made_ready: u32 = 0,
         /// Entries dropped from the PEL for exceeding max_deliver (poison).
         dropped: u32 = 0,
     };
 
     /// Background-sweeper pass: for each PEL entry idle ≥ `ack_timeout_ms`,
-    /// either drop it (delivery_count > max_deliver, poison guard) or re-nack
-    /// it — reset the idle timer and bump delivery_count so a subsequent
-    /// claim/redelivery picks it up. No-op when ack_timeout_ms == 0.
+    /// either drop it (delivered max_deliver times, poison guard) or make it
+    /// ready for the group's next read. No-op when ack_timeout_ms == 0.
     ///
     /// Dropped entries are removed with `fetchOrderedRemove` to preserve PEL
     /// ordering (autoclaim's cursor invariant). Returns counts.
@@ -974,10 +990,10 @@ pub const ConsumerGroup = struct {
                     drop_buf[drop_n] = kv.key_ptr.*;
                     drop_n += 1;
                 }
-            } else if (!pe.ready) {
+            } else if (pe.ready == .no) {
                 // Expired: the group's next read serves it.
-                pe.ready = true;
-                res.renacked += 1;
+                pe.ready = .expired;
+                res.made_ready += 1;
             }
         }
 
@@ -1474,9 +1490,9 @@ pub const StreamProjection = struct {
     }
 
     /// Touch (reset idle timer) for PEL entries.
-    pub fn groupTouch(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, now_ms: u64) !u32 {
+    pub fn groupTouch(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, now_ms: u64) !u32 {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.touch(ids, now_ms);
+        return group.touch(ids, consumer, now_ms);
     }
 
     /// Get pending entries for a consumer group (optionally filtered by consumer).
@@ -1526,7 +1542,7 @@ pub const StreamProjection = struct {
         var it = self.groups.iterator();
         while (it.next()) |kv| {
             const r = kv.value_ptr.sweep(now_ms);
-            total.renacked += r.renacked;
+            total.made_ready += r.made_ready;
             total.dropped += r.dropped;
         }
         return total;
@@ -2473,15 +2489,15 @@ test "stream: the sweeper makes an idle entry ready without counting a delivery,
 
     // Not yet idle enough → no-op.
     var r = s.sweepAllGroups(1100);
-    try testing.expectEqual(@as(u32, 0), r.renacked);
+    try testing.expectEqual(@as(u32, 0), r.made_ready);
     try testing.expectEqual(@as(u32, 0), r.dropped);
 
     // Idle ≥ 200ms → ready, not counted; a second pass changes nothing.
     r = s.sweepAllGroups(1400);
-    try testing.expectEqual(@as(u32, 1), r.renacked);
+    try testing.expectEqual(@as(u32, 1), r.made_ready);
     try testing.expectEqual(@as(u32, 1), try testDeliveryCount(&s, "g"));
     r = s.sweepAllGroups(1500);
-    try testing.expectEqual(@as(u32, 0), r.renacked);
+    try testing.expectEqual(@as(u32, 0), r.made_ready);
 
     // Served to another consumer (delivery 2), expires, served (3).
     try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "g", "c2", 1500));
@@ -2492,6 +2508,45 @@ test "stream: the sweeper makes an idle entry ready without counting a delivery,
     // Delivered max_deliver times and idle again → dropped.
     r = s.sweepAllGroups(2100);
     try testing.expectEqual(@as(u32, 1), r.dropped);
+    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
+}
+
+test "stream: a consumer touching an entry that expired keeps it, but not one it nacked or another's" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+    try s.configureGroup("g", 200, 5);
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
+    const ids = [_]StreamID{id1};
+    var ready: [4]StreamID = undefined;
+
+    _ = s.sweepAllGroups(1300);
+    _ = try s.groupTouch("g", &ids, "c2", 1350);
+    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ready));
+    _ = try s.groupTouch("g", &ids, "c1", 1400);
+    try testing.expectEqual(@as(usize, 0), try s.groupPeekReady("g", &ready));
+
+    _ = try s.groupNack("g", &ids);
+    _ = try s.groupTouch("g", &ids, "c1", 1500);
+    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ready));
+}
+
+test "stream: lowering max_deliver drops a ready entry already delivered that often" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+    try s.configureGroup("g", 200, 5);
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
+    _ = try s.groupNack("g", &[_]StreamID{id1});
+    try s.configureGroup("g", null, 1);
     try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
 }
 
@@ -2526,7 +2581,7 @@ test "stream: sweeper disabled when ack_timeout_ms is 0" {
     _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
 
     const r = s.sweepAllGroups(1_000_000);
-    try testing.expectEqual(@as(u32, 0), r.renacked);
+    try testing.expectEqual(@as(u32, 0), r.made_ready);
     try testing.expectEqual(@as(u32, 0), r.dropped);
     try testing.expectEqual(@as(usize, 1), try s.groupPelCount("g"));
 }
@@ -2602,7 +2657,7 @@ test "stream: groupTouch resets idle timer" {
 
     // Touch at t=5000
     const ids = [_]StreamID{id1};
-    const touched = try s.groupTouch("mygroup", &ids, 5000);
+    const touched = try s.groupTouch("mygroup", &ids, "c1", 5000);
     try testing.expectEqual(@as(u32, 1), touched);
 
     // Verify last_delivery_ms updated via getPending

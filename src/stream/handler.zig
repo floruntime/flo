@@ -1143,12 +1143,19 @@ pub const StreamHandler = struct {
         };
         // Only appends the reply carries are delivered; the cursor passes the
         // rest too, or the next read would meet them again.
+        // A ready entry whose payload can't be read can never be sent:
+        // dropped with the trimmed ones, or it would lead every read.
         var served: [MAX_READ_BATCH]StreamID = undefined;
         var served_n: usize = 0;
-        for (buf[0..found], readable[0..found]) |rec, ok| if (ok) {
-            served[served_n] = rec.id;
-            served_n += 1;
-        };
+        for (buf[0..found], readable[0..found]) |rec, ok| {
+            if (ok) {
+                served[served_n] = rec.id;
+                served_n += 1;
+            } else {
+                gone[gone_n] = rec.id;
+                gone_n += 1;
+            }
+        }
         var sent: [MAX_READ_BATCH]StreamRecord = undefined;
         var sent_n: usize = 0;
         for (buf[found..count], readable[found..count]) |rec, ok| if (ok) {
@@ -1412,7 +1419,7 @@ pub const StreamHandler = struct {
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
-        _ = reader.readLengthPrefixed(u16); // consumer
+        const consumer = reader.readLengthPrefixed(u16) orelse "";
 
         // Read StreamIDs to touch
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1431,7 +1438,7 @@ pub const StreamHandler = struct {
         const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         var touched_count: u32 = 0;
         if (id_count > 0) {
-            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], now_ms) catch |err| {
+            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], consumer, now_ms) catch |err| {
                 return switch (err) {
                     error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
                 };
@@ -2542,6 +2549,44 @@ test "stream handler: a group read that can't build its answer leaves nothing pe
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "stream handler: a ready entry that can't be read is dropped, not left to lead every read" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // An append the projection knows but whose payload is in no tier, then
+    // one that reads.
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
+
+    // The lost append is pending and ready, as if delivered before it was lost.
+    var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group = resolveGroupName(&q_buf, "default", "s1", "cg1").?;
+    var rec: [1]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 1), handler.stream.readStreamByIds(h, &.{lost}, &rec));
+    try handler.stream.groupDeliverRecords(group, "c1", &rec, lost, 1);
+    _ = try handler.stream.groupNack(group, &.{lost});
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU32(.count, 1);
+    for (0..2) |_| {
+        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), b.getOptions()));
+        handler.freeResult(r);
+    }
+    // The first read dropped it; the second served the readable one.
+    var pel: [4]PendingEntry = undefined;
+    const n = try handler.stream.groupPending(group, null, &pel);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(!pel[0].id.eql(lost));
 }
 
 test "stream handler: read honors count" {

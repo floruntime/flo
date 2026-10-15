@@ -3636,7 +3636,7 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
-        // Consumer-group PEL sweeper — runs every 1 second. Re-nacks
+        // Consumer-group PEL sweeper — runs every 1 second. Makes ready
         // pending entries idle past their group's ack_timeout_ms and drops
         // poison entries past max_deliver. Local in-memory PEL mutation only
         // (PEL is not persisted), so no Raft round-trip.
@@ -3749,15 +3749,15 @@ pub const Shard = struct {
     }
 
     /// TaskScheduler callback: sweep every consumer group's PEL.
-    /// Re-nacks entries idle past ack_timeout_ms and drops poison entries
-    /// past max_deliver. Returns renacked + dropped for scheduler accounting.
+    /// Makes entries idle past ack_timeout_ms ready for their group's next
+    /// read and drops ones past max_deliver. Returns how many it changed.
     fn streamGroupSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const proj = self.stream_handler.stream;
         const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
         const r = proj.sweepAllGroups(now_ms);
-        if (r.renacked > 0) self.waiter_pool.notifyAny(.stream_group_read, wakeGroupReadWaiter, @ptrCast(self));
-        return @as(u64, r.renacked) + @as(u64, r.dropped);
+        if (r.made_ready > 0) self.waiter_pool.notifyAny(.stream_group_read, wakeGroupReadWaiter, @ptrCast(self));
+        return @as(u64, r.made_ready) + @as(u64, r.dropped);
     }
 
     // ─── Event processing ────────────────────────────────────────────────
