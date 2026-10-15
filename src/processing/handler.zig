@@ -1354,7 +1354,7 @@ pub const ProcessingHandler = struct {
                 sc.ts_tag_keys = try serializeFlatPairs(allocator, snk.ts_tag_keys);
                 sc.ts_field_keys = try serializeFlatPairs(allocator, snk.ts_field_keys);
                 sc.kv_key_prefix = try allocator.dupe(u8, snk.key_prefix);
-                sc.kv_separator = try allocator.dupe(u8, if (snk.separator.len > 0) snk.separator else ":");
+                sc.kv_separator = try allocator.dupe(u8, snk.separator);
             }
         }
         pipe.src_measurement = try allocator.dupe(u8, src.ts_measurement);
@@ -2316,8 +2316,8 @@ test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server
 test "ProcessingHandler: a pipeline's copied config is freed once, and a build out of memory frees what it copied" {
     const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "app", .batch_size = 0, .ts_measurement = "cpu", .ts_field = "v" };
     const sinks = [_]definition.SinkSpec{
-        .{ .name = "k", .kind = .kv, .target = "", .namespace = "app", .key_prefix = "user", .separator = "-", .write_mode = "upsert", .ttl_ms = null, .priority = 0 },
-        .{ .name = "t", .kind = .ts, .target = "", .namespace = "", .key_prefix = "", .separator = "", .write_mode = "upsert", .ttl_ms = null, .priority = 0, .ts_measurement = "m", .ts_tag_keys = &.{ "host", "h" }, .ts_field_keys = &.{ "load", "l" } },
+        .{ .name = "k", .kind = .kv, .target = "", .namespace = "app", .key_prefix = "user", .separator = "-", .ttl_ms = null, .priority = 0 },
+        .{ .name = "t", .kind = .ts, .target = "", .namespace = "", .key_prefix = "", .separator = "", .ttl_ms = null, .priority = 0, .ts_measurement = "m", .ts_tag_keys = &.{ "host", "h" }, .ts_field_keys = &.{ "load", "l" } },
     };
     const Build = struct {
         fn run(allocator: Allocator, s: *const definition.SourceSpec, k: []const definition.SinkSpec) !void {
@@ -2325,7 +2325,7 @@ test "ProcessingHandler: a pipeline's copied config is freed once, and a build o
             defer ProcessingHandler.freePipeStateFields(allocator, &pipe);
             try std.testing.expectEqualStrings("user", pipe.sinks[0].kv_key_prefix);
             try std.testing.expectEqualStrings("-", pipe.sinks[0].kv_separator);
-            try std.testing.expectEqualStrings(":", pipe.sinks[1].kv_separator);
+            try std.testing.expectEqualStrings("", pipe.sinks[1].kv_separator);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Build.run, .{ &src, &sinks });
