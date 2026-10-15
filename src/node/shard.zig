@@ -691,6 +691,8 @@ pub const Shard = struct {
         const processing_handler = try allocator.create(ProcessingHandler);
         errdefer allocator.destroy(processing_handler);
         processing_handler.* = ProcessingHandler.init(allocator);
+        // Set before the log replays: whether a stored job starts depends on it.
+        processing_handler.peer_shard_count = shard_count;
 
         // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);

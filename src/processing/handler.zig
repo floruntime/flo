@@ -104,9 +104,10 @@ pub const ProcessingHandler = struct {
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
 
-    /// Cross-shard KV handlers — one per shard, wired by Runtime.
-    /// Enables KV lookup operators and KV sinks to reach keys on any shard.
+    /// KV handlers — one per shard, wired by Runtime.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
+    /// The shard this handler runs on; kv_lookup reads only its KV.
+    own_shard: u16 = 0,
 
     /// Cross-shard TS / queue handlers — one per shard, wired by Runtime.
     /// Enables TS and queue sinks to write to the shard that owns the target
@@ -280,8 +281,9 @@ pub const ProcessingHandler = struct {
 
     /// Wire cross-shard KV handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
+    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler, own_shard: u16) void {
         self.peer_kv_handlers = handlers;
+        self.own_shard = own_shard;
     }
 
     /// Wire cross-shard TS handler references (for TS sinks).
@@ -511,6 +513,10 @@ pub const ProcessingHandler = struct {
         const home = if (req.namespace.len > 0) req.namespace else "default";
         var why_buf: [256]u8 = undefined;
         if (def.homeRefusal(home, &why_buf)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
@@ -1135,6 +1141,11 @@ pub const ProcessingHandler = struct {
     /// deep-copies everything it retains, so the caller may free `def` after.
     fn startPipelines(self: *ProcessingHandler, job_id: []const u8, def: *definition.JobDefinition) void {
         if (def.sinks.items.len == 0) return;
+        // A stored job meets the shard count the server restarted with.
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
+            log.err("processing job {s} not started: {s}", .{ job_id, why });
+            return;
+        }
 
         // Build tag registry from all sinks and classify operators.
         // Heap-allocated so classify operators can reference it during creation.
@@ -1253,7 +1264,6 @@ pub const ProcessingHandler = struct {
                 self.allocator.free(ops);
                 return;
             };
-            // Wire kv_lookup operators to route across all shards' KV projections
             if (result.backing == .kv_lookup) {
                 result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(self));
             }
@@ -1277,41 +1287,18 @@ pub const ProcessingHandler = struct {
         };
     }
 
-    /// KV lookup callback passed to KvLookupOperator.
-    /// Routes the lookup to the correct shard's KV projection via cross-shard peer handlers.
+    /// KV lookup callback passed to KvLookupOperator. It reads this shard's
+    /// KV on this shard's thread. A job with a lookup is refused on a server
+    /// of more than one shard, so this KV is all there is.
     fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
+        const handlers = self.peer_kv_handlers orelse return null;
+        if (self.own_shard >= handlers.len) return null;
         const ns_handler = @import("../namespace/handler.zig");
         var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
-
-        log.debug("shardKvLookup: ns='{s}' key='{s}' qkey='{s}' has_peers={} pc={d} sc={d}", .{
-            namespace,                     key,                       qkey,
-            self.peer_kv_handlers != null, self.peer_partition_count, self.peer_shard_count,
-        });
-
-        // Route to the correct shard using the same hash as the KV dispatcher
-        if (self.peer_kv_handlers) |handlers| {
-            if (self.peer_partition_count > 0 and self.peer_shard_count > 0) {
-                const hash = router.hashKeyWithNamespace(namespace, key);
-                const partition_id: u32 = @intCast(hash % self.peer_partition_count);
-                const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
-                log.debug("shardKvLookup: hash={d} part={d} shard={d} nhandlers={d}", .{
-                    hash, partition_id, shard_id, handlers.len,
-                });
-                if (shard_id < handlers.len) {
-                    const entry = handlers[shard_id].*.kv.get(qkey) orelse {
-                        log.debug("shardKvLookup: NOT FOUND on shard {d}", .{shard_id});
-                        return null;
-                    };
-                    log.debug("shardKvLookup: FOUND val_len={d}", .{entry.value.len});
-                    return entry.value;
-                }
-            }
-        }
-
-        log.debug("shardKvLookup: NO PEERS, returning null", .{});
-        return null;
+        const entry = handlers[self.own_shard].*.kv.get(qkey) orelse return null;
+        return entry.value;
     }
 
     /// Helper to build a PipelineState with source/sink config (no operators).
@@ -2215,5 +2202,72 @@ test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
     for ([_][]const u8{ "", "k", "another-key" }) |key| {
         req.key = key;
         try std.testing.expectEqual(@as(?u64, 0), ProcessingHandler.preRouteByProcessing(req));
+    }
+}
+
+test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key hashes to" {
+    const allocator = std.testing.allocator;
+    const KVProjection = @import("../projection/kv.zig").KVProjection;
+    var kv0 = KVProjection.init(allocator, 0);
+    defer kv0.deinit();
+    var kv1 = KVProjection.init(allocator, 0);
+    defer kv1.deinit();
+    var h0 = kv_handler_mod.KVHandler.init(allocator, &kv0);
+    var h1 = kv_handler_mod.KVHandler.init(allocator, &kv1);
+    const peers = [_]*kv_handler_mod.KVHandler{ &h0, &h1 };
+
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    handler.peer_partition_count = 8;
+    handler.peer_shard_count = 2;
+    handler.setPeerKvHandlers(&peers, 0);
+
+    // A key whose hash names shard 1, written here (as a routing key does).
+    var elsewhere: []const u8 = "";
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" }) |c| {
+        if (handler.peerShardId("default", c) == 1) elsewhere = c;
+    }
+    try std.testing.expect(elsewhere.len > 0);
+    const ns_handler = @import("../namespace/handler.zig");
+    var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
+    try kv0.put(try ns_handler.qualifyKey(&qbuf, "default", elsewhere), "here", 1, 1, 0, 0);
+    try kv1.put(try ns_handler.qualifyKey(&qbuf, "default", "only-there"), "there", 1, 1, 0, 0);
+
+    try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
+    try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);
+}
+
+test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server of more than one shard" {
+    const yaml =
+        \\kind: Processing
+        \\name: lookup
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: l
+        \\    lookup_key: k
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    {
+        var handler = ProcessingHandler.init(std.testing.allocator);
+        defer handler.deinit();
+        handler.peer_shard_count = 2;
+        // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
+        var value: [512]u8 = undefined;
+        value[0] = @backingInt(ProcessingHandler.JobStatus.running);
+        std.mem.writeInt(u32, value[1..5], 1, .little);
+        std.mem.writeInt(u32, value[5..9], 0, .little);
+        std.mem.writeInt(u16, value[9..11], 7, .little);
+        @memcpy(value[11..18], "default");
+        @memcpy(value[18 .. 18 + yaml.len], yaml);
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", value[0 .. 18 + yaml.len], 1));
+        try std.testing.expect(handler.jobs.contains("job-1"));
+        try std.testing.expect(!handler.pipelines.contains("job-1"));
     }
 }

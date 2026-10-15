@@ -874,8 +874,7 @@ pub const Runtime = struct {
         }
     }
 
-    /// Wire cross-shard KV handler references so processing pipelines'
-    /// KV lookup operators and KV sinks can reach keys on any shard.
+    /// Wire every shard's KV handler into each processing handler.
     fn wirePeerKvHandlers(self: *Runtime, shards: []Shard) !void {
         const n = self.shard_count;
         const handlers = try self.allocator.alloc(*KVHandler, n);
@@ -885,7 +884,7 @@ pub const Runtime = struct {
         self.peer_kv_handlers_slice = handlers;
 
         for (0..n) |i| {
-            shards[i].processing_handler.setPeerKvHandlers(handlers);
+            shards[i].processing_handler.setPeerKvHandlers(handlers, shards[i].id);
         }
     }
 

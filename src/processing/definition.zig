@@ -410,6 +410,16 @@ pub const JobDefinition = struct {
         return null;
     }
 
+    /// Why this job cannot run on a server of `shard_count` shards, or null.
+    /// A `kv_lookup` reads only the KV of the shard the job runs on.
+    pub fn shardRefusal(self: *const JobDefinition, shard_count: u16) ?[]const u8 {
+        if (shard_count <= 1) return null;
+        for (self.operators.items) |op| {
+            if (std.mem.eql(u8, op.type_name, "kv_lookup")) return "kv_lookup needs a one-shard server (--shards 1) until lookups can read other shards";
+        }
+        return null;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);
@@ -526,4 +536,21 @@ test "TagRegistry: capacity limit" {
     }
     // 33rd tag should fail
     try std.testing.expect(reg.getOrCreate("overflow") == null);
+}
+
+test "JobDefinition: kv_lookup is refused on a server of more than one shard" {
+    const parser = @import("parser.zig");
+    const allocator = std.testing.allocator;
+    var with = try parser.parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"out"}}],
+        \\ "operators":[{"type":"kv_lookup","name":"l","lookup_key":"k"}]}
+    , null);
+    defer with.deinit(allocator);
+    var without = try parser.parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"out"}}]}
+    , null);
+    defer without.deinit(allocator);
+    try std.testing.expect(with.shardRefusal(1) == null);
+    try std.testing.expect(std.mem.indexOf(u8, with.shardRefusal(2).?, "--shards 1") != null);
+    try std.testing.expect(without.shardRefusal(2) == null);
 }
