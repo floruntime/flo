@@ -113,7 +113,7 @@ pub fn checkKeys(d: *Diagnostic, obj: JsonValue, comptime allowed: []const []con
 pub fn failDuplicateKey(allocator: std.mem.Allocator, d: *Diagnostic, json: []const u8, err: anytype) @TypeOf(err) {
     var scanner = std.json.Scanner.initCompleteInput(allocator, json);
     defer scanner.deinit();
-    walkForDuplicate(allocator, d, &scanner) catch |e| switch (e) {
+    walkForDuplicate(allocator, d, &scanner, 0) catch |e| switch (e) {
         error.Duplicate => return err,
         else => {},
     };
@@ -122,13 +122,17 @@ pub fn failDuplicateKey(allocator: std.mem.Allocator, d: *Diagnostic, json: []co
 
 const WalkError = error{ Duplicate, Invalid, OutOfMemory };
 
+/// Deepest nesting the walk follows; past it the duplicate goes unnamed.
+const MAX_WALK_DEPTH: usize = 64;
+
 /// Walks one value starting at the scanner's next token.
-fn walkForDuplicate(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Scanner) WalkError!void {
+fn walkForDuplicate(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Scanner, depth: usize) WalkError!void {
     const tok = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.Invalid;
-    try walkValue(allocator, d, scanner, tok);
+    try walkValue(allocator, d, scanner, tok, depth);
 }
 
-fn walkValue(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Scanner, tok: std.json.Token) WalkError!void {
+fn walkValue(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Scanner, tok: std.json.Token, depth: usize) WalkError!void {
+    if ((tok == .object_begin or tok == .array_begin) and depth >= MAX_WALK_DEPTH) return error.Invalid;
     switch (tok) {
         .object_begin => {
             var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -150,7 +154,7 @@ fn walkValue(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Sc
                 }
                 try seen.put(allocator, key, {});
                 const mark = d.push(key);
-                try walkForDuplicate(allocator, d, scanner);
+                try walkForDuplicate(allocator, d, scanner, depth + 1);
                 d.pop(mark);
             }
         },
@@ -160,7 +164,7 @@ fn walkValue(allocator: std.mem.Allocator, d: *Diagnostic, scanner: *std.json.Sc
                 const t = scanner.nextAlloc(allocator, .alloc_if_needed) catch return error.Invalid;
                 if (t == .array_end) return;
                 const mark = d.pushIndex(i);
-                try walkValue(allocator, d, scanner, t);
+                try walkValue(allocator, d, scanner, t, depth + 1);
                 d.pop(mark);
             }
         },
@@ -207,4 +211,16 @@ test "failDuplicateKey names the key and where" {
     ;
     try std.testing.expectEqual(error.Dup, failDuplicateKey(allocator, &d, json, error.Dup));
     try std.testing.expectEqualStrings("key \"run\" appears twice at start", d.message());
+}
+
+test "failDuplicateKey: a deeply nested document is walked only so deep" {
+    const allocator = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (0..60_000) |_| try text.appendSlice(allocator, "{\"a\":");
+    try text.appendSlice(allocator, "{\"k\":1,\"k\":2}");
+    for (0..60_000) |_| try text.append(allocator, '}');
+    var d: Diagnostic = .{};
+    try std.testing.expectEqual(error.Dup, failDuplicateKey(allocator, &d, text.items, error.Dup));
+    try std.testing.expect(std.mem.indexOf(u8, d.message(), "a key appears twice") != null);
 }

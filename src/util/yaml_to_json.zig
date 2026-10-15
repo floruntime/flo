@@ -24,7 +24,12 @@ pub const ConvertError = error{
     UnexpectedToken,
     OutOfMemory,
     InvalidFormat,
+    /// Maps and sequences nested deeper than `MAX_DEPTH`.
+    NestingTooDeep,
 };
+
+/// Deepest nesting of maps and sequences a document may have.
+pub const MAX_DEPTH: usize = 64;
 
 /// Convert YAML content to JSON
 pub fn convert(allocator: Allocator, yaml: []const u8) ConvertError![]const u8 {
@@ -43,6 +48,7 @@ const Converter = struct {
     allocator: Allocator,
     output: std.ArrayList(u8),
     lines: std.ArrayList(Line),
+    depth: usize = 0,
 
     fn init(allocator: Allocator) Converter {
         return .{
@@ -92,7 +98,15 @@ const Converter = struct {
         return self.output.toOwnedSlice(self.allocator) catch return ConvertError.OutOfMemory;
     }
 
+    /// Each map and sequence is one level, so the recursion is bounded.
+    fn enter(self: *Converter) ConvertError!void {
+        if (self.depth >= MAX_DEPTH) return ConvertError.NestingTooDeep;
+        self.depth += 1;
+    }
+
     fn processObject(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -157,6 +171,8 @@ const Converter = struct {
     }
 
     fn processArray(self: *Converter, start: usize, base_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
         var i = start;
@@ -222,6 +238,8 @@ const Converter = struct {
     /// Process an array item that starts an object on the same line
     /// e.g., "- name: value" followed by more properties
     fn processArrayItemObject(self: *Converter, start: usize, array_indent: usize) ConvertError!usize {
+        try self.enter();
+        defer self.depth -= 1;
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
         const line = self.lines.items[start];
@@ -346,8 +364,12 @@ const Converter = struct {
                         if (inner[k] == '\'' and k + 1 < inner.len and inner[k + 1] == '\'') k += 1;
                     }
                     try self.writeString(buf.items);
-                } else {
+                } else if (std.json.validate(self.allocator, trimmed) catch return ConvertError.OutOfMemory) {
+                    // One JSON string: its escapes are JSON's.
                     self.output.appendSlice(self.allocator, trimmed) catch return ConvertError.OutOfMemory;
+                } else {
+                    // Not one JSON string: its content, as a string.
+                    try self.writeString(trimmed[1 .. trimmed.len - 1]);
                 }
                 return;
             }
@@ -391,6 +413,8 @@ const Converter = struct {
 
     /// Convert a YAML flow sequence `[item1, item2, ...]` to a JSON array.
     fn writeFlowSequence(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '[') catch return ConvertError.OutOfMemory;
 
@@ -422,6 +446,8 @@ const Converter = struct {
     /// Values are recursively converted, so nested flow maps/sequences and scalars
     /// all work (e.g. `{ name: events }`, `{ a: { b: c }, d: [1, 2] }`).
     fn writeFlowMapping(self: *Converter, value: []const u8) ConvertError!void {
+        try self.enter();
+        defer self.depth -= 1;
         const inner = mem.trim(u8, value[1 .. value.len - 1], " \t");
         self.output.append(self.allocator, '{') catch return ConvertError.OutOfMemory;
 
@@ -541,6 +567,11 @@ const Converter = struct {
                 },
                 '\t' => {
                     self.output.appendSlice(self.allocator, "\\t") catch return ConvertError.OutOfMemory;
+                },
+                0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                    var esc: [6]u8 = undefined;
+                    _ = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                    self.output.appendSlice(self.allocator, &esc) catch return ConvertError.OutOfMemory;
                 },
                 else => {
                     self.output.append(self.allocator, c) catch return ConvertError.OutOfMemory;
@@ -834,4 +865,105 @@ test "yaml_to_json: comments on list items and flow values" {
         \\msg: don't retry  # why
         \\say: he said "hi"  # quoted inside
     , "{\"items\":[\"one\",{\"name\":\"two\"},{\"name\":\"three\"}],\"flow\":[\"a\",\"b\"],\"url\":\"http://x/#frag\",\"msg\":\"don't retry\",\"say\":\"he said \\\"hi\\\"\"}");
+}
+
+test "yaml_to_json: nesting is limited to MAX_DEPTH levels" {
+    const allocator = std.testing.allocator;
+    // Flow sequences and mappings, MAX_DEPTH deep and one deeper, and very deep.
+    for ([_]usize{ MAX_DEPTH - 1, MAX_DEPTH, 60_000 }) |levels| {
+        for ([_][2]u8{ .{ '[', ']' }, .{ '{', '}' } }) |br| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try text.appendSlice(allocator, "a: ");
+            for (0..levels) |i| {
+                if (br[0] == '{' and i > 0) try text.appendSlice(allocator, "k: ");
+                try text.append(allocator, br[0]);
+            }
+            for (0..levels) |_| try text.append(allocator, br[1]);
+            // The top-level map is one level.
+            if (levels + 1 <= MAX_DEPTH) {
+                allocator.free(try convert(allocator, text.items));
+            } else {
+                try std.testing.expectError(ConvertError.NestingTooDeep, convert(allocator, text.items));
+            }
+        }
+    }
+    // Maps nested by indentation.
+    for ([_]usize{ MAX_DEPTH, MAX_DEPTH + 1 }) |levels| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
+        for (0..levels) |i| {
+            for (0..i) |_| try text.append(allocator, ' ');
+            try text.appendSlice(allocator, if (i + 1 == levels) "k: v\n" else "k:\n");
+        }
+        if (levels <= MAX_DEPTH) {
+            allocator.free(try convert(allocator, text.items));
+        } else {
+            try std.testing.expectError(ConvertError.NestingTooDeep, convert(allocator, text.items));
+        }
+    }
+}
+
+test "yaml_to_json: a double-quoted value becomes one JSON string" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "k: \"a\\nb\"", "{\"k\":\"a\\nb\"}" },
+        .{ "k: \"a\",\"x\":[[1]],\"b\":\"c\"", "{\"k\":\"a\\\",\\\"x\\\":[[1]],\\\"b\\\":\\\"c\"}" },
+        .{ "k: \"tab\there\"", "{\"k\":\"tab\\there\"}" },
+    };
+    for (cases) |c| {
+        const out = try convert(allocator, c[0]);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c[1], out);
+        try std.testing.expect(try std.json.validate(allocator, out));
+    }
+
+    // Text that would nest 1,000 levels stays inside the string.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "k: \"a\",\"x\":");
+    try text.appendNTimes(allocator, '[', 1000);
+    try text.appendNTimes(allocator, ']', 1000);
+    try text.appendSlice(allocator, ",\"b\":\"c\"");
+    const out = try convert(allocator, text.items);
+    defer allocator.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try std.testing.expect(parsed.value.object.get("k").? == .string);
+}
+
+test "yaml_to_json: block sequences nest at most MAX_DEPTH levels" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ MAX_DEPTH, MAX_DEPTH + 1 }) |levels| {
+        // `-` under `-`: one sequence a level.
+        var seqs: std.ArrayList(u8) = .empty;
+        defer seqs.deinit(allocator);
+        for (0..levels) |i| {
+            try seqs.appendNTimes(allocator, ' ', 2 * i);
+            try seqs.appendSlice(allocator, if (i + 1 == levels) "- v\n" else "-\n");
+        }
+        // `- k:` under `- k:`: a sequence and a map a line; a last `- v`
+        // adds the sequence alone.
+        var maps: std.ArrayList(u8) = .empty;
+        defer maps.deinit(allocator);
+        const lines = levels / 2;
+        for (0..lines) |i| {
+            try maps.appendNTimes(allocator, ' ', 4 * i);
+            try maps.appendSlice(allocator, if (i + 1 < lines) "- k:\n" else if (levels % 2 == 0) "- k: v\n" else "- k:\n");
+        }
+        if (levels % 2 == 1) {
+            try maps.appendNTimes(allocator, ' ', 4 * lines);
+            try maps.appendSlice(allocator, "- v\n");
+        }
+        for ([_][]const u8{ seqs.items, maps.items }) |text| {
+            if (levels <= MAX_DEPTH) {
+                const out = try convert(allocator, text);
+                defer allocator.free(out);
+                try std.testing.expect(try std.json.validate(allocator, out));
+            } else {
+                try std.testing.expectError(ConvertError.NestingTooDeep, convert(allocator, text));
+            }
+        }
+    }
 }
