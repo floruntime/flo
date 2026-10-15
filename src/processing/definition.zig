@@ -259,8 +259,6 @@ pub const SinkSpec = struct {
     key_prefix: []const u8,
     /// Delimiter between prefix and record key (default: ":")
     separator: []const u8,
-    /// Write mode: "upsert" | "if_absent" | "versioned" (default: "upsert")
-    write_mode: []const u8,
     /// TTL for KV entries in milliseconds (null = no expiration)
     ttl_ms: ?u64,
 
@@ -444,7 +442,6 @@ pub const JobDefinition = struct {
             allocator.free(snk.namespace);
             allocator.free(snk.key_prefix);
             allocator.free(snk.separator);
-            allocator.free(snk.write_mode);
             if (snk.match) |match_list| {
                 for (match_list) |t| allocator.free(t);
                 allocator.free(match_list);

@@ -598,7 +598,6 @@ fn freeSink(allocator: Allocator, snk: SinkSpec) void {
     allocator.free(snk.namespace);
     allocator.free(snk.key_prefix);
     allocator.free(snk.separator);
-    allocator.free(snk.write_mode);
     if (snk.match) |tags| {
         for (tags) |t| allocator.free(t);
         allocator.free(tags);
@@ -641,15 +640,12 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
         .namespace = "",
         .key_prefix = "",
         .separator = "",
-        .write_mode = "",
         .ttl_ms = null,
         .priority = 0,
     };
     errdefer freeSink(allocator, snk);
     snk.name = try dupe(allocator, sink_name);
     snk.match = try parseMatch(allocator, d, item);
-    // Only upsert exists; the field stays for the sink writer.
-    snk.write_mode = try dupe(allocator, "upsert");
     snk.separator = try dupe(allocator, ":");
 
     const mark = d.push(kk);
@@ -986,7 +982,6 @@ test "parser: multi-sink array (stream + kv + queue)" {
     try std.testing.expectEqualStrings("user-store", s1.namespace);
     try std.testing.expectEqualStrings("user", s1.key_prefix);
     try std.testing.expectEqualStrings(":", s1.separator);
-    try std.testing.expectEqualStrings("upsert", s1.write_mode);
     try std.testing.expectEqual(@as(?u64, 86400000), s1.ttl_ms);
 
     // Queue sink
@@ -1326,7 +1321,6 @@ test "parser: KV sink defaults" {
     try std.testing.expectEqualStrings("my-ns", snk.namespace);
     try std.testing.expectEqualStrings("", snk.key_prefix);
     try std.testing.expectEqualStrings(":", snk.separator);
-    try std.testing.expectEqualStrings("upsert", snk.write_mode);
     try std.testing.expect(snk.ttl_ms == null);
 }
 
@@ -2091,4 +2085,14 @@ test "parser: two sources may not read the same stream in one namespace" {
         \\{"kind":"Processing","sources":[{"name":"a","stream":{"name":"in"}},{"name":"b","stream":{"name":"in","namespace":"other"}}],"sinks":[{"stream":{"name":"out"}}]}
     , null);
     def.deinit(allocator);
+}
+
+test "parser: a KV sink's empty separator is kept, not replaced by the default" {
+    var def = try parseJobDefinition(std.testing.allocator,
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "kv": { "key_prefix": "user", "separator": "" } }, { "kv": { "key_prefix": "acct" } } ] }
+    , null);
+    defer def.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", def.sinks.items[0].separator);
+    try std.testing.expectEqualStrings(":", def.sinks.items[1].separator);
 }
