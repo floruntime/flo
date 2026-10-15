@@ -8096,6 +8096,30 @@ test "Shard: a diverged node refuses writes even if it led" {
     try std.testing.expect(std.mem.indexOf(u8, resp.data, "diverged") != null);
 }
 
+test "Shard: a worker's await on a node that does not lead goes to the leader" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var await_value: [16]u8 = undefined;
+    std.mem.writeInt(u32, await_value[0..4], 1, .little);
+    std.mem.writeInt(u16, await_value[4..6], 3, .little);
+    @memcpy(await_value[6..9], "job");
+    shard.runRequest(conn, testReq(.action_await, 7, "", "w-1", await_value[0..9], ""), .client);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.action_await));
+}
+
 test "Shard: a forward waits for its leader's answer, is answered when that leader is replaced, and runs here once this node leads" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
