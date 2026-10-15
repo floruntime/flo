@@ -34,7 +34,6 @@ const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
 
-const MAX_PLAN_EXECUTORS = @import("plan_types.zig").MAX_PLAN_EXECUTORS;
 const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
@@ -263,9 +262,10 @@ pub const WorkflowHandler = struct {
         /// The order this pass through the plan tries its executors in,
         /// fixed when the pass starts (0 = not started). Health-weighted
         /// order is a sort by health, and a failure changes health: sorting
-        /// again mid-pass would put an exhausted executor back under
-        /// `plan_executor_idx`, and the pass would never end.
-        plan_order: [MAX_PLAN_EXECUTORS]u8 = undefined,
+        /// again mid-pass would put a different executor under
+        /// `plan_executor_idx`, so a retry or the next attempt could start
+        /// one that already ran out while another is never tried.
+        plan_order: [plan_types.MAX_PLAN_EXECUTORS]u8 = undefined,
         plan_order_len: u8 = 0,
 
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
@@ -1928,7 +1928,9 @@ pub const WorkflowHandler = struct {
 
         // The pass's executor order: health-weighted sorts by score, all
         // other strategies use definition order.
-        const exec_count: u8 = @intCast(@min(plan.executors.len, MAX_PLAN_EXECUTORS));
+        // The parser refuses a longer list.
+        std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
+        const exec_count: u8 = @intCast(plan.executors.len);
         if (run.plan_order_len != exec_count) {
             for (run.plan_order[0..exec_count], 0..) |*slot, i| slot.* = @intCast(i);
             if (plan.selection == .health_weighted) {
@@ -2559,7 +2561,8 @@ pub const WorkflowHandler = struct {
                     if (def.getPlan(run_step.targetName())) |plan| {
                         // Use natural index — in health-weighted mode plan_executor_idx
                         // is the position in sorted order, not the index into plan.executors[].
-                        const exec_count: u8 = @intCast(@min(plan.executors.len, MAX_PLAN_EXECUTORS));
+                        std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
+                        const exec_count: u8 = @intCast(plan.executors.len);
 
                         // Check per-executor retry first
                         if (run.plan_executor_idx < exec_count and
@@ -4818,8 +4821,8 @@ test "step executor: retry on failure" {
 
 // Two executors that always fail, each with one retry, under
 // health-weighted selection: a failure lowers the failing executor's health,
-// which used to sort it back under the pass's position, so the plan ran
-// round after round until the breakers opened.
+// which used to sort it under the pass's next position, so one executor ran
+// past its retries and the other was never tried.
 const test_plan_exhaust_workflow_json =
     \\{"kind":"Workflow","name":"plan-wf","version":"1.0.0",
     \\"plans":{"charge":{"selection":"health-weighted","executors":[
