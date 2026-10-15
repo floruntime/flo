@@ -302,12 +302,7 @@ pub const StreamHandler = struct {
                 .stream = shard.stream_handler.readWindow(req),
                 .timeout_ms = bms,
             });
-            if (!registered) {
-                // Pool full — send an empty result now rather than deferring a
-                // response that has no waiter to ever complete it.
-                shard.sendOkResponse(conn, req.header.request_id, "");
-                return;
-            }
+            if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
             conn.response_deferred = true;
             return;
         }
@@ -369,12 +364,7 @@ pub const StreamHandler = struct {
                 .stream = .{ .name_hash = name_hash, .after = shard.stream_handler.stream.streamLastId(name_hash) },
                 .timeout_ms = bms,
             });
-            if (!registered) {
-                // Pool full — send an empty result now rather than deferring a
-                // response that has no waiter to ever complete it.
-                shard.sendOkResponse(conn, req.header.request_id, "");
-                return;
-            }
+            if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
             conn.response_deferred = true;
             return;
         }

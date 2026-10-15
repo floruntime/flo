@@ -424,6 +424,10 @@ pub const Shard = struct {
     /// applied what the leader committed, so the client reads its write.
     forwards: []Forward,
     forward_count: u32,
+    /// Of those, blocking reads, which may wait there for minutes: they hold
+    /// at most FORWARD_SLOTS - FORWARD_WRITE_RESERVE slots, so writes always
+    /// find one.
+    blocking_forwards: u32,
     replies_held: u32,
     next_forward_id: u32,
     /// On a lone node, damage this shard's data holds. The shard answers
@@ -993,6 +997,7 @@ pub const Shard = struct {
             .respond_proxy = respond_proxy,
             .forwards = forwards,
             .forward_count = 0,
+            .blocking_forwards = 0,
             .replies_held = 0,
             .next_forward_id = FORWARD_ID_FIRST,
             .offline = if (cluster_role == .single) boot_damage else null,
@@ -1550,13 +1555,25 @@ pub const Shard = struct {
         return null;
     }
 
-    /// The blocking reads `conn` has out: on other shards, and parked here.
+    /// `conn`'s blocking reads held for the leader: parked there, not here,
+    /// but still `conn`'s.
+    fn blockingForwardsFor(self: *Shard, conn: *Connection) u16 {
+        if (self.blocking_forwards == 0) return 0;
+        var n: u16 = 0;
+        for (self.forwards) |*f| {
+            if (f.active and f.wait_ms > 0 and f.reply_to.isSocket(@intCast(self.id), conn.fd, conn.id)) n += 1;
+        }
+        return n;
+    }
+
+    /// The blocking reads `conn` has out: on other shards, parked here, and
+    /// held for the leader.
     /// `local_reads` only ever overcounts — raised as each parks, not
     /// lowered as each returns — so the waiters are counted only when it
     /// says the cap may be reached.
     fn blockingOut(self: *Shard, conn: *Connection) u16 {
         if (conn.blocking_in_flight + conn.local_reads >= Connection.MAX_BLOCKING_IN_FLIGHT) {
-            conn.local_reads = self.waiter_pool.countFor(@intCast(self.id), conn.fd, conn.id);
+            conn.local_reads = self.waiter_pool.countFor(@intCast(self.id), conn.fd, conn.id) + self.blockingForwardsFor(conn);
         }
         return conn.blocking_in_flight + conn.local_reads;
     }
@@ -2385,6 +2402,11 @@ pub const Shard = struct {
     /// hold the client until the leader answers. With no leader known the
     /// write waits for one, up to FORWARD_TIMEOUT_MS.
     fn forwardToLeader(self: *Shard, conn: *Connection, req: proto.Request) void {
+        const wait_ms = blockingWait(req) orelse 0;
+        if (wait_ms > 0 and self.blocking_forwards >= FORWARD_SLOTS - FORWARD_WRITE_RESERVE) {
+            self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .too_many_waiters, .ran = .no, .message = "overloaded: too many reads waiting for the leader — retry" });
+            return;
+        }
         const slot = blk: {
             for (self.forwards) |*f| if (!f.active) break :blk f;
             self.sendErrorResponse(conn, req.header.request_id, .overloaded, "too many writes waiting for the leader");
@@ -2394,10 +2416,11 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "could not hold the request for the leader");
             return;
         };
-        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .wait_ms = blockingWait(req) orelse 0, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
+        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .wait_ms = wait_ms, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
         self.next_forward_id +%= 1;
         if (self.next_forward_id == 0) self.next_forward_id = FORWARD_ID_FIRST;
         self.forward_count += 1;
+        if (wait_ms > 0) self.blocking_forwards += 1;
         conn.recordForward();
         conn.response_deferred = true;
         self.sendForward(slot);
@@ -2535,6 +2558,7 @@ pub const Shard = struct {
             self.allocator.free(r);
             self.replies_held -= 1;
         }
+        if (f.wait_ms > 0) self.blocking_forwards -= 1;
         f.* = .{};
         self.forward_count -= 1;
     }
@@ -4585,6 +4609,14 @@ pub const Shard = struct {
     /// The most a refusal's frame takes: one too long is cut to fit.
     pub const REFUSAL_FRAME_MAX = 1024;
 
+    /// A blocking read with no room left to wait: refused overloaded rather
+    /// than answered empty. SDK workers back off and retry; a direct caller
+    /// gets the error. Forwarded, the refusal goes back and frees the
+    /// asking node's slot.
+    pub fn refuseWaitersFull(self: *Shard, conn: *Connection, request_id: u64) void {
+        self.sendRefusal(conn, request_id, .overloaded, .{ .reason = .too_many_waiters, .ran = .no, .message = "overloaded: too many reads waiting on this shard — retry" });
+    }
+
     /// A refusal is always sent: one too long for its frame is cut, never
     /// dropped (a dropped one left the client the no-answer fallback).
     pub fn sendRefusal(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
@@ -5485,6 +5517,8 @@ const Forward = struct {
     applied_by: u64 = 0,
 };
 const FORWARD_SLOTS: usize = 1024;
+/// Forward slots blocking reads may not take.
+const FORWARD_WRITE_RESERVE: usize = 256;
 /// How long a write waits for a leader to be known, and how long an
 /// answer is held for this node to catch up to it.
 pub const FORWARD_TIMEOUT_MS: u64 = 5000;
@@ -8136,6 +8170,131 @@ test "Shard: a worker's await on a node that does not lead goes to the leader" {
     shard.runRequest(conn, testReq(.action_await, 7, "", "w-1", await_value[0..9], ""), .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.action_await));
+}
+
+/// A node that has joined a cluster but leads nothing, with a client: its
+/// writes and blocking reads are held for a leader.
+const FollowerTest = struct {
+    pipe_fds: [2]std.posix.fd_t,
+    rn: RaftNetwork,
+    shard: Shard,
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+
+    fn init(t: *FollowerTest) !void {
+        t.pipe_fds = try @import("stdx").io.pipe();
+        t.rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+        t.shard.raft_network = &t.rn;
+        t.shard.wireHandlerShardPtrs();
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &t.pair));
+        // A test that reads an answer that never comes fails, not hangs.
+        try @import("stdx").net.sysFcntlSetNonblocking(t.pair[1]);
+        try @import("stdx").net.sysFcntlSetNonblocking(t.pair[0]);
+        t.conn = try t.shard.addConnection(t.pair[0]);
+    }
+
+    fn deinit(t: *FollowerTest) void {
+        _ = std.c.close(t.pair[1]);
+        t.shard.deinit();
+        t.rn.deinit();
+        _ = std.c.close(t.pipe_fds[0]);
+        _ = std.c.close(t.pipe_fds[1]);
+    }
+
+    fn blockingDequeue(id: u64) ![]u8 {
+        var opts: [8]u8 = undefined;
+        var ob = proto.OptionsBuilder.init(&opts);
+        try ob.addU32(.block_ms, 60_000);
+        return testRequestWith(.queue_dequeue, id, "q", "", ob.getOptions());
+    }
+};
+
+test "Shard: a connection's blocking reads held for the leader count toward its cap" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    const reads = Connection.MAX_BLOCKING_IN_FLIGHT + 2;
+    var reqs: [reads][]u8 = undefined;
+    for (&reqs, 0..) |*r, i| r.* = try FollowerTest.blockingDequeue(100 + i);
+    defer for (reqs) |r| std.testing.allocator.free(r);
+    const all = try std.mem.concat(std.testing.allocator, u8, &reqs);
+    defer std.testing.allocator.free(all);
+    _ = feedClient(t.pair[1], &t.shard, t.conn.fd, all);
+
+    // Eight go to the leader; the ninth waits for one of them to return.
+    try std.testing.expectEqual(@as(u32, Connection.MAX_BLOCKING_IN_FLIGHT), t.shard.forward_count);
+    try std.testing.expectEqual(@as(u32, Connection.MAX_BLOCKING_IN_FLIGHT), t.shard.blocking_forwards);
+    try std.testing.expect(t.conn.waiting != null);
+
+    // The client goes: its forwards go, and the count with them.
+    t.shard.dropForwardsFor(t.conn.fd, t.conn.id);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.forward_count);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.blocking_forwards);
+}
+
+test "Shard: blocking reads held for the leader leave forward slots for writes" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+
+    // Every slot blocking reads may hold is taken.
+    t.shard.blocking_forwards = FORWARD_SLOTS - FORWARD_WRITE_RESERVE;
+    defer t.shard.blocking_forwards = 0;
+    t.shard.runRequest(t.conn, testReq(.queue_dequeue, 1, "", "q", "", blk: {
+        var opts: [8]u8 = undefined;
+        var ob = proto.OptionsBuilder.init(&opts);
+        try ob.addU32(.block_ms, 60_000);
+        break :blk ob.getOptions();
+    }), .client);
+    var out: [256]u8 = undefined;
+    const n = try readAnswer(t.pair[1], &t.shard, t.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.forward_count);
+
+    // A write still gets a slot.
+    t.shard.runRequest(t.conn, testReq(.kv_put, 2, "", "k", "v", ""), .client);
+    try std.testing.expectEqual(@as(u32, 1), t.shard.forward_count);
+}
+
+test "Shard: a blocking read with no room left to wait is refused overloaded, not answered empty" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    for (0..waiter_pool_mod.MAX_WAITERS) |i| {
+        _ = shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 1000, @intCast(i)), .request_id = i, .key = "x", .timeout_ms = 60_000 });
+    }
+
+    var opts: [8]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts);
+    try ob.addU32(.block_ms, 60_000);
+    // [group_len:u16][group][consumer_len:u16][consumer]
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    // [count:u32][type_len:u16][type]
+    const await_value = "\x01\x00\x00\x00" ++ "\x03\x00" ++ "job";
+    for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8 }{
+        .{ .op = .queue_dequeue, .key = "q", .value = "" },
+        .{ .op = .stream_read, .key = "s", .value = "" },
+        .{ .op = .stream_group_read, .key = "s", .value = group_consumer },
+        .{ .op = .action_await, .key = "w", .value = await_value },
+    }, 7..) |r, id| {
+        const req = try testRequestWith(r.op, id, r.key, r.value, ob.getOptions());
+        defer std.testing.allocator.free(req);
+        _ = feedClient(c.pair[1], &shard, c.conn.fd, req);
+        var out: [256]u8 = undefined;
+        var resp = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@as(u64, id), resp.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+        try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+    }
 }
 
 test "Shard: a forward waits for its leader's answer, is answered when that leader is replaced, and runs here once this node leads" {

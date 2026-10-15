@@ -211,14 +211,7 @@ pub const QueueHandler = struct {
                 .min_version = q_hash,
                 .timeout_ms = bms,
             });
-            if (!registered) {
-                // Pool full — send empty result (count = 0) rather than deferring
-                // a response with no waiter to ever complete it.
-                var empty_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &empty_buf, 0, .little);
-                shard.sendOkResponse(conn, req.header.request_id, &empty_buf);
-                return;
-            }
+            if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
             conn.response_deferred = true;
             return;
         }
