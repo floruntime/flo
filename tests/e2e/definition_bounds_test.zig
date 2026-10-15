@@ -104,6 +104,34 @@ test "e2e/definitions: a wait whose timeout is past the clock parks the run, and
     try alive(ctx);
 }
 
+test "e2e/definitions: a stream source's partitions other than all are refused at submit" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_][]const u8{
+        \\kind: Processing
+        \\name: ranged
+        \\sources.[0].stream.name: in
+        \\sources.[0].stream.partitions: "0-4294967295"
+        \\sinks.[0].stream.name: out
+        ,
+        \\kind: Processing
+        \\name: listed
+        \\sources.[0].stream.name: in
+        \\sources.[0].stream.partitions: "0,3"
+        \\sinks.[0].stream.name: out
+    }) |def| {
+        var r = try submit(ctx, &.{ "processing", "submit" }, def, "parts.yaml");
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
+        try testing.expect(r.contains("\"partitions\" must be all"));
+        try alive(ctx);
+    }
+    var listed = try ctx.cli.run(&.{ "processing", "list" });
+    defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
+    try testing.expect(!listed.contains("ranged") and !listed.contains("listed"));
+}
+
 test "e2e/definitions: a pipeline whose window or partition doesn't fit is refused at submit" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
