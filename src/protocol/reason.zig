@@ -67,6 +67,10 @@ pub const Reason = enum(u16) {
     wrong_type = 24,
     /// The shard holds as many open transactions as it may.
     too_many_transactions = 25,
+    /// An action complete or fail for a run that has moved on: another
+    /// worker holds it now, or it finished with another outcome. The
+    /// report was dropped; resending it is refused the same way.
+    stale_report = 26,
 };
 
 /// Whether a refused request took effect.
