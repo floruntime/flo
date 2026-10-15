@@ -134,14 +134,17 @@ pub const QueueProjection = struct {
     /// Message store: seq → Message.
     messages: std.AutoHashMap(u64, Message),
 
-    /// Ready heap: min-heap sorted by priority.
-    ready_heap: std.PriorityQueue(HeapItem, void, heapCompare),
+    /// Each queue's ready heap and dead letters, by queue name hash. Every
+    /// queue on a partition shares the message store and sequence numbers,
+    /// so a dequeue or a full dead-letter queue must never have to pass
+    /// over another queue's messages. An entry exists only while its queue
+    /// has ready messages or dead letters.
+    lanes: std.AutoHashMap(u64, Lane),
 
     /// Lease tracker: min-heap sorted by expiry.
     lease_heap: std.PriorityQueue(LeaseItem, void, leaseCompare),
 
-    /// Dead letter queue (bounded ring buffer).
-    dlq: std.ArrayList(DLQEntry),
+    /// Dead letters kept per queue; the oldest is evicted past this.
     dlq_limit: usize,
 
     /// Known queue metadata: queue_name_hash → QueueMeta.
@@ -172,6 +175,18 @@ pub const QueueProjection = struct {
     /// register the queue under its real namespace instead of "default".
     ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) ?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
+
+    pub const Lane = struct {
+        /// Ready messages, lowest priority value then lowest seq first.
+        ready: std.PriorityQueue(HeapItem, void, heapCompare) = .empty,
+        /// Dead letters, oldest first.
+        dlq: std.ArrayList(DLQEntry) = .empty,
+
+        fn deinit(self: *Lane, allocator: Allocator) void {
+            self.ready.deinit(allocator);
+            self.dlq.deinit(allocator);
+        }
+    };
 
     pub const QueueMeta = struct {
         name: []const u8,
@@ -204,9 +219,8 @@ pub const QueueProjection = struct {
         return .{
             .allocator = allocator,
             .messages = std.AutoHashMap(u64, Message).init(allocator),
-            .ready_heap = .empty,
+            .lanes = std.AutoHashMap(u64, Lane).init(allocator),
             .lease_heap = .empty,
-            .dlq = .empty,
             .dlq_limit = config.dlq_limit,
             .known_queues = std.AutoHashMap(u64, QueueMeta).init(allocator),
             .next_seq = 1,
@@ -226,9 +240,9 @@ pub const QueueProjection = struct {
             }
         }
         self.messages.deinit();
-        self.ready_heap.deinit(self.allocator);
+        self.clearLanes();
+        self.lanes.deinit();
         self.lease_heap.deinit(self.allocator);
-        self.dlq.deinit(self.allocator);
         // Free known queue name/namespace copies
         var q_it = self.known_queues.iterator();
         while (q_it.next()) |kv| {
@@ -249,9 +263,9 @@ pub const QueueProjection = struct {
             }
         }
         self.messages.clearAndFree();
-        self.ready_heap.items.len = 0;
+        self.clearLanes();
+        self.lanes.clearAndFree();
         self.lease_heap.items.len = 0;
-        self.dlq.clearAndFree(self.allocator);
         // Free known queue name/namespace copies
         var kq_it = self.known_queues.iterator();
         while (kq_it.next()) |kv| {
@@ -262,6 +276,37 @@ pub const QueueProjection = struct {
         self.next_seq = 1;
         self.applied_index = 0;
         self.stats = .{};
+    }
+
+    fn clearLanes(self: *QueueProjection) void {
+        var it = self.lanes.valueIterator();
+        while (it.next()) |l| l.deinit(self.allocator);
+    }
+
+    fn lane(self: *QueueProjection, queue_name_hash: u64) !*Lane {
+        const gop = try self.lanes.getOrPut(queue_name_hash);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr;
+    }
+
+    /// Free a lane left with nothing in it, so lanes are bounded by the
+    /// queues that hold ready messages or dead letters.
+    fn dropLaneIfEmpty(self: *QueueProjection, queue_name_hash: u64) void {
+        const l = self.lanes.getPtr(queue_name_hash) orelse return;
+        if (l.ready.count() != 0 or l.dlq.items.len != 0) return;
+        l.deinit(self.allocator);
+        _ = self.lanes.remove(queue_name_hash);
+    }
+
+    fn pushReady(self: *QueueProjection, msg: *const Message) !void {
+        const l = try self.lane(msg.queue_name_hash);
+        try l.ready.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority });
+    }
+
+    /// One queue's dead letters, oldest first.
+    pub fn deadLetters(self: *const QueueProjection, queue_name_hash: u64) []const DLQEntry {
+        const l = self.lanes.getPtr(queue_name_hash) orelse return &.{};
+        return l.dlq.items;
     }
 
     /// Count the live (ready + leased) messages belonging to one queue.
@@ -275,9 +320,9 @@ pub const QueueProjection = struct {
     }
 
     /// Purge all live (ready + leased) messages for one queue, returning the
-    /// count removed. The ready/lease heaps are left untouched — they self-clean
-    /// lazily on pop (a popped seq missing from `messages` is skipped), so only
-    /// the message store needs mutating. Dead letters are left intact.
+    /// count removed. The queue's ready heap goes with them; the lease heap
+    /// self-cleans lazily (an expiring seq missing from `messages` is
+    /// skipped). Dead letters are left intact.
     pub fn purgeQueue(self: *QueueProjection, queue_name_hash: u64) u64 {
         // Collect matching seqs first; removing during iteration is unsafe.
         var seqs: std.ArrayList(u64) = .empty;
@@ -292,6 +337,11 @@ pub const QueueProjection = struct {
             if (self.messages.fetchRemove(seq)) |removed| {
                 if (removed.value.payload.len > 0) self.allocator.free(removed.value.payload);
             }
+        }
+        if (self.lanes.getPtr(queue_name_hash)) |l| {
+            l.ready.deinit(self.allocator);
+            l.ready = .empty;
+            self.dropLaneIfEmpty(queue_name_hash);
         }
         self.last_purge_count = seqs.items.len;
         return @intCast(seqs.items.len);
@@ -324,7 +374,8 @@ pub const QueueProjection = struct {
         };
 
         try self.messages.put(seq, msg);
-        try self.ready_heap.push(self.allocator, .{ .seq = seq, .priority = priority });
+        errdefer _ = self.messages.remove(seq);
+        try self.pushReady(&msg);
 
         // Update known-queue stats
         if (self.known_queues.getPtr(queue_name_hash)) |meta| {
@@ -362,70 +413,45 @@ pub const QueueProjection = struct {
         return self.known_queues.count();
     }
 
-    /// Dequeue the highest-priority ready message matching queue_name_hash.
-    /// Pass queue_name_hash == 0 to dequeue from any queue (legacy path).
-    /// Returns null if no matching ready messages.
+    /// Dequeue the highest-priority ready message of one queue, or null when
+    /// it has none ready.
     pub fn dequeue(self: *QueueProjection, now_ns: u64, queue_name_hash: u64) !?DequeueResult {
         // First, expire any leases
         self.expireLeases(now_ns);
 
-        // We may need to skip non-matching items; collect them for re-push.
-        var skipped_buf: [128]HeapItem = undefined;
-        var skipped_count: usize = 0;
-        var found: ?DequeueResult = null;
+        const l = self.lanes.getPtr(queue_name_hash) orelse return null;
+        defer self.dropLaneIfEmpty(queue_name_hash);
+        while (l.ready.pop()) |item| {
+            const msg = self.messages.getPtr(item.seq) orelse continue;
+            if (msg.state != .ready) continue; // stale heap entry
 
-        while (self.ready_heap.pop()) |item| {
-            if (self.messages.getPtr(item.seq)) |msg| {
-                if (msg.state != .ready) continue; // stale heap entry
+            self.lease_heap.push(self.allocator, .{
+                .seq = msg.seq,
+                .expiry_ns = now_ns + self.default_lease_ns,
+            }) catch |err| {
+                // Still ready: it goes back where it was.
+                l.ready.push(self.allocator, item) catch {};
+                return err;
+            };
+            msg.state = .leased;
+            msg.attempts += 1;
+            msg.lease_expiry_ns = now_ns + self.default_lease_ns;
 
-                // Filter by queue name hash (0 = match any)
-                if (queue_name_hash != 0 and msg.queue_name_hash != queue_name_hash) {
-                    if (skipped_count < skipped_buf.len) {
-                        skipped_buf[skipped_count] = item;
-                        skipped_count += 1;
-                    } else {
-                        // Too many skipped — re-add and give up
-                        self.ready_heap.push(self.allocator, item) catch {};
-                        break;
-                    }
-                    continue;
-                }
-
-                // Lease the message
-                msg.state = .leased;
-                msg.attempts += 1;
-                msg.lease_expiry_ns = now_ns + self.default_lease_ns;
-
-                try self.lease_heap.push(self.allocator, .{
-                    .seq = msg.seq,
-                    .expiry_ns = msg.lease_expiry_ns,
-                });
-
-                self.stats.dequeued += 1;
-
-                // Update known-queue stats
-                if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| {
-                    meta.dequeued += 1;
-                }
-
-                found = .{
-                    .seq = msg.seq,
-                    .ual_index = msg.ual_index,
-                    .priority = msg.priority,
-                    .attempts = msg.attempts,
-                    .payload = msg.payload,
-                    .enqueued_at_ns = msg.enqueued_at_ns,
-                };
-                break;
+            self.stats.dequeued += 1;
+            if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| {
+                meta.dequeued += 1;
             }
-        }
 
-        // Re-push any skipped items
-        for (skipped_buf[0..skipped_count]) |item| {
-            self.ready_heap.push(self.allocator, item) catch {};
+            return .{
+                .seq = msg.seq,
+                .ual_index = msg.ual_index,
+                .priority = msg.priority,
+                .attempts = msg.attempts,
+                .payload = msg.payload,
+                .enqueued_at_ns = msg.enqueued_at_ns,
+            };
         }
-
-        return found;
+        return null;
     }
 
     const AckTarget = struct { seq: u64, queue: u64 };
@@ -466,7 +492,7 @@ pub const QueueProjection = struct {
                 // Re-enqueue
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
-                try self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority });
+                try self.pushReady(msg);
             }
             self.stats.nacked += 1;
             if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.nacked += 1;
@@ -493,9 +519,12 @@ pub const QueueProjection = struct {
         return count;
     }
 
-    /// Get the DLQ size.
+    /// Dead letters across every queue on this partition.
     pub fn dlqCount(self: *const QueueProjection) usize {
-        return self.dlq.items.len;
+        var n: usize = 0;
+        var it = self.lanes.valueIterator();
+        while (it.next()) |l| n += l.dlq.items.len;
+        return n;
     }
 
     /// One queue's message counts by state: ready, leased, dead letters.
@@ -511,11 +540,7 @@ pub const QueueProjection = struct {
                 else => {},
             }
         }
-        var dead: usize = 0;
-        for (self.dlq.items) |d| {
-            if (d.queue_name_hash == queue_name_hash) dead += 1;
-        }
-        return .{ .ready = ready, .leased = leased, .dead = dead };
+        return .{ .ready = ready, .leased = leased, .dead = self.deadLetters(queue_name_hash).len };
     }
 
     /// Total messages tracked (ready + leased, not DLQ).
@@ -539,7 +564,7 @@ pub const QueueProjection = struct {
                 // Return to ready
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
-                self.ready_heap.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority }) catch {};
+                self.pushReady(msg) catch {};
 
                 self.stats.leases_expired += 1;
                 if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.leases_expired += 1;
@@ -550,15 +575,10 @@ pub const QueueProjection = struct {
     // ─── DLQ ───────────────────────────────────────────────────────────────
 
     fn moveToDLQ(self: *QueueProjection, msg: *Message, now_ns: u64) !void {
-        // Add to DLQ ring buffer
-        if (self.dlq.items.len >= self.dlq_limit) {
-            // Remove oldest
-            _ = self.dlq.orderedRemove(0);
-            // Note: orderedRemove in 0.15.2 doesn't need allocator
-        }
-
-        try self.dlq.append(self.allocator, .{
-            .seq = msg.seq,
+        const seq = msg.seq;
+        const l = try self.lane(msg.queue_name_hash);
+        try l.dlq.append(self.allocator, .{
+            .seq = seq,
             .ual_index = msg.ual_index,
             .attempts = msg.attempts,
             .moved_at_ns = now_ns,
@@ -568,6 +588,14 @@ pub const QueueProjection = struct {
         msg.state = .dlq;
         self.stats.dlq_count += 1;
         if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.dead_lettered += 1;
+
+        // Past the cap the queue's oldest dead letter goes, message and all.
+        if (l.dlq.items.len > self.dlq_limit) {
+            const evicted = l.dlq.orderedRemove(0);
+            if (evicted.seq != seq) if (self.messages.fetchRemove(evicted.seq)) |kv| {
+                if (kv.value.payload.len > 0) self.allocator.free(kv.value.payload);
+            };
+        }
     }
 
     // ─── UAL Entry application ─────────────────────────────────────────────
@@ -659,14 +687,21 @@ pub const QueueProjection = struct {
     }
 
     pub fn memoryUsage(self: *const QueueProjection) usize {
-        // Approximate: per-message overhead + heap + DLQ + payload bytes + known queues
+        // Approximate: per-message overhead + lanes + payload bytes + known queues
         var payload_bytes: usize = 0;
         var it = self.messages.iterator();
         while (it.next()) |kv| {
             payload_bytes += kv.value_ptr.payload.len;
         }
+        var lane_bytes: usize = 0;
+        var lit = self.lanes.valueIterator();
+        while (lit.next()) |l| {
+            lane_bytes += @sizeOf(u64) + @sizeOf(Lane) +
+                l.ready.capacity() * @sizeOf(HeapItem) +
+                l.dlq.capacity * @sizeOf(DLQEntry);
+        }
         return self.messages.count() * @sizeOf(Message) +
-            self.dlq.items.len * @sizeOf(DLQEntry) +
+            lane_bytes +
             self.known_queues.count() * @sizeOf(QueueMeta) +
             payload_bytes +
             @sizeOf(QueueProjection);
@@ -674,7 +709,20 @@ pub const QueueProjection = struct {
 
     // ─── Snapshot Serialization ────────────────────────────────────────────
 
-    /// Serialize the full queue projection state.
+    /// A map's keys in ascending order, so two replicas holding the same
+    /// state serialize the same bytes whatever order their maps hold it in.
+    fn sortedKeys(allocator: Allocator, map: anytype) ![]u64 {
+        const keys = try allocator.alloc(u64, map.count());
+        var it = map.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) keys[i] = k.*;
+        std.mem.sortUnstable(u64, keys, {}, std.sort.asc(u64));
+        return keys;
+    }
+
+    /// Serialize the full queue projection state. Messages are in seq
+    /// order, dead letters by queue hash then oldest first, known queues by
+    /// hash. Ready heaps are not stored: they are rebuilt from the messages.
     /// Format: [next_seq: u64][message_count: u32] then per message:
     ///   [seq: u64][ual_index: u64][priority: u32][state: u8][attempts: u32]
     ///   [lease_expiry_ns: u64][enqueued_at_ns: u64][queue_name_hash: u64]
@@ -687,21 +735,29 @@ pub const QueueProjection = struct {
     ///   [dead_lettered: u64][leases_expired: u64]
     /// Caller owns returned slice.
     pub fn serialize(self: *QueueProjection, allocator: Allocator) ![]u8 {
+        const seqs = try sortedKeys(allocator, self.messages);
+        defer allocator.free(seqs);
+        const lane_keys = try sortedKeys(allocator, self.lanes);
+        defer allocator.free(lane_keys);
+        const queue_keys = try sortedKeys(allocator, self.known_queues);
+        defer allocator.free(queue_keys);
+
         // Calculate total size
         var total_size: usize = 8 + 4; // next_seq + message_count
-        var msg_it = self.messages.iterator();
-        while (msg_it.next()) |kv| {
+        var msg_it = self.messages.valueIterator();
+        while (msg_it.next()) |msg| {
             // Fixed fields: 8+8+4+1+4+8+8+8+4 = 53 bytes + payload
-            total_size += 53 + kv.value_ptr.payload.len;
+            total_size += 53 + msg.payload.len;
         }
         // DLQ: count(4) + entries(8+8+4+8+8=36 each)
-        total_size += 4 + self.dlq.items.len * 36;
+        const dead = self.dlqCount();
+        total_size += 4 + dead * 36;
         // Known queues
         total_size += 4; // count
-        var kq_it = self.known_queues.iterator();
-        while (kq_it.next()) |kv| {
+        var kq_it = self.known_queues.valueIterator();
+        while (kq_it.next()) |meta| {
             // hash(8) + name_len(2) + name + ns_len(2) + ns + 6 counters(48)
-            total_size += 60 + kv.value_ptr.name.len + kv.value_ptr.namespace.len;
+            total_size += 60 + meta.name.len + meta.namespace.len;
         }
 
         const buf = try allocator.alloc(u8, total_size);
@@ -713,12 +769,11 @@ pub const QueueProjection = struct {
         offset += 8;
 
         // Messages
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.messages.count()), .little);
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(seqs.len), .little);
         offset += 4;
 
-        msg_it = self.messages.iterator();
-        while (msg_it.next()) |kv| {
-            const msg = kv.value_ptr;
+        for (seqs) |seq| {
+            const msg = self.messages.getPtr(seq).?;
             std.mem.writeInt(u64, buf[offset..][0..8], msg.seq, .little);
             offset += 8;
             std.mem.writeInt(u64, buf[offset..][0..8], msg.ual_index, .little);
@@ -744,28 +799,28 @@ pub const QueueProjection = struct {
         }
 
         // DLQ
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.dlq.items.len), .little);
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(dead), .little);
         offset += 4;
-        for (self.dlq.items) |dlq_entry| {
-            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.seq, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.ual_index, .little);
-            offset += 8;
-            std.mem.writeInt(u32, buf[offset..][0..4], dlq_entry.attempts, .little);
-            offset += 4;
-            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.moved_at_ns, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.queue_name_hash, .little);
-            offset += 8;
+        for (lane_keys) |hash| {
+            for (self.lanes.getPtr(hash).?.dlq.items) |dlq_entry| {
+                std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.seq, .little);
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.ual_index, .little);
+                offset += 8;
+                std.mem.writeInt(u32, buf[offset..][0..4], dlq_entry.attempts, .little);
+                offset += 4;
+                std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.moved_at_ns, .little);
+                offset += 8;
+                std.mem.writeInt(u64, buf[offset..][0..8], dlq_entry.queue_name_hash, .little);
+                offset += 8;
+            }
         }
 
         // Known queues
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(self.known_queues.count()), .little);
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(queue_keys.len), .little);
         offset += 4;
-        kq_it = self.known_queues.iterator();
-        while (kq_it.next()) |kv| {
-            const hash = kv.key_ptr.*;
-            const meta = kv.value_ptr;
+        for (queue_keys) |hash| {
+            const meta = self.known_queues.getPtr(hash).?;
             std.mem.writeInt(u64, buf[offset..][0..8], hash, .little);
             offset += 8;
             std.mem.writeInt(u16, buf[offset..][0..2], @intCast(meta.name.len), .little);
@@ -849,7 +904,7 @@ pub const QueueProjection = struct {
 
             // Rebuild heaps from message state
             if (state == .ready) {
-                try self.ready_heap.push(self.allocator, .{ .seq = seq, .priority = priority });
+                try self.pushReady(self.messages.getPtr(seq).?);
             } else if (state == .leased and lease_expiry_ns > 0) {
                 try self.lease_heap.push(self.allocator, .{ .seq = seq, .expiry_ns = lease_expiry_ns });
             }
@@ -871,7 +926,7 @@ pub const QueueProjection = struct {
                 .queue_name_hash = std.mem.readInt(u64, data[offset + 28 ..][0..8], .little),
             };
             offset += 36;
-            try self.dlq.append(self.allocator, dlq_entry);
+            try (try self.lane(dlq_entry.queue_name_hash)).dlq.append(self.allocator, dlq_entry);
         }
 
         // Known queues
@@ -1123,6 +1178,81 @@ test "queue: dequeue filters by queue_name_hash" {
     try testing.expectEqualStrings("queue-A msg2", d3.payload);
 }
 
+test "queue: one queue's backlog never hides another queue's message" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000 });
+    defer q.deinit();
+
+    // A's messages all outrank B's, so one shared heap would put them first.
+    for (0..200) |i| _ = try q.enqueue(100 + i, 0, 1000, 1, "a");
+    _ = try q.enqueue(400, 5, 2000, 2, "b");
+
+    const d = (try q.dequeue(3000, 2)).?;
+    try testing.expectEqualStrings("b", d.payload);
+    try testing.expect(try q.dequeue(3000, 2) == null);
+    try testing.expectEqual(@as(usize, 200), q.queueCounts(1).ready);
+}
+
+test "queue: dead letters are capped per queue, and an evicted one's message goes with it" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000, .max_attempts = 1, .dlq_limit = 2 });
+    defer q.deinit();
+
+    const kill = struct {
+        fn f(p: *QueueProjection, hash: u64) !u64 {
+            const seq = try p.enqueue(100, 0, 1000, hash, "x");
+            _ = (try p.dequeue(2000, hash)).?;
+            try p.nack(seq, 3000);
+            return seq;
+        }
+    }.f;
+
+    const b = try kill(&q, 2);
+    const a1 = try kill(&q, 1);
+    _ = try kill(&q, 1);
+    _ = try kill(&q, 1);
+
+    try testing.expectEqual(@as(usize, 1), q.deadLetters(2).len);
+    try testing.expectEqual(b, q.deadLetters(2)[0].seq);
+    try testing.expectEqual(@as(usize, 2), q.deadLetters(1).len);
+    try testing.expect(!q.inQueue(a1, 1));
+    try testing.expectEqual(@as(usize, 3), q.totalMessages());
+}
+
+test "queue: a queue's ready heap is freed once it has nothing ready or dead" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000 });
+    defer q.deinit();
+
+    for (0..3) |i| _ = try q.enqueue(100 + i, 0, 1000, 1, "a");
+    _ = try q.enqueue(200, 0, 1000, 2, "b");
+    try testing.expectEqual(@as(u64, 3), q.purgeQueue(1));
+    try testing.expect(q.lanes.get(1) == null);
+
+    _ = (try q.dequeue(2000, 2)).?;
+    try testing.expectEqual(@as(usize, 0), q.lanes.count());
+}
+
+test "queue: the same state serializes to the same bytes whatever order built it" {
+    // One replica took 2000 messages and acked half; the other only ever
+    // held the half left, and learned its queues in the opposite order.
+    var a = QueueProjection.init(testing.allocator, .{});
+    defer a.deinit();
+    for (1..51) |h| try a.registerQueue(h, "q", "ns");
+    for (1..2001) |s| _ = try a.enqueue(s, @intCast(s % 3), s, 99, "m");
+    for (1001..2001) |s| try a.ack(s);
+
+    var b = QueueProjection.init(testing.allocator, .{});
+    defer b.deinit();
+    var h: u64 = 50;
+    while (h > 0) : (h -= 1) try b.registerQueue(h, "q", "ns");
+    for (1..1001) |s| _ = try b.enqueue(s, @intCast(s % 3), s, 99, "m");
+    b.next_seq = a.next_seq;
+
+    const sa = try a.serialize(testing.allocator);
+    defer testing.allocator.free(sa);
+    const sb = try b.serialize(testing.allocator);
+    defer testing.allocator.free(sb);
+    try testing.expectEqualSlices(u8, sa, sb);
+}
+
 test "queue: registerQueue and queueCount" {
     var q = QueueProjection.init(testing.allocator, .{});
     defer q.deinit();
@@ -1168,7 +1298,7 @@ test "queue: serialize/deserialize round-trip" {
     msg.state = .leased;
     msg.attempts = q.max_attempts;
     try q.nack(dead, 3600);
-    try testing.expectEqual(@as(usize, 1), q.dlq.items.len);
+    try testing.expectEqual(@as(usize, 1), q.dlqCount());
 
     // Serialize
     const data = try q.serialize(testing.allocator);
@@ -1182,9 +1312,9 @@ test "queue: serialize/deserialize round-trip" {
 
     // Verify messages restored (the dead letter's message stays held)
     try testing.expectEqual(@as(usize, 4), q2.messages.count());
-    try testing.expectEqual(@as(usize, 1), q2.dlq.items.len);
-    try testing.expectEqual(@as(u64, 99), q2.dlq.items[0].queue_name_hash);
-    try testing.expectEqual(dead, q2.dlq.items[0].seq);
+    try testing.expectEqual(@as(usize, 1), q2.deadLetters(99).len);
+    try testing.expectEqual(@as(u64, 99), q2.deadLetters(99)[0].queue_name_hash);
+    try testing.expectEqual(dead, q2.deadLetters(99)[0].seq);
 
     // Verify next_seq was preserved
     try testing.expectEqual(q.next_seq, q2.next_seq);
@@ -1243,7 +1373,7 @@ test "queue: a nack applied twice queues the message once and counts one attempt
     _ = try q.dequeue(2000, 42);
     try q.nack(seq, 3000);
     try q.nack(seq, 3001);
-    try testing.expectEqual(@as(usize, 1), q.ready_heap.count());
+    try testing.expectEqual(@as(usize, 1), q.lanes.get(42).?.ready.count());
     try testing.expectEqual(@as(u64, 1), q.stats.nacked);
     const d = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 2), d.attempts);
