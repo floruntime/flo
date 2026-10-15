@@ -99,6 +99,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+          cache: false
 
       - name: Linux packages
         if: matrix.platform == 'linux'
@@ -107,7 +108,11 @@ jobs:
           ARCH: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
         run: |
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
-          for format in deb rpm; do "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p "$format"; done
+          # File names without nfpm's "~": GitHub renames it in release assets.
+          RPM_ARCH=${{ matrix.arch }}
+          nfpm="$(go env GOPATH)/bin/nfpm"
+          "$nfpm" package -f packaging/nfpm.yaml -p deb -t "flo_${VERSION}_${ARCH}.deb"
+          "$nfpm" package -f packaging/nfpm.yaml -p rpm -t "flo-${VERSION}-1.${RPM_ARCH}.rpm"
           for p in flo_*.deb flo-*.rpm; do sha256sum "$p" > "$p.sha256"; done
 
       - name: Upload artifact

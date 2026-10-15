@@ -3,6 +3,12 @@ Description=Flo Server
 Documentation=https://github.com/floruntime/flo
 After=network-online.target
 Wants=network-online.target
+# A crash loop ends as a visible failed unit, not restarts forever: 10 failed
+# starts within an hour. An hour, not minutes, because a server that panics
+# during log replay spends the replay on every attempt; a short window would
+# never see 10 of them.
+StartLimitIntervalSec=1h
+StartLimitBurst=10
 
 [Service]
 Type=simple

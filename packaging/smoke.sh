@@ -52,11 +52,14 @@ getent passwd flo >/dev/null || fail "no flo user"
 [ "$(stat -c %U:%G /var/lib/flo)" = flo:flo ] || fail "/var/lib/flo is not owned by flo"
 [ "$(stat -c %a /var/lib/flo)" = 750 ] || fail "/var/lib/flo is not 0750"
 grep -q '^bind = "127.0.0.1"' /etc/flo/flo.toml || fail "the config doesn't bind 127.0.0.1"
+[ "$(stat -c %U:%G:%a /etc/flo/flo.toml)" = root:flo:640 ] || fail "/etc/flo/flo.toml is not root:flo 0640"
 if [ $systemd = yes ]; then
     [ "$(systemctl is-enabled flo || true)" = disabled ] || fail "the service was enabled on install"
     [ "$(systemctl is-active flo || true)" != active ] || fail "the service was started on install"
+    [ "$(systemctl show flo -p StartLimitBurst --value)" = 10 ] || fail "the unit's start limit isn't 10"
 fi
-command -v systemd-analyze >/dev/null && systemd-analyze verify /usr/lib/systemd/system/flo.service
+command -v systemd-analyze >/dev/null || fail "systemd-analyze is missing: can't verify the unit"
+systemd-analyze verify /usr/lib/systemd/system/flo.service
 
 echo "== run"
 start
@@ -65,11 +68,14 @@ flo kv set smoke kept -e 127.0.0.1:9000
 
 echo "== upgrade over itself"
 echo "# edited" >> /etc/flo/flo.toml
+[ $systemd = yes ] && pid=$(systemctl show flo -p MainPID --value)
 install
 grep -q '^# edited' /etc/flo/flo.toml || fail "the upgrade replaced the edited config"
 if [ $systemd = yes ]; then
-    # The upgrade restarted the running service.
+    # The upgrade restarted the running service, which stays enabled.
     [ "$(systemctl is-active flo)" = active ] || fail "the service is not running after the upgrade"
+    [ "$(systemctl show flo -p MainPID --value)" != "$pid" ] || fail "the upgrade didn't restart the service"
+    [ "$(systemctl is-enabled flo)" = enabled ] || fail "the upgrade disabled the service"
     up
 else
     stop
@@ -78,11 +84,17 @@ fi
 [ "$(flo kv get smoke -e 127.0.0.1:9000 -o raw)" = kept ] || fail "the data did not survive the upgrade"
 
 echo "== remove"
-stop
+# With systemd, removal itself must stop and disable the running service.
+[ $systemd = yes ] || stop
 remove
+if [ $systemd = yes ]; then
+    [ "$(systemctl is-active flo || true)" != active ] || fail "removal left the service running"
+    [ "$(systemctl is-enabled flo 2>/dev/null || true)" != enabled ] || fail "removal left the service enabled"
+fi
 [ ! -e /usr/bin/flo ] || fail "/usr/bin/flo is still there"
 [ -d /var/lib/flo ] && [ -n "$(ls -A /var/lib/flo)" ] || fail "the data was removed"
 getent passwd flo >/dev/null || fail "the flo user was removed"
 purge
 [ -d /var/lib/flo ] || fail "purge removed the data"
+case "$pkg" in *.deb) [ ! -e /etc/flo ] || fail "purge left /etc/flo" ;; esac
 echo "OK"

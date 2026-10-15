@@ -44,6 +44,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+          cache: false
 
       - name: Build the packages
         if: ${{ !inputs.from_artifact }}
@@ -55,7 +56,8 @@ jobs:
           cp zig-out/bin/flo flo
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
           mkdir -p dist
-          for format in deb rpm; do "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p "$format" -t dist/; done
+          "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p deb -t "dist/flo_${VERSION}_${ARCH}.deb"
+          "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p rpm -t "dist/flo-${VERSION}-1.x86_64.rpm"
 
       - name: .deb on Ubuntu, with systemd
         run: sudo packaging/smoke.sh "$(ls dist/flo_*.deb)"
@@ -65,4 +67,4 @@ jobs:
         run: |
           docker run --rm --security-opt seccomp=unconfined \
             -v "$PWD/dist:/dist" -v "$PWD/packaging:/p" rockylinux:9 \
-            sh -c '/p/smoke.sh "$(ls /dist/flo-*.rpm)"'
+            sh -c 'dnf -y -q install systemd >/dev/null && /p/smoke.sh "$(ls /dist/flo-*.rpm)"'

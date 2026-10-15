@@ -1,7 +1,10 @@
 # .deb and .rpm for each Linux release, built by release.yml with nfpm:
 #   cp zig-out/bin/flo flo
-#   VERSION=0.1.0-dev.12 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb
-# from the repository root. ARCH is the Go-style name (amd64, arm64); nfpm
+#   VERSION=0.1.0-dev.12 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb \
+#     -t flo_0.1.0-dev.12_amd64.deb
+# from the repository root. The version inside the package is 0.1.0~dev.12
+# (so it sorts before 0.1.0); the file is named without the "~", which
+# GitHub would rename in a release asset. ARCH is the Go-style name (amd64, arm64); nfpm
 # maps it per format.
 name: flo
 arch: ${ARCH}
@@ -30,8 +33,11 @@ contents:
   - src: packaging/flo.toml
     dst: /etc/flo/flo.toml
     type: config|noreplace
+    # It may hold [cluster] secret: readable by the service, not by everyone.
     file_info:
-      mode: 0644
+      mode: 0640
+      owner: root
+      group: flo
   - dst: /var/lib/flo
     type: dir
     file_info:
