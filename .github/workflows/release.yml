@@ -94,6 +94,22 @@ jobs:
             shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
           fi
 
+      - name: Setup Go
+        if: matrix.platform == 'linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Linux packages
+        if: matrix.platform == 'linux'
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          ARCH: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
+          for format in deb rpm; do "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p "$format"; done
+          for p in flo_*.deb flo-*.rpm; do sha256sum "$p" > "$p.sha256"; done
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -101,9 +117,21 @@ jobs:
           path: |
             flo-*.tar.gz
             flo-*.tar.gz.sha256
+            flo_*.deb
+            flo_*.deb.sha256
+            flo-*.rpm
+            flo-*.rpm.sha256
+
+  # Installs, runs, upgrades and removes the x86_64 packages before anything
+  # is published.
+  packages:
+    needs: build
+    uses: ./.github/workflows/packages.yml
+    with:
+      from_artifact: true
 
   release:
-    needs: build
+    needs: [build, packages]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     steps:
@@ -137,6 +165,10 @@ jobs:
           files: |
             artifacts/flo-*.tar.gz
             artifacts/flo-*.tar.gz.sha256
+            artifacts/flo_*.deb
+            artifacts/flo_*.deb.sha256
+            artifacts/flo-*.rpm
+            artifacts/flo-*.rpm.sha256
 
   # Points floruntime/homebrew-tap at this release. HOMEBREW_TAP_TOKEN may
   # write to that repo only; until it exists the job says so and passes, so

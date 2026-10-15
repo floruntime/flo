@@ -1,0 +1,52 @@
+# .deb and .rpm for each Linux release, built by release.yml with nfpm:
+#   cp zig-out/bin/flo flo
+#   VERSION=0.1.0-dev.12 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb
+# from the repository root. ARCH is the Go-style name (amd64, arm64); nfpm
+# maps it per format.
+name: flo
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: database
+priority: optional
+maintainer: Flo <hello@floruntime.dev>
+description: |
+  Flo: streams, KV, queues, time-series, actions, workflows and stream
+  processing in one server.
+vendor: Flo
+homepage: https://github.com/floruntime/flo
+license: Apache-2.0
+
+contents:
+  - src: flo
+    dst: /usr/bin/flo
+    file_info:
+      mode: 0755
+  - src: packaging/flo.service
+    dst: /usr/lib/systemd/system/flo.service
+    file_info:
+      mode: 0644
+  - src: packaging/flo.toml
+    dst: /etc/flo/flo.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - dst: /var/lib/flo
+    type: dir
+    file_info:
+      mode: 0750
+
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - adduser | passwd
+  rpm:
+    depends:
+      - shadow-utils
