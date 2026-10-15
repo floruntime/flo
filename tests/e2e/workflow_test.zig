@@ -1455,15 +1455,29 @@ test "e2e/workflow: E2E-5 history retrieval after workflow execution" {
     // Brief pause for execution
     @import("stdx").time.sleep(200 * std.time.ns_per_ms);
 
-    // Retrieve history
-    var history_result = try ctx.cli.run(&.{
-        "workflow", "history", "e2e5-history-run",
-    });
-    defer history_result.deinit();
+    // -o json must parse: event details carry the run's JSON input, so
+    // unescaped strings break it.
+    var history = try ctx.cli.run(&.{ "workflow", "history", "e2e5-history-run", "-o", "json" });
+    defer history.deinit();
+    try testing.expectEqual(@as(u8, 0), history.exit_code);
+    const events = try std.json.parseFromSlice(std.json.Value, testing.allocator, history.stdout, .{});
+    defer events.deinit();
+    try testing.expect(events.value.array.items.len >= 1);
+    for (events.value.array.items) |ev| try testing.expect(ev.object.get("type").? == .string);
 
-    try stdx.testing.assertSucceeded(history_result);
-    // History should contain at least workflow_started event
-    // (exact events depend on execution progress)
+    var runs = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "e2e5-history-wf", "-o", "json" });
+    defer runs.deinit();
+    try testing.expectEqual(@as(u8, 0), runs.exit_code);
+    const listed = try std.json.parseFromSlice(std.json.Value, testing.allocator, runs.stdout, .{});
+    defer listed.deinit();
+    try testing.expectEqual(@as(usize, 1), listed.value.array.items.len);
+    try testing.expectEqualStrings("e2e5-history-run", listed.value.array.items[0].object.get("run_id").?.string);
+
+    // No runs is an empty list, not a message.
+    var none = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "e2e5-no-such-wf", "-o", "json" });
+    defer none.deinit();
+    try testing.expectEqual(@as(u8, 0), none.exit_code);
+    try testing.expectEqualStrings("[]", std.mem.trim(u8, none.stdout, &std.ascii.whitespace));
 }
 
 test "e2e/workflow: E2E-5b history with limit parameter" {

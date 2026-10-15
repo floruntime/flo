@@ -457,7 +457,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
 
     // A run with no events still answers with a count of 0.
     const data = result.asRawData() orelse return outcome.malformed(ctx, "history response (empty)");
-    ctx.print("History for run: {s}\n", .{run_id});
+    if (output.getFormat(ctx) == .table) ctx.print("History for run: {s}\n", .{run_id});
     output.printWireList(ctx, data, "(no events)", &.{
         .{ .field = "type", .header = "TYPE", .field_type = .str_u16, .alignment = .left },
         .{ .field = "detail", .header = "DETAIL", .field_type = .str_u16, .alignment = .left },
@@ -496,10 +496,12 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 
     // No matching runs still answers with a count of 0.
     const data = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
-    if (name.len > 0) {
-        ctx.print("Runs for workflow: {s}\n", .{name});
-    } else {
-        ctx.print("Runs across all workflows:\n", .{});
+    if (output.getFormat(ctx) == .table) {
+        if (name.len > 0) {
+            ctx.print("Runs for workflow: {s}\n", .{name});
+        } else {
+            ctx.print("Runs across all workflows:\n", .{});
+        }
     }
     output.printWireList(ctx, data, "(no runs)", &.{
         .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
