@@ -447,8 +447,6 @@ pub const ActionsHandler = struct {
     /// the claimer may be another shard's thread, and nothing it keeps may
     /// point into a run that shard can change or free.
     const ClaimedTask = struct {
-        /// The handler holding the run, which `releaseClaim` puts back.
-        owner: *ActionsHandler,
         /// The answer body, owned by the claimer (the allocator it passed).
         body: []u8,
         /// The run id, inside `body`.
@@ -493,28 +491,9 @@ pub const ActionsHandler = struct {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .owner = self, .body = body, .run_id = body[2..][0..run.run_id_owned.len] };
+            return .{ .body = body, .run_id = body[2..][0..run.run_id_owned.len] };
         }
         return null;
-    }
-
-    /// Put a claimed run back to pending, as if never claimed: its task
-    /// couldn't be sent, and a running run with no worker never expires.
-    fn releaseClaim(self: *ActionsHandler, run_id: []const u8) void {
-        self.runs_mu.lock();
-        defer self.runs_mu.unlock();
-        var it = self.runs.iterator();
-        while (it.next()) |entry| {
-            const run = entry.value_ptr;
-            if (!std.mem.eql(u8, run.run_id_owned, run_id)) continue;
-            if (run.status != .running) return;
-            run.status = .pending;
-            run.started_at_ms = 0;
-            run.attempt -|= 1;
-            if (run.worker_id_owned) |w| self.allocator.free(w);
-            run.worker_id_owned = null;
-            return;
-        }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -1714,6 +1693,11 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
     var worker_labels: ?[]const u8 = null;
     var worker_ptr: ?*const WorkerRecord = null;
     if (worker_id.len > 0) {
+        // A worker drained while it waited takes no more work.
+        if (shard.worker_handler.isDraining(namespace, worker_id)) {
+            shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .bad_request, "worker is draining");
+            return true;
+        }
         if (shard.worker_handler.find(namespace, worker_id)) |w| {
             worker_labels = w.metadata_owned;
             worker_ptr = w;
@@ -1811,16 +1795,6 @@ fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task
 /// one. An invoke is a log entry, so it can be no larger than an entry's
 /// payload, whichever path proposed it.
 const MAX_INVOKE_VALUE = persistence.MAX_PERSIST_PAYLOAD;
-
-/// Put the run back to pending and have every shard's waiting workers try
-/// it on their next tick: a flag, not a wake now, since this can run inside
-/// a waiter's own resolution.
-pub fn releaseAndWake(shard: *Shard, task: ActionsHandler.ClaimedTask) void {
-    task.owner.releaseClaim(task.run_id);
-    if (shard.peer_mailboxes) |mailboxes| {
-        for (mailboxes) |mb| mb.wake.set(.action_invoked);
-    }
-}
 
 /// Extract the first task type (action name) from the action_await value.
 /// Wire format: [count:u32][type_len:u16][type_name]...
@@ -2422,7 +2396,8 @@ fn testRunning(h: *ActionsHandler, worker: []const u8) !void {
         const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
         try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
     }
-    _ = h.claimPendingRun("default", "echo", null, worker) orelse return error.NothingToClaim;
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, worker) orelse return error.NothingToClaim;
+    std.testing.allocator.free(task.body);
 }
 
 test "actions: a report for a run that has finished is refused, and a resent one is ok" {
@@ -2601,6 +2576,26 @@ test "actions: a claimed task owns its bytes, so the run can be freed while it i
 
     try testing.expectEqualStrings("act-1", task.run_id);
     try testing.expect(std.mem.endsWith(u8, task.body, "payload"));
+}
+
+test "actions: a claim with no memory for its task leaves the run as it was" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "payload", "", "", "") orelse return error.EncodeFailed;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try testing.expect(h.claimPendingRun(failing.allocator(), "default", "echo", null, "w-1") == null);
+    const run = h.runs.get("act-1").?;
+    try testing.expectEqual(ActionRunStatus.pending, run.status);
+    try testing.expect(run.worker_id_owned == null);
+    try testing.expectEqual(@as(u32, 0), run.attempt);
+
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
+    defer std.testing.allocator.free(task.body);
+    try testing.expectEqual(@as(u32, 1), h.runs.get("act-1").?.attempt);
 }
 
 test "encodeTaskAssignment: a large input is encoded whole, caller block included" {
