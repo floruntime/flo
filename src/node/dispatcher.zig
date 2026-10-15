@@ -92,6 +92,9 @@ pub fn opWrites(op: proto.OpCode) bool {
         .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,
+        // A worker's await claims a run, and claims live in the leader's
+        // memory: run on a follower it would hand out the follower's copy.
+        .action_await => true,
         .worker_register, .worker_heartbeat, .worker_deregister, .worker_drain => true,
         .workflow_create, .workflow_start, .workflow_signal, .workflow_cancel, .workflow_disable, .workflow_enable => true,
         .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_restore, .processing_rescale => true,
