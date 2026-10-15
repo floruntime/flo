@@ -1,0 +1,22 @@
+# Flo server configuration, read by the flo systemd service
+# (/usr/bin/flo server start --config /etc/flo/flo.toml).
+# Edits survive package upgrades.
+
+[server]
+data_dir = "/var/lib/flo"
+port = 9000
+# Clients aren't authenticated yet, so the client port listens on this host
+# only. To serve other hosts, set the address of a private interface (or
+# "0.0.0.0") and keep the port behind a firewall.
+bind = "127.0.0.1"
+
+[storage]
+durability = "async_flush"
+
+[dashboard]
+# The web console. Like the client port, it is unauthenticated.
+bind = "127.0.0.1"
+
+[metrics]
+# Prometheus /metrics.
+bind = "127.0.0.1"
