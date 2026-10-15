@@ -20,12 +20,16 @@ start() {
     else
         su -s /bin/sh flo -c '/usr/bin/flo server start --config /etc/flo/flo.toml >/tmp/flo-smoke.log 2>&1 & echo $! >/tmp/flo-smoke.pid'
     fi
+    up
+}
+# Wait until the server answers.
+up() {
     for _ in $(seq 1 50); do
-        flo kv get __probe -e 127.0.0.1:9000 >/dev/null 2>&1 && return 0
         flo kv set __probe 1 -e 127.0.0.1:9000 >/dev/null 2>&1 && return 0
         sleep 0.2
     done
     [ -f /tmp/flo-smoke.log ] && cat /tmp/flo-smoke.log
+    [ $systemd = yes ] && journalctl -u flo --no-pager | tail -20
     fail "the server did not start"
 }
 stop() {
@@ -64,7 +68,9 @@ echo "# edited" >> /etc/flo/flo.toml
 install
 grep -q '^# edited' /etc/flo/flo.toml || fail "the upgrade replaced the edited config"
 if [ $systemd = yes ]; then
+    # The upgrade restarted the running service.
     [ "$(systemctl is-active flo)" = active ] || fail "the service is not running after the upgrade"
+    up
 else
     stop
     start
