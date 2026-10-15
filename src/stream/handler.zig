@@ -2509,7 +2509,36 @@ test "stream handler: a read steps past an append it can't read" {
     try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
 }
 
-test "stream handler: a group read and a processing read skip and count an append in no tier" {
+test "stream handler: a group read skips and counts an append in no tier, and its cursor passes it" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // A readable append, then one the projection knows but no tier holds,
+    // last, so only the cursor moving past it shows it was passed.
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    _ = try handler.stream.appendToStreamAt(h, 999_999, 0, 4_000_000_000_000, 1, 10);
+
+    for ([_]u32{ 1, 0 }) |want| {
+        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
+        switch (r) {
+            .group_messages => |m| {
+                defer handler.freeResult(r);
+                try testing.expectEqual(want, std.mem.readInt(u32, m.data[0..4], .little));
+                if (want == 1) try testing.expect(std.mem.endsWith(u8, m.data, "ok\x00\x00\x00\x00"));
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
+}
+
+test "stream handler: a processing read skips and counts an append in no tier, and its cursor passes it" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 1 << 20, 0);
     defer partition.deinit();
@@ -2519,29 +2548,13 @@ test "stream handler: a group read and a processing read skip and count an appen
 
     const h = router.nameHash(router.namespaceHash("default"), "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
-    var vb: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
 
-    // A group read returns the readable append alone, and its cursor
-    // passes the lost one.
-    const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    switch (r) {
-        .group_messages => |m| {
-            defer handler.freeResult(r);
-            try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, m.data[0..4], .little));
-            try testing.expect(std.mem.endsWith(u8, m.data, "ok\x00\x00\x00\x00"));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
-
-    // A processing source the same, counting the lost append once.
     const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
     defer allocator.free(read.payloads);
     defer allocator.free(read.ids);
-    try testing.expectEqual(@as(usize, 1), read.payloads.len);
-    try testing.expectEqualStrings("ok", read.payloads[0]);
-    try testing.expect(read.last_id.greaterThan(lost));
+    try testing.expectEqual(@as(usize, 0), read.payloads.len);
+    // Passed, or a source would read it again forever.
+    try testing.expect(read.last_id.eql(lost));
     try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
 }
 
