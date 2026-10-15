@@ -10476,7 +10476,7 @@ test "Shard: an answer refused for a full write buffer is not taken for a missin
     try std.testing.expectEqual(@as(u64, 0), sm.snapshot().handler_no_answer);
 }
 
-test "Shard: a run whose task couldn't be sent goes to an await parked on another shard" {
+test "Shard: a worker's await runs where the worker is registered, so a labelled run finds its labels" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -10486,51 +10486,147 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     }
     const owner = &two.shards[0];
     const other = &two.shards[1];
-    // An action name shard 0 owns, so its register and invoke run there.
+    // The action on shard 0, the worker routed to shard 1.
     var name_buf: [16]u8 = undefined;
     const name = for (0..256) |i| {
         const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
         if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
     } else return error.NoLocalName;
+    var worker_buf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
+        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+    } else return error.NoLocalWorker;
 
     const ca = try TestClient.open(owner);
     defer _ = std.c.close(ca.pair[1]);
+    const cb = try TestClient.open(other);
+    defer _ = std.c.close(cb.pair[1]);
     var out: [4096]u8 = undefined;
-    const invoke_value: []const u8 = "\x00job";
+    const labels = "{\"gpu\":true}";
+
+    // The run requires the label; the worker has it.
+    var invoke_value: [64]u8 = undefined;
+    invoke_value[0] = 1;
+    std.mem.writeInt(u16, invoke_value[1..3], labels.len, .little);
+    @memcpy(invoke_value[3..][0..labels.len], labels);
+    @memcpy(invoke_value[3 + labels.len ..][0..3], "job");
     for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
         .{ .op = .action_register, .id = 1, .value = "" },
-        .{ .op = .action_invoke, .id = 2, .value = invoke_value },
+        .{ .op = .action_invoke, .id = 2, .value = invoke_value[0 .. 6 + labels.len] },
     }) |r| {
         const frame = try testRequest(r.op, r.id, name, r.value);
         defer std.testing.allocator.free(frame);
         _ = feedClient(ca.pair[1], owner, ca.conn.fd, frame);
         _ = owner.applyCommitted();
-        const resp = try nextAnswer(ca, owner, &out);
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
     }
+    var reg: [128]u8 = undefined;
+    var off: usize = 0;
+    reg[off] = @backingInt(@import("../worker/handler.zig").WorkerType.action);
+    std.mem.writeInt(u32, reg[off + 1 ..][0..4], 1, .little);
+    std.mem.writeInt(u16, reg[off + 5 ..][0..2], 1, .little);
+    off += 7;
+    std.mem.writeInt(u16, reg[off..][0..2], @intCast(name.len), .little);
+    @memcpy(reg[off + 2 ..][0..name.len], name);
+    off += 2 + name.len;
+    reg[off] = @backingInt(@import("../worker/handler.zig").ProcessKind.action);
+    reg[off + 1] = 1;
+    std.mem.writeInt(u16, reg[off + 2 ..][0..2], labels.len, .little);
+    @memcpy(reg[off + 4 ..][0..labels.len], labels);
+    off += 4 + labels.len;
+    const register = try testRequest(.worker_register, 3, worker, reg[0..off]);
+    defer std.testing.allocator.free(register);
+    _ = feedClient(cb.pair[1], other, cb.conn.fd, register);
+    _ = other.applyCommitted();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(cb, other, &out)).header.status);
 
-    // Claimed, as by an await whose task then couldn't be built. The
-    // invoke's own wake is spent before the other shard's await parks.
-    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
-    _ = other.drainInbox();
-    const cb = try TestClient.open(other);
-    defer _ = std.c.close(cb.pair[1]);
+    // The await arrives on shard 0; the worker's labels are on shard 1.
     var await_value: [64]u8 = undefined;
     std.mem.writeInt(u32, await_value[0..4], 1, .little);
     std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
     @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    const aw = try testRequest(.action_await, 4, worker, await_value[0 .. 6 + name.len]);
+    defer std.testing.allocator.free(aw);
+    _ = feedClient(ca.pair[1], owner, ca.conn.fd, aw);
+    _ = other.drainInbox();
+    _ = owner.drainInbox();
+    const resp = try nextAnswer(ca, owner, &out);
+    try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+}
+
+test "Shard: an await parked before its worker was drained is refused when work arrives" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        try std.testing.expect(s.applyCommitted());
+    }
+    const owner = &two.shards[0];
+    const other = &two.shards[1];
+    var name_buf: [16]u8 = undefined;
+    const name = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
+        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+    } else return error.NoLocalName;
+    var worker_buf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
+        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+    } else return error.NoLocalWorker;
+
+    const ca = try TestClient.open(owner);
+    defer _ = std.c.close(ca.pair[1]);
+    const cb = try TestClient.open(other);
+    defer _ = std.c.close(cb.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    const register_action = try testRequest(.action_register, 1, name, "");
+    defer std.testing.allocator.free(register_action);
+    _ = feedClient(ca.pair[1], owner, ca.conn.fd, register_action);
+    _ = owner.applyCommitted();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
+    const reg = [_]u8{ @backingInt(@import("../worker/handler.zig").WorkerType.action), 1, 0, 0, 0, 0, 0 };
+    for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
+        .{ .op = .worker_register, .id = 2, .value = &reg },
+    }) |r| {
+        const frame = try testRequest(r.op, r.id, worker, r.value);
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(cb.pair[1], other, cb.conn.fd, frame);
+        _ = other.applyCommitted();
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(cb, other, &out)).header.status);
+    }
+
+    // Parked with nothing to take, then drained.
+    var await_value: [64]u8 = undefined;
+    std.mem.writeInt(u32, await_value[0..4], 1, .little);
+    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
+    @memcpy(await_value[6..][0..name.len], name);
+    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
     other.flushToClient(cb.conn.fd);
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
+    const drain = try testRequest(.worker_drain, 4, worker, "");
+    defer std.testing.allocator.free(drain);
+    _ = feedClient(cb.pair[1], other, cb.conn.fd, drain);
+    try std.testing.expectEqual(@as(u64, 4), (try nextAnswer(cb, other, &out)).header.request_id);
 
-    @import("../actions/handler.zig").releaseAndWake(owner, task);
+    // A run arrives: the drained worker's await is refused, and the run waits.
+    const invoke = try testRequest(.action_invoke, 5, name, "\x00job");
+    defer std.testing.allocator.free(invoke);
+    _ = feedClient(ca.pair[1], owner, ca.conn.fd, invoke);
+    _ = owner.applyCommitted();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
     _ = other.drainInbox();
     const resp = try nextAnswer(cb, other, &out);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
-    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+    var runs = owner.actions_handler.runs.valueIterator();
+    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, runs.next().?.status);
 }
 
 test "Shard: a failed attempt sent back to pending wakes an await parked on another shard" {
@@ -10565,7 +10661,8 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     }
 
     // Worker w0 holds the run; w1 then waits for work on the other shard.
-    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
+    const task = owner.actions_handler.claimPendingRun(std.testing.allocator, "default", name, null, "w0") orelse return error.NoRun;
+    defer std.testing.allocator.free(task.body);
     var run_id_buf: [64]u8 = undefined;
     const run_id = run_id_buf[0..task.run_id.len];
     @memcpy(run_id, task.run_id);
@@ -10576,7 +10673,13 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     std.mem.writeInt(u32, await_value[0..4], 1, .little);
     std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
     @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    // A worker registered on the other shard, where its await runs.
+    var worker_buf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
+        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+    } else return error.NoLocalWorker;
+    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
     other.flushToClient(cb.conn.fd);

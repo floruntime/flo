@@ -147,7 +147,7 @@ pub const WorkerHandler = struct {
         dispatcher.registerWithRoute(.worker_info, dispatchWorkerCmd, preRouteByWorker);
     }
 
-    fn preRouteByWorker(req: Request) ?u64 {
+    pub fn preRouteByWorker(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
         return router.hashKeyWithNamespace(req.namespace, req.key);
     }

@@ -40,6 +40,7 @@ const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
 const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
 const WorkerRecord = @import("../worker/handler.zig").WorkerRecord;
+const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
@@ -192,10 +193,10 @@ pub const ActionsHandler = struct {
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
-        // action_await is NOT pre-routed: workers register multiple action names
-        // that may hash to different shards. Instead, tryClaimAnyAction checks all
-        // peer shards to find pending runs regardless of which shard created them.
-        dispatcher.register(.action_await, dispatchActionAwait);
+        // An await runs where its worker is registered, so the worker's
+        // record (labels, draining, actions) is read on its own shard; the
+        // runs it claims live on their actions' shards.
+        dispatcher.registerWithRoute(.action_await, dispatchActionAwait, WorkerHandler.preRouteByWorker);
         dispatcher.registerWithRoute(.action_complete, dispatchActionTaskCmd, preRouteByActionValue);
         dispatcher.registerWithRoute(.action_fail, dispatchActionTaskCmd, preRouteByActionValue);
         dispatcher.registerWithRoute(.action_touch, dispatchActionTaskCmd, preRouteByActionValue);
@@ -301,15 +302,17 @@ pub const ActionsHandler = struct {
         }
     }
 
-    /// The run update applied: the worker's stats on the shard that owns
-    /// its registration, then ok.
+    /// The run update applied: the worker's stats, then ok. The stats are
+    /// counted only when the worker is registered on this shard: another
+    /// shard's registry is that shard's thread's to change.
     fn respondTask(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         const action_name = parseLeadingName(req.value);
-        const ws = resolveWorkerShard(shard, req.namespace, req.key);
-        if (op == .action_complete) ws.worker_handler.recordCompletion(req.namespace, req.key, action_name) else ws.worker_handler.recordFailure(req.namespace, req.key, action_name);
+        if (resolveWorkerShard(shard, req.namespace, req.key) == shard) {
+            if (op == .action_complete) shard.worker_handler.recordCompletion(req.namespace, req.key, action_name) else shard.worker_handler.recordFailure(req.namespace, req.key, action_name);
+        }
         shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
@@ -342,18 +345,10 @@ pub const ActionsHandler = struct {
             return;
         }
 
-        // Look up worker metadata from worker registry for label matching.
-        // worker_register is pre-routed by hash(namespace, worker_id), so the
-        // registration may live on a different shard than the action_await caller.
+        // The worker's labels, for runs that require some.
         const namespace = if (req.namespace.len == 0) "default" else req.namespace;
         const worker_labels: ?[]const u8 = if (worker_id.len > 0) blk: {
-            const wh = router.hashKeyWithNamespace(namespace, worker_id);
-            const wt = shard.router.route(wh);
-            const ws: *Shard = switch (wt) {
-                .local => shard,
-                .shard => |t| if (shard.peer_shards) |peers| (if (t.shard_id < peers.len) peers[t.shard_id] else shard) else shard,
-            };
-            break :blk if (ws.worker_handler.find(namespace, worker_id)) |w| w.metadata_owned else null;
+            break :blk if (shard.worker_handler.find(namespace, worker_id)) |w| w.metadata_owned else null;
         } else null;
 
         // Try to claim a pending run for ANY registered action, not just the first.
@@ -404,7 +399,7 @@ pub const ActionsHandler = struct {
         var it = TaskTypeIterator.init(req.value);
         while (it.next()) |name| {
             const target = resolveActionShard(shard, namespace, name);
-            if (target.actions_handler.claimPendingRun(namespace, name, worker_labels, worker_id)) |task| {
+            if (target.actions_handler.claimPendingRun(shard.allocator, namespace, name, worker_labels, worker_id)) |task| {
                 shard.worker_handler.recordTaskAssigned(namespace, worker_id);
                 answerTaskAssignment(shard, conn, req.header.request_id, task);
                 return true;
@@ -448,22 +443,21 @@ pub const ActionsHandler = struct {
         };
     }
 
-    /// Claimed task info returned by claimPendingRun.
+    /// A claimed run's task, built while the run's shard held its lock:
+    /// the claimer may be another shard's thread, and nothing it keeps may
+    /// point into a run that shard can change or free.
     const ClaimedTask = struct {
-        /// The handler holding the run, which `releaseClaim` puts back.
-        owner: *ActionsHandler,
+        /// The answer body, owned by the claimer (the allocator it passed).
+        body: []u8,
+        /// The run id, inside `body`.
         run_id: []const u8,
-        action_name: []const u8,
-        input: ?[]const u8,
-        created_at_ms: i64,
-        caller_run_id: ?[]const u8 = null,
-        caller_workflow_name: ?[]const u8 = null,
-        attempt: u32 = 1,
     };
 
-    /// Try to claim a pending run for the given action. Returns the run_id and input if found.
-    /// If worker_labels is provided, only claims runs whose required labels match.
-    pub fn claimPendingRun(self: *ActionsHandler, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
+    /// Try to claim a pending run for the given action, its task built
+    /// with `allocator`. If worker_labels is provided, only claims runs
+    /// whose required labels match. With no memory for the task, nothing
+    /// is claimed.
+    pub fn claimPendingRun(self: *ActionsHandler, allocator: std.mem.Allocator, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ClaimedTask {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
 
@@ -484,6 +478,10 @@ pub const ActionsHandler = struct {
                 }
             }
 
+            const body = encodeTaskAssignment(allocator, run, run.attempt + 1) catch {
+                log.err("action run '{s}' left pending: no memory to build its task", .{run.run_id_owned});
+                return null;
+            };
             run.status = .running;
             // The claim is off the log: its time is this node's clock until
             // claims are logged with stamps of their own.
@@ -493,28 +491,9 @@ pub const ActionsHandler = struct {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
                 run.worker_id_owned = self.allocator.dupe(u8, worker_id) catch null;
             }
-            return .{ .owner = self, .run_id = run.run_id_owned, .action_name = run.action_name_owned, .input = run.input_owned, .created_at_ms = run.created_at_ms, .caller_run_id = run.caller_run_id_owned, .caller_workflow_name = run.caller_workflow_name_owned, .attempt = run.attempt };
+            return .{ .body = body, .run_id = body[2..][0..run.run_id_owned.len] };
         }
         return null;
-    }
-
-    /// Put a claimed run back to pending, as if never claimed: its task
-    /// couldn't be sent, and a running run with no worker never expires.
-    fn releaseClaim(self: *ActionsHandler, run_id: []const u8) void {
-        self.runs_mu.lock();
-        defer self.runs_mu.unlock();
-        var it = self.runs.iterator();
-        while (it.next()) |entry| {
-            const run = entry.value_ptr;
-            if (!std.mem.eql(u8, run.run_id_owned, run_id)) continue;
-            if (run.status != .running) return;
-            run.status = .pending;
-            run.started_at_ms = 0;
-            run.attempt -|= 1;
-            if (run.worker_id_owned) |w| self.allocator.free(w);
-            run.worker_id_owned = null;
-            return;
-        }
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -1709,26 +1688,17 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
     const action_name = full_key[ns_len + 1 ..][0..action_name_len];
     const worker_id = full_key[ns_len + 1 + action_name_len ..];
 
-    // Look up worker metadata and process list from the worker registry.
-    // worker_register is pre-routed by hash(namespace, worker_id), so the
-    // registration may live on a different shard than the action_await waiter.
-    // We must check the correct shard via peer_shards.
+    // The worker's labels and actions: the await was routed to the shard
+    // its registration lives on.
     var worker_labels: ?[]const u8 = null;
     var worker_ptr: ?*const WorkerRecord = null;
     if (worker_id.len > 0) {
-        // Find the shard that owns this worker's registration
-        const worker_hash = router.hashKeyWithNamespace(namespace, worker_id);
-        const worker_target = shard.router.route(worker_hash);
-        const worker_shard: *Shard = switch (worker_target) {
-            .local => shard,
-            .shard => |t| blk: {
-                if (shard.peer_shards) |peers| {
-                    if (t.shard_id < peers.len) break :blk peers[t.shard_id];
-                }
-                break :blk shard;
-            },
-        };
-        if (worker_shard.worker_handler.find(namespace, worker_id)) |w| {
+        // A worker drained while it waited takes no more work.
+        if (shard.worker_handler.isDraining(namespace, worker_id)) {
+            shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .bad_request, "worker is draining");
+            return true;
+        }
+        if (shard.worker_handler.find(namespace, worker_id)) |w| {
             worker_labels = w.metadata_owned;
             worker_ptr = w;
         }
@@ -1760,18 +1730,20 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
 /// O(1) — no peer scan needed since action_invoke is pre-routed by action name.
 fn claimFromTargetShard(shard: *Shard, namespace: []const u8, action_name: []const u8, worker_labels: ?[]const u8, worker_id: []const u8) ?ActionsHandler.ClaimedTask {
     const target = ActionsHandler.resolveActionShard(shard, namespace, action_name);
-    return target.actions_handler.claimPendingRun(namespace, action_name, worker_labels, worker_id);
+    return target.actions_handler.claimPendingRun(shard.allocator, namespace, action_name, worker_labels, worker_id);
 }
 
 /// A task assignment's body:
 ///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32]
 ///   [has_caller:u8]([caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf])?[payload]
 /// Sized exactly and allocated, so an assignment is sent whole or not at all.
-fn encodeTaskAssignment(allocator: std.mem.Allocator, task: ActionsHandler.ClaimedTask) ![]u8 {
-    const payload = task.input orelse "";
-    const caller_run_id = task.caller_run_id orelse "";
-    const caller_wf_name = task.caller_workflow_name orelse "";
-    const has_caller: u8 = if (task.caller_run_id != null) 1 else 0;
+fn encodeTaskAssignment(allocator: std.mem.Allocator, run: *const ActionsHandler.RunRecord, attempt: u32) ![]u8 {
+    comptime std.debug.assert(MAX_INVOKE_VALUE + run_id_mod.MAX_ID_LEN + 64 <= shard_mod.MAX_REQUEST_SIZE);
+    const task = .{ .run_id = run.run_id_owned, .action_name = run.action_name_owned, .created_at_ms = run.created_at_ms, .attempt = attempt };
+    const payload = run.input_owned orelse "";
+    const caller_run_id = run.caller_run_id_owned orelse "";
+    const caller_wf_name = run.caller_workflow_name_owned orelse "";
+    const has_caller: u8 = if (run.caller_run_id_owned != null) 1 else 0;
     const caller_extra: usize = if (has_caller == 1) (2 + caller_run_id.len + 2 + caller_wf_name.len) else 0;
     const buf = try allocator.alloc(u8, 2 + task.run_id.len + 2 + task.action_name.len + 8 + 4 + 1 + caller_extra + payload.len);
     var pos: usize = 0;
@@ -1801,6 +1773,7 @@ fn encodeTaskAssignment(allocator: std.mem.Allocator, task: ActionsHandler.Claim
         pos += caller_wf_name.len;
     }
     @memcpy(buf[pos..], payload);
+    std.debug.assert(buf.len <= shard_mod.MAX_REQUEST_SIZE);
     return buf;
 }
 
@@ -1808,54 +1781,20 @@ fn encodeTaskAssignment(allocator: std.mem.Allocator, task: ActionsHandler.Claim
 /// connection like any answer: delivering it as deferred as well would let
 /// the dispatcher, seeing no answer, send a second one under the same id.
 fn answerTaskAssignment(shard: *Shard, conn: *Connection, request_id: u64, task: ActionsHandler.ClaimedTask) void {
-    const body = encodeForAnswer(shard, task) orelse {
-        shard.sendErrorResponse(conn, request_id, .internal_error, TASK_NOT_SENT);
-        return;
-    };
-    defer shard.allocator.free(body);
-    shard.sendOkResponse(conn, request_id, body);
+    defer shard.allocator.free(task.body);
+    shard.sendOkResponse(conn, request_id, task.body);
 }
 
 /// Deliver a task to a parked await, whose request was answered as deferred.
 fn deliverTaskAssignment(shard: *Shard, reply_to: ReplyTo, request_id: u64, task: ActionsHandler.ClaimedTask) void {
-    const body = encodeForAnswer(shard, task) orelse {
-        shard.deliverDeferredError(reply_to, request_id, .internal_error, TASK_NOT_SENT);
-        return;
-    };
-    defer shard.allocator.free(body);
-    shard.deliverDeferredOk(reply_to, request_id, body);
+    defer shard.allocator.free(task.body);
+    shard.deliverDeferredOk(reply_to, request_id, task.body);
 }
 
 /// Largest invoke entry value; every run, and so every task, is built from
 /// one. An invoke is a log entry, so it can be no larger than an entry's
 /// payload, whichever path proposed it.
 const MAX_INVOKE_VALUE = persistence.MAX_PERSIST_PAYLOAD;
-
-const TASK_NOT_SENT = "internal error: the task could not be sent; it is pending again";
-
-/// The task's answer body, or null with the claim released when there is
-/// no memory to build it. A task holds its invoke value's fields plus the
-/// run id and a few fixed ones, so it always fits one answer: no run is
-/// left that can never be sent.
-fn encodeForAnswer(shard: *Shard, task: ActionsHandler.ClaimedTask) ?[]u8 {
-    comptime std.debug.assert(MAX_INVOKE_VALUE + run_id_mod.MAX_ID_LEN + 64 <= shard_mod.MAX_REQUEST_SIZE);
-    const body = encodeTaskAssignment(shard.allocator, task) catch {
-        releaseAndWake(shard, task);
-        return null;
-    };
-    std.debug.assert(body.len <= shard_mod.MAX_REQUEST_SIZE);
-    return body;
-}
-
-/// Put the run back to pending and have every shard's waiting workers try
-/// it on their next tick: a flag, not a wake now, since this can run inside
-/// a waiter's own resolution.
-pub fn releaseAndWake(shard: *Shard, task: ActionsHandler.ClaimedTask) void {
-    task.owner.releaseClaim(task.run_id);
-    if (shard.peer_mailboxes) |mailboxes| {
-        for (mailboxes) |mb| mb.wake.set(.action_invoked);
-    }
-}
 
 /// Extract the first task type (action name) from the action_await value.
 /// Wire format: [count:u32][type_len:u16][type_name]...
@@ -2457,7 +2396,8 @@ fn testRunning(h: *ActionsHandler, worker: []const u8) !void {
         const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
         try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
     }
-    _ = h.claimPendingRun("default", "echo", null, worker) orelse return error.NothingToClaim;
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, worker) orelse return error.NothingToClaim;
+    std.testing.allocator.free(task.body);
 }
 
 test "actions: a report for a run that has finished is refused, and a resent one is ok" {
@@ -2620,21 +2560,62 @@ test "actions: an action name holding a NUL has no registry key" {
     try std.testing.expect(ActionsHandler.defKey(&buf, "", "b\x00x") == null);
 }
 
+test "actions: a claimed task owns its bytes, so the run can be freed while it is sent" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "payload", "", "", "") orelse return error.EncodeFailed;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
+    defer std.testing.allocator.free(task.body);
+    // The run's shard frees it (a delete applying) before the task is sent.
+    const gone = h.runs.fetchRemove("act-1").?;
+    h.freeRun(gone.value);
+
+    try testing.expectEqualStrings("act-1", task.run_id);
+    try testing.expect(std.mem.endsWith(u8, task.body, "payload"));
+}
+
+test "actions: a claim with no memory for its task leaves the run as it was" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "payload", "", "", "") orelse return error.EncodeFailed;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try testing.expect(h.claimPendingRun(failing.allocator(), "default", "echo", null, "w-1") == null);
+    const run = h.runs.get("act-1").?;
+    try testing.expectEqual(ActionRunStatus.pending, run.status);
+    try testing.expect(run.worker_id_owned == null);
+    try testing.expectEqual(@as(u32, 0), run.attempt);
+
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
+    defer std.testing.allocator.free(task.body);
+    try testing.expectEqual(@as(u32, 1), h.runs.get("act-1").?.attempt);
+}
+
 test "encodeTaskAssignment: a large input is encoded whole, caller block included" {
     // Past the old 8 KiB buffer, which sent the run id alone as the body.
     const input = try std.testing.allocator.alloc(u8, 65_536);
     defer std.testing.allocator.free(input);
     for (input, 0..) |*b, i| b.* = @truncate(i);
-    const body = try encodeTaskAssignment(std.testing.allocator, .{
-        .owner = undefined,
-        .run_id = "run-1",
-        .action_name = "act",
-        .input = input,
+    const run: ActionsHandler.RunRecord = .{
+        .run_id_owned = "run-1",
+        .action_name_owned = "act",
+        .namespace_owned = "default",
+        .input_owned = input,
+        .caller_run_id_owned = "wf-run",
+        .caller_workflow_name_owned = "wf",
+        .status = .pending,
         .created_at_ms = 7,
-        .caller_run_id = "wf-run",
-        .caller_workflow_name = "wf",
-        .attempt = 2,
-    });
+        .started_at_ms = null,
+        .completed_at_ms = null,
+    };
+    const body = try encodeTaskAssignment(std.testing.allocator, &run, 2);
     defer std.testing.allocator.free(body);
 
     var pos: usize = 0;
