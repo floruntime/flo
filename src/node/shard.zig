@@ -231,14 +231,26 @@ const ShardIo = struct {
             of(r).stoppedLeading(message);
         }
     };
-
-    comptime {
-        std.debug.assert(@sizeOf(ShardIo) == 0);
-        std.debug.assert(@sizeOf(Host) == 0);
-    }
 };
 
 const Replica = replica_mod.Replica(ShardIo);
+
+comptime {
+    // A pointer held by the replica would outlive the shard's move after
+    // init. ShardIo is never instantiated, so what could creep in is a
+    // pointer field on the replica itself; slices into the shard's buffers
+    // are fine. (A container-level `var` in ShardIo can't be seen here: don't
+    // add one.)
+    const fields = @typeInfo(Replica).@"struct";
+    for (fields.field_names, fields.field_types) |name, F| {
+        const T = switch (@typeInfo(F)) {
+            .optional => |o| o.child,
+            else => F,
+        };
+        const info = @typeInfo(T);
+        if (info == .pointer and info.pointer.size == .one) @compileError("Replica." ++ name ++ " holds a pointer; the shard moves after init, so reach it through Io.Host");
+    }
+}
 
 pub const Shard = struct {
     /// Shard index (0..shard_count-1).
