@@ -2394,7 +2394,7 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "could not hold the request for the leader");
             return;
         };
-        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
+        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .wait_ms = blockingWait(req) orelse 0, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
         self.next_forward_id +%= 1;
         if (self.next_forward_id == 0) self.next_forward_id = FORWARD_ID_FIRST;
         self.forward_count += 1;
@@ -2468,7 +2468,7 @@ pub const Shard = struct {
                     // Gone, or gone and back between two ticks: either way the
                     // link it went over is not the one up now.
                     self.finishForward(f, .unavailable, "unavailable: lost the link to the leader — write may still apply");
-                } else if (now -| f.sent_ms >= SENT_FORWARD_BACKSTOP_MS) {
+                } else if (now -| f.sent_ms >= SENT_FORWARD_BACKSTOP_MS + f.wait_ms) {
                     self.finishForward(f, .unavailable, "unavailable: no answer from the leader — write may still apply");
                 }
                 continue;
@@ -5466,6 +5466,9 @@ const Forward = struct {
     sent_term: u64 = 0,
     sent_session: u64 = 0,
     sent_ms: u64 = 0,
+    /// How long the request may wait for its data on the leader (a
+    /// blocking read), which the backstop adds to its own wait.
+    wait_ms: u64 = 0,
     deadline_ms: u64 = 0,
     /// The leader's answer, held until `applied_by` is applied here.
     reply: ?[]u8 = null,
@@ -5476,8 +5479,13 @@ const FORWARD_SLOTS: usize = 1024;
 /// answer is held for this node to catch up to it.
 pub const FORWARD_TIMEOUT_MS: u64 = 5000;
 /// A write sent to a leader that stays linked and in office but never
-/// answers is answered after this: the last guard, for a leader that is
-/// wedged. Everything else that ends a sent write answers sooner.
+/// answers is answered after this, past any time it may block there: the
+/// last guard, for a leader that is wedged. Everything else that ends a
+/// sent write answers sooner. Cut off sooner, a blocking read would leave
+/// its waiter on the leader to take a message nobody receives. That can
+/// still happen when it does fire (the leader is wedged) or when the
+/// client closes and its forwards are dropped: closing it needs a cancel
+/// sent to the leader's waiter.
 pub const SENT_FORWARD_BACKSTOP_MS: u64 = 60_000;
 /// A forwarded write's frame: its id, then the length of the fields carried
 /// beside the client's bytes (none yet), then those fields, then the bytes.
@@ -8195,6 +8203,27 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     resp = try proto.Response.parse(out[0..@intCast(n)]);
     try std.testing.expectEqualStrings("unavailable: no answer from the leader — write may still apply", (try resp.refused()).message);
     // Sent to a leader that is gone: it may still apply.
+    try std.testing.expectEqual(proto.Ran.unknown, (try resp.refused()).ran);
+
+    // A blocking dequeue may wait on the leader as long as it asked to:
+    // the backstop runs from the end of that wait, not from its start.
+    var opts: [8]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts);
+    try ob.addU32(.block_ms, 90_000);
+    shard.runRequest(conn, testReq(.queue_dequeue, header.request_id, "", "q", "", ob.getOptions()), .client);
+    shard.forwards[0].sent_to = 2;
+    shard.forwards[0].sent_term = raft.current_term;
+    shard.forwards[0].sent_session = 5;
+    shard.forwards[0].sent_ms = now;
+    shard.sweepForwards(now + SENT_FORWARD_BACKSTOP_MS);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    shard.sweepForwards(now + SENT_FORWARD_BACKSTOP_MS + 90_000 - 1);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    shard.sweepForwards(now + SENT_FORWARD_BACKSTOP_MS + 90_000);
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    n = std.c.read(pair[1], &out, out.len);
+    resp = try proto.Response.parse(out[0..@intCast(n)]);
+    try std.testing.expectEqualStrings("unavailable: no answer from the leader — write may still apply", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.unknown, (try resp.refused()).ran);
     rn.linked_ids[0].store(0, .release);
     rn.linked_sessions[0].store(0, .release);
