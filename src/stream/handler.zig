@@ -217,6 +217,8 @@ pub const StreamHandler = struct {
 
         // Track namespace data for stream create operations
         const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
+        // A nacked entry is ready for the stream's parked group reads.
+        if (op == .stream_group_nack and cmd_result == .ok) shard.waiter_pool.notify(.stream_group_read, req.key, shard_mod.wakeGroupReadWaiter, @ptrCast(shard));
         if (op == .stream_create) {
             switch (cmd_result) {
                 .ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
@@ -353,8 +355,9 @@ pub const StreamHandler = struct {
                 },
             }
 
-            // Nothing deliverable now, so the next deliverable record is the
-            // next append: wake when the stream's last id moves past this one.
+            // Nothing deliverable now: wake when the stream's last id moves
+            // past this one, or when a nack or the sweeper makes a pending
+            // entry ready (`wakeGroupReadWaiter`).
             // (A wildcard key is already rejected by handleCommand above, so the
             // key here is always a single concrete stream.)
             const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
@@ -1103,28 +1106,69 @@ pub const StreamHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
 
-        // The reply is built before the pending list takes its records, so a
-        // reply that can't be built leaves them for the next read.
-        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const count = self.stream.groupPeek(group_name, name_hash, capped, buf[0..capped]) catch |err| {
+        // Ready pending entries (nacked, or idle past the ack timeout) come
+        // first, then new records past the cursor. The reply is built before
+        // the pending list changes, so a reply that can't be built leaves
+        // everything for the next read.
+        var ready_ids: [MAX_READ_BATCH]StreamID = undefined;
+        const ready_n = self.stream.groupPeekReady(group_name, ready_ids[0..capped]) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
         };
+        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
+        const found = self.stream.readStreamByIds(name_hash, ready_ids[0..ready_n], buf[0..ready_n]);
+        // Found records keep the ids' order; the ids without one were trimmed.
+        var gone: [MAX_READ_BATCH]StreamID = undefined;
+        var gone_n: usize = 0;
+        var j: usize = 0;
+        for (ready_ids[0..ready_n]) |id| {
+            if (j < found and buf[j].id.eql(id)) {
+                j += 1;
+            } else {
+                gone[gone_n] = id;
+                gone_n += 1;
+            }
+        }
+        const fresh = self.stream.groupPeek(group_name, name_hash, capped - found, buf[found..capped]) catch |err| {
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
+        };
+        const count = found + fresh;
         // A group's cursor passes whole appends, so nothing is left out.
         var readable: [MAX_READ_BATCH]bool = undefined;
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
-        // Only appends the reply carries go pending; the cursor passes the
+        // Only appends the reply carries are delivered; the cursor passes the
         // rest too, or the next read would meet them again.
+        // A ready entry whose payload can't be read can never be sent:
+        // dropped with the trimmed ones, or it would lead every read.
+        var served: [MAX_READ_BATCH]StreamID = undefined;
+        var served_n: usize = 0;
+        for (buf[0..found], readable[0..found]) |rec, ok| {
+            if (ok) {
+                served[served_n] = rec.id;
+                served_n += 1;
+            } else {
+                gone[gone_n] = rec.id;
+                gone_n += 1;
+            }
+        }
         var sent: [MAX_READ_BATCH]StreamRecord = undefined;
         var sent_n: usize = 0;
-        for (buf[0..count], readable[0..count]) |rec, ok| if (ok) {
+        for (buf[found..count], readable[found..count]) |rec, ok| if (ok) {
             sent[sent_n] = rec;
             sent_n += 1;
         };
-        const through = if (count > 0) stream_mod.lastRecordOf(buf[count - 1]) else StreamID.MIN;
+        self.stream.groupServeReady(group_name, consumer_id, served[0..served_n], gone[0..gone_n], now_ms) catch |err| {
+            self.allocator.free(data);
+            return switch (err) {
+                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
+            };
+        };
+        const through = if (fresh > 0) stream_mod.lastRecordOf(buf[count - 1]) else StreamID.MIN;
         self.stream.groupDeliverRecords(group_name, consumer_id, sent[0..sent_n], through, now_ms) catch |err| {
             self.allocator.free(data);
             return switch (err) {
@@ -1214,9 +1258,8 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         }
 
-        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         if (id_count > 0) {
-            _ = self.stream.groupNack(group_name, ids[0..id_count], now_ms) catch |err| {
+            _ = self.stream.groupNack(group_name, ids[0..id_count]) catch |err| {
                 return switch (err) {
                     error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
                 };
@@ -1376,7 +1419,7 @@ pub const StreamHandler = struct {
 
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
-        _ = reader.readLengthPrefixed(u16); // consumer
+        const consumer = reader.readLengthPrefixed(u16) orelse "";
 
         // Read StreamIDs to touch
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1395,7 +1438,7 @@ pub const StreamHandler = struct {
         const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         var touched_count: u32 = 0;
         if (id_count > 0) {
-            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], now_ms) catch |err| {
+            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], consumer, now_ms) catch |err| {
                 return switch (err) {
                     error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
                 };
@@ -2506,6 +2549,44 @@ test "stream handler: a group read that can't build its answer leaves nothing pe
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "stream handler: a ready entry that can't be read is dropped, not left to lead every read" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // An append the projection knows but whose payload is in no tier, then
+    // one that reads.
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
+    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
+
+    // The lost append is pending and ready, as if delivered before it was lost.
+    var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group = resolveGroupName(&q_buf, "default", "s1", "cg1").?;
+    var rec: [1]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 1), handler.stream.readStreamByIds(h, &.{lost}, &rec));
+    try handler.stream.groupDeliverRecords(group, "c1", &rec, lost, 1);
+    _ = try handler.stream.groupNack(group, &.{lost});
+
+    var ob: [32]u8 = undefined;
+    var b = OptionsBuilder.init(&ob);
+    try b.addU32(.count, 1);
+    for (0..2) |_| {
+        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), b.getOptions()));
+        handler.freeResult(r);
+    }
+    // The first read dropped it; the second served the readable one.
+    var pel: [4]PendingEntry = undefined;
+    const n = try handler.stream.groupPending(group, null, &pel);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(!pel[0].id.eql(lost));
 }
 
 test "stream handler: read honors count" {
