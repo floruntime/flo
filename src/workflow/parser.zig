@@ -446,7 +446,7 @@ fn parseRunStep(allocator: Allocator, obj: JsonValue, d: D) ParseError!Step {
     const retry: ?RetryPolicy = if (try optObject(d, obj, "retry")) |r| blk: {
         // A plan's executors each retry by their own policy; a step-level
         // retry on top would run the whole plan again.
-        if (mem.startsWith(u8, target, "@plan/")) return d.fail(ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own", .{});
+        if (mem.startsWith(u8, target, "@plan/")) return d.fail(ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own policy", .{});
         const mark = d.push("retry");
         defer d.pop(mark);
         break :blk try parseRetryPolicy(r, d);
@@ -1225,7 +1225,7 @@ test "parseWorkflow: a retry on a plan step is refused" {
         \\{ "kind": "Workflow", "name": "w", "version": "1",
         \\  "plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "retry": { "max_attempts": 2 } } ] } },
         \\  "start": { "run": "@plan/p", "retry": { "max_attempts": 3 }, "transitions": { "success": "flo.Completed" } } }
-    , ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own at start");
+    , ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own policy at start");
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
