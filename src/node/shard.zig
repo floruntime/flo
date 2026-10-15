@@ -8976,7 +8976,7 @@ test "Shard: a step-down answers parked dequeues unavailable and leaves parked w
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .queue_dequeue, .reply_to = conn.replyTo(), .request_id = 30, .key = "jobs", .min_version = q_hash, .timeout_ms = 60_000 }));
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 31, .key = "k", .min_version = 0, .timeout_ms = 60_000 }));
 
-    shard.leadershipLost("test");
+    shard.replica.leadershipLost("test");
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.queue_dequeue));
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.kv_get));
 
