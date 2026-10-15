@@ -14,8 +14,6 @@
 //!
 //! Window modes:
 //!   - **Running** (no `window` config) — emit updated aggregate on every record
-//!   - **Tumbling time** (`window: tumbling`, `window_size: <seconds>`) —
-//!     accumulate per-key, emit on watermark when window closes
 //!   - **Count-based** (`window: count`, `window_size: <n>`) —
 //!     accumulate per-key, emit after every N records
 //!
@@ -33,13 +31,6 @@
 //!     function: sum
 //!     field: "$.amount"
 //!
-//!   # Count records per key in 60-second tumbling windows
-//!   - type: aggregate
-//!     name: event-counter
-//!     function: count
-//!     window: tumbling
-//!     window_size: 60
-//!
 //!   # Average every 100 records per key
 //!   - type: aggregate
 //!     name: batch-avg
@@ -55,8 +46,6 @@ const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
-const log = @import("stdx").log;
 
 pub const JsonAggregateOperator = struct {
     name: []const u8,
@@ -107,8 +96,6 @@ pub const JsonAggregateOperator = struct {
     pub const WindowConfig = union(enum) {
         /// Running aggregate — emit on every input record
         none,
-        /// Tumbling time window — emit when watermark closes window (ms)
-        tumbling_time: i64,
         /// Count-based window — emit after N records per key
         tumbling_count: u64,
     };
@@ -118,11 +105,9 @@ pub const JsonAggregateOperator = struct {
         count: u64 = 0,
         min: f64 = std.math.floatMax(f64),
         max: f64 = -std.math.floatMax(f64),
-        window_start_ms: i64 = 0,
 
         fn reset(self: *Group) void {
-            const ws = self.window_start_ms;
-            self.* = .{ .window_start_ms = ws };
+            self.* = .{};
         }
 
         fn addValue(self: *Group, val: f64) void {
@@ -214,33 +199,21 @@ pub const JsonAggregateOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = closeFn,
-        .snapshotState = snapshotState,
-        .restoreState = restoreState,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        log.info("aggregate processElement: entering, func={s} value_len={d} key_len={d}", .{ self.function.toStr(), rec.value.len, rec.key.len });
-
         // Extract numeric value (for non-count functions)
         const numeric_val: ?f64 = if (self.function != .count)
-            self.extractNumericField(rec.value) orelse {
-                log.info("aggregate processElement: extractNumericField returned null, skipping", .{});
-                return; // skip non-numeric records
-            }
+            self.extractNumericField(rec.value) orelse return // skip non-numeric records
         else
             null;
 
-        log.info("aggregate processElement: numeric_val extracted", .{});
-
         // Get or create group for this key
-        const group = try self.getOrCreateGroup(rec.key, rec.event_time_ms);
-
-        log.info("aggregate processElement: got group, updating accumulator", .{});
+        const group = try self.getOrCreateGroup(rec.key);
 
         // Update accumulator
         if (numeric_val) |val| {
@@ -248,8 +221,6 @@ pub const JsonAggregateOperator = struct {
         } else {
             group.addCount();
         }
-
-        log.info("aggregate processElement: emitting result", .{});
 
         // Emit based on window mode
         switch (self.window) {
@@ -263,29 +234,6 @@ pub const JsonAggregateOperator = struct {
                     group.reset();
                 }
             },
-            .tumbling_time => {
-                // Time windows emit on watermark, not on record arrival
-            },
-        }
-        log.info("aggregate processElement: done", .{});
-    }
-
-    fn processWatermark(ptr: *anyopaque, wm: Watermark, ctx: *OperatorContext) !void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-
-        switch (self.window) {
-            .tumbling_time => |window_size_ms| {
-                // Close windows where watermark has passed the window end
-                for (self.groups.keys(), self.groups.values()) |key, *group| {
-                    const window_end = group.window_start_ms + window_size_ms;
-                    if (wm.timestamp_ms >= window_end and group.count > 0) {
-                        try self.emitResult(key, group, window_end, ctx);
-                        group.reset();
-                        group.window_start_ms = window_end;
-                    }
-                }
-            },
-            else => {},
         }
     }
 
@@ -300,116 +248,16 @@ pub const JsonAggregateOperator = struct {
     }
 
     // =========================================================================
-    // State serialization (checkpoint support)
-    // =========================================================================
-
-    fn snapshotState(ptr: *anyopaque, _: u64, alloc: Allocator) anyerror!?[]u8 {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        if (self.groups.count() == 0) return null;
-
-        // Serialize as: num_groups | (key_len | key | Group fields)*
-        var total: usize = 4; // u32 group count
-        for (self.groups.keys()) |key| {
-            total += 4 + key.len; // u32 key_len + key bytes
-            total += 8 + 8 + 8 + 8 + 8; // sum(f64) + count(u64) + min(f64) + max(f64) + window_start(i64)
-        }
-
-        const buf = try alloc.alloc(u8, total);
-        var offset: usize = 0;
-
-        // Group count
-        @memcpy(buf[offset..][0..4], std.mem.asBytes(&@as(u32, @intCast(self.groups.count()))));
-        offset += 4;
-
-        for (self.groups.keys(), self.groups.values()) |key, group| {
-            // Key length + key
-            @memcpy(buf[offset..][0..4], std.mem.asBytes(&@as(u32, @intCast(key.len))));
-            offset += 4;
-            @memcpy(buf[offset..][0..key.len], key);
-            offset += key.len;
-
-            // Group fields (fixed-size binary)
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&group.sum));
-            offset += 8;
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&group.count));
-            offset += 8;
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&group.min));
-            offset += 8;
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&group.max));
-            offset += 8;
-            @memcpy(buf[offset..][0..8], std.mem.asBytes(&group.window_start_ms));
-            offset += 8;
-        }
-
-        return buf;
-    }
-
-    fn restoreState(ptr: *anyopaque, _: u64, data: []const u8) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-
-        if (data.len < 4) return;
-        var offset: usize = 0;
-
-        const num_groups = std.mem.bytesToValue(u32, data[offset..][0..4]);
-        offset += 4;
-
-        for (0..num_groups) |_| {
-            if (offset + 4 > data.len) return;
-            const key_len = std.mem.bytesToValue(u32, data[offset..][0..4]);
-            offset += 4;
-
-            if (offset + key_len + 40 > data.len) return;
-            const key = data[offset..][0..key_len];
-            offset += key_len;
-
-            var group: Group = .{};
-            group.sum = std.mem.bytesToValue(f64, data[offset..][0..8]);
-            offset += 8;
-            group.count = std.mem.bytesToValue(u64, data[offset..][0..8]);
-            offset += 8;
-            group.min = std.mem.bytesToValue(f64, data[offset..][0..8]);
-            offset += 8;
-            group.max = std.mem.bytesToValue(f64, data[offset..][0..8]);
-            offset += 8;
-            group.window_start_ms = std.mem.bytesToValue(i64, data[offset..][0..8]);
-            offset += 8;
-
-            const key_dupe = try self.allocator.dupe(u8, key);
-            try self.groups.put(self.allocator, key_dupe, group);
-        }
-    }
-
-    // =========================================================================
     // Helpers
     // =========================================================================
 
-    fn getOrCreateGroup(self: *Self, key: []const u8, event_time_ms: i64) !*Group {
-        if (self.groups.getPtr(key)) |existing| {
-            // For tumbling time windows: if event belongs to a new window, emit old & reset
-            switch (self.window) {
-                .tumbling_time => |window_size_ms| {
-                    const event_window_start = @divFloor(event_time_ms, window_size_ms) * window_size_ms;
-                    if (event_window_start != existing.window_start_ms and existing.count > 0) {
-                        // New window period — reset accumulator
-                        existing.reset();
-                        existing.window_start_ms = event_window_start;
-                    }
-                },
-                else => {},
-            }
-            return existing;
-        }
+    fn getOrCreateGroup(self: *Self, key: []const u8) !*Group {
+        if (self.groups.getPtr(key)) |existing| return existing;
 
         // New key — dupe and insert
         const key_dupe = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_dupe);
-
-        const window_start: i64 = switch (self.window) {
-            .tumbling_time => |window_size_ms| @divFloor(event_time_ms, window_size_ms) * window_size_ms,
-            else => 0,
-        };
-
-        try self.groups.put(self.allocator, key_dupe, .{ .window_start_ms = window_start });
+        try self.groups.put(self.allocator, key_dupe, .{});
         return self.groups.getPtr(key_dupe).?;
     }
 
@@ -524,7 +372,6 @@ test "JsonAggregateOperator — running sum" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -557,7 +404,6 @@ test "JsonAggregateOperator — running count" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -588,7 +434,6 @@ test "JsonAggregateOperator — running avg" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -616,7 +461,6 @@ test "JsonAggregateOperator — min and max" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -652,7 +496,6 @@ test "JsonAggregateOperator — count-based tumbling window" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -675,49 +518,6 @@ test "JsonAggregateOperator — count-based tumbling window" {
     collector.clear();
 }
 
-test "JsonAggregateOperator — tumbling time window on watermark" {
-    const allocator = std.testing.allocator;
-    // 10-second tumbling window (10_000 ms)
-    var agg = try JsonAggregateOperator.init(
-        allocator,
-        "windowed",
-        .sum,
-        "$.v",
-        .{ .tumbling_time = 10_000 },
-    );
-    defer agg.deinit();
-
-    var collector = OutputCollector.init(allocator);
-    defer collector.deinit();
-    var metrics = OperatorMetrics{};
-    var ctx = OperatorContext{
-        .collector = &collector,
-        .metrics = &metrics,
-        .allocator = allocator,
-        .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
-        .operator_name = "test-agg",
-    };
-
-    const op = agg.operator();
-
-    // Records in first window [0, 10_000)
-    try op.processElement(ProcessingRecord.init("k1", "{\"v\":5}", 1000), &ctx);
-    try op.processElement(ProcessingRecord.init("k1", "{\"v\":3}", 5000), &ctx);
-    try std.testing.expectEqual(@as(usize, 0), collector.count()); // no emission yet
-
-    // Watermark at 10_000 — closes the [0, 10_000) window
-    try op.processWatermark(.{ .timestamp_ms = 10_000, .source_index = 0 }, &ctx);
-    try std.testing.expectEqual(@as(usize, 1), collector.count());
-
-    // Group should be reset for next window
-    const group = agg.getGroup("k1").?;
-    try std.testing.expectEqual(@as(u64, 0), group.count);
-    try std.testing.expectEqual(@as(i64, 10_000), group.window_start_ms);
-
-    collector.clear();
-}
-
 test "JsonAggregateOperator — nested JSON field" {
     const allocator = std.testing.allocator;
     var agg = try JsonAggregateOperator.init(allocator, "nested", .sum, "$.stats.value", .none);
@@ -731,7 +531,6 @@ test "JsonAggregateOperator — nested JSON field" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -757,7 +556,6 @@ test "JsonAggregateOperator — skips non-numeric / missing field" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -792,7 +590,6 @@ test "JsonAggregateOperator — multiple keys grouping" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
 
@@ -809,47 +606,6 @@ test "JsonAggregateOperator — multiple keys grouping" {
     collector.clear();
 }
 
-test "JsonAggregateOperator — snapshot and restore" {
-    const allocator = std.testing.allocator;
-    var agg = try JsonAggregateOperator.init(allocator, "snap", .sum, "$.v", .none);
-    defer agg.deinit();
-
-    var collector = OutputCollector.init(allocator);
-    defer collector.deinit();
-    var metrics = OperatorMetrics{};
-    var ctx = OperatorContext{
-        .collector = &collector,
-        .metrics = &metrics,
-        .allocator = allocator,
-        .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
-        .operator_name = "test-agg",
-    };
-
-    const op = agg.operator();
-
-    try op.processElement(ProcessingRecord.init("k1", "{\"v\":10}", 100), &ctx);
-    try op.processElement(ProcessingRecord.init("k2", "{\"v\":20}", 200), &ctx);
-
-    // Snapshot
-    const snapshot = try op.snapshotState(1, allocator);
-    try std.testing.expect(snapshot != null);
-    defer allocator.free(snapshot.?);
-
-    // Create a new operator and restore
-    var agg2 = try JsonAggregateOperator.init(allocator, "snap2", .sum, "$.v", .none);
-    defer agg2.deinit();
-
-    const op2 = agg2.operator();
-    try op2.restoreState(1, snapshot.?);
-
-    try std.testing.expectEqual(@as(usize, 2), agg2.groupCount());
-    try std.testing.expectEqual(@as(f64, 10), agg2.getGroup("k1").?.sum);
-    try std.testing.expectEqual(@as(f64, 20), agg2.getGroup("k2").?.sum);
-
-    collector.clear();
-}
-
 test "JsonAggregateOperator — output is JSON for any key, and a value past f64's range is skipped or null" {
     const allocator = std.testing.allocator;
     var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.amount", .none);
@@ -862,7 +618,6 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-agg",
     };
     const op = agg.operator();

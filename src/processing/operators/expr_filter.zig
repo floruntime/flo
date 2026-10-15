@@ -67,12 +67,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 
 pub const ExprFilterOperator = struct {
     name: []const u8,
@@ -167,11 +164,8 @@ pub const ExprFilterOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = close,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
@@ -179,10 +173,6 @@ pub const ExprFilterOperator = struct {
         if (self.evaluate(rec)) {
             try ctx.emit(rec);
         }
-    }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {
-        // Stateless — watermarks pass through via chain
     }
 
     fn getName(ptr: *anyopaque) []const u8 {

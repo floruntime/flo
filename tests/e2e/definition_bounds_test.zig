@@ -133,20 +133,10 @@ test "e2e/definitions: a stream source's partitions other than all are refused a
     try testing.expect(!listed.contains("ranged") and !listed.contains("listed"));
 }
 
-test "e2e/definitions: a pipeline whose window or partition doesn't fit is refused at submit" {
+test "e2e/definitions: a pipeline whose partition doesn't fit is refused at submit" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     for ([_][]const u8{
-        \\kind: Processing
-        \\name: bad-window
-        \\sources.[0].stream.name: in
-        \\sinks.[0].stream.name: out
-        \\operators.[0].type: aggregate
-        \\operators.[0].name: agg
-        \\operators.[0].function: sum
-        \\operators.[0].window: tumbling
-        \\operators.[0].window_size: 9223372036854775
-        ,
         \\kind: Processing
         \\name: bad-partition
         \\sources.[0].stream.name: in
@@ -159,7 +149,7 @@ test "e2e/definitions: a pipeline whose window or partition doesn't fit is refus
     }
     var listed = try ctx.cli.run(&.{ "processing", "list" });
     defer listed.deinit();
-    try testing.expect(!listed.contains("bad-window") and !listed.contains("bad-partition"));
+    try testing.expect(!listed.contains("bad-partition"));
 }
 
 /// A definition `levels` flow sequences deep under `key`.

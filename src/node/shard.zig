@@ -4947,7 +4947,7 @@ fn serializeWalkActionEntries(
 /// Serialize walk results as binary wire format for processing jobs.
 ///
 /// Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-///              [status_len:u16][status][parallelism:u32][created_at:i64])*
+///              [status_len:u16][status][created_at:i64])*
 ///              [has_more:u8][cursor_len:u16]
 fn serializeWalkProcessingJobs(
     allocator: std.mem.Allocator,
@@ -4956,7 +4956,7 @@ fn serializeWalkProcessingJobs(
     contexts: []const *anyopaque,
     namespace: []const u8,
 ) ![]u8 {
-    const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
+    const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, created_at: i64 };
     var jobs: std.ArrayListUnmanaged(JobInfo) = .empty;
     defer jobs.deinit(allocator);
 
@@ -4973,7 +4973,6 @@ fn serializeWalkProcessingJobs(
                         .name = job.name_owned,
                         .job_id = job.job_id_owned,
                         .status = job.status.toString(),
-                        .parallelism = job.parallelism,
                         .created_at = job.created_at_ms,
                     });
                     break;
@@ -4990,7 +4989,6 @@ fn serializeWalkProcessingJobs(
         total += 2 + j.name.len; // name_len:u16 + name
         total += 2 + j.job_id.len; // job_id_len:u16 + job_id
         total += 2 + j.status.len; // status_len:u16 + status
-        total += 4; // parallelism:u32
         total += 8; // created_at:i64
     }
     total += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
@@ -5013,8 +5011,6 @@ fn serializeWalkProcessingJobs(
         pos += 2;
         @memcpy(buf[pos..][0..j.status.len], j.status);
         pos += j.status.len;
-        std.mem.writeInt(u32, buf[pos..][0..4], j.parallelism, .little);
-        pos += 4;
         std.mem.writeInt(i64, buf[pos..][0..8], j.created_at, .little);
         pos += 8;
     }
@@ -5687,7 +5683,7 @@ pub const ApplyResult = union(enum) {
 const APPLIES_NOTHING = [_]entry_mod.EntryType{.raft_noop};
 /// Entry types nothing writes today. One that arrives anyway is counted as
 /// having no applier.
-const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot, .checkpoint };
+const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot };
 
 fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
     return std.mem.indexOfScalar(entry_mod.EntryType, list, etype) != null;
@@ -5891,6 +5887,12 @@ fn replaySegmentFile(
             out.damage = silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} that will not parse", .{ name, offset });
             return;
         };
+        // Apply switches on the type byte as an exhaustive enum: a type this
+        // build doesn't know (retired, or a corrupt byte) must stop here.
+        if (std.enums.fromInt(entry_mod.EntryType, seg_entry.header.entry_type) == null) {
+            out.damage = silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} of unknown type 0x{x:0>2}", .{ name, offset, seg_entry.header.entry_type });
+            return;
+        }
         offset += seg_entry.totalSize();
 
         if (boot.cancelled()) {
@@ -11409,6 +11411,24 @@ test "an entry that will not parse in a segment whose checksum holds takes its s
     // checksum is recomputed, as a writer bug would have written it.
     const seg = @import("../storage/ual/segment.zig");
     std.mem.writeInt(u32, bytes[seg.HEADER_SIZE + 32 ..][0..4], 0xffff_fff0, .little);
+    const footer_start = bytes.len - seg.FOOTER_SIZE;
+    std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], @import("../util/checksum.zig").checksum(bytes[0..footer_start]), .little);
+    try DamageTest.writeFile(path, bytes);
+    try t.expectOffline(.segment_bad_entry, 1);
+}
+
+test "an entry of a type this build doesn't know takes its shard offline, not the node" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(1, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    // 0x83 was a retired processing entry type; the file checksum is
+    // recomputed so the segment reads and only the type is wrong.
+    const seg = @import("../storage/ual/segment.zig");
+    bytes[seg.HEADER_SIZE + 5] = 0x83;
     const footer_start = bytes.len - seg.FOOTER_SIZE;
     std.mem.writeInt(u32, bytes[footer_start + 16 ..][0..4], @import("../util/checksum.zig").checksum(bytes[0..footer_start]), .little);
     try DamageTest.writeFile(path, bytes);

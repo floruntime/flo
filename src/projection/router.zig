@@ -272,10 +272,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .workflow_create, .workflow_start, .workflow_complete => .none,
         .namespace_create, .namespace_delete, .namespace_config => .none,
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
-        .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale, .processing_checkpoint => .none,
-
-        // Checkpoint — processing runtime
-        .checkpoint => .none,
+        .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => .none,
     };
 }
 
@@ -369,9 +366,6 @@ test "router: routing table correctness" {
 
     // Snapshot
     try testing.expectEqual(RouteTarget.snapshot, routeTarget(.raft_snapshot));
-
-    // Checkpoint
-    try testing.expectEqual(RouteTarget.none, routeTarget(.checkpoint));
 }
 
 test "router: kv entry routed to kv projection" {

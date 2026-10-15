@@ -7,8 +7,8 @@
 //! - CLI command parsing and routing
 //! - Protocol serialization/deserialization for processing commands
 //! - Help text generation for processing subcommands
-//! - Real pipeline execution (passthrough, late-data, metrics, savepoint)
-//! - Job lifecycle: submit → status → metrics → savepoint → stop/cancel
+//! - Real pipeline execution (passthrough, late-data, metrics)
+//! - Job lifecycle: submit → status → stop/cancel
 //! - TS sink: JSON → time-series via FloTsSink (tag/field extraction, query)
 //! - TS source: time-series → JSON via FloTsSource (measurement polling, field mapping)
 //! - TS-to-stream pipeline: TS source → stream sink
@@ -63,10 +63,6 @@ test "e2e/processing: help shows all subcommands" {
     try stdx.testing.assertContains(result, "cancel");
     try stdx.testing.assertContains(result, "status");
     try stdx.testing.assertContains(result, "list");
-    try stdx.testing.assertContains(result, "metrics");
-    try stdx.testing.assertContains(result, "savepoint");
-    try stdx.testing.assertContains(result, "restore");
-    try stdx.testing.assertContains(result, "rescale");
 }
 
 test "e2e/processing: submit help shows usage" {
@@ -78,17 +74,6 @@ test "e2e/processing: submit help shows usage" {
 
     try stdx.testing.assertContains(result, "Submit a processing job");
     try stdx.testing.assertContains(result, "file");
-}
-
-test "e2e/processing: rescale help shows usage" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.runRaw(&.{ "processing", "rescale", "--help" });
-    defer result.deinit();
-
-    try stdx.testing.assertContains(result, "Rescale job parallelism");
-    try stdx.testing.assertContains(result, "parallelism");
 }
 
 // =============================================================================
@@ -132,38 +117,6 @@ test "e2e/processing: status requires job_id argument" {
     defer ctx.deinit();
 
     var result = try ctx.cli.run(&.{ "processing", "status" });
-    defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
-}
-
-test "e2e/processing: savepoint requires job_id argument" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.run(&.{ "processing", "savepoint" });
-    defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
-}
-
-test "e2e/processing: restore requires job_id and savepoint_id" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Missing both arguments
-    var result = try ctx.cli.run(&.{ "processing", "restore" });
-    defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
-}
-
-test "e2e/processing: rescale requires job_id and parallelism" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Missing arguments
-    var result = try ctx.cli.run(&.{ "processing", "rescale" });
     defer result.deinit();
 
     try stdx.testing.assertFailed(result);
@@ -241,38 +194,6 @@ test "e2e/processing: protocol request building - list" {
     try testing.expectEqual(@backingInt(proto.OpCode.processing_list), req.header.op_code);
 }
 
-test "e2e/processing: protocol request building - rescale" {
-    const proto = src.protocol.proto;
-    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
-
-    var builder = RequestBuilder.init(testing.allocator);
-    const req = builder.build(
-        proto.OpCode.processing_rescale,
-        "prod",
-        "job-xyz",
-        "8",
-        "",
-    );
-
-    try testing.expectEqual(@backingInt(proto.OpCode.processing_rescale), req.header.op_code);
-}
-
-test "e2e/processing: protocol request building - restore" {
-    const proto = src.protocol.proto;
-    const RequestBuilder = src.protocol.request_builder.RequestBuilder;
-
-    var builder = RequestBuilder.init(testing.allocator);
-    const req = builder.build(
-        proto.OpCode.processing_restore,
-        "ns",
-        "job-1",
-        "sp-42",
-        "",
-    );
-
-    try testing.expectEqual(@backingInt(proto.OpCode.processing_restore), req.header.op_code);
-}
-
 // =============================================================================
 // Processing Result Tests
 // =============================================================================
@@ -290,9 +211,6 @@ test "e2e/processing: processing opcodes are defined" {
     try testing.expectEqual(@as(u16, 0x362), @backingInt(proto.OpCode.processing_cancel));
     try testing.expectEqual(@as(u16, 0x363), @backingInt(proto.OpCode.processing_status));
     try testing.expectEqual(@as(u16, 0x364), @backingInt(proto.OpCode.processing_list));
-    try testing.expectEqual(@as(u16, 0x365), @backingInt(proto.OpCode.processing_savepoint));
-    try testing.expectEqual(@as(u16, 0x366), @backingInt(proto.OpCode.processing_restore));
-    try testing.expectEqual(@as(u16, 0x367), @backingInt(proto.OpCode.processing_rescale));
 }
 
 // =============================================================================
@@ -379,7 +297,6 @@ test "e2e/processing: submit job and verify running state" {
         \\namespace: proc_state
         \\sources.[0].stream.name: state-input
         \\sinks.[0].stream.name: state-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-state-test.yaml");
@@ -543,7 +460,6 @@ test "e2e/processing: passthrough pipeline - data flows from source to sink stre
         \\namespace: proc_pipe
         \\sources.[0].stream.name: pipe-input
         \\sinks.[0].stream.name: pipe-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-passthrough.yaml");
@@ -605,7 +521,6 @@ test "e2e/processing: pipeline processes data appended after job submission" {
         \\namespace: proc_late
         \\sources.[0].stream.name: late-input
         \\sinks.[0].stream.name: late-output
-        \\parallelism: 1
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-late-data.yaml");
     defer cleanupTempFile(testing.allocator, path);
@@ -685,42 +600,6 @@ test "e2e/processing: job status reflects processed record count" {
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_metrics" });
 }
 
-test "e2e/processing: savepoint captures job state" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Scope to dedicated namespace for isolation
-    try ctx.exec(&.{ "ns", "create", "proc_sp" });
-
-    try ctx.exec(&.{ "stream", "append", "sp-input", "savepoint-data", "-n", "proc_sp" });
-
-    const job_def =
-        \\kind: Processing
-        \\name: e2e-savepoint
-        \\namespace: proc_sp
-        \\sources.[0].stream.name: sp-input
-        \\sinks.[0].stream.name: sp-output
-    ;
-    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-savepoint.yaml");
-    defer cleanupTempFile(testing.allocator, path);
-
-    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_sp" });
-    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
-
-    // Wait for at least one record to be processed
-    _ = try readStreamBlocking(ctx, "sp-output", "proc_sp", "savepoint-data", "5000");
-
-    // Take a savepoint
-    var sp_result = try ctx.cli.run(&.{ "processing", "savepoint", job_id, "-n", "proc_sp" });
-    defer sp_result.deinit();
-
-    try stdx.testing.assertSucceeded(sp_result);
-    // Should contain a savepoint ID
-    try testing.expect(sp_result.stdoutContains("savepoint") or sp_result.stdoutContains("sp-"));
-
-    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_sp" });
-}
-
 // =============================================================================
 // Multi-Source / Multi-Sink Pipeline E2E Tests
 // =============================================================================
@@ -744,7 +623,6 @@ test "e2e/processing: multi-source pipeline merges two input streams" {
         \\sources.[0].stream.name: multi-src-a
         \\sources.[1].stream.name: multi-src-b
         \\sinks.[0].stream.name: multi-src-out
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-multi-source.yaml");
@@ -796,7 +674,6 @@ test "e2e/processing: a record reaches every sink a job declares" {
         \\sinks.[0].stream.name: msink-stream-out
         \\sinks.[1].name: secondary-kv
         \\sinks.[1].kv.key_prefix: msink
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-multi-sink.yaml");
@@ -810,40 +687,6 @@ test "e2e/processing: a record reaches every sink a job declares" {
     try testing.expect(try kvGetBlocking(ctx, "msink:", "proc_msink", "multi-sink-record", 6000));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_msink" });
-}
-
-test "e2e/processing: a savepoint on a running job is accepted" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Scope to dedicated namespace for isolation
-    try ctx.exec(&.{ "ns", "create", "proc_ckpt" });
-
-    // Seed + submit
-    try ctx.exec(&.{ "stream", "append", "ckpt-input", "checkpoint-test-data", "-n", "proc_ckpt" });
-
-    const job_def =
-        \\kind: Processing
-        \\name: e2e-checkpoint-persist
-        \\namespace: proc_ckpt
-        \\sources.[0].stream.name: ckpt-input
-        \\sinks.[0].stream.name: ckpt-output
-        \\checkpointing.interval_ms: 500
-    ;
-    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ckpt.yaml");
-    defer cleanupTempFile(testing.allocator, path);
-
-    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_ckpt" });
-    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
-
-    // Wait for data to flow through
-    _ = try readStreamBlocking(ctx, "ckpt-output", "proc_ckpt", "checkpoint-test-data", "5000");
-
-    var sp_result = try ctx.cli.run(&.{ "processing", "savepoint", job_id, "-n", "proc_ckpt" });
-    defer sp_result.deinit();
-    try std.testing.expect(sp_result.stdoutContains("Savepoint created"));
-
-    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_ckpt" });
 }
 
 // =============================================================================
@@ -906,7 +749,6 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
         \\sinks.[0].ts.measurement: proc_cpu_metrics
         \\sinks.[0].ts.tags.host: hostname
         \\sinks.[0].ts.fields.cpu: cpu_percent
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-sink.yaml");
@@ -975,7 +817,6 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
         \\sinks.[0].ts.measurement: proc_temp
         \\sinks.[0].ts.value_field: temperature
         \\sinks.[0].ts.tags.sensor: sensor
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-scalar.yaml");
@@ -1028,7 +869,6 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
         \\sinks.[0].ts.measurement: proc_late_metric
         \\sinks.[0].ts.tags.host: host
         \\sinks.[0].ts.fields.load: load_avg
-        \\parallelism: 1
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-late.yaml");
     defer cleanupTempFile(testing.allocator, path);
@@ -1086,7 +926,6 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
         \\sinks.[0].ts.measurement: proc_requests
         \\sinks.[0].ts.tags.region: region
         \\sinks.[0].ts.fields.rps: rps
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-agg.yaml");
@@ -1145,7 +984,6 @@ test "e2e/processing: ts source - TS measurement data flows to stream sink" {
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
         \\sinks.[0].stream.name: ts-src-stream-out
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-stream.yaml");
@@ -1205,7 +1043,6 @@ test "e2e/processing: ts source - late data written after job starts" {
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 200
         \\sinks.[0].stream.name: ts-src-late-out
-        \\parallelism: 1
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-late.yaml");
     defer cleanupTempFile(testing.allocator, path);
@@ -1260,7 +1097,6 @@ test "e2e/processing: ts source - with tag filter reads subset of data" {
         \\sources.[0].ts.tags.host: web-01
         \\sources.[0].ts.poll_interval_ms: 200
         \\sinks.[0].stream.name: ts-src-filtered-out
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-filtered.yaml");
@@ -1312,7 +1148,6 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
         \\sinks.[0].ts.measurement: derived_temp
         \\sinks.[0].ts.value_field: value
         \\sinks.[0].ts.tags.sensor: sensor
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-to-ts.yaml");
@@ -1377,7 +1212,6 @@ test "e2e/processing: ts source - job status shows RUNNING" {
         \\sources.[0].ts.field: value
         \\sources.[0].ts.poll_interval_ms: 500
         \\sinks.[0].stream.name: ts-src-status-out
-        \\parallelism: 1
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-src-status.yaml");
     defer cleanupTempFile(testing.allocator, path);
@@ -1618,7 +1452,6 @@ test "e2e/processing: pipeline data flows only within namespace scope" {
         \\namespace: proc_scope_a
         \\sources.[0].stream.name: scoped-input
         \\sinks.[0].stream.name: scoped-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-scoped-pipe.yaml");
@@ -1730,7 +1563,6 @@ test "e2e/processing: submitted job survives restart" {
         \\namespace: proc_persist
         \\sources.[0].stream.name: persist-input
         \\sinks.[0].stream.name: persist-output
-        \\parallelism: 1
         \\batch_size: 50
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-submit.yaml");
@@ -1871,47 +1703,6 @@ test "e2e/processing: list shows jobs after restart" {
     try stdx.testing.assertSucceeded(after);
     try stdx.testing.assertContains(after, "persist-list-alpha");
     try stdx.testing.assertContains(after, "persist-list-beta");
-}
-
-test "e2e/processing: rescaled parallelism survives restart" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .durability = .sync },
-    });
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "ns", "create", "proc_persist_rescale" });
-
-    const job_def =
-        \\kind: Processing
-        \\name: persist-rescale-job
-        \\namespace: proc_persist_rescale
-        \\sources.[0].stream.name: prescale-input
-        \\sinks.[0].stream.name: prescale-output
-        \\parallelism: 1
-    ;
-    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-persist-rescale.yaml");
-    defer cleanupTempFile(testing.allocator, path);
-
-    const submit_output = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_persist_rescale" });
-    const job_id = extractJobId(submit_output) orelse return error.NoJobId;
-
-    // Rescale to parallelism=4
-    try ctx.exec(&.{ "processing", "rescale", job_id, "4", "-n", "proc_persist_rescale" });
-
-    // Verify parallelism changed before restart
-    var before = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
-    defer before.deinit();
-    try stdx.testing.assertSucceeded(before);
-    try stdx.testing.assertContains(before, "Parallelism:4");
-
-    // Restart the server
-    try ctx.restartServer();
-
-    // After restart, parallelism should still be 4 (not reset to 1)
-    var after = try ctx.cli.run(&.{ "processing", "status", job_id, "-n", "proc_persist_rescale" });
-    defer after.deinit();
-    try stdx.testing.assertSucceeded(after);
-    try stdx.testing.assertContains(after, "Parallelism:4");
 }
 
 test "e2e/processing: new job IDs don't collide after restart" {
@@ -2078,7 +1869,6 @@ test "e2e/processing: kv_lookup filter mode — only records with matching KV ke
         \\operators.[0].lookup_key: account:${$.account_id}
         \\operators.[0].namespace: proc_kvfilt
         \\operators.[0].mode: filter
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-filter.yaml");
@@ -2141,7 +1931,6 @@ test "e2e/processing: kv_lookup enrich mode — records are enriched with KV val
         \\operators.[0].namespace: proc_kvenr
         \\operators.[0].mode: enrich
         \\operators.[0].enrich_field: tier
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-enrich.yaml");
@@ -2206,7 +1995,6 @@ test "e2e/processing: kv_lookup filter with composite key template" {
         \\operators.[0].lookup_key: org.${$.org}.${$.user}
         \\operators.[0].namespace: proc_kvcomp
         \\operators.[0].mode: filter
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-composite.yaml");
@@ -2259,7 +2047,6 @@ test "e2e/processing: kv_lookup filter drops all when no matching keys exist" {
         \\operators.[0].lookup_key: item:${$.id}
         \\operators.[0].namespace: proc_kvnone
         \\operators.[0].mode: filter
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-nomatch.yaml");
@@ -2309,7 +2096,6 @@ test "e2e/processing: kv_lookup late KV write — records written after KV seed 
         \\operators.[0].lookup_key: acct:${$.account_id}
         \\operators.[0].namespace: proc_kvlate
         \\operators.[0].mode: filter
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-late.yaml");
@@ -2378,7 +2164,6 @@ test "e2e/processing: classify operator routes tagged records to filtered sink" 
         \\sinks.[1].name: error-events
         \\sinks.[1].stream.name: clf-err-out
         \\sinks.[1].match.[0]: errors
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-classify-route.yaml");
@@ -2463,7 +2248,6 @@ test "e2e/processing: classify multi-tag routing with AND match" {
         \\sinks.[2].stream.name: clftag-critical
         \\sinks.[2].match.[0]: critical
         \\sinks.[2].match.[1]: errors
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-classify-and.yaml");
@@ -2543,7 +2327,6 @@ test "e2e/processing: filter with OR condition — keeps records matching either
         \\operators.[0].name: payment-or-kyc
         \\operators.[0].condition: value_contains:payment OR value_contains:kyc
         \\sinks.[0].stream.name: or-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-or-filter.yaml");
@@ -2600,7 +2383,6 @@ test "e2e/processing: filter with AND condition — keeps records matching all b
         \\operators.[0].name: payment-and-approved
         \\operators.[0].condition: value_contains:payment AND value_contains:approved
         \\sinks.[0].stream.name: and-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-and-filter.yaml");
@@ -2698,7 +2480,6 @@ test "e2e/processing: kv sink writes records to KV" {
         \\operators.[0].key_expression: $.user_id
         \\sinks.[0].kv.namespace: proc_bug_kvsink
         \\sinks.[0].kv.key_prefix: user
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-kvsink.yaml");
@@ -2733,7 +2514,6 @@ test "e2e/processing: a kv sink's sub-second ttl_ms expires the keys it writes" 
         \\sinks.[0].kv.namespace: proc_kvttl
         \\sinks.[0].kv.key_prefix: user
         \\sinks.[0].kv.ttl_ms: 900
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvsink-ttl.yaml");
@@ -2767,7 +2547,6 @@ test "e2e/processing: queue sink enqueues records" {
         \\sources.[0].stream.name: qsink-input
         \\sinks.[0].queue.name: bug-task-queue
         \\sinks.[0].queue.priority: 5
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-qsink.yaml");
@@ -2805,7 +2584,6 @@ test "e2e/processing: filter json:$. condition keeps matching records" {
         \\operators.[0].name: big-amounts
         \\operators.[0].condition: json:$.amount>100
         \\sinks.[0].stream.name: filt-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-filter-dollar.yaml");
@@ -2853,7 +2631,6 @@ test "e2e/processing: classify json:$. routing delivers to matched sink" {
         \\sinks.[0].stream.name: cls-main
         \\sinks.[1].stream.name: cls-errors
         \\sinks.[1].match.[0]: errors
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-classify-dollar.yaml");
@@ -2899,7 +2676,6 @@ test "e2e/processing: ts sink maps configured field value" {
         \\sinks.[0].ts.measurement: bug_cpu
         \\sinks.[0].ts.tags.host: hostname
         \\sinks.[0].ts.fields.cpu: cpu_percent
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-bug-tssink.yaml");
@@ -2987,7 +2763,6 @@ test "e2e/processing: kv sink routes to the owning shard (multi-shard)" {
         \\operators.[0].key_expression: $.id
         \\sinks.[0].kv.namespace: xshard
         \\sinks.[0].kv.key_prefix: u
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-xshard-kv.yaml");
@@ -3031,7 +2806,6 @@ test "e2e/processing: a source reads every record of a batch over 100" {
         \\namespace: proc_big
         \\sources.[0].stream.name: big-input
         \\sinks.[0].stream.name: big-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-big-batch.yaml");

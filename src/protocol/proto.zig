@@ -198,9 +198,6 @@ pub const OpCode = enum(u16) {
     processing_cancel = 0x362,
     processing_status = 0x363,
     processing_list = 0x364,
-    processing_savepoint = 0x365,
-    processing_restore = 0x366,
-    processing_rescale = 0x367,
 
     // 0x380–0x3FF: compute reserve (emit, future compute — 128 slots)
 

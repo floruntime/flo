@@ -26,11 +26,11 @@
 //!       name: by-user
 //!       key_expression: "$.user_id"
 //!     - type: aggregate
-//!       name: hourly-sum
+//!       name: sum-per-100
 //!       function: sum
 //!       field: "$.amount"
-//!       window: tumbling
-//!       window_size: 3600
+//!       window: count
+//!       window_size: 100
 //!     - type: passthrough
 //!       name: debug-tap
 //!     - type: map
@@ -248,17 +248,7 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
             return CreateError.MissingConfig;
         };
 
-        if (std.mem.eql(u8, window_type, "tumbling")) {
-            const seconds = std.fmt.parseInt(i64, window_size_str, 10) catch {
-                log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer seconds", .{ spec.name, window_size_str });
-                return CreateError.MissingConfig;
-            };
-            const ms = if (seconds > 0) std.math.mul(i64, seconds, 1000) catch null else null;
-            break :blk .{ .tumbling_time = ms orelse {
-                log.err("Native operator '{s}' (type=aggregate) window_size '{s}' — expected a positive number of seconds", .{ spec.name, window_size_str });
-                return CreateError.MissingConfig;
-            } };
-        } else if (std.mem.eql(u8, window_type, "count")) {
+        if (std.mem.eql(u8, window_type, "count")) {
             const count = std.fmt.parseInt(u64, window_size_str, 10) catch {
                 log.err("Native operator '{s}' (type=aggregate) invalid window_size '{s}' — expected integer count", .{ spec.name, window_size_str });
                 return CreateError.MissingConfig;
@@ -269,7 +259,7 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
             }
             break :blk .{ .tumbling_count = count };
         } else {
-            log.err("Native operator '{s}' (type=aggregate) unknown window type '{s}' — expected tumbling|count", .{ spec.name, window_type });
+            log.err("Native operator '{s}' (type=aggregate) unknown window type '{s}' — expected count", .{ spec.name, window_type });
             return CreateError.MissingConfig;
         }
     };
@@ -573,9 +563,7 @@ test "NativeOperatorRegistry — create aggregate count (no field)" {
     try std.testing.expectEqualStrings("event-counter", result.op.getName());
 }
 
-test "NativeOperatorRegistry — create aggregate with tumbling window" {
-    const allocator = std.testing.allocator;
-
+test "NativeOperatorRegistry — a tumbling window is refused" {
     const config_entries = [_]OperatorSpec.ConfigEntry{
         .{ .key = "function", .value = "avg" },
         .{ .key = "field", .value = "$.latency" },
@@ -587,11 +575,7 @@ test "NativeOperatorRegistry — create aggregate with tumbling window" {
         .name = "avg-latency",
         .config = &config_entries,
     };
-
-    const result = try create(allocator, &spec, null);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqualStrings("avg-latency", result.op.getName());
+    try std.testing.expectError(CreateError.MissingConfig, create(std.testing.allocator, &spec, null));
 }
 
 test "NativeOperatorRegistry — aggregate missing function" {

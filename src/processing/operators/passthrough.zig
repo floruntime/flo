@@ -13,12 +13,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 
 pub const PassthroughOperator = struct {
     name: []const u8,
@@ -39,18 +36,13 @@ pub const PassthroughOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = close,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(_: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
         try ctx.emit(rec);
     }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
 
     fn getName(ptr: *anyopaque) []const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));

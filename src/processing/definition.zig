@@ -8,7 +8,6 @@
 //! ```yaml
 //! kind: Processing
 //! name: my-pipeline
-//! parallelism: 4
 //! batch_size: 200
 //!
 //! sources:
@@ -72,13 +71,13 @@
 //!     array_field: "$.order.items"
 //!     element_key: "$.sku"         # optional — extract key
 //!
-//!   # Declarative aggregate (sum/count/avg/min/max + optional windowing)
+//!   # Declarative aggregate (sum/count/avg/min/max), running or per count window
 //!   - type: aggregate
-//!     name: hourly-total
+//!     name: total-per-100
 //!     function: sum
 //!     field: "$.amount"
-//!     window: tumbling
-//!     window_size: 3600           # seconds
+//!     window: count
+//!     window_size: 100            # records
 //! ```
 
 const std = @import("std");
@@ -329,8 +328,6 @@ pub const JobDefinition = struct {
     description: []const u8,
     /// Namespace for this job (inherited by sources/sinks when not overridden)
     namespace: []const u8,
-    /// Parallelism level (defaults to 1)
-    parallelism: u32,
     /// Default batch size for sources (defaults to 100)
     batch_size: u32,
 
@@ -340,9 +337,6 @@ pub const JobDefinition = struct {
     sinks: std.ArrayList(SinkSpec),
     /// Ordered list of operator specifications
     operators: std.ArrayList(OperatorSpec),
-
-    /// Checkpoint interval in milliseconds (null = use default, 0 = disabled)
-    checkpoint_interval_ms: ?u64 = null,
 
     // =========================================================================
     // Convenience accessors

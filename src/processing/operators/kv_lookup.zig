@@ -50,12 +50,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 
 pub const Mode = enum {
     filter,
@@ -247,11 +244,8 @@ pub const KvLookupOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = close,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
@@ -295,8 +289,6 @@ pub const KvLookupOperator = struct {
             },
         }
     }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
 
     fn getName(ptr: *anyopaque) []const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -478,7 +470,6 @@ test "KvLookupOperator — filter mode: drops when no lookup fn" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 1000,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -504,7 +495,6 @@ test "KvLookupOperator — enrich mode: passes through when no lookup fn" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 1000,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -544,7 +534,6 @@ test "KvLookupOperator — filter mode with stub lookup fn" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 1000,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -620,7 +609,6 @@ test "KvLookupOperator — enrich output is JSON for any KV value" {
         .metrics = &metrics,
         .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
     const iface = op.operator();

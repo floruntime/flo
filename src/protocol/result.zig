@@ -367,18 +367,6 @@ pub const CommandResult = union(enum) {
         cursor: ?[]const u8 = null,
     },
 
-    /// Savepoint created
-    processing_savepoint_result: struct {
-        /// The savepoint ID
-        savepoint_id: []const u8,
-    },
-
-    /// Processing job restored from savepoint
-    processing_restored: void,
-
-    /// Processing job rescaled
-    processing_rescaled: void,
-
     // =========================================================================
     // Layer 4: Time-Series Responses
     // =========================================================================

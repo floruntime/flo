@@ -1,9 +1,8 @@
 //! Processing Handler — registers stream processing opcodes with Dispatcher.
 //!
 //! Stream processing is a Layer 2 "Intelligent Layer" that composes Layer 1
-//! primitives for continuous data pipelines (Flink-inspired). The handler
-//! manages job lifecycle: submit, stop, cancel, status, list, savepoint,
-//! restore, and rescale.
+//! primitives for continuous data pipelines. The handler
+//! manages job lifecycle: submit, stop, cancel, status and list.
 //!
 //! ## Opcode Range
 //!
@@ -21,9 +20,6 @@
 //! | processing_cancel    | job_id     | (empty)                        |
 //! | processing_status    | job_id     | (empty)                        |
 //! | processing_list      | (unused)   | [limit:u32][cursor...]?        |
-//! | processing_savepoint | job_id     | (empty)                        |
-//! | processing_restore   | job_id     | savepoint_id                   |
-//! | processing_rescale   | job_id     | [parallelism:u32]              |
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -74,15 +70,18 @@ const OpCode = proto.OpCode;
 // ProcessingHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// The first byte of a processing_submit entry. It is outside JobStatus's
+/// range, where an entry from before it was added starts with the status.
+const SUBMIT_LAYOUT: u8 = 0x80;
+
 pub const ProcessingHandler = struct {
     allocator: Allocator,
 
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
-    /// What the last applied submit and savepoint created; keys of `jobs`
-    /// and `savepoints` (see `Shard.answering_index`).
+    /// What the last applied submit created; a key of `jobs` (see
+    /// `Shard.answering_index`).
     last_submitted_job_id: ?[]const u8 = null,
-    last_savepoint_id: ?[]const u8 = null,
     /// The last applied submit was refused: the server held `max_jobs`.
     last_submit_at_limit: bool = false,
     sink_drops: u64 = 0,
@@ -91,9 +90,6 @@ pub const ProcessingHandler = struct {
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
     ticking_job: []const u8 = "",
-
-    /// Savepoint store: savepoint_id → SavepointRecord.
-    savepoints: std.StringHashMap(SavepointRecord),
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
@@ -214,25 +210,16 @@ pub const ProcessingHandler = struct {
         name_owned: []const u8,
         namespace_owned: []const u8,
         status: JobStatus,
-        parallelism: u32,
         batch_size: u32,
         yaml_owned: []const u8,
         created_at_ms: i64,
         records_processed: u64,
     };
 
-    pub const SavepointRecord = struct {
-        savepoint_id_owned: []const u8,
-        job_id_owned: []const u8,
-        created_at_ms: i64,
-        records_at_savepoint: u64,
-    };
-
     pub fn init(allocator: Allocator) ProcessingHandler {
         return .{
             .allocator = allocator,
             .jobs = std.StringHashMap(JobRecord).init(allocator),
-            .savepoints = std.StringHashMap(SavepointRecord).init(allocator),
             .pipelines = std.StringHashMap(PipelineState).init(allocator),
         };
     }
@@ -252,14 +239,6 @@ pub const ProcessingHandler = struct {
             self.freeJobRecord(entry.value_ptr);
         }
         self.jobs.deinit();
-
-        // Free all savepoint records
-        var sit = self.savepoints.iterator();
-        while (sit.next()) |entry| {
-            self.allocator.free(entry.value_ptr.savepoint_id_owned);
-            self.allocator.free(entry.value_ptr.job_id_owned);
-        }
-        self.savepoints.deinit();
     }
 
     /// Wire cross-shard stream handler references.
@@ -375,9 +354,6 @@ pub const ProcessingHandler = struct {
         dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.processing_status, dispatchProcessing, run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.processing_list, dispatchProcessing, localScanJobs);
-        dispatcher.registerWithRoute(.processing_savepoint, dispatchProcessing, run_id_mod.preRouteByRunId);
-        dispatcher.registerWithRoute(.processing_restore, dispatchProcessing, run_id_mod.preRouteByRunId);
-        dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, run_id_mod.preRouteByRunId);
     }
 
     /// Every submit goes to shard 0, whatever its key: one shard holds the
@@ -444,13 +420,6 @@ pub const ProcessingHandler = struct {
                 if (shard.metrics_registry) |m| if (op == .processing_cancel) m.processing.recordCancelled() else m.processing.recordCompleted();
                 shard.sendOkResponse(conn, req.header.request_id, "");
             },
-            .processing_savepoint => {
-                const sp_id = h.last_savepoint_id orelse {
-                    shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-                    return;
-                };
-                shard.sendOkResponse(conn, req.header.request_id, sp_id);
-            },
             else => shard.sendOkResponse(conn, req.header.request_id, ""),
         }
     }
@@ -465,9 +434,6 @@ pub const ProcessingHandler = struct {
             .processing_cancel => self.handleCancel(shard, conn, req),
             .processing_status => self.handleStatus(shard, conn, req),
             .processing_list => self.handleList(shard, conn, req),
-            .processing_savepoint => self.handleSavepoint(shard, conn, req),
-            .processing_restore => self.handleRestore(shard, conn, req),
-            .processing_rescale => self.handleRescale(shard, conn, req),
             else => {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown processing opcode");
             },
@@ -525,8 +491,8 @@ pub const ProcessingHandler = struct {
         // registry entry — i.e. THIS shard. Submit is routed here by
         // preRouteByProcessing (every submit → partition 0 → shard 0), so the
         // entry lives in this shard's `self.jobs`. The job_id's partition bits
-        // are how every ID-routed op (status/stop/cancel/savepoint/restore/
-        // rescale) finds it again: partitionToShard = partition % shard_count.
+        // are how every ID-routed op (status/stop/cancel) finds it again:
+        // partitionToShard = partition % shard_count.
         //
         // Deriving the partition from the job *name* (keyToPartitionNs) was
         // wrong: it resolves to an arbitrary partition whose shard differs from
@@ -546,7 +512,7 @@ pub const ProcessingHandler = struct {
         // pipelines from the entry — the same applier a restart uses.
         // Admitted at dispatch; the definition has now passed, so reserve.
         shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
-        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.parallelism, def.batch_size, home, yaml) catch |err| {
+        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.batch_size, home, yaml) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "job not persisted"));
             return;
         };
@@ -620,10 +586,10 @@ pub const ProcessingHandler = struct {
         if (self.ownedJob(job_id, req.namespace)) |job| {
             // Binary wire format:
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
-            // [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
+            // [batch_size:u32][records_processed:u64][created_at:i64]
             // Sized to the job. The id is 32 bytes and the name came from a
             // submit entry under 64 KiB, so both lengths fit u16.
-            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 4 + 8 + 8;
+            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8;
             const buf = self.allocator.alloc(u8, size) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
                 return;
@@ -636,7 +602,6 @@ pub const ProcessingHandler = struct {
             w.writeInt(u16, @intCast(job.name_owned.len), .little) catch unreachable;
             w.writeAll(job.name_owned) catch unreachable;
             w.writeByte(@backingInt(job.status)) catch unreachable;
-            w.writeInt(u32, job.parallelism, .little) catch unreachable;
             w.writeInt(u32, job.batch_size, .little) catch unreachable;
             w.writeInt(u64, job.records_processed, .little) catch unreachable;
             w.writeInt(i64, job.created_at_ms, .little) catch unreachable;
@@ -662,7 +627,7 @@ pub const ProcessingHandler = struct {
         const req_ns = if (req.namespace.len > 0) req.namespace else "default";
 
         // Collect matching jobs
-        const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, parallelism: u32, created_at: i64 };
+        const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, created_at: i64 };
         var jobs: std.ArrayListUnmanaged(JobInfo) = .empty;
         defer jobs.deinit(self.allocator);
 
@@ -675,7 +640,6 @@ pub const ProcessingHandler = struct {
                 .name = job.name_owned,
                 .job_id = job.job_id_owned,
                 .status = job.status.toString(),
-                .parallelism = job.parallelism,
                 .created_at = job.created_at_ms,
             }) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
@@ -685,11 +649,11 @@ pub const ProcessingHandler = struct {
 
         // Serialize to binary wire format:
         // [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-        //  [status_len:u16][status][parallelism:u32][created_at:i64])*
+        //  [status_len:u16][status][created_at:i64])*
         // [has_more:u8][cursor_len:u16]
         var total: usize = 4; // count
         for (jobs.items) |j| {
-            total += 2 + j.name.len + 2 + j.job_id.len + 2 + j.status.len + 4 + 8;
+            total += 2 + j.name.len + 2 + j.job_id.len + 2 + j.status.len + 8;
         }
         total += 1 + 2; // trailer
 
@@ -716,8 +680,6 @@ pub const ProcessingHandler = struct {
             pos += 2;
             @memcpy(buf[pos..][0..j.status.len], j.status);
             pos += j.status.len;
-            std.mem.writeInt(u32, buf[pos..][0..4], j.parallelism, .little);
-            pos += 4;
             std.mem.writeInt(i64, buf[pos..][0..8], j.created_at, .little);
             pos += 8;
         }
@@ -728,117 +690,20 @@ pub const ProcessingHandler = struct {
         shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
-    // ── Savepoint ────────────────────────────────────────────────────────
-
-    fn handleSavepoint(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const job_id = req.key;
-        if (job_id.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job_id is required");
-            return;
-        }
-
-        if (self.ownedJob(job_id, req.namespace)) |job| {
-            // Generate savepoint ID with partition from parent job
-            const partition_id = run_id_mod.extractPartition(job_id) orelse 0;
-            var id_buf: [32]u8 = undefined;
-            const sp_id = shard.run_id_gen.next(.savepoint, partition_id, &id_buf);
-
-            // Persist through Raft; the applier stores the savepoint.
-            const proposed = self.proposeSavepoint(shard, req.namespace, sp_id, job_id, job.records_processed) catch |err| {
-                shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "savepoint not persisted"));
-                return;
-            };
-            shard.park(conn, req, proposed, respondProcessing);
-        } else {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-        }
-    }
-
-    // ── Restore ──────────────────────────────────────────────────────────
-
-    fn handleRestore(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const job_id = req.key;
-        const savepoint_id = req.value;
-
-        if (job_id.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job_id is required");
-            return;
-        }
-
-        if (savepoint_id.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "savepoint_id is required");
-            return;
-        }
-
-        // Check job exists, in this namespace
-        if (self.ownedJob(job_id, req.namespace)) |job| {
-            // Check savepoint exists
-            if (self.savepoints.get(savepoint_id)) |sp| {
-                // Verify the savepoint belongs to this job
-                if (!std.mem.eql(u8, sp.job_id_owned, job_id)) {
-                    shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "savepoint does not belong to this job");
-                    return;
-                }
-
-                // Restore: reset job state to savepoint
-                job.status = .running;
-                job.records_processed = sp.records_at_savepoint;
-                shard.sendOkResponse(conn, req.header.request_id, "");
-            } else {
-                shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-            }
-        } else {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-        }
-    }
-
-    // ── Rescale ──────────────────────────────────────────────────────────
-
-    fn handleRescale(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const job_id = req.key;
-        const data = req.value;
-
-        if (job_id.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job_id is required");
-            return;
-        }
-
-        if (data.len < 4) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "parallelism value is required");
-            return;
-        }
-
-        const parallelism = std.mem.readInt(u32, data[0..4], .little);
-        if (parallelism == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "parallelism must be at least 1");
-            return;
-        }
-
-        if (self.ownedJob(job_id, req.namespace) != null) {
-            const proposed = self.proposeRescale(shard, req.namespace, job_id, parallelism) catch |err| {
-                shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "rescale not persisted"));
-                return;
-            };
-            shard.park(conn, req, proposed, respondProcessing);
-        } else {
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-        }
-    }
-
     // ── UAL Persistence ─────────────────────────────────────────────────
 
     /// A processing_submit entry. Key = job_id. The job is created at the
     /// entry's stamp.
-    /// Value format: [status:u8][parallelism:u32][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, parallelism: u32, batch_size: u32, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
+    /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
+    fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, batch_size: u32, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         var off: usize = 0;
 
+        value_buf[off] = SUBMIT_LAYOUT;
+        off += 1;
         value_buf[off] = @backingInt(status);
         off += 1;
-        std.mem.writeInt(u32, value_buf[off..][0..4], parallelism, .little);
-        off += 4;
         std.mem.writeInt(u32, value_buf[off..][0..4], batch_size, .little);
         off += 4;
 
@@ -870,33 +735,6 @@ pub const ProcessingHandler = struct {
         return persistence_mod.proposeEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
     }
 
-    /// A processing_savepoint entry. Key = savepoint_id. The savepoint is
-    /// created at the entry's stamp.
-    /// Value format: [job_id_len:u16][job_id][records_at:u64]
-    fn proposeSavepoint(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, sp_id: []const u8, job_id: []const u8, records_at: u64) !persistence_mod.ProposeResult {
-        _ = self;
-        var value_buf: [512]u8 = undefined;
-        var off: usize = 0;
-
-        // An owned job's id: 32 bytes.
-        std.mem.writeInt(u16, value_buf[off..][0..2], @intCast(job_id.len), .little);
-        off += 2;
-        @memcpy(value_buf[off .. off + job_id.len], job_id);
-        off += job_id.len;
-        std.mem.writeInt(u64, value_buf[off..][0..8], records_at, .little);
-        off += 8;
-
-        return persistence_mod.proposeEntry(shard, .processing_savepoint, Flags.NONE, namespace, sp_id, value_buf[0..off]);
-    }
-
-    /// A processing_rescale entry. Key = job_id, value = [parallelism:u32].
-    fn proposeRescale(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, parallelism: u32) !persistence_mod.ProposeResult {
-        _ = self;
-        var value_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, value_buf[0..4], parallelism, .little);
-        return persistence_mod.proposeEntry(shard, .processing_rescale, Flags.NONE, namespace, job_id, &value_buf);
-    }
-
     // ── Replay ──────────────────────────────────────────────────────────
 
     /// Register this handler's entry types with the shared ReplayRegistry.
@@ -904,8 +742,6 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_submit, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_stop, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_cancel, @ptrCast(self), replayEntryThunk);
-        registry.register(.processing_savepoint, @ptrCast(self), replayEntryThunk);
-        registry.register(.processing_rescale, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
     }
 
@@ -922,7 +758,6 @@ pub const ProcessingHandler = struct {
                 self.last_submitted_job_id = null;
                 self.last_submit_at_limit = false;
             },
-            .processing_savepoint => self.last_savepoint_id = null,
             else => {},
         }
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
@@ -932,24 +767,24 @@ pub const ProcessingHandler = struct {
             .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
-            .processing_savepoint => self.replaySavepoint(cmd.key, cmd.value, stamp_ms),
-            .processing_rescale => self.replayRescale(cmd.key, cmd.value),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => .failed,
         };
     }
 
     /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
-    /// Value format: [status:u8][parallelism:u32][batch_size:u32][ns_len:u16][namespace][yaml...]
+    /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
     fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
-        if (value.len < 11) return .failed; // 1+4+4+2 minimum
         const job_id = key;
+        if (value.len == 0 or value[0] != SUBMIT_LAYOUT) {
+            log.err("processing job {s} not started: its submit entry is from an older server, with a parallelism the server no longer takes; submit the job again", .{job_id});
+            return .failed;
+        }
+        if (value.len < 8) return .failed; // 1+1+4+2 minimum
 
-        var off: usize = 0;
+        var off: usize = 1;
         const status = std.enums.fromInt(JobStatus, value[off]) orelse return .failed;
         off += 1;
-        const parallelism = std.mem.readInt(u32, value[off..][0..4], .little);
-        off += 4;
         const batch_size = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
 
@@ -1016,7 +851,6 @@ pub const ProcessingHandler = struct {
             .name_owned = name,
             .namespace_owned = namespace,
             .status = status,
-            .parallelism = parallelism,
             .batch_size = batch_size,
             .yaml_owned = owned_yaml,
             .created_at_ms = created_at_ms,
@@ -1047,53 +881,6 @@ pub const ProcessingHandler = struct {
         // nothing to change.
         const job = self.jobs.getPtr(key) orelse return .failed;
         job.status = status;
-        return .applied;
-    }
-
-    /// Replay a savepoint entry.
-    /// Value format: [job_id_len:u16][job_id][records_at:u64]
-    fn replaySavepoint(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
-        if (value.len < 2) return .failed;
-        var off: usize = 0;
-
-        const job_id_len = std.mem.readInt(u16, value[off..][0..2], .little);
-        off += 2;
-        if (off + job_id_len + 8 > value.len) return .failed;
-        const job_id = value[off .. off + job_id_len];
-        off += job_id_len;
-        const records_at = std.mem.readInt(u64, value[off..][0..8], .little);
-
-        const owned_sp_id = self.allocator.dupe(u8, key) catch return .failed;
-        const owned_job_id = self.allocator.dupe(u8, job_id) catch {
-            self.allocator.free(owned_sp_id);
-            return .failed;
-        };
-
-        // Remove old entry if exists (idempotent replay)
-        if (self.savepoints.fetchRemove(owned_sp_id)) |old| {
-            self.allocator.free(old.value.savepoint_id_owned);
-            self.allocator.free(old.value.job_id_owned);
-        }
-
-        self.savepoints.put(owned_sp_id, .{
-            .savepoint_id_owned = owned_sp_id,
-            .job_id_owned = owned_job_id,
-            .created_at_ms = created_at_ms,
-            .records_at_savepoint = records_at,
-        }) catch {
-            self.allocator.free(owned_sp_id);
-            self.allocator.free(owned_job_id);
-        };
-        self.last_savepoint_id = owned_sp_id;
-        return .applied;
-    }
-
-    /// Replay a rescale entry. Value = [parallelism:u32].
-    fn replayRescale(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyOutcome {
-        if (value.len < 4) return .failed;
-        const parallelism = std.mem.readInt(u32, value[0..4], .little);
-        const job = self.jobs.getPtr(key) orelse return .failed;
-        job.parallelism = parallelism;
         return .applied;
     }
 
@@ -1570,7 +1357,6 @@ pub const ProcessingHandler = struct {
             .metrics = &metrics,
             .allocator = allocator,
             .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
-            .current_watermark_ms = event_time_ms,
             .operator_name = "",
         };
 
@@ -1943,9 +1729,6 @@ test "ProcessingHandler: all opcodes are registered" {
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_cancel));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_status));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_list));
-    try std.testing.expect(d.hasHandler(proto.OpCode.processing_savepoint));
-    try std.testing.expect(d.hasHandler(proto.OpCode.processing_restore));
-    try std.testing.expect(d.hasHandler(proto.OpCode.processing_rescale));
 }
 
 test "ProcessingHandler: init and deinit" {
@@ -2094,21 +1877,6 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
     try std.testing.expectEqual(@as(usize, 0), records.len);
 }
 
-test "ProcessingHandler: a savepoint is created at its entry's stamp, not the host's clock" {
-    const host_ms = @import("stdx").time.milliTimestamp();
-    // One stamp far behind the host's clock and one a day ahead.
-    for ([_]i64{ 1_000, host_ms + std.time.ms_per_day }) |stamp_ms| {
-        var handler = ProcessingHandler.init(std.testing.allocator);
-        defer handler.deinit();
-        // [job_id_len=3][job][records_at=0]
-        const value = [_]u8{ 3, 0, 'j', 'o', 'b' } ++ @as([8]u8, @splat(0));
-        var pbuf: [128]u8 = undefined;
-        // Through `replayEntry`, as the log applies it.
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_savepoint, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "sp-1", &value, &pbuf).?));
-        try std.testing.expectEqual(stamp_ms, handler.savepoints.get("sp-1").?.created_at_ms);
-    }
-}
-
 test "ProcessingHandler: a job is created at its submit entry's stamp, not the host's clock" {
     const yaml =
         \\kind: Processing
@@ -2127,16 +1895,16 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
     for ([_]i64{ 1_000, host_ms + std.time.ms_per_day }) |stamp_ms| {
         var handler = ProcessingHandler.init(std.testing.allocator);
         defer handler.deinit();
-        // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
+        // [layout][status][batch_size=0][ns_len=7]["default"][yaml]
         var value: [512]u8 = undefined;
-        value[0] = @backingInt(ProcessingHandler.JobStatus.stopped);
-        std.mem.writeInt(u32, value[1..5], 1, .little);
-        std.mem.writeInt(u32, value[5..9], 0, .little);
-        std.mem.writeInt(u16, value[9..11], 7, .little);
-        @memcpy(value[11..18], "default");
-        @memcpy(value[18 .. 18 + yaml.len], yaml);
+        value[0] = SUBMIT_LAYOUT;
+        value[1] = @backingInt(ProcessingHandler.JobStatus.stopped);
+        std.mem.writeInt(u32, value[2..6], 0, .little);
+        std.mem.writeInt(u16, value[6..8], 7, .little);
+        @memcpy(value[8..15], "default");
+        @memcpy(value[15 .. 15 + yaml.len], yaml);
         var pbuf: [1024]u8 = undefined;
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 18 + yaml.len], &pbuf).?));
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 15 + yaml.len], &pbuf).?));
         try std.testing.expectEqual(stamp_ms, (handler.jobs.get("job-1") orelse return error.JobNotCreated).created_at_ms);
     }
 }
@@ -2146,9 +1914,10 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
 
-    // [status=0xee][parallelism][batch_size][ns_len=0]
-    var val = @as([13]u8, @splat(0));
-    val[0] = 0xee;
+    // [layout][status=0xee][batch_size][ns_len=0]
+    var val = @as([8]u8, @splat(0));
+    val[0] = SUBMIT_LAYOUT;
+    val[1] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }
@@ -2171,15 +1940,15 @@ test "ProcessingHandler: a TS source record writes a non-finite value as null" {
     }
 }
 
-/// A processing_submit value: [status][parallelism=1][batch_size=0][ns_len]["default"][yaml].
+/// A processing_submit value: [layout][status][batch_size=0][ns_len]["default"][yaml].
 fn testSubmitValue(buf: []u8, status: ProcessingHandler.JobStatus, yaml: []const u8) []const u8 {
-    buf[0] = @backingInt(status);
-    std.mem.writeInt(u32, buf[1..5], 1, .little);
-    std.mem.writeInt(u32, buf[5..9], 0, .little);
-    std.mem.writeInt(u16, buf[9..11], 7, .little);
-    @memcpy(buf[11..18], "default");
-    @memcpy(buf[18 .. 18 + yaml.len], yaml);
-    return buf[0 .. 18 + yaml.len];
+    buf[0] = SUBMIT_LAYOUT;
+    buf[1] = @backingInt(status);
+    std.mem.writeInt(u32, buf[2..6], 0, .little);
+    std.mem.writeInt(u16, buf[6..8], 7, .little);
+    @memcpy(buf[8..15], "default");
+    @memcpy(buf[15 .. 15 + yaml.len], yaml);
+    return buf[0 .. 15 + yaml.len];
 }
 
 test "ProcessingHandler: a stored definition that lists partitions is not started" {
@@ -2294,15 +2063,8 @@ test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server
         var handler = ProcessingHandler.init(std.testing.allocator);
         defer handler.deinit();
         handler.peer_shard_count = 2;
-        // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
         var value: [512]u8 = undefined;
-        value[0] = @backingInt(ProcessingHandler.JobStatus.running);
-        std.mem.writeInt(u32, value[1..5], 1, .little);
-        std.mem.writeInt(u32, value[5..9], 0, .little);
-        std.mem.writeInt(u16, value[9..11], 7, .little);
-        @memcpy(value[11..18], "default");
-        @memcpy(value[18 .. 18 + yaml.len], yaml);
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", value[0 .. 18 + yaml.len], 1));
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", testSubmitValue(&value, .running, yaml), 1));
         try std.testing.expect(handler.jobs.contains("job-1"));
         try std.testing.expect(!handler.pipelines.contains("job-1"));
     }
@@ -2430,4 +2192,20 @@ test "ProcessingHandler: starting a part-started job again keeps the pipelines i
     const long_id = comptime @import("stdx").repeat("j", 300);
     handler.startPipelines(long_id, &def);
     try std.testing.expect(handler.pipelines.contains(long_id ++ "\x001"));
+}
+
+test "ProcessingHandler: a submit entry from before the layout byte is refused, not misread" {
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    // The old layout: [status=running][parallelism=1][batch_size=100][ns_len=7]["default"][yaml]
+    var val: [128]u8 = undefined;
+    val[0] = @backingInt(ProcessingHandler.JobStatus.running);
+    std.mem.writeInt(u32, val[1..5], 1, .little);
+    std.mem.writeInt(u32, val[5..9], 100, .little);
+    std.mem.writeInt(u16, val[9..11], 7, .little);
+    @memcpy(val[11..18], "default");
+    const yaml = "kind: Processing\nsources: [{stream: {name: in}}]\nsinks: [{stream: {name: out}}]\n";
+    @memcpy(val[18 .. 18 + yaml.len], yaml);
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-old", val[0 .. 18 + yaml.len], 1));
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }

@@ -42,7 +42,7 @@ Flo takes a different approach. All five primitives share one Raft consensus log
 - **Queues** — Priority queues with competing consumers and dead-letter support; delivery is currently at-most-once
 - **Time-Series** — Columnar write buffers with block index, InfluxDB line protocol ingest, and FloQL query language
 - **Actions** — Durable execution of external business logic with automatic retries, timeouts, and dead-letter handling
-- **Stream Processing** — Real-time stateful pipelines with windowing, keyed state, checkpointing, watermarks, and WASM operators — no separate cluster needed
+- **Stream Processing** — Continuous YAML pipelines (filter, map, keyed aggregates, KV enrichment) over streams and time-series — no separate cluster needed
 - **Workflows** — Multi-step orchestration with YAML definitions, signals, timers, circuit breakers, and health-weighted routing
 - **Thread-per-Core** — Shared-nothing architecture with io_uring/kqueue per core. No locks, no GC pauses
 - **Raft Consensus** — Linearizable writes, tiered storage (hot RAM → warm disk), automatic leader election
@@ -322,57 +322,43 @@ flo action status <run-id>
 
 ## Stream Processing
 
-Flo includes a built-in stream processing engine for real-time, stateful pipelines. Define jobs declaratively in YAML or programmatically via the SDK — Flo handles checkpointing, watermarks, and state management internally.
-
-### Declarative (YAML)
+Flo includes a built-in stream processing engine for continuous pipelines over streams and time-series. A job is a YAML definition — sources, a chain of operators, sinks — and runs inside the node that owns its source; the source cursor is persisted, so a restarted job resumes where it stopped.
 
 ```yaml
-kind: ProcessingJob
-name: user-spend-alerts
-version: "1.0.0"
+kind: Processing
+name: high-spenders
 
 sources:
   - name: transactions
-    stream: payment-events
-    start: latest
-    watermark:
-      strategy: bounded-out-of-order
-      max_delay_ms: 5000
+    stream:
+      name: payment-events
 
 operators:
-  - name: by-user
-    type: keyBy
-    input: transactions
-    key: "$.user_id"
-
-  - name: spend-per-hour
-    type: window
-    input: by-user
-    window: { type: tumbling, size: 1h }
-    aggregate: { type: sum, field: "$.amount" }
-    trigger: event-time
-
-  - name: high-spenders
-    type: filter
-    input: spend-per-hour
-    condition: "$.value > 10000"
+  - type: keyby
+    name: by-user
+    key_expression: "$.user_id"
+  - type: aggregate              # running total per user
+    name: spend
+    function: sum
+    field: "$.amount"
+  - type: filter
+    name: over-limit
+    condition: "json:$.value>10000"
 
 sinks:
   - name: alerts
-    input: high-spenders
-    stream: high-spend-alerts
-
-checkpointing:
-  interval: 30s
-  mode: exactly-once
+    stream:
+      name: high-spend-alerts
 ```
 
 ```bash
-flo processing submit --file jobs/user-spend-alerts.yaml
-flo processing status user-spend-alerts
-flo processing savepoint user-spend-alerts
-flo processing stop user-spend-alerts
+flo processing submit high-spenders.yaml   # prints the job id
+flo processing list
+flo processing status <job-id>
+flo processing stop <job-id>
 ```
+
+Operators: `filter`, `map`, `flatmap`, `keyby`, `aggregate` (running, or per `window: count`), `kv_lookup`, `classify`, `passthrough`.
 
 ## Workflows
 
@@ -606,7 +592,7 @@ Flo is in **active development**. The core runtime has been rewritten from the g
 | Time-Series (write, query, FloQL) | ✅ Complete |
 | Actions (register, invoke, WASM) | ✅ Complete |
 | Workflows (YAML, signals, timers) | ✅ Complete |
-| Stream Processing (operators, windows, checkpoints) | ✅ Complete |
+| Stream Processing (operators, keyed and count-window aggregates) | ✅ Complete |
 | Web Dashboard | ✅ Complete |
 | Cluster membership by the replicated log | ✅ Complete |
 | Writes forwarded to the leader | ✅ Complete |
