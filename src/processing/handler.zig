@@ -83,6 +83,8 @@ pub const ProcessingHandler = struct {
     /// and `savepoints` (see `Shard.answering_index`).
     last_submitted_job_id: ?[]const u8 = null,
     last_savepoint_id: ?[]const u8 = null,
+    /// The last applied submit was refused: the server held `max_jobs`.
+    last_submit_at_limit: bool = false,
     sink_drops: u64 = 0,
     sink_warn_ms: i64 = 0,
     chain_errors: u64 = 0,
@@ -113,7 +115,12 @@ pub const ProcessingHandler = struct {
     peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
     peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
-    const MAX_JOBS: usize = 100_000;
+    /// Most jobs a server holds. Jobs are never removed (stopped ones still
+    /// count) and each keeps its definition, up to 256 KiB, so a submit past
+    /// it is refused. A field only so tests can reach it.
+    max_jobs: usize = MAX_JOBS,
+
+    const MAX_JOBS: usize = 10_000;
 
     /// Sink configuration for a single sink in the pipeline.
     pub const SinkConfig = struct {
@@ -381,13 +388,10 @@ pub const ProcessingHandler = struct {
         dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, run_id_mod.preRouteByRunId);
     }
 
-    /// Pre-routing: hash on key (job_id) for deterministic shard assignment.
-    /// Uses namespace-qualified hash: hash(namespace \0 job_id)
-    fn preRouteByProcessing(req: Request) ?u64 {
-        if (req.key.len > 0) {
-            return router.hashKeyWithNamespace(req.namespace, req.key);
-        }
-        // For submit/list with empty key, use namespace
+    /// Every submit goes to shard 0, whatever its key: one shard holds the
+    /// job registry, so `max_jobs` bounds the server, and each job id
+    /// carries that shard back for the ops that name it.
+    fn preRouteByProcessing(_: Request) ?u64 {
         return 0;
     }
 
@@ -431,6 +435,7 @@ pub const ProcessingHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .processing_submit => {
+                if (h.last_submit_at_limit) return h.refuseAtJobLimit(shard, conn, req.header.request_id);
                 shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 const job_id = h.last_submitted_job_id orelse {
                     shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
@@ -485,6 +490,9 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job definition is required");
             return;
         }
+        // The applier refuses too, so submits in flight together can't
+        // pass the limit; this spares the log an entry that changes nothing.
+        if (self.jobs.count() >= self.max_jobs) return self.refuseAtJobLimit(shard, conn, req.header.request_id);
 
         // Parse the YAML/JSON definition, using the request namespace as fallback
         const req_ns: ?[]const u8 = if (req.namespace.len > 0) req.namespace else null;
@@ -523,7 +531,7 @@ pub const ProcessingHandler = struct {
         //
         // The partition MUST route back to the shard that stores this job's
         // registry entry — i.e. THIS shard. Submit is routed here by
-        // preRouteByProcessing (empty key → partition 0 → shard 0), so the
+        // preRouteByProcessing (every submit → partition 0 → shard 0), so the
         // entry lives in this shard's `self.jobs`. The job_id's partition bits
         // are how every ID-routed op (status/stop/cancel/savepoint/restore/
         // rescale) finds it again: partitionToShard = partition % shard_count.
@@ -551,6 +559,12 @@ pub const ProcessingHandler = struct {
             return;
         };
         shard.park(conn, req, proposed, respondProcessing);
+    }
+
+    fn refuseAtJobLimit(self: *const ProcessingHandler, shard: *Shard, conn: *Connection, request_id: u64) void {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "job not submitted: this server holds at most {d} processing jobs", .{self.max_jobs}) catch "job not submitted: this server holds as many processing jobs as it may";
+        shard.sendRefusal(conn, request_id, .overloaded, .{ .reason = .unclassified, .ran = .no, .message = msg });
     }
 
     // ── Stop ─────────────────────────────────────────────────────────────
@@ -912,7 +926,10 @@ pub const ProcessingHandler = struct {
     pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
-            .processing_submit => self.last_submitted_job_id = null,
+            .processing_submit => {
+                self.last_submitted_job_id = null;
+                self.last_submit_at_limit = false;
+            },
             .processing_savepoint => self.last_savepoint_id = null,
             else => {},
         }
@@ -952,6 +969,14 @@ pub const ProcessingHandler = struct {
         off += ns_len;
 
         const yaml = value[off..];
+
+        // Refused in log order, so every replica and restart refuses the
+        // same submits. A job already held is a replay of itself.
+        if (!self.jobs.contains(job_id) and self.jobs.count() >= self.max_jobs) {
+            log.warn("processing job {s} not created: this server holds at most {d} jobs", .{ job_id, self.max_jobs });
+            self.last_submit_at_limit = true;
+            return .applied;
+        }
 
         // Re-parse with the job's namespace as fallback, as the submit did, so
         // endpoints and lookups that name none resolve alike on every replica
@@ -1224,12 +1249,12 @@ pub const ProcessingHandler = struct {
         };
 
         var count: usize = 0;
-        log.info("createPipeline: {d} operator specs to process", .{op_specs.len});
+        log.debug("createPipeline: {d} operator specs to process", .{op_specs.len});
         for (op_specs) |*spec| {
-            log.info("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
+            log.debug("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
             if (spec.config) |cfg| {
                 for (cfg) |entry| {
-                    log.info("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
+                    log.debug("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
                 }
             }
             const result = native_registry.create(self.allocator, spec, tag_registry) catch |err| {
@@ -1249,7 +1274,7 @@ pub const ProcessingHandler = struct {
 
         var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash);
         pipe_state.tag_registry = tag_registry;
-        log.info("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
+        log.debug("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
         if (count > 0) {
             pipe_state.operators = ops[0..count];
             pipe_state.operator_backings = backings[0..count];
@@ -1921,7 +1946,6 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
         .name = "s",
         .stream = "raw",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
     };
     try handler.pipelines.put("job-cp", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
@@ -1954,7 +1978,6 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
         .name = "t",
         .stream = "",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
         .ts_measurement = "cpu",
         .ts_field = "value",
@@ -1980,7 +2003,7 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     const allocator = std.testing.allocator;
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
-    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .partition = 0, .batch_size = 0 };
+    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
     try handler.pipelines.put("job-fw", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     const pipe = handler.pipelines.getPtr("job-fw").?;
     pipe.stream_cursor_ts = 2000;
@@ -2110,6 +2133,76 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     val[0] = 0xee;
     try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+}
+
+/// A processing_submit value: [status][parallelism=1][batch_size=0][ns_len]["default"][yaml].
+fn testSubmitValue(buf: []u8, status: ProcessingHandler.JobStatus, yaml: []const u8) []const u8 {
+    buf[0] = @backingInt(status);
+    std.mem.writeInt(u32, buf[1..5], 1, .little);
+    std.mem.writeInt(u32, buf[5..9], 0, .little);
+    std.mem.writeInt(u16, buf[9..11], 7, .little);
+    @memcpy(buf[11..18], "default");
+    @memcpy(buf[18 .. 18 + yaml.len], yaml);
+    return buf[0 .. 18 + yaml.len];
+}
+
+test "ProcessingHandler: a stored definition that lists partitions is not started" {
+    const yaml =
+        \\kind: Processing
+        \\name: ranged
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\      partitions: "0-4294967295"
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1));
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+    try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
+}
+
+test "ProcessingHandler: a submit past the job limit is refused in log order" {
+    const yaml =
+        \\kind: Processing
+        \\name: one
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    handler.max_jobs = 1;
+    var buf: [512]u8 = undefined;
+    var pbuf: [1024]u8 = undefined;
+    const value = testSubmitValue(&buf, .stopped, yaml);
+    for ([_]struct { []const u8, bool }{ .{ "job-1", false }, .{ "job-2", true }, .{ "job-1", false } }) |c| {
+        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, 0, c[0], value, &pbuf).?;
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry));
+        try std.testing.expectEqual(c[1], handler.last_submit_at_limit);
+        try std.testing.expectEqual(@as(usize, 1), handler.jobs.count());
+    }
+    try std.testing.expect(!handler.jobs.contains("job-2"));
+}
+
+test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
+    var req: proto.Request = undefined;
+    req.namespace = "acme";
+    for ([_][]const u8{ "", "k", "another-key" }) |key| {
+        req.key = key;
+        try std.testing.expectEqual(@as(?u64, 0), ProcessingHandler.preRouteByProcessing(req));
+    }
 }
 
 test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key hashes to" {

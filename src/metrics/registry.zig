@@ -5,7 +5,7 @@ const Atomic = std.atomic.Value;
 const StreamMetrics = @import("../stream/metrics.zig").Metrics;
 
 // =============================================================================
-// Queue Metrics — imported from src/queue/metrics.zig (rich per-queue metrics)
+// Queue Metrics — imported from src/queue/metrics.zig
 // =============================================================================
 pub const QueueMetrics = @import("../queue/metrics.zig").Metrics;
 
@@ -564,6 +564,8 @@ pub const ShardMetrics = struct {
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
     replies_dropped: Atomic(u64) = Atomic(u64).init(0),
+    /// Removal notices received, by what became of each (`RemovalOutcome`).
+    removal_notices: [4]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Requests whose handler neither answered nor parked them; each was
     /// answered internal_error. A count is a handler bug.
     handler_no_answer: Atomic(u64) = Atomic(u64).init(0),
@@ -590,6 +592,9 @@ pub const ShardMetrics = struct {
     /// Entries and segments lost without anyone being told, by path
     /// (`silent_loss.Path`), as the shard last published them.
     silent_loss: [silent_loss.PATH_COUNT]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    /// Entries refused for repeating an index the partition holds: no loss,
+    /// but a writer bug.
+    duplicate_index: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
 
@@ -674,6 +679,12 @@ pub const ShardMetrics = struct {
         for (counts, &self.connections_paused) |n, *g| g.store(n, .monotonic);
     }
 
+    pub const RemovalOutcome = enum(u2) { counted, duplicate, ignored, conflict };
+
+    pub fn recordRemovalNotice(self: *ShardMetrics, outcome: RemovalOutcome) void {
+        _ = self.removal_notices[@backingInt(outcome)].fetchAdd(1, .monotonic);
+    }
+
     pub fn recordReplyDropped(self: *ShardMetrics) void {
         _ = self.replies_dropped.fetchAdd(1, .monotonic);
     }
@@ -682,8 +693,9 @@ pub const ShardMetrics = struct {
         _ = self.handler_no_answer.fetchAdd(1, .monotonic);
     }
 
-    pub fn setSilentLoss(self: *ShardMetrics, counts: [silent_loss.PATH_COUNT]u64, offline: bool) void {
+    pub fn setSilentLoss(self: *ShardMetrics, counts: [silent_loss.PATH_COUNT]u64, duplicate_index: u64, offline: bool) void {
         for (counts, &self.silent_loss) |n, *c| c.store(n, .monotonic);
+        self.duplicate_index.store(duplicate_index, .monotonic);
         self.offline.store(@intFromBool(offline), .monotonic);
     }
 
@@ -713,6 +725,7 @@ pub const ShardMetrics = struct {
         cross_shard_in_flight: u64,
         cross_shard_overloaded: [2]u64,
         replies_dropped: u64,
+        removal_notices: [4]u64,
         handler_no_answer: u64,
         stream_skipped_appends: u64,
         kv_txns_reaped: u64,
@@ -721,6 +734,7 @@ pub const ShardMetrics = struct {
         connections_paused: [PAUSE_REASONS.len]u64,
         stamp_skew_ms: i64,
         silent_loss: [silent_loss.PATH_COUNT]u64,
+        duplicate_index: u64,
         offline: u8,
     };
 
@@ -739,6 +753,7 @@ pub const ShardMetrics = struct {
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
             .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic) },
             .replies_dropped = self.replies_dropped.load(.monotonic),
+            .removal_notices = .{ self.removal_notices[0].load(.monotonic), self.removal_notices[1].load(.monotonic), self.removal_notices[2].load(.monotonic), self.removal_notices[3].load(.monotonic) },
             .handler_no_answer = self.handler_no_answer.load(.monotonic),
             .stream_skipped_appends = self.stream_skipped_appends.load(.monotonic),
             .kv_txns_reaped = self.kv_txns_reaped.load(.monotonic),
@@ -750,6 +765,7 @@ pub const ShardMetrics = struct {
                 for (&out, &self.silent_loss) |*o, *c| o.* = c.load(.monotonic);
                 break :blk out;
             },
+            .duplicate_index = self.duplicate_index.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
@@ -1271,37 +1287,15 @@ fn writeStreamMetrics(
     try writer.print("flo_stream_append_ops_total{{{s}}} {d}\n", .{ labels, snapshot.append_ops_total });
     try writer.print("flo_stream_append_records_total{{{s}}} {d}\n", .{ labels, snapshot.append_records_total });
     try writer.print("flo_stream_append_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.append_bytes_total });
-    try writer.print("flo_stream_append_errors_total{{{s}}} {d}\n", .{ labels, snapshot.append_errors_total });
-    try writer.print("flo_stream_append_oversized_total{{{s}}} {d}\n", .{ labels, snapshot.append_oversized_total });
 
     // Read metrics
     try writer.print("flo_stream_read_ops_total{{{s}}} {d}\n", .{ labels, snapshot.read_ops_total });
     try writer.print("flo_stream_read_records_total{{{s}}} {d}\n", .{ labels, snapshot.read_records_total });
     try writer.print("flo_stream_read_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.read_bytes_total });
-    try writer.print("flo_stream_read_errors_total{{{s}}} {d}\n", .{ labels, snapshot.read_errors_total });
     try writer.print("flo_stream_read_empty_total{{{s}}} {d}\n", .{ labels, snapshot.read_empty_total });
-
-    // Blocking read metrics
-    try writer.print("flo_stream_blocking_readers_current{{{s}}} {d}\n", .{ labels, snapshot.blocking_readers_current });
-    try writer.print("flo_stream_blocking_read_waits_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_waits_total });
-    try writer.print("flo_stream_blocking_read_timeouts_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_timeouts_total });
-    try writer.print("flo_stream_blocking_read_wakeups_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_wakeups_total });
-
-    // Consumer group metrics
-    try writer.print("flo_stream_consumer_group_reads_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_reads_total });
-    try writer.print("flo_stream_consumer_group_claims_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_claims_total });
-    try writer.print("flo_stream_consumer_group_acks_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_acks_total });
-    try writer.print("flo_stream_consumer_group_autoclaims_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_autoclaims_total });
-    try writer.print("flo_stream_consumer_group_pending_current{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_pending_current });
-
-    // Stream state
-    try writer.print("flo_stream_last_seq{{{s}}} {d}\n", .{ labels, snapshot.stream_last_seq });
-    try writer.print("flo_stream_trim_ops_total{{{s}}} {d}\n", .{ labels, snapshot.trim_ops_total });
-    try writer.print("flo_stream_trim_records_total{{{s}}} {d}\n", .{ labels, snapshot.trim_records_total });
-    try writer.print("flo_stream_trim_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.trim_bytes_total });
 }
 
-/// Write queue metrics in Prometheus format (rich per-queue metrics from queue/metrics.zig)
+/// Write queue metrics in Prometheus format
 fn writeQueueMetrics(
     writer: anytype,
     snapshot: QueueMetrics.Snapshot,
@@ -1311,45 +1305,12 @@ fn writeQueueMetrics(
     try writer.print("flo_queue_enqueue_ops_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_ops_total });
     try writer.print("flo_queue_enqueue_messages_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_messages_total });
     try writer.print("flo_queue_enqueue_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_bytes_total });
-    try writer.print("flo_queue_enqueue_delayed_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_delayed_total });
-    try writer.print("flo_queue_enqueue_errors_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_errors_total });
-    try writer.print("flo_queue_enqueue_dedup_rejected_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_dedup_rejected_total });
 
     // Dequeue metrics
     try writer.print("flo_queue_dequeue_ops_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_ops_total });
     try writer.print("flo_queue_dequeue_messages_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_messages_total });
     try writer.print("flo_queue_dequeue_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_bytes_total });
     try writer.print("flo_queue_dequeue_empty_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_empty_total });
-    try writer.print("flo_queue_dequeue_errors_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_errors_total });
-
-    // Lease metrics
-    try writer.print("flo_queue_leases_active{{{s}}} {d}\n", .{ labels, snapshot.leases_active_current });
-    try writer.print("flo_queue_leases_created_total{{{s}}} {d}\n", .{ labels, snapshot.leases_created_total });
-    try writer.print("flo_queue_leases_completed_total{{{s}}} {d}\n", .{ labels, snapshot.leases_completed_total });
-    try writer.print("flo_queue_leases_failed_total{{{s}}} {d}\n", .{ labels, snapshot.leases_failed_total });
-    try writer.print("flo_queue_leases_expired_total{{{s}}} {d}\n", .{ labels, snapshot.leases_expired_total });
-    try writer.print("flo_queue_leases_extended_total{{{s}}} {d}\n", .{ labels, snapshot.leases_extended_total });
-
-    // DLQ metrics
-    try writer.print("flo_queue_dlq_messages_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_messages_total });
-    try writer.print("flo_queue_dlq_requeue_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_requeue_total });
-    try writer.print("flo_queue_dlq_delete_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_delete_total });
-    try writer.print("flo_queue_dlq_messages_current{{{s}}} {d}\n", .{ labels, snapshot.dlq_messages_current });
-
-    // Sweeper metrics
-    try writer.print("flo_queue_sweeper_runs_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_runs_total });
-    try writer.print("flo_queue_sweeper_reclaimed_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_reclaimed_total });
-    try writer.print("flo_queue_sweeper_orphaned_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_orphaned_total });
-    try writer.print("flo_queue_sweeper_scanned_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_scanned_total });
-    try writer.print("flo_queue_sweeper_errors_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_errors_total });
-
-    // Delayed message metrics
-    try writer.print("flo_queue_delayed_promoted_total{{{s}}} {d}\n", .{ labels, snapshot.delayed_promoted_total });
-    try writer.print("flo_queue_delayed_messages_current{{{s}}} {d}\n", .{ labels, snapshot.delayed_messages_current });
-
-    // Queue state
-    try writer.print("flo_queue_available_current{{{s}}} {d}\n", .{ labels, snapshot.queue_available_current });
-    try writer.print("flo_queue_last_seq{{{s}}} {d}\n", .{ labels, snapshot.queue_last_seq });
 }
 
 /// Write tiered log metrics in Prometheus format
@@ -1535,10 +1496,15 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
+    const rinfo = @typeInfo(ShardMetrics.RemovalOutcome).@"enum";
+    inline for (rinfo.field_names, rinfo.field_values) |rname, rvalue| {
+        try writer.print("flo_shard_removal_notices_total{{shard_id=\"{d}\",outcome=\"" ++ rname ++ "\"}} {d}\n", .{ snap.shard_id, snap.removal_notices[rvalue] });
+    }
     try writer.print("flo_shard_handler_no_answer_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.handler_no_answer });
     inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, i| {
         try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
     }
+    try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
@@ -1755,4 +1721,41 @@ test "registry: shard metrics reactor and inbox" {
     try testing.expectEqual(@as(u64, 10), snap.inbox_processed);
     try testing.expectEqual(@as(u64, 5), snap.inbox_pending);
     try testing.expectEqual(@as(u64, 8), snap.partitions);
+}
+
+test "registry: queue and stream series are exactly the ones something records" {
+    var registry = MetricsRegistry.init(testing.allocator);
+    defer registry.deinit();
+    _ = try registry.registerQueue("prod", "jobs");
+    _ = try registry.registerStream("prod", "orders", 0);
+
+    const text = try registry.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(text);
+
+    const want = [_][]const u8{
+        "flo_queue_enqueue_ops_total",   "flo_queue_enqueue_messages_total", "flo_queue_enqueue_bytes_total",
+        "flo_queue_dequeue_ops_total",   "flo_queue_dequeue_messages_total", "flo_queue_dequeue_bytes_total",
+        "flo_queue_dequeue_empty_total", "flo_stream_append_ops_total",      "flo_stream_append_records_total",
+        "flo_stream_append_bytes_total", "flo_stream_read_ops_total",        "flo_stream_read_records_total",
+        "flo_stream_read_bytes_total",   "flo_stream_read_empty_total",
+    };
+    var seen: [want.len]bool = @splat(false);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "flo_queue_") and !std.mem.startsWith(u8, line, "flo_stream_")) continue;
+        const name = line[0 .. std.mem.indexOfAny(u8, line, "{ ") orelse line.len];
+        for (want, 0..) |w, i| {
+            if (!std.mem.eql(u8, w, name)) continue;
+            try testing.expect(!seen[i]);
+            seen[i] = true;
+            break;
+        } else {
+            std.debug.print("unexpected series {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (seen, want) |s, w| {
+        if (!s) std.debug.print("missing series {s}\n", .{w});
+        try testing.expect(s);
+    }
 }

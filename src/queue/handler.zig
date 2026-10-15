@@ -687,7 +687,7 @@ pub const QueueHandler = struct {
                 offset += 8;
 
                 // dlq
-                std.mem.writeInt(u64, buf[offset..][0..8], @intCast(self.queue.dlqCount()), .little);
+                std.mem.writeInt(u64, buf[offset..][0..8], @intCast(self.queue.deadLetters(kv.key_ptr.*).len), .little);
                 offset += 8;
             }
         }
@@ -1322,4 +1322,47 @@ test "queue handler: an ack batch logs each held message once, and nothing for o
     try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, "")) != .err);
     try testing.expectEqual(before + 1, handler.partition.ual.max_index);
     try testing.expectEqual(@as(usize, 0), handler.queue.messages.count());
+}
+
+test "queue handler: a listing gives each queue its own dead-letter count" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    var handler = QueueHandler.init(allocator, partition);
+
+    const q = &partition.queue;
+    const ns = router.namespaceHash("default");
+    for ([_]struct { name: []const u8, dead: usize }{ .{ .name = "mine", .dead = 1 }, .{ .name = "theirs", .dead = 2 } }) |c| {
+        const hash = router.nameHash(ns, c.name);
+        try q.registerQueue(hash, c.name, "default");
+        for (0..c.dead) |i| {
+            const seq = try q.enqueue(100 + i, 0, 1, hash, "x");
+            const msg = q.messages.getPtr(seq).?;
+            msg.state = .leased;
+            msg.attempts = q.max_attempts;
+            try q.nack(seq, 2);
+        }
+    }
+
+    const result = handler.handleCommand(makeRequest(.queue_list, "", "", ""));
+    defer handler.freeResult(result);
+    const data = switch (result) {
+        .queue_messages => |m| m.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, data[0..4], .little));
+    var off: usize = 4;
+    var seen: usize = 0;
+    for (0..2) |_| {
+        const name_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        const name = data[off + 4 ..][0..name_len];
+        off += 4 + name_len;
+        off += 4 + std.mem.readInt(u32, data[off..][0..4], .little);
+        const dead = std.mem.readInt(u64, data[off + 32 ..][0..8], .little);
+        off += 40;
+        const want: u64 = if (std.mem.eql(u8, name, "mine")) 1 else 2;
+        try testing.expectEqual(want, dead);
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
 }

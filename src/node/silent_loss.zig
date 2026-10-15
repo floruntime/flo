@@ -40,6 +40,9 @@ pub const Counts = struct {
     /// Counted since that path's last line, said with the next one.
     unlogged: [PATH_COUNT]u64 = @splat(0),
     last_line_ms: [PATH_COUNT]u64 = @splat(0),
+    duplicate_index: u64 = 0,
+    duplicate_unlogged: u64 = 0,
+    duplicate_line_ms: u64 = 0,
 
     /// Count one loss on `path` and say why, unless that path has spoken
     /// within `WARN_INTERVAL_MS`; then the next line says how many went
@@ -58,6 +61,21 @@ pub const Counts = struct {
 
     pub fn total(self: *const Counts, path: Path) u64 {
         return self.counts[@backingInt(path)];
+    }
+
+    /// An entry at an index the partition already holds: refused, and not
+    /// a loss, since the first entry there applied. It still means a
+    /// writer wrote one index twice, so it is counted and said, rate-limited
+    /// like a loss, but on its own count.
+    pub fn noteDuplicate(self: *Counts, now_ms: u64, shard_id: u16, index: u64, type_name: []const u8) void {
+        self.duplicate_index += 1;
+        if (self.duplicate_line_ms != 0 and now_ms -| self.duplicate_line_ms < WARN_INTERVAL_MS) {
+            self.duplicate_unlogged += 1;
+            return;
+        }
+        self.duplicate_line_ms = @max(now_ms, 1);
+        log.err("shard {d}: entry index={d} type={s} repeats an index the partition already holds; refused, nothing lost; a writer wrote one index twice ({d} more since the last line, {d} in all)", .{ shard_id, index, type_name, self.duplicate_unlogged, self.duplicate_index });
+        self.duplicate_unlogged = 0;
     }
 };
 

@@ -53,7 +53,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .name("flo")
         .about("Flo - High-performance distributed platform")
         .usage("flo <command> [args...]")
-        .version(version_line)
+        .version(short_version)
         .examples(&.{
             "flo server start --port 9000 --data-dir ./data",
             "flo status --endpoint localhost:9000",
@@ -153,6 +153,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 .name("version")
                 .about("Show version information")
                 .group("Other Commands")
+                .examples(&.{ "flo version", "flo version --verbose" })
+                .boolFlag("verbose", 'v', "Also show the protocol version, op table hash and build")
                 .action(wrapHandler(showVersion)),
         )
         .subcommand(
@@ -306,13 +308,16 @@ fn configInit(ctx: *commander.Context) commander.Error!void {
     ctx.print("Created flo.toml with default configuration\n", .{});
 }
 
+/// The release: what `-V`, `--version` and `flo version` print.
+const short_version = "flo " ++ build_options.version;
+
 /// The release, the protocol version and op table this build speaks (a
 /// client or SDK must carry the same table hash to be served), and how it
-/// was built.
-const version_line = std.fmt.comptimePrint("{s} (protocol {d}, table 0x{x:0>16}; {s})", .{ build_options.version, proto.VERSION, proto.TABLE_HASH, build_info.line });
+/// was built: `flo version --verbose`.
+const verbose_version = std.fmt.comptimePrint("{s} (protocol {d}, table 0x{x:0>16}; {s})", .{ short_version, proto.VERSION, proto.TABLE_HASH, build_info.line });
 
 fn showVersion(ctx: *commander.Context) commander.Error!void {
-    ctx.print("flo version {s}\n", .{version_line});
+    ctx.print("{s}\n", .{if (ctx.getBool("verbose")) verbose_version else short_version});
 }
 
 fn showHelp(ctx: *commander.Context) commander.Error!void {

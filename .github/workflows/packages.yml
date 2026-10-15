@@ -1,0 +1,70 @@
+name: Linux packages
+
+# Installs, runs, upgrades over itself and removes the .deb (on the runner,
+# with systemd) and the .rpm (in Rocky Linux 9), checking each step.
+# Release calls it with the packages it built; a pull request touching the
+# packaging builds its own.
+on:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/packages.yml'
+  workflow_call:
+    inputs:
+      from_artifact:
+        description: Use the flo-x86_64-linux artifact this run built
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Packages from this release run
+        if: inputs.from_artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flo-x86_64-linux
+          path: dist
+
+      - name: Install Zig
+        if: ${{ !inputs.from_artifact }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.0"
+
+      - name: Setup Go
+        if: ${{ !inputs.from_artifact }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: Build the packages
+        if: ${{ !inputs.from_artifact }}
+        env:
+          VERSION: 0.0.0-smoke
+          ARCH: amd64
+        run: |
+          zig build --release=safe -Dtarget=x86_64-linux -Dversion="$VERSION"
+          cp zig-out/bin/flo flo
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
+          mkdir -p dist
+          "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p deb -t "dist/flo_${VERSION}_${ARCH}.deb"
+          "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p rpm -t "dist/flo-${VERSION}-1.x86_64.rpm"
+
+      - name: .deb on Ubuntu, with systemd
+        run: sudo packaging/smoke.sh "$(ls dist/flo_*.deb)"
+
+      - name: .rpm on Rocky Linux 9
+        # io_uring, which flo needs, is blocked by Docker's default seccomp profile.
+        run: |
+          docker run --rm --security-opt seccomp=unconfined \
+            -v "$PWD/dist:/dist" -v "$PWD/packaging:/p" rockylinux:9 \
+            sh -c 'dnf -y -q install systemd >/dev/null && /p/smoke.sh "$(ls /dist/flo-*.rpm)"'

@@ -317,6 +317,21 @@ test "e2e/queue: different queues are independent" {
     try testing.expect(!result_b.contains("only-in-a"));
 }
 
+test "e2e/queue: a backlog in one queue doesn't hide another queue's message" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // One shard, so both queues share a partition; the backlog outranks b.
+    for (0..200) |_| try ctx.exec(&.{ "queue", "enqueue", "backlog-a", "from-a", "--priority", "0" });
+    try ctx.exec(&.{ "queue", "enqueue", "backlog-b", "only-in-b", "--priority", "5" });
+
+    var result = try ctx.cli.run(&.{ "queue", "dequeue", "backlog-b" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expect(result.contains("only-in-b"));
+    try testing.expect(!result.contains("from-a"));
+}
+
 // =============================================================================
 // Edge Cases
 // =============================================================================
