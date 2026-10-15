@@ -68,3 +68,23 @@ test "e2e/table: a client from another table or protocol is refused readably and
     defer got.deinit();
     try testing.expectEqual(@as(u8, 0), got.exit_code);
 }
+
+test "e2e/table: -V prints the release; version --verbose adds the protocol and table" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for ([_][]const []const u8{ &.{"-V"}, &.{"--version"}, &.{"version"} }) |args| {
+        var short = try ctx.cli.runRaw(args);
+        defer short.deinit();
+        try testing.expectEqual(@as(u8, 0), short.exit_code);
+        try testing.expect(std.mem.startsWith(u8, short.stdout, "flo "));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, short.stdout, "\n"));
+        try testing.expect(std.mem.indexOf(u8, short.stdout, "protocol") == null);
+    }
+
+    var verbose = try ctx.cli.runRaw(&.{ "version", "--verbose" });
+    defer verbose.deinit();
+    try testing.expectEqual(@as(u8, 0), verbose.exit_code);
+    const want = std.fmt.comptimePrint("(protocol {d}, table 0x{x:0>16}; ", .{ proto.VERSION, proto.TABLE_HASH });
+    try testing.expect(std.mem.indexOf(u8, verbose.stdout, want) != null);
+}

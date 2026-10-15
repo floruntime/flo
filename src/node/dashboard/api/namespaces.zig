@@ -237,13 +237,8 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
             try qobj.begin();
             try qobj.stringField("name", q.queue);
             try qobj.stringField("namespace", q.namespace);
-            try qobj.intField("pending", snap.queue_available_current + snap.leases_active_current);
-            try qobj.intField("available", snap.queue_available_current);
             try qobj.intField("enqueued", snap.enqueue_ops_total);
             try qobj.intField("dequeued", snap.dequeue_ops_total);
-            try qobj.intField("acked", snap.leases_completed_total);
-            try qobj.intField("nacked", snap.leases_failed_total);
-            try qobj.intField("dlq_count", snap.dlq_messages_total);
             try qobj.intField("bytes_total", snap.enqueue_bytes_total);
             try qobj.end();
         }
@@ -348,12 +343,10 @@ pub fn getNamespaceQueues(allocator: Allocator, namespace: []const u8, ctx: *Das
             if (!std.mem.eql(u8, q.namespace, namespace)) continue;
 
             try arr.next();
-            const snap = q.metrics.snapshot();
             var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try obj.begin();
             try obj.stringField("name", q.queue);
             try obj.stringField("namespace", q.namespace);
-            try obj.intField("pending", snap.queue_available_current + snap.leases_active_current);
             try obj.end();
         }
     }

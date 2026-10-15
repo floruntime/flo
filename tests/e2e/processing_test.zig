@@ -3136,3 +3136,27 @@ test "e2e/processing: ts sink with fields drops a value past f64's range" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, read.stdout, "\"value\""));
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tsfields" });
 }
+
+test "e2e/processing: kv_lookup is refused on a server of more than one shard" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 2 } });
+    defer ctx.deinit();
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-kvlookup-shards
+        \\sources.[0].stream.name: in
+        \\sinks.[0].stream.name: out
+        \\operators.[0].type: kv_lookup
+        \\operators.[0].name: check
+        \\operators.[0].lookup_key: account:${$.id}
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-kvlookup-shards.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    var r = try ctx.cli.run(&.{ "processing", "submit", path });
+    defer r.deinit();
+    try testing.expectEqual(@as(u8, 3), r.exit_code);
+    try testing.expect(r.contains("kv_lookup needs a one-shard server"));
+    var listed = try ctx.cli.run(&.{ "processing", "list" });
+    defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
+    try testing.expect(!listed.contains("e2e-kvlookup-shards"));
+}

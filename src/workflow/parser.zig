@@ -201,8 +201,10 @@ pub fn parseWorkflow(allocator: Allocator, content: []const u8, diag: ?*Diagnost
     }
 
     // Not JSON: YAML, converted to JSON.
-    const json_content = yaml_to_json.convert(allocator, content) catch
-        return d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{});
+    const json_content = yaml_to_json.convert(allocator, content) catch |err| return switch (err) {
+        error.NestingTooDeep => d.fail(ParseError.InvalidFormat, "YAML nesting is limited to {d} levels", .{yaml_to_json.MAX_DEPTH}),
+        else => d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{}),
+    };
     defer allocator.free(json_content);
 
     const parsed = std.json.parseFromSlice(JsonValue, allocator, json_content, .{}) catch |err| switch (err) {
@@ -742,6 +744,7 @@ fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]Exec
     const arr = try optArray(d, root, "executors") orelse return missing(d, "executors");
     const list_mark = d.push("executors");
     defer d.pop(list_mark);
+    if (arr.len > plan_types.MAX_PLAN_EXECUTORS) return d.fail(ParseError.InvalidFieldType, "a plan lists at most {d} executors, not {d}", .{ plan_types.MAX_PLAN_EXECUTORS, arr.len });
 
     var executors: std.ArrayList(ExecutorConfig) = .empty;
     errdefer {
@@ -1206,6 +1209,12 @@ test "parseWorkflow: a breaker threshold past what a failure count holds is refu
     try expectRefused(wrap("",
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "failure_threshold": 3000000000 } } ] } },
     ), ParseError.InvalidFieldType, "\"failure_threshold\" must be from 0 to 2147483647, not 3000000000 at plans.p.executors[0].breaker");
+}
+
+test "parseWorkflow: a plan listing more executors than one pass tries is refused" {
+    const one = "{ \"name\": \"e\", \"run\": \"@actions/e\" },";
+    const many = comptime stdx.repeat(one, plan_types.MAX_PLAN_EXECUTORS) ++ "{ \"name\": \"e\", \"run\": \"@actions/e\" }";
+    try expectRefused(wrap("", "\"plans\": { \"p\": { \"executors\": [ " ++ many ++ " ] } },"), ParseError.InvalidFieldType, "a plan lists at most 32 executors, not 33 at plans.p.executors");
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {

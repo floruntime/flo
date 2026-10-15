@@ -244,8 +244,7 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
         const n = shardCount(ctx);
         for (0..n) |i| {
             if (getQueueProjection(ctx, i)) |qp| {
-                for (qp.dlq.items) |dlq_entry| {
-                    if (dlq_entry.queue_name_hash != qhash) continue;
+                for (qp.deadLetters(qhash)) |dlq_entry| {
                     if (entry_count >= limit) break;
                     try entries_arr.next();
                     var eobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);

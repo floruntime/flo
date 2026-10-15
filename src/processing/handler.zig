@@ -83,6 +83,8 @@ pub const ProcessingHandler = struct {
     /// and `savepoints` (see `Shard.answering_index`).
     last_submitted_job_id: ?[]const u8 = null,
     last_savepoint_id: ?[]const u8 = null,
+    /// The last applied submit was refused: the server held `max_jobs`.
+    last_submit_at_limit: bool = false,
     sink_drops: u64 = 0,
     sink_warn_ms: i64 = 0,
     chain_errors: u64 = 0,
@@ -102,9 +104,10 @@ pub const ProcessingHandler = struct {
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
 
-    /// Cross-shard KV handlers — one per shard, wired by Runtime.
-    /// Enables KV lookup operators and KV sinks to reach keys on any shard.
+    /// KV handlers — one per shard, wired by Runtime.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
+    /// The shard this handler runs on; kv_lookup reads only its KV.
+    own_shard: u16 = 0,
 
     /// Cross-shard TS / queue handlers — one per shard, wired by Runtime.
     /// Enables TS and queue sinks to write to the shard that owns the target
@@ -112,7 +115,12 @@ pub const ProcessingHandler = struct {
     peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
     peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
-    const MAX_JOBS: usize = 100_000;
+    /// Most jobs a server holds. Jobs are never removed (stopped ones still
+    /// count) and each keeps its definition, up to 256 KiB, so a submit past
+    /// it is refused. A field only so tests can reach it.
+    max_jobs: usize = MAX_JOBS,
+
+    const MAX_JOBS: usize = 10_000;
 
     /// Sink configuration for a single sink in the pipeline.
     pub const SinkConfig = struct {
@@ -273,8 +281,9 @@ pub const ProcessingHandler = struct {
 
     /// Wire cross-shard KV handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
+    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler, own_shard: u16) void {
         self.peer_kv_handlers = handlers;
+        self.own_shard = own_shard;
     }
 
     /// Wire cross-shard TS handler references (for TS sinks).
@@ -379,13 +388,10 @@ pub const ProcessingHandler = struct {
         dispatcher.registerWithRoute(.processing_rescale, dispatchProcessing, run_id_mod.preRouteByRunId);
     }
 
-    /// Pre-routing: hash on key (job_id) for deterministic shard assignment.
-    /// Uses namespace-qualified hash: hash(namespace \0 job_id)
-    fn preRouteByProcessing(req: Request) ?u64 {
-        if (req.key.len > 0) {
-            return router.hashKeyWithNamespace(req.namespace, req.key);
-        }
-        // For submit/list with empty key, use namespace
+    /// Every submit goes to shard 0, whatever its key: one shard holds the
+    /// job registry, so `max_jobs` bounds the server, and each job id
+    /// carries that shard back for the ops that name it.
+    fn preRouteByProcessing(_: Request) ?u64 {
         return 0;
     }
 
@@ -429,6 +435,7 @@ pub const ProcessingHandler = struct {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         switch (op) {
             .processing_submit => {
+                if (h.last_submit_at_limit) return h.refuseAtJobLimit(shard, conn, req.header.request_id);
                 shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
                 const job_id = h.last_submitted_job_id orelse {
                     shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
@@ -483,6 +490,9 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "job definition is required");
             return;
         }
+        // The applier refuses too, so submits in flight together can't
+        // pass the limit; this spares the log an entry that changes nothing.
+        if (self.jobs.count() >= self.max_jobs) return self.refuseAtJobLimit(shard, conn, req.header.request_id);
 
         // Parse the YAML/JSON definition, using the request namespace as fallback
         const req_ns: ?[]const u8 = if (req.namespace.len > 0) req.namespace else null;
@@ -506,6 +516,10 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
         if (self.operatorRefusal(&def)) |name| {
             var buf: [192]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "operator '{s}' has a missing or invalid setting", .{name}) catch "an operator has a missing or invalid setting";
@@ -517,7 +531,7 @@ pub const ProcessingHandler = struct {
         //
         // The partition MUST route back to the shard that stores this job's
         // registry entry — i.e. THIS shard. Submit is routed here by
-        // preRouteByProcessing (empty key → partition 0 → shard 0), so the
+        // preRouteByProcessing (every submit → partition 0 → shard 0), so the
         // entry lives in this shard's `self.jobs`. The job_id's partition bits
         // are how every ID-routed op (status/stop/cancel/savepoint/restore/
         // rescale) finds it again: partitionToShard = partition % shard_count.
@@ -545,6 +559,12 @@ pub const ProcessingHandler = struct {
             return;
         };
         shard.park(conn, req, proposed, respondProcessing);
+    }
+
+    fn refuseAtJobLimit(self: *const ProcessingHandler, shard: *Shard, conn: *Connection, request_id: u64) void {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "job not submitted: this server holds at most {d} processing jobs", .{self.max_jobs}) catch "job not submitted: this server holds as many processing jobs as it may";
+        shard.sendRefusal(conn, request_id, .overloaded, .{ .reason = .unclassified, .ran = .no, .message = msg });
     }
 
     // ── Stop ─────────────────────────────────────────────────────────────
@@ -906,7 +926,10 @@ pub const ProcessingHandler = struct {
     pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
         const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
-            .processing_submit => self.last_submitted_job_id = null,
+            .processing_submit => {
+                self.last_submitted_job_id = null;
+                self.last_submit_at_limit = false;
+            },
             .processing_savepoint => self.last_savepoint_id = null,
             else => {},
         }
@@ -946,6 +969,14 @@ pub const ProcessingHandler = struct {
         off += ns_len;
 
         const yaml = value[off..];
+
+        // Refused in log order, so every replica and restart refuses the
+        // same submits. A job already held is a replay of itself.
+        if (!self.jobs.contains(job_id) and self.jobs.count() >= self.max_jobs) {
+            log.warn("processing job {s} not created: this server holds at most {d} jobs", .{ job_id, self.max_jobs });
+            self.last_submit_at_limit = true;
+            return .applied;
+        }
 
         // Re-parse with the job's namespace as fallback, as the submit did, so
         // endpoints and lookups that name none resolve alike on every replica
@@ -1110,6 +1141,11 @@ pub const ProcessingHandler = struct {
     /// deep-copies everything it retains, so the caller may free `def` after.
     fn startPipelines(self: *ProcessingHandler, job_id: []const u8, def: *definition.JobDefinition) void {
         if (def.sinks.items.len == 0) return;
+        // A stored job meets the shard count the server restarted with.
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
+            log.err("processing job {s} not started: {s}", .{ job_id, why });
+            return;
+        }
 
         // Build tag registry from all sinks and classify operators.
         // Heap-allocated so classify operators can reference it during creation.
@@ -1213,12 +1249,12 @@ pub const ProcessingHandler = struct {
         };
 
         var count: usize = 0;
-        log.info("createPipeline: {d} operator specs to process", .{op_specs.len});
+        log.debug("createPipeline: {d} operator specs to process", .{op_specs.len});
         for (op_specs) |*spec| {
-            log.info("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
+            log.debug("createPipeline: spec type='{s}' name='{s}' has_config={}", .{ spec.type_name, spec.name, spec.config != null });
             if (spec.config) |cfg| {
                 for (cfg) |entry| {
-                    log.info("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
+                    log.debug("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
                 }
             }
             const result = native_registry.create(self.allocator, spec, tag_registry) catch |err| {
@@ -1228,7 +1264,6 @@ pub const ProcessingHandler = struct {
                 self.allocator.free(ops);
                 return;
             };
-            // Wire kv_lookup operators to route across all shards' KV projections
             if (result.backing == .kv_lookup) {
                 result.backing.kv_lookup.setLookupFn(shardKvLookup, @ptrCast(self));
             }
@@ -1239,7 +1274,7 @@ pub const ProcessingHandler = struct {
 
         var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash);
         pipe_state.tag_registry = tag_registry;
-        log.info("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
+        log.debug("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
         if (count > 0) {
             pipe_state.operators = ops[0..count];
             pipe_state.operator_backings = backings[0..count];
@@ -1252,41 +1287,18 @@ pub const ProcessingHandler = struct {
         };
     }
 
-    /// KV lookup callback passed to KvLookupOperator.
-    /// Routes the lookup to the correct shard's KV projection via cross-shard peer handlers.
+    /// KV lookup callback passed to KvLookupOperator. It reads this shard's
+    /// KV on this shard's thread. A job with a lookup is refused on a server
+    /// of more than one shard, so this KV is all there is.
     fn shardKvLookup(ctx: *anyopaque, namespace: []const u8, key: []const u8) ?[]const u8 {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
+        const handlers = self.peer_kv_handlers orelse return null;
+        if (self.own_shard >= handlers.len) return null;
         const ns_handler = @import("../namespace/handler.zig");
         var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
-
-        log.debug("shardKvLookup: ns='{s}' key='{s}' qkey='{s}' has_peers={} pc={d} sc={d}", .{
-            namespace,                     key,                       qkey,
-            self.peer_kv_handlers != null, self.peer_partition_count, self.peer_shard_count,
-        });
-
-        // Route to the correct shard using the same hash as the KV dispatcher
-        if (self.peer_kv_handlers) |handlers| {
-            if (self.peer_partition_count > 0 and self.peer_shard_count > 0) {
-                const hash = router.hashKeyWithNamespace(namespace, key);
-                const partition_id: u32 = @intCast(hash % self.peer_partition_count);
-                const shard_id: u16 = @intCast(partition_id % self.peer_shard_count);
-                log.debug("shardKvLookup: hash={d} part={d} shard={d} nhandlers={d}", .{
-                    hash, partition_id, shard_id, handlers.len,
-                });
-                if (shard_id < handlers.len) {
-                    const entry = handlers[shard_id].*.kv.get(qkey) orelse {
-                        log.debug("shardKvLookup: NOT FOUND on shard {d}", .{shard_id});
-                        return null;
-                    };
-                    log.debug("shardKvLookup: FOUND val_len={d}", .{entry.value.len});
-                    return entry.value;
-                }
-            }
-        }
-
-        log.debug("shardKvLookup: NO PEERS, returning null", .{});
-        return null;
+        const entry = handlers[self.own_shard].*.kv.get(qkey) orelse return null;
+        return entry.value;
     }
 
     /// `{"measurement":<name>,"value":<v>,"timestamp_ms":<ms>}`, the name
@@ -1949,7 +1961,6 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
         .name = "s",
         .stream = "raw",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
     };
     try handler.pipelines.put("job-cp", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
@@ -1982,7 +1993,6 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
         .name = "t",
         .stream = "",
         .namespace = "default",
-        .partition = 0,
         .batch_size = 0,
         .ts_measurement = "cpu",
         .ts_field = "value",
@@ -2008,7 +2018,7 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     const allocator = std.testing.allocator;
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
-    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .partition = 0, .batch_size = 0 };
+    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
     try handler.pipelines.put("job-fw", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     const pipe = handler.pipelines.getPtr("job-fw").?;
     pipe.stream_cursor_ts = 2000;
@@ -2155,5 +2165,142 @@ test "ProcessingHandler: a TS source record writes a non-finite value as null" {
     for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |v| {
         const json = ProcessingHandler.tsPointJson(&buf, "m", v, 7).?;
         try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"value\":null,\"timestamp_ms\":7}", json);
+    }
+}
+
+/// A processing_submit value: [status][parallelism=1][batch_size=0][ns_len]["default"][yaml].
+fn testSubmitValue(buf: []u8, status: ProcessingHandler.JobStatus, yaml: []const u8) []const u8 {
+    buf[0] = @backingInt(status);
+    std.mem.writeInt(u32, buf[1..5], 1, .little);
+    std.mem.writeInt(u32, buf[5..9], 0, .little);
+    std.mem.writeInt(u16, buf[9..11], 7, .little);
+    @memcpy(buf[11..18], "default");
+    @memcpy(buf[18 .. 18 + yaml.len], yaml);
+    return buf[0 .. 18 + yaml.len];
+}
+
+test "ProcessingHandler: a stored definition that lists partitions is not started" {
+    const yaml =
+        \\kind: Processing
+        \\name: ranged
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\      partitions: "0-4294967295"
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1));
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+    try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
+}
+
+test "ProcessingHandler: a submit past the job limit is refused in log order" {
+    const yaml =
+        \\kind: Processing
+        \\name: one
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    handler.max_jobs = 1;
+    var buf: [512]u8 = undefined;
+    var pbuf: [1024]u8 = undefined;
+    const value = testSubmitValue(&buf, .stopped, yaml);
+    for ([_]struct { []const u8, bool }{ .{ "job-1", false }, .{ "job-2", true }, .{ "job-1", false } }) |c| {
+        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, 0, c[0], value, &pbuf).?;
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry));
+        try std.testing.expectEqual(c[1], handler.last_submit_at_limit);
+        try std.testing.expectEqual(@as(usize, 1), handler.jobs.count());
+    }
+    try std.testing.expect(!handler.jobs.contains("job-2"));
+}
+
+test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
+    var req: proto.Request = undefined;
+    req.namespace = "acme";
+    for ([_][]const u8{ "", "k", "another-key" }) |key| {
+        req.key = key;
+        try std.testing.expectEqual(@as(?u64, 0), ProcessingHandler.preRouteByProcessing(req));
+    }
+}
+
+test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key hashes to" {
+    const allocator = std.testing.allocator;
+    const KVProjection = @import("../projection/kv.zig").KVProjection;
+    var kv0 = KVProjection.init(allocator, 0);
+    defer kv0.deinit();
+    var kv1 = KVProjection.init(allocator, 0);
+    defer kv1.deinit();
+    var h0 = kv_handler_mod.KVHandler.init(allocator, &kv0);
+    var h1 = kv_handler_mod.KVHandler.init(allocator, &kv1);
+    const peers = [_]*kv_handler_mod.KVHandler{ &h0, &h1 };
+
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    handler.peer_partition_count = 8;
+    handler.peer_shard_count = 2;
+    handler.setPeerKvHandlers(&peers, 0);
+
+    // A key whose hash names shard 1, written here (as a routing key does).
+    var elsewhere: []const u8 = "";
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" }) |c| {
+        if (handler.peerShardId("default", c) == 1) elsewhere = c;
+    }
+    try std.testing.expect(elsewhere.len > 0);
+    const ns_handler = @import("../namespace/handler.zig");
+    var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
+    try kv0.put(try ns_handler.qualifyKey(&qbuf, "default", elsewhere), "here", 1, 1, 0, 0);
+    try kv1.put(try ns_handler.qualifyKey(&qbuf, "default", "only-there"), "there", 1, 1, 0, 0);
+
+    try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
+    try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);
+}
+
+test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server of more than one shard" {
+    const yaml =
+        \\kind: Processing
+        \\name: lookup
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: l
+        \\    lookup_key: k
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    {
+        var handler = ProcessingHandler.init(std.testing.allocator);
+        defer handler.deinit();
+        handler.peer_shard_count = 2;
+        // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
+        var value: [512]u8 = undefined;
+        value[0] = @backingInt(ProcessingHandler.JobStatus.running);
+        std.mem.writeInt(u32, value[1..5], 1, .little);
+        std.mem.writeInt(u32, value[5..9], 0, .little);
+        std.mem.writeInt(u16, value[9..11], 7, .little);
+        @memcpy(value[11..18], "default");
+        @memcpy(value[18 .. 18 + yaml.len], yaml);
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", value[0 .. 18 + yaml.len], 1));
+        try std.testing.expect(handler.jobs.contains("job-1"));
+        try std.testing.expect(!handler.pipelines.contains("job-1"));
     }
 }
