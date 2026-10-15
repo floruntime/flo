@@ -1265,3 +1265,32 @@ test "e2e/action: an invoke value is a has_labels byte, the labels if set, then 
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.header.status);
     }
 }
+
+test "e2e/action: a task held past its action's timeout goes back to pending, then times out" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "slow-task", "--timeout", "1000", "--retries", "2" });
+    try ctx.exec(&.{ "worker", "register", "slow-worker", "slow-task" });
+    const run_id = extractRunId(try ctx.execCapture(&.{ "action", "invoke", "slow-task", "{}" })) orelse return error.TestFailed;
+
+    for ([_][]const u8{ "pending", "timed_out" }) |want| {
+        // Taken, then neither completed nor touched past the timeout.
+        var taken = try ctx.cli.run(&.{ "worker", "await", "slow-task", "--worker-id", "slow-worker", "--block", "5000" });
+        defer taken.deinit();
+        try testing.expectEqual(@as(u8, 0), taken.exit_code);
+        try testing.expect(taken.contains(run_id));
+        // The timeout plus a full extra sweep of slack.
+        stdx.time.sleep(3500 * std.time.ns_per_ms);
+
+        var status = try ctx.cli.run(&.{ "action", "status", run_id });
+        defer status.deinit();
+        try testing.expectEqual(@as(u8, 0), status.exit_code);
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "status: {s}\n", .{want});
+        if (!status.contains(line)) {
+            std.debug.print("\nwanted {s}, got: {s}\n", .{ want, status.stdout });
+            return error.TestUnexpectedResult;
+        }
+    }
+}

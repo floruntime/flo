@@ -2270,7 +2270,7 @@ pub const WorkflowHandler = struct {
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
                 const done = if (getActionRunResult(shard, run.pending_action_shard_id, action_rid)) |result|
-                    result.status == .completed or result.status == .failed
+                    result.status == .completed or result.status == .failed or result.status == .timed_out
                 else
                     pendingLost(shard, run, run.pending_action_shard_id);
                 if (done and resume_count < resume_keys.len) {
@@ -4890,6 +4890,35 @@ test "step executor: a plan whose executors all fail fails the step after one pa
         exhausted[i] += 1;
     }
     try testing.expectEqual([2]u32{ 1, 1 }, exhausted);
+}
+
+test "step executor: an action run that timed out takes the step's failure transition" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "flaky");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
+    createTestRun(&handler, "default:run-to", "run-to", "retry-wf");
+    handler.advanceWorkflow(&shard, "default:run-to", "default");
+    _ = shard.applyCommitted();
+
+    // Each attempt's action run times out; the step's retries then fail it.
+    var attempts: u32 = 0;
+    while (attempts < 6) : (attempts += 1) {
+        const run = handler.runs.getPtr("default:run-to").?;
+        if (run.status.isTerminal()) break;
+        const rid = run.pending_action_run_id_owned orelse break;
+        actions.runs.getPtr(rid).?.status = .timed_out;
+        handler.checkPendingActions(&shard);
+        _ = shard.applyCommitted();
+    }
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get("default:run-to").?.status);
 }
 
 // An action that returns the `pending` business outcome on a `poll:` step must
