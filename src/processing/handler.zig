@@ -114,11 +114,12 @@ pub const ProcessingHandler = struct {
     peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
     peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
-    /// Most jobs a server holds. Jobs are never removed, so a submit past
+    /// Most jobs a server holds. Jobs are never removed (stopped ones still
+    /// count) and each keeps its definition, up to 256 KiB, so a submit past
     /// it is refused. A field only so tests can reach it.
     max_jobs: usize = MAX_JOBS,
 
-    const MAX_JOBS: usize = 100_000;
+    const MAX_JOBS: usize = 10_000;
 
     /// Sink configuration for a single sink in the pipeline.
     pub const SinkConfig = struct {
