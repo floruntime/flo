@@ -5,7 +5,7 @@ const Atomic = std.atomic.Value;
 const StreamMetrics = @import("../stream/metrics.zig").Metrics;
 
 // =============================================================================
-// Queue Metrics — imported from src/queue/metrics.zig (rich per-queue metrics)
+// Queue Metrics — imported from src/queue/metrics.zig
 // =============================================================================
 pub const QueueMetrics = @import("../queue/metrics.zig").Metrics;
 
@@ -1287,37 +1287,15 @@ fn writeStreamMetrics(
     try writer.print("flo_stream_append_ops_total{{{s}}} {d}\n", .{ labels, snapshot.append_ops_total });
     try writer.print("flo_stream_append_records_total{{{s}}} {d}\n", .{ labels, snapshot.append_records_total });
     try writer.print("flo_stream_append_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.append_bytes_total });
-    try writer.print("flo_stream_append_errors_total{{{s}}} {d}\n", .{ labels, snapshot.append_errors_total });
-    try writer.print("flo_stream_append_oversized_total{{{s}}} {d}\n", .{ labels, snapshot.append_oversized_total });
 
     // Read metrics
     try writer.print("flo_stream_read_ops_total{{{s}}} {d}\n", .{ labels, snapshot.read_ops_total });
     try writer.print("flo_stream_read_records_total{{{s}}} {d}\n", .{ labels, snapshot.read_records_total });
     try writer.print("flo_stream_read_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.read_bytes_total });
-    try writer.print("flo_stream_read_errors_total{{{s}}} {d}\n", .{ labels, snapshot.read_errors_total });
     try writer.print("flo_stream_read_empty_total{{{s}}} {d}\n", .{ labels, snapshot.read_empty_total });
-
-    // Blocking read metrics
-    try writer.print("flo_stream_blocking_readers_current{{{s}}} {d}\n", .{ labels, snapshot.blocking_readers_current });
-    try writer.print("flo_stream_blocking_read_waits_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_waits_total });
-    try writer.print("flo_stream_blocking_read_timeouts_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_timeouts_total });
-    try writer.print("flo_stream_blocking_read_wakeups_total{{{s}}} {d}\n", .{ labels, snapshot.blocking_read_wakeups_total });
-
-    // Consumer group metrics
-    try writer.print("flo_stream_consumer_group_reads_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_reads_total });
-    try writer.print("flo_stream_consumer_group_claims_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_claims_total });
-    try writer.print("flo_stream_consumer_group_acks_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_acks_total });
-    try writer.print("flo_stream_consumer_group_autoclaims_total{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_autoclaims_total });
-    try writer.print("flo_stream_consumer_group_pending_current{{{s}}} {d}\n", .{ labels, snapshot.consumer_group_pending_current });
-
-    // Stream state
-    try writer.print("flo_stream_last_seq{{{s}}} {d}\n", .{ labels, snapshot.stream_last_seq });
-    try writer.print("flo_stream_trim_ops_total{{{s}}} {d}\n", .{ labels, snapshot.trim_ops_total });
-    try writer.print("flo_stream_trim_records_total{{{s}}} {d}\n", .{ labels, snapshot.trim_records_total });
-    try writer.print("flo_stream_trim_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.trim_bytes_total });
 }
 
-/// Write queue metrics in Prometheus format (rich per-queue metrics from queue/metrics.zig)
+/// Write queue metrics in Prometheus format
 fn writeQueueMetrics(
     writer: anytype,
     snapshot: QueueMetrics.Snapshot,
@@ -1327,45 +1305,12 @@ fn writeQueueMetrics(
     try writer.print("flo_queue_enqueue_ops_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_ops_total });
     try writer.print("flo_queue_enqueue_messages_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_messages_total });
     try writer.print("flo_queue_enqueue_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_bytes_total });
-    try writer.print("flo_queue_enqueue_delayed_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_delayed_total });
-    try writer.print("flo_queue_enqueue_errors_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_errors_total });
-    try writer.print("flo_queue_enqueue_dedup_rejected_total{{{s}}} {d}\n", .{ labels, snapshot.enqueue_dedup_rejected_total });
 
     // Dequeue metrics
     try writer.print("flo_queue_dequeue_ops_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_ops_total });
     try writer.print("flo_queue_dequeue_messages_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_messages_total });
     try writer.print("flo_queue_dequeue_bytes_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_bytes_total });
     try writer.print("flo_queue_dequeue_empty_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_empty_total });
-    try writer.print("flo_queue_dequeue_errors_total{{{s}}} {d}\n", .{ labels, snapshot.dequeue_errors_total });
-
-    // Lease metrics
-    try writer.print("flo_queue_leases_active{{{s}}} {d}\n", .{ labels, snapshot.leases_active_current });
-    try writer.print("flo_queue_leases_created_total{{{s}}} {d}\n", .{ labels, snapshot.leases_created_total });
-    try writer.print("flo_queue_leases_completed_total{{{s}}} {d}\n", .{ labels, snapshot.leases_completed_total });
-    try writer.print("flo_queue_leases_failed_total{{{s}}} {d}\n", .{ labels, snapshot.leases_failed_total });
-    try writer.print("flo_queue_leases_expired_total{{{s}}} {d}\n", .{ labels, snapshot.leases_expired_total });
-    try writer.print("flo_queue_leases_extended_total{{{s}}} {d}\n", .{ labels, snapshot.leases_extended_total });
-
-    // DLQ metrics
-    try writer.print("flo_queue_dlq_messages_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_messages_total });
-    try writer.print("flo_queue_dlq_requeue_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_requeue_total });
-    try writer.print("flo_queue_dlq_delete_total{{{s}}} {d}\n", .{ labels, snapshot.dlq_delete_total });
-    try writer.print("flo_queue_dlq_messages_current{{{s}}} {d}\n", .{ labels, snapshot.dlq_messages_current });
-
-    // Sweeper metrics
-    try writer.print("flo_queue_sweeper_runs_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_runs_total });
-    try writer.print("flo_queue_sweeper_reclaimed_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_reclaimed_total });
-    try writer.print("flo_queue_sweeper_orphaned_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_orphaned_total });
-    try writer.print("flo_queue_sweeper_scanned_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_scanned_total });
-    try writer.print("flo_queue_sweeper_errors_total{{{s}}} {d}\n", .{ labels, snapshot.sweeper_errors_total });
-
-    // Delayed message metrics
-    try writer.print("flo_queue_delayed_promoted_total{{{s}}} {d}\n", .{ labels, snapshot.delayed_promoted_total });
-    try writer.print("flo_queue_delayed_messages_current{{{s}}} {d}\n", .{ labels, snapshot.delayed_messages_current });
-
-    // Queue state
-    try writer.print("flo_queue_available_current{{{s}}} {d}\n", .{ labels, snapshot.queue_available_current });
-    try writer.print("flo_queue_last_seq{{{s}}} {d}\n", .{ labels, snapshot.queue_last_seq });
 }
 
 /// Write tiered log metrics in Prometheus format
@@ -1776,4 +1721,36 @@ test "registry: shard metrics reactor and inbox" {
     try testing.expectEqual(@as(u64, 10), snap.inbox_processed);
     try testing.expectEqual(@as(u64, 5), snap.inbox_pending);
     try testing.expectEqual(@as(u64, 8), snap.partitions);
+}
+
+test "registry: queue and stream series are only those something records" {
+    var registry = MetricsRegistry.init(testing.allocator);
+    defer registry.deinit();
+    _ = try registry.registerQueue("prod", "jobs");
+    _ = try registry.registerStream("prod", "orders", 0);
+
+    const text = try registry.exportPrometheus(testing.allocator);
+    defer testing.allocator.free(text);
+
+    const want = [_][]const u8{
+        "flo_queue_enqueue_ops_total",   "flo_queue_enqueue_messages_total", "flo_queue_enqueue_bytes_total",
+        "flo_queue_dequeue_ops_total",   "flo_queue_dequeue_messages_total", "flo_queue_dequeue_bytes_total",
+        "flo_queue_dequeue_empty_total", "flo_stream_append_ops_total",      "flo_stream_append_records_total",
+        "flo_stream_append_bytes_total", "flo_stream_read_ops_total",        "flo_stream_read_records_total",
+        "flo_stream_read_bytes_total",   "flo_stream_read_empty_total",
+    };
+    var seen: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "flo_queue_") and !std.mem.startsWith(u8, line, "flo_stream_")) continue;
+        const name = line[0 .. std.mem.indexOfAny(u8, line, "{ ") orelse line.len];
+        for (want) |w| {
+            if (std.mem.eql(u8, w, name)) break;
+        } else {
+            std.debug.print("unexpected series {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+        seen += 1;
+    }
+    try testing.expectEqual(want.len, seen);
 }

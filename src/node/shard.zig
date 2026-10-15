@@ -3495,7 +3495,7 @@ pub const Shard = struct {
                     // The value carries a 4-byte priority before the message.
                     const body_len = cmd.value.len -| 4;
                     if (mr.registerQueue(ns, cmd.key)) |qm| {
-                        qm.recordEnqueue(1, body_len, false);
+                        qm.recordEnqueue(1, body_len);
                     } else |_| {}
                 }
             },
