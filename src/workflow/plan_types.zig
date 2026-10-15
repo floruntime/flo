@@ -406,6 +406,9 @@ pub const RetryPolicy = struct {
 // Executor Configuration
 // =============================================================================
 
+/// Most executors one plan may list.
+pub const MAX_PLAN_EXECUTORS = 32;
+
 /// Configuration for a single executor in a plan
 pub const ExecutorConfig = struct {
     /// Executor name (unique within plan)

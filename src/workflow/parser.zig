@@ -742,6 +742,7 @@ fn parseExecutors(allocator: Allocator, root: JsonValue, d: D) ParseError![]Exec
     const arr = try optArray(d, root, "executors") orelse return missing(d, "executors");
     const list_mark = d.push("executors");
     defer d.pop(list_mark);
+    if (arr.len > plan_types.MAX_PLAN_EXECUTORS) return d.fail(ParseError.InvalidFieldType, "a plan lists at most {d} executors, not {d}", .{ plan_types.MAX_PLAN_EXECUTORS, arr.len });
 
     var executors: std.ArrayList(ExecutorConfig) = .empty;
     errdefer {
@@ -1206,6 +1207,12 @@ test "parseWorkflow: a breaker threshold past what a failure count holds is refu
     try expectRefused(wrap("",
         \\"plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "breaker": { "failure_threshold": 3000000000 } } ] } },
     ), ParseError.InvalidFieldType, "\"failure_threshold\" must be from 0 to 2147483647, not 3000000000 at plans.p.executors[0].breaker");
+}
+
+test "parseWorkflow: a plan listing more executors than one pass tries is refused" {
+    const one = "{ \"name\": \"e\", \"run\": \"@actions/e\" },";
+    const many = comptime stdx.repeat(one, plan_types.MAX_PLAN_EXECUTORS) ++ "{ \"name\": \"e\", \"run\": \"@actions/e\" }";
+    try expectRefused(wrap("", "\"plans\": { \"p\": { \"executors\": [ " ++ many ++ " ] } },"), ParseError.InvalidFieldType, "a plan lists at most 32 executors, not 33 at plans.p.executors");
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
