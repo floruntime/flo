@@ -308,7 +308,8 @@ pub fn printWireList(
     const count = try checkWireList(data, columns);
     var reader = WireReader.init(data);
     _ = reader.readU32();
-    if (count == 0) {
+    // Only a table gets the message; json and raw print an empty list.
+    if (count == 0 and getFormat(ctx) == .table) {
         ctx.print("{s}\n", .{empty_message});
         return;
     }
@@ -453,7 +454,7 @@ fn formatFieldForDisplay(
 /// Emit one JSON field. Caller handles comma separation.
 fn writeJsonField(ctx: *Context, col: WireColumn, val: FieldValue) void {
     switch (val) {
-        .string => |s| ctx.print("\"{s}\":\"{s}\"", .{ col.field, s }),
+        .string => |s| ctx.print("\"{s}\":{f}", .{ col.field, std.json.fmt(s, .{}) }),
         .uint => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
         .int => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
         .enum_val => |v| ctx.print("\"{s}\":\"{s}\"", .{ col.field, enumLabel(col, v) }),
@@ -461,7 +462,7 @@ fn writeJsonField(ctx: *Context, col: WireColumn, val: FieldValue) void {
             if (maybe) |v| ctx.print("\"{s}\":{d}", .{ col.field, v }) else ctx.print("\"{s}\":null", .{col.field});
         },
         .optional_string => |maybe| {
-            if (maybe) |s| ctx.print("\"{s}\":\"{s}\"", .{ col.field, s }) else ctx.print("\"{s}\":null", .{col.field});
+            if (maybe) |s| ctx.print("\"{s}\":{f}", .{ col.field, std.json.fmt(s, .{}) }) else ctx.print("\"{s}\":null", .{col.field});
         },
         .skipped => {},
     }
