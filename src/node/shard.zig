@@ -3263,6 +3263,13 @@ pub const Shard = struct {
             .action_invoke => if (self.raft_node.role == .leader) {
                 self.wake_workers = true;
             },
+            // A failed attempt put back to pending is a run to take again,
+            // as an invoke is; left unannounced it waits out a parked
+            // worker's block time.
+            .action_update_run => if (self.raft_node.role == .leader) {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (cmd.value.len > 0 and cmd.value[0] == @backingInt(result_mod.CommandResult.ActionRunStatus.pending)) self.wake_workers = true;
+            },
             .queue_enqueue => {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (cmd.key.len == 0) return;
@@ -10522,6 +10529,103 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+}
+
+test "Shard: a failed attempt sent back to pending wakes an await parked on another shard" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        try std.testing.expect(s.applyCommitted());
+    }
+    const owner = &two.shards[0];
+    const other = &two.shards[1];
+    var name_buf: [16]u8 = undefined;
+    const name = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
+        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+    } else return error.NoLocalName;
+
+    const ca = try TestClient.open(owner);
+    defer _ = std.c.close(ca.pair[1]);
+    var out: [4096]u8 = undefined;
+    for ([_]struct { op: proto.OpCode, id: u64, value: []const u8 }{
+        .{ .op = .action_register, .id = 1, .value = "" },
+        .{ .op = .action_invoke, .id = 2, .value = "\x00job" },
+    }) |r| {
+        const frame = try testRequest(r.op, r.id, name, r.value);
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(ca.pair[1], owner, ca.conn.fd, frame);
+        _ = owner.applyCommitted();
+        const resp = try nextAnswer(ca, owner, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    }
+
+    // Worker w0 holds the run; w1 then waits for work on the other shard.
+    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
+    var run_id_buf: [64]u8 = undefined;
+    const run_id = run_id_buf[0..task.run_id.len];
+    @memcpy(run_id, task.run_id);
+    _ = other.drainInbox();
+    const cb = try TestClient.open(other);
+    defer _ = std.c.close(cb.pair[1]);
+    var await_value: [64]u8 = undefined;
+    std.mem.writeInt(u32, await_value[0..4], 1, .little);
+    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
+    @memcpy(await_value[6..][0..name.len], name);
+    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    defer std.testing.allocator.free(aw);
+    _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
+    other.flushToClient(cb.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
+
+    // w0 fails its attempt asking for another: once that applies, the run
+    // is pending again and w1 gets it now, not when its wait runs out.
+    var fail_value: [128]u8 = undefined;
+    var off: usize = 0;
+    for ([_][]const u8{ name, run_id }) |f| {
+        std.mem.writeInt(u16, fail_value[off..][0..2], @intCast(f.len), .little);
+        @memcpy(fail_value[off + 2 ..][0..f.len], f);
+        off += 2 + f.len;
+    }
+    fail_value[off] = 1;
+    off += 1;
+    const fail = try testRequest(.action_fail, 4, "w0", fail_value[0..off]);
+    defer std.testing.allocator.free(fail);
+    _ = feedClient(ca.pair[1], owner, ca.conn.fd, fail);
+    _ = owner.applyCommitted();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
+
+    _ = other.drainInbox();
+    const resp = try nextAnswer(cb, other, &out);
+    try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+}
+
+test "Shard: only a run update to pending, applied on a leader, wakes workers" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const shard = &two.shards[0];
+    const role = shard.raft_node.role;
+    defer shard.raft_node.role = role;
+
+    var pbuf: [256]u8 = undefined;
+    for ([_]struct { leads: bool, status: result_mod.CommandResult.ActionRunStatus, wakes: bool }{
+        .{ .leads = true, .status = .pending, .wakes = true },
+        .{ .leads = true, .status = .completed, .wakes = false },
+        .{ .leads = true, .status = .failed, .wakes = false },
+        .{ .leads = false, .status = .pending, .wakes = false },
+    }) |c| {
+        shard.raft_node.role = if (c.leads) .leader else .follower;
+        shard.wake_workers = false;
+        const value = [_]u8{ @backingInt(c.status), 0, 0, 0, 0, 0 };
+        const entry = entry_mod.buildCommandEntry(.action_update_run, 0, 1, 1, 0, 0, "act-1", &value, &pbuf).?;
+        shard.notifyApplied(&entry);
+        try std.testing.expectEqual(c.wakes, shard.wake_workers);
+    }
 }
 
 /// A clustered shard leading alone (node 1), with a client connection.
