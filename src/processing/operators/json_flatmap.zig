@@ -31,6 +31,7 @@
 //!   ```
 
 const std = @import("std");
+const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
 const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
@@ -135,7 +136,7 @@ pub const JsonFlatMapOperator = struct {
         // Emit one record per array element
         for (items) |element| {
             // Serialize element to JSON string
-            const elem_str = try serializeJsonValue(self.allocator, element);
+            const elem_str = try json_out.valueAlloc(self.allocator, element);
             errdefer self.allocator.free(elem_str);
 
             // Extract key from element if configured, otherwise use original key
@@ -216,60 +217,6 @@ pub const JsonFlatMapOperator = struct {
             }
         }
         return current;
-    }
-
-    fn serializeJsonValue(allocator: Allocator, value: std.json.Value) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(allocator);
-        try writeJsonValue(&buf, allocator, value);
-        return try allocator.dupe(u8, buf.items);
-    }
-
-    fn writeJsonValue(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: std.json.Value) !void {
-        switch (value) {
-            .null => try buf.appendSlice(allocator, "null"),
-            .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-            .integer => |i| {
-                const formatted = try std.fmt.allocPrint(allocator, "{d}", .{i});
-                defer allocator.free(formatted);
-                try buf.appendSlice(allocator, formatted);
-            },
-            .float => |f| {
-                const formatted = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                defer allocator.free(formatted);
-                try buf.appendSlice(allocator, formatted);
-            },
-            .string => |s| {
-                try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, s);
-                try buf.append(allocator, '"');
-            },
-            .array => |arr| {
-                try buf.append(allocator, '[');
-                for (arr.items, 0..) |item, idx| {
-                    if (idx > 0) try buf.append(allocator, ',');
-                    try writeJsonValue(buf, allocator, item);
-                }
-                try buf.append(allocator, ']');
-            },
-            .object => |obj| {
-                try buf.append(allocator, '{');
-                var first = true;
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    if (!first) try buf.append(allocator, ',');
-                    first = false;
-                    try buf.append(allocator, '"');
-                    try buf.appendSlice(allocator, entry.key_ptr.*);
-                    try buf.appendSlice(allocator, "\":");
-                    try writeJsonValue(buf, allocator, entry.value_ptr.*);
-                }
-                try buf.append(allocator, '}');
-            },
-            .number_string => |s| {
-                try buf.appendSlice(allocator, s);
-            },
-        }
     }
 
     fn extractStringValue(allocator: Allocator, value: std.json.Value) !?[]u8 {
@@ -550,4 +497,33 @@ test "JsonFlatMapOperator — string array elements" {
     try std.testing.expectEqualStrings("\"world\"", out[1].value);
 
     collector.clear();
+}
+
+test "JsonFlatMapOperator — each element is written as JSON" {
+    const allocator = std.testing.allocator;
+    var fm = try JsonFlatMapOperator.init(allocator, "explode", "$.items", null);
+    defer fm.deinit();
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test-flatmap",
+    };
+    const op = fm.operator();
+    try op.processElement(ProcessingRecord.init("k1",
+        \\{"items":["a\"b\\c",{"k\"q":"v\""}]}
+    , 0), &ctx);
+    const out = collector.drain();
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    const s = try std.json.parseFromSlice([]const u8, allocator, out[0].value, .{});
+    defer s.deinit();
+    try std.testing.expectEqualStrings("a\"b\\c", s.value);
+    const o = try std.json.parseFromSlice(std.json.Value, allocator, out[1].value, .{});
+    defer o.deinit();
+    try std.testing.expectEqualStrings("v\"", o.value.object.get("k\"q").?.string);
 }

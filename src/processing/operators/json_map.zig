@@ -35,6 +35,7 @@
 //!   ```
 
 const std = @import("std");
+const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
 const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
@@ -175,45 +176,20 @@ pub const JsonMapOperator = struct {
         defer parsed.deinit();
 
         // Build output JSON object
-        var output_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer output_buf.deinit(self.allocator);
-
-        try output_buf.append(self.allocator, '{');
-        var first = true;
-
-        for (self.mappings) |mapping| {
-            if (!first) {
-                try output_buf.append(self.allocator, ',');
-            }
-            first = false;
-
-            // Write field name
-            try output_buf.append(self.allocator, '"');
-            try output_buf.appendSlice(self.allocator, mapping.output_field);
-            try output_buf.appendSlice(self.allocator, "\":");
-
-            switch (mapping.source) {
-                .constant => |val| {
-                    // Emit as JSON string
-                    try output_buf.append(self.allocator, '"');
-                    try output_buf.appendSlice(self.allocator, val);
-                    try output_buf.append(self.allocator, '"');
-                },
-                .json_path => |segments| {
-                    // Navigate JSON tree
-                    const extracted = navigateJson(parsed.value, segments);
-                    try writeJsonValue(&output_buf, self.allocator, extracted);
-                },
-            }
-        }
-
-        try output_buf.append(self.allocator, '}');
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer };
+        writeMapped(self, &jw, parsed.value) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.NestingTooDeep => error.NestingTooDeep,
+        };
+        const output_buf = out.written();
 
         // Emit as owned record
-        const output = try self.allocator.dupe(u8, output_buf.items);
+        const output = try self.allocator.dupe(u8, output_buf);
         errdefer self.allocator.free(output);
 
-        log.info("JsonMapOperator: emitting output='{s}'", .{output});
+        log.debug("JsonMapOperator: emitting output='{s}'", .{output});
 
         const key_dupe = try self.allocator.dupe(u8, rec.key);
 
@@ -243,6 +219,18 @@ pub const JsonMapOperator = struct {
     // Helpers
     // =========================================================================
 
+    fn writeMapped(self: *const Self, jw: *std.json.Stringify, root: std.json.Value) json_out.Error!void {
+        try jw.beginObject();
+        for (self.mappings) |mapping| {
+            try jw.objectField(mapping.output_field);
+            switch (mapping.source) {
+                .constant => |val| try jw.write(val),
+                .json_path => |segments| try json_out.writeValue(jw, navigateJson(root, segments)),
+            }
+        }
+        try jw.endObject();
+    }
+
     fn navigateJson(root: std.json.Value, segments: []const []const u8) std.json.Value {
         var current = root;
         for (segments) |seg| {
@@ -258,53 +246,6 @@ pub const JsonMapOperator = struct {
             }
         }
         return current;
-    }
-
-    fn writeJsonValue(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: std.json.Value) !void {
-        switch (value) {
-            .null => try buf.appendSlice(allocator, "null"),
-            .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-            .integer => |i| {
-                const formatted = try std.fmt.allocPrint(allocator, "{d}", .{i});
-                defer allocator.free(formatted);
-                try buf.appendSlice(allocator, formatted);
-            },
-            .float => |f| {
-                const formatted = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                defer allocator.free(formatted);
-                try buf.appendSlice(allocator, formatted);
-            },
-            .string => |s| {
-                try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, s);
-                try buf.append(allocator, '"');
-            },
-            .array => |arr| {
-                try buf.append(allocator, '[');
-                for (arr.items, 0..) |item, idx| {
-                    if (idx > 0) try buf.append(allocator, ',');
-                    try writeJsonValue(buf, allocator, item);
-                }
-                try buf.append(allocator, ']');
-            },
-            .object => |obj| {
-                try buf.append(allocator, '{');
-                var first = true;
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    if (!first) try buf.append(allocator, ',');
-                    first = false;
-                    try buf.append(allocator, '"');
-                    try buf.appendSlice(allocator, entry.key_ptr.*);
-                    try buf.appendSlice(allocator, "\":");
-                    try writeJsonValue(buf, allocator, entry.value_ptr.*);
-                }
-                try buf.append(allocator, '}');
-            },
-            .number_string => |s| {
-                try buf.appendSlice(allocator, s);
-            },
-        }
     }
 };
 
@@ -604,4 +545,38 @@ test "JsonMapOperator — no mappings passes through" {
     try std.testing.expectEqualStrings("raw-data", out[0].value);
 
     collector.clear();
+}
+
+test "JsonMapOperator — output is JSON for any value, field name and constant" {
+    const allocator = std.testing.allocator;
+    const entries = [_]ConfigEntry{
+        .{ .key = "src\"x", .value = "a\"b\\c" },
+        .{ .key = "user", .value = "$.user_id" },
+        .{ .key = "meta", .value = "$.meta" },
+    };
+    var mapper = try JsonMapOperator.init(allocator, "m", &entries);
+    defer mapper.deinit();
+    var collector = OutputCollector.init(allocator);
+    defer collector.deinit();
+    var metrics = OperatorMetrics{};
+    var ctx = OperatorContext{
+        .collector = &collector,
+        .metrics = &metrics,
+        .allocator = allocator,
+        .current_processing_time_ms = 0,
+        .current_watermark_ms = 0,
+        .operator_name = "test-map",
+    };
+    const op = mapper.operator();
+    try op.processElement(ProcessingRecord.init("k1",
+        \\{"user_id":"x\",\"admin\":true,\"y\":\"","meta":{"k\"q":"v\\w"}}
+    , 0), &ctx);
+    const out = collector.drain();
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, out[0].value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+    try std.testing.expectEqualStrings("a\"b\\c", parsed.value.object.get("src\"x").?.string);
+    try std.testing.expectEqualStrings("x\",\"admin\":true,\"y\":\"", parsed.value.object.get("user").?.string);
+    try std.testing.expectEqualStrings("v\\w", parsed.value.object.get("meta").?.object.get("k\"q").?.string);
 }
