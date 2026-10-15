@@ -14,11 +14,15 @@
 //! var resolver = PathResolver.init(allocator, input, step_outputs, run_id);
 //! const value = try resolver.resolve("$.steps.enrich_company.output.email");
 //! ```
+//!
+//! JSON read or built here nests at most `json_depth.MAX_DEPTH` levels;
+//! deeper fails with `error.JsonTooDeep`.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const log = @import("stdx").log;
+const json_depth = @import("../util/json_depth.zig");
 
 const types = @import("types.zig");
 const StepOutputMap = types.StepOutputMap;
@@ -161,6 +165,7 @@ pub const PathResolver = struct {
     /// Extract a nested field from JSON
     /// Supports dot-notation: "company.email" extracts obj.company.email
     fn extractJsonField(self: *Self, json: []const u8, field_path: []const u8) !?[]u8 {
+        if (!json_depth.within(json)) return error.JsonTooDeep;
         // Parse the JSON
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json, .{}) catch {
             return error.InvalidJson;
@@ -209,6 +214,8 @@ pub fn resolveInput(
     step_outputs: ?*const StepOutputMap,
     run_id: []const u8,
 ) ![]u8 {
+    if (!json_depth.within(input_json)) return error.JsonTooDeep;
+
     // Fast path: no path references
     if (mem.indexOf(u8, input_json, "$.") == null) {
         return try allocator.dupe(u8, input_json);
@@ -224,16 +231,22 @@ pub fn resolveInput(
     defer parsed.deinit();
 
     // Resolve path references in the JSON tree
-    const resolved = try resolveJsonValue(allocator, &resolver, parsed.value);
+    const resolved = try resolveJsonValue(allocator, &resolver, parsed.value, 0);
     defer freeJsonValue(allocator, resolved);
 
     // Stringify back to JSON
     return std.json.Stringify.valueAlloc(allocator, resolved, .{});
 }
 
-/// Recursively resolve path references in JSON values.
+/// Recursively resolve path references in JSON values. `depth` is how
+/// many containers enclose `value`; the tree built nests at most
+/// `json_depth.MAX_DEPTH` levels, references' values included.
 /// Returns a fully-owned JSON tree that must be freed with freeJsonValue.
-fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.json.Value) !std.json.Value {
+fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.json.Value, depth: usize) !std.json.Value {
+    switch (value) {
+        .object, .array => if (depth >= json_depth.MAX_DEPTH) return error.JsonTooDeep,
+        else => {},
+    }
     return switch (value) {
         .string => |s| {
             // Check if string is a path reference
@@ -248,7 +261,7 @@ fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.js
                     };
                     defer parsed.deinit();
                     // Clone the parsed value since we're deferring deinit
-                    return cloneJsonValue(allocator, parsed.value);
+                    return cloneJsonValue(allocator, parsed.value, depth);
                 } else {
                     // Path not found, return null
                     return .null;
@@ -258,47 +271,60 @@ fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.js
             return .{ .string = try allocator.dupe(u8, s) };
         },
         .object => |obj| {
-            var new_obj: std.json.ObjectMap = .empty;
+            var new: std.json.Value = .{ .object = .empty };
+            errdefer freeJsonValue(allocator, new);
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
-                const resolved_val = try resolveJsonValue(allocator, resolver, entry.value_ptr.*);
-                try new_obj.put(allocator, owned_key, resolved_val);
+                errdefer allocator.free(owned_key);
+                const resolved_val = try resolveJsonValue(allocator, resolver, entry.value_ptr.*, depth + 1);
+                errdefer freeJsonValue(allocator, resolved_val);
+                try new.object.put(allocator, owned_key, resolved_val);
             }
-            return .{ .object = new_obj };
+            return new;
         },
         .array => |arr| {
-            var new_arr = try std.json.Array.initCapacity(allocator, arr.items.len);
+            var new: std.json.Value = .{ .array = try std.json.Array.initCapacity(allocator, arr.items.len) };
+            errdefer freeJsonValue(allocator, new);
             for (arr.items) |item| {
-                const resolved_item = try resolveJsonValue(allocator, resolver, item);
-                try new_arr.append(resolved_item);
+                const resolved_item = try resolveJsonValue(allocator, resolver, item, depth + 1);
+                new.array.appendAssumeCapacity(resolved_item);
             }
-            return .{ .array = new_arr };
+            return new;
         },
         else => value, // Primitives (bool, integer, float, null) are value types — no alloc needed
     };
 }
 
-/// Deep clone a JSON value
-fn cloneJsonValue(allocator: Allocator, value: std.json.Value) !std.json.Value {
+/// Deep clone a JSON value enclosed by `depth` containers, to at most
+/// `json_depth.MAX_DEPTH` levels in all.
+fn cloneJsonValue(allocator: Allocator, value: std.json.Value, depth: usize) !std.json.Value {
+    switch (value) {
+        .object, .array => if (depth >= json_depth.MAX_DEPTH) return error.JsonTooDeep,
+        else => {},
+    }
     return switch (value) {
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         .object => |obj| {
-            var new_obj: std.json.ObjectMap = .empty;
+            var new: std.json.Value = .{ .object = .empty };
+            errdefer freeJsonValue(allocator, new);
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 const cloned_key = try allocator.dupe(u8, entry.key_ptr.*);
-                const cloned_val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(allocator, cloned_key, cloned_val);
+                errdefer allocator.free(cloned_key);
+                const cloned_val = try cloneJsonValue(allocator, entry.value_ptr.*, depth + 1);
+                errdefer freeJsonValue(allocator, cloned_val);
+                try new.object.put(allocator, cloned_key, cloned_val);
             }
-            return .{ .object = new_obj };
+            return new;
         },
         .array => |arr| {
-            var new_arr = try std.json.Array.initCapacity(allocator, arr.items.len);
+            var new: std.json.Value = .{ .array = try std.json.Array.initCapacity(allocator, arr.items.len) };
+            errdefer freeJsonValue(allocator, new);
             for (arr.items) |item| {
-                try new_arr.append(try cloneJsonValue(allocator, item));
+                new.array.appendAssumeCapacity(try cloneJsonValue(allocator, item, depth + 1));
             }
-            return .{ .array = new_arr };
+            return new;
         },
         else => value,
     };
@@ -515,4 +541,59 @@ test "PathResolver: direct step output passthrough" {
     try std.testing.expectEqualStrings(
         \\{"shipped": true, "trackingId": "TRK-42", "binaryRef": "s3://bucket/audio.wav"}
     , result.?);
+}
+
+test "resolveInput: a mapping's result nests at most 128 levels" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        const input = try json_depth.nestedArrays(allocator, n);
+        defer allocator.free(input);
+
+        // The whole input, as the mapping's root.
+        if (n <= json_depth.MAX_DEPTH) {
+            const out = try resolveInput(allocator, "\"$.input\"", input, null, "run_test");
+            defer allocator.free(out);
+            try std.testing.expectEqualStrings(input, out);
+        } else {
+            try std.testing.expectError(error.JsonTooDeep, resolveInput(allocator, "\"$.input\"", input, null, "run_test"));
+        }
+
+        // One level inside an object: the object's level counts too.
+        const inner = input[1 .. input.len - 1];
+        if (n <= json_depth.MAX_DEPTH) {
+            const out = try resolveInput(allocator, "{\"x\":\"$.input\"}", inner, null, "run_test");
+            allocator.free(out);
+        } else {
+            try std.testing.expectError(error.JsonTooDeep, resolveInput(allocator, "{\"x\":\"$.input\"}", inner, null, "run_test"));
+        }
+    }
+}
+
+test "PathResolver: a field read from input nested past 128 levels fails" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        // {"a": <n-1 arrays>} nests n levels.
+        const arrays = try json_depth.nestedArrays(allocator, n - 1);
+        defer allocator.free(arrays);
+        const input = try std.fmt.allocPrint(allocator, "{{\"a\":{s}}}", .{arrays});
+        defer allocator.free(input);
+
+        var resolver = PathResolver.init(allocator, input, null, "run_test");
+        if (n <= json_depth.MAX_DEPTH) {
+            const out = (try resolver.resolve("$.input.a")).?;
+            defer allocator.free(out);
+            try std.testing.expectEqualStrings(arrays, out);
+        } else {
+            try std.testing.expectError(error.JsonTooDeep, resolver.resolve("$.input.a"));
+        }
+    }
+}
+
+test "resolveInput: a mapping nested past 128 levels fails" {
+    const allocator = std.testing.allocator;
+    const arrays = try json_depth.nestedArrays(allocator, 129);
+    defer allocator.free(arrays);
+    const mapping = try std.fmt.allocPrint(allocator, "{s}\"$.input\"{s}", .{ arrays[0..129], arrays[129..] });
+    defer allocator.free(mapping);
+    try std.testing.expectError(error.JsonTooDeep, resolveInput(allocator, mapping, "1", null, "run_test"));
 }

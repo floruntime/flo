@@ -30,6 +30,7 @@ const Allocator = mem.Allocator;
 const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const cron = @import("cron.zig");
+const json_depth = @import("../util/json_depth.zig");
 
 // Type imports
 pub const WorkflowDefinition = definition.WorkflowDefinition;
@@ -94,6 +95,7 @@ pub const ErrorCode = enum {
     invalid_schedule_config,
     invalid_cron_expression,
     child_workflow_unverifiable,
+    json_too_deep,
 
     pub fn code(self: ErrorCode) []const u8 {
         return switch (self) {
@@ -126,6 +128,7 @@ pub const ErrorCode = enum {
             .invalid_schedule_config => "E504",
             .invalid_cron_expression => "E506",
             .child_workflow_unverifiable => "E507",
+            .json_too_deep => "E508",
         };
     }
 };
@@ -247,7 +250,35 @@ pub fn validateWorkflow(allocator: Allocator, def: *const WorkflowDefinition) !V
     // 12. Note @workflow/ references that can only be verified at runtime
     try validateChildWorkflowReferences(&result, def);
 
+    // 13. JSON the definition carries nests at most json_depth.MAX_DEPTH levels
+    try validateJsonDepth(&result, def);
+
     return result;
+}
+
+fn validateJsonDepth(result: *ValidationResult, def: *const WorkflowDefinition) !void {
+    try checkStepJsonDepth(result, def.start, "start");
+    for (def.steps) |step| try checkStepJsonDepth(result, step.step, step.name);
+    if (def.output) |o| try checkJsonDepth(result, o, "output");
+    if (def.schedule) |sched| if (sched.input) |i| try checkJsonDepth(result, i, "schedule.input");
+}
+
+fn checkStepJsonDepth(result: *ValidationResult, step: Step, step_name: []const u8) !void {
+    switch (step) {
+        .run => |r| if (r.input_mapping) |m| if (!json_depth.within(m)) {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "input_mapping of step '{s}': {s}", .{ step_name, json_depth.TOO_DEEP_MESSAGE }) catch json_depth.TOO_DEEP_MESSAGE;
+            try result.addError(.json_too_deep, msg, step_name);
+        },
+        .wait_for_signal => {},
+    }
+}
+
+fn checkJsonDepth(result: *ValidationResult, json: []const u8, field: []const u8) !void {
+    if (json_depth.within(json)) return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ field, json_depth.TOO_DEEP_MESSAGE }) catch json_depth.TOO_DEEP_MESSAGE;
+    try result.addError(.json_too_deep, msg, field);
 }
 
 fn validateRequiredFields(result: *ValidationResult, def: *const WorkflowDefinition) !void {
@@ -1461,4 +1492,40 @@ test "validator: an action reference holding a NUL is not valid" {
     try std.testing.expect(isValidActionOrPlanReference("@actions/x"));
     try std.testing.expect(!isValidActionOrPlanReference("@actions/b\x00x"));
     try std.testing.expect(!isValidActionReference("@actions/b\x00x"));
+}
+
+test "validateWorkflow: an input_mapping or output nested past 128 levels is refused" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        const json = try json_depth.nestedArrays(allocator, n);
+        defer allocator.free(json);
+        for ([_]bool{ false, true }) |as_output| {
+            var def = WorkflowDefinition{
+                .name = "deep",
+                .description = "",
+                .version = "1.0.0",
+                .idempotency = .none,
+                .search_attributes = &.{},
+                .plans = &.{},
+                .start = .{ .run = .{
+                    .target = "@actions/validate",
+                    .input_mapping = if (as_output) null else json,
+                    .retry = null,
+                    .poll = null,
+                    .transitions = &.{
+                        .{ .outcome = "success", .target = "flo.Completed" },
+                        .{ .outcome = "failure", .target = "flo.Failed" },
+                    },
+                } },
+                .steps = &.{},
+                .terminals = &.{},
+                .output = if (as_output) json else null,
+            };
+            var result = try validateWorkflow(allocator, &def);
+            defer result.deinit();
+            try testing.expectEqual(n > json_depth.MAX_DEPTH, result.hasErrors());
+            if (result.hasErrors()) try testing.expectEqual(ErrorCode.json_too_deep, result.items()[0].code);
+        }
+    }
 }

@@ -46,6 +46,7 @@ const kv_ops = @import("../protocol/kv_ops.zig");
 const ops = @import("../protocol/ops.zig");
 const schema = @import("../protocol/schema.zig");
 const json_path = @import("../util/json_path.zig");
+const json_depth = @import("../util/json_depth.zig");
 const table_run = @import("../node/table_run.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
@@ -186,6 +187,7 @@ pub const KVHandler = struct {
         BadPath,
         NotADocument,
         NotJson,
+        TooDeep,
         TooManyTransactions,
         ScanShort,
         Internal,
@@ -216,6 +218,7 @@ pub const KVHandler = struct {
             error.BadPath => refused(.bad_request, .malformed, "bad request: path isn't a JSON path"),
             error.NotADocument => refused(.bad_request, .wrong_type, "bad request: the key's value isn't a JSON document"),
             error.NotJson => refused(.bad_request, .malformed, "bad request: document isn't JSON"),
+            error.TooDeep => refused(.bad_request, .field_too_long, "bad request: " ++ json_depth.TOO_DEEP_MESSAGE),
             error.TooManyTransactions => refused(.overloaded, .too_many_transactions, "overloaded: too many open transactions on this shard — commit or roll some back, or retry"),
             error.ScanShort => refused(.overloaded, .shard_busy, "overloaded: no memory to list this page — retry"),
             error.Internal => refused(.internal_error, .internal, "internal error: the request couldn't be run"),
@@ -635,6 +638,7 @@ pub const KVHandler = struct {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const self = shard.kv_handler;
+        if (!json_depth.within(document)) return error.TooDeep;
         if (!(std.json.validate(self.allocator, document) catch return error.Internal)) return error.NotJson;
         const merged: []u8 = if (self.kv.get(qkey)) |e|
             json_path.jsonPathSet(self.allocator, e.value, path, document) catch |err| return jsonError(err)
@@ -697,6 +701,7 @@ pub const KVHandler = struct {
             error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => error.PathNotFound,
             error.InvalidPath => error.BadPath,
             error.InvalidJson => error.NotADocument,
+            error.TooDeep => error.TooDeep,
             error.OutOfMemory => error.Internal,
         };
     }

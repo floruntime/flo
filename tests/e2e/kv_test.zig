@@ -2166,3 +2166,42 @@ test "e2e/kv: a 90 KB transaction batch is applied, not just acked" {
         try testing.expectEqualStrings(value, got);
     }
 }
+
+fn nestedArrays(levels: usize) ![]u8 {
+    const out = try testing.allocator.alloc(u8, levels * 2);
+    @memset(out[0..levels], '[');
+    @memset(out[levels..], ']');
+    return out;
+}
+
+test "e2e/kv: JSON nesting is limited to 128 levels" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const refusal = "Error: bad request: JSON nesting is limited to 128 levels [bad_request/field_too_long]";
+
+    const ok = try nestedArrays(128);
+    defer testing.allocator.free(ok);
+    try ctx.exec(&.{ "kv", "jset", "deep128", ok });
+    const got = try ctx.execCapture(&.{ "kv", "jget", "deep128", "--path", "$" });
+    try testing.expect(std.mem.indexOf(u8, got, ok) != null);
+
+    const over = try nestedArrays(129);
+    defer testing.allocator.free(over);
+    var set = try ctx.cli.run(&.{ "kv", "jset", "deep129", over });
+    defer set.deinit();
+    try testing.expectEqual(@as(u8, 3), set.exit_code);
+    try testing.expectEqualStrings(refusal, std.mem.trimEnd(u8, set.stderr, "\n"));
+
+    // A plain set takes any bytes; reading them as JSON is refused.
+    const far = try nestedArrays(300);
+    defer testing.allocator.free(far);
+    try ctx.exec(&.{ "kv", "set", "deep300", far });
+    var get = try ctx.cli.run(&.{ "kv", "jget", "deep300", "--path", "$" });
+    defer get.deinit();
+    try testing.expectEqual(@as(u8, 3), get.exit_code);
+    try testing.expectEqualStrings(refusal, std.mem.trimEnd(u8, get.stderr, "\n"));
+
+    // The node still serves.
+    const again = try ctx.execCapture(&.{ "kv", "jget", "deep128", "--path", "$" });
+    try testing.expect(std.mem.indexOf(u8, again, ok) != null);
+}
