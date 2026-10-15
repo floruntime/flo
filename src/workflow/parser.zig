@@ -623,6 +623,9 @@ fn parseSchedule(allocator: Allocator, root: JsonValue, d: D) ParseError!?Schedu
     };
 }
 
+/// Longest stream name a trigger may name: a stream's own name limit.
+pub const MAX_TRIGGER_STREAM = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+
 /// Optional stream trigger block:
 /// ```yaml
 /// trigger:
@@ -633,9 +636,6 @@ fn parseSchedule(allocator: Allocator, root: JsonValue, d: D) ParseError!?Schedu
 ///   batch_size: 1                  # events per workflow run
 ///   batch_timeout_ms: 5000
 /// ```
-/// Longest stream name a trigger may name.
-pub const MAX_TRIGGER_STREAM = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
-
 fn parseTrigger(allocator: Allocator, root: JsonValue, d: D) ParseError!?StreamTriggerDef {
     const trig_obj = try optObject(d, root, "trigger") orelse return null;
     const mark = d.push("trigger");
@@ -645,7 +645,7 @@ fn parseTrigger(allocator: Allocator, root: JsonValue, d: D) ParseError!?StreamT
     const stream = try reqString(d, trig_obj, "stream");
     if (stream.len == 0) return d.fail(ParseError.InvalidFieldType, "\"stream\" must not be empty", .{});
     // No stream has a longer name; the runs it starts carry it in their key.
-    if (stream.len > MAX_TRIGGER_STREAM) return d.fail(ParseError.InvalidFieldType, "\"stream\" is at most {d} bytes, not {d}", .{ MAX_TRIGGER_STREAM, stream.len });
+    if (stream.len > MAX_TRIGGER_STREAM) return d.fail(ParseError.InvalidFieldType, "a stream name is at most {d} bytes, not {d}", .{ MAX_TRIGGER_STREAM, stream.len });
     const namespace = try optString(d, trig_obj, "namespace");
     const consumer_group = try optString(d, trig_obj, "consumer_group");
     const mode = try oneOf(TriggerMode, d, "mode", try optString(d, trig_obj, "mode") orelse "shared", &.{
@@ -1235,7 +1235,7 @@ test "parseWorkflow: a retry on a plan step is refused" {
 
 test "parseWorkflow: a trigger naming a stream longer than any stream is refused" {
     const name = comptime stdx.repeat("s", (MAX_TRIGGER_STREAM + 1));
-    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"" ++ name ++ "\" },"), ParseError.InvalidFieldType, std.fmt.comptimePrint("\"stream\" is at most {d} bytes, not {d} at trigger", .{ MAX_TRIGGER_STREAM, MAX_TRIGGER_STREAM + 1 }));
+    try expectRefused(wrap("", "\"trigger\": { \"stream\": \"" ++ name ++ "\" },"), ParseError.InvalidFieldType, std.fmt.comptimePrint("a stream name is at most {d} bytes, not {d} at trigger", .{ MAX_TRIGGER_STREAM, MAX_TRIGGER_STREAM + 1 }));
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
