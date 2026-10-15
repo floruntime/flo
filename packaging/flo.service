@@ -16,7 +16,12 @@ User=flo
 Group=flo
 ExecStart=/usr/bin/flo server start --config /etc/flo/flo.toml
 Restart=on-failure
+# Back off from 5 s to 2 min between attempts. systemd before 254 (Rocky 9
+# has 252) warns that it doesn't know these two keys, ignores them and
+# keeps the flat 5 s.
 RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=2min
 LimitNOFILE=1048576
 # Flo needs to write only its data dir.
 ProtectSystem=strict
