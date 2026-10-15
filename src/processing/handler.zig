@@ -1116,6 +1116,11 @@ pub const ProcessingHandler = struct {
     /// deep-copies everything it retains, so the caller may free `def` after.
     fn startPipelines(self: *ProcessingHandler, job_id: []const u8, def: *definition.JobDefinition) void {
         if (def.sinks.items.len == 0) return;
+        // A stored job meets the shard count the server restarted with.
+        if (def.shardRefusal(self.peer_shard_count)) |why| {
+            log.err("processing job {s} not started: {s}", .{ job_id, why });
+            return;
+        }
 
         // Build tag registry from all sinks and classify operators.
         // Heap-allocated so classify operators can reference it during creation.
@@ -2137,4 +2142,39 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
 
     try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
     try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);
+}
+
+test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server of more than one shard" {
+    const yaml =
+        \\kind: Processing
+        \\name: lookup
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\operators:
+        \\  - type: kv_lookup
+        \\    name: l
+        \\    lookup_key: k
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    {
+        var handler = ProcessingHandler.init(std.testing.allocator);
+        defer handler.deinit();
+        handler.peer_shard_count = 2;
+        // [status][parallelism=1][batch_size=0][ns_len=7]["default"][yaml]
+        var value: [512]u8 = undefined;
+        value[0] = @backingInt(ProcessingHandler.JobStatus.running);
+        std.mem.writeInt(u32, value[1..5], 1, .little);
+        std.mem.writeInt(u32, value[5..9], 0, .little);
+        std.mem.writeInt(u16, value[9..11], 7, .little);
+        @memcpy(value[11..18], "default");
+        @memcpy(value[18 .. 18 + yaml.len], yaml);
+        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", value[0 .. 18 + yaml.len], 1));
+        try std.testing.expect(handler.jobs.contains("job-1"));
+        try std.testing.expect(!handler.pipelines.contains("job-1"));
+    }
 }
