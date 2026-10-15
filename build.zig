@@ -161,6 +161,10 @@ pub fn build(b: *std.Build) void {
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
+    // The tests spawn the installed flo. Its bytes are part of the run's
+    // cache key, or a change to flo alone would replay the last result
+    // without running anything.
+    run_e2e_tests.addFileInput(exe.getEmittedBin());
 
     // ── Integration Tests ──
 
