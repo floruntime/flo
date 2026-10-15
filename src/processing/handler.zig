@@ -175,9 +175,6 @@ pub const ProcessingHandler = struct {
         operators: []Operator = &.{},
         operator_backings: []native_registry.CreateResult = &.{},
 
-        // Tag registry — heap-allocated, used by classify operators for tag resolution
-        tag_registry: ?*definition.TagRegistry = null,
-
         // ── Live runtime metrics (ephemeral; reset on submit/restart) ──
         // Surfaced per-job on the dashboard Metrics tab (issue #27). All cheap
         // counters updated on the hot tick path; no persistence.
@@ -245,13 +242,7 @@ pub const ProcessingHandler = struct {
         var pit = self.pipelines.iterator();
         while (pit.next()) |entry| {
             self.freePipelineState(entry.value_ptr);
-            // Multi-source pipeline keys (containing '\0' separator) are independently
-            // allocated and must be freed here. The idx==0 key is shared with the jobs
-            // map and freed via freeJobRecord below.
-            const key = entry.key_ptr.*;
-            if (std.mem.indexOfScalar(u8, key, 0) != null) {
-                self.allocator.free(key);
-            }
+            self.allocator.free(entry.key_ptr.*);
         }
         self.pipelines.deinit();
 
@@ -355,9 +346,6 @@ pub const ProcessingHandler = struct {
         if (pipe.operator_backings.len > 0) self.allocator.free(pipe.operator_backings);
         if (pipe.operators.len > 0) self.allocator.free(pipe.operators);
         freePipeStateFields(self.allocator, pipe);
-
-        // Free heap-allocated tag registry
-        if (pipe.tag_registry) |reg| self.allocator.destroy(reg);
     }
 
     /// The source and sink strings `makePipeState` copies.
@@ -1151,14 +1139,11 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        // Build tag registry from all sinks and classify operators.
-        // Heap-allocated so classify operators can reference it during creation.
-        const tag_registry_ptr = self.allocator.create(definition.TagRegistry) catch {
-            log.err("startPipelines: tag registry alloc failed for job {s}", .{job_id});
-            return;
-        };
-        tag_registry_ptr.* = definition.TagRegistry{};
-        const tag_registry = tag_registry_ptr;
+        // The job's tags, from its sinks and classify operators: read while
+        // operators are built (classify keeps only tag bits), so no pipeline
+        // keeps it.
+        var tags = definition.TagRegistry{};
+        const tag_registry = &tags;
         fillTagRegistry(tag_registry, def);
 
         // Resolve required_tags bitmask for each sink.
@@ -1178,16 +1163,21 @@ pub const ProcessingHandler = struct {
 
         // Create pipeline execution state. For multi-source jobs, one pipeline
         // per source (all sinks per pipeline).
+        // Each pipeline owns its key: the job's id for the first source, a
+        // suffixed one for each more. Not the job record's slice, which a
+        // repeated submit replaces.
+        // A source whose pipeline already runs (a submit applied again
+        // after part of it started) keeps it.
         for (def.sources.items, 0..) |*src, idx| {
-            if (idx == 0) {
-                self.createPipeline(job_id, src, def.sinks.items, def, tag_registry);
-            } else {
-                // Multi-source: additional pipeline under a suffixed key.
-                var key_buf: [256]u8 = undefined;
-                const ms_key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, idx }) catch continue;
-                const ms_owned = self.allocator.dupe(u8, ms_key) catch continue;
-                self.createPipeline(ms_owned, src, def.sinks.items, def, tag_registry);
+            const owned_key = (if (idx == 0) self.allocator.dupe(u8, job_id) else std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ job_id, idx })) catch {
+                log.err("processing job {s}: pipeline for source {d} not started (out of memory)", .{ job_id, idx });
+                continue;
+            };
+            if (self.pipelines.contains(owned_key)) {
+                self.allocator.free(owned_key);
+                continue;
             }
+            self.createPipeline(owned_key, src, def.sinks.items, def, tag_registry);
         }
     }
 
@@ -1223,7 +1213,12 @@ pub const ProcessingHandler = struct {
         }
     }
 
-    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tag_registry: *definition.TagRegistry) void {
+    fn createPipeline(self: *ProcessingHandler, job_id: []const u8, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, def: *const definition.JobDefinition, tags: *const definition.TagRegistry) void {
+        // A pipeline not built leaves its key, which it owns
+        // (`startPipelines`), behind for no one: freed.
+        var built = false;
+        defer if (!built) self.allocator.free(job_id);
+
         // Canonical tag hash for TS source selection — must match the write
         // path exactly (ts_mod.canonicalTagHash), or the series won't be found.
         const tag_hash: u64 = if (src.ts_tags.len >= 2) blk: {
@@ -1261,7 +1256,7 @@ pub const ProcessingHandler = struct {
                     log.debug("createPipeline:   config: {s} = {s}", .{ entry.key, entry.value });
                 }
             }
-            const result = native_registry.create(self.allocator, spec, tag_registry) catch |err| {
+            const result = native_registry.create(self.allocator, spec, tags) catch |err| {
                 log.err("processing job {s}: pipeline not started: operator '{s}' (type {s}) can't be built: {}", .{ job_id, spec.name, spec.type_name, err });
                 for (backings[0..count]) |*b| b.deinit(self.allocator);
                 self.allocator.free(backings);
@@ -1283,7 +1278,7 @@ pub const ProcessingHandler = struct {
             log.err("processing job {s}: pipeline not started (out of memory)", .{job_id});
             return;
         };
-        pipe_state.tag_registry = tag_registry;
+        built = true;
         log.debug("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
         if (count > 0) {
             pipe_state.operators = ops[0..count];
@@ -1294,6 +1289,7 @@ pub const ProcessingHandler = struct {
         }
         self.pipelines.put(job_id, pipe_state) catch {
             self.freePipelineState(&pipe_state);
+            self.allocator.free(job_id);
         };
     }
 
@@ -1963,15 +1959,14 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
 
-    // A minimal stream-source pipeline registered under a primary (no '\0') key,
-    // which deinit will not try to free.
+    // A minimal stream-source pipeline; deinit frees its key.
     const src = definition.SourceSpec{
         .name = "s",
         .stream = "raw",
         .namespace = "default",
         .batch_size = 0,
     };
-    try handler.pipelines.put("job-cp", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put(try allocator.dupe(u8, "job-cp"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
 
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1700, .little);
@@ -2005,7 +2000,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
         .ts_measurement = "cpu",
         .ts_field = "value",
     };
-    try handler.pipelines.put("job-ts", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put(try allocator.dupe(u8, "job-ts"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
     std.mem.writeInt(u64, val[8..16], 0, .little);
@@ -2027,7 +2022,7 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
     const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
-    try handler.pipelines.put("job-fw", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put(try allocator.dupe(u8, "job-fw"), try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     const pipe = handler.pipelines.getPtr("job-fw").?;
     pipe.stream_cursor_ts = 2000;
     pipe.stream_cursor_seq = 3;
@@ -2329,4 +2324,110 @@ test "ProcessingHandler: a pipeline's copied config is freed once, and a build o
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Build.run, .{ &src, &sinks });
+}
+
+test "ProcessingHandler: a job reading two streams frees its tag registry once" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+
+    var def = try parser.parseJobDefinition(allocator,
+        \\kind: Processing
+        \\name: two-sources
+        \\sources:
+        \\  - name: a
+        \\    stream: { name: in-a }
+        \\  - name: b
+        \\    stream: { name: in-b }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: out }
+    , null);
+    defer def.deinit(allocator);
+
+    handler.startPipelines("job-two", &def);
+    try std.testing.expectEqual(@as(u32, 2), handler.pipelines.count());
+}
+
+test "ProcessingHandler: a two-source job short of memory at any point leaves nothing behind" {
+    var def = try parser.parseJobDefinition(std.testing.allocator,
+        \\kind: Processing
+        \\name: two-sources
+        \\sources:
+        \\  - name: a
+        \\    stream: { name: in-a }
+        \\  - name: b
+        \\    stream: { name: in-b }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: out }
+    , null);
+    defer def.deinit(std.testing.allocator);
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var handler = ProcessingHandler.init(failing.allocator());
+        handler.startPipelines("job-two", &def);
+        const built = handler.pipelines.count();
+        handler.deinit();
+        if (!failing.has_induced_failure) {
+            try std.testing.expectEqual(@as(u32, 2), built);
+            break;
+        }
+    }
+}
+
+test "ProcessingHandler: a submit applied twice keeps one pipeline, under a key it owns" {
+    const yaml =
+        \\kind: Processing
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    for (0..2) |_| try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-twice", testSubmitValue(&buf, .running, yaml), 1));
+    try std.testing.expectEqual(@as(usize, 1), handler.pipelines.count());
+    try std.testing.expect(handler.pipelines.contains("job-twice"));
+}
+
+test "ProcessingHandler: starting a part-started job again keeps the pipelines it has, and a long job id starts every source" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    var def = try parser.parseJobDefinition(allocator,
+        \\kind: Processing
+        \\sources:
+        \\  - name: a
+        \\    stream: { name: in-a }
+        \\  - name: b
+        \\    stream: { name: in-b }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: out }
+    , null);
+    defer def.deinit(allocator);
+
+    // Source 0's pipeline is missing, as if it failed to start.
+    handler.startPipelines("job-part", &def);
+    const first = handler.pipelines.fetchRemove("job-part").?;
+    var first_state = first.value;
+    handler.freePipelineState(&first_state);
+    allocator.free(first.key);
+    const kept = handler.pipelines.getPtr("job-part\x001").?;
+
+    handler.startPipelines("job-part", &def);
+    try std.testing.expectEqual(@as(u32, 2), handler.pipelines.count());
+    try std.testing.expectEqual(kept, handler.pipelines.getPtr("job-part\x001").?);
+
+    const long_id = comptime @import("stdx").repeat("j", 300);
+    handler.startPipelines(long_id, &def);
+    try std.testing.expect(handler.pipelines.contains(long_id ++ "\x001"));
 }
