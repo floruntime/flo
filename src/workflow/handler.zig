@@ -1673,9 +1673,11 @@ pub const WorkflowHandler = struct {
                         .proceed => |o| o,
                     };
 
-                    // Check retry on failure
-                    if (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
-                        std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure))
+                    // Check retry on failure. A plan's executors retry by
+                    // their own policies (the parser refuses a plan step's).
+                    if (!run_step.isPlan() and
+                        (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
+                            std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
                     {
                         if (run_step.retry) |retry| {
                             if (run.retry_count < retry.max_attempts) {

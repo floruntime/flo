@@ -444,6 +444,9 @@ fn parseRunStep(allocator: Allocator, obj: JsonValue, d: D) ParseError!Step {
     errdefer if (input_mapping) |m| allocator.free(m);
 
     const retry: ?RetryPolicy = if (try optObject(d, obj, "retry")) |r| blk: {
+        // A plan's executors each retry by their own policy; a step-level
+        // retry on top would run the whole plan again.
+        if (mem.startsWith(u8, target, "@plan/")) return d.fail(ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own policy", .{});
         const mark = d.push("retry");
         defer d.pop(mark);
         break :blk try parseRetryPolicy(r, d);
@@ -1215,6 +1218,14 @@ test "parseWorkflow: a plan listing more executors than one pass tries is refuse
     const one = "{ \"name\": \"e\", \"run\": \"@actions/e\" },";
     const many = comptime stdx.repeat(one, plan_types.MAX_PLAN_EXECUTORS) ++ "{ \"name\": \"e\", \"run\": \"@actions/e\" }";
     try expectRefused(wrap("", "\"plans\": { \"p\": { \"executors\": [ " ++ many ++ " ] } },"), ParseError.InvalidFieldType, "a plan lists at most 32 executors, not 33 at plans.p.executors");
+}
+
+test "parseWorkflow: a retry on a plan step is refused" {
+    try expectRefused(
+        \\{ "kind": "Workflow", "name": "w", "version": "1",
+        \\  "plans": { "p": { "executors": [ { "name": "e", "run": "@actions/e", "retry": { "max_attempts": 2 } } ] } },
+        \\  "start": { "run": "@plan/p", "retry": { "max_attempts": 3 }, "transitions": { "success": "flo.Completed" } } }
+    , ParseError.UnknownKey, "a plan step takes no \"retry\"; each executor retries by its own policy at start");
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
