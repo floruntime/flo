@@ -51,6 +51,14 @@ const ns_keys = @import("../namespace/handler.zig");
 
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
+
+/// A run nothing moves on from.
+fn finished(status: ActionRunStatus) bool {
+    return switch (status) {
+        .completed, .failed, .cancelled, .timed_out => true,
+        .pending, .running => false,
+    };
+}
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -267,7 +275,9 @@ pub const ActionsHandler = struct {
 
     /// What a task command did: refused, proposed (the worker parks on
     /// it), or applied here without a shard.
-    const TaskOutcome = union(enum) { refused: TaskError, parked: persistence.ProposeResult, applied };
+    /// `repeat`: the run already has the outcome reported, so the report
+    /// is answered ok with nothing proposed or counted again.
+    const TaskOutcome = union(enum) { refused: TaskError, parked: persistence.ProposeResult, applied, repeat };
 
     /// Dispatch for action_complete, action_fail, action_touch opcodes.
     fn dispatchActionTaskCmd(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -282,6 +292,7 @@ pub const ActionsHandler = struct {
                     .refused => |e| shard.sendRefusal(conn, req.header.request_id, e.status, proto.notRun(e.message)),
                     .parked => |proposed| shard.park(conn, req, proposed, respondTask),
                     .applied => respondTask(shard_ptr, conn_ptr, req),
+                    .repeat => shard.sendOkResponse(conn, req.header.request_id, ""),
                 }
             },
             .action_touch => {
@@ -916,6 +927,28 @@ pub const ActionsHandler = struct {
 
     // ── Action Task Command Handlers ───────────────────────────────────
 
+    /// A report the run already shows (a resend) is answered ok. A report
+    /// for a finished run, or for an attempt another worker is now running,
+    /// is stale and refused, so a late fail can't put a finished or
+    /// re-dispatched run back to pending. A pending run takes reports:
+    /// claims are off the log, so a run claimed before a leader change is
+    /// pending here. `replayUpdateRun` separately leaves a finished run
+    /// alone on every replica.
+    fn staleReport(run: *const RunRecord, worker_id: []const u8, reported: ActionRunStatus) ?TaskOutcome {
+        switch (run.status) {
+            .running => {
+                const current = run.worker_id_owned orelse return null;
+                if (worker_id.len == 0 or std.mem.eql(u8, current, worker_id)) return null;
+                return .{ .refused = .{ .status = .conflict, .message = "stale report: another worker is running this run now" } };
+            },
+            .pending => return if (reported == .pending) .repeat else null,
+            .completed, .failed, .cancelled, .timed_out => {
+                if (run.status == reported) return .repeat;
+                return .{ .refused = .{ .status = .conflict, .message = "stale report: the run has finished" } };
+            },
+        }
+    }
+
     /// Complete a task. key = worker_id.
     /// value = [action_name_len:u16][action_name][task_id_len:u16][task_id]
     ///         [outcome_len:u16][outcome][result_len:u16][result]
@@ -960,6 +993,7 @@ pub const ActionsHandler = struct {
         // The applier updates the run from the entry.
         const run = self.runs.getPtr(task_id) orelse return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
         if (!runIn(run, req.namespace)) return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
+        if (staleReport(run, req.key, .completed)) |o| return o;
         const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
         return self.applyRunUpdate(shard, req.namespace, task_id, .{
             .status = .completed,
@@ -1037,8 +1071,10 @@ pub const ActionsHandler = struct {
         // The applier updates the run from the entry.
         const run = self.runs.getPtr(task_id) orelse return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
         if (!runIn(run, req.namespace)) return .{ .refused = .{ .status = .not_found, .message = "run not found" } };
+        const again = retry and run.attempt < run.max_retries;
+        if (staleReport(run, req.key, if (again) .pending else .failed)) |o| return o;
         const worker_id: ?[]const u8 = if (req.key.len > 0) req.key else run.worker_id_owned;
-        if (retry and run.attempt < run.max_retries) {
+        if (again) {
             // Back to pending for another attempt (within the limit).
             return self.applyRunUpdate(shard, req.namespace, task_id, .{
                 .status = .pending,
@@ -1583,6 +1619,9 @@ pub const ActionsHandler = struct {
             log.err("action run update for unknown run '{s}' skipped", .{run_id});
             return .failed;
         };
+        // A finished run stays finished: two reports can both pass the
+        // leader's check before either applies.
+        if (finished(run.status)) return .applied;
         self.updateRun(run, status, started_at_ms, @intCast(stamp_ns / std.time.ns_per_ms), fields) catch return .failed;
         return .applied;
     }
@@ -2357,7 +2396,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
 
     // A failed attempt keeps its error and worker; a completion clears the error.
     try std.testing.expect(h.applyRunUpdate(null, "default", "act-1", .{
-        .status = .failed,
+        .status = .pending,
         .started_at_ms = 1500,
         .result = "",
         .worker_id = "w-1",
@@ -2365,7 +2404,7 @@ test "actions: a run update applied from its entry carries outcome, error and wo
         .error_message = "boom",
     }) == .applied);
     const failed = h.runs.get("act-1") orelse return error.RunMissing;
-    try std.testing.expectEqual(ActionRunStatus.failed, failed.status);
+    try std.testing.expectEqual(ActionRunStatus.pending, failed.status);
     try std.testing.expectEqualStrings("boom", failed.error_owned.?);
     try std.testing.expectEqualStrings("w-1", failed.worker_id_owned.?);
 
@@ -2383,6 +2422,82 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     try std.testing.expectEqualStrings("{\"ok\":true}", done.result_owned.?);
     try std.testing.expectEqualStrings("w-2", done.worker_id_owned.?);
     try std.testing.expect(done.error_owned == null);
+}
+
+fn testReport(buf: []u8, op: proto.OpCode, worker: []const u8, run_id: []const u8, retry: bool) Request {
+    var off: usize = 0;
+    for ([_][]const u8{ "echo", run_id }) |f| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(f.len), .little);
+        @memcpy(buf[off + 2 ..][0..f.len], f);
+        off += 2 + f.len;
+    }
+    if (op == .action_complete) {
+        for ([_][]const u8{ "success", "{}" }) |f| {
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(f.len), .little);
+            @memcpy(buf[off + 2 ..][0..f.len], f);
+            off += 2 + f.len;
+        }
+    } else {
+        buf[off] = @intFromBool(retry);
+        off += 1;
+    }
+    return .{ .header = proto.RequestHeader.init(op, 1), .namespace = "default", .key = worker, .value = buf[0..off], .options = "" };
+}
+
+fn testRunning(h: *ActionsHandler, worker: []const u8) !void {
+    var inv_buf: [512]u8 = undefined;
+    if (h.runs.get("act-1") == null) {
+        try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+        const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
+        try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    }
+    _ = h.claimPendingRun("default", "echo", null, worker) orelse return error.NothingToClaim;
+}
+
+test "actions: a report for a run that has finished is refused, and a resent one is ok" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    var buf: [128]u8 = undefined;
+
+    try testing.expect(h.handleActionComplete(null, testReport(&buf, .action_complete, "w-1", "act-1", false)) == .applied);
+    try testing.expectEqual(ActionRunStatus.completed, h.runs.get("act-1").?.status);
+    // The same completion resent: ok, nothing new.
+    try testing.expect(h.handleActionComplete(null, testReport(&buf, .action_complete, "w-1", "act-1", false)) == .repeat);
+    // A late fail asking for a retry would have put it back to pending.
+    const late = h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true));
+    try testing.expectEqual(proto.StatusCode.conflict, late.refused.status);
+    try testing.expectEqual(ActionRunStatus.completed, h.runs.get("act-1").?.status);
+}
+
+test "actions: a resent fail can't send back an attempt another worker now runs" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    var buf: [128]u8 = undefined;
+
+    try testing.expect(h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true)) == .applied);
+    try testing.expectEqual(ActionRunStatus.pending, h.runs.get("act-1").?.status);
+    // Resent while it waits: the run already shows it.
+    try testing.expect(h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true)) == .repeat);
+
+    try testRunning(&h, "w-2");
+    const resent = h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true));
+    try testing.expectEqual(proto.StatusCode.conflict, resent.refused.status);
+    try testing.expectEqual(ActionRunStatus.running, h.runs.get("act-1").?.status);
+    try testing.expectEqualStrings("w-2", h.runs.get("act-1").?.worker_id_owned.?);
+}
+
+test "actions: an update applied to a finished run leaves it finished" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    // Two reports that both passed the leader's check, applied in order.
+    try testing.expect(h.applyRunUpdate(null, "default", "act-1", .{ .status = .completed, .started_at_ms = 1, .result = "{}", .worker_id = "w-1", .outcome = "success", .error_message = "" }) == .applied);
+    try testing.expect(h.applyRunUpdate(null, "default", "act-1", .{ .status = .pending, .started_at_ms = null, .result = "", .worker_id = "w-1", .outcome = "", .error_message = "late" }) == .applied);
+    const run = h.runs.get("act-1").?;
+    try testing.expectEqual(ActionRunStatus.completed, run.status);
+    try testing.expect(run.error_owned == null);
 }
 
 test "actions: an apply that runs out of memory fails and changes nothing" {
