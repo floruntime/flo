@@ -4609,16 +4609,16 @@ pub const Shard = struct {
     /// The most a refusal's frame takes: one too long is cut to fit.
     pub const REFUSAL_FRAME_MAX = 1024;
 
-    /// A refusal is always sent: one too long for its frame is cut, never
-    /// dropped (a dropped one left the client the no-answer fallback).
-    /// A blocking read with no room left to wait: refused, so the client
-    /// backs off and retries, rather than answered empty and asked again
-    /// at once. Forwarded, the refusal goes back and frees the asking
-    /// node's slot.
+    /// A blocking read with no room left to wait: refused overloaded rather
+    /// than answered empty. SDK workers back off and retry; a direct caller
+    /// gets the error. Forwarded, the refusal goes back and frees the
+    /// asking node's slot.
     pub fn refuseWaitersFull(self: *Shard, conn: *Connection, request_id: u64) void {
         self.sendRefusal(conn, request_id, .overloaded, .{ .reason = .too_many_waiters, .ran = .no, .message = "overloaded: too many reads waiting on this shard — retry" });
     }
 
+    /// A refusal is always sent: one too long for its frame is cut, never
+    /// dropped (a dropped one left the client the no-answer fallback).
     pub fn sendRefusal(self: *Shard, conn: *Connection, request_id: u64, status: proto.StatusCode, r: proto.Refusal) void {
         _ = self;
         var buf: [REFUSAL_FRAME_MAX]u8 = undefined;
@@ -8188,6 +8188,9 @@ const FollowerTest = struct {
         t.shard.raft_network = &t.rn;
         t.shard.wireHandlerShardPtrs();
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &t.pair));
+        // A test that reads an answer that never comes fails, not hangs.
+        try @import("stdx").net.sysFcntlSetNonblocking(t.pair[1]);
+        try @import("stdx").net.sysFcntlSetNonblocking(t.pair[0]);
         t.conn = try t.shard.addConnection(t.pair[0]);
     }
 
@@ -8224,6 +8227,11 @@ test "Shard: a connection's blocking reads held for the leader count toward its 
     try std.testing.expectEqual(@as(u32, Connection.MAX_BLOCKING_IN_FLIGHT), t.shard.forward_count);
     try std.testing.expectEqual(@as(u32, Connection.MAX_BLOCKING_IN_FLIGHT), t.shard.blocking_forwards);
     try std.testing.expect(t.conn.waiting != null);
+
+    // The client goes: its forwards go, and the count with them.
+    t.shard.dropForwardsFor(t.conn.fd, t.conn.id);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.forward_count);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.blocking_forwards);
 }
 
 test "Shard: blocking reads held for the leader leave forward slots for writes" {
@@ -8240,10 +8248,9 @@ test "Shard: blocking reads held for the leader leave forward slots for writes" 
         try ob.addU32(.block_ms, 60_000);
         break :blk ob.getOptions();
     }), .client);
-    t.shard.flushToClient(t.conn.fd);
     var out: [256]u8 = undefined;
-    const n = std.c.read(t.pair[1], &out, out.len);
-    var resp = try proto.Response.parse(out[0..@intCast(n)]);
+    const n = try readAnswer(t.pair[1], &t.shard, t.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
     try std.testing.expectEqual(@as(u32, 0), t.shard.forward_count);
@@ -8266,15 +8273,28 @@ test "Shard: a blocking read with no room left to wait is refused overloaded, no
         _ = shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = ReplyTo.socketOf(0, 1000, @intCast(i)), .request_id = i, .key = "x", .timeout_ms = 60_000 });
     }
 
-    const dequeue = try FollowerTest.blockingDequeue(7);
-    defer std.testing.allocator.free(dequeue);
-    _ = feedClient(c.pair[1], &shard, c.conn.fd, dequeue);
-    var out: [256]u8 = undefined;
-    const resp = try nextAnswer(c, &shard, &out);
-    try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
-    var r = resp;
-    try std.testing.expectEqual(proto.Ran.no, (try r.refused()).ran);
+    var opts: [8]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&opts);
+    try ob.addU32(.block_ms, 60_000);
+    // [group_len:u16][group][consumer_len:u16][consumer]
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    // [count:u32][type_len:u16][type]
+    const await_value = "\x01\x00\x00\x00" ++ "\x03\x00" ++ "job";
+    for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8 }{
+        .{ .op = .queue_dequeue, .key = "q", .value = "" },
+        .{ .op = .stream_read, .key = "s", .value = "" },
+        .{ .op = .stream_group_read, .key = "s", .value = group_consumer },
+        .{ .op = .action_await, .key = "w", .value = await_value },
+    }, 7..) |r, id| {
+        const req = try testRequestWith(r.op, id, r.key, r.value, ob.getOptions());
+        defer std.testing.allocator.free(req);
+        _ = feedClient(c.pair[1], &shard, c.conn.fd, req);
+        var out: [256]u8 = undefined;
+        var resp = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@as(u64, id), resp.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+        try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+    }
 }
 
 test "Shard: a forward waits for its leader's answer, is answered when that leader is replaced, and runs here once this node leads" {

@@ -231,7 +231,7 @@ pub const WaiterPool = struct {
         if (!room) {
             if (now_ms -| self.full_warn_ms >= 10_000) {
                 self.full_warn_ms = now_ms;
-                log.warn("waiter pool full ({d} waiting, {d} of them for other shards); blocking reads are answered at once until some return", .{ self.count, self.forwarded });
+                log.warn("waiter pool full ({d} waiting, {d} of them for other shards); blocking reads are refused overloaded until some return", .{ self.count, self.forwarded });
             }
             return false;
         }
