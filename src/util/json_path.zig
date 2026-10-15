@@ -11,9 +11,13 @@
 //!
 //! All functions take JSON document bytes and return either a borrowed slice
 //! (zero-copy GET) or a freshly allocated JSON document (SET/DEL).
+//!
+//! Documents and values nest at most `json_depth.MAX_DEPTH` levels, the
+//! result of a SET included; deeper ones are refused with `TooDeep`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json_depth = @import("json_depth.zig");
 
 pub const PathError = error{
     InvalidPath,
@@ -23,6 +27,7 @@ pub const PathError = error{
     IndexOutOfBounds,
     OutOfMemory,
     InvalidJson,
+    TooDeep,
 };
 
 /// A single segment of a parsed path.
@@ -96,6 +101,7 @@ fn walk(root: std.json.Value, segments: []const Segment) PathError!std.json.Valu
 /// JSON.GET — extract a value at `path` from `json_bytes` and return it as
 /// freshly allocated JSON text. Caller owns the returned slice.
 pub fn jsonPathGet(allocator: Allocator, json_bytes: []const u8, path: []const u8) PathError![]u8 {
+    if (!json_depth.within(json_bytes)) return error.TooDeep;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch
         return error.InvalidJson;
     defer parsed.deinit();
@@ -116,6 +122,7 @@ pub fn jsonPathSet(
     path: []const u8,
     value_json: []const u8,
 ) PathError![]u8 {
+    if (!json_depth.within(json_bytes)) return error.TooDeep;
     // Validate replacement is parseable JSON.
     const new_parsed = std.json.parseFromSlice(std.json.Value, allocator, value_json, .{}) catch
         return error.InvalidJson;
@@ -123,6 +130,9 @@ pub fn jsonPathSet(
 
     const segments = try parsePath(allocator, path);
     defer allocator.free(segments);
+
+    // The value lands under one container per segment.
+    if (segments.len + json_depth.depth(value_json) > json_depth.MAX_DEPTH) return error.TooDeep;
 
     if (segments.len == 0) {
         // Replace entire document.
@@ -188,6 +198,7 @@ pub fn jsonPathDel(
     if (segments.len == 0) {
         return allocator.dupe(u8, "null") catch return error.OutOfMemory;
     }
+    if (!json_depth.within(json_bytes)) return error.TooDeep;
 
     var root_parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch
         return error.InvalidJson;
@@ -314,4 +325,47 @@ test "jsonPathDel: remove array element" {
     const result = try jsonPathDel(std.testing.allocator, "{\"xs\":[10,20,30]}", "$.xs[1]");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("{\"xs\":[10,30]}", result);
+}
+
+test "jsonPathGet/Del: a document nested 128 levels is read; 129 and 300 are refused" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        const doc = try json_depth.nestedArrays(a, n);
+        defer a.free(doc);
+        if (n <= json_depth.MAX_DEPTH) {
+            const got = try jsonPathGet(a, doc, "$");
+            defer a.free(got);
+            try std.testing.expectEqualStrings(doc, got);
+            const rest = try jsonPathDel(a, doc, "$[0]");
+            a.free(rest);
+        } else {
+            try std.testing.expectError(error.TooDeep, jsonPathGet(a, doc, "$"));
+            try std.testing.expectError(error.TooDeep, jsonPathGet(a, doc, "$[0]"));
+            try std.testing.expectError(error.TooDeep, jsonPathDel(a, doc, "$[0]"));
+        }
+    }
+}
+
+test "jsonPathSet: the result nests at most 128 levels" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        const value = try json_depth.nestedArrays(a, n);
+        defer a.free(value);
+        // At the root the value is the whole document.
+        if (n <= json_depth.MAX_DEPTH) {
+            const doc = try jsonPathSet(a, "{}", "$", value);
+            a.free(doc);
+        } else {
+            try std.testing.expectError(error.TooDeep, jsonPathSet(a, "{}", "$", value));
+            try std.testing.expectError(error.TooDeep, jsonPathSet(a, value, "$[0]", "1"));
+        }
+        // Under a field, the object adds a level.
+        const inner = value[1 .. value.len - 1];
+        if (n <= json_depth.MAX_DEPTH) {
+            const doc = try jsonPathSet(a, "{\"a\":1}", "$.a", inner);
+            a.free(doc);
+        } else {
+            try std.testing.expectError(error.TooDeep, jsonPathSet(a, "{\"a\":1}", "$.a", inner));
+        }
+    }
 }

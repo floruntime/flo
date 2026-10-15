@@ -37,6 +37,7 @@ const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
 const jsonpath = @import("jsonpath.zig");
+const json_depth = @import("../util/json_depth.zig");
 const wf_types = @import("types.zig");
 const StepOutputMap = wf_types.StepOutputMap;
 
@@ -731,6 +732,11 @@ pub const WorkflowHandler = struct {
             if (offset < value.len) {
                 input = value[offset..];
             }
+        }
+
+        if (!json_depth.within(input)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "input: " ++ json_depth.TOO_DEEP_MESSAGE);
+            return null;
         }
 
         // Enforce idempotency mode: `required` rejects starts with no key.
@@ -1642,7 +1648,13 @@ pub const WorkflowHandler = struct {
                             run.input_owned,
                             if (run.step_outputs) |*so| so else null,
                             run.run_id_owned,
-                        ) catch null;
+                        ) catch |err| switch (err) {
+                            error.JsonTooDeep => {
+                                self.completeRun(shard, run_ns_key, run, .failed, "step input: " ++ json_depth.TOO_DEEP_MESSAGE, now_ms);
+                                return;
+                            },
+                            else => null,
+                        };
                     }
                     const step_input: []const u8 = resolved_input orelse run.input_owned;
 
@@ -5573,4 +5585,63 @@ test "workflow handler: a trigger cursor restored inside an append resumes with 
     defer allocator.free(rest.ids);
     try testing.expectEqual(@as(usize, 3), rest.payloads.len);
     for (rest.payloads, "cde") |p, want| try testing.expectEqual(want, p[0]);
+}
+
+test "a step whose mapped input would nest past 128 levels fails its run" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerTestAction(&actions, "step-a");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:map-wf", "map-wf",
+        \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
+        \\"start":{"run":"@actions/step-a","input_mapping":"\"$.input\"","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    );
+
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        const input = try json_depth.nestedArrays(allocator, n);
+        defer allocator.free(input);
+        var id_buf: [16]u8 = undefined;
+        var key_buf: [32]u8 = undefined;
+        const run_id = try std.fmt.bufPrint(&id_buf, "run-{d}", .{n});
+        const ns_key = try std.fmt.bufPrint(&key_buf, "default:{s}", .{run_id});
+        createTestRunWithInput(&handler, ns_key, run_id, "map-wf", input);
+
+        handler.advanceWorkflow(&shard, ns_key, "default");
+        _ = shard.applyCommitted();
+        const want: WorkflowHandler.RunStatus = if (n <= json_depth.MAX_DEPTH) .waiting else .failed;
+        try testing.expectEqual(want, handler.runs.get(ns_key).?.status);
+    }
+}
+
+test "workflow replay: a start whose input nests past 128 levels applies; a search attribute read from it is null" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    createTestDef(&handler, "default:wf", "wf",
+        \\{"kind":"Workflow","name":"wf","version":"1.0.0","search_attributes":[{"name":"a","from":"$.input.a"}],
+        \\"start":{"run":"@actions/step-a","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    );
+
+    for ([_]usize{ 128, 129, 300 }) |n| {
+        // {"a": <n-1 arrays>} nests n levels.
+        const arrays = try json_depth.nestedArrays(allocator, n - 1);
+        defer allocator.free(arrays);
+        // [wf_len][wf][ver_len][ver][status][evt_len][idem_len][input]
+        const value = try std.fmt.allocPrint(allocator, "\x02\x00wf\x01\x001\x01\x00\x00\x00\x00{{\"a\":{s}}}", .{arrays});
+        defer allocator.free(value);
+        var key_buf: [32]u8 = undefined;
+        const ns_key = try std.fmt.bufPrint(&key_buf, "default:r{d}", .{n});
+
+        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayStart(ns_key, value, 1));
+        const tags = handler.runs.get(ns_key).?.search_tags_owned.?;
+        if (n <= json_depth.MAX_DEPTH) {
+            try testing.expect(std.mem.indexOf(u8, tags, arrays) != null);
+        } else {
+            try testing.expectEqualStrings("{\"a\":null}", tags);
+        }
+    }
 }

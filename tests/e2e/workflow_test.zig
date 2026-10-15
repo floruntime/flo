@@ -3224,3 +3224,46 @@ fn expectOneRunPerInput(ctx: *stdx.testing.TestContext, workflow: []const u8, in
     }
     for (inputs, 0..) |_, i| try testing.expectEqual(@as(usize, 1), seen[i]);
 }
+
+test "e2e/workflow: a start's input nests at most 128 levels" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "deep-action" });
+    const workflow_def =
+        \\kind: Workflow
+        \\name: deep-input-wf
+        \\version: 1.0.0
+        \\start.run: @actions/deep-action
+        \\start.input_mapping: '{"x": "$.input"}'
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "deep-input.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    var buf: [600]u8 = undefined;
+    // With the mapping's object around it, 127 levels of input make 128.
+    var ok = try ctx.cli.run(&.{ "workflow", "start", "deep-input-wf", nestedArrays(&buf, 127), "--run-id", "deep-ok" });
+    defer ok.deinit();
+    try testing.expectEqual(@as(u8, 0), ok.exit_code);
+
+    for ([_]usize{ 129, 300 }) |n| {
+        var refused = try ctx.cli.run(&.{ "workflow", "start", "deep-input-wf", nestedArrays(&buf, n) });
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 3), refused.exit_code);
+        try testing.expectEqualStrings("Error: input: JSON nesting is limited to 128 levels [bad_request]", std.mem.trimEnd(u8, refused.stderr, "\n"));
+    }
+
+    var status = try ctx.cli.run(&.{ "workflow", "status", "deep-ok" });
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.exit_code);
+    try testing.expect(status.stdoutContains("Status:   waiting"));
+}
+
+fn nestedArrays(buf: []u8, levels: usize) []const u8 {
+    @memset(buf[0..levels], '[');
+    @memset(buf[levels .. 2 * levels], ']');
+    return buf[0 .. 2 * levels];
+}
