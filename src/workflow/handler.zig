@@ -4261,6 +4261,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.shard_metrics = null;
     shard.offline = null;
     shard.offline_published = .init(false);
+    shard.replica.diverged = false;
     shard.losses = .{};
     const raft_node = try std.testing.allocator.create(RaftNode);
     // Room for an entry at the payload limit, which a 64 KiB ring can't hold.
