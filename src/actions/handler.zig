@@ -382,11 +382,7 @@ pub const ActionsHandler = struct {
             .min_version = (@as(u64, ns_len) << 16) | @as(u64, action_len),
             .timeout_ms = block_ms,
         });
-        if (!registered) {
-            // Pool full — send empty OK rather than deferring forever.
-            shard.sendOkResponse(conn, req.header.request_id, "");
-            return;
-        }
+        if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
         conn.response_deferred = true;
     }
 
