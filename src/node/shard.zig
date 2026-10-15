@@ -5482,7 +5482,9 @@ pub const FORWARD_TIMEOUT_MS: u64 = 5000;
 /// answers is answered after this, past any time it may block there: the
 /// last guard, for a leader that is wedged. Everything else that ends a
 /// sent write answers sooner. Cut off sooner, a blocking read would leave
-/// its waiter on the leader to take a message nobody receives.
+/// its waiter on the leader to take a message nobody receives. When it
+/// does fire, the leader is wedged and that can still happen: closing it
+/// needs a cancel sent to the leader's waiter.
 pub const SENT_FORWARD_BACKSTOP_MS: u64 = 60_000;
 /// A forwarded write's frame: its id, then the length of the fields carried
 /// beside the client's bytes (none yet), then those fields, then the bytes.
