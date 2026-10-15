@@ -2149,3 +2149,11 @@ test "ProcessingHandler: a TS source record is JSON for any measurement name" {
     try std.testing.expectEqual(@as(f64, 1.5), parsed.value.object.get("value").?.float);
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("timestamp_ms").?.integer);
 }
+
+test "ProcessingHandler: a TS source record writes a non-finite value as null" {
+    var buf: [512]u8 = undefined;
+    for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |v| {
+        const json = ProcessingHandler.tsPointJson(&buf, "m", v, 7).?;
+        try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"value\":null,\"timestamp_ms\":7}", json);
+    }
+}

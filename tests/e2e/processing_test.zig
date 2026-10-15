@@ -3107,3 +3107,32 @@ test "e2e/processing: ts sink drops a value past f64's range, and a ts source wr
     try testing.expect(!out.contains("inf"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.stdout, "\"measurement\""));
 }
+
+test "e2e/processing: ts sink with fields drops a value past f64's range" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_tsfields" });
+
+    try ctx.exec(&.{ "stream", "append", "fields-in", "{\"v\":1e400}", "-n", "proc_tsfields" });
+    try ctx.exec(&.{ "stream", "append", "fields-in", "{\"v\":2.5}", "-n", "proc_tsfields" });
+    const job_def =
+        \\kind: Processing
+        \\name: e2e-ts-fields-finite
+        \\namespace: proc_tsfields
+        \\sources.[0].stream.name: fields-in
+        \\sinks.[0].ts.measurement: fields_m
+        \\sinks.[0].ts.fields.val: v
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, job_def, "e2e-ts-fields-finite.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const job_id = extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_tsfields" })) orelse return error.NoJobId;
+    // Records are taken in order: once 2.5 is in, 1e400 was handled.
+    if (!try readTsBlocking(ctx, "fields_m", "proc_tsfields", "val", 5000)) return error.PipelineTimeout;
+
+    var read = try ctx.cli.run(&.{ "ts", "read", "fields_m", "-n", "proc_tsfields", "--from", "0", "--field", "val", "--limit", "100", "--output", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(u8, 0), read.exit_code);
+    try testing.expect(read.stdoutContains("2.5"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, read.stdout, "\"value\""));
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tsfields" });
+}
