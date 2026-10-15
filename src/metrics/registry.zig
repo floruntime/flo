@@ -1723,7 +1723,7 @@ test "registry: shard metrics reactor and inbox" {
     try testing.expectEqual(@as(u64, 8), snap.partitions);
 }
 
-test "registry: queue and stream series are only those something records" {
+test "registry: queue and stream series are exactly the ones something records" {
     var registry = MetricsRegistry.init(testing.allocator);
     defer registry.deinit();
     _ = try registry.registerQueue("prod", "jobs");
@@ -1739,18 +1739,23 @@ test "registry: queue and stream series are only those something records" {
         "flo_stream_append_bytes_total", "flo_stream_read_ops_total",        "flo_stream_read_records_total",
         "flo_stream_read_bytes_total",   "flo_stream_read_empty_total",
     };
-    var seen: usize = 0;
+    var seen: [want.len]bool = @splat(false);
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "flo_queue_") and !std.mem.startsWith(u8, line, "flo_stream_")) continue;
         const name = line[0 .. std.mem.indexOfAny(u8, line, "{ ") orelse line.len];
-        for (want) |w| {
-            if (std.mem.eql(u8, w, name)) break;
+        for (want, 0..) |w, i| {
+            if (!std.mem.eql(u8, w, name)) continue;
+            try testing.expect(!seen[i]);
+            seen[i] = true;
+            break;
         } else {
             std.debug.print("unexpected series {s}\n", .{name});
             return error.TestUnexpectedResult;
         }
-        seen += 1;
     }
-    try testing.expectEqual(want.len, seen);
+    for (seen, want) |s, w| {
+        if (!s) std.debug.print("missing series {s}\n", .{w});
+        try testing.expect(s);
+    }
 }

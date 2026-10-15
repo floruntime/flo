@@ -1,6 +1,6 @@
 //! Stream Metrics Collection
 //!
-//! Simple counters and gauges for stream operations.
+//! Simple counters for stream operations.
 //! Thread-safe via atomic operations.
 //!
 //! This module provides metrics compatible with the metrics registry for
