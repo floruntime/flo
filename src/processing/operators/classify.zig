@@ -32,13 +32,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
 const log = @import("stdx").log;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 const ExprFilterOperator = @import("expr_filter.zig").ExprFilterOperator;
 
 /// A single classification rule: condition + tag bit to set.
@@ -84,11 +81,8 @@ pub const ClassifyOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = close,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
@@ -115,8 +109,6 @@ pub const ClassifyOperator = struct {
         }
         try ctx.emit(tagged_rec);
     }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
 
     fn getName(ptr: *anyopaque) []const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -152,7 +144,6 @@ test "ClassifyOperator single rule match" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -188,7 +179,6 @@ test "ClassifyOperator no rules match — record still emitted" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -231,7 +221,6 @@ test "ClassifyOperator multiple rules compose" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -276,7 +265,6 @@ test "ClassifyOperator default tag on unmatched records" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 
@@ -320,7 +308,6 @@ test "ClassifyOperator default tag null — unmatched gets no tags" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test",
     };
 

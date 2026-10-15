@@ -5,9 +5,6 @@
 //! - POST   /processing/jobs                       — Submit new job
 //! - DELETE /processing/jobs/:id                   — Cancel job
 //! - PUT    /processing/jobs/:id/stop              — Stop job (graceful)
-//! - POST   /processing/jobs/:id/savepoint         — Create savepoint
-//! - PUT    /processing/jobs/:id/restore           — Restore from savepoint
-//! - PUT    /processing/jobs/:id/rescale           — Rescale parallelism
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -135,28 +132,13 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
         };
     }
 
-    // /processing/jobs/:id[/stop|/savepoint|/restore|/rescale]
+    // /processing/jobs/:id[/stop]
     if (std.mem.startsWith(u8, path, "/jobs/")) {
         const rest = path["/jobs/".len..];
         if (std.mem.endsWith(u8, rest, "/stop")) {
             if (method != .PUT) return error.MethodNotAllowed;
             const job_id = rest[0 .. rest.len - "/stop".len];
             return stopJob(allocator, job_id, query_string, ctx);
-        }
-        if (std.mem.endsWith(u8, rest, "/savepoint")) {
-            if (method != .POST) return error.MethodNotAllowed;
-            const job_id = rest[0 .. rest.len - "/savepoint".len];
-            return createSavepoint(allocator, job_id, ctx);
-        }
-        if (std.mem.endsWith(u8, rest, "/restore")) {
-            if (method != .POST) return error.MethodNotAllowed;
-            const job_id = rest[0 .. rest.len - "/restore".len];
-            return restoreJob(allocator, job_id, body, ctx);
-        }
-        if (std.mem.endsWith(u8, rest, "/rescale")) {
-            if (method != .POST) return error.MethodNotAllowed;
-            const job_id = rest[0 .. rest.len - "/rescale".len];
-            return rescaleJob(allocator, job_id, body, ctx);
         }
         // DELETE /processing/jobs/:id or GET /processing/jobs/:id
         return switch (method) {
@@ -201,7 +183,6 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
                     try obj.stringField("name", job.name_owned);
                     try obj.stringField("namespace", job.namespace_owned);
                     try obj.stringField("status", job.status.toString());
-                    try obj.intField("parallelism", @as(i64, @intCast(job.parallelism)));
                     try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
                     try obj.intField("created_at", job.created_at_ms);
                     try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
@@ -237,7 +218,6 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
         try obj.stringField("name", job.name_owned);
         try obj.stringField("namespace", job.namespace_owned);
         try obj.stringField("status", job.status.toString());
-        try obj.intField("parallelism", @as(i64, @intCast(job.parallelism)));
         try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
         try obj.intField("created_at", job.created_at_ms);
         try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
@@ -246,24 +226,6 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
         // operator/sink DAG.
         try obj.stringField("yaml", job.yaml_owned);
 
-        // Savepoints for this job (from the same shard's savepoint store).
-        {
-            var sp_arr = try obj.arrayField("savepoints");
-            try sp_arr.begin();
-            var sit = shard.processing_handler.savepoints.iterator();
-            while (sit.next()) |se| {
-                const sp = se.value_ptr;
-                if (!std.mem.eql(u8, sp.job_id_owned, job_id)) continue;
-                try sp_arr.next();
-                var sobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try sobj.begin();
-                try sobj.stringField("savepoint_id", sp.savepoint_id_owned);
-                try sobj.intField("created_at", sp.created_at_ms);
-                try sobj.intField("records_at_savepoint", @as(i64, @intCast(sp.records_at_savepoint)));
-                try sobj.end();
-            }
-            try sp_arr.end();
-        }
         try obj.end();
         return try json_aw.toOwnedSlice();
     }
@@ -273,7 +235,6 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
     try obj.begin();
     try obj.stringField("job_id", job_id);
     try obj.stringField("status", "unknown");
-    try obj.intField("parallelism", 0);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -347,59 +308,6 @@ fn cancelJob(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8
     try obj.boolField("ok", true);
     try obj.stringField("job_id", job_id);
     try obj.stringField("state", "CANCELLED");
-    try obj.end();
-    return try json_aw.toOwnedSlice();
-}
-
-fn createSavepoint(allocator: Allocator, job_id: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-    try obj.boolField("ok", true);
-    try obj.stringField("job_id", job_id);
-    try obj.stringField("savepoint_id", "");
-    try obj.end();
-    return try json_aw.toOwnedSlice();
-}
-
-fn restoreJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    _ = body;
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-    try obj.boolField("ok", true);
-    try obj.stringField("job_id", job_id);
-    try obj.stringField("state", "RUNNING");
-    try obj.end();
-    return try json_aw.toOwnedSlice();
-}
-
-fn rescaleJob(allocator: Allocator, job_id: []const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
-    _ = body;
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-    try obj.boolField("ok", true);
-    try obj.stringField("job_id", job_id);
-    try obj.intField("parallelism", 1);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

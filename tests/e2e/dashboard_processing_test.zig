@@ -34,7 +34,6 @@ test "e2e/dashboard: processing job surfaces real runtime metrics" {
         \\namespace: proc_metrics
         \\sources.[0].stream.name: m-input
         \\sinks.[0].stream.name: m-output
-        \\parallelism: 1
         \\batch_size: 100
     ;
     const path = try writeDottedToTempYaml(testing.allocator, job_def, "metrics-job.yaml");

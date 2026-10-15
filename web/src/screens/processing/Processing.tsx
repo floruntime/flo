@@ -1,10 +1,10 @@
 /* Flo Console v2 — Processing screen (live).
-   Stream processing · pipeline DAG · savepoints.
+   Stream processing · pipeline DAG.
 
    Wired to the dashboard API. Jobs are namespace-scoped server-side. The API
-   exposes the registry record (status, parallelism, batch_size, records_processed)
-   and the full submitted pipeline YAML (parsed here into the source→operator→sink
-   DAG) + savepoints. It does NOT expose live rates, e2e latency, backpressure,
+   exposes the registry record (status, batch_size, records_processed) and the
+   full submitted pipeline YAML (parsed here into the source→operator→sink
+   DAG). It does NOT expose live rates, e2e latency, backpressure,
    per-operator in/out counts, checkpoints or window metrics — those mock cards were
    dropped, not faked. Submit / stop / cancel are real loopback writes. See API_INTEGRATION.md. */
 import { Fragment, useMemo, useState } from 'react'
@@ -281,14 +281,13 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
   const q = useJobDetail(job.job_id)
   const stop = useStopJob(ns)
   const cancel = useCancelJob(ns)
-  const [tab, setTab] = useState<'overview' | 'definition' | 'savepoints'>('overview')
+  const [tab, setTab] = useState<'overview' | 'definition'>('overview')
 
   const d: ProcessingJobDetail | undefined = q.data
   const status: JobStatus = (d?.status ?? job.status) as JobStatus
   const records = d?.records_processed ?? job.records_processed
   const running = status === 'RUNNING'
   const pipe = useMemo(() => parsePipeline(d?.yaml ?? ''), [d?.yaml])
-  const savepoints = d?.savepoints ?? []
   const [c, l] = P_ST[status] ?? P_ST.unknown
 
   return (
@@ -322,7 +321,6 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
 
       <Stats>
         <Stat label="Records processed" value={pfmtN(records)} sub={running ? 'climbing' : 'final'} />
-        <Stat label="Parallelism" value={'×' + (d?.parallelism ?? job.parallelism)} sub="subtasks" />
         <Stat label="Batch size" value={d?.batch_size ?? job.batch_size} sub="per tick" />
         <Stat label="Uptime" value={pUp(d?.created_at ?? job.created_at)} sub="since submit" />
       </Stats>
@@ -333,8 +331,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
             [
               ['overview', 'Overview'],
               ['definition', 'Definition'],
-              ['savepoints', 'Savepoints · ' + savepoints.length],
-            ] as ['overview' | 'definition' | 'savepoints', string][]
+            ] as ['overview' | 'definition', string][]
           ).map(([id, lab]) => (
             <button key={id} className={'wtab' + (tab === id ? ' on' : '')} onClick={() => setTab(id)}>
               {lab}
@@ -354,7 +351,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
               Edge counts aren’t exposed per-operator — only the source record total is live.
             </div>
           </div>
-        ) : tab === 'definition' ? (
+        ) : (
           <div className="card card-p">
             <PhSec icon={PSEC.info} title="Submitted definition" />
             {d?.yaml ? (
@@ -364,29 +361,6 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
                 {q.isLoading ? 'Loading…' : 'No definition available.'}
               </div>
             )}
-          </div>
-        ) : savepoints.length === 0 ? (
-          <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '40px 0' }}>
-            No savepoints. Create one with `flo processing savepoint {job.job_id}`.
-          </div>
-        ) : (
-          <div className="list">
-            <div className="li head" style={{ gridTemplateColumns: '1.6fr 120px 1fr' }}>
-              <div className="c">Savepoint</div>
-              <div className="c r">Records</div>
-              <div className="c r">Created</div>
-            </div>
-            {savepoints.map((sp) => (
-              <div className="li" key={sp.savepoint_id} style={{ gridTemplateColumns: '1.6fr 120px 1fr', cursor: 'default' }}>
-                <span className="mono nw" style={{ color: 'var(--tx)' }}>
-                  {sp.savepoint_id}
-                </span>
-                <span className="c r mono">{pfmtN(sp.records_at_savepoint)}</span>
-                <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
-                  {pUp(sp.created_at)} ago
-                </span>
-              </div>
-            ))}
           </div>
         )}
       </div>
@@ -409,7 +383,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
   const filtered =
     tab === 'all' ? jobs : tab === 'running' ? jobs.filter((j) => j.status === 'RUNNING') : jobs.filter((j) => j.status !== 'RUNNING')
 
-  const grid = '1.6fr 110px 90px 110px 90px'
+  const grid = '1.6fr 110px 110px 90px'
 
   return (
     <div className="wrap fade">
@@ -417,7 +391,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
           <div>
             <h1 className="ph-t">Processing</h1>
-            <div className="ph-s">Stream processing · pipeline DAG · checkpoints &amp; savepoints</div>
+            <div className="ph-s">Stream processing · pipeline DAG</div>
           </div>
           <Button variant="accent" style={{ flex: 'none' }} onClick={() => setSubmit(true)}>
             Submit pipeline
@@ -460,7 +434,6 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
             <div className="li head" style={{ gridTemplateColumns: grid }}>
               <div className="c">Job</div>
               <div className="c">Status</div>
-              <div className="c r">Parallelism</div>
               <div className="c r">Records</div>
               <div className="c r">Uptime</div>
             </div>
@@ -477,7 +450,6 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
                   <span>
                     <StatusPill color={c} label={l} />
                   </span>
-                  <span className="c r mono">×{j.parallelism}</span>
                   <span className="c r mono">{pfmtN(j.records_processed)}</span>
                   <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
                     {pUp(j.created_at)}

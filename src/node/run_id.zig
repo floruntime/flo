@@ -41,14 +41,12 @@ pub const Prefix = enum {
     workflow,
     action,
     job,
-    savepoint,
 
     pub fn string(self: Prefix) []const u8 {
         return switch (self) {
             .workflow => "wfr-",
             .action => "act-",
             .job => "job-",
-            .savepoint => "sp-",
         };
     }
 };
@@ -264,9 +262,6 @@ test "prefix strings" {
 
     const job = gen.next(.job, 0, &buf);
     try std.testing.expect(std.mem.startsWith(u8, job, "job-"));
-
-    const sp = gen.next(.savepoint, 0, &buf);
-    try std.testing.expect(std.mem.startsWith(u8, sp, "sp-"));
 }
 
 test "extractPartition returns null for invalid IDs" {

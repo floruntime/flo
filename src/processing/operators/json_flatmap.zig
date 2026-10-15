@@ -34,12 +34,9 @@ const std = @import("std");
 const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 const log = @import("stdx").log;
 
 pub const JsonFlatMapOperator = struct {
@@ -107,11 +104,8 @@ pub const JsonFlatMapOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = closeFn,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
@@ -156,8 +150,6 @@ pub const JsonFlatMapOperator = struct {
             });
         }
     }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
 
     fn getName(ptr: *anyopaque) []const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -259,7 +251,6 @@ test "JsonFlatMapOperator — explode simple array" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -291,7 +282,6 @@ test "JsonFlatMapOperator — explode object array" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -326,7 +316,6 @@ test "JsonFlatMapOperator — with element_key extraction" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -356,7 +345,6 @@ test "JsonFlatMapOperator — nested array field" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -384,7 +372,6 @@ test "JsonFlatMapOperator — missing array field produces zero records" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -409,7 +396,6 @@ test "JsonFlatMapOperator — non-array field produces zero records" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -434,7 +420,6 @@ test "JsonFlatMapOperator — invalid JSON skipped" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -459,7 +444,6 @@ test "JsonFlatMapOperator — empty array produces zero records" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -484,7 +468,6 @@ test "JsonFlatMapOperator — string array elements" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
 
@@ -511,7 +494,6 @@ test "JsonFlatMapOperator — each element is written as JSON" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-flatmap",
     };
     const op = fm.operator();

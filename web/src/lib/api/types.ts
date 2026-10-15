@@ -316,20 +316,13 @@ export interface ProcessingJobInfo {
   name: string
   namespace: string
   status: JobStatus
-  parallelism: number
   batch_size: number
   created_at: number
   records_processed: number
 }
-export interface ProcessingSavepoint {
-  savepoint_id: string
-  created_at: number
-  records_at_savepoint: number
-}
 export interface ProcessingJobDetail extends ProcessingJobInfo {
   /** Full submitted pipeline definition (parsed client-side into the DAG). */
   yaml: string
-  savepoints: ProcessingSavepoint[]
 }
 export interface ProcessingMutationResult {
   ok: boolean

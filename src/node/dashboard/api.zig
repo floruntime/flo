@@ -568,10 +568,9 @@ test "route: every change refuses GET, and every read refuses a change" {
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
     const changes = [_][]const u8{
-        "queues/q/purge",                 "queues/q/dlq/1/requeue",    "queues/q/dlq/1",
-        "actions/a/invoke",               "streams/s/trim",            "workflow/definitions/w/enable",
-        "workflow/definitions/w/disable", "workflow/runs/r/signal",    "processing/jobs/j/stop",
-        "processing/jobs/j/savepoint",    "processing/jobs/j/restore", "processing/jobs/j/rescale",
+        "queues/q/purge",                 "queues/q/dlq/1/requeue", "queues/q/dlq/1",
+        "actions/a/invoke",               "streams/s/trim",         "workflow/definitions/w/enable",
+        "workflow/definitions/w/disable", "workflow/runs/r/signal", "processing/jobs/j/stop",
     };
     for (changes) |path| {
         if (handleRequest(allocator, .GET, path, null, "", &ctx)) |r| {

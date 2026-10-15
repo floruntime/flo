@@ -352,7 +352,7 @@ pub fn cleanupTempFile(allocator: Allocator, path: []const u8) void {
 ///   name: e2e-passthrough
 ///   source.stream: pipe-input
 ///   sink.stream: pipe-output
-///   parallelism: 1
+///   batch_size: 50
 ///
 /// Become:
 ///   name: e2e-passthrough
@@ -360,7 +360,7 @@ pub fn cleanupTempFile(allocator: Allocator, path: []const u8) void {
 ///     stream: pipe-input
 ///   sink:
 ///     stream: pipe-output
-///   parallelism: 1
+///   batch_size: 50
 ///
 /// Caller owns the returned slice.
 pub fn dottedToYaml(allocator: Allocator, flat: []const u8) ![]const u8 {
@@ -559,12 +559,12 @@ pub fn writeDottedToTempYaml(allocator: Allocator, flat_def: []const u8, filenam
 // =============================================================================
 
 test "dottedToYaml: flat keys stay flat" {
-    const input = "name: my-job\nparallelism: 4\nbatch_size: 100\n";
+    const input = "name: my-job\nkind: Processing\nbatch_size: 100\n";
     const result = try dottedToYaml(std.testing.allocator, input);
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "name: my-job") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "parallelism: 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "kind: Processing") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "batch_size: 100") != null);
 }
 

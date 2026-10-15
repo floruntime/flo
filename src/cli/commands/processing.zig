@@ -6,9 +6,6 @@
 //!   flo processing cancel <job_id> [--namespace <ns>]
 //!   flo processing status <job_id> [--namespace <ns>]
 //!   flo processing list [--limit <n>] [--namespace <ns>]
-//!   flo processing savepoint <job_id> [--namespace <ns>]
-//!   flo processing restore <job_id> <savepoint_id> [--namespace <ns>]
-//!   flo processing rescale <job_id> <parallelism> [--namespace <ns>]
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,10 +34,10 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
         .about("Stream processing operations")
         .group("Data Commands")
         .longAbout(
-            \\Manage stream processing jobs (Flink-inspired).
+            \\Manage stream processing jobs.
             \\
-            \\Submit YAML job definitions, monitor status, collect metrics,
-            \\create savepoints, and rescale running jobs.
+            \\Submit YAML job definitions, check their status, list them, and
+            \\stop or cancel them.
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -94,38 +91,6 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                 })
                 .uintFlag("limit", 'l', 100, "Maximum jobs to show")
                 .action(wrapHandler(runList)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
-                .name("savepoint")
-                .about("Trigger a savepoint")
-                .examples(&.{
-                    "flo processing savepoint job-123",
-                })
-                .arg("job_id", "Job ID to savepoint")
-                .action(wrapHandler(runSavepoint)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
-                .name("restore")
-                .about("Restore from a savepoint")
-                .examples(&.{
-                    "flo processing restore job-123 sp-456",
-                })
-                .arg("job_id", "Job ID to restore")
-                .arg("savepoint_id", "Savepoint ID to restore from")
-                .action(wrapHandler(runRestore)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
-                .name("rescale")
-                .about("Rescale job parallelism")
-                .examples(&.{
-                    "flo processing rescale job-123 4",
-                })
-                .arg("job_id", "Job ID to rescale")
-                .arg("parallelism", "New parallelism level")
-                .action(wrapHandler(runRescale)),
         )
         .build();
 }
@@ -244,7 +209,6 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
         4 => "COMPLETED",
         else => "UNKNOWN",
     };
-    const parallelism = r.readU32() orelse return outcome.malformed(ctx, what);
     const batch_size = r.readU32() orelse return outcome.malformed(ctx, what);
     const records = r.readU64() orelse return outcome.malformed(ctx, what);
     const created_at = r.readI64() orelse return outcome.malformed(ctx, what);
@@ -252,7 +216,6 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     ctx.print("Job:        {s}\n", .{job_id});
     ctx.print("Name:       {s}\n", .{name});
     ctx.print("Status:     {s}\n", .{status_str});
-    ctx.print("Parallelism:{d}\n", .{parallelism});
     ctx.print("Batch size: {d}\n", .{batch_size});
     ctx.print("Processed:  {d} records\n", .{records});
     ctx.print("Created:    {d}ms\n", .{created_at});
@@ -282,87 +245,6 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
         .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16, .alignment = .left },
         .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
-        .{ .field = "parallelism", .header = "", .field_type = .uint_u32 },
         .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
     }) catch return outcome.malformed(ctx, "list");
-}
-
-fn runSavepoint(ctx: *commander.Context) commander.Error!void {
-    const job_id = ctx.getPositional("job_id").?;
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.processing.savepoint(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
-    }
-
-    try outcome.check(ctx, result);
-
-    if (result.asRawData()) |sp_id| {
-        ctx.print("Savepoint created: {s}\n", .{sp_id});
-    } else {
-        ctx.print("Savepoint created\n", .{});
-    }
-}
-
-fn runRestore(ctx: *commander.Context) commander.Error!void {
-    const job_id = ctx.getPositional("job_id").?;
-    const savepoint_id = ctx.getPositional("savepoint_id").?;
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.processing.restore(&client, namespace, job_id, savepoint_id) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "job {s} or savepoint {s} not found", .{ job_id, savepoint_id });
-    }
-
-    try outcome.check(ctx, result);
-
-    ctx.print("Job {s} restored from savepoint {s}\n", .{ job_id, savepoint_id });
-}
-
-fn runRescale(ctx: *commander.Context) commander.Error!void {
-    const job_id = ctx.getPositional("job_id").?;
-    const parallelism_str = ctx.getPositional("parallelism").?;
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    const parallelism = std.fmt.parseInt(u32, parallelism_str, 10) catch {
-        return outcome.usage(ctx, "invalid parallelism: {s} (must be a positive integer)", .{parallelism_str});
-    };
-
-    if (parallelism == 0) {
-        return outcome.usage(ctx, "parallelism must be at least 1", .{});
-    }
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.processing.rescale(&client, namespace, job_id, parallelism) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    if (result.isNotFound()) {
-        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
-    }
-
-    try outcome.check(ctx, result);
-
-    ctx.print("Job {s} rescaled to parallelism {d}\n", .{ job_id, parallelism });
 }

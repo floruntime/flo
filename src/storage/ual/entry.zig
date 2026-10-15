@@ -113,12 +113,7 @@ pub const EntryType = enum(u8) {
     processing_submit = 0x80,
     processing_stop = 0x81,
     processing_cancel = 0x82,
-    processing_savepoint = 0x83,
-    processing_rescale = 0x84,
     processing_checkpoint = 0x85,
-
-    // ── Checkpoint ──
-    checkpoint = 0xE0,
 
     /// Returns true if this type carries a key-value command payload.
     pub fn hasKeyValue(self: EntryType) bool {
@@ -131,8 +126,8 @@ pub const EntryType = enum(u8) {
             .workflow_create, .workflow_start, .workflow_complete => true,
             .namespace_create, .namespace_delete, .namespace_config => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
-            .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_rescale, .processing_checkpoint => true,
-            .raft_config, .raft_noop, .raft_snapshot, .checkpoint => false,
+            .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => true,
+            .raft_config, .raft_noop, .raft_snapshot => false,
         };
     }
 };
@@ -512,7 +507,6 @@ test "entry: EntryType hasKeyValue" {
     try std.testing.expect(EntryType.ts_write.hasKeyValue());
     try std.testing.expect(!EntryType.raft_noop.hasKeyValue());
     try std.testing.expect(!EntryType.raft_config.hasKeyValue());
-    try std.testing.expect(!EntryType.checkpoint.hasKeyValue());
 }
 
 test "entry: deserialize rejects truncated data" {

@@ -1,7 +1,6 @@
 //! Operator Context
 //!
-//! Provides operators with access to output collection, timing,
-//! keyed state, timer services, and side outputs.
+//! Provides operators with output collection, timing and metrics.
 //!
 //! The OperatorContext is created per-operator invocation and gives
 //! each operator a consistent interface to the processing runtime.
@@ -11,8 +10,6 @@ const Allocator = std.mem.Allocator;
 const OutputCollector = @import("collector.zig").OutputCollector;
 const record_mod = @import("record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const KeyedStateAccess = @import("state.zig").KeyedStateAccess;
-const TimerService = @import("time/timer.zig").TimerService;
 
 // =============================================================================
 // OperatorMetrics - Per-operator counters
@@ -58,15 +55,8 @@ pub const OperatorContext = struct {
     allocator: Allocator,
     /// Current processing time (wall clock, milliseconds)
     current_processing_time_ms: i64,
-    /// Current watermark (event time progress)
-    current_watermark_ms: i64,
     /// Operator name (for logging/debugging)
     operator_name: []const u8,
-
-    /// Keyed state access (for stateful operators, null if stateless)
-    keyed_state: ?*KeyedStateAccess = null,
-    /// Timer service (for event-time / processing-time timers)
-    timer_service: ?*TimerService = null,
 
     /// Convenience: emit a record downstream
     pub fn emit(self: *OperatorContext, rec: ProcessingRecord) !void {
@@ -81,21 +71,6 @@ pub const OperatorContext = struct {
     /// Get current processing time (wall clock)
     pub fn processingTime(self: *const OperatorContext) i64 {
         return self.current_processing_time_ms;
-    }
-
-    /// Get current watermark
-    pub fn watermark(self: *const OperatorContext) i64 {
-        return self.current_watermark_ms;
-    }
-
-    /// Get keyed state access (returns null if operator is stateless)
-    pub fn getKeyedState(self: *OperatorContext) ?*KeyedStateAccess {
-        return self.keyed_state;
-    }
-
-    /// Get timer service (returns null if timers not configured)
-    pub fn getTimerService(self: *OperatorContext) ?*TimerService {
-        return self.timer_service;
     }
 };
 
@@ -114,14 +89,12 @@ test "OperatorContext emit through collector" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 1000,
-        .current_watermark_ms = 500,
         .operator_name = "test-op",
     };
 
     try ctx.emit(ProcessingRecord.init("k", "v", 100));
     try std.testing.expectEqual(@as(usize, 1), collector.count());
     try std.testing.expectEqual(@as(i64, 1000), ctx.processingTime());
-    try std.testing.expectEqual(@as(i64, 500), ctx.watermark());
 }
 
 test "OperatorMetrics counting" {

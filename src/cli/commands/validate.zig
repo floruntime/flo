@@ -164,12 +164,6 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
         errors += 1;
     }
 
-    // Check parallelism
-    if (def.parallelism == 0) {
-        ctx.printErr("ERR   Parallelism must be >= 1\n", .{});
-        errors += 1;
-    }
-
     // Check source names are unique
     {
         var seen = std.StringHashMap(void).init(ctx.allocator);
@@ -260,11 +254,10 @@ fn runValidateProcessing(ctx: *commander.Context) commander.Error!void {
     }
 
     // Print summary info
-    ctx.print("      Sources: {d}, Sinks: {d}, Operators: {d}, Parallelism: {d}\n", .{
+    ctx.print("      Sources: {d}, Sinks: {d}, Operators: {d}\n", .{
         def.sources.items.len,
         def.sinks.items.len,
         def.operators.items.len,
-        def.parallelism,
     });
 
     // Summary

@@ -97,7 +97,7 @@ pub fn opWrites(op: proto.OpCode) bool {
         .action_await => true,
         .worker_register, .worker_heartbeat, .worker_deregister, .worker_drain => true,
         .workflow_create, .workflow_start, .workflow_signal, .workflow_cancel, .workflow_disable, .workflow_enable => true,
-        .processing_submit, .processing_stop, .processing_cancel, .processing_savepoint, .processing_restore, .processing_rescale => true,
+        .processing_submit, .processing_stop, .processing_cancel => true,
         else => false,
     };
 }

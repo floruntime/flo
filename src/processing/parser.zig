@@ -68,7 +68,6 @@ pub const ParseError = error{
     MissingSink,
     MissingSourceStream,
     MissingSinkTarget,
-    InvalidParallelism,
     InvalidPartitions,
     InvalidFormat,
     OutOfMemory,
@@ -181,8 +180,8 @@ pub fn parseJobDefinitionWithNamespace(allocator: Allocator, content: []const u8
 fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_namespace: ?[]const u8, d: D) ParseError!JobDefinition {
     if (root != .object) return d.fail(ParseError.InvalidFormat, "a job definition must be a map, not {s}", .{kindName(root)});
     try checkKeys(d, root, &.{
-        "kind",    "name",  "description", "namespace",     "parallelism", "batch_size",
-        "sources", "sinks", "operators",   "checkpointing",
+        "kind",    "name",  "description", "namespace", "batch_size",
+        "sources", "sinks", "operators",
     });
 
     const kind = try reqString(d, root, "kind", ParseError.MissingRequiredField);
@@ -191,28 +190,17 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
     const name = try optString(d, root, "name") orelse "unnamed-job";
     const description = try optString(d, root, "description") orelse "";
     const effective_namespace: []const u8 = try optString(d, root, "namespace") orelse (fallback_namespace orelse "default");
-    const parallelism = try optPositive(u32, d, root, "parallelism", ParseError.InvalidParallelism) orelse 1;
     const batch_size = try optPositive(u32, d, root, "batch_size", ParseError.InvalidFormat) orelse 100;
-
-    var checkpoint_interval_ms: ?u64 = null;
-    if (try optObject(d, root, "checkpointing")) |cp_obj| {
-        const mark = d.push("checkpointing");
-        defer d.pop(mark);
-        try checkKeys(d, cp_obj, &.{"interval_ms"});
-        checkpoint_interval_ms = try optPositive(u64, d, cp_obj, "interval_ms", ParseError.InvalidFormat);
-    }
 
     // Owns everything from here; "" frees as nothing.
     var def: JobDefinition = .{
         .name = "",
         .description = "",
         .namespace = "",
-        .parallelism = parallelism,
         .batch_size = batch_size,
         .sources = .empty,
         .sinks = .empty,
         .operators = .empty,
-        .checkpoint_interval_ms = checkpoint_interval_ms,
     };
     errdefer def.deinit(allocator);
     def.name = try dupe(allocator, name);
@@ -429,7 +417,11 @@ fn checkOperatorSettings(d: D, item: JsonValue, op_type: []const u8) ParseError!
         const function = (try optString(d, item, "function")).?;
         if (!mem.eql(u8, function, "count")) try need.key(d, item, "field");
         if (item.object.contains("window")) {
-            try need.oneOf(d, item, "window", &.{ "tumbling", "count" });
+            // A time window would need watermarks the engine doesn't have:
+            // it would never emit.
+            if (mem.eql(u8, (try optString(d, item, "window")) orelse "", "tumbling"))
+                return d.fail(ParseError.InvalidFieldType, "\"window\": tumbling isn't supported; use a running aggregate (no window) or window: count", .{});
+            try need.oneOf(d, item, "window", &.{"count"});
             if (try optPositive(u64, d, item, "window_size", ParseError.InvalidFormat) == null)
                 return d.fail(ParseError.MissingRequiredField, "missing required key \"window_size\"", .{});
         } else if (item.object.contains("window_size")) {
@@ -752,7 +744,6 @@ test "parser: nested YAML full definition" {
         \\    stream:
         \\      name: output-events
         \\      namespace: analytics
-        \\parallelism: 4
         \\batch_size: 500
     ;
 
@@ -760,7 +751,6 @@ test "parser: nested YAML full definition" {
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("my-pipeline", def.name);
-    try std.testing.expectEqual(@as(u32, 4), def.parallelism);
     try std.testing.expectEqual(@as(u32, 500), def.batch_size);
 
     try std.testing.expectEqual(@as(usize, 1), def.sources.items.len);
@@ -793,7 +783,6 @@ test "parser: nested YAML minimal with defaults" {
     defer def.deinit(allocator);
 
     try std.testing.expectEqualStrings("unnamed-job", def.name);
-    try std.testing.expectEqual(@as(u32, 1), def.parallelism);
     try std.testing.expectEqual(@as(u32, 100), def.batch_size);
 
     const src = def.primarySource().?;
@@ -1076,38 +1065,6 @@ test "parser: sink without target" {
     try std.testing.expectError(error.MissingSinkTarget, parseJobDefinition(allocator, text, null));
 }
 
-test "parser: invalid parallelism" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - stream:
-        \\      name: in
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-        \\parallelism: abc
-    ;
-    try std.testing.expectError(error.InvalidFieldType, parseJobDefinition(allocator, text, null));
-}
-
-test "parser: zero parallelism rejected" {
-    const allocator = std.testing.allocator;
-
-    const text =
-        \\kind: Processing
-        \\sources:
-        \\  - stream:
-        \\      name: in
-        \\sinks:
-        \\  - stream:
-        \\      name: out
-        \\parallelism: 0
-    ;
-    try std.testing.expectError(error.InvalidParallelism, parseJobDefinition(allocator, text, null));
-}
-
 test "parser: empty text" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.MissingRequiredField, parseJobDefinition(allocator, "", null));
@@ -1165,7 +1122,6 @@ test "parser: JSON input (native)" {
         \\  "name": "json-job",
         \\  "sources": [{ "stream": { "name": "in", "namespace": "prod" } }],
         \\  "sinks": [{ "stream": { "name": "out" } }],
-        \\  "parallelism": 2,
         \\  "operators": [
         \\    { "type": "map", "name": "xform" }
         \\  ]
@@ -1179,7 +1135,6 @@ test "parser: JSON input (native)" {
     try std.testing.expectEqualStrings("in", def.primarySource().?.stream);
     try std.testing.expectEqualStrings("prod", def.primarySource().?.namespace);
     try std.testing.expectEqualStrings("out", def.primarySink().?.target);
-    try std.testing.expectEqual(@as(u32, 2), def.parallelism);
     try std.testing.expectEqual(@as(usize, 1), def.operators.items.len);
     try std.testing.expectEqualStrings("map", def.operators.items[0].type_name);
     try std.testing.expectEqualStrings("xform", def.operators.items[0].name);
@@ -1965,7 +1920,10 @@ test "parser: an unknown key is refused by name and place" {
     try expectRefused(job("\"paralelism\": 2,", "", ""), ParseError.UnknownKey, "unknown key \"paralelism\" at the top level");
     try expectRefused(job("", ", \"batchSize\": 5", ""), ParseError.UnknownKey, "unknown key \"batchSize\" at sources[0].stream");
     try expectRefused(job("", "", ", \"matches\": \"x\""), ParseError.UnknownKey, "unknown key \"matches\" at sinks[0]");
-    try expectRefused(job("\"checkpointing\": { \"interval\": 5 },", "", ""), ParseError.UnknownKey, "unknown key \"interval\" at checkpointing");
+    // Neither did anything: one job runs on one shard, and only the source
+    // cursor is checkpointed, at its own pace.
+    try expectRefused(job("\"parallelism\": 2,", "", ""), ParseError.UnknownKey, "unknown key \"parallelism\" at the top level");
+    try expectRefused(job("\"checkpointing\": { \"interval_ms\": 5 },", "", ""), ParseError.UnknownKey, "unknown key \"checkpointing\" at the top level");
     try expectRefused(
         \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
         \\  "sinks": [ { "kv": { "write_mode": "versioned" } } ] }
@@ -1982,7 +1940,6 @@ test "parser: an unknown operator type is refused at parse" {
 test "parser: a value of the wrong kind or out of range is refused, not ignored" {
     try expectRefused(job("", ", \"batch_size\": 0", ""), ParseError.InvalidFormat, "\"batch_size\" must be at least 1, not 0 at sources[0].stream");
     try expectRefused(job("", ", \"poll_interval_ms\": \"fast\"", ""), ParseError.InvalidFieldType, "\"poll_interval_ms\" must be an integer, not a string at sources[0].stream");
-    try expectRefused(job("\"checkpointing\": { \"interval_ms\": -1 },", "", ""), ParseError.InvalidFormat, "\"interval_ms\" must be at least 1, not -1 at checkpointing");
     try expectRefused(job("\"operators\": [ \"filter\" ],", "", ""), ParseError.InvalidFieldType, "an operator must be a map, not a string at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"map\", \"out\": { \"nested\": 1 } } ],", "", ""), ParseError.InvalidFieldType, "\"out\" must be a string, number or boolean, not a map at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"classify\", \"rules\": [ { \"condition\": \"key_not_empty\" } ] } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"tag\" at operators[0].rules[0]");
@@ -2025,7 +1982,8 @@ test "parser: an operator missing what it needs, or with an unknown mode, is ref
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"condition\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"median\", \"field\": \"$.a\" } ],", "", ""), ParseError.InvalidFieldType, "\"function\" must be one of sum|count|avg|min|max, not \"median\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"sum\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"field\" at operators[0]");
-    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of tumbling|count, not \"sliding\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of count, not \"sliding\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"tumbling\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\": tumbling isn't supported; use a running aggregate (no window) or window: count at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_size\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_size\" must be at least 1, not 0 at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"kv_lookup\", \"lookup_key\": \"k\", \"mode\": \"join\" } ],", "", ""), ParseError.InvalidFieldType, "\"mode\" must be one of filter|enrich, not \"join\" at operators[0]");
 }

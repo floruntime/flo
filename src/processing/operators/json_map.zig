@@ -38,12 +38,9 @@ const std = @import("std");
 const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
 const Operator = @import("../operator.zig").Operator;
-const noOpSnapshot = @import("../operator.zig").noOpSnapshot;
-const noOpRestore = @import("../operator.zig").noOpRestore;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
 const ProcessingRecord = record_mod.ProcessingRecord;
-const Watermark = record_mod.Watermark;
 const log = @import("stdx").log;
 
 pub const JsonMapOperator = struct {
@@ -147,11 +144,8 @@ pub const JsonMapOperator = struct {
 
     const vtable = Operator.VTable{
         .processElement = processElement,
-        .processWatermark = processWatermark,
         .getName = getName,
         .close = closeFn,
-        .snapshotState = noOpSnapshot,
-        .restoreState = noOpRestore,
     };
 
     fn processElement(ptr: *anyopaque, rec: ProcessingRecord, ctx: *OperatorContext) !void {
@@ -202,8 +196,6 @@ pub const JsonMapOperator = struct {
             .owns_memory = true,
         });
     }
-
-    fn processWatermark(_: *anyopaque, _: Watermark, _: *OperatorContext) !void {}
 
     fn getName(ptr: *anyopaque) []const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
@@ -285,7 +277,6 @@ test "JsonMapOperator — extract single field" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -319,7 +310,6 @@ test "JsonMapOperator — multiple fields with rename" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -359,7 +349,6 @@ test "JsonMapOperator — constant values" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -395,7 +384,6 @@ test "JsonMapOperator — nested field extraction" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -431,7 +419,6 @@ test "JsonMapOperator — missing field becomes null" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -466,7 +453,6 @@ test "JsonMapOperator — invalid JSON input skipped" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -495,7 +481,6 @@ test "JsonMapOperator — preserves nested objects/arrays" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -533,7 +518,6 @@ test "JsonMapOperator — no mappings passes through" {
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
 
@@ -564,7 +548,6 @@ test "JsonMapOperator — output is JSON for any value, field name and constant"
         .metrics = &metrics,
         .allocator = allocator,
         .current_processing_time_ms = 0,
-        .current_watermark_ms = 0,
         .operator_name = "test-map",
     };
     const op = mapper.operator();
