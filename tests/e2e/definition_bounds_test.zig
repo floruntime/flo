@@ -37,8 +37,9 @@ fn createRaw(ctx: *stdx.testing.TestContext, name: []const u8, json: []const u8)
     const proto = @import("src").protocol.proto;
     const header = proto.RequestHeader.init(.workflow_create, 7);
     const req: proto.Request = .{ .header = header, .namespace = "default", .key = name, .value = json, .options = "" };
-    var buf: [1024]u8 = undefined;
-    const bytes = try req.serialize(&buf);
+    const buf = try testing.allocator.alloc(u8, json.len + 1024);
+    defer testing.allocator.free(buf);
+    const bytes = try req.serialize(buf);
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
     if (std.c.write(fd, bytes.ptr, bytes.len) != @as(isize, @intCast(bytes.len))) return error.ShortWrite;
@@ -104,6 +105,34 @@ test "e2e/definitions: a wait whose timeout is past the clock parks the run, and
     try alive(ctx);
 }
 
+test "e2e/definitions: a stream source's partitions other than all are refused at submit" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_][]const u8{
+        \\kind: Processing
+        \\name: ranged
+        \\sources.[0].stream.name: in
+        \\sources.[0].stream.partitions: "0-4294967295"
+        \\sinks.[0].stream.name: out
+        ,
+        \\kind: Processing
+        \\name: listed
+        \\sources.[0].stream.name: in
+        \\sources.[0].stream.partitions: "0,3"
+        \\sinks.[0].stream.name: out
+    }) |def| {
+        var r = try submit(ctx, &.{ "processing", "submit" }, def, "parts.yaml");
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
+        try testing.expect(r.contains("\"partitions\" must be all"));
+        try alive(ctx);
+    }
+    var listed = try ctx.cli.run(&.{ "processing", "list" });
+    defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
+    try testing.expect(!listed.contains("ranged") and !listed.contains("listed"));
+}
+
 test "e2e/definitions: a pipeline whose window or partition doesn't fit is refused at submit" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -131,4 +160,39 @@ test "e2e/definitions: a pipeline whose window or partition doesn't fit is refus
     var listed = try ctx.cli.run(&.{ "processing", "list" });
     defer listed.deinit();
     try testing.expect(!listed.contains("bad-window") and !listed.contains("bad-partition"));
+}
+
+/// A definition `levels` flow sequences deep under `key`.
+fn deepYaml(head: []const u8, key: []const u8, levels: usize) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, head);
+    try text.appendSlice(testing.allocator, key);
+    try text.appendSlice(testing.allocator, ": ");
+    try text.appendNTimes(testing.allocator, '[', levels);
+    try text.appendNTimes(testing.allocator, ']', levels);
+    try text.append(testing.allocator, '\n');
+    return text.toOwnedSlice(testing.allocator);
+}
+
+test "e2e/definitions: YAML nested too deep is refused, and the node keeps serving" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const proto = @import("src").protocol.proto;
+
+    const pipeline = try deepYaml("kind: Processing\nname: deep\n", "description", 60_000);
+    defer testing.allocator.free(pipeline);
+    const path = try stdx.testing.writeTempYaml(testing.allocator, pipeline, "deep.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    var r = try ctx.cli.run(&.{ "processing", "submit", path });
+    defer r.deinit();
+    try testing.expectEqual(@as(u8, 3), r.exit_code);
+    try testing.expect(r.contains("YAML nesting is limited to 64 levels"));
+    try alive(ctx);
+
+    // The CLI parses a workflow before sending it, so this one goes raw.
+    const workflow = try deepYaml("kind: Workflow\nname: deep\nversion: \"1\"\n", "description", 60_000);
+    defer testing.allocator.free(workflow);
+    try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), try createRaw(ctx, "deep", workflow));
+    try alive(ctx);
 }

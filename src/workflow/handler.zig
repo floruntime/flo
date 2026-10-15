@@ -33,6 +33,7 @@ const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const parser = @import("parser.zig");
+
 const definition = @import("definition.zig");
 const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
@@ -258,6 +259,15 @@ pub const WorkflowHandler = struct {
 
         /// Retry counter for the current plan executor (reset on executor advance).
         plan_executor_retry_count: u32 = 0,
+
+        /// The order this pass through the plan tries its executors in,
+        /// fixed when the pass starts (0 = not started). Health-weighted
+        /// order is a sort by health, and a failure changes health: sorting
+        /// again mid-pass would put a different executor under
+        /// `plan_executor_idx`, so a retry or the next attempt could start
+        /// one that already ran out while another is never tried.
+        plan_order: [plan_types.MAX_PLAN_EXECUTORS]u8 = undefined,
+        plan_order_len: u8 = 0,
 
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
         wait_timeout_at_ms: i64 = 0,
@@ -1675,9 +1685,11 @@ pub const WorkflowHandler = struct {
                         .proceed => |o| o,
                     };
 
-                    // Check retry on failure
-                    if (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
-                        std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure))
+                    // Check retry on failure. A plan's executors retry by
+                    // their own policies (the parser refuses a plan step's).
+                    if (!run_step.isPlan() and
+                        (std.mem.eql(u8, outcome, definition.StepOutcome.failure) or
+                            std.mem.eql(u8, outcome, definition.StepOutcome.execution_failure)))
                     {
                         if (run_step.retry) |retry| {
                             if (run.retry_count < retry.max_attempts) {
@@ -1928,16 +1940,19 @@ pub const WorkflowHandler = struct {
             return definition.StepOutcome.execution_failure;
         };
 
-        // Build executor iteration order — health-weighted sorts by score,
-        // all other strategies use definition order.
-        var order_buf: [32]u8 = undefined;
-        const exec_count: u8 = @intCast(@min(plan.executors.len, 32));
-        const exec_order = order_buf[0..exec_count];
-        for (exec_order, 0..) |*slot, i| slot.* = @intCast(i);
-
-        if (plan.selection == .health_weighted) {
-            self.sortExecutorsByHealth(exec_order, plan, namespace, run.workflow_name_owned);
+        // The pass's executor order: health-weighted sorts by score, all
+        // other strategies use definition order.
+        // The parser refuses a longer list.
+        std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
+        const exec_count: u8 = @intCast(plan.executors.len);
+        if (run.plan_order_len != exec_count) {
+            for (run.plan_order[0..exec_count], 0..) |*slot, i| slot.* = @intCast(i);
+            if (plan.selection == .health_weighted) {
+                self.sortExecutorsByHealth(run.plan_order[0..exec_count], plan, namespace, run.workflow_name_owned);
+            }
+            run.plan_order_len = exec_count;
         }
+        const exec_order = run.plan_order[0..exec_count];
 
         while (run.plan_executor_idx < exec_count) {
             const natural_idx = exec_order[run.plan_executor_idx];
@@ -1985,9 +2000,7 @@ pub const WorkflowHandler = struct {
             // Success — reset plan state and return
             if (success) {
                 self.addHistoryEvent(run, "plan_executor_success", executor.name, now_ms);
-                run.plan_executor_idx = 0;
-                run.plan_executor_natural_idx = 0;
-                run.plan_executor_retry_count = 0;
+                resetPlanPass(run);
                 return outcome;
             }
 
@@ -2007,9 +2020,7 @@ pub const WorkflowHandler = struct {
         }
 
         // All executors exhausted
-        run.plan_executor_idx = 0;
-        run.plan_executor_natural_idx = 0;
-        run.plan_executor_retry_count = 0;
+        resetPlanPass(run);
         return definition.StepOutcome.failure;
     }
 
@@ -2564,7 +2575,8 @@ pub const WorkflowHandler = struct {
                     if (def.getPlan(run_step.targetName())) |plan| {
                         // Use natural index — in health-weighted mode plan_executor_idx
                         // is the position in sorted order, not the index into plan.executors[].
-                        const exec_count: u8 = @intCast(@min(plan.executors.len, 32));
+                        std.debug.assert(plan.executors.len <= plan_types.MAX_PLAN_EXECUTORS);
+                        const exec_count: u8 = @intCast(plan.executors.len);
 
                         // Check per-executor retry first
                         if (run.plan_executor_idx < exec_count and
@@ -2596,9 +2608,7 @@ pub const WorkflowHandler = struct {
                             }
                         }
                         // All executors exhausted — reset and fall through to failure transition
-                        run.plan_executor_idx = 0;
-                        run.plan_executor_natural_idx = 0;
-                        run.plan_executor_retry_count = 0;
+                        resetPlanPass(run);
                     }
                 }
 
@@ -2937,14 +2947,20 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    /// Start the next pass through a plan from its first executor.
+    fn resetPlanPass(run: *RunRecord) void {
+        run.plan_executor_idx = 0;
+        run.plan_executor_natural_idx = 0;
+        run.plan_executor_retry_count = 0;
+        run.plan_order_len = 0;
+    }
+
     /// Update the run's current step pointer.
     fn setCurrentStep(self: *WorkflowHandler, run: *RunRecord, step_name: []const u8) void {
         if (run.current_step_name_owned) |old| self.allocator.free(old);
         run.current_step_name_owned = self.allocator.dupe(u8, step_name) catch null;
         // Reset plan state on step transition
-        run.plan_executor_idx = 0;
-        run.plan_executor_natural_idx = 0;
-        run.plan_executor_retry_count = 0;
+        resetPlanPass(run);
         // Reset poll state — a new step starts its own poll budget
         run.poll_attempt = 0;
         run.poll_next_at_ms = 0;
@@ -4815,6 +4831,59 @@ test "step executor: retry on failure" {
         }
     }
     try testing.expect(retry_count >= 2); // at least 2 retries before final failure
+}
+
+// Two executors that always fail, each with one retry, under
+// health-weighted selection: a failure lowers the failing executor's health,
+// which used to sort it under the pass's next position, so one executor ran
+// past its retries and the other was never tried.
+const test_plan_exhaust_workflow_json =
+    \\{"kind":"Workflow","name":"plan-wf","version":"1.0.0",
+    \\"plans":{"charge":{"selection":"health-weighted","executors":[
+    \\{"name":"stripe","run":"@actions/stripe","retry":{"max_attempts":1},"breaker":{"failure_threshold":50}},
+    \\{"name":"paypal","run":"@actions/paypal","retry":{"max_attempts":1},"breaker":{"failure_threshold":50}}]}},
+    \\"start":{"run":"@plan/charge","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+;
+
+test "step executor: a plan whose executors all fail fails the step after one pass" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    registerFailingAction(&actions, "stripe");
+    registerFailingAction(&actions, "paypal");
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:plan-wf", "plan-wf", test_plan_exhaust_workflow_json);
+    createTestRun(&handler, "default:run-plan", "run-plan", "plan-wf");
+
+    handler.advanceWorkflow(&shard, "default:run-plan", "default");
+    _ = shard.applyCommitted();
+
+    // Each executor runs once and retries once: four tasks in all.
+    var tasks: u32 = 0;
+    while (tasks < 40) : (tasks += 1) {
+        const run_ptr = handler.runs.getPtr("default:run-plan").?;
+        if (run_ptr.status.isTerminal()) break;
+        const rid = run_ptr.pending_action_run_id_owned orelse break;
+        completeTestActionWith(&actions, rid, "failure");
+        handler.checkPendingActions(&shard);
+        _ = shard.applyCommitted();
+    }
+
+    const run = handler.runs.get("default:run-plan").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
+    try testing.expectEqual(@as(u32, 4), tasks);
+    var exhausted: [2]u32 = .{ 0, 0 };
+    for (run.history.items) |evt| {
+        if (!std.mem.eql(u8, evt.event_type_owned, "plan_executor_exhausted")) continue;
+        const i: usize = if (std.mem.eql(u8, evt.detail_owned, "stripe")) 0 else 1;
+        exhausted[i] += 1;
+    }
+    try testing.expectEqual([2]u32{ 1, 1 }, exhausted);
 }
 
 // An action that returns the `pending` business outcome on a `poll:` step must

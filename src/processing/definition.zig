@@ -16,27 +16,8 @@
 //!     stream:
 //!       name: input-events
 //!       namespace: production
-//!       partitions: 0              # single partition (integer)
+//!       partitions: all            # every partition: the only value, and the default
 //!       batch_size: 500            # per-source override
-//!     # omitting `partitions:` defaults to all partitions
-//!
-//!   # Partition range — expands into one SourceSpec per partition
-//!   - name: all-partitions
-//!     stream:
-//!       name: click-events
-//!       partitions: "0-63"         # range: creates 64 internal sources
-//!
-//!   # Partition list — comma-separated
-//!   - name: selected
-//!     stream:
-//!       name: impressions
-//!       partitions: "0,3,7"        # explicit list
-//!
-//!   # All partitions — resolved at runtime from stream metadata
-//!   - name: full-stream
-//!     stream:
-//!       name: transactions
-//!       partitions: "all"          # sentinel, handler resolves partition count
 //!
 //! sinks:
 //!   - name: output
@@ -182,16 +163,15 @@ pub const SourceKind = enum(u8) {
 // SourceSpec — one logical source (Flo-Stream or Flo-TS)
 // =============================================================================
 
-/// Sentinel value for `partition` indicating "all partitions".
-/// The handler resolves the actual partition count from stream metadata at runtime.
-pub const PARTITION_ALL: u32 = std.math.maxInt(u32);
+/// Most sources, sinks and operators one job may declare. Every source runs
+/// its own pipeline, holding every operator and sink.
+pub const MAX_SOURCES: usize = 64;
+pub const MAX_SINKS: usize = 64;
+pub const MAX_OPERATORS: usize = 256;
 
 /// Specification for a source endpoint in the processing topology.
 ///
-/// For **stream** sources the parser expands `partitions: "0-63"` or
-/// `partitions: "0,3,7"` into multiple SourceSpec entries (one per
-/// partition). The `partitions: "all"` form sets `partition = PARTITION_ALL`
-/// for runtime resolution.
+/// A **stream** source reads every partition of its stream.
 ///
 /// For **ts** sources the spec identifies a measurement + optional tags and
 /// field to read. The handler periodically polls `ts_read` to feed the
@@ -206,10 +186,6 @@ pub const SourceSpec = struct {
     stream: []const u8,
     /// Namespace (default: "default")
     namespace: []const u8,
-    /// Partition to read from (stream sources only, default: 0).
-    /// Set to `PARTITION_ALL` when `partitions: "all"` is specified;
-    /// the handler resolves the actual count from stream metadata.
-    partition: u32,
     /// Batch size for this source (default: inherited from top-level batch_size)
     batch_size: u32,
 
@@ -434,6 +410,16 @@ pub const JobDefinition = struct {
         return null;
     }
 
+    /// Why this job cannot run on a server of `shard_count` shards, or null.
+    /// A `kv_lookup` reads only the KV of the shard the job runs on.
+    pub fn shardRefusal(self: *const JobDefinition, shard_count: u16) ?[]const u8 {
+        if (shard_count <= 1) return null;
+        for (self.operators.items) |op| {
+            if (std.mem.eql(u8, op.type_name, "kv_lookup")) return "kv_lookup needs a one-shard server (--shards 1) until lookups can read other shards";
+        }
+        return null;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *JobDefinition, allocator: Allocator) void {
         allocator.free(self.name);
@@ -550,4 +536,21 @@ test "TagRegistry: capacity limit" {
     }
     // 33rd tag should fail
     try std.testing.expect(reg.getOrCreate("overflow") == null);
+}
+
+test "JobDefinition: kv_lookup is refused on a server of more than one shard" {
+    const parser = @import("parser.zig");
+    const allocator = std.testing.allocator;
+    var with = try parser.parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"out"}}],
+        \\ "operators":[{"type":"kv_lookup","name":"l","lookup_key":"k"}]}
+    , null);
+    defer with.deinit(allocator);
+    var without = try parser.parseJobDefinition(allocator,
+        \\{"kind":"Processing","sources":[{"stream":{"name":"in"}}],"sinks":[{"stream":{"name":"out"}}]}
+    , null);
+    defer without.deinit(allocator);
+    try std.testing.expect(with.shardRefusal(1) == null);
+    try std.testing.expect(std.mem.indexOf(u8, with.shardRefusal(2).?, "--shards 1") != null);
+    try std.testing.expect(without.shardRefusal(2) == null);
 }
