@@ -52,13 +52,6 @@ const ns_keys = @import("../namespace/handler.zig");
 const CommandResult = result_mod.CommandResult;
 const ActionRunStatus = CommandResult.ActionRunStatus;
 
-/// A run nothing moves on from.
-fn finished(status: ActionRunStatus) bool {
-    return switch (status) {
-        .completed, .failed, .cancelled, .timed_out => true,
-        .pending, .running => false,
-    };
-}
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -927,18 +920,31 @@ pub const ActionsHandler = struct {
 
     // ── Action Task Command Handlers ───────────────────────────────────
 
-    /// A report the run already shows (a resend) is answered ok. A report
-    /// for a finished run, or for an attempt another worker is now running,
-    /// is stale and refused, so a late fail can't put a finished or
-    /// re-dispatched run back to pending. A pending run takes reports:
-    /// claims are off the log, so a run claimed before a leader change is
-    /// pending here. `replayUpdateRun` separately leaves a finished run
-    /// alone on every replica.
+    /// A run nothing moves on from.
+    fn finished(status: ActionRunStatus) bool {
+        return switch (status) {
+            .completed, .failed, .cancelled, .timed_out => true,
+            .pending, .running => false,
+        };
+    }
+
+    /// A report the run already shows (a resend) is answered ok; "shows"
+    /// is the status alone, so of two different reports the first applied
+    /// stands. A report for a finished run, or from anyone but the worker
+    /// holding a running run, is stale and refused, so a late fail can't
+    /// put a finished or re-dispatched run back to pending. A pending run
+    /// takes reports: claims are off the log, so a run claimed before a
+    /// leader change is pending here. `replayUpdateRun` separately leaves a
+    /// finished run alone on every replica.
+    ///
+    /// Not caught until reports carry the attempt they answer: a late
+    /// report from the same worker after it claimed the run again, and two
+    /// reports in flight at once (both pass here; the second fail applies).
     fn staleReport(run: *const RunRecord, worker_id: []const u8, reported: ActionRunStatus) ?TaskOutcome {
         switch (run.status) {
             .running => {
-                const current = run.worker_id_owned orelse return null;
-                if (worker_id.len == 0 or std.mem.eql(u8, current, worker_id)) return null;
+                const holder = run.worker_id_owned orelse return null;
+                if (std.mem.eql(u8, holder, worker_id)) return null;
                 return .{ .refused = .{ .status = .conflict, .message = "stale report: another worker is running this run now" } };
             },
             .pending => return if (reported == .pending) .repeat else null,
