@@ -292,7 +292,10 @@ fn resolveJsonValue(allocator: Allocator, resolver: *PathResolver, value: std.js
             }
             return new;
         },
-        else => value, // Primitives (bool, integer, float, null) are value types — no alloc needed
+        // A number too big for i64 is text in the parsed tree: copied, so
+        // the tree built owns it, as it owns its strings.
+        .number_string => |s| .{ .number_string = try allocator.dupe(u8, s) },
+        else => value, // bool, integer, float, null: value types, no alloc needed
     };
 }
 
@@ -326,6 +329,7 @@ fn cloneJsonValue(allocator: Allocator, value: std.json.Value, depth: usize) !st
             }
             return new;
         },
+        .number_string => |s| .{ .number_string = try allocator.dupe(u8, s) },
         else => value,
     };
 }
@@ -335,7 +339,7 @@ fn cloneJsonValue(allocator: Allocator, value: std.json.Value, depth: usize) !st
 /// not values borrowed from a parsed tree.
 fn freeJsonValue(allocator: Allocator, value: std.json.Value) void {
     switch (value) {
-        .string => |s| allocator.free(s),
+        .string, .number_string => |s| allocator.free(s),
         .object => |obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
@@ -596,4 +600,11 @@ test "resolveInput: a mapping nested past 128 levels fails" {
     const mapping = try std.fmt.allocPrint(allocator, "{s}\"$.input\"{s}", .{ arrays[0..129], arrays[129..] });
     defer allocator.free(mapping);
     try std.testing.expectError(error.JsonTooDeep, resolveInput(allocator, mapping, "1", null, "run_test"));
+}
+
+test "resolveInput: a referenced integer too big for i64 comes through intact" {
+    const out = try resolveInput(std.testing.allocator, "{\"n\": \"$.input.big\", \"m\": \"$.input\"}", "{\"big\": 123456789012345678901234567890}", null, "run-1");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"n\":123456789012345678901234567890") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"m\":{\"big\":123456789012345678901234567890}") != null);
 }
