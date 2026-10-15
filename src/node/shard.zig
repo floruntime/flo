@@ -3015,6 +3015,7 @@ pub const Shard = struct {
         self.more_work = false;
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates();
+        self.actions_handler.forgetExpiries();
         self.resolvePending(message);
         // Blocking reads that hand out work belong to the leader: a parked
         // dequeue woken here would take a message from this node's copy
@@ -3664,6 +3665,14 @@ pub const Shard = struct {
         // pending entries idle past their group's ack_timeout_ms and drops
         // poison entries past max_deliver. Local in-memory PEL mutation only
         // (PEL is not persisted), so no Raft round-trip.
+        // Action runs past their timeout, on the leader, which holds claims.
+        self.task_scheduler.register(
+            "action_timeout_sweep",
+            1_000,
+            actionTimeoutSweepTask,
+            @ptrCast(self),
+        ) catch {};
+
         self.task_scheduler.register(
             "stream_group_sweep",
             1_000, // check every 1 second
@@ -3775,6 +3784,12 @@ pub const Shard = struct {
     /// TaskScheduler callback: sweep every consumer group's PEL.
     /// Makes entries idle past ack_timeout_ms ready for their group's next
     /// read and drops ones past max_deliver. Returns how many it changed.
+    fn actionTimeoutSweepTask(ctx: *anyopaque) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        if (self.raft_node.role != .leader) return 0;
+        return self.actions_handler.expireRuns(self, @import("stdx").time.milliTimestamp());
+    }
+
     fn streamGroupSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const proj = self.stream_handler.stream;
@@ -8211,6 +8226,57 @@ const FollowerTest = struct {
         return testRequestWith(.queue_dequeue, id, "q", "", ob.getOptions());
     }
 };
+
+test "Shard: a node that stops leading forgets the action timeouts it proposed" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    const actions = shard.actions_handler;
+
+    var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
+    var pbuf: [1024]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?));
+    var inv_buf: [256]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?));
+    const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
+    std.testing.allocator.free(task.body);
+
+    // Proposed and not yet applied when this node stops leading.
+    actions.runs.getPtr("act-1").?.expiry_proposed = true;
+    shard.replica.leadershipLost("test");
+    try std.testing.expect(!actions.runs.get("act-1").?.expiry_proposed);
+}
+
+test "Shard: an action timeout this node can't propose is proposed again by a later sweep" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+
+    var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
+    var pbuf: [1024]u8 = undefined;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?));
+    var inv_buf: [256]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?));
+    const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
+    std.testing.allocator.free(task.body);
+    actions.runs.getPtr("act-1").?.lease_from_ms = 0;
+
+    // No leader to take it: refused, so nothing is left marked proposed.
+    try std.testing.expectEqual(@as(usize, 1), actions.expireRuns(&t.shard, 5000));
+    const run = actions.runs.get("act-1").?;
+    try std.testing.expect(!run.expiry_proposed);
+    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.running, run.status);
+}
 
 test "Shard: a connection's blocking reads held for the leader count toward its cap" {
     var t: FollowerTest = undefined;

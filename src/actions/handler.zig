@@ -61,6 +61,12 @@ const OpCode = proto.OpCode;
 // ActionsHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// An action's timeout when its register names none.
+pub const DEFAULT_ACTION_TIMEOUT_MS: u32 = 30_000;
+
+/// Longest lease one touch may ask for: a touch can't park a run forever.
+pub const MAX_TOUCH_EXTEND_MS: u32 = 60 * 60 * 1000;
+
 pub const ActionsHandler = struct {
     /// Public reference to resolveActionAwait for cross-shard inbox notifications.
     pub const resolveActionAwaitFn = resolveActionAwait;
@@ -100,8 +106,8 @@ pub const ActionsHandler = struct {
         version: u32,
         enabled: bool,
         created_at_ns: u64,
-        /// Execution timeout in ms from `--timeout` (persisted; default 30s).
-        timeout_ms: u32 = 30_000,
+        /// Execution timeout in ms from `--timeout` (persisted).
+        timeout_ms: u32 = DEFAULT_ACTION_TIMEOUT_MS,
         max_retries: u32 = 3,
     };
 
@@ -126,6 +132,17 @@ pub const ActionsHandler = struct {
         completed_at_ms: ?i64,
         attempt: u32 = 0,
         max_retries: u32 = 3,
+        /// When the running attempt's lease began (its claim, or its last
+        /// touch), and the length the last touch asked for; the lease runs
+        /// for the longer of that and the action's `timeout_ms`, read at
+        /// each sweep. Leader memory, like the claim.
+        lease_from_ms: i64 = 0,
+        lease_ms: ?u32 = null,
+        /// A timeout for this attempt is proposed and not yet applied, so
+        /// the next sweep doesn't propose another. Leader memory: cleared
+        /// when an update applies, at a claim, and when this node stops
+        /// leading.
+        expiry_proposed: bool = false,
     };
 
     pub fn init(allocator: Allocator) ActionsHandler {
@@ -479,9 +496,12 @@ pub const ActionsHandler = struct {
                 return null;
             };
             run.status = .running;
+            run.expiry_proposed = false;
             // The claim is off the log: its time is this node's clock until
             // claims are logged with stamps of their own.
             run.started_at_ms = @import("stdx").time.milliTimestamp();
+            run.lease_from_ms = run.started_at_ms.?;
+            run.lease_ms = null;
             run.attempt += 1;
             if (worker_id.len > 0) {
                 if (run.worker_id_owned) |old| self.allocator.free(old);
@@ -529,7 +549,7 @@ pub const ActionsHandler = struct {
     /// Every field is defaulted so short/legacy values still parse. `owner` is a
     /// borrowed slice into `value`; the caller dupes it if it needs ownership.
     fn parseRegisterValue(value: []const u8) RegisterMeta {
-        var m = RegisterMeta{ .action_type = .user, .timeout_ms = 30_000, .max_retries = 3, .owner = "" };
+        var m = RegisterMeta{ .action_type = .user, .timeout_ms = DEFAULT_ACTION_TIMEOUT_MS, .max_retries = 3, .owner = "" };
         if (value.len > 0) m.action_type = ActionType.fromU8(value[0]);
         if (value.len >= 5) m.timeout_ms = std.mem.readInt(u32, value[1..5], .little);
         if (value.len >= 9) m.max_retries = std.mem.readInt(u32, value[5..9], .little);
@@ -1006,12 +1026,17 @@ pub const ActionsHandler = struct {
         offset += 2;
         if (offset + tid_len > value.len) return .{ .status = .bad_request, .message = "invalid value format" };
         const task_id = value[offset .. offset + tid_len];
+        offset += tid_len;
+        // How long the lease should run from now, at least the action's
+        // timeout; 0 or absent asks for just that.
+        const extend_ms: u32 = if (offset + 4 <= value.len) std.mem.readInt(u32, value[offset..][0..4], .little) else 0;
+        if (extend_ms > MAX_TOUCH_EXTEND_MS) return .{ .status = .bad_request, .message = std.fmt.comptimePrint("bad request: extend_ms is at most {d}", .{MAX_TOUCH_EXTEND_MS}) };
 
-        // Find and touch the run — reset started_at to extend the lease
         if (self.runs.getPtr(task_id)) |run| {
             if (!runIn(run, req.namespace)) return .{ .status = .not_found, .message = "run not found" };
             if (run.status == .running) {
-                run.started_at_ms = @import("stdx").time.milliTimestamp();
+                run.lease_from_ms = @import("stdx").time.milliTimestamp();
+                run.lease_ms = if (extend_ms > 0) extend_ms else null;
                 return null; // success
             }
             return .{ .status = .conflict, .message = "run not in running state" };
@@ -1223,6 +1248,79 @@ pub const ActionsHandler = struct {
         error_message: []const u8,
     };
 
+    /// Time out running runs past their lease: the longer of the action's
+    /// `timeout_ms` and the last touch's `extend_ms`, counted from the claim
+    /// or that touch, on this node's clock; an action with `timeout_ms` 0
+    /// never times out. A
+    /// run with attempts left goes back to pending, as a failure asking for
+    /// a retry does, and one with none is timed out. Proposed as ordinary
+    /// run updates, so every replica applies them; the leader runs this,
+    /// since only it holds claims. Returns how many it proposed.
+    pub fn expireRuns(self: *ActionsHandler, shard: ?*Shard, now_ms: i64) usize {
+        const Expiry = struct { run_id: []u8, namespace: []u8, update: RunUpdate, msg: [48]u8 };
+        var due: [32]Expiry = undefined;
+        var n: usize = 0;
+        {
+            self.runs_mu.lock();
+            defer self.runs_mu.unlock();
+            var it = self.runs.iterator();
+            while (it.next()) |entry| {
+                if (n == due.len) break;
+                const run = entry.value_ptr;
+                if (run.status != .running or run.expiry_proposed) continue;
+                // A deleted action's runs end on the default timeout.
+                var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+                const action_timeout: u32 = if (defKey(&kbuf, run.namespace_owned, run.action_name_owned)) |key|
+                    (if (self.actions.get(key)) |a| a.timeout_ms else DEFAULT_ACTION_TIMEOUT_MS)
+                else
+                    DEFAULT_ACTION_TIMEOUT_MS;
+                if (action_timeout == 0) continue;
+                // A touch can lengthen the lease past the action's timeout,
+                // never shorten it.
+                const lease_ms = @max(run.lease_ms orelse 0, action_timeout);
+                if (now_ms - run.lease_from_ms < lease_ms) continue;
+                const run_id = self.allocator.dupe(u8, run.run_id_owned) catch break;
+                const namespace = self.allocator.dupe(u8, run.namespace_owned) catch {
+                    self.allocator.free(run_id);
+                    break;
+                };
+                due[n] = .{ .run_id = run_id, .namespace = namespace, .msg = undefined, .update = .{
+                    .status = if (run.attempt < run.max_retries) .pending else .timed_out,
+                    .started_at_ms = null,
+                    .result = "",
+                    .worker_id = null,
+                    .outcome = "",
+                    .error_message = "",
+                } };
+                due[n].update.error_message = std.fmt.bufPrint(&due[n].msg, "timed out after {d} ms", .{lease_ms}) catch "timed out";
+                run.expiry_proposed = true;
+                n += 1;
+            }
+        }
+        for (due[0..n]) |*d| {
+            defer self.allocator.free(d.run_id);
+            defer self.allocator.free(d.namespace);
+            if (self.applyRunUpdate(shard, d.namespace, d.run_id, d.update) == .refused) self.clearExpiry(d.run_id);
+        }
+        return n;
+    }
+
+    /// Let a run's timeout be proposed again: its proposal was refused.
+    fn clearExpiry(self: *ActionsHandler, run_id: []const u8) void {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+        if (self.runs.getPtr(run_id)) |run| run.expiry_proposed = false;
+    }
+
+    /// This node stopped leading: a timeout it proposed may never apply,
+    /// and whoever leads next decides afresh.
+    pub fn forgetExpiries(self: *ActionsHandler) void {
+        self.runs_mu.lock();
+        defer self.runs_mu.unlock();
+        var it = self.runs.valueIterator();
+        while (it.next()) |run| run.expiry_proposed = false;
+    }
+
     /// Encode a run update and propose it (or, without a shard, apply it).
     fn applyRunUpdate(self: *ActionsHandler, shard: ?*Shard, namespace: []const u8, run_id: []const u8, u: RunUpdate) TaskOutcome {
         var value_buf: [65536]u8 = undefined;
@@ -1267,7 +1365,7 @@ pub const ActionsHandler = struct {
     ///   [input_len:u32][input][labels_len:u32][labels]
     ///   [caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf]
     ///   [namespace_len:u16][namespace]
-    fn encodeInvokeValue(value_buf: []u8, namespace: []const u8, action_name: []const u8, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
+    pub fn encodeInvokeValue(value_buf: []u8, namespace: []const u8, action_name: []const u8, input: []const u8, labels: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]const u8 {
         var off: usize = 0;
         if (!putLenPrefixed(value_buf, &off, u16, action_name)) return null;
         if (off + 1 > value_buf.len) return null;
@@ -1627,7 +1725,8 @@ pub const ActionsHandler = struct {
         const error_data = if (fields.err) |x| try self.allocator.dupe(u8, x) else null;
 
         run.status = status;
-        if (status == .completed or status == .failed) {
+        run.expiry_proposed = false;
+        if (finished(status)) {
             run.completed_at_ms = stamp_ms;
         } else if (status == .pending) {
             run.started_at_ms = null;
@@ -2626,4 +2725,128 @@ test "encodeTaskAssignment: a large input is encoded whole, caller block include
     try std.testing.expectEqual(@as(u8, 1), body[pos]);
     pos += 1 + 2 + "wf-run".len + 2 + "wf".len;
     try std.testing.expectEqualSlices(u8, input, body[pos..]);
+}
+
+/// Register "echo" with `timeout_ms` and `max_retries`, invoke run act-1, and
+/// claim it for w-1 at a known time.
+fn testTimedRun(h: *ActionsHandler, timeout_ms: u32, max_retries: u32, started_at_ms: i64) !void {
+    var reg: [9]u8 = undefined;
+    reg[0] = 0;
+    std.mem.writeInt(u32, reg[1..5], timeout_ms, .little);
+    std.mem.writeInt(u32, reg[5..9], max_retries, .little);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", &reg, 1));
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
+    std.testing.allocator.free(task.body);
+    h.runs.getPtr("act-1").?.lease_from_ms = started_at_ms;
+}
+
+test "actions: a run past its action's timeout goes back to pending while it has attempts, then times out" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testTimedRun(&h, 1000, 2, 10_000);
+
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 10_999));
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 11_000));
+    var run = h.runs.get("act-1").?;
+    try testing.expectEqual(ActionRunStatus.pending, run.status);
+    try testing.expectEqualStrings("timed out after 1000 ms", run.error_owned.?);
+
+    // Its second attempt, out of retries, times out for good.
+    const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-2") orelse return error.NothingToClaim;
+    std.testing.allocator.free(task.body);
+    h.runs.getPtr("act-1").?.lease_from_ms = 20_000;
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 21_000));
+    run = h.runs.get("act-1").?;
+    try testing.expectEqual(ActionRunStatus.timed_out, run.status);
+    try testing.expect(run.completed_at_ms != null);
+    // A late report from either worker is stale now.
+    var buf: [128]u8 = undefined;
+    try testing.expectEqual(proto.StatusCode.conflict, h.handleActionComplete(null, testReport(&buf, .action_complete, "w-2", "act-1", false)).refused.status);
+}
+
+test "actions: a timeout of 0 never expires, touched or not, and a re-registered timeout applies to runs in flight" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testTimedRun(&h, 0, 3, 10_000);
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 10_000_000));
+    var buf: [64]u8 = undefined;
+    try testing.expect(h.handleActionTouch(testTouch(&buf, 30_000)) == null);
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, std.math.maxInt(i64)));
+    // As freshly claimed again.
+    h.runs.getPtr("act-1").?.lease_from_ms = 10_000;
+    h.runs.getPtr("act-1").?.lease_ms = null;
+
+    var reg: [9]u8 = undefined;
+    reg[0] = 0;
+    std.mem.writeInt(u32, reg[1..5], 500, .little);
+    std.mem.writeInt(u32, reg[5..9], 3, .little);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", &reg, 2));
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 10_500));
+}
+
+/// A touch of act-1 by w-1 asking for `extend_ms` (null: none on the wire).
+fn testTouch(buf: []u8, extend_ms: ?u32) Request {
+    var off: usize = 0;
+    for ([_][]const u8{ "echo", "act-1" }) |f| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(f.len), .little);
+        @memcpy(buf[off + 2 ..][0..f.len], f);
+        off += 2 + f.len;
+    }
+    if (extend_ms) |e| {
+        std.mem.writeInt(u32, buf[off..][0..4], e, .little);
+        off += 4;
+    }
+    return .{ .header = proto.RequestHeader.init(.action_touch, 1), .namespace = "default", .key = "w-1", .value = buf[0..off], .options = "" };
+}
+
+test "actions: a touch restarts the lease, for the longer of its length and the action's timeout, capped" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testTimedRun(&h, 1000, 3, 10_000);
+    var buf: [64]u8 = undefined;
+
+    // No length: the action's timeout from now.
+    try testing.expect(h.handleActionTouch(testTouch(&buf, null)) == null);
+    var from = h.runs.get("act-1").?.lease_from_ms;
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, from + 999));
+
+    // A named length shorter than the action's timeout doesn't shorten it.
+    try testing.expect(h.handleActionTouch(testTouch(&buf, 500)) == null);
+    from = h.runs.get("act-1").?.lease_from_ms;
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, from + 999));
+
+    // A named length, past the action's timeout.
+    try testing.expect(h.handleActionTouch(testTouch(&buf, 5000)) == null);
+    from = h.runs.get("act-1").?.lease_from_ms;
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, from + 4999));
+
+    // Longer than a touch may ask for: refused, the lease unchanged.
+    try testing.expectEqual(proto.StatusCode.bad_request, h.handleActionTouch(testTouch(&buf, MAX_TOUCH_EXTEND_MS + 1)).?.status);
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, from + 5000));
+    try testing.expectEqualStrings("timed out after 5000 ms", h.runs.get("act-1").?.error_owned.?);
+}
+
+test "actions: a timeout proposed once isn't proposed again until it clears" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testTimedRun(&h, 1000, 3, 10_000);
+    // Proposed and not applied (as on a leader): the next sweep skips it;
+    // when this node stops leading, a sweep may propose it again.
+    h.runs.getPtr("act-1").?.expiry_proposed = true;
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 20_000));
+    h.forgetExpiries();
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 20_000));
+}
+
+test "actions: a run of a deleted action ends on the default timeout" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testTimedRun(&h, 0, 1, 10_000);
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayDelete("echo"));
+    try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS - 1));
+    try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS));
+    try testing.expectEqual(ActionRunStatus.timed_out, h.runs.get("act-1").?.status);
 }
