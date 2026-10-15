@@ -10511,7 +10511,8 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
 
     // Claimed, as by an await whose task then couldn't be built. The
     // invoke's own wake is spent before the other shard's await parks.
-    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
+    const task = owner.actions_handler.claimPendingRun(std.testing.allocator, "default", name, null, "w0") orelse return error.NoRun;
+    defer std.testing.allocator.free(task.body);
     _ = other.drainInbox();
     const cb = try TestClient.open(other);
     defer _ = std.c.close(cb.pair[1]);
@@ -10519,7 +10520,13 @@ test "Shard: a run whose task couldn't be sent goes to an await parked on anothe
     std.mem.writeInt(u32, await_value[0..4], 1, .little);
     std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
     @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    // A worker registered on the other shard, where its await runs.
+    var worker_buf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
+        if (other.router.route(node_router.hashKeyWithNamespace("", w)) == .local) break w;
+    } else return error.NoLocalWorker;
+    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
     other.flushToClient(cb.conn.fd);
@@ -10565,7 +10572,8 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     }
 
     // Worker w0 holds the run; w1 then waits for work on the other shard.
-    const task = owner.actions_handler.claimPendingRun("default", name, null, "w0") orelse return error.NoRun;
+    const task = owner.actions_handler.claimPendingRun(std.testing.allocator, "default", name, null, "w0") orelse return error.NoRun;
+    defer std.testing.allocator.free(task.body);
     var run_id_buf: [64]u8 = undefined;
     const run_id = run_id_buf[0..task.run_id.len];
     @memcpy(run_id, task.run_id);
@@ -10576,7 +10584,13 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     std.mem.writeInt(u32, await_value[0..4], 1, .little);
     std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
     @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 3, "w1", await_value[0 .. 6 + name.len]);
+    // A worker registered on the other shard, where its await runs.
+    var worker_buf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
+        if (other.router.route(node_router.hashKeyWithNamespace("", w)) == .local) break w;
+    } else return error.NoLocalWorker;
+    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
     other.flushToClient(cb.conn.fd);
