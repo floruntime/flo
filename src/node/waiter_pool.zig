@@ -603,3 +603,34 @@ test "WaiterPool: a key past the inline buffer, up to a qualified key's length, 
     try std.testing.expectEqual(@as(u16, 1), pool.count);
     try std.testing.expectEqual(@as(usize, MAX_WAITER_KEY), pool.waiters[0].key().len);
 }
+
+test "WaiterPool: expireKinds takes every waiter of the kinds named, including one swapped into a taken slot" {
+    var pool = try WaiterPool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+    const r = ReplyTo.socketOf(0, 10, 1);
+    // The last slot is a match, so removing slot 0 swaps a match into it.
+    _ = pool.register(.{ .kind = .queue_dequeue, .reply_to = r, .request_id = 1, .key = "a", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .kv_get, .reply_to = r, .request_id = 2, .key = "b", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .stream_read, .reply_to = r, .request_id = 3, .key = "c", .timeout_ms = 1_000 });
+    _ = pool.register(.{ .kind = .action_await, .reply_to = r, .request_id = 4, .key = "d", .timeout_ms = 1_000 });
+
+    const Seen = struct {
+        var ids: [4]u64 = undefined;
+        var n: usize = 0;
+        fn f(w: *const Waiter, _: *anyopaque) void {
+            ids[n] = w.request_id;
+            n += 1;
+        }
+    };
+    Seen.n = 0;
+    var ctx: u8 = 0;
+    pool.expireKinds(&.{ .queue_dequeue, .action_await }, Seen.f, @ptrCast(&ctx));
+
+    try std.testing.expectEqual(@as(usize, 2), Seen.n);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 4 }, Seen.ids[0..2]);
+    try std.testing.expectEqual(@as(u16, 2), pool.totalActive());
+    try std.testing.expectEqual(@as(u16, 0), pool.countByKind(.queue_dequeue));
+    try std.testing.expectEqual(@as(u16, 0), pool.countByKind(.action_await));
+    try std.testing.expectEqual(@as(u16, 1), pool.countByKind(.kv_get));
+    try std.testing.expectEqual(@as(u16, 1), pool.countByKind(.stream_read));
+}

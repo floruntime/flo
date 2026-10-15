@@ -3146,10 +3146,11 @@ pub const Shard = struct {
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates();
         self.resolvePending(message);
-        // A blocking read that hands out work would, left parked, take it
-        // from this node's follower projection while the new leader hands
-        // the same work to someone else. Reads that only look (kv watch,
-        // stream read) stay: a follower serves those.
+        // Blocking reads that hand out work belong to the leader: a parked
+        // dequeue woken here would take a message from this node's copy
+        // while the new leader hands the same message to someone else, and
+        // a group read or an await would retry here rather than there. Reads
+        // that only look (kv watch, stream read) stay: a follower serves them.
         self.waiter_pool.expireKinds(&.{ .queue_dequeue, .stream_group_read, .action_await }, answerNotLeading, @ptrCast(self));
     }
 
@@ -5501,6 +5502,14 @@ pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// Returns true if a message was available and sent.
 pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
+    // A leader whose own removal commits stops leading inside the commit,
+    // and applies that batch before the step-down answers its waiters: an
+    // enqueue in it must not be handed out from what is now a follower's
+    // copy while the new leader hands it out too.
+    if (shard.raft_network != null and shard.raft_node.role != .leader) {
+        answerNotLeading(waiter, ctx);
+        return true;
+    }
     const partition = shard.defaultPartition();
 
     const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
@@ -9203,9 +9212,46 @@ test "Shard: a step-down answers parked dequeues unavailable and leaves parked w
 
     var out: [512]u8 = undefined;
     const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
-    const resp = try proto.Response.parse(out[0..n]);
+    var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(@as(u64, 30), resp.header.request_id);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: an enqueue applied after this node stopped leading wakes a parked dequeue with unavailable, not the message" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    const q_hash = node_router.nameHash(node_router.namespaceHash(""), "jobs");
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .queue_dequeue, .reply_to = conn.replyTo(), .request_id = 40, .key = "jobs", .min_version = q_hash, .timeout_ms = 60_000 }));
+
+    // The commit that removed this leader also carried an enqueue; it
+    // applies before the step-down runs.
+    shard.raft_node.role = .follower;
+    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, q_hash, "m");
+    shard.waiter_pool.notify(.queue_dequeue, "jobs", resolveQueueWaiter, @ptrCast(&shard));
+
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.queue_dequeue));
+    try std.testing.expectEqual(@as(usize, 1), shard.defaultPartition().queue.queueCounts(q_hash).ready);
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 40), resp.header.request_id);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
 test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {
