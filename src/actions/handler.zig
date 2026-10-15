@@ -265,7 +265,7 @@ pub const ActionsHandler = struct {
     }
 
     /// Why a task command was refused, with the status the worker is told.
-    const TaskError = struct { status: proto.StatusCode, message: []const u8 };
+    const TaskError = struct { status: proto.StatusCode, message: []const u8, reason: proto.Reason = .unclassified };
 
     /// What a task command did: refused, proposed (the worker parks on
     /// it), or applied here without a shard.
@@ -283,7 +283,7 @@ pub const ActionsHandler = struct {
                 const outcome = if (op == .action_complete) shard.actions_handler.handleActionComplete(shard, req) else shard.actions_handler.handleActionFail(shard, req);
                 switch (outcome) {
                     // Refused before anything was proposed.
-                    .refused => |e| shard.sendRefusal(conn, req.header.request_id, e.status, proto.notRun(e.message)),
+                    .refused => |e| shard.sendRefusal(conn, req.header.request_id, e.status, .{ .reason = e.reason, .ran = .no, .message = e.message }),
                     .parked => |proposed| shard.park(conn, req, proposed, respondTask),
                     .applied => respondTask(shard_ptr, conn_ptr, req),
                     .repeat => shard.sendOkResponse(conn, req.header.request_id, ""),
@@ -920,12 +920,12 @@ pub const ActionsHandler = struct {
             .running => {
                 const holder = run.worker_id_owned orelse return null;
                 if (std.mem.eql(u8, holder, worker_id)) return null;
-                return .{ .refused = .{ .status = .conflict, .message = "stale report: another worker is running this run now" } };
+                return .{ .refused = .{ .status = .conflict, .reason = .stale_report, .message = "stale report: another worker is running this run now" } };
             },
             .pending => return if (reported == .pending) .repeat else null,
             .completed, .failed, .cancelled, .timed_out => {
                 if (run.status == reported) return .repeat;
-                return .{ .refused = .{ .status = .conflict, .message = "stale report: the run has finished" } };
+                return .{ .refused = .{ .status = .conflict, .reason = .stale_report, .message = "stale report: the run has finished" } };
             },
         }
     }
@@ -2409,6 +2409,7 @@ test "actions: a report for a run that has finished is refused, and a resent one
     // A late fail asking for a retry would have put it back to pending.
     const late = h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true));
     try testing.expectEqual(proto.StatusCode.conflict, late.refused.status);
+    try testing.expectEqual(proto.Reason.stale_report, late.refused.reason);
     try testing.expectEqual(ActionRunStatus.completed, h.runs.get("act-1").?.status);
 }
 
@@ -2426,6 +2427,7 @@ test "actions: a resent fail can't send back an attempt another worker now runs"
     try testRunning(&h, "w-2");
     const resent = h.handleActionFail(null, testReport(&buf, .action_fail, "w-1", "act-1", true));
     try testing.expectEqual(proto.StatusCode.conflict, resent.refused.status);
+    try testing.expectEqual(proto.Reason.stale_report, resent.refused.reason);
     try testing.expectEqual(ActionRunStatus.running, h.runs.get("act-1").?.status);
     try testing.expectEqualStrings("w-2", h.runs.get("act-1").?.worker_id_owned.?);
 }
