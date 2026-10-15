@@ -1280,12 +1280,15 @@ test "e2e/action: a task held past its action's timeout goes back to pending, th
         defer taken.deinit();
         try testing.expectEqual(@as(u8, 0), taken.exit_code);
         try testing.expect(taken.contains(run_id));
-        stdx.time.sleep(2500 * std.time.ns_per_ms);
+        // The timeout plus a full extra sweep of slack.
+        stdx.time.sleep(3500 * std.time.ns_per_ms);
 
         var status = try ctx.cli.run(&.{ "action", "status", run_id });
         defer status.deinit();
         try testing.expectEqual(@as(u8, 0), status.exit_code);
-        if (!status.contains(want)) {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "status: {s}\n", .{want});
+        if (!status.contains(line)) {
             std.debug.print("\nwanted {s}, got: {s}\n", .{ want, status.stdout });
             return error.TestUnexpectedResult;
         }

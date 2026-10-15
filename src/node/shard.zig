@@ -3661,10 +3661,6 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
-        // Consumer-group PEL sweeper — runs every 1 second. Makes ready
-        // pending entries idle past their group's ack_timeout_ms and drops
-        // poison entries past max_deliver. Local in-memory PEL mutation only
-        // (PEL is not persisted), so no Raft round-trip.
         // Action runs past their timeout, on the leader, which holds claims.
         self.task_scheduler.register(
             "action_timeout_sweep",
@@ -3673,6 +3669,10 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        // Consumer-group PEL sweeper — runs every 1 second. Makes ready
+        // pending entries idle past their group's ack_timeout_ms and drops
+        // poison entries past max_deliver. Local in-memory PEL mutation only
+        // (PEL is not persisted), so no Raft round-trip.
         self.task_scheduler.register(
             "stream_group_sweep",
             1_000, // check every 1 second
@@ -3781,15 +3781,17 @@ pub const Shard = struct {
         return trims_proposed;
     }
 
-    /// TaskScheduler callback: sweep every consumer group's PEL.
-    /// Makes entries idle past ack_timeout_ms ready for their group's next
-    /// read and drops ones past max_deliver. Returns how many it changed.
+    /// TaskScheduler callback: on the leader, time out action runs held past
+    /// their lease. Returns how many timeouts it proposed.
     fn actionTimeoutSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         if (self.raft_node.role != .leader) return 0;
         return self.actions_handler.expireRuns(self, @import("stdx").time.milliTimestamp());
     }
 
+    /// TaskScheduler callback: sweep every consumer group's PEL.
+    /// Makes entries idle past ack_timeout_ms ready for their group's next
+    /// read and drops ones past max_deliver. Returns how many it changed.
     fn streamGroupSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         const proj = self.stream_handler.stream;
