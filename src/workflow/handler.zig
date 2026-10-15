@@ -1318,15 +1318,16 @@ pub const WorkflowHandler = struct {
         const cursor_filter = query.cursor;
         const search_query = query.search;
 
-        // Lowercase the search query once for case-insensitive matching
-        var search_lower_buf: [256]u8 = undefined;
-        const search_lower: ?[]const u8 = if (search_query) |sq| blk: {
-            const len = @min(sq.len, search_lower_buf.len);
-            for (0..len) |idx| {
-                search_lower_buf[idx] = std.ascii.toLower(sq[idx]);
-            }
-            break :blk search_lower_buf[0..len];
+        // Lowercase the search query once for case-insensitive matching:
+        // all of it, so a long query matches no more than it says.
+        const search_lower: ?[]u8 = if (search_query) |sq| blk: {
+            const lower = self.allocator.alloc(u8, sq.len) catch {
+                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list-runs search not run (out of memory)");
+                return;
+            };
+            break :blk std.ascii.lowerString(lower, sq);
         } else null;
+        defer if (search_lower) |sl| self.allocator.free(sl);
 
         // Collect matching runs with sort key
         var runs_list: std.ArrayListUnmanaged(RunInfo) = .empty;
@@ -3308,8 +3309,13 @@ pub const WorkflowHandler = struct {
         const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
-        var idem_buf: [512]u8 = undefined;
-        const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch return;
+        // Room for the longest stream name a trigger may have, and both
+        // numbers at their widest.
+        var idem_buf: [parser.MAX_TRIGGER_STREAM + "trigger:@:".len + 2 * 20]u8 = undefined;
+        const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch {
+            log.err("workflow {s}: trigger on stream of {d} bytes not started: its key doesn't fit", .{ trigger.workflow_name_owned, trigger.stream_name_owned.len });
+            return;
+        };
 
         // The first-step queue is shared with a parent run on another
         // shard starting a child here, which holds this handler's lock.

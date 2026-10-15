@@ -714,6 +714,35 @@ test "e2e/workflow: list runs after starting workflows" {
     try stdx.testing.assertContains(list_result, "list-run-2");
 }
 
+test "e2e/workflow: a list-runs search longer than 256 bytes matches all of it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "action", "register", "search-long-action" });
+    const workflow_def =
+        \\kind: Workflow
+        \\name: search-long-wf
+        \\version: 1.0.0
+        \\start.run: @actions/search-long-action
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, workflow_def, "search-long.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    // Two inputs that share their first 300 bytes and differ after.
+    const shared = comptime stdx.repeat("x", 300);
+    try ctx.exec(&.{ "workflow", "start", "search-long-wf", "{\"k\":\"" ++ shared ++ "aaa\"}", "--run-id", "long-run-a" });
+    try ctx.exec(&.{ "workflow", "start", "search-long-wf", "{\"k\":\"" ++ shared ++ "bbb\"}", "--run-id", "long-run-b" });
+
+    var result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "search-long-wf", "--search", shared ++ "bbb" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expect(result.contains("long-run-b"));
+    try testing.expect(!result.contains("long-run-a"));
+}
+
 test "e2e/workflow: get definition after create" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
