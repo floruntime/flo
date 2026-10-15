@@ -3146,6 +3146,11 @@ pub const Shard = struct {
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates();
         self.resolvePending(message);
+        // A blocking read that hands out work would, left parked, take it
+        // from this node's follower projection while the new leader hands
+        // the same work to someone else. Reads that only look (kv watch,
+        // stream read) stay: a follower serves those.
+        self.waiter_pool.expireKinds(&.{ .queue_dequeue, .stream_group_read, .action_await }, answerNotLeading, @ptrCast(self));
     }
 
     /// The leader loop, once per tick and after anything that changes what
@@ -5376,6 +5381,14 @@ fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const
 fn answerCancelled(waiter: *const Waiter, ctx: *anyopaque) void {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     shard.deliverDeferred(waiter.reply_to, "");
+}
+
+const NOT_LEADING_NOT_RUN = "unavailable: this node stopped leading while the read waited; nothing was delivered — retry";
+
+/// A delivering blocking read parked on a node that stopped leading.
+fn answerNotLeading(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(NOT_LEADING_NOT_RUN));
 }
 
 /// Timeout callback: send an appropriate "no data" response based on waiter kind.
@@ -9161,6 +9174,38 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     shard.leadershipLost("test");
     try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
     try std.testing.expectEqual(@as(u32, 0), shard.namespace_handler.pending_creates.count());
+}
+
+test "Shard: a step-down answers parked dequeues unavailable and leaves parked watches waiting" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    const q_hash = node_router.nameHash(node_router.namespaceHash(""), "jobs");
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .queue_dequeue, .reply_to = conn.replyTo(), .request_id = 30, .key = "jobs", .min_version = q_hash, .timeout_ms = 60_000 }));
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 31, .key = "k", .min_version = 0, .timeout_ms = 60_000 }));
+
+    shard.leadershipLost("test");
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.queue_dequeue));
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.kv_get));
+
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 30), resp.header.request_id);
 }
 
 test "Shard: an idempotency key of any length is scoped to its namespace, a retry with key and run id is the same start, and a run id started twice is refused" {

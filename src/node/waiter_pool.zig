@@ -366,6 +366,21 @@ pub const WaiterPool = struct {
         }
     }
 
+    /// Hand every waiter of the given kinds to `on_removed` and remove it,
+    /// due or not.
+    pub fn expireKinds(self: *WaiterPool, kinds: []const WaiterKind, on_removed: TimeoutFn, ctx: *anyopaque) void {
+        var i: u16 = 0;
+        while (i < self.count) {
+            const w = &self.waiters[i];
+            if (w.active and std.mem.indexOfScalar(WaiterKind, kinds, w.kind) != null) {
+                on_removed(w, ctx);
+                self.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     // ── Connection Cleanup ──────────────────────────────────────────────
 
     /// Remove the waiters of one closed connection, named by the shard that
