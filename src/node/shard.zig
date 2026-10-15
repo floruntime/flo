@@ -5017,7 +5017,7 @@ fn serializeWalkQueueEntries(
                         .ns = meta.namespace,
                         .enqueued = meta.enqueued,
                         .dequeued = meta.dequeued,
-                        .dlq = @intCast(handler.queue.dlqCount()),
+                        .dlq = @intCast(handler.queue.deadLetters(entry.key_ptr.*).len),
                     };
                     found = true;
                     break;

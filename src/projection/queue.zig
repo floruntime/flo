@@ -216,6 +216,8 @@ pub const QueueProjection = struct {
     };
 
     pub fn init(allocator: Allocator, config: Config) QueueProjection {
+        // Eviction keeps the newest dead letter, so a queue holds at least one.
+        std.debug.assert(config.dlq_limit > 0);
         return .{
             .allocator = allocator,
             .messages = std.AutoHashMap(u64, Message).init(allocator),
@@ -1399,4 +1401,27 @@ test "queue: a snapshot with any one byte corrupted is refused or loaded, never 
         var q2 = QueueProjection.init(arena.allocator(), .{ .default_lease_ns = 1000 });
         q2.deserialize(bad) catch {};
     }
+}
+
+test "queue: dead letters in many queues serialize the same after a restore" {
+    // The restored copy builds its lanes fresh; the original grew to 200
+    // lanes and dropped 150, so the two maps hold the same lanes in
+    // different orders.
+    var a = QueueProjection.init(testing.allocator, .{ .max_attempts = 1 });
+    defer a.deinit();
+    for (1..201) |h| _ = try a.enqueue(h, 0, h, h, "m");
+    for (1..201) |h| {
+        const d = (try a.dequeue(1000, h)).?;
+        if (h <= 50) try a.nack(d.seq, 2000) else try a.ack(d.seq);
+    }
+    try testing.expectEqual(@as(usize, 50), a.lanes.count());
+
+    const sa = try a.serialize(testing.allocator);
+    defer testing.allocator.free(sa);
+    var b = QueueProjection.init(testing.allocator, .{ .max_attempts = 1 });
+    defer b.deinit();
+    try b.deserialize(sa);
+    const sb = try b.serialize(testing.allocator);
+    defer testing.allocator.free(sb);
+    try testing.expectEqualSlices(u8, sa, sb);
 }
