@@ -3756,6 +3756,7 @@ pub const Shard = struct {
         const proj = self.stream_handler.stream;
         const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
         const r = proj.sweepAllGroups(now_ms);
+        if (r.renacked > 0) self.waiter_pool.notifyAny(.stream_group_read, wakeGroupReadWaiter, @ptrCast(self));
         return @as(u64, r.renacked) + @as(u64, r.dropped);
     }
 
@@ -5274,6 +5275,15 @@ pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const last = shard.stream_handler.stream.streamLastId(waiter.stream.name_hash);
     if (!last.greaterThan(waiter.stream.after)) return false;
 
+    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
+    return true;
+}
+
+/// A parked group read woken because a pending entry became ready (a nack,
+/// or the sweeper): an empty answer, and the client's next read gets it.
+/// Reads of other groups on the stream wake too, and read again.
+pub fn wakeGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
     shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
     return true;
 }
@@ -9468,6 +9478,71 @@ test "Shard: a blocking group read wakes on its own namespace's append, not a sa
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
     try std.testing.expect(two[0].header.request_id == 1 or two[1].header.request_id == 1);
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+}
+
+test "Shard: a nack wakes a parked group read, and the next read serves the nacked record" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const rec = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "r" ++ "\x00\x00";
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", rec, ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, 2, "app", "s", group_consumer, ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "r") != null);
+
+    // Nothing new: the next read parks.
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.block_ms, 5000);
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, 3, "app", "s", group_consumer, ob.getOptions()), .client);
+    try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
+
+    // The consumer nacks what it got: the parked read is woken, empty.
+    var qbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
+    const group_key = try @import("../namespace/handler.zig").qualifyGroupKey(&qbuf, "app", "s", "g");
+    var pel: [4]stream_mod.PendingEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try shard.stream_handler.stream.groupPending(group_key, null, &pel));
+    var nack: [64]u8 = undefined;
+    @memcpy(nack[0..group_consumer.len], group_consumer);
+    var off: usize = group_consumer.len;
+    std.mem.writeInt(u32, nack[off..][0..4], 1, .little);
+    std.mem.writeInt(u64, nack[off + 4 ..][0..8], pel[0].id.timestamp_ms, .little);
+    std.mem.writeInt(u64, nack[off + 12 ..][0..8], pel[0].id.sequence, .little);
+    off += 20;
+    shard.runRequest(conn, try ParkTest.request(.stream_group_nack, 4, "app", "s", nack[0..off], ""), .client);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+    for (two) |r| {
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        if (r.header.request_id == 3) try std.testing.expectEqual(@as(usize, 0), r.data.len);
+    }
+
+    // Read again: the nacked record, delivered a second time.
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, 5, "app", "s", group_consumer, ""), .client);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 5), one[0].header.request_id);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "r") != null);
+    try std.testing.expectEqual(@as(usize, 1), try shard.stream_handler.stream.groupPending(group_key, null, &pel));
+    try std.testing.expectEqual(@as(u32, 2), pel[0].delivery_count);
 }
 
 test "Shard: a deferred answer too large to frame reaches its client as an error" {

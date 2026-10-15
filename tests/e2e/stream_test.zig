@@ -2508,29 +2508,49 @@ test "e2e/stream: ack reduces pending count" {
     }
 }
 
-test "e2e/stream: nack makes message re-deliverable" {
+test "e2e/stream: a nacked record is the next group read's" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "nack-redeliver", "redeliver-msg" });
-    }
+    try ctx.exec(&.{ "stream", "append", "nack-redeliver", "first-msg" });
+    try ctx.exec(&.{ "stream", "append", "nack-redeliver", "second-msg" });
 
-    // Read messages
-    const read1_output = try ctx.execCapture(&.{ "stream", "group", "read", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--limit", "2" });
-    const id = extractStreamId(read1_output);
+    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
+    defer read1.deinit();
+    try testing.expectEqual(@as(u8, 0), read1.exit_code);
+    try testing.expect(read1.contains("first-msg"));
+    const id = extractStreamId(read1.stdout) orelse return error.NoStreamId;
 
-    if (id) |nack_id| {
-        // Nack the message
-        try ctx.exec(&.{ "stream", "group", "nack", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--ids", nack_id });
+    var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "nack-redeliver", "--group", "g", "--consumer", "w1", "--ids", id });
+    defer nack.deinit();
+    try testing.expectEqual(@as(u8, 0), nack.exit_code);
 
-        // Read again — the nack'd message should be re-delivered
-        var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "nack-redeliver-grp", "--consumer", "w1", "--limit", "5" });
-        defer read2.deinit();
+    // The nacked record comes before the one never delivered.
+    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
+    defer read2.deinit();
+    try testing.expectEqual(@as(u8, 0), read2.exit_code);
+    try testing.expect(read2.contains("first-msg"));
+    try testing.expect(!read2.contains("second-msg"));
+}
 
-        // Should get messages (the nack'd one is back in the pool)
-        try testing.expect(read2.contains("redeliver-msg") or read2.succeeded());
-    }
+test "e2e/stream: a record left unacked past the ack timeout goes to the group's next reader" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "stream", "group", "create", "expire-redeliver", "--group", "g", "--ack-timeout", "500" });
+    try ctx.exec(&.{ "stream", "append", "expire-redeliver", "only-msg" });
+
+    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "expire-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
+    defer read1.deinit();
+    try testing.expectEqual(@as(u8, 0), read1.exit_code);
+    try testing.expect(read1.contains("only-msg"));
+
+    // w1 never acks; past the timeout and a sweeper pass, w2 gets it.
+    stdx.time.sleep(2500 * std.time.ns_per_ms);
+    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "expire-redeliver", "--group", "g", "--consumer", "w2", "--limit", "1" });
+    defer read2.deinit();
+    try testing.expectEqual(@as(u8, 0), read2.exit_code);
+    try testing.expect(read2.contains("only-msg"));
 }
 
 test "e2e/stream: trim with --before StreamID" {

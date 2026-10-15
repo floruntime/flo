@@ -121,6 +121,9 @@ pub const PendingEntry = struct {
     last_delivery_ms: u64,
     /// How many times delivered.
     delivery_count: u32,
+    /// Nacked, or idle past the group's ack timeout: the group's next read
+    /// serves it, to whichever consumer reads, before any new record.
+    ready: bool = false,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -737,18 +740,75 @@ pub const ConsumerGroup = struct {
         return acked;
     }
 
-    /// Negative-acknowledge messages — mark for redelivery (increment delivery_count, reset timer).
-    pub fn nack(self: *ConsumerGroup, ids: []const StreamID, now_ms: u64) u32 {
+    /// Negative-acknowledge messages: each is served again by the group's
+    /// next read, or dropped if it has been delivered `max_deliver` times.
+    /// The count goes up when an entry is delivered, not here.
+    pub fn nack(self: *ConsumerGroup, ids: []const StreamID) u32 {
         var nacked: u32 = 0;
         for (ids) |id| {
             const key = id.order();
-            if (self.pel.getPtr(key)) |pe| {
-                pe.delivery_count += 1;
-                pe.last_delivery_ms = now_ms;
-                nacked += 1;
+            const pe = self.pel.getPtr(key) orelse continue;
+            if (self.exhausted(pe)) {
+                self.dropEntry(key);
+            } else {
+                pe.ready = true;
             }
+            nacked += 1;
         }
         return nacked;
+    }
+
+    /// Delivered as many times as the group allows.
+    fn exhausted(self: *const ConsumerGroup, pe: *const PendingEntry) bool {
+        return self.max_deliver > 0 and pe.delivery_count >= self.max_deliver;
+    }
+
+    /// Remove one pending entry, as an ack does.
+    fn dropEntry(self: *ConsumerGroup, key: u128) void {
+        const kv = self.pel.fetchOrderedRemove(key) orelse return;
+        if (self.members.getPtr(kv.value.consumer)) |m| {
+            if (m.pending_count > 0) m.pending_count -= 1;
+        }
+        self.reapLeftMember(kv.value.consumer);
+    }
+
+    /// The ready entries a read would serve, oldest first, without changing
+    /// them: the read builds its reply before anything moves.
+    pub fn peekReady(self: *const ConsumerGroup, out: []StreamID) usize {
+        var n: usize = 0;
+        var it = self.pel.iterator();
+        while (it.next()) |kv| {
+            if (n >= out.len) break;
+            if (kv.value_ptr.ready) {
+                out[n] = kv.value_ptr.id;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Deliver ready entries (from `peekReady`) to `consumer`.
+    pub fn serveReady(self: *ConsumerGroup, consumer: []const u8, ids: []const StreamID, now_ms: u64) void {
+        for (ids) |id| {
+            const pe = self.pel.getPtr(id.order()) orelse continue;
+            if (!pe.ready) continue;
+            if (!std.mem.eql(u8, pe.consumer, consumer)) {
+                if (self.members.getPtr(pe.consumer)) |m| {
+                    if (m.pending_count > 0) m.pending_count -= 1;
+                }
+                pe.consumer = self.internConsumer(consumer);
+                if (self.members.getPtr(consumer)) |m| m.pending_count += 1;
+            }
+            pe.ready = false;
+            pe.delivery_count += 1;
+            pe.last_delivery_ms = now_ms;
+        }
+    }
+
+    /// Drop pending entries whose records are gone (trimmed): they can never
+    /// be delivered again.
+    pub fn dropPending(self: *ConsumerGroup, ids: []const StreamID) void {
+        for (ids) |id| self.dropEntry(id.order());
     }
 
     /// Claim specific PEL entries for a new consumer. Returns count claimed.
@@ -766,6 +826,7 @@ pub const ConsumerGroup = struct {
                     pe.consumer = self.internConsumer(new_consumer);
                     pe.last_delivery_ms = now_ms;
                     pe.delivery_count += 1;
+                    pe.ready = false;
                     // Increment new consumer count
                     if (self.members.getPtr(new_consumer)) |m| {
                         m.pending_count += 1;
@@ -830,6 +891,7 @@ pub const ConsumerGroup = struct {
                 }
                 pe.last_delivery_ms = now_ms;
                 pe.delivery_count += 1;
+                pe.ready = false;
                 out[result_count] = pe.id;
                 result_count += 1;
             }
@@ -907,27 +969,21 @@ pub const ConsumerGroup = struct {
             const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
             if (idle < self.ack_timeout_ms) continue;
 
-            if (self.max_deliver > 0 and pe.delivery_count >= self.max_deliver) {
+            if (self.exhausted(pe)) {
                 if (drop_n < drop_buf.len) {
                     drop_buf[drop_n] = kv.key_ptr.*;
                     drop_n += 1;
                 }
-            } else {
-                // Re-nack: make the entry eligible for redelivery/claim.
-                pe.delivery_count += 1;
-                pe.last_delivery_ms = now_ms;
+            } else if (!pe.ready) {
+                // Expired: the group's next read serves it.
+                pe.ready = true;
                 res.renacked += 1;
             }
         }
 
         for (drop_buf[0..drop_n]) |key| {
-            if (self.pel.fetchOrderedRemove(key)) |kv| {
-                if (self.members.getPtr(kv.value.consumer)) |m| {
-                    if (m.pending_count > 0) m.pending_count -= 1;
-                }
-                self.reapLeftMember(kv.value.consumer);
-                res.dropped += 1;
-            }
+            if (self.pel.contains(key)) res.dropped += 1;
+            self.dropEntry(key);
         }
         return res;
     }
@@ -1386,9 +1442,23 @@ pub const StreamProjection = struct {
     }
 
     /// Negative-acknowledge messages in a consumer group (mark for redelivery).
-    pub fn groupNack(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, now_ms: u64) !u32 {
+    pub fn groupNack(self: *StreamProjection, group_name: []const u8, ids: []const StreamID) !u32 {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.nack(ids, now_ms);
+        return group.nack(ids);
+    }
+
+    /// The group's ready entries, oldest first, unchanged (see `ConsumerGroup.peekReady`).
+    pub fn groupPeekReady(self: *StreamProjection, group_name: []const u8, out: []StreamID) !usize {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.peekReady(out);
+    }
+
+    /// Deliver ready entries to `consumer`, and drop the ones whose records
+    /// are gone.
+    pub fn groupServeReady(self: *StreamProjection, group_name: []const u8, consumer: []const u8, served: []const StreamID, gone: []const StreamID, now_ms: u64) !void {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        group.serveReady(consumer, served, now_ms);
+        group.dropPending(gone);
     }
 
     /// Claim specific PEL entries for a new consumer.
@@ -2287,7 +2357,23 @@ test "stream: groupAck removes from PEL" {
     try testing.expectEqual(@as(usize, 1), try s.groupPelCount("mygroup"));
 }
 
-test "stream: groupNack marks for redelivery" {
+/// A group read's ready half, as `handleGroupRead` runs it: serve what is
+/// ready to `consumer`. Returns how many were served.
+fn testServeReady(s: *StreamProjection, group: []const u8, consumer: []const u8, now_ms: u64) !usize {
+    var ids: [16]StreamID = undefined;
+    const n = try s.groupPeekReady(group, &ids);
+    try s.groupServeReady(group, consumer, ids[0..n], &.{}, now_ms);
+    return n;
+}
+
+fn testDeliveryCount(s: *StreamProjection, group: []const u8) !u32 {
+    var pel_buf: [10]PendingEntry = undefined;
+    const n = try s.groupPending(group, null, &pel_buf);
+    try testing.expectEqual(@as(usize, 1), n);
+    return pel_buf[0].delivery_count;
+}
+
+test "stream: a nacked entry is served again by the group's next read, to any consumer" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2296,23 +2382,52 @@ test "stream: groupNack marks for redelivery" {
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
+    _ = try s.joinGroup("mygroup", "c2", 1000);
 
     var buf: [10]StreamRecord = undefined;
     _ = try s.groupDeliver("mygroup", hash, "c1", 1, 5000, &buf);
+    try testing.expectEqual(@as(usize, 0), try testServeReady(&s, "mygroup", "c2", 5500));
 
-    // Nack
     const ids = [_]StreamID{id1};
-    const nacked = try s.groupNack("mygroup", &ids, 6000);
-    try testing.expectEqual(@as(u32, 1), nacked);
+    try testing.expectEqual(@as(u32, 1), try s.groupNack("mygroup", &ids));
+    // A nack is not a delivery: the count goes up when it is served.
+    try testing.expectEqual(@as(u32, 1), try testDeliveryCount(&s, "mygroup"));
 
-    // Still in PEL (delivery_count incremented)
-    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("mygroup"));
-
-    // Verify delivery count via getPending
+    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "mygroup", "c2", 6000));
     var pel_buf: [10]PendingEntry = undefined;
-    const n = try s.groupPending("mygroup", null, &pel_buf);
-    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 1), try s.groupPending("mygroup", "c2", &pel_buf));
     try testing.expectEqual(@as(u32, 2), pel_buf[0].delivery_count);
+    // Served once: not again until nacked or expired.
+    try testing.expectEqual(@as(usize, 0), try testServeReady(&s, "mygroup", "c2", 6100));
+}
+
+test "stream: a nacked and an expired entry are dropped after the same number of deliveries" {
+    for ([_]bool{ true, false }) |by_nack| {
+        var s = StreamProjection.init(testing.allocator);
+        defer s.deinit();
+        const hash: u64 = 42;
+        const id1 = try s.appendToStream(hash, 100, 0);
+        try s.createGroup("g", 1000);
+        _ = try s.joinGroup("g", "c1", 1000);
+        try s.configureGroup("g", 200, 3);
+
+        var rec_buf: [10]StreamRecord = undefined;
+        _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
+        var now: u64 = 1000;
+        var deliveries: u32 = 1;
+        while (try s.groupPelCount("g") > 0) {
+            now += 300;
+            if (by_nack) {
+                _ = try s.groupNack("g", &[_]StreamID{id1});
+            } else {
+                _ = s.sweepAllGroups(now);
+            }
+            if (try s.groupPelCount("g") == 0) break;
+            deliveries += @intCast(try testServeReady(&s, "g", "c1", now));
+            try testing.expect(deliveries <= 3);
+        }
+        try testing.expectEqual(@as(u32, 3), deliveries);
+    }
 }
 
 test "stream: groupClaim transfers ownership" {
@@ -2340,7 +2455,7 @@ test "stream: groupClaim transfers ownership" {
     try testing.expectEqual(@as(usize, 1), n);
 }
 
-test "stream: sweeper re-nacks idle entries then drops poison" {
+test "stream: the sweeper makes an idle entry ready without counting a delivery, then drops it at max_deliver" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
@@ -2349,29 +2464,51 @@ test "stream: sweeper re-nacks idle entries then drops poison" {
 
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
-    // Tight config: re-nack after 200ms idle, drop after 3 deliveries.
+    _ = try s.joinGroup("g", "c2", 1000);
+    // Ready after 200ms idle, dropped after 3 deliveries.
     try s.configureGroup("g", 200, 3);
 
     var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf); // delivery_count=1, last=1000
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf); // delivery 1
 
     // Not yet idle enough → no-op.
     var r = s.sweepAllGroups(1100);
     try testing.expectEqual(@as(u32, 0), r.renacked);
     try testing.expectEqual(@as(u32, 0), r.dropped);
 
-    // Idle ≥ 200ms → re-nacked (delivery_count 1→2), still in PEL.
+    // Idle ≥ 200ms → ready, not counted; a second pass changes nothing.
     r = s.sweepAllGroups(1400);
     try testing.expectEqual(@as(u32, 1), r.renacked);
-    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("g"));
+    try testing.expectEqual(@as(u32, 1), try testDeliveryCount(&s, "g"));
+    r = s.sweepAllGroups(1500);
+    try testing.expectEqual(@as(u32, 0), r.renacked);
 
-    // Re-nack again (2→3). Now delivery_count == max_deliver (3).
-    r = s.sweepAllGroups(1700);
-    try testing.expectEqual(@as(u32, 1), r.renacked);
+    // Served to another consumer (delivery 2), expires, served (3).
+    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "g", "c2", 1500));
+    _ = s.sweepAllGroups(1800);
+    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "g", "c2", 1800));
+    try testing.expectEqual(@as(u32, 3), try testDeliveryCount(&s, "g"));
 
-    // Next sweep: delivery_count (3) >= max_deliver (3) → dropped from PEL.
-    r = s.sweepAllGroups(2000);
+    // Delivered max_deliver times and idle again → dropped.
+    r = s.sweepAllGroups(2100);
     try testing.expectEqual(@as(u32, 1), r.dropped);
+    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
+}
+
+test "stream: a ready entry whose record was trimmed is dropped by the read that finds it gone" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+    const hash: u64 = 42;
+    const id1 = try s.appendToStream(hash, 100, 0);
+    try s.createGroup("g", 1000);
+    _ = try s.joinGroup("g", "c1", 1000);
+    var rec_buf: [10]StreamRecord = undefined;
+    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
+    _ = try s.groupNack("g", &[_]StreamID{id1});
+
+    var ids: [4]StreamID = undefined;
+    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ids));
+    try s.groupServeReady("g", "c1", &.{}, ids[0..1], 2000);
     try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
 }
 
