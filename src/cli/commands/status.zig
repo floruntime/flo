@@ -66,7 +66,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| {
         if (json_output) {
-            ctx.print("{{\"status\":\"down\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
+            ctx.print("{{\"status\":\"down\",\"endpoint\":{f},\"error\":\"{}\"}}\n", .{ output.jsonString(endpoint), err });
         } else {
             ctx.printErr("✗ Server at {s} is DOWN\n", .{endpoint});
         }
@@ -75,7 +75,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
     var result = client.sendRequest(.ping, "", "", "") catch |err| {
         if (json_output) {
-            ctx.print("{{\"status\":\"error\",\"endpoint\":\"{s}\",\"error\":\"{}\"}}\n", .{ endpoint, err });
+            ctx.print("{{\"status\":\"error\",\"endpoint\":{f},\"error\":\"{}\"}}\n", .{ output.jsonString(endpoint), err });
         } else {
             ctx.printErr("✗ Server at {s} is not responding\n", .{endpoint});
         }
@@ -85,7 +85,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
     if (result.status != .ok) {
         if (json_output) {
-            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":\"{s}\",\"error\":\"{s}\"}}\n", .{ endpoint, result.errorMessage() });
+            ctx.print("{{\"status\":\"unhealthy\",\"endpoint\":{f},\"error\":{f}}}\n", .{ output.jsonString(endpoint), output.jsonString(result.errorMessage()) });
         } else {
             ctx.printErr("✗ Server is UNHEALTHY\n", .{});
         }
@@ -93,7 +93,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     }
 
     if (json_output) {
-        ctx.print("{{\"status\":\"healthy\",\"endpoint\":\"{s}\"}}\n", .{endpoint});
+        ctx.print("{{\"status\":\"healthy\",\"endpoint\":{f}}}\n", .{output.jsonString(endpoint)});
     } else {
         ctx.print("✓ Server is HEALTHY\n", .{});
         ctx.print("  Endpoint: {s}\n", .{endpoint});

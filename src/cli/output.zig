@@ -59,6 +59,53 @@ pub fn getFormat(ctx: *Context) Format {
     return .table;
 }
 
+/// A string as a JSON string value: quoted and escaped. Print it with `{f}`.
+pub fn jsonString(s: []const u8) JsonString {
+    return .{ .bytes = s };
+}
+
+pub const JsonString = struct {
+    bytes: []const u8,
+
+    /// Always a JSON string, whatever the bytes: each byte that isn't part
+    /// of valid UTF-8 becomes U+FFFD, so a field never changes type.
+    pub fn format(self: JsonString, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeByte('"');
+        var i: usize = 0;
+        var run: usize = 0;
+        while (i < self.bytes.len) {
+            const n = std.unicode.utf8ByteSequenceLength(self.bytes[i]) catch 0;
+            if (n != 0 and i + n <= self.bytes.len and std.unicode.utf8ValidateSlice(self.bytes[i..][0..n])) {
+                i += n;
+                continue;
+            }
+            try std.json.Stringify.encodeJsonStringChars(self.bytes[run..i], .{}, w);
+            try w.writeAll("\\ufffd");
+            i += 1;
+            run = i;
+        }
+        try std.json.Stringify.encodeJsonStringChars(self.bytes[run..], .{}, w);
+        try w.writeByte('"');
+    }
+
+    /// The same string as a field of a value serialized with std.json.
+    pub fn jsonStringify(self: JsonString, jw: *std.json.Stringify) std.Io.Writer.Error!void {
+        try jw.beginWriteRaw();
+        try self.format(jw.writer);
+        jw.endWriteRaw();
+    }
+};
+
+/// Print an empty list in the output format: `[]` for json, nothing for raw,
+/// and `message` for a table.
+pub fn printEmptyList(ctx: *Context, message: []const u8) void {
+    switch (getFormat(ctx)) {
+        .json => ctx.print("[]\n", .{}),
+        .raw => {},
+        .table => ctx.print("{s}\n", .{message}),
+    }
+}
+
 /// Check if --verbose was set globally.
 pub fn isVerbose(ctx: *Context) bool {
     return ctx.getBool("verbose");
@@ -454,7 +501,7 @@ fn formatFieldForDisplay(
 /// Emit one JSON field. Caller handles comma separation.
 fn writeJsonField(ctx: *Context, col: WireColumn, val: FieldValue) void {
     switch (val) {
-        .string => |s| ctx.print("\"{s}\":{f}", .{ col.field, std.json.fmt(s, .{}) }),
+        .string => |s| ctx.print("\"{s}\":{f}", .{ col.field, jsonString(s) }),
         .uint => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
         .int => |v| ctx.print("\"{s}\":{d}", .{ col.field, v }),
         .enum_val => |v| ctx.print("\"{s}\":\"{s}\"", .{ col.field, enumLabel(col, v) }),
@@ -462,7 +509,7 @@ fn writeJsonField(ctx: *Context, col: WireColumn, val: FieldValue) void {
             if (maybe) |v| ctx.print("\"{s}\":{d}", .{ col.field, v }) else ctx.print("\"{s}\":null", .{col.field});
         },
         .optional_string => |maybe| {
-            if (maybe) |s| ctx.print("\"{s}\":{f}", .{ col.field, std.json.fmt(s, .{}) }) else ctx.print("\"{s}\":null", .{col.field});
+            if (maybe) |s| ctx.print("\"{s}\":{f}", .{ col.field, jsonString(s) }) else ctx.print("\"{s}\":null", .{col.field});
         },
         .skipped => {},
     }
@@ -781,4 +828,19 @@ test "output: printWireList refuses a cut answer before printing anything" {
     const data = [_]u8{ 2, 0, 0, 0 } ++ entry ++ entry;
     try printWireList(&q.ctx, &data, "(none)", &cols);
     for (0..data.len) |n| try std.testing.expectError(error.Truncated, printWireList(&q.ctx, data[0..n], "(none)", &cols));
+}
+
+test "output: jsonString is always a JSON string, escaped, with bad UTF-8 replaced" {
+    var buf: [128]u8 = undefined;
+    for ([_][2][]const u8{
+        .{ "plain", "\"plain\"" },
+        .{ "q\"b\\n\x01", "\"q\\\"b\\\\n\\u0001\"" },
+        .{ "\xff\xfe", "\"\\ufffd\\ufffd\"" },
+        .{ "ok\xc3", "\"ok\\ufffd\"" },
+        .{ "\xc3\xa9", "\"\xc3\xa9\"" },
+        .{ "m\xe2\x82", "\"m\\ufffd\\ufffd\"" },
+    }) |c| {
+        const out = try std.fmt.bufPrint(&buf, "{f}", .{jsonString(c[0])});
+        try std.testing.expectEqualStrings(c[1], out);
+    }
 }

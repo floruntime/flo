@@ -3457,3 +3457,38 @@ test "e2e/stream: create and alter set a count retention" {
     defer altered.deinit();
     try testing.expect(std.mem.indexOf(u8, altered.stdout, "\"retention\":{\"age_s\":3600,\"count\":9}") != null);
 }
+
+test "e2e/stream: read and group read -o json carry a JSON payload and headers exactly" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const payload = "{\"msg\":\"say \\\"hi\\\"\",\"path\":\"C:\\\\tmp\"}\ttab";
+    const header_val = "a \"quoted\" \\ value";
+    try ctx.exec(&.{ "stream", "append", "json-exact", payload, "--header", "q=" ++ header_val });
+
+    var read = try ctx.cli.run(&.{ "stream", "read", "json-exact", "-o", "json" });
+    defer read.deinit();
+    try testing.expectEqual(@as(u8, 0), read.exit_code);
+    try expectOneExactRecord(read.stdout, payload, header_val);
+
+    try ctx.exec(&.{ "stream", "group", "create", "json-exact", "--group", "g" });
+    var group = try ctx.cli.run(&.{ "stream", "group", "read", "json-exact", "--group", "g", "--consumer", "c", "-o", "json" });
+    defer group.deinit();
+    try testing.expectEqual(@as(u8, 0), group.exit_code);
+    try expectOneExactRecord(group.stdout, payload, header_val);
+}
+
+/// `out` parses as JSON holding exactly one record whose data and `q` header
+/// are byte-for-byte what was appended.
+fn expectOneExactRecord(out: []const u8, payload: []const u8, header_val: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const records = switch (parsed.value) {
+        .array => |a| a.items,
+        .object => |o| o.get("records").?.array.items,
+        else => return error.NotAList,
+    };
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqualStrings(payload, records[0].object.get("data").?.string);
+    try testing.expectEqualStrings(header_val, records[0].object.get("headers").?.object.get("q").?.string);
+}

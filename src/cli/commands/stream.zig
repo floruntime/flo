@@ -401,12 +401,12 @@ fn runAppend(ctx: *commander.Context) commander.Error!void {
 
     if (json_output) {
         if (payloads.len == 1) {
-            ctx.print("{{\"stream_id\":\"{s}\",\"count\":1}}\n", .{id_str});
+            ctx.print("{{\"stream_id\":{f},\"count\":1}}\n", .{output.jsonString(id_str)});
         } else {
             const last_id = result.last_id;
             var last_buf: [64]u8 = undefined;
             const last_str = last_id.format(&last_buf) catch "0-0";
-            ctx.print("{{\"first_id\":\"{s}\",\"last_id\":\"{s}\",\"count\":{d}}}\n", .{ id_str, last_str, payloads.len });
+            ctx.print("{{\"first_id\":{f},\"last_id\":{f},\"count\":{d}}}\n", .{ output.jsonString(id_str), output.jsonString(last_str), payloads.len });
         }
     } else {
         if (payloads.len == 1) {
@@ -583,15 +583,15 @@ fn parseAndPrintRecords(
         if (json_output and !is_follow) {
             if (i > 0) ctx.print(",", .{});
             if (hdr_n > 0) {
-                ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"tier\":\"{s}\",\"data\":\"{s}\",\"headers\":{{", .{ id_str, timestamp_ms, tier_str, payload });
+                ctx.print("{{\"id\":{f},\"timestamp_ms\":{d},\"tier\":{f},\"data\":{f},\"headers\":{{", .{ output.jsonString(id_str), timestamp_ms, output.jsonString(tier_str), output.jsonString(payload) });
                 var hi: u32 = 0;
                 while (hi < hdr_n) : (hi += 1) {
                     if (hi > 0) ctx.print(",", .{});
-                    ctx.print("\"{s}\":\"{s}\"", .{ hdr_keys[hi], hdr_vals[hi] });
+                    ctx.print("{f}:{f}", .{ output.jsonString(hdr_keys[hi]), output.jsonString(hdr_vals[hi]) });
                 }
                 ctx.print("}}}}", .{});
             } else {
-                ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d},\"tier\":\"{s}\",\"data\":\"{s}\"}}", .{ id_str, timestamp_ms, tier_str, payload });
+                ctx.print("{{\"id\":{f},\"timestamp_ms\":{d},\"tier\":{f},\"data\":{f}}}", .{ output.jsonString(id_str), timestamp_ms, output.jsonString(tier_str), output.jsonString(payload) });
             }
         } else {
             if (hdr_n > 0) {
@@ -636,7 +636,7 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"name\":\"{s}\",\"partitions\":{d},\"status\":\"created\"}}\n", .{ stream, partitions });
+        ctx.print("{{\"name\":{f},\"partitions\":{d},\"status\":\"created\"}}\n", .{ output.jsonString(stream), partitions });
     } else {
         ctx.print("Created stream: {s}\n", .{stream});
     }
@@ -664,7 +664,7 @@ fn runAlter(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"name\":\"{s}\",\"status\":\"altered\"}}\n", .{stream});
+        ctx.print("{{\"name\":{f},\"status\":\"altered\"}}\n", .{output.jsonString(stream)});
     } else {
         ctx.print("Altered stream: {s}\n", .{stream});
     }
@@ -689,7 +689,7 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"name\":\"{s}\",\"status\":\"deleted\"}}\n", .{stream});
+        ctx.print("{{\"name\":{f},\"status\":\"deleted\"}}\n", .{output.jsonString(stream)});
     } else {
         ctx.print("Deleted stream: {s}\n", .{stream});
     }
@@ -736,9 +736,9 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
     const last_str = last_id.format(&last_buf) catch "0-0";
 
     if (json_output) {
-        ctx.print("{{\"name\":\"{s}\",\"namespace\":\"{s}\",\"partitions\":{d},\"message_count\":{d},\"size_bytes\":{d}", .{ stream, namespace, partitions, msg_count, bytes });
+        ctx.print("{{\"name\":{f},\"namespace\":{f},\"partitions\":{d},\"message_count\":{d},\"size_bytes\":{d}", .{ output.jsonString(stream), output.jsonString(namespace), partitions, msg_count, bytes });
         if (msg_count > 0) {
-            ctx.print(",\"first_id\":\"{s}\",\"last_id\":\"{s}\"", .{ first_str, last_str });
+            ctx.print(",\"first_id\":{f},\"last_id\":{f}", .{ output.jsonString(first_str), output.jsonString(last_str) });
         }
         if (retention_age_s > 0 or retention_count > 0 or retention_bytes > 0) {
             ctx.print(",\"retention\":{{", .{});
@@ -1060,17 +1060,17 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
 
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":\"{s}\",\"timestamp_ms\":{d}", .{ id_str, timestamp_ms });
+            ctx.print("{{\"id\":{f},\"timestamp_ms\":{d}", .{ output.jsonString(id_str), timestamp_ms });
             if (stream_name) |sn| {
-                ctx.print(",\"stream\":\"{s}\"", .{sn});
+                ctx.print(",\"stream\":{f}", .{output.jsonString(sn)});
             }
-            ctx.print(",\"data\":\"{s}\"", .{payload});
+            ctx.print(",\"data\":{f}", .{output.jsonString(payload)});
             if (hdr_n > 0) {
                 ctx.print(",\"headers\":{{", .{});
                 var hi: u32 = 0;
                 while (hi < hdr_n) : (hi += 1) {
                     if (hi > 0) ctx.print(",", .{});
-                    ctx.print("\"{s}\":\"{s}\"", .{ hdr_keys[hi], hdr_vals[hi] });
+                    ctx.print("{f}:{f}", .{ output.jsonString(hdr_keys[hi]), output.jsonString(hdr_vals[hi]) });
                 }
                 ctx.print("}}", .{});
             }
@@ -1184,8 +1184,8 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
     if (json_output) {
         // JSON keeps the raw epoch-ns for machine consumers.
         ctx.print(
-            "{{\"stream\":\"{s}\",\"group\":\"{s}\",\"pending\":{d},\"members\":{d},\"created_at_ns\":{d}}}\n",
-            .{ stream, group, pel_count, member_count, created_at_ns },
+            "{{\"stream\":{f},\"group\":{f},\"pending\":{d},\"members\":{d},\"created_at_ns\":{d}}}\n",
+            .{ output.jsonString(stream), output.jsonString(group), pel_count, member_count, created_at_ns },
         );
     } else {
         // Human view: render created_at as ISO-8601 UTC (helper takes ms).
@@ -1230,7 +1230,7 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
     // Parse pending wire format: [count:u32]([id:16][consumer_len:u32][consumer][delivered_at:i64][delivery_count:u32])*
     if (data.len < 4) {
         if (json_output) {
-            ctx.print("{{\"stream\":\"{s}\",\"group\":\"{s}\",\"pending\":[],\"count\":0}}\n", .{ stream, group });
+            ctx.print("{{\"stream\":{f},\"group\":{f},\"pending\":[],\"count\":0}}\n", .{ output.jsonString(stream), output.jsonString(group) });
         } else {
             ctx.print("Consumer Group: {s}/{s}\n  (no pending messages)\n", .{ stream, group });
         }
@@ -1240,7 +1240,7 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
     const count = std.mem.readInt(u32, data[0..4], .little);
 
     if (json_output) {
-        ctx.print("{{\"stream\":\"{s}\",\"group\":\"{s}\",\"count\":{d},\"pending\":[", .{ stream, group, count });
+        ctx.print("{{\"stream\":{f},\"group\":{f},\"count\":{d},\"pending\":[", .{ output.jsonString(stream), output.jsonString(group), count });
     } else {
         ctx.print("Consumer Group: {s}/{s}\n  Pending: {d} message(s)\n\n", .{ stream, group, count });
         if (count > 0) {
@@ -1281,7 +1281,7 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
 
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":\"{s}\",\"consumer\":\"{s}\",\"delivery_count\":{d}}}", .{ id_str, consumer, delivery_count });
+            ctx.print("{{\"id\":{f},\"consumer\":{f},\"delivery_count\":{d}}}", .{ output.jsonString(id_str), output.jsonString(consumer), delivery_count });
         } else {
             ctx.print("  {s:<24} {s:<16} {d}\n", .{ id_str, consumer, delivery_count });
         }
@@ -1458,7 +1458,7 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\"}}\n", .{ group, stream });
+        ctx.print("{{\"status\":\"ok\",\"group\":{f},\"stream\":{f}}}\n", .{ output.jsonString(group), output.jsonString(stream) });
     } else {
         ctx.print("Created consumer group '{s}' on stream '{s}'\n", .{ group, stream });
     }
@@ -1494,7 +1494,7 @@ fn runGroupLeave(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"consumer\":\"{s}\",\"group\":\"{s}\"}}\n", .{ consumer, group });
+        ctx.print("{{\"status\":\"ok\",\"consumer\":{f},\"group\":{f}}}\n", .{ output.jsonString(consumer), output.jsonString(group) });
     } else {
         ctx.print("Consumer '{s}' left group '{s}'\n", .{ consumer, group });
     }
@@ -1524,7 +1524,7 @@ fn runGroupDelete(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, response);
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"group\":\"{s}\",\"stream\":\"{s}\",\"deleted\":true}}\n", .{ group, stream });
+        ctx.print("{{\"status\":\"ok\",\"group\":{f},\"stream\":{f},\"deleted\":true}}\n", .{ output.jsonString(group), output.jsonString(stream) });
     } else {
         ctx.print("Deleted consumer group '{s}' from stream '{s}'\n", .{ group, stream });
     }

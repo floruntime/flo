@@ -513,7 +513,7 @@ fn runRuns(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse {
-        ctx.print("(no runs)\n", .{});
+        cli_output.printEmptyList(ctx, "(no runs)");
         return;
     };
 
@@ -727,7 +727,7 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
 
     // Wire format: [count:u32](worker_record)*[has_more:u8][cursor_len:u16]
     const data = result.asRawData() orelse {
-        ctx.print("(no workers)\n", .{});
+        cli_output.printEmptyList(ctx, "(no workers)");
         return;
     };
 

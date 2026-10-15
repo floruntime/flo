@@ -143,7 +143,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             .{ .field = "name", .header = "NAMESPACE", .field_type = .str_u16 },
         }) catch return outcome.malformed(ctx, "list");
     } else {
-        ctx.print("(no namespaces)\n", .{});
+        output.printEmptyList(ctx, "(no namespaces)");
     }
 }
 

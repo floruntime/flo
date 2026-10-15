@@ -142,7 +142,8 @@ test "e2e/ts: write refuses a value that is not a finite number" {
     // Nothing was written, not even field a.
     var r = try ctx.cli.run(&.{ "ts", "read", "bad_value", "--field", "a", "--from", "0", "-o", "raw" });
     defer r.deinit();
-    try testing.expectEqualStrings("(no data)\n", r.stdout);
+    // raw prints an empty answer as nothing.
+    try testing.expectEqualStrings("", r.stdout);
 }
 
 test "e2e/ts: write no tags" {
@@ -334,7 +335,7 @@ test "e2e/ts: write refuses flags --batch would ignore, and bad timestamps and f
 
     var r = try ctx.cli.run(&.{ "ts", "read", "bad", "--field", "a", "--from", "0", "-o", "raw" });
     defer r.deinit();
-    try testing.expectEqualStrings("(no data)\n", r.stdout);
+    try testing.expectEqualStrings("", r.stdout);
 }
 
 // =============================================================================
@@ -1732,5 +1733,22 @@ test "e2e/ts: a delete with tags removes only the matching series, and stays don
         try testing.expect(!r.contains(" 11.000000"));
         try testing.expect(r.contains(" 22.000000"));
         try testing.expect(r.contains(" 33.000000"));
+    }
+}
+
+test "e2e/ts: a read or query with no data is still JSON under -o json" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // A measurement that doesn't exist, then one with no points in range.
+    try ctx.exec(&.{ "ts", "write", "json_empty", "--value", "1", "--timestamp", "1708700000000" });
+    for ([_][]const u8{ "json_nosuch", "json_empty" }) |m| {
+        var read = try ctx.cli.run(&.{ "ts", "read", m, "--from", "1", "--to", "2", "-o", "json" });
+        defer read.deinit();
+        try testing.expectEqualStrings("[]", std.mem.trim(u8, read.stdout, &std.ascii.whitespace));
+
+        var query = try ctx.cli.run(&.{ "ts", "query", m, "--from", "1", "--to", "2", "--window", "1m", "--agg", "avg", "-o", "json" });
+        defer query.deinit();
+        try testing.expectEqualStrings("{\"series\":[]}", std.mem.trim(u8, query.stdout, &std.ascii.whitespace));
     }
 }

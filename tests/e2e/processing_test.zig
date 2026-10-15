@@ -707,7 +707,7 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
         });
         defer result.deinit();
 
-        if (result.succeeded() and !result.stdoutContains("(no data)") and result.stdoutContains("[")) {
+        if (result.succeeded() and tsReadHasPoints(result.stdout)) {
             return true;
         }
 
@@ -722,7 +722,14 @@ fn readTsBlocking(ctx: *stdx.testing.TestContext, measurement: []const u8, ns: [
     });
     defer result.deinit();
 
-    return result.succeeded() and !result.stdoutContains("(no data)") and result.stdoutContains("[");
+    return result.succeeded() and tsReadHasPoints(result.stdout);
+}
+
+/// A `ts read -o json` answer holding at least one point: an empty read
+/// prints `[]`.
+fn tsReadHasPoints(stdout: []const u8) bool {
+    const out = std.mem.trim(u8, stdout, &std.ascii.whitespace);
+    return out.len > 2 and out[0] == '[';
 }
 
 test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
@@ -781,8 +788,8 @@ test "e2e/processing: ts sink - JSON records flow to time-series measurement" {
     defer read_result.deinit();
 
     try stdx.testing.assertSucceeded(read_result);
-    // JSON output should contain data points (not "(no data)") with the mapped value.
-    try testing.expect(!read_result.stdoutContains("(no data)"));
+    // JSON output should contain data points with the mapped value.
+    try testing.expect(tsReadHasPoints(read_result.stdout));
     try testing.expect(read_result.stdoutContains("["));
     try testing.expect(read_result.stdoutContains("72.5"));
 
@@ -845,7 +852,7 @@ test "e2e/processing: ts sink - value_field shorthand for scalar extraction" {
     defer read_result.deinit();
 
     try stdx.testing.assertSucceeded(read_result);
-    try testing.expect(!read_result.stdoutContains("(no data)"));
+    try testing.expect(tsReadHasPoints(read_result.stdout));
     // JSON array with data points
     try testing.expect(read_result.stdoutContains("timestamp_ms"));
 
@@ -901,7 +908,7 @@ test "e2e/processing: ts sink - late data flows through after job starts" {
     defer read_result.deinit();
 
     try stdx.testing.assertSucceeded(read_result);
-    try testing.expect(!read_result.stdoutContains("(no data)"));
+    try testing.expect(tsReadHasPoints(read_result.stdout));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tslate" });
 }
@@ -952,8 +959,8 @@ test "e2e/processing: ts sink - query aggregation on pipeline-written data" {
     defer query_result.deinit();
 
     try stdx.testing.assertSucceeded(query_result);
-    // Should have data (not empty)
-    try testing.expect(!query_result.stdoutContains("(no data)"));
+    // Should have data (an empty query prints {"series":[]})
+    try testing.expect(!std.mem.eql(u8, std.mem.trim(u8, query_result.stdout, &std.ascii.whitespace), "{\"series\":[]}"));
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_tsagg" });
 }
@@ -1181,7 +1188,7 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
     defer read_result.deinit();
 
     try stdx.testing.assertSucceeded(read_result);
-    try testing.expect(!read_result.stdoutContains("(no data)"));
+    try testing.expect(tsReadHasPoints(read_result.stdout));
     try testing.expect(read_result.stdoutContains("["));
 
     // Step 5: Verify derived_temp appears in ts list

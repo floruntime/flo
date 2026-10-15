@@ -156,19 +156,12 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     };
     // No leader is known while electing or joining.
     const leader_shown = if (leader_id == 0) "none" else leader_name;
-    const leader_json = if (leader_id == 0) "null" else leader_name;
 
     if (json_output) {
-        ctx.print("{{\"node_id\":\"{s}\",\"address\":\"{s}\",\"leader_id\":{s}{s}{s},\"term\":{d},\"role\":\"{s}\",\"members\":{d}}}\n", .{
-            node_name,
-            endpoint,
-            if (leader_id == 0) "" else "\"",
-            leader_json,
-            if (leader_id == 0) "" else "\"",
-            term,
-            role_str,
-            member_count,
-        });
+        ctx.print("{{\"node_id\":{f},\"address\":{f},\"leader_id\":", .{ output.jsonString(node_name), output.jsonString(endpoint) });
+        // No leader is known while electing or joining.
+        if (leader_id == 0) ctx.print("null", .{}) else ctx.print("{f}", .{output.jsonString(leader_name)});
+        ctx.print(",\"term\":{d},\"role\":{f},\"members\":{d}}}\n", .{ term, output.jsonString(role_str), member_count });
     } else {
         ctx.print("\nCluster Status\n", .{});
         ctx.print("──────────────\n", .{});
@@ -234,7 +227,7 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
         const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{id}) catch "?";
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":{d},\"role\":\"{s}\",\"address\":\"{s}\"", .{ id, if (m[4] == 0) "voter" else role, address });
+            ctx.print("{{\"id\":{d},\"role\":{f},\"address\":{f}", .{ id, output.jsonString(if (m[4] == 0) "voter" else role), output.jsonString(address) });
             if (contact != std.math.maxInt(u32)) ctx.print(",\"last_contact_ms\":{d}", .{contact});
             if (match != std.math.maxInt(u64)) ctx.print(",\"lag\":{d}", .{commit -| match});
             ctx.print("}}", .{});
