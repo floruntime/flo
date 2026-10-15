@@ -125,18 +125,18 @@ pub const ProcessingHandler = struct {
     /// Sink configuration for a single sink in the pipeline.
     pub const SinkConfig = struct {
         kind: SinkKind,
-        target: []const u8, // owned (stream/queue sink: target name)
-        namespace: []const u8, // owned (sink namespace)
-        measurement: []const u8, // owned (TS sink: measurement name)
-        value_field: []const u8, // owned (TS sink: value field name)
-        ts_tag_keys: []const u8, // owned (serialized flat pairs: tag_key\0json_key\0…)
-        ts_field_keys: []const u8, // owned (serialized flat pairs: field_name\0json_key\0…)
-        required_tags: u32, // tag bitmask — 0 = firehose (receives all records)
+        // Owned when not empty; freed by `freePipelineState`.
+        target: []const u8 = "", // stream/queue sink: target name
+        namespace: []const u8 = "", // sink namespace
+        measurement: []const u8 = "", // TS sink: measurement name
+        value_field: []const u8 = "", // TS sink: value field name
+        ts_tag_keys: []const u8 = "", // serialized flat pairs: tag_key\0json_key\0…
+        ts_field_keys: []const u8 = "", // serialized flat pairs: field_name\0json_key\0…
+        required_tags: u32 = 0, // tag bitmask — 0 = firehose (receives all records)
 
         // KV sink options
-        kv_key_prefix: []const u8 = "", // owned: prepended to record key
-        kv_separator: []const u8 = ":", // owned: between prefix and key
-        kv_write_mode: []const u8 = "upsert", // owned: upsert | if_absent
+        kv_key_prefix: []const u8 = "", // prepended to record key
+        kv_separator: []const u8 = "", // between prefix and key
         kv_ttl_ms: ?u64 = null, // optional TTL in ms
 
         // Queue sink options
@@ -354,25 +354,29 @@ pub const ProcessingHandler = struct {
         }
         if (pipe.operator_backings.len > 0) self.allocator.free(pipe.operator_backings);
         if (pipe.operators.len > 0) self.allocator.free(pipe.operators);
-
-        if (pipe.src_measurement.len > 0) self.allocator.free(pipe.src_measurement);
-        if (pipe.src_field.len > 0) self.allocator.free(pipe.src_field);
-        if (pipe.src_stream.len > 0) self.allocator.free(pipe.src_stream);
-        if (pipe.src_namespace.len > 0) self.allocator.free(pipe.src_namespace);
-
-        // Free multi-sink configs
-        for (pipe.sinks) |snk| {
-            if (snk.target.len > 0) self.allocator.free(snk.target);
-            if (snk.namespace.len > 0) self.allocator.free(snk.namespace);
-            if (snk.measurement.len > 0) self.allocator.free(snk.measurement);
-            if (snk.value_field.len > 0) self.allocator.free(snk.value_field);
-            if (snk.ts_tag_keys.len > 0) self.allocator.free(snk.ts_tag_keys);
-            if (snk.ts_field_keys.len > 0) self.allocator.free(snk.ts_field_keys);
-        }
-        if (pipe.sinks.len > 0) self.allocator.free(pipe.sinks);
+        freePipeStateFields(self.allocator, pipe);
 
         // Free heap-allocated tag registry
         if (pipe.tag_registry) |reg| self.allocator.destroy(reg);
+    }
+
+    /// The source and sink strings `makePipeState` copies.
+    fn freePipeStateFields(allocator: Allocator, pipe: *const PipelineState) void {
+        if (pipe.src_measurement.len > 0) allocator.free(pipe.src_measurement);
+        if (pipe.src_field.len > 0) allocator.free(pipe.src_field);
+        if (pipe.src_stream.len > 0) allocator.free(pipe.src_stream);
+        if (pipe.src_namespace.len > 0) allocator.free(pipe.src_namespace);
+        for (pipe.sinks) |snk| {
+            if (snk.target.len > 0) allocator.free(snk.target);
+            if (snk.namespace.len > 0) allocator.free(snk.namespace);
+            if (snk.measurement.len > 0) allocator.free(snk.measurement);
+            if (snk.value_field.len > 0) allocator.free(snk.value_field);
+            if (snk.ts_tag_keys.len > 0) allocator.free(snk.ts_tag_keys);
+            if (snk.ts_field_keys.len > 0) allocator.free(snk.ts_field_keys);
+            if (snk.kv_key_prefix.len > 0) allocator.free(snk.kv_key_prefix);
+            if (snk.kv_separator.len > 0) allocator.free(snk.kv_separator);
+        }
+        if (pipe.sinks.len > 0) allocator.free(pipe.sinks);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -1272,7 +1276,13 @@ pub const ProcessingHandler = struct {
             count += 1;
         }
 
-        var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash);
+        var pipe_state = makePipeState(self.allocator, src, sinks, tag_hash) catch {
+            for (backings[0..count]) |*b| b.deinit(self.allocator);
+            self.allocator.free(backings);
+            self.allocator.free(ops);
+            log.err("processing job {s}: pipeline not started (out of memory)", .{job_id});
+            return;
+        };
         pipe_state.tag_registry = tag_registry;
         log.debug("createPipeline: {d} operators loaded (out of {d} specs)", .{ count, op_specs.len });
         if (count > 0) {
@@ -1311,48 +1321,47 @@ pub const ProcessingHandler = struct {
         return w.buffered();
     }
 
-    /// Helper to build a PipelineState with source/sink config (no operators).
-    fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, tag_hash: u64) PipelineState {
-        // Build SinkConfig array from all sink specs
-        const sink_configs: []SinkConfig = if (sinks.len > 0)
-            allocator.alloc(SinkConfig, sinks.len) catch @as([]SinkConfig, &.{})
-        else
-            @as([]SinkConfig, &.{});
-
-        for (sink_configs, 0..) |*sc, i| {
-            const snk = sinks[i];
-            sc.* = .{
-                .kind = snk.kind,
-                .target = allocator.dupe(u8, snk.target) catch "",
-                .namespace = allocator.dupe(u8, if (snk.namespace.len > 0) snk.namespace else "default") catch "",
-                .measurement = allocator.dupe(u8, snk.ts_measurement) catch "",
-                .value_field = allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value") catch "",
-                .ts_tag_keys = serializeFlatPairs(allocator, snk.ts_tag_keys) catch "",
-                .ts_field_keys = serializeFlatPairs(allocator, snk.ts_field_keys) catch "",
-                .required_tags = snk.required_tags,
-                .kv_key_prefix = allocator.dupe(u8, snk.key_prefix) catch "",
-                .kv_separator = allocator.dupe(u8, if (snk.separator.len > 0) snk.separator else ":") catch ":",
-                .kv_write_mode = allocator.dupe(u8, if (snk.write_mode.len > 0) snk.write_mode else "upsert") catch "upsert",
-                .kv_ttl_ms = snk.ttl_ms,
-                .queue_priority = snk.priority,
-            };
-        }
-
-        return .{
+    /// A PipelineState with source/sink config (no operators). Out of
+    /// memory fails the build rather than leave a field empty: a sink with
+    /// an empty target or separator is a different job.
+    fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, tag_hash: u64) !PipelineState {
+        var pipe: PipelineState = .{
             .source_kind = src.kind,
-            .src_measurement = allocator.dupe(u8, src.ts_measurement) catch "",
-            .src_field = allocator.dupe(u8, if (src.ts_field.len > 0) src.ts_field else "value") catch "",
+            .src_measurement = "",
+            .src_field = "",
             .src_tag_hash = tag_hash,
-            .src_stream = allocator.dupe(u8, src.stream) catch "",
-            .src_namespace = allocator.dupe(u8, if (src.namespace.len > 0) src.namespace else "default") catch "",
+            .src_stream = "",
+            .src_namespace = "",
             .src_poll_ms = if (src.ts_poll_interval_ms > 0) src.ts_poll_interval_ms else 1000,
             .batch_size = if (src.batch_size > 0) src.batch_size else 100,
-            .sinks = sink_configs,
+            .sinks = &.{},
             .ts_cursor_ns = 0,
             .stream_cursor_ts = 0,
             .stream_cursor_seq = 0,
             .last_poll_ms = 0,
         };
+        errdefer freePipeStateFields(allocator, &pipe);
+
+        if (sinks.len > 0) {
+            const sink_configs = try allocator.alloc(SinkConfig, sinks.len);
+            for (sink_configs, sinks) |*sc, snk| sc.* = .{ .kind = snk.kind, .required_tags = snk.required_tags, .kv_ttl_ms = snk.ttl_ms, .queue_priority = snk.priority };
+            pipe.sinks = sink_configs;
+            for (sink_configs, sinks) |*sc, snk| {
+                sc.target = try allocator.dupe(u8, snk.target);
+                sc.namespace = try allocator.dupe(u8, if (snk.namespace.len > 0) snk.namespace else "default");
+                sc.measurement = try allocator.dupe(u8, snk.ts_measurement);
+                sc.value_field = try allocator.dupe(u8, if (snk.ts_value_field.len > 0) snk.ts_value_field else "value");
+                sc.ts_tag_keys = try serializeFlatPairs(allocator, snk.ts_tag_keys);
+                sc.ts_field_keys = try serializeFlatPairs(allocator, snk.ts_field_keys);
+                sc.kv_key_prefix = try allocator.dupe(u8, snk.key_prefix);
+                sc.kv_separator = try allocator.dupe(u8, if (snk.separator.len > 0) snk.separator else ":");
+            }
+        }
+        pipe.src_measurement = try allocator.dupe(u8, src.ts_measurement);
+        pipe.src_field = try allocator.dupe(u8, if (src.ts_field.len > 0) src.ts_field else "value");
+        pipe.src_stream = try allocator.dupe(u8, src.stream);
+        pipe.src_namespace = try allocator.dupe(u8, if (src.namespace.len > 0) src.namespace else "default");
+        return pipe;
     }
 
     /// Drive all running pipelines: poll sources, push to sinks.
@@ -1764,7 +1773,6 @@ pub const ProcessingHandler = struct {
         var opt_buf: [64]u8 = undefined;
         var ob = proto.OptionsBuilder.init(&opt_buf);
         if (snk.kv_ttl_ms) |ttl_ms| ob.addU64(.ttl_ms, ttl_ms) catch {};
-        if (std.mem.eql(u8, snk.kv_write_mode, "if_absent")) ob.addFlag(.if_not_exists) catch {};
 
         const req = proto.Request{
             .header = makeSinkHeader(.kv_put),
@@ -1963,7 +1971,7 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
         .namespace = "default",
         .batch_size = 0,
     };
-    try handler.pipelines.put("job-cp", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put("job-cp", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
 
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1700, .little);
@@ -1997,7 +2005,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
         .ts_measurement = "cpu",
         .ts_field = "value",
     };
-    try handler.pipelines.put("job-ts", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put("job-ts", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
     std.mem.writeInt(u64, val[8..16], 0, .little);
@@ -2019,7 +2027,7 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     var handler = ProcessingHandler.init(allocator);
     defer handler.deinit();
     const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "default", .batch_size = 0 };
-    try handler.pipelines.put("job-fw", ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
+    try handler.pipelines.put("job-fw", try ProcessingHandler.makePipeState(allocator, &src, &.{}, 0));
     const pipe = handler.pipelines.getPtr("job-fw").?;
     pipe.stream_cursor_ts = 2000;
     pipe.stream_cursor_seq = 3;
@@ -2303,4 +2311,22 @@ test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server
         try std.testing.expect(handler.jobs.contains("job-1"));
         try std.testing.expect(!handler.pipelines.contains("job-1"));
     }
+}
+
+test "ProcessingHandler: a pipeline's copied config is freed once, and a build out of memory frees what it copied" {
+    const src = definition.SourceSpec{ .name = "s", .stream = "raw", .namespace = "app", .batch_size = 0, .ts_measurement = "cpu", .ts_field = "v" };
+    const sinks = [_]definition.SinkSpec{
+        .{ .name = "k", .kind = .kv, .target = "", .namespace = "app", .key_prefix = "user", .separator = "-", .write_mode = "upsert", .ttl_ms = null, .priority = 0 },
+        .{ .name = "t", .kind = .ts, .target = "", .namespace = "", .key_prefix = "", .separator = "", .write_mode = "upsert", .ttl_ms = null, .priority = 0, .ts_measurement = "m", .ts_tag_keys = &.{ "host", "h" }, .ts_field_keys = &.{ "load", "l" } },
+    };
+    const Build = struct {
+        fn run(allocator: Allocator, s: *const definition.SourceSpec, k: []const definition.SinkSpec) !void {
+            var pipe = try ProcessingHandler.makePipeState(allocator, s, k, 0);
+            defer ProcessingHandler.freePipeStateFields(allocator, &pipe);
+            try std.testing.expectEqualStrings("user", pipe.sinks[0].kv_key_prefix);
+            try std.testing.expectEqualStrings("-", pipe.sinks[0].kv_separator);
+            try std.testing.expectEqualStrings(":", pipe.sinks[1].kv_separator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Build.run, .{ &src, &sinks });
 }
