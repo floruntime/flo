@@ -2288,3 +2288,43 @@ test "e2e/kv: a value that isn't UTF-8 is a JSON string with U+FFFD under -o jso
     defer parsed.deinit();
     try testing.expectEqualStrings("a\u{fffd}b\"", parsed.value.object.get("value").?.string);
 }
+
+// A merge that would grow a document past the largest value a read can
+// answer is refused when it's written, so no key is stored that can't be
+// read back.
+test "e2e/kv: jset refuses a merge past the largest value" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Built up in merges: Linux caps one argument at 128 KiB, so no
+    // argument here passes 100 KB. Each merge replaces a field the document
+    // already has.
+    const filler = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'x');
+    try ctx.exec(&.{ "kv", "jset", "big", "{\"a\":\"\",\"b\":\"\",\"c\":\"\",\"d\":\"\"}" });
+    for ([_]struct { path: []const u8, len: usize }{ .{ .path = "$.a", .len = 100_000 }, .{ .path = "$.b", .len = 100_000 }, .{ .path = "$.c", .len = 51_000 } }) |part| {
+        const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..part.len]});
+        defer testing.allocator.free(more);
+        try ctx.exec(&.{ "kv", "jset", "big", more, "--path", part.path });
+    }
+    // About 251,000 bytes now, under the largest value.
+    var before = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
+    defer before.deinit();
+    try testing.expectEqual(@as(u8, 0), before.exit_code);
+    try testing.expect(before.stdout.len > 250_000);
+
+    const last = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
+    defer testing.allocator.free(last);
+    var grown = try ctx.cli.run(&.{ "kv", "jset", "big", last, "--path", "$.d" });
+    defer grown.deinit();
+    try testing.expectEqual(@as(u8, 3), grown.exit_code);
+    const want = std.fmt.comptimePrint("Error: bad request: the value to write is more than a key holds: at most {d} bytes [bad_request/field_too_long]", .{@import("src").protocol.kv_ops.MAX_VALUE});
+    try testing.expectEqualStrings(want, std.mem.trimEnd(u8, grown.stderr, "\n"));
+
+    // The document is as it was, and reads back whole.
+    var after = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
+    defer after.deinit();
+    try testing.expectEqual(@as(u8, 0), after.exit_code);
+    try testing.expectEqualStrings(before.stdout, after.stdout);
+}

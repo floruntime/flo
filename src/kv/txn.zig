@@ -37,14 +37,14 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const stdx_time = @import("stdx").time;
+const limits = @import("../protocol/limits.zig");
+const schema = @import("../protocol/schema.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
 
 // ─── Caps ─────────────────────────────────────────────────────────────────
 
-pub const MAX_OPS_PER_TXN: u16 = 256;
-pub const MAX_PAYLOAD_PER_TXN: usize = 1 * 1024 * 1024;
-/// Upper bound of `batchPayloadSize`: the key+value budget plus the fixed
-/// framing of every op (kind, flags, namespace, key len, value len, TTL).
-pub const MAX_BATCH_ENTRY_PAYLOAD: usize = 3 + MAX_OPS_PER_TXN * 20 + MAX_PAYLOAD_PER_TXN;
+pub const MAX_OPS_PER_TXN = limits.MAX_OPS_PER_TXN;
+pub const MAX_PAYLOAD_PER_TXN = limits.MAX_PAYLOAD_PER_TXN;
 pub const MAX_OPEN_TXNS: usize = 1024;
 /// A transaction isn't tied to a connection: a shell script may open it,
 /// write in it and commit it from separate `flo` runs. So the only sign its
@@ -56,13 +56,7 @@ pub const IDLE_TIMEOUT_MS: u64 = 30 * std.time.ms_per_s;
 
 // ─── Op record ────────────────────────────────────────────────────────────
 
-pub const TxnOpKind = enum(u8) {
-    put = 1,
-    delete = 2,
-    incr = 3,
-    touch = 4,
-    persist = 5,
-};
+pub const TxnOpKind = kv_entries.BatchKind;
 
 /// One buffered op inside a transaction. Owns the key and value bytes.
 pub const TxnOp = struct {
@@ -70,14 +64,13 @@ pub const TxnOp = struct {
     /// Namespace-qualified key (already prefixed with `namespace\0`).
     key: []u8,
     /// Op-specific value bytes:
-    ///   put     → arbitrary value
-    ///   delete  → empty
-    ///   incr    → 8-byte i64 LE delta
-    ///   touch   → 8-byte u64 LE TTL in milliseconds (0 = clear)
-    ///   persist → empty (equivalent to touch with a TTL of 0)
+    ///   put    → arbitrary value
+    ///   delete → empty
+    ///   incr   → 8-byte i64 LE delta
+    ///   expire → empty
     value: []u8,
-    /// TTL in milliseconds for a put, counted from the batch's stamp at
-    /// apply. 0 = no TTL. Only meaningful for `kind == .put`.
+    /// TTL in milliseconds, counted from the batch's stamp at apply: a
+    /// put's (0 = none) or an expire's (0 = clear it).
     ttl_ms: u64,
 };
 
@@ -288,141 +281,45 @@ pub const TxnTable = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// kv_batch UAL entry payload codec
+// The commit's log entry
 // ═══════════════════════════════════════════════════════════════════════════════
-//
-// One `kv_batch` UAL entry carries a serialized list of TxnOps. The format
-// reuses the same shape as `CommandPayload` (namespace_hash + key + value)
-// per op so the projection apply path can reuse familiar primitives.
-//
-// Layout:
-//   [version: u8]            // 1 — bump if format changes
-//   [op_count: u16 LE]
-//   for each op:
-//     [kind: u8]             // TxnOpKind
-//     [flags: u8]            // bit 0 = HAS_TTL (ttl_ms appended after value)
-//     [namespace_hash: u32 LE]
-//     [key_len: u16 LE]
-//     [val_len: u32 LE]
-//     [key bytes]
-//     [val bytes]
-//     [ttl_ms: u64 LE]       // only if flags & HAS_TTL
 
-pub const BATCH_VERSION: u8 = 1;
-pub const FLAG_HAS_TTL: u8 = 0x01;
-
-/// Compute the serialized size of a batch payload for `ops`.
-pub fn batchPayloadSize(ops: []const TxnOp) usize {
-    var size: usize = 1 + 2; // version + op_count
-    for (ops) |op| {
-        size += 1 + 1 + 4 + 2 + 4 + op.key.len + op.value.len;
-        if (op.kind == .put and op.ttl_ms != 0) size += 8;
-    }
-    return size;
+// The batch's only field is its op list, so the list's encoding is the
+// whole payload.
+comptime {
+    std.debug.assert(kv_entries.Batch.field_list.len == 1 and kv_entries.Batch.field_list[0].T == kv_entries.BatchOps);
 }
 
-/// Serialize `ops` into `buf`. `namespace_hash` is the same for every op in
-/// a single-shard txn (the txn is pinned to one partition). Returns bytes written.
-pub fn serializeBatch(buf: []u8, namespace_hash: u32, ops: []const TxnOp) !usize {
-    const need = batchPayloadSize(ops);
-    if (buf.len < need) return error.BufferTooSmall;
-    var off: usize = 0;
-
-    buf[off] = BATCH_VERSION;
-    off += 1;
-    std.mem.writeInt(u16, buf[off..][0..2], @intCast(ops.len), .little);
-    off += 2;
-
-    for (ops) |op| {
-        const has_ttl = op.kind == .put and op.ttl_ms != 0;
-        buf[off] = @backingInt(op.kind);
-        off += 1;
-        buf[off] = if (has_ttl) FLAG_HAS_TTL else 0;
-        off += 1;
-        std.mem.writeInt(u32, buf[off..][0..4], namespace_hash, .little);
-        off += 4;
-        std.mem.writeInt(u16, buf[off..][0..2], @intCast(op.key.len), .little);
-        off += 2;
-        std.mem.writeInt(u32, buf[off..][0..4], @intCast(op.value.len), .little);
-        off += 4;
-        @memcpy(buf[off..][0..op.key.len], op.key);
-        off += op.key.len;
-        @memcpy(buf[off..][0..op.value.len], op.value);
-        off += op.value.len;
-        if (has_ttl) {
-            std.mem.writeInt(u64, buf[off..][0..8], op.ttl_ms, .little);
-            off += 8;
-        }
+/// A commit's `kv.batch` payload for `ops`, allocated. An op that breaks
+/// its kind's rule is a bug in buffering, refused here rather than logged.
+pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {
+    const values = try allocator.alloc(kv_entries.BatchOp.Value, ops.len);
+    defer allocator.free(values);
+    for (ops, values) |op, *v| {
+        v.* = batchOp(op);
+        if (kv_entries.batchOpRule(v.*) != null) return error.InvalidBatch;
     }
-    return off;
+    var counter: schema.Writer = .{ .buf = &.{}, .counting = true };
+    try kv_entries.BatchOps.encodeSlice(&counter, values);
+    const buf = try allocator.alloc(u8, counter.pos);
+    errdefer allocator.free(buf);
+    var w: schema.Writer = .{ .buf = buf };
+    try kv_entries.BatchOps.encodeSlice(&w, values);
+    return buf;
 }
 
-/// One op recovered from a batched UAL entry. Slices borrow into the entry payload.
-pub const BatchedOp = struct {
-    kind: TxnOpKind,
-    namespace_hash: u32,
-    key: []const u8,
-    value: []const u8,
-    /// TTL in milliseconds from the batch's stamp. 0 = no TTL. Only
-    /// meaningful for `.put`.
-    ttl_ms: u64,
-};
-
-pub const BatchIterator = struct {
-    payload: []const u8,
-    off: usize,
-    remaining: u16,
-
-    pub fn next(self: *BatchIterator) ?BatchedOp {
-        if (self.remaining == 0) return null;
-        if (self.off + 1 + 1 + 4 + 2 + 4 > self.payload.len) return null;
-
-        const kind_raw = self.payload[self.off];
-        self.off += 1;
-        const flags = self.payload[self.off];
-        self.off += 1;
-        const ns_hash = std.mem.readInt(u32, self.payload[self.off..][0..4], .little);
-        self.off += 4;
-        const key_len = std.mem.readInt(u16, self.payload[self.off..][0..2], .little);
-        self.off += 2;
-        const val_len = std.mem.readInt(u32, self.payload[self.off..][0..4], .little);
-        self.off += 4;
-
-        if (self.off + key_len + val_len > self.payload.len) return null;
-        const key = self.payload[self.off .. self.off + key_len];
-        self.off += key_len;
-        const value = self.payload[self.off .. self.off + val_len];
-        self.off += val_len;
-
-        var ttl_ms: u64 = 0;
-        if (flags & FLAG_HAS_TTL != 0) {
-            if (self.off + 8 > self.payload.len) return null;
-            ttl_ms = std.mem.readInt(u64, self.payload[self.off..][0..8], .little);
-            self.off += 8;
-        }
-
-        const kind: TxnOpKind = std.enums.fromInt(TxnOpKind, kind_raw) orelse return null;
-        self.remaining -= 1;
-        return .{
-            .kind = kind,
-            .namespace_hash = ns_hash,
-            .key = key,
-            .value = value,
-            .ttl_ms = ttl_ms,
-        };
+fn batchOp(op: TxnOp) kv_entries.BatchOp.Value {
+    var v: kv_entries.BatchOp.Value = .{ .kind = op.kind, .key = op.key, .value = null, .ttl_ms = null, .delta = null };
+    switch (op.kind) {
+        .put => {
+            v.value = op.value;
+            if (op.ttl_ms != 0) v.ttl_ms = op.ttl_ms;
+        },
+        .delete => {},
+        .incr => v.delta = if (op.value.len == 8) std.mem.readInt(i64, op.value[0..8], .little) else null,
+        .expire => v.ttl_ms = op.ttl_ms,
     }
-};
-
-/// Open an iterator over a kv_batch UAL entry payload. Returns null if the
-/// payload is malformed at the header.
-pub fn iterateBatch(payload: []const u8) ?BatchIterator {
-    if (payload.len < 1 + 2) return null;
-    if (payload[0] != BATCH_VERSION) {
-        log.err("kv_batch: unsupported version {d}", .{payload[0]});
-        return null;
-    }
-    const count = std.mem.readInt(u16, payload[1..3], .little);
-    return .{ .payload = payload, .off = 3, .remaining = count };
+    return v;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -519,47 +416,38 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
     try t.expectEqual(@as(usize, 2), tt.count());
 }
 
-test "kv_batch: serializeBatch / iterateBatch round-trip" {
+test "kv_batch: a commit's ops decode from its payload as they were buffered" {
     const t = std.testing;
-
-    var ops: [3]TxnOp = .{
-        .{ .kind = .put, .key = @constCast("default\x00alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
-        .{ .kind = .delete, .key = @constCast("default\x00beta"), .value = @constCast(""), .ttl_ms = 0 },
-        .{ .kind = .incr, .key = @constCast("default\x00counter"), .value = @constCast("\x07\x00\x00\x00\x00\x00\x00\x00"), .ttl_ms = 0 },
+    var ops: [4]TxnOp = .{
+        .{ .kind = .put, .key = @constCast("ns\x00alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
+        .{ .kind = .delete, .key = @constCast("beta"), .value = @constCast(""), .ttl_ms = 0 },
+        .{ .kind = .incr, .key = @constCast("counter"), .value = @constCast("\xf9\xff\xff\xff\xff\xff\xff\xff"), .ttl_ms = 0 },
+        .{ .kind = .expire, .key = @constCast("gamma"), .value = @constCast(""), .ttl_ms = 0 },
     };
-
-    const need = batchPayloadSize(&ops);
-    const buf = try t.allocator.alloc(u8, need);
-    defer t.allocator.free(buf);
-
-    const written = try serializeBatch(buf, 0xCAFEBABE, &ops);
-    try t.expectEqual(need, written);
-
-    var it = iterateBatch(buf[0..written]).?;
-
-    const a = it.next().?;
+    const payload = try encodeBatch(t.allocator, &ops);
+    defer t.allocator.free(payload);
+    var diag: schema.Diagnostic = .{};
+    const batch = try kv_entries.Batch.decodeAll(payload, &diag);
+    var it = batch.ops.iterator();
+    const a = (try it.next()).?;
     try t.expectEqual(TxnOpKind.put, a.kind);
-    try t.expectEqualStrings("default\x00alpha", a.key);
-    try t.expectEqualStrings("hello", a.value);
-    try t.expectEqual(@as(u64, 1_000), a.ttl_ms);
-    try t.expectEqual(@as(u32, 0xCAFEBABE), a.namespace_hash);
-
-    const b = it.next().?;
+    try t.expectEqualStrings("ns\x00alpha", a.key);
+    try t.expectEqualStrings("hello", a.value.?);
+    try t.expectEqual(@as(?u64, 1_000), a.ttl_ms);
+    const b = (try it.next()).?;
     try t.expectEqual(TxnOpKind.delete, b.kind);
-    try t.expectEqualStrings("default\x00beta", b.key);
-    try t.expectEqual(@as(u64, 0), b.ttl_ms);
-
-    const c = it.next().?;
-    try t.expectEqual(TxnOpKind.incr, c.kind);
-    try t.expectEqual(@as(usize, 8), c.value.len);
-
-    try t.expectEqual(@as(?BatchedOp, null), it.next());
+    try t.expectEqual(@as(?[]const u8, null), b.value);
+    const c = (try it.next()).?;
+    try t.expectEqual(@as(?i64, -7), c.delta);
+    const d = (try it.next()).?;
+    try t.expectEqual(TxnOpKind.expire, d.kind);
+    try t.expectEqual(@as(?u64, 0), d.ttl_ms);
+    try t.expectEqual(@as(?kv_entries.BatchOp.Value, null), try it.next());
 }
 
-test "iterateBatch rejects unknown version" {
-    const t = std.testing;
-    const bad = [_]u8{ 99, 0, 0 };
-    try t.expectEqual(@as(?BatchIterator, null), iterateBatch(&bad));
+test "kv_batch: an op that breaks its kind's rule is refused, not logged" {
+    var ops = [_]TxnOp{.{ .kind = .incr, .key = @constCast("k"), .value = @constCast(""), .ttl_ms = 0 }};
+    try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, &ops));
 }
 
 test "txn: an id names its shard" {

@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("ual/entry.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
 const ual_mod = @import("ual/ual.zig");
 const tombstones = @import("tombstones.zig");
 const snapshot_mod = @import("snapshot.zig");
@@ -408,6 +409,14 @@ test "partition: init and deinit" {
     try testing.expectEqual(@as(u64, 0), part.entryCount());
 }
 
+/// KV entry `entry_type` carrying `payload`, at `index`, stamped `ts`.
+fn kvTestEntry(buf: []u8, comptime entry_type: EntryType, payload: kv_entries.Payload(@backingInt(entry_type)).Value, index: u64, ts: u64) entry_mod.Entry {
+    const bytes = kv_entries.Payload(@backingInt(entry_type)).encodeInto(buf, payload) catch unreachable;
+    var e = entry_mod.buildEntry(entry_type, entry_mod.Flags.NONE, 1, index, ts, bytes);
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
 test "partition: apply and read entries" {
     const allocator = testing.allocator;
 
@@ -415,9 +424,9 @@ test "partition: apply and read entries" {
     defer part.deinit();
     part.wireProjections();
 
-    // Apply a KV put (use CommandPayload format so projection can parse)
+    // Apply a KV put
     var payload_buf: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "key1", "val1", &payload_buf) orelse unreachable;
+    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "key1", .value = "val1", .ttl_ms = null }, 1, 1000);
     const idx1 = try part.apply(&e1);
     try testing.expectEqual(@as(u64, 1), idx1);
 
@@ -444,9 +453,9 @@ test "partition: KV projection wired through router" {
     defer part.deinit();
     part.wireProjections();
 
-    // Apply a KV put with proper CommandPayload
+    // Apply a KV put
     var payload_buf: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "mykey", "myvalue", &payload_buf) orelse unreachable;
+    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "mykey", .value = "myvalue", .ttl_ms = null }, 1, 1000);
     _ = try part.apply(&e1);
 
     // Verify the KV projection received the entry
@@ -464,13 +473,13 @@ test "partition: KV put then delete" {
 
     // Put
     var buf1: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k", "v", &buf1) orelse unreachable;
+    const e1 = kvTestEntry(&buf1, .kv_put, .{ .key = "k", .value = "v", .ttl_ms = null }, 1, 1000);
     _ = try part.apply(&e1);
     try testing.expect(part.kvGet("k") != null);
 
     // Delete
     var buf2: [128]u8 = undefined;
-    const e2 = entry_mod.buildCommandEntry(.kv_delete, 0, 1, 2, 2000, 0, "k", "", &buf2) orelse unreachable;
+    const e2 = kvTestEntry(&buf2, .kv_delete, .{ .key = "k" }, 2, 2000);
     _ = try part.apply(&e2);
     try testing.expect(part.kvGet("k") == null);
 }
@@ -498,7 +507,7 @@ test "partition: idempotent apply" {
     part.wireProjections();
 
     var buf: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k", "v", &buf) orelse unreachable;
+    const e1 = kvTestEntry(&buf, .kv_put, .{ .key = "k", .value = "v", .ttl_ms = null }, 1, 1000);
     _ = try part.apply(&e1);
 
     // Apply same entry again — projection router should skip it
@@ -517,11 +526,11 @@ test "partition: snapshot and recover" {
     part.wireProjections();
 
     var buf1: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "k1", "v1", &buf1) orelse unreachable;
+    const e1 = kvTestEntry(&buf1, .kv_put, .{ .key = "k1", .value = "v1", .ttl_ms = null }, 1, 1000);
     _ = try part.apply(&e1);
 
     var buf2: [128]u8 = undefined;
-    const e2 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 2, 2000, 0, "k2", "v2", &buf2) orelse unreachable;
+    const e2 = kvTestEntry(&buf2, .kv_put, .{ .key = "k2", .value = "v2", .ttl_ms = null }, 2, 2000);
     _ = try part.apply(&e2);
 
     // Take snapshot
@@ -569,7 +578,7 @@ test "partition: projection memory tracking" {
     part.wireProjections();
 
     var buf: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.kv_put, 0, 1, 1, 1000, 0, "key", "val", &buf) orelse unreachable;
+    const e1 = kvTestEntry(&buf, .kv_put, .{ .key = "key", .value = "val", .ttl_ms = null }, 1, 1000);
     _ = try part.apply(&e1);
 
     try testing.expect(part.projectionMemory() > 0);

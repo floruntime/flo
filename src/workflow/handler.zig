@@ -4316,7 +4316,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.partitions = partitions;
     shard.replay_registry = .{};
     actions.registerReplay(&shard.replay_registry);
-    shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
+    shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../protocol/limits.zig").MAX_LOG_ENTRY_PAYLOAD);
     shard.entry_buf = try std.testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
     shard.scratch = try @import("../node/scratch.zig").Scratch.init(std.testing.allocator, shard_mod.SCRATCH_SIZE);
     shard.durability = .async_flush;
@@ -4528,7 +4528,7 @@ test "a step whose child run the log dropped fails once the child's start index 
 
     // Parked on a child whose start is at an index this shard has applied
     // but which created no run, as when a lost leadership truncated it.
-    const proposed = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "v");
+    const proposed = try @import("../kv/handler.zig").KVHandler.testProposePut(&shard, "k", "v");
     _ = shard.applyCommitted();
     const run = handler.runs.getPtr("default:run-c").?;
     handler.parkForChild(run, "gone", "start", "child-wf", shard.id, 0, proposed.index);

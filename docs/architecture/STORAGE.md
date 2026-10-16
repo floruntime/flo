@@ -67,7 +67,7 @@ Every UAL entry has a 40-byte header followed by a variable-length payload:
 
 The `entry_type` field tells you what kind of mutation this is: `kv_put`, `queue_enqueue`, `stream_append`, `ts_write`, `raft_noop`, and so on — around 30 types total, with room for more. The CRC covers the header and payload together.
 
-Payload layout varies by entry type. For KV operations, the payload is a `CommandPayload` with key length, value length, namespace hash, and then the key and value bytes inline. For queue operations, it includes priority and delay metadata. The projections know how to parse their own payloads.
+Payload layout varies by entry type. KV entries are declared as schemas in the entry table (`protocol/kv_entries.zig`): a put carries the namespace-qualified key, the value and an optional TTL in milliseconds from the entry's stamp; a transaction's batch carries its ops as a list. Other families use a `CommandPayload` with key length, value length, namespace hash, and then the key and value bytes inline. For queue operations, it includes priority and delay metadata. The projections know how to parse their own payloads.
 
 ### Two-Tier Storage
 
@@ -128,7 +128,7 @@ Every committed entry goes through the **Projection Router**, which dispatches b
 
 The KV projection maintains a hash table mapping keys to values, plus MVCC version tracking and TTL expiry management.
 
-When a `kv_put` entry is applied, the projection parses the `CommandPayload` to extract the key, value, namespace hash, and optional expiry timestamp. It upserts into the hash table and pushes the previous value onto a version chain (bounded ring buffer, default 8 versions per key). If the entry includes a TTL, the key is registered in the TTL tracker for future expiry.
+When a `kv_put` entry is applied, the projection decodes it whole to get the key, value and optional TTL, and computes the expiry from the entry's stamp. It upserts into the hash table and pushes the previous value onto a version chain (bounded ring buffer, default 8 versions per key). If the entry includes a TTL, the key is registered in the TTL tracker for future expiry.
 
 A `kv_delete` entry removes the key from the hash table and records a tombstone version.
 
@@ -185,7 +185,7 @@ The router is the single fan-out point between the UAL and the projections. When
 
 1. Is `entry.index <= applied_index`? If yes, skip (idempotent replay guard).
 2. What's the entry type? Route to the appropriate projection:
-   - `kv_put`, `kv_delete`, `kv_batch`, `cg_*` → KV Projection
+   - `kv_put`, `kv_delete`, `kv_batch`, `kv_incr`, `kv_expire` → KV Projection
    - `queue_enqueue`, `queue_ack`, `queue_requeue` → Queue Projection
    - `ts_write`, `ts_write_batch` → TS Projection
    - `stream_append` → Nothing (data stays in UAL)

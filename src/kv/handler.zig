@@ -45,6 +45,7 @@ const txn_mod = @import("./txn.zig");
 const kv_ops = @import("../protocol/kv_ops.zig");
 const ops = @import("../protocol/ops.zig");
 const schema = @import("../protocol/schema.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
 const json_path = @import("../util/json_path.zig");
 const json_depth = @import("../util/json_depth.zig");
 const table_run = @import("../node/table_run.zig");
@@ -63,13 +64,9 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const RaftNetwork = network_mode.RaftNetwork;
 
-/// Max serialized payload for a UAL entry (key + value + command prefix + TTL).
-pub const MAX_ENTRY_PAYLOAD = 256 * 1024 + 64;
-/// The largest entry any handler proposes: a full transaction batch. The
-/// shard's apply buffer and the Raft ring floor are both sized from it,
-/// because an entry that fits the ring but not the buffer would be acked
-/// and never applied.
-pub const MAX_APPLY_PAYLOAD: usize = @max(MAX_ENTRY_PAYLOAD, txn_mod.MAX_BATCH_ENTRY_PAYLOAD);
+/// The largest single-key KV entry, a put: what `proposeKV` borrows
+/// scratch for. A transaction's batch is larger and allocated.
+pub const MAX_KEY_ENTRY_PAYLOAD: usize = kv_entries.Put.max_size;
 
 /// Re-export from centralized namespace module for local convenience.
 const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
@@ -215,7 +212,7 @@ pub const KVHandler = struct {
             error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
             error.AnswerTooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the JSON at that path is more than an answer holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
-            error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key and value are too large to write: at most {d} bytes together", .{MAX_ENTRY_PAYLOAD})),
+            error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the value to write is more than a key holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
             error.NotACounter => refused(.bad_request, .wrong_type, "bad request: the key's value isn't an 8-byte counter"),
             error.CounterOverflow => refused(.bad_request, .out_of_range, "bad request: delta would take the counter past an i64"),
             error.PathNotFound => refused(.not_found, .not_found, "not found: nothing at that path in the document"),
@@ -266,7 +263,7 @@ pub const KVHandler = struct {
                 // Not committed, so no version yet.
                 .put => return .{ .answer = .{ .version = 0, .value = last.value } },
                 // Their value isn't the key's: read what's committed.
-                .touch, .persist, .incr => {},
+                .expire, .incr => {},
             };
         }
         const current = kv.get(qkey);
@@ -323,7 +320,7 @@ pub const KVHandler = struct {
             try bufferInTxn(shard, t, qkey, .put, value, ttl);
             return .{ .answer = .{ .version = null } };
         }
-        const proposed = proposeKV(shard, .kv_put, req, qkey, value, ttl) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = if (ttl == 0) null else ttl }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondSet } };
     }
 
@@ -416,7 +413,7 @@ pub const KVHandler = struct {
             return .{ .answer = .{ .existed = null } };
         }
         if (current == null) return .{ .answer = .{ .existed = false } };
-        const proposed = proposeKV(shard, .kv_delete, req, qkey, "", 0) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondDeleted } };
     }
 
@@ -601,7 +598,7 @@ pub const KVHandler = struct {
             try bufferInTxn(shard, t, qkey, .incr, &delta_bytes, 0);
             return .{ .answer = .{ .version = null, .value = null } };
         }
-        const proposed = proposeKV(shard, .kv_incr, req, qkey, &delta_bytes, 0) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_incr, .{ .key = qkey, .delta = delta }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondIncr } };
     }
 
@@ -636,13 +633,11 @@ pub const KVHandler = struct {
         const qkey = try tableKey(&qbuf, req);
         const current = shard.kv_handler.*.kv.get(qkey) orelse return error.NotFound;
         if (cas_version) |want| if (current.version != want) return error.CasMismatch;
-        var ttl_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &ttl_bytes, ttl_ms, .little);
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, if (ttl_ms == 0) .persist else .touch, &ttl_bytes, 0);
+            try bufferInTxn(shard, t, qkey, .expire, "", ttl_ms);
             return .{ .answer = .{} };
         }
-        const proposed = proposeKV(shard, .kv_touch, req, qkey, &ttl_bytes, 0) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_expire, .{ .key = qkey, .ttl_ms = ttl_ms }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondExpired } };
     }
 
@@ -668,7 +663,7 @@ pub const KVHandler = struct {
             if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
                 .delete => return .{ .answer = .{ .exists = false, .version = 0 } },
                 .put => return .{ .answer = .{ .exists = true, .version = 0 } },
-                .touch, .persist, .incr => {},
+                .expire, .incr => {},
             };
         }
         const e = shard.kv_handler.*.kv.get(qkey) orelse return .{ .answer = .{ .exists = false, .version = 0 } };
@@ -717,7 +712,7 @@ pub const KVHandler = struct {
         else
             return error.NotFound;
         defer self.allocator.free(merged);
-        const proposed = proposeKV(shard, .kv_put, req, qkey, merged, 0) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = merged, .ttl_ms = null }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondJsonSet } };
     }
 
@@ -746,12 +741,12 @@ pub const KVHandler = struct {
         const self = shard.kv_handler;
         const e = self.kv.get(qkey) orelse return error.NotFound;
         if (std.mem.eql(u8, path, "$")) {
-            const proposed = proposeKV(shard, .kv_delete, req, qkey, "", 0) catch |err| return proposeError(err);
+            const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
             return .{ .park = .{ .proposed = proposed, .responder = respondJsonDel } };
         }
         const rest = json_path.jsonPathDel(self.allocator, e.value, path) catch |err| return jsonError(err);
         defer self.allocator.free(rest);
-        const proposed = proposeKV(shard, .kv_put, req, qkey, rest, 0) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = rest, .ttl_ms = null }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .responder = respondJsonDel } };
     }
 
@@ -796,10 +791,9 @@ pub const KVHandler = struct {
             self.txn_table.drop(txn);
             return .{ .answer = .{ .commit_index = shard.raft_node.commit_index, .ops = 0 } };
         }
-        const payload = self.allocator.alloc(u8, txn_mod.batchPayloadSize(t.ops.items)) catch return error.Internal;
+        const payload = txn_mod.encodeBatch(self.allocator, t.ops.items) catch return error.Internal;
         defer self.allocator.free(payload);
-        const written = txn_mod.serializeBatch(payload, t.namespace_hash, t.ops.items) catch return error.Internal;
-        const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload[0..written]) catch |err| return proposeError(err);
+        const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload) catch |err| return proposeError(err);
         // The transaction stays until its batch applies, and the responder
         // drops it; until then a second commit would propose it again.
         t.committing = true;
@@ -907,44 +901,34 @@ pub const KVHandler = struct {
 
     // ── Raft Propose ────────────────────────────────────────────────────
 
-    /// Propose a KV entry; `ttl_ms` applies to a put, 0 for none.
+    /// Propose KV entry `entry_type` carrying `payload`. A value past what
+    /// a read can answer is refused here, so nothing is stored that can't
+    /// be read back.
     fn proposeKV(
         shard: *Shard,
-        entry_type: entry_mod.EntryType,
-        req: Request,
-        qualified_key: []const u8,
-        value: []const u8,
-        ttl_ms: u64,
+        comptime entry_type: entry_mod.EntryType,
+        payload: kv_entries.Payload(@backingInt(entry_type)).Value,
     ) !@import("../raft/node.zig").ProposeResult {
-        // Build CommandPayload (namespace_hash:4 + key_len:2 + val_len:4 + key + value)
-        const cmd = entry_mod.CommandPayload{
-            .namespace_hash = router.namespaceHash(req.namespace),
-            .key_length = @intCast(qualified_key.len),
-            .value_length = @intCast(value.len),
-            .key = qualified_key,
-            .value = value,
+        const P = kv_entries.Payload(@backingInt(entry_type));
+        comptime std.debug.assert(P.max_size <= MAX_KEY_ENTRY_PAYLOAD);
+        const size = P.encodedSize(payload) catch |err| return encodeError(err);
+        const buf = shard.scratch.borrow(size);
+        defer shard.scratch.release(buf);
+        const bytes = P.encodeInto(buf, payload) catch |err| return encodeError(err);
+        return try shard.raft_node.propose(entry_type, entry_mod.Flags.NONE, bytes);
+    }
+
+    /// For tests: propose a put of `value` at `key` in the default
+    /// namespace, as kv.set would.
+    pub fn testProposePut(shard: *Shard, key: []const u8, value: []const u8) !@import("../raft/node.zig").ProposeResult {
+        return proposeKV(shard, .kv_put, .{ .key = key, .value = value, .ttl_ms = null });
+    }
+
+    fn encodeError(err: schema.EncodeError) error{ PayloadTooLarge, TtlTooLarge } {
+        return switch (err) {
+            error.TooLong, error.NoSpaceLeft => error.PayloadTooLarge,
+            error.OutOfRange => error.TtlTooLarge,
         };
-        const has_ttl = entry_type == .kv_put and ttl_ms > 0;
-        const size = cmd.serializedSize() + if (has_ttl) @as(usize, 8) else 0;
-        if (size > MAX_ENTRY_PAYLOAD) return error.PayloadTooLarge;
-        const payload_buf = shard.scratch.borrow(size);
-        defer shard.scratch.release(payload_buf);
-        var payload_len = cmd.serialize(payload_buf).?; // sized above
-
-        // Set flags and append TTL if present
-        var flags: u16 = entry_mod.Flags.NONE;
-        if (entry_type == .kv_delete) {
-            flags |= entry_mod.Flags.TOMBSTONE;
-        }
-
-        if (has_ttl) {
-            flags |= entry_mod.Flags.HAS_TTL;
-            if (time_units.msToNs(ttl_ms) == null) return error.TtlTooLarge;
-            std.mem.writeInt(u64, payload_buf[payload_len..][0..8], ttl_ms, .little);
-            payload_len += 8;
-        }
-
-        return try shard.raft_node.propose(entry_type, flags, payload_buf[0..payload_len]);
     }
 
     /// Transaction `txn_id`, if it is open and was begun in `namespace`.
