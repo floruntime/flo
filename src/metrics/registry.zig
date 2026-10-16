@@ -580,6 +580,13 @@ pub const ShardMetrics = struct {
     cross_shard_timeouts: Atomic(u64) = Atomic(u64).init(0),
     /// Gathers ended because a part went unanswered past its deadline.
     gather_timeouts: Atomic(u64) = Atomic(u64).init(0),
+    /// Raft frames dropped as from a node no config names; rounds asking
+    /// members for their committed config; vouches taken; and the index of
+    /// the vouched config while it holds (0 for none).
+    stranger_frames_dropped: Atomic(u64) = Atomic(u64).init(0),
+    vouch_asks: Atomic(u64) = Atomic(u64).init(0),
+    vouches_taken: Atomic(u64) = Atomic(u64).init(0),
+    vouched_config_index: Atomic(u64) = Atomic(u64).init(0),
     /// How long the oldest unanswered request to another shard has waited,
     /// in seconds, blocking reads aside, as of the last sweep.
     oldest_cross_shard_wait_s: Atomic(u64) = Atomic(u64).init(0),
@@ -683,6 +690,13 @@ pub const ShardMetrics = struct {
         _ = self.gather_timeouts.fetchAdd(1, .monotonic);
     }
 
+    pub fn setVouch(self: *ShardMetrics, strangers: u64, asks: u64, taken: u64, vouched_index: u64) void {
+        self.stranger_frames_dropped.store(strangers, .monotonic);
+        self.vouch_asks.store(asks, .monotonic);
+        self.vouches_taken.store(taken, .monotonic);
+        self.vouched_config_index.store(vouched_index, .monotonic);
+    }
+
     pub fn setConnectionsPaused(self: *ShardMetrics, counts: [PAUSE_REASONS.len]u64) void {
         for (counts, &self.connections_paused) |n, *g| g.store(n, .monotonic);
     }
@@ -739,6 +753,10 @@ pub const ShardMetrics = struct {
         kv_txns_reaped: u64,
         cross_shard_timeouts: u64,
         gather_timeouts: u64,
+        stranger_frames_dropped: u64,
+        vouch_asks: u64,
+        vouches_taken: u64,
+        vouched_config_index: u64,
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
         stamp_skew_ms: i64,
@@ -769,6 +787,10 @@ pub const ShardMetrics = struct {
             .kv_txns_reaped = self.kv_txns_reaped.load(.monotonic),
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
             .gather_timeouts = self.gather_timeouts.load(.monotonic),
+            .stranger_frames_dropped = self.stranger_frames_dropped.load(.monotonic),
+            .vouch_asks = self.vouch_asks.load(.monotonic),
+            .vouches_taken = self.vouches_taken.load(.monotonic),
+            .vouched_config_index = self.vouched_config_index.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
             .stamp_skew_ms = self.stamp_skew_ms.load(.monotonic),
             .silent_loss = blk: {
@@ -1507,6 +1529,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     }
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"gather\"}} {d}\n", .{ snap.shard_id, snap.gather_timeouts });
+    try writer.print("flo_shard_raft_stranger_frames_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stranger_frames_dropped });
+    try writer.print("flo_shard_raft_vouch_asks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.vouch_asks });
+    try writer.print("flo_shard_raft_vouches_taken_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.vouches_taken });
+    try writer.print("flo_shard_raft_vouched_config_index{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.vouched_config_index });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
     const rinfo = @typeInfo(ShardMetrics.RemovalOutcome).@"enum";

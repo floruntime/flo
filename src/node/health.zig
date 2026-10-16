@@ -116,6 +116,11 @@ pub const ShardSlot = struct {
     reason_len: Atomic(u16) = .init(0),
     reason_buf: [REASON_MAX]u8 = undefined,
     removal: Removal = .{},
+    /// The committed config a member vouched for, while it is newer than
+    /// this shard's own (0 for none); and whether the shard is dropping a
+    /// stranger's frames with no leader heard, the stuck-member symptom.
+    vouched_index: Atomic(u64) = .init(0),
+    strangers_while_quiet: Atomic(bool) = .init(false),
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -123,6 +128,11 @@ pub const ShardSlot = struct {
 
     pub fn set(self: *ShardSlot, state: ShardState) void {
         self.state.store(@backingInt(state), .release);
+    }
+
+    pub fn publishVouch(self: *ShardSlot, vouched_index: u64, strangers_while_quiet: bool) void {
+        self.vouched_index.store(vouched_index, .monotonic);
+        self.strangers_while_quiet.store(strangers_while_quiet, .monotonic);
     }
 
     pub fn publish(self: *ShardSlot, state: ShardState, role: Role, last_applied: u64, commit_index: u64) void {
@@ -208,6 +218,9 @@ pub const NodeHealth = struct {
                 }
                 try w.writeAll("]}");
             }
+            const vouched = s.vouched_index.load(.monotonic);
+            if (vouched != 0) try w.print(",\"vouched_index\":{d}", .{vouched});
+            if (s.strangers_while_quiet.load(.monotonic)) try w.writeAll(",\"strangers_while_quiet\":true");
             try w.print(",\"last_applied\":{d},\"commit_index\":{d},\"role\":\"{s}\",\"losses\":{{", .{ s.last_applied.load(.monotonic), s.commit_index.load(.monotonic), @tagName(role) });
             const sm = if (registry) |reg| reg.shardMetrics(@intCast(i)) else null;
             inline for (@typeInfo(silent_loss.Path).@"enum".field_names, 0..) |name, p| {
@@ -289,6 +302,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     h.shards[1].setReason("segment 00000001.flseg failed its \"checksum\"");
     h.shards[1].setReason("a later reason is not kept");
     h.shards[1].publish(.offline, .follower, 4, 4);
+    h.shards[1].publishVouch(3726, true);
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -309,11 +323,15 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqual(@as(i64, 10), s0.get("last_applied").?.integer);
     try testing.expectEqual(@as(i64, 12), s0.get("commit_index").?.integer);
     try testing.expect(s0.get("reason") == null);
+    try testing.expect(s0.get("vouched_index") == null);
+    try testing.expect(s0.get("strangers_while_quiet") == null);
     try testing.expectEqual(@as(usize, silent_loss.PATH_COUNT), s0.get("losses").?.object.count());
 
     const s1 = shards[1].object;
     try testing.expectEqualStrings("offline", s1.get("state").?.string);
     try testing.expectEqualStrings("segment 00000001.flseg failed its \"checksum\"", s1.get("reason").?.string);
+    try testing.expectEqual(@as(i64, 3726), s1.get("vouched_index").?.integer);
+    try testing.expect(s1.get("strangers_while_quiet").?.bool);
     try testing.expectEqual(@as(i64, 3), s1.get("losses").?.object.get("segment_unreadable").?.integer);
     // A repeated index is shown beside the losses, not among them.
     try testing.expectEqual(@as(i64, 0), s0.get("duplicate_index").?.integer);

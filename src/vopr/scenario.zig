@@ -55,6 +55,9 @@ pub const DurabilityMode = enum {
 /// head mid-apply.
 pub const MAX_BATCH: u32 = 64;
 
+/// The outsider takes the id after the members', within the network's 8.
+pub const MAX_NODES_WITH_OUTSIDER: u8 = 7;
+
 pub const Scenario = struct {
     seed: u64,
 
@@ -131,6 +134,14 @@ pub const Scenario = struct {
     /// and now and then one steps by up to this much: what the leader's
     /// stamps must stay ordered through.
     clock_skew_ms: u32 = 0,
+    /// A node with the cluster secret but no seat (id `node_count + 1`):
+    /// per tick, at this chance, it sends a member a vote request at a
+    /// raised term, skipping pre-vote, or an append claiming to lead, with
+    /// a real member's history as its prefix (a removed member's log) and
+    /// forged entries after it, or a term check. It speaks under its own
+    /// id: any holder of the secret can also link as a member's id, which
+    /// no frame guard stops, and this mode doesn't try.
+    outsider_permille: u16 = 0,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -202,6 +213,16 @@ pub const Scenario = struct {
         s.partition_permille = @max(s.partition_permille, 3);
         s.crash_permille = @max(s.crash_permille, 2);
         s.restart_permille = @max(s.restart_permille, 20);
+        return s;
+    }
+
+    /// The outsider slice: same sampling as `fromSeed`, at most seven
+    /// members so the outsider has an id, and an outsider busy enough to
+    /// reach every member many times a run.
+    pub fn outsider(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        s.node_count = @min(s.node_count, MAX_NODES_WITH_OUTSIDER);
+        s.outsider_permille = 50;
         return s;
     }
 
@@ -292,7 +313,8 @@ pub const Scenario = struct {
             \\  "rpc_timeout_ms": {d},
             \\  "config_change_permille": {d},
             \\  "clock_drift_ppm": {d},
-            \\  "clock_skew_ms": {d}
+            \\  "clock_skew_ms": {d},
+            \\  "outsider_permille": {d}
             \\}}
             \\
         , .{
@@ -306,6 +328,7 @@ pub const Scenario = struct {
             self.payload_min,             self.payload_max,           self.election_timeout_min_ms,
             self.election_timeout_max_ms, self.heartbeat_interval_ms, self.rpc_timeout_ms,
             self.config_change_permille,  self.clock_drift_ppm,       self.clock_skew_ms,
+            self.outsider_permille,
         });
     }
 
@@ -353,6 +376,7 @@ pub const Scenario = struct {
             .clock_drift_ppm = try jsonInt(u32, obj, "clock_drift_ppm"),
             // Absent from pins written before it: those ran without skew.
             .clock_skew_ms = if (obj.get("clock_skew_ms") == null) 0 else try jsonInt(u32, obj, "clock_skew_ms"),
+            .outsider_permille = if (obj.get("outsider_permille") == null) 0 else try jsonInt(u16, obj, "outsider_permille"),
         };
     }
 };
@@ -449,6 +473,26 @@ test "vopr scenario: pin parsing rejects bad values instead of guessing" {
     try testing.expectError(error.InvalidField, Scenario.fromJsonSlice(testing.allocator, out_of_range));
 }
 
+test "vopr scenario: the outsider's rate round-trips, and a pin without it runs with none" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const s = Scenario.outsider(5);
+    try testing.expect(s.outsider_permille > 0 and s.node_count <= MAX_NODES_WITH_OUTSIDER);
+    try s.writeJson(&w);
+    const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
+    try testing.expectEqual(s.outsider_permille, back.outsider_permille);
+
+    // Written before the field existed: no outsider.
+    const old = w.buffered();
+    const cut = std.mem.lastIndexOf(u8, old, ",\n  \"outsider_permille\"").?;
+    var pin: [4096]u8 = undefined;
+    const end = "\n}\n";
+    @memcpy(pin[0..cut], old[0..cut]);
+    @memcpy(pin[cut..][0..end.len], end);
+    const legacy = try Scenario.fromJsonSlice(testing.allocator, pin[0 .. cut + end.len]);
+    try testing.expectEqual(@as(u16, 0), legacy.outsider_permille);
+}
+
 test "vopr scenario: json emit parses and fields pair correctly" {
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -461,7 +505,8 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 30), obj.count());
+    try testing.expectEqual(@as(usize, 31), obj.count());
+    try testing.expectEqual(@as(i64, s.outsider_permille), obj.get("outsider_permille").?.integer);
     try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);
     try testing.expectEqual(@as(i64, s.clock_drift_ppm), obj.get("clock_drift_ppm").?.integer);
     try testing.expectEqual(@as(i64, s.clock_skew_ms), obj.get("clock_skew_ms").?.integer);

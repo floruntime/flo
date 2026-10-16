@@ -12,10 +12,10 @@
   "msg_delay_max_ms": 37,
   "drop_percent": 6,
   "duplicate_percent": 2,
-  "partition_permille": 3,
+  "partition_permille": 1,
   "partition_min_ms": 835,
   "partition_max_ms": 2121,
-  "crash_permille": 2,
+  "crash_permille": 1,
   "restart_permille": 26,
   "wipe_permille": 153,
   "max_lost_nodes": 1,
@@ -26,7 +26,8 @@
   "election_timeout_max_ms": 261,
   "heartbeat_interval_ms": 34,
   "rpc_timeout_ms": 111,
-  "config_change_permille": 5,
+  "config_change_permille": 4,
   "clock_drift_ppm": 178,
-  "clock_skew_ms": 0
+  "clock_skew_ms": 0,
+  "outsider_permille": 0
 }
