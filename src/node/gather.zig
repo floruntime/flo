@@ -1,10 +1,11 @@
 //! Gather — a client's read that other shards answer in parts.
 //!
 //! A shard never reads another shard's state. A read that needs several
-//! shards' data (a kv.mget whose keys several shards own) sends each owner
-//! its part as an ordinary forwarded request, answered on that owner's own
-//! thread, and keeps an entry here until every part has answered. Then the
-//! parts are merged into one answer for the client.
+//! shards' data (a kv.mget whose keys several shards own, a list every
+//! shard holds part of) sends each shard its part as an ordinary forwarded
+//! request, answered on that shard's own thread, and keeps an entry here
+//! until every part has answered. Then the op's `merge` writes one answer
+//! for the client from the parts' bodies.
 //!
 //! Each part another shard answers holds a reply slot (`ReplyPool`) naming
 //! its entry, its generation and its place; the part this shard owns is
@@ -18,6 +19,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ReplyPool = @import("reply_pool.zig").ReplyPool;
+const Shard = @import("shard.zig").Shard;
+const Connection = @import("connection.zig").Connection;
 
 /// Gathers one shard may have under way: the room it keeps for fan-out.
 pub const GATHER_SLOTS: u16 = 256;
@@ -25,8 +28,40 @@ pub const GATHER_SLOTS: u16 = 256;
 /// The most parts one gather has: one per shard.
 pub const MAX_PARTS: u16 = @import("../config/server.zig").MAX_SHARDS;
 
-/// `Context` is what the merge needs beyond the parts' answers (where each
-/// of a kv.mget's keys comes from); it has `deinit(*Context, Allocator)`.
+/// What a gathered read does with its parts.
+pub const Op = struct {
+    /// Writes the client's answer from the parts' ok bodies, in part order
+    /// (`table_run.answer` with the op's Response, or a refusal). Called at
+    /// most once, only when every part answered ok. It may fail only before
+    /// it has written anything: the gather then answers `internal_error`,
+    /// and a merge that wrote and then failed would answer twice.
+    merge: *const fn (shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void,
+    /// Frees what the op kept. Called exactly once, however the gather ends.
+    deinit: *const fn (state: *anyopaque, allocator: Allocator) void,
+};
+
+/// One part of a gathered read. A gather has one part per owner at most:
+/// room is checked per part against that owner's whole share.
+pub const Part = struct {
+    owner: u16,
+    /// For another shard, the body of the request it runs (the client's op
+    /// with this body), copied at the send. For this shard, its own answer
+    /// body, allocated by the caller and owned by the gather from the call.
+    body: []const u8,
+};
+
+/// An entry's op and the state it keeps.
+pub const OpContext = struct {
+    op: *const Op,
+    state: *anyopaque,
+
+    pub fn deinit(self: *OpContext, allocator: Allocator) void {
+        self.op.deinit(self.state, allocator);
+    }
+};
+
+/// `Context` is what the merge needs beyond the parts' answers; it has
+/// `deinit(*Context, Allocator)`.
 pub fn GatherTable(comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -52,7 +87,7 @@ pub fn GatherTable(comptime Context: type) type {
         pub const Ticket = struct { index: u16, gen: u32 };
 
         /// What a part's reply slot remembers of it.
-        pub const Part = ReplyPool.GatherPart;
+        pub const PartRef = ReplyPool.GatherPart;
 
         pub fn init(allocator: Allocator) !Self {
             const entries = try allocator.alloc(Entry, GATHER_SLOTS);
@@ -107,7 +142,7 @@ pub fn GatherTable(comptime Context: type) type {
         /// Null while parts are still out, or when the part is not one the
         /// entry waits for (its gather ended, or it answered already), in
         /// which case `bytes` is freed.
-        pub fn arrive(self: *Self, allocator: Allocator, part: Part, bytes: []u8) ?*Entry {
+        pub fn arrive(self: *Self, allocator: Allocator, part: PartRef, bytes: []u8) ?*Entry {
             const e = self.get(.{ .index = part.index, .gen = part.gen }) orelse {
                 allocator.free(bytes);
                 return null;
@@ -188,7 +223,7 @@ test "gather: a part repeated, or arriving after its gather ended, is dropped" {
     var t = try TestTable.init(a);
     defer t.deinit(a);
     const tk = try t.start(a, 5, 1, 1, 2, try testCtx());
-    const p0: TestTable.Part = .{ .index = tk.index, .gen = tk.gen, .part = 0 };
+    const p0: TestTable.PartRef = .{ .index = tk.index, .gen = tk.gen, .part = 0 };
 
     try std.testing.expect(t.arrive(a, p0, try owned("a")) == null);
     try std.testing.expect(t.arrive(a, p0, try owned("again")) == null);
