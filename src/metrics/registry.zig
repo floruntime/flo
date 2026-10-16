@@ -597,6 +597,8 @@ pub const ShardMetrics = struct {
     /// Entries refused for repeating an index the partition holds: no loss,
     /// but a writer bug.
     duplicate_index: Atomic(u64) = Atomic(u64).init(0),
+    /// Processing jobs held as failed: stored jobs that couldn't be rebuilt.
+    processing_failed_jobs: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
 
@@ -742,6 +744,7 @@ pub const ShardMetrics = struct {
         stamp_skew_ms: i64,
         silent_loss: [silent_loss.PATH_COUNT]u64,
         duplicate_index: u64,
+        processing_failed_jobs: u64,
         offline: u8,
     };
 
@@ -774,6 +777,7 @@ pub const ShardMetrics = struct {
                 break :blk out;
             },
             .duplicate_index = self.duplicate_index.load(.monotonic),
+            .processing_failed_jobs = self.processing_failed_jobs.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
@@ -1515,6 +1519,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     }
     try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
+    try writer.print("flo_processing_failed_jobs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.processing_failed_jobs });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });

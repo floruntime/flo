@@ -215,7 +215,10 @@ pub const NodeHealth = struct {
                 const n = if (sm) |m| m.silent_loss[p].load(.monotonic) else 0;
                 try w.print("\"{s}\":{d}", .{ name, n });
             }
-            try w.print("}},\"duplicate_index\":{d}}}", .{if (sm) |m| m.duplicate_index.load(.monotonic) else 0});
+            try w.print("}},\"duplicate_index\":{d},\"processing_failed_jobs\":{d}}}", .{
+                if (sm) |m| m.duplicate_index.load(.monotonic) else 0,
+                if (sm) |m| m.processing_failed_jobs.load(.monotonic) else 0,
+            });
         }
         try w.writeAll("]}\n");
     }
@@ -277,6 +280,7 @@ test "health: /status names each shard's state, its reason when offline, and its
     try registry.initShards(2);
     registry.shardMetrics(1).?.silent_loss[@backingInt(silent_loss.Path.segment_unreadable)].store(3, .monotonic);
     registry.shardMetrics(1).?.duplicate_index.store(2, .monotonic);
+    registry.shardMetrics(1).?.processing_failed_jobs.store(4, .monotonic);
 
     var h = try NodeHealth.init(testing.allocator, 42, 2);
     defer h.deinit(testing.allocator);
@@ -314,6 +318,8 @@ test "health: /status names each shard's state, its reason when offline, and its
     // A repeated index is shown beside the losses, not among them.
     try testing.expectEqual(@as(i64, 0), s0.get("duplicate_index").?.integer);
     try testing.expectEqual(@as(i64, 2), s1.get("duplicate_index").?.integer);
+    try testing.expectEqual(@as(i64, 0), s0.get("processing_failed_jobs").?.integer);
+    try testing.expectEqual(@as(i64, 4), s1.get("processing_failed_jobs").?.integer);
 }
 
 test "health: /status shows removal notices held, and the quorum once acted on" {
