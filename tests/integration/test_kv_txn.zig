@@ -2,7 +2,7 @@
 //!
 //! Covers the in-memory side of the BEGIN→stage-ops→COMMIT cycle:
 //!   1. TxnTable: open, append several mixed ops, drop.
-//!   2. Codec: round-trip a batch payload (serialize → iterate).
+//!   2. Codec: a buffered transaction encodes to the batch entry and decodes back.
 //!   3. Projection: apply a synthetic kv_batch UAL entry and verify state.
 
 const std = @import("std");
@@ -12,6 +12,8 @@ const src = @import("src");
 const txn_mod = src.kv.txn;
 const KVProjection = src.projection.kv.KVProjection;
 const ual_entry = src.storage.ual.entry;
+const kv_entries = src.protocol.kv_entries;
+const schema = src.protocol.schema;
 
 test "integration: kv_txn — table appends ops and drops cleanly" {
     var table = txn_mod.TxnTable.init(testing.allocator);
@@ -53,27 +55,25 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     try table.appendOp(tid, .delete, "k3", "", 0);
 
     const state = table.get(tid).?;
-    const size = txn_mod.batchPayloadSize(state.ops.items);
-    const buf = try testing.allocator.alloc(u8, size);
-    defer testing.allocator.free(buf);
-    const written = try txn_mod.serializeBatch(buf, state.namespace_hash, state.ops.items);
-    try testing.expectEqual(size, written);
+    const payload = try txn_mod.encodeBatch(testing.allocator, state.ops.items);
+    defer testing.allocator.free(payload);
+    var diag: schema.Diagnostic = .{};
+    const batch = try kv_entries.Batch.decodeAll(payload, &diag);
 
-    var it = txn_mod.iterateBatch(buf[0..written]).?;
+    var it = batch.ops.iterator();
     var seen: usize = 0;
-    while (it.next()) |op| : (seen += 1) {
-        try testing.expectEqual(@as(u32, 99), op.namespace_hash);
+    while (try it.next()) |op| : (seen += 1) {
         switch (seen) {
             0 => {
                 try testing.expectEqual(txn_mod.TxnOpKind.put, op.kind);
                 try testing.expectEqualStrings("k1", op.key);
-                try testing.expectEqualStrings("v1", op.value);
-                try testing.expectEqual(@as(u64, 1_000), op.ttl_ms);
+                try testing.expectEqualStrings("v1", op.value.?);
+                try testing.expectEqual(@as(?u64, 1_000), op.ttl_ms);
             },
             1 => {
                 try testing.expectEqual(txn_mod.TxnOpKind.put, op.kind);
                 try testing.expectEqualStrings("k2", op.key);
-                try testing.expectEqual(@as(u64, 0), op.ttl_ms);
+                try testing.expectEqual(@as(?u64, null), op.ttl_ms);
             },
             2 => {
                 try testing.expectEqual(txn_mod.TxnOpKind.delete, op.kind);
@@ -104,10 +104,8 @@ test "integration: kv_txn — projection applies kv_batch atomically" {
     // A minute's TTL, counted from the batch's stamp.
     ops[3] = .{ .kind = .put, .key = @constCast("ephemeral"), .value = @constCast("temp"), .ttl_ms = 60_000 };
 
-    const size = txn_mod.batchPayloadSize(&ops);
-    const payload = try testing.allocator.alloc(u8, size);
+    const payload = try txn_mod.encodeBatch(testing.allocator, &ops);
     defer testing.allocator.free(payload);
-    _ = try txn_mod.serializeBatch(payload, 0, &ops);
 
     const entry = ual_entry.buildEntry(.kv_batch, 0, 1, 100, 12345, payload);
     try kv.applyEntry(&entry);

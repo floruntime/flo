@@ -2258,3 +2258,32 @@ test "e2e/kv: a value that isn't UTF-8 is a JSON string with U+FFFD under -o jso
     defer parsed.deinit();
     try testing.expectEqualStrings("a\u{fffd}b\"", parsed.value.object.get("value").?.string);
 }
+
+// A merge that would grow a document past the largest value a read can
+// answer is refused when it's written, so no key is stored that can't be
+// read back.
+test "e2e/kv: jset refuses a merge past the largest value" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const filler = try testing.allocator.alloc(u8, 251_000);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'x');
+    const doc = try std.fmt.allocPrint(testing.allocator, "{{\"a\":\"{s}\"}}", .{filler});
+    defer testing.allocator.free(doc);
+    try ctx.exec(&.{ "kv", "jset", "big", doc });
+
+    const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
+    defer testing.allocator.free(more);
+    var grown = try ctx.cli.run(&.{ "kv", "jset", "big", more, "--path", "$.b" });
+    defer grown.deinit();
+    try testing.expectEqual(@as(u8, 3), grown.exit_code);
+    const want = std.fmt.comptimePrint("Error: bad request: the value to write is more than a key holds: at most {d} bytes [bad_request/field_too_long]", .{@import("src").protocol.kv_ops.MAX_VALUE});
+    try testing.expectEqualStrings(want, std.mem.trimEnd(u8, grown.stderr, "\n"));
+
+    // The document is as it was, and reads back whole.
+    var read = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
+    defer read.deinit();
+    try testing.expectEqual(@as(u8, 0), read.exit_code);
+    try testing.expectEqualStrings(doc, std.mem.trimEnd(u8, read.stdout, "\n"));
+}

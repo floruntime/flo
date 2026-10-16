@@ -19,10 +19,11 @@ const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
 const time_units = @import("../util/time_units.zig");
+const schema = @import("../protocol/schema.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
-const CommandPayload = entry_mod.CommandPayload;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // KV Entry — stored in the hash map
@@ -558,126 +559,49 @@ pub const KVProjection = struct {
 
     // ─── UAL Entry application (ProjectionRouter interface) ────────────────
 
-    /// Apply a committed UAL entry to this projection.
+    /// Apply a committed UAL entry to this projection. A payload that
+    /// doesn't decode whole is a bug in the proposer: nothing of it is
+    /// applied, and it is `InvalidPayload`, counted as an apply error. An
+    /// incr that overflows or meets a non-counter, and an expire of a key
+    /// that's gone, change nothing and are applied: every replica reaches
+    /// the same state. (Once results are kept by index, each becomes a
+    /// refusal the client sees.)
     pub fn applyEntry(self: *KVProjection, entry: *const Entry) !void {
         const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+        const h = entry.header;
+        var diag: schema.Diagnostic = .{};
 
         switch (entry_type) {
             .kv_put => {
-                const cmd = CommandPayload.deserialize(entry.payload) orelse
-                    return error.InvalidPayload;
-                try self.put(
-                    cmd.key,
-                    cmd.value,
-                    entry.header.index,
-                    entry.header.term,
-                    entry.header.timestamp_ns,
-                    time_units.expiryAfter(entry.header.timestamp_ns, extractTtlMs(entry, &cmd)),
-                );
+                const p = kv_entries.Put.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                try self.put(p.key, p.value, h.index, h.term, h.timestamp_ns, time_units.expiryAfter(h.timestamp_ns, p.ttl_ms orelse 0));
             },
             .kv_delete => {
-                const cmd = CommandPayload.deserialize(entry.payload) orelse
-                    return error.InvalidPayload;
-                try self.delete(
-                    cmd.key,
-                    entry.header.index,
-                    entry.header.term,
-                    entry.header.timestamp_ns,
-                );
-            },
-            .kv_batch => {
-                // Per-shard transaction commit. Iterate the batched op list
-                // and apply each op against the projection. Atomicity comes
-                // from this whole entry being one Raft propose.
-                const txn = @import("../kv/txn.zig");
-                var it = txn.iterateBatch(entry.payload) orelse return error.InvalidPayload;
-                while (it.next()) |op| {
-                    switch (op.kind) {
-                        .put => try self.put(
-                            op.key,
-                            op.value,
-                            entry.header.index,
-                            entry.header.term,
-                            entry.header.timestamp_ns,
-                            time_units.expiryAfter(entry.header.timestamp_ns, op.ttl_ms),
-                        ),
-                        .delete => try self.delete(
-                            op.key,
-                            entry.header.index,
-                            entry.header.term,
-                            entry.header.timestamp_ns,
-                        ),
-                        .incr => {
-                            if (op.value.len != 8) return error.InvalidPayload;
-                            const delta = std.mem.readInt(i64, op.value[0..8], .little);
-                            _ = self.applyIncr(
-                                op.key,
-                                delta,
-                                entry.header.index,
-                                entry.header.term,
-                                entry.header.timestamp_ns,
-                            ) catch |err| switch (err) {
-                                // Same swallow-on-replay policy as standalone kv_incr.
-                                error.Overflow, error.NotACounter => {},
-                                else => return err,
-                            };
-                        },
-                        .touch, .persist => {
-                            const expiry_ns: u64 = if (op.kind == .persist) 0 else blk: {
-                                if (op.value.len != 8) return error.InvalidPayload;
-                                const ttl_ms = std.mem.readInt(u64, op.value[0..8], .little);
-                                break :blk time_units.expiryAfter(entry.header.timestamp_ns, ttl_ms);
-                            };
-                            self.applyTouch(
-                                op.key,
-                                expiry_ns,
-                                entry.header.index,
-                                entry.header.term,
-                                entry.header.timestamp_ns,
-                            ) catch |err| switch (err) {
-                                error.NotFound => {},
-                            };
-                        },
-                    }
-                }
+                const p = kv_entries.Delete.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                try self.delete(p.key, h.index, h.term, h.timestamp_ns);
             },
             .kv_incr => {
-                // Payload: CommandPayload where value is the 8-byte i64 LE delta.
-                const cmd = CommandPayload.deserialize(entry.payload) orelse
-                    return error.InvalidPayload;
-                if (cmd.value.len != 8) return error.InvalidPayload;
-                const delta = std.mem.readInt(i64, cmd.value[0..8], .little);
-                _ = self.applyIncr(
-                    cmd.key,
-                    delta,
-                    entry.header.index,
-                    entry.header.term,
-                    entry.header.timestamp_ns,
-                ) catch |err| switch (err) {
-                    // Overflow / NotACounter on replay are non-fatal: skip the
-                    // entry rather than crash the projection. The original
-                    // proposer surfaced the error to the client at apply time.
-                    error.Overflow, error.NotACounter => {},
-                    else => return err,
-                };
+                const p = kv_entries.Incr.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                try self.applyIncrNoop(p.key, p.delta, h);
             },
-            .kv_touch => {
-                // Payload: CommandPayload where value is the 8-byte u64 LE TTL
-                // in milliseconds from this entry's stamp (0 = clear TTL / PERSIST).
-                const cmd = CommandPayload.deserialize(entry.payload) orelse
-                    return error.InvalidPayload;
-                if (cmd.value.len != 8) return error.InvalidPayload;
-                const ttl_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
-                self.applyTouch(
-                    cmd.key,
-                    time_units.expiryAfter(entry.header.timestamp_ns, ttl_ms),
-                    entry.header.index,
-                    entry.header.term,
-                    entry.header.timestamp_ns,
-                ) catch |err| switch (err) {
-                    // TOUCH/PERSIST on a missing key is a no-op on the apply path —
-                    // the proposer already returned not-found to the client.
-                    error.NotFound => {},
+            .kv_expire => {
+                const p = kv_entries.Expire.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                self.applyExpireNoop(p.key, p.ttl_ms, h);
+            },
+            .kv_batch => {
+                // Decoded and checked whole before any op applies, so a bad
+                // batch changes nothing.
+                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                var check = batch.ops.iterator();
+                while (check.next() catch return error.InvalidPayload) |op| {
+                    if (kv_entries.batchOpRule(op) != null) return error.InvalidPayload;
+                }
+                var it = batch.ops.iterator();
+                while (it.next() catch return error.InvalidPayload) |op| switch (op.kind) {
+                    .put => try self.put(op.key, op.value.?, h.index, h.term, h.timestamp_ns, time_units.expiryAfter(h.timestamp_ns, op.ttl_ms orelse 0)),
+                    .delete => try self.delete(op.key, h.index, h.term, h.timestamp_ns),
+                    .incr => try self.applyIncrNoop(op.key, op.delta.?, h),
+                    .expire => self.applyExpireNoop(op.key, op.ttl_ms.?, h),
                 };
             },
             else => {},
@@ -686,21 +610,22 @@ pub const KVProjection = struct {
         self.applied_index = entry.header.index;
     }
 
-    /// The TTL in milliseconds a UAL entry carries if the HAS_TTL flag is set,
-    /// encoded as 8 bytes of u64 LE after the CommandPayload data. It counts
-    /// from the entry's stamp, so every replica computes the same expiry.
-    fn extractTtlMs(entry: *const Entry, cmd: *const CommandPayload) u64 {
-        const Flags = entry_mod.Flags;
-        if (entry.header.flags & Flags.HAS_TTL == 0) return 0;
+    /// An incr as the log applies it: overflow and a non-counter change
+    /// nothing (the proposer checked both; a concurrent write can still
+    /// reach either first).
+    fn applyIncrNoop(self: *KVProjection, key: []const u8, delta: i64, h: entry_mod.Header) !void {
+        _ = self.applyIncr(key, delta, h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+            error.Overflow, error.NotACounter => {},
+            else => return err,
+        };
+    }
 
-        // TTL bytes start after command prefix (ns_hash:4 + key_len:2 + val_len:4 = 10)
-        // plus key + value data
-        const COMMAND_PREFIX_SIZE = entry_mod.COMMAND_PREFIX_SIZE;
-        const ttl_offset = COMMAND_PREFIX_SIZE + cmd.key_length + cmd.value_length;
-        if (entry.payload.len >= ttl_offset + 8) {
-            return std.mem.readInt(u64, entry.payload[ttl_offset..][0..8], .little);
-        }
-        return 0;
+    /// An expire as the log applies it: a TTL of 0 clears it, and a key
+    /// that's gone changes nothing.
+    fn applyExpireNoop(self: *KVProjection, key: []const u8, ttl_ms: u64, h: entry_mod.Header) void {
+        self.applyTouch(key, time_units.expiryAfter(h.timestamp_ns, ttl_ms), h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+            error.NotFound => {},
+        };
     }
 
     /// ProjectionVTable implementation for use with ProjectionRouter.
@@ -1003,21 +928,8 @@ test "kv: compact removes tombstones" {
 test "kv: apply UAL entry for kv_put" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
-
-    // Build a command payload: ns_hash(4) + key_len(2) + val_len(4) + key + value
-    var payload_buf: [256]u8 = undefined;
-    const cmd = entry_mod.CommandPayload{
-        .namespace_hash = 0,
-        .key_length = 5,
-        .value_length = 5,
-        .key = "mykey",
-        .value = "myval",
-    };
-    const plen = cmd.serialize(&payload_buf) orelse unreachable;
-
-    const entry = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, payload_buf[0..plen]);
-
-    try kv.applyEntry(&entry);
+    var buf: [256]u8 = undefined;
+    try kv.applyEntry(&putEntry(&buf, "mykey", "myval", 1, 1000, 0));
     const result = kv.get("mykey").?;
     try testing.expectEqualSlices(u8, "myval", result.value);
     try testing.expectEqual(@as(u64, 1), kv.applied_index);
@@ -1026,19 +938,9 @@ test "kv: apply UAL entry for kv_put" {
 test "kv: apply UAL entry for kv_delete" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
-
-    // First put
-    var pb: [256]u8 = undefined;
-    const put_cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 5, .value_length = 1, .key = "delme", .value = "v" };
-    const put_len = put_cmd.serialize(&pb) orelse unreachable;
-    try kv.applyEntry(&entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, pb[0..put_len]));
-
-    // Then delete
-    var db: [256]u8 = undefined;
-    const del_cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 5, .value_length = 0, .key = "delme", .value = "" };
-    const del_len = del_cmd.serialize(&db) orelse unreachable;
-    try kv.applyEntry(&entry_mod.buildEntry(.kv_delete, 0, 1, 2, 2000, db[0..del_len]));
-
+    var buf: [256]u8 = undefined;
+    try kv.applyEntry(&putEntry(&buf, "delme", "v", 1, 1000, 0));
+    try kv.applyEntry(&testEntry(&buf, .kv_delete, .{ .key = "delme" }, 2, 2000));
     try testing.expect(kv.get("delme") == null);
     try testing.expectEqual(@as(u64, 2), kv.applied_index);
 }
@@ -1050,11 +952,8 @@ test "kv: projection handle integrates with router" {
     var router = router_mod.ProjectionRouter.init();
     router.registerKV(kv.projectionHandle());
 
-    // Build a UAL entry with command payload
     var pb: [256]u8 = undefined;
-    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 4, .value_length = 4, .key = "rkey", .value = "rval" };
-    const plen = cmd.serialize(&pb) orelse unreachable;
-    const entry = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1000, pb[0..plen]);
+    const entry = putEntry(&pb, "rkey", "rval", 1, 1000, 0);
 
     const result = router.apply(&entry);
     try testing.expectEqual(router_mod.ApplyResult.applied, result);
@@ -1250,18 +1149,15 @@ const TestReadClock = struct {
     }
 };
 
-/// A kv entry of `entry_type` for `key` at `index`, stamped `stamp`;
-/// `value` is the command's value, and a non-zero `ttl_ms` goes after it.
-fn stampedEntry(buf: []u8, entry_type: entry_mod.EntryType, key: []const u8, value: []const u8, index: u64, stamp: u64, ttl_ms: u64) entry_mod.Entry {
-    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = @intCast(key.len), .value_length = @intCast(value.len), .key = key, .value = value };
-    var len = cmd.serialize(buf) orelse unreachable;
-    var flags: u16 = 0;
-    if (ttl_ms > 0) {
-        flags = entry_mod.Flags.HAS_TTL;
-        std.mem.writeInt(u64, buf[len..][0..8], ttl_ms, .little);
-        len += 8;
-    }
-    return entry_mod.buildEntry(entry_type, flags, 1, index, stamp, buf[0..len]);
+/// KV entry `entry_type` carrying `payload`, at `index`, stamped `stamp`.
+fn testEntry(buf: []u8, comptime entry_type: entry_mod.EntryType, payload: kv_entries.Payload(@backingInt(entry_type)).Value, index: u64, stamp: u64) entry_mod.Entry {
+    const bytes = kv_entries.Payload(@backingInt(entry_type)).encodeInto(buf, payload) catch unreachable;
+    return entry_mod.buildEntry(entry_type, 0, 1, index, stamp, bytes);
+}
+
+/// A put of `value` at `key`, with a TTL unless it is 0.
+fn putEntry(buf: []u8, key: []const u8, value: []const u8, index: u64, stamp: u64, ttl_ms: u64) entry_mod.Entry {
+    return testEntry(buf, .kv_put, .{ .key = key, .value = value, .ttl_ms = if (ttl_ms == 0) null else ttl_ms }, index, stamp);
 }
 
 test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on every replica alike, and reads judge it by the read clock" {
@@ -1271,7 +1167,7 @@ test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on ever
     kv.read_clock = .{ .ctx = &clock, .now_ns = TestReadClock.read };
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var buf: [128]u8 = undefined;
-    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "k", "v", 1, stamp, 5_000));
+    try kv.applyEntry(&putEntry(&buf, "k", "v", 1, stamp, 5_000));
     try testing.expectEqual(stamp + 5 * std.time.ns_per_s, kv.getRaw("k").?.expiry_ns);
 
     clock.ns = stamp + 5 * std.time.ns_per_s - 1;
@@ -1285,14 +1181,11 @@ test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on ever
     var names: [4][]const u8 = undefined;
     try testing.expectEqual(@as(usize, 0), kv.scanKeyNames("", &names));
 
-    // TOUCH counts from its own entry's stamp; PERSIST clears it.
-    var tb: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tb, 60_000, .little);
-    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "t", "v", 2, stamp, 1_000));
-    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 3, stamp + 500 * std.time.ns_per_ms, 0));
+    // An expire counts from its own entry's stamp; a TTL of 0 clears it.
+    try kv.applyEntry(&putEntry(&buf, "t", "v", 2, stamp, 1_000));
+    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 3, stamp + 500 * std.time.ns_per_ms));
     try testing.expectEqual(stamp + 60_500 * std.time.ns_per_ms, kv.getRaw("t").?.expiry_ns);
-    std.mem.writeInt(u64, &tb, 0, .little);
-    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 4, stamp + std.time.ns_per_s, 0));
+    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 0 }, 4, stamp + std.time.ns_per_s));
     try testing.expectEqual(@as(u64, 0), kv.getRaw("t").?.expiry_ns);
 }
 
@@ -1303,22 +1196,18 @@ test "kv: a key whose TTL ran out by an entry's stamp is gone to that entry: inc
     var buf: [128]u8 = undefined;
     var counter: [8]u8 = undefined;
     std.mem.writeInt(i64, &counter, 7, .little);
-    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "c", &counter, 1, stamp, 1_000));
-    var delta: [8]u8 = undefined;
-    std.mem.writeInt(i64, &delta, 1, .little);
+    try kv.applyEntry(&putEntry(&buf, "c", &counter, 1, stamp, 1_000));
     // Before the TTL runs out it counts on; after, it starts again.
-    try kv.applyEntry(&stampedEntry(&buf, .kv_incr, "c", &delta, 2, stamp + 999 * std.time.ns_per_ms, 0));
+    try kv.applyEntry(&testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 2, stamp + 999 * std.time.ns_per_ms));
     try testing.expectEqual(@as(i64, 8), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
-    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "c", &counter, 3, stamp + 2 * std.time.ns_per_s, 1_000));
-    try kv.applyEntry(&stampedEntry(&buf, .kv_incr, "c", &delta, 4, stamp + 3 * std.time.ns_per_s, 0));
+    try kv.applyEntry(&putEntry(&buf, "c", &counter, 3, stamp + 2 * std.time.ns_per_s, 1_000));
+    try kv.applyEntry(&testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 4, stamp + 3 * std.time.ns_per_s));
     try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
     try testing.expectEqual(@as(u64, 0), kv.getRaw("c").?.expiry_ns);
 
-    // TOUCH after the TTL ran out does not bring the key back.
-    try kv.applyEntry(&stampedEntry(&buf, .kv_put, "t", "v", 5, stamp, 1_000));
-    var tb: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tb, 60_000, .little);
-    try kv.applyEntry(&stampedEntry(&buf, .kv_touch, "t", &tb, 6, stamp + std.time.ns_per_s, 0));
+    // An expire after the TTL ran out does not bring the key back.
+    try kv.applyEntry(&putEntry(&buf, "t", "v", 5, stamp, 1_000));
+    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 6, stamp + std.time.ns_per_s));
     try testing.expectEqual(stamp + std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
 }
 
@@ -1328,17 +1217,42 @@ test "kv: a transaction's TTLs count from its batch's stamp" {
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var eb: [64]u8 = undefined;
-    try kv.applyEntry(&stampedEntry(&eb, .kv_put, "t", "v", 1, stamp, 0));
-    var ttl: [8]u8 = undefined;
-    std.mem.writeInt(u64, &ttl, 30_000, .little);
+    try kv.applyEntry(&putEntry(&eb, "t", "v", 1, stamp, 0));
     const ops = [_]txn.TxnOp{
         .{ .kind = .put, .key = @constCast("p"), .value = @constCast("v"), .ttl_ms = 2_000 },
-        .{ .kind = .touch, .key = @constCast("t"), .value = &ttl, .ttl_ms = 0 },
+        .{ .kind = .expire, .key = @constCast("t"), .value = @constCast(""), .ttl_ms = 30_000 },
     };
-    var buf: [256]u8 = undefined;
-    const n = try txn.serializeBatch(&buf, 0, &ops);
+    const payload = try txn.encodeBatch(testing.allocator, &ops);
+    defer testing.allocator.free(payload);
     const later = stamp + 10 * std.time.ns_per_s;
-    try kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 2, later, buf[0..n]));
+    try kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 2, later, payload));
     try testing.expectEqual(later + 2 * std.time.ns_per_s, kv.getRaw("p").?.expiry_ns);
     try testing.expectEqual(later + 30 * std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
+}
+
+test "kv: a batch that doesn't decode whole, or breaks a kind's rule, applies nothing" {
+    const txn = @import("../kv/txn.zig");
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    const ops = [_]txn.TxnOp{
+        .{ .kind = .put, .key = @constCast("a"), .value = @constCast("1"), .ttl_ms = 0 },
+        .{ .kind = .put, .key = @constCast("b"), .value = @constCast("2"), .ttl_ms = 0 },
+    };
+    const payload = try txn.encodeBatch(testing.allocator, &ops);
+    defer testing.allocator.free(payload);
+    // Cut inside the second op: the first must not apply on its own.
+    for (1..payload.len) |n| {
+        try testing.expectError(error.InvalidPayload, kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, payload[0..n])));
+        try testing.expect(kv.get("a") == null);
+    }
+    // A delete carrying a value decodes, but breaks its kind's rule.
+    var buf: [64]u8 = undefined;
+    var w: schema.Writer = .{ .buf = &buf };
+    try kv_entries.BatchOps.encodeSlice(&w, &.{
+        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null },
+        .{ .kind = .delete, .key = "b", .value = "x", .ttl_ms = null, .delta = null },
+    });
+    try testing.expectError(error.InvalidPayload, kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, w.written())));
+    try testing.expect(kv.get("a") == null);
+    try testing.expectEqual(@as(u64, 0), kv.applied_index);
 }

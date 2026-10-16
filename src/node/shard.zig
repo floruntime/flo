@@ -49,6 +49,8 @@ const table_run = @import("table_run.zig");
 const table = @import("../protocol/table.zig");
 const schema = @import("../protocol/schema.zig");
 const kv_ops = @import("../protocol/kv_ops.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
+const limits = @import("../protocol/limits.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const HandlerFn = @import("dispatcher.zig").HandlerFn;
 const Connection = @import("connection.zig").Connection;
@@ -123,9 +125,11 @@ const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
 pub const MAX_REQUEST_SIZE = proto.MAX_REQUEST_BYTES;
 /// How much `readFromClient` reads from a socket at once.
 const READ_CHUNK: usize = 64 * 1024;
-/// The largest answer or payload a handler builds in `scratch`: a whole
-/// kv.get answer, header included, or a KV entry's payload.
-pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size, kv_handler_mod.MAX_ENTRY_PAYLOAD);
+/// The largest answer or payload a handler builds in `scratch`: an answer
+/// frame of up to MAX_REQUEST_SIZE bytes, header included (a whole kv.get
+/// answer, or one `deliverDeferredOk` frames for another shard or node), or
+/// a single-key KV entry's payload.
+pub const SCRATCH_SIZE: usize = @max(@sizeOf(proto.ResponseHeader) + MAX_REQUEST_SIZE, @sizeOf(proto.ResponseHeader) + table_run.op("kv.get").response.max_size, kv_handler_mod.MAX_KEY_ENTRY_PAYLOAD);
 comptime {
     // An answer frame is sized from the request limit.
     std.debug.assert(MAX_REQUEST_SIZE >= proto.MAX_ANSWER_BYTES);
@@ -762,7 +766,7 @@ pub const Shard = struct {
         stream_handler.registerReplay(&replay_registry);
         try checkAppliers(shard_id, &replay_registry);
 
-        const apply_buf = try allocator.alloc(u8, kv_handler_mod.MAX_APPLY_PAYLOAD);
+        const apply_buf = try allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD);
         errdefer allocator.free(apply_buf);
         const read_buf = try allocator.alloc(u8, READ_CHUNK);
         errdefer allocator.free(read_buf);
@@ -3227,20 +3231,33 @@ pub const Shard = struct {
         return self.namespace_handler.nameForHash(ns_hash);
     }
 
+    /// The namespace a qualified KV key names: the part before the
+    /// separator, or "default" for a bare key. Read off the key, so ""
+    /// and "default" can't meter apart.
+    fn kvNamespace(qkey: []const u8) []const u8 {
+        const sep = std.mem.indexOfScalar(u8, qkey, 0) orelse return "default";
+        return qkey[0..sep];
+    }
+
     /// Waiters, triggers and per-namespace metrics for an entry that just
     /// applied. Keyed from the entry itself, never from the request, so a
     /// follower's blocking read wakes on the same event a leader's does.
     fn notifyApplied(self: *Shard, entry: *const entry_mod.Entry) void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
-            .kv_put, .kv_delete, .kv_incr, .kv_touch => {
-                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-                self.waiter_pool.notify(.kv_get, cmd.key, resolveKVWaiter, @ptrCast(self));
+            .kv_put, .kv_delete, .kv_incr, .kv_expire => {
+                // Every single-key KV entry starts with its key.
+                var diag: schema.Diagnostic = .{};
+                var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
+                const key = kv_entries.Key.decode(&r, "key") catch return;
+                self.waiter_pool.notify(.kv_get, key, resolveKVWaiter, @ptrCast(self));
                 if (self.metrics_registry) |mr| {
-                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
-                    if (mr.registerKVNamespace(ns)) |km| switch (etype) {
+                    if (mr.registerKVNamespace(kvNamespace(key))) |km| switch (etype) {
                         // A per-key version of 1 is the key's first write.
-                        .kv_put => km.recordSet(cmd.value.len, if (self.kv_handler.kv.get(cmd.key)) |e| e.version == 1 else false),
+                        .kv_put => {
+                            const put = kv_entries.Put.decodeAll(entry.payload, &diag) catch return;
+                            km.recordSet(put.value.len, if (self.kv_handler.kv.get(key)) |e| e.version == 1 else false);
+                        },
                         .kv_delete => {
                             km.recordDelete();
                             km.decrementKeyCount();
@@ -3250,8 +3267,10 @@ pub const Shard = struct {
                 }
             },
             .kv_batch => {
-                var it = txn_mod.iterateBatch(entry.payload) orelse return;
-                while (it.next()) |op| {
+                var diag: schema.Diagnostic = .{};
+                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return;
+                var it = batch.ops.iterator();
+                while (it.next() catch return) |op| {
                     self.waiter_pool.notify(.kv_get, op.key, resolveKVWaiter, @ptrCast(self));
                 }
             },
@@ -5441,8 +5460,8 @@ pub const RAFT_RING_MAX: usize = 16 * 1024 * 1024;
 pub const RAFT_RING_MIN: usize = 2 * 1024 * 1024;
 
 comptime {
-    std.debug.assert(@import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE <= RAFT_RING_MIN);
-    std.debug.assert(@import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE <= @import("../config/tiered_log.zig").MIN_HOT_BUFFER);
+    std.debug.assert(limits.MAX_LOG_ENTRY_PAYLOAD + entry_mod.HEADER_SIZE <= RAFT_RING_MIN);
+    std.debug.assert(limits.MAX_LOG_ENTRY_PAYLOAD + entry_mod.HEADER_SIZE <= @import("../config/tiered_log.zig").MIN_HOT_BUFFER);
 }
 
 /// How a shard's Raft group comes up.
@@ -5560,9 +5579,12 @@ const JOIN_WARN_INTERVAL_MS: u64 = 30_000;
 /// hold: a batch is sized by bytes, and must hold the largest entry any
 /// handler writes or no follower could ever pass it.
 pub const RPC_MAX_ENTRIES: usize = 1024;
-pub const RPC_BATCH_BYTES: usize = @max(1024 * 1024, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD + entry_mod.HEADER_SIZE);
+pub const RPC_BATCH_BYTES: usize = @max(1024 * 1024, limits.MAX_LOG_ENTRY_PAYLOAD + entry_mod.HEADER_SIZE);
 comptime {
     std.debug.assert(transport.APPEND_REQ_PREFIX + RPC_MAX_ENTRIES * entry_mod.HEADER_SIZE + RPC_BATCH_BYTES <= transport.MAX_PAYLOAD_SIZE);
+    // The largest entry alone in an AppendEntries fits a peer frame, or a
+    // follower could never be sent it and replication would stall there.
+    std.debug.assert(transport.APPEND_REQ_PREFIX + entry_mod.HEADER_SIZE + limits.MAX_LOG_ENTRY_PAYLOAD <= transport.MAX_PAYLOAD_SIZE);
 }
 const JOIN_ASK_INTERVAL_MS: u64 = 1000;
 
@@ -10015,7 +10037,7 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
 test "the Raft ring floor holds the largest transaction batch" {
     var log_inst = try RaftLog.init(std.testing.allocator, RAFT_RING_MIN);
     defer log_inst.deinit();
-    const payload = try std.testing.allocator.alloc(u8, @import("../kv/handler.zig").MAX_APPLY_PAYLOAD);
+    const payload = try std.testing.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD);
     defer std.testing.allocator.free(payload);
     @memset(payload, 'b');
     var e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, 1, 0, payload);
@@ -10074,7 +10096,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
             calls += 1;
             const shard_inner = shard_ptr;
             last_applied_seen = shard_inner.raft_node.last_applied;
-            _ = persistence_mod.proposeEntry(shard_inner, .kv_put, entry_mod.Flags.NONE, "", "nested", "v") catch unreachable;
+            _ = kv_handler_mod.KVHandler.testProposePut(shard_inner, "nested", "v") catch unreachable;
             _ = shard_inner.applyCommitted();
             nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
             return .applied;
@@ -10114,6 +10136,17 @@ fn testCommandEntry(entry_type: entry_mod.EntryType, index: u64, key: []const u8
     };
     const n = cmd.serialize(&S.payload_buf).?;
     var e = entry_mod.buildEntry(entry_type, entry_mod.Flags.NONE, 1, index, index * 1000, S.payload_buf[0..n]);
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
+/// A kv put of `value` at `key`, as the log holds it, at `index`.
+fn testPutEntry(index: u64, key: []const u8, value: []const u8) entry_mod.Entry {
+    const S = struct {
+        var payload_buf: [256]u8 = undefined;
+    };
+    const payload = kv_entries.Put.encodeInto(&S.payload_buf, .{ .key = key, .value = value, .ttl_ms = null }) catch unreachable;
+    var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, index, index * 1000, payload);
     e.header.crc32c = e.computeCrc();
     return e;
 }
@@ -10180,16 +10213,16 @@ test "a truncated suffix is gone from the segments a restart replays" {
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
 
-        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "A");
+        _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "A");
         try std.testing.expect(shard.applyCommitted());
         // An uncommitted tail, flushed: the shape a follower is left with
         // when its leader dies mid-batch.
-        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "C");
+        _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "C");
         try shard.flushSegmentToDisk();
         // The new leader's log disagrees at index 3; commit never covered it.
         shard.raft_node.commit_index = 2;
         shard.raft_node.log.truncateAfter(2);
-        _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "D");
+        _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "D");
         try std.testing.expect(shard.applyCommitted());
         try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
     }
@@ -10252,12 +10285,12 @@ test "a truncation the previous run recorded is finished before replay" {
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
-    try w.addEntry(&testCommandEntry(.kv_put, 2, "k", "A"));
-    try w.addEntry(&testCommandEntry(.kv_put, 3, "k", "C"));
+    try w.addEntry(&testPutEntry(2, "k", "A"));
+    try w.addEntry(&testPutEntry(3, "k", "C"));
     w.commit_index_at_seal = 3;
     try w.writeToFile(segs);
     w.reset();
-    try w.addEntry(&testCommandEntry(.kv_put, 4, "k", "X"));
+    try w.addEntry(&testPutEntry(4, "k", "X"));
     w.commit_index_at_seal = 4;
     try w.writeToFile(segs);
     const intent = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ segs, durable_log_mod.INTENT_FILENAME });
@@ -10389,11 +10422,8 @@ test "KV reads on a shard judge expiry by its Raft node's time, not the host's w
     var ahead: Ahead = .{ .ns = @intCast(@import("stdx").time.nanoTimestamp() + std.time.ns_per_day) };
     shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
     var buf: [64]u8 = undefined;
-    const cmd = entry_mod.CommandPayload{ .namespace_hash = 0, .key_length = 1, .value_length = 1, .key = "k", .value = "v" };
-    var len = cmd.serialize(&buf).?;
-    std.mem.writeInt(u64, buf[len..][0..8], 1_000, .little);
-    len += 8;
-    _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.HAS_TTL, buf[0..len]);
+    const put = try kv_entries.Put.encodeInto(&buf, .{ .key = "k", .value = "v", .ttl_ms = 1_000 });
+    _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, put);
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expect(shard.kv_handler.kv.get("k") != null);
     ahead.ns += 2 * std.time.ns_per_s;
@@ -10589,9 +10619,9 @@ test "Shard: with sync durability, entries after one the writer could not buffer
     const real = writer.allocator;
     var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
     writer.allocator = failing.allocator();
-    const first = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    const first = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k1", "v");
     writer.allocator = real;
-    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
 
     s.shard.syncFlushIfNeeded();
@@ -10616,7 +10646,7 @@ test "Shard: with sync durability, an entry that left memory before reaching dis
     // flush: it is nowhere.
     const writer = s.shard.durable_log.?.writer;
     writer.first_unbuffered = s.shard.raft_node.log.lastIndex() + 1;
-    _ = try persistence_mod.proposeEntry(&s.shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&s.shard, "k2", "v");
     _ = s.shard.raft_node.log.ual.evictOlderThan(std.math.maxInt(u64));
 
     const lost = try s.put(3, "k3", &buf);
@@ -10651,9 +10681,9 @@ test "Shard: with async durability, an entry the writer could not buffer is a ho
     const real = writer.allocator;
     var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
     writer.allocator = failing.allocator();
-    _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k1", "v");
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
     writer.allocator = real;
-    const second = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k2", "v");
+    const second = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
     try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
     try std.testing.expect(writer.first_unbuffered == null);
     try std.testing.expectEqual(@as(u32, 1), writer.entry_count);
@@ -12076,12 +12106,12 @@ test "Shard: a follower whose uncommitted tail shares a term run with its commit
         const raft = shard.raft_node;
 
         // Committed in the first term; then a later term's two entries.
-        for (0..3) |_| _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "v");
+        for (0..3) |_| _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "v");
         try ParkTest.ack(&shard);
         const committed = raft.commit_index;
         const first_term = raft.current_term;
         raft.current_term += 1;
-        for (0..2) |_| _ = try persistence_mod.proposeEntry(&shard, .kv_put, entry_mod.Flags.NONE, "", "k", "w");
+        for (0..2) |_| _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "w");
         const last = raft.log.lastIndex();
 
         // The follower holds the committed prefix, then a longer tail in

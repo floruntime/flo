@@ -5,7 +5,8 @@
 //! Partition calls `router.apply(entry)` which dispatches by EntryType.
 //!
 //! Routing table:
-//!   kv_put, kv_delete, kv_batch     → KVProjection
+//!   kv_put, kv_delete, kv_batch,
+//!   kv_incr, kv_expire              → KVProjection
 //!   queue_enqueue, queue_ack, etc.  → QueueProjection
 //!   ts_write, ts_write_batch        → TSProjection
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
@@ -242,7 +243,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
     return switch (entry_type) {
         // KV
         .kv_put, .kv_delete, .kv_batch => .kv,
-        .kv_incr, .kv_touch => .kv,
+        .kv_incr, .kv_expire => .kv,
 
         // Consumer-group durability: cg_commit / cg_delete carry
         // consumer-group state, which lives on the StreamProjection. They are

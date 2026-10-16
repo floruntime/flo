@@ -7,9 +7,10 @@ const ops = @import("ops.zig");
 const entries = @import("entries.zig");
 const kv_ops = @import("kv_ops.zig");
 const action_ops = @import("action_ops.zig");
+const kv_entries = @import("kv_entries.zig");
 
 pub const op_table = kv_ops.table ++ action_ops.table;
-pub const entry_table = [_]entries.Entry{};
+pub const entry_table = kv_entries.table;
 
 comptime {
     ops.check(&op_table);
