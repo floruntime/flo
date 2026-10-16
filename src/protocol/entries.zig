@@ -4,7 +4,10 @@
 //!
 //! It is a table of its own because entries aren't one-to-one with ops (a
 //! transaction commit, a lease, a checkpoint). The table hash covers it, so
-//! a data directory or a node built from another layout is refused.
+//! a node built from another layout is refused at its hello; a data
+//! directory written with another layout is refused at open by the segment
+//! version, which moves with this table (protocol/table.zig pins the two
+//! together).
 
 const std = @import("std");
 const schema = @import("schema.zig");

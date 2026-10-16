@@ -276,7 +276,9 @@ pub const DurableLog = struct {
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.segs_path, de.name });
             errdefer self.allocator.free(path);
             const hdr = readHeader(path) catch |err| {
-                log.err("durable log: cannot read the header of {s}: {s}", .{ path, @errorName(err) });
+                if (err == error.InvalidVersion) {
+                    log.err("durable log: {s} was written by a flo whose stored format this build can't read; start from an empty data directory", .{path});
+                } else log.err("durable log: cannot read the header of {s}: {s}", .{ path, @errorName(err) });
                 const kept = @min(de.name.len, self.bad_header.len);
                 @memcpy(self.bad_header[0..kept], de.name[0..kept]);
                 self.bad_header_len = kept;
@@ -716,6 +718,28 @@ test "durable log: a truncation the previous run did not finish is completed bef
     try testing.expect((try dl.readIntent()) == null);
     // Idempotent: a second recovery finds nothing to do.
     try dl.recoverTruncation();
+}
+
+test "durable log: a segment from another stored format refuses to be listed" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    try writer.addEntry(&testEntry(1, 1, "a"));
+    try dl.flush(1);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+
+    // The segment as a build with the previous format wrote it.
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, files[0].path, 1 << 20);
+    defer testing.allocator.free(bytes);
+    std.mem.writeInt(u16, bytes[@offsetOf(segment.SegmentHeader, "version")..][0..2], segment.SEGMENT_VERSION - 1, .little);
+    const file = try stdx.fs.createFile(files[0].path, .{});
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAll(file, bytes);
+    try testing.expectError(error.InvalidVersion, dl.listSegments(true));
 }
 
 test "durable log: two segments holding the same index refuse to be listed" {

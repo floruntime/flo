@@ -22,6 +22,15 @@ const time_units = @import("../util/time_units.zig");
 const schema = @import("../protocol/schema.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 
+// Each KV entry's code is its UAL type's: `kv.put` is `kv_put`, so a
+// renumbering on either side fails the build instead of mis-mapping.
+comptime {
+    for (kv_entries.table) |e| {
+        const tag = "kv_" ++ e.name["kv.".len..];
+        if (@backingInt(@field(entry_mod.EntryType, tag)) != e.type_code) @compileError("KV entry '" ++ e.name ++ "' has code " ++ std.fmt.comptimePrint("{d}", .{e.type_code}) ++ ", but " ++ tag ++ " is another");
+    }
+}
+
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 
@@ -564,8 +573,7 @@ pub const KVProjection = struct {
     /// applied, and it is `InvalidPayload`, counted as an apply error. An
     /// incr that overflows or meets a non-counter, and an expire of a key
     /// that's gone, change nothing and are applied: every replica reaches
-    /// the same state. (Once results are kept by index, each becomes a
-    /// refusal the client sees.)
+    /// the same state.
     pub fn applyEntry(self: *KVProjection, entry: *const Entry) !void {
         const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         const h = entry.header;
