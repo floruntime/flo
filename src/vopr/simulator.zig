@@ -1,12 +1,13 @@
-//! VOPR Simulator — a deterministic cluster of real RaftNodes under
-//! fault injection and invariant checking
+//! VOPR Simulator — a deterministic cluster of real replicas under fault
+//! injection and invariant checking
 //!
-//! The unit under test is the production `RaftNode`, driven through its
-//! public API plus the seams a wired runtime must own anyway: per-peer
-//! replication state (`peers[]`), the election deadline, hard-state
-//! restore on restart, and `last_applied`. The harness supplies what the
-//! runtime doesn't have yet — a replication pump, timer arming, stable
-//! storage — as reference implementations.
+//! The unit under test is the production replica (`src/replica`) and the
+//! `RaftNode` it drives: frames in, the Raft clock, the leader loop, and
+//! every frame serialized through the wire codec in both directions. The
+//! simulator is each replica's `Io` — its clock, its links, its disk —
+//! and its host: what the shard does for it (applying, the leader's own
+//! membership changes, stopping when it diverges) is modelled here, with
+//! the invariant checks on the way.
 //!
 //! One run is two-phase: a safety phase under full fault injection, then
 //! a liveness phase where a random quorum-sized "core" is healed, its
@@ -23,6 +24,10 @@ const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
 const membership = @import("../raft/membership.zig");
+const transport = @import("../raft/transport.zig");
+const RaftFrame = @import("../raft/raft_queue.zig").Frame;
+const replica_mod = @import("../replica/replica.zig");
+const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
 const RaftNode = raft_node.RaftNode;
@@ -30,8 +35,6 @@ const Scenario = scenario_mod.Scenario;
 const Workload = workload_mod.Workload;
 const SimNetwork = network_mod.SimNetwork;
 const Message = network_mod.Message;
-const Body = network_mod.Body;
-const OwnedEntry = network_mod.OwnedEntry;
 const NodeId = network_mod.NodeId;
 
 pub const MAX_NODES = network_mod.MAX_NODES;
@@ -57,6 +60,10 @@ pub const Invariant = enum {
     /// A committed entry stamped no later than the one before it: the
     /// leader's stamps must order the log whatever the clocks do.
     stamp_order,
+    /// A node found the group's log contradicting history it had applied
+    /// and stopped taking part. Only an async-mode crash can erase applied
+    /// history; anywhere else it is a safety bug.
+    divergence,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -92,6 +99,11 @@ const SimDisk = struct {
     /// entries[0..durable_len] survive a crash.
     durable_len: usize = 0,
     last_flush: u64 = 0,
+    /// Replication batches the log read from here, below its ring: a run
+    /// that never does has not exercised catch-up. Applies read here too
+    /// (a restarted node's log outgrows its ring) and are not counted.
+    catch_up_reads: u64 = 0,
+    applying: bool = false,
 
     const DiskEntry = struct {
         entry_type: u8,
@@ -156,6 +168,7 @@ const SimDisk = struct {
             );
             used += de.payload.len;
         }
+        if (!self.applying) self.catch_up_reads += 1;
         return n;
     }
 
@@ -174,8 +187,12 @@ const SimDisk = struct {
     /// before it takes effect, in either durability mode.
     fn flushLog(ctx: *anyopaque) bool {
         const self: *SimDisk = @ptrCast(@alignCast(ctx));
-        self.durable_len = self.entries.items.len;
+        self.flush();
         return true;
+    }
+
+    fn flush(self: *SimDisk) void {
+        self.durable_len = self.entries.items.len;
     }
 
     /// The disk is gone: log and hard state alike, as a replaced volume.
@@ -206,6 +223,11 @@ const SimNode = struct {
     id: NodeId,
     up: bool,
     raft: RaftNode,
+    replica: Replica,
+    /// The simulator, for the replica's `Io`. Set at the start of every
+    /// tick: `Simulator.init` returns by value, so an address taken there
+    /// would not survive the move.
+    sim: *Simulator = undefined,
     disk: SimDisk,
     /// Highest term this node has ever held — restarting below it is the
     /// term-monotonicity violation (fires only for a node without a
@@ -213,14 +235,13 @@ const SimNode = struct {
     max_term_seen: u64,
     /// Its disk was wiped while down: it restarts as a lost-log node.
     wiped: bool = false,
+    /// Diverged where no config could spare it: left as it is.
+    beyond_tolerance: bool = false,
     /// Only its hard state was lost: it restarts with its log, and must
     /// confirm the term before it votes.
     lost_hard_state: bool = false,
     /// A lost-log node the convergence phase waits on to finish its guard.
     guard_watched: bool = false,
-    // Pump state, by peer id: membership changes reorder the peers.
-    sent_at: [network_mod.MAX_NODES + 1]u64,
-    last_heartbeat: [network_mod.MAX_NODES + 1]u64,
     /// Its clock runs at 1 + this / 1e6 of the simulation's.
     clock_rate_ppm: i32 = 0,
     /// Its wall clock's error, and the wall clock its Raft node reads,
@@ -233,6 +254,121 @@ const SimNode = struct {
     applied_stamp_index: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SimIo — the replica's clock, links, disk and host
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Replica = replica_mod.Replica(SimIo);
+
+const SimIo = struct {
+    fn of(r: *Replica) *SimNode {
+        return @alignCast(@fieldParentPtr("replica", r));
+    }
+
+    pub fn nowMs(r: *Replica) u64 {
+        const node = of(r);
+        return node.sim.nodeNow(node);
+    }
+
+    pub fn networked(_: *Replica) bool {
+        return true;
+    }
+
+    pub fn send(r: *Replica, peer: u32, msg_type: transport.MsgType, group: u32, payload: []const u8) bool {
+        _ = group;
+        const node = of(r);
+        const sim = node.sim;
+        sim.net.send(&sim.prng, &sim.scenario, sim.now, node.id, @intCast(peer), msg_type, payload) catch @panic("sim OOM");
+        return true;
+    }
+
+    pub fn durableCommits(r: *Replica) bool {
+        return of(r).sim.scenario.durability == .sync;
+    }
+
+    /// Asked only when commits are durable: the batch is on disk before the
+    /// ack, as the shard's segment flush makes it. Async mode flushes on
+    /// its interval alone (`syncStableStorage`), as production's does.
+    pub fn flushForAck(r: *Replica) bool {
+        of(r).disk.flush();
+        return true;
+    }
+
+    /// The network takes any member's frames; the replica's own guard
+    /// decides whom it hears.
+    pub fn setVoters(_: *Replica, _: []const u32) void {}
+
+    pub const Host = struct {
+        pub fn raftNode(r: *Replica) *RaftNode {
+            return &of(r).raft;
+        }
+
+        /// Removal here drops a member without a tombstone, so no node is
+        /// ever told it was removed.
+        pub fn isRemoved(_: *Replica) bool {
+            return false;
+        }
+
+        pub fn checkRemoved(_: *Replica, _: u64) bool {
+            return false;
+        }
+
+        pub fn tickMembership(r: *Replica, _: u64) void {
+            const node = of(r);
+            if (node.raft.role != .leader) return;
+            node.sim.writeConfig(node);
+            node.sim.changeMembership(node);
+        }
+
+        pub fn applyCommitted(r: *Replica) bool {
+            const node = of(r);
+            node.sim.applyCommitted(node);
+            return true;
+        }
+
+        pub fn clearRemovalNotices(_: *Replica) void {}
+
+        pub fn strangerFrame(r: *Replica, _: RaftFrame) void {
+            of(r).sim.stranger_frames += 1;
+        }
+
+        // The simulator sends none of these: joiners are added by the
+        // leader, and clients propose on the leader directly.
+        pub fn handleJoinRequest(r: *Replica, _: u32) void {
+            of(r).sim.unexpected_frames += 1;
+        }
+
+        pub fn takeRemovedNotice(r: *Replica, _: RaftFrame) void {
+            of(r).sim.unexpected_frames += 1;
+        }
+
+        pub fn runForwardedWrite(r: *Replica, _: RaftFrame) void {
+            of(r).sim.unexpected_frames += 1;
+        }
+
+        pub fn takeForwardReply(r: *Replica, _: RaftFrame) void {
+            of(r).sim.unexpected_frames += 1;
+        }
+
+        /// As the shard: lead nothing. A diverged node is a finding unless
+        /// an async-mode crash could have erased what it applied; then it
+        /// is repaired as its operator would (`repairDiverged`).
+        pub fn stopTakingPart(r: *Replica, message: []const u8) void {
+            const node = of(r);
+            if (node.raft.role == .leader) {
+                node.raft.role = .follower;
+                node.raft.leader_id = 0;
+            }
+            stoppedLeading(r, message);
+            if (node.replica.diverged) node.sim.onDiverged(node);
+        }
+
+        pub fn stoppedLeading(r: *Replica, _: []const u8) void {
+            of(r).sim.steps_down += 1;
+        }
+    };
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +397,8 @@ const Checker = struct {
     /// unflushed entries, a survivor's older flushed suffix can win the
     /// next election and be re-committed at the same indices.
     allow_cross_term_rewrite: bool = false,
+    /// The longest an ack is in flight: the network's largest delay.
+    ack_flight_ms: u64 = 0,
     /// canonical[i] is the first-applied (term, payload-hash) at index i+1.
     /// First applier sets it; every later applier must match. A mismatch
     /// is a violation whichever side is "right" — two nodes applied
@@ -347,7 +485,10 @@ const Checker = struct {
                     .detail = "two different entries applied at one index in the same term",
                 });
             } else if (canon.term != term) {
-                const erasable = self.allow_cross_term_rewrite and latest_crash >= canon.recorded_at;
+                // An ack can be on the wire when its sender crashes: the
+                // leader commits on it, and applies, up to one delivery
+                // after the crash that erased it.
+                const erasable = self.allow_cross_term_rewrite and latest_crash + self.ack_flight_ms >= canon.recorded_at;
                 if (erasable) {
                     // History at this index was legally erased; whatever
                     // is now being applied is the surviving version.
@@ -421,8 +562,13 @@ pub const Summary = struct {
     messages_delivered: u64,
     messages_dropped: u64,
     apply_stalls: u64,
-    /// Replication batches read from below the leader's ring.
+    /// Replication batches read from below the leaders' rings.
     catch_up_reads: u64,
+    /// Diverged nodes wiped and rejoined (async mode, after a crash).
+    divergences: u64,
+    /// Diverged nodes no config could spare, left diverged; a run with one
+    /// is excused from converging.
+    divergences_beyond_tolerance: u64,
     /// Wyhash over the canonical history — two runs of one seed must agree.
     canonical_hash: u64,
     violation_count: usize,
@@ -459,8 +605,6 @@ pub const Simulator = struct {
     /// O(ops x ticks) and dominates the whole run.
     max_acked_index: u64,
     // Scratch, allocated once.
-    range_entries: []entry_mod.Entry,
-    range_arena: []u8,
     apply_buf: []u8,
     delivery: std.ArrayListUnmanaged(Message),
 
@@ -474,7 +618,13 @@ pub const Simulator = struct {
     convergence_target: u64 = 0,
     elections_won: u64 = 0,
     apply_stalls: u64 = 0,
-    catch_up_reads: u64 = 0,
+    /// Frames from a node outside the receiver's membership, dropped.
+    stranger_frames: u64 = 0,
+    /// Join, removal and forward frames, which nothing here sends.
+    unexpected_frames: u64 = 0,
+    steps_down: u64 = 0,
+    divergences: u64 = 0,
+    divergences_beyond_tolerance: u64 = 0,
 
     const RAFT_GROUP: u32 = 1;
 
@@ -492,6 +642,7 @@ pub const Simulator = struct {
             .checker = .{
                 .allocator = allocator,
                 .allow_cross_term_rewrite = scenario.durability == .async_flush,
+                .ack_flight_ms = scenario.msg_delay_max_ms,
             },
             .now = 0,
             .phase = .safety,
@@ -502,8 +653,6 @@ pub const Simulator = struct {
             .latest_crash_at = 0,
             .started_ms = stdx.time.milliTimestamp(),
             .max_acked_index = 0,
-            .range_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH),
-            .range_arena = try allocator.alloc(u8, @as(usize, scenario.payload_max) * MAX_BATCH + 64),
             .apply_buf = try allocator.alloc(u8, @as(usize, scenario.payload_max) + 64),
             .delivery = .empty,
         };
@@ -513,10 +662,9 @@ pub const Simulator = struct {
                 .id = id,
                 .up = true,
                 .raft = try RaftNode.init(allocator, id, RAFT_GROUP, scenario.log_capacity, self.raftConfig()),
+                .replica = try newReplica(allocator, &scenario),
                 .disk = .{ .allocator = allocator },
                 .max_term_seen = 0,
-                .sent_at = @splat(0),
-                .last_heartbeat = @splat(0),
             };
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
@@ -543,6 +691,9 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             node.raft.deinit();
             node.disk.deinit();
+            self.allocator.free(node.replica.rpc_entries);
+            self.allocator.free(node.replica.rpc_arena);
+            self.allocator.free(node.replica.rpc_out);
         }
         self.allocator.free(self.nodes);
         self.net.deinit();
@@ -551,8 +702,6 @@ pub const Simulator = struct {
         self.pending_ops.deinit(self.allocator);
         self.acked_at.deinit(self.allocator);
         self.crash_ticks.deinit(self.allocator);
-        self.allocator.free(self.range_entries);
-        self.allocator.free(self.range_arena);
         self.allocator.free(self.apply_buf);
         for (self.delivery.items) |*m| self.net.release(m);
         self.delivery.deinit(self.allocator);
@@ -568,8 +717,34 @@ pub const Simulator = struct {
             .heartbeat_interval_ms = self.scenario.heartbeat_interval_ms,
             .enable_pre_vote = true,
             .durable_commits = self.scenario.durability == .sync,
+            // A leader's own copy counts once on disk, as the runtime sets it.
+            .self_counts_when_durable = self.scenario.durability == .sync,
             .rng_seed = self.prng.random().int(u64) | 1,
             .rpc_timeout_ms = self.scenario.rpc_timeout_ms,
+        };
+    }
+
+    /// A replica's scratch, sized for the scenario's largest batch: up to
+    /// MAX_BATCH entries of the largest payload, and the frame that holds
+    /// them.
+    fn newReplica(allocator: Allocator, scenario: *const Scenario) !Replica {
+        const arena_len = @as(usize, scenario.payload_max) * MAX_BATCH + 64;
+        const rpc_entries = try allocator.alloc(entry_mod.Entry, MAX_BATCH);
+        errdefer allocator.free(rpc_entries);
+        const rpc_arena = try allocator.alloc(u8, arena_len);
+        errdefer allocator.free(rpc_arena);
+        const rpc_out = try allocator.alloc(u8, transport.APPEND_REQ_PREFIX + MAX_BATCH * entry_mod.HEADER_SIZE + arena_len);
+        return .{ .id = 0, .rpc_entries = rpc_entries, .rpc_arena = rpc_arena, .rpc_out = rpc_out, .diverged = false };
+    }
+
+    /// The replica a restarted node gets: its scratch, nothing else.
+    fn resetReplica(node: *SimNode) void {
+        node.replica = .{
+            .id = 0,
+            .rpc_entries = node.replica.rpc_entries,
+            .rpc_arena = node.replica.rpc_arena,
+            .rpc_out = node.replica.rpc_out,
+            .diverged = false,
         };
     }
 
@@ -635,7 +810,7 @@ pub const Simulator = struct {
 
     /// Wiped and down, or back but still guarded.
     fn isLost(node: *const SimNode) bool {
-        return node.wiped or node.lost_hard_state or node.disk.lost_log or (node.up and node.raft.lost_log != .none);
+        return node.replica.diverged or node.wiped or node.lost_hard_state or node.disk.lost_log or (node.up and node.raft.lost_log != .none);
     }
 
     /// No other node may be lost now: at most the scenario's `max_lost_nodes` at once,
@@ -732,9 +907,8 @@ pub const Simulator = struct {
             if (!self.options.no_lost_log_guard) node.raft.enterLostVote() catch unreachable;
         }
         if (self.options.no_lost_log_wait) node.raft.hold_pending = false;
+        resetReplica(node);
         node.up = true;
-        node.sent_at = @splat(0);
-        node.last_heartbeat = @splat(0);
         self.restarts += 1;
         // Replay applies from the start again.
         node.applied_config = .{};
@@ -786,95 +960,90 @@ pub const Simulator = struct {
         self.delivery.clearRetainingCapacity();
         try self.net.deliverDue(self.now, &self.delivery);
         // Drain from the front so a message is out of the list before it
-        // can error — anything still listed on an error path is released
+        // is handled — anything still listed on an error path is released
         // exactly once, by deinit.
         while (self.delivery.items.len > 0) {
             var msg = self.delivery.orderedRemove(0);
             defer self.net.release(&msg);
             const node = self.node_(msg.to);
             if (!node.up) continue;
-            try self.handleMessage(node, &msg);
+            self.drive(node, .{
+                .source_node = msg.from,
+                .group_id = RAFT_GROUP,
+                .msg_type = msg.msg_type,
+                .payload = msg.payload,
+            });
         }
     }
 
-    fn handleMessage(self: *Simulator, node: *SimNode, msg: *const Message) !void {
-        // The clock before the message, as production observes it before
-        // draining its queue.
-        node.raft.observeTime(self.nodeNow(node));
-        switch (msg.body) {
-            .vote_req => |req| {
-                const resp = node.raft.handleVoteRequest(req);
-                try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .vote_resp = resp });
-            },
-            .vote_resp => |resp| {
-                switch (node.raft.handleVoteResponse(resp)) {
-                    .none => {},
-                    .won => {
-                        self.elections_won += 1;
-                        self.checker.onLeader(node, self.now);
-                        self.writeConfig(node);
-                        // A change the moment a leader wins, before its
-                        // term's noop commits: what the own-term gate is for,
-                        // when an earlier term left a change uncommitted.
-                        if (self.config_written and self.scenario.config_change_permille > 0 and self.prng.random().boolean()) self.randomChange(node);
-                        // Send first heartbeats immediately.
-                        node.last_heartbeat = @splat(0);
-                        node.sent_at = @splat(0);
-                    },
-                    // The poll passed: the real request goes out now.
-                    .elect => |req| {
-                        node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
-                        for (0..node.raft.peer_count) |i| {
-                            try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
-                        }
-                    },
+    /// One call into a replica: a frame, or (null) its tick. A leadership
+    /// won inside the call is seen when it returns — no call both wins and
+    /// loses one.
+    fn drive(self: *Simulator, node: *SimNode, frame: ?RaftFrame) void {
+        const was_leader = node.raft.role == .leader;
+        const was_term = node.raft.current_term;
+        if (frame) |f| node.replica.handleRaftFrame(f) else node.replica.tickRaft();
+        node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
+        if (node.raft.role == .leader and (!was_leader or node.raft.current_term != was_term)) self.onWon(node);
+    }
+
+    fn onWon(self: *Simulator, node: *SimNode) void {
+        self.elections_won += 1;
+        self.checker.onLeader(node, self.now);
+        self.writeConfig(node);
+        // A change the moment a leader wins, before its term's noop
+        // commits: what the own-term gate is for, when an earlier term
+        // left a change uncommitted.
+        if (self.config_written and self.scenario.config_change_permille > 0 and self.prng.random().boolean()) self.randomChange(node);
+    }
+
+    /// A replica stopped taking part: its log contradicts history it
+    /// applied. Sync mode never erases applied history, and async mode
+    /// only in a crash.
+    fn onDiverged(self: *Simulator, node: *SimNode) void {
+        if (self.scenario.durability == .sync or self.crashes == 0) self.checker.fail(.{
+            .invariant = .divergence,
+            .node = node.id,
+            .index = node.raft.commit_index,
+            .tick = self.now,
+            .detail = "a node's applied history contradicts the group's log",
+        });
+    }
+
+    /// What the replica's message tells its operator: move the data aside
+    /// and rejoin. It comes back as a wiped node, under the lost-log guard.
+    ///
+    /// Only within what the configs tolerate losing, as every other wipe
+    /// here. A diverged voter the group can't spare stays diverged: the
+    /// async crash that erased its history cost the group its quorum, and
+    /// the way back is the operator's force-members, which only a
+    /// hand-built test here models. That run is excused from converging.
+    fn repairDiverged(self: *Simulator) !void {
+        for (self.nodes) |*node| {
+            if (!node.up or !node.replica.diverged) continue;
+            if (!self.mayRepair(node.id)) {
+                if (!node.beyond_tolerance) {
+                    node.beyond_tolerance = true;
+                    self.divergences_beyond_tolerance += 1;
                 }
-            },
-            .append_req => |req| {
-                var entries: [MAX_BATCH]entry_mod.Entry = undefined;
-                for (req.entries, 0..) |e, i| {
-                    entries[i] = entry_mod.buildEntry(
-                        @fromBackingInt(@intCast(e.entry_type)),
-                        e.flags,
-                        e.term,
-                        e.index,
-                        e.timestamp_ns,
-                        e.payload,
-                    );
-                    entries[i].header.crc32c = entries[i].computeCrc();
-                }
-                const result = node.raft.handleAppendEntries(.{
-                    .term = req.term,
-                    .leader_id = req.leader_id,
-                    .prev_log_index = req.prev_log_index,
-                    .prev_log_term = req.prev_log_term,
-                    .entries = entries[0..req.entries.len],
-                    .leader_commit = req.leader_commit,
-                }) catch {
-                    // Protocol-legal input must never error out of the
-                    // public API — this is a finding, not a drop.
-                    self.checker.fail(.{
-                        .invariant = .api_error,
-                        .node = node.id,
-                        .index = req.prev_log_index + 1,
-                        .tick = self.now,
-                        .detail = "handleAppendEntries returned an error on legal input",
-                    });
-                    return;
-                };
-                try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .append_resp = result });
-            },
-            .append_resp => |resp| {
-                node.raft.handleAppendResponse(resp);
-            },
-            .term_check => |req| {
-                try self.net.send(&self.prng, &self.scenario, self.now, node.id, msg.from, .{ .term_check_resp = node.raft.handleTermCheck(req) });
-            },
-            .term_check_resp => |resp| {
-                node.raft.handleTermCheckResponse(resp);
-                node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
-            },
+                continue;
+            }
+            self.divergences += 1;
+            self.wipeNode(node);
+            try self.restartNode(node);
         }
+    }
+
+    /// `mayLose` for a node that is lost already (diverged): the limits
+    /// count the others, and every config must spare it.
+    fn mayRepair(self: *const Simulator, id: NodeId) bool {
+        var lost: u8 = 0;
+        for (self.nodes) |*node| lost += @intFromBool(node.id != id and isLost(node));
+        if (lost >= self.scenario.max_lost_nodes) return false;
+        for (self.nodes) |*node| {
+            if (!self.toleratesLoss(&node.raft.latest_config, id)) return false;
+        }
+        return true;
     }
 
     /// Every node is a member from the start: the committed membership a
@@ -901,32 +1070,11 @@ pub const Simulator = struct {
         self.config_written = true;
     }
 
-    // ── Node tick: elections + replication pump ────────────────────────
+    // ── Node tick: the replica's clock ─────────────────────────────────
 
-    fn tickNodes(self: *Simulator) !void {
+    fn tickNodes(self: *Simulator) void {
         for (self.nodes) |*node| {
-            if (!node.up) continue;
-            const result = node.raft.tick(self.nodeNow(node));
-            if (result.start_election) {
-                // The sim disk never refuses a write, so this always starts.
-                const req = node.raft.startElection() orelse unreachable;
-                node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
-                for (0..node.raft.peer_count) |i| {
-                    try self.net.send(&self.prng, &self.scenario, self.now, node.id, node.raft.peer_ids[i], .{ .vote_req = req });
-                }
-            }
-            if (result.send_term_check) {
-                var ids: [MAX_PEERS + 1]NodeId = undefined;
-                for (node.raft.termCheckTargets(&ids)) |peer| {
-                    try self.net.send(&self.prng, &self.scenario, self.now, node.id, peer, .{ .term_check = node.raft.termCheckRequest() });
-                }
-            }
-            if (node.raft.role == .leader) {
-                self.writeConfig(node);
-                try self.pump(node);
-                self.changeMembership(node);
-            }
-            node.max_term_seen = @max(node.max_term_seen, node.raft.current_term);
+            if (node.up) self.drive(node, null);
         }
     }
 
@@ -1033,73 +1181,6 @@ pub const Simulator = struct {
         _ = self.proposeConfig(node, &next);
     }
 
-    /// The replication pump the production runtime is missing: heartbeat
-    /// on interval, batched entries when a peer is behind, inflight
-    /// tracking with a resend timeout (a dropped response would otherwise
-    /// wedge `PeerState.inflight` forever).
-    fn pump(self: *Simulator, node: *SimNode) !void {
-        const last = node.raft.log.lastIndex();
-        for (0..node.raft.peer_count) |i| {
-            const peer_id = node.raft.peer_ids[i];
-            const next = node.raft.peers[i].next_index;
-            const behind = next <= last;
-            const inflight_timeout = self.now -| node.sent_at[peer_id] >= self.scenario.rpc_timeout_ms;
-            const want_data = behind and (!node.raft.peers[i].inflight or inflight_timeout);
-            const want_heartbeat = self.now -| node.last_heartbeat[peer_id] >= self.scenario.heartbeat_interval_ms;
-            if (!want_data and !want_heartbeat) continue;
-
-            const prev_index = next - 1;
-            const prev_term = node.raft.log.entryTerm(prev_index) orelse blk: {
-                if (prev_index == 0) break :blk @as(u64, 0);
-                // The term index survives eviction, so this is a log bug.
-                // Surfaces as convergence failure.
-                self.apply_stalls += 1;
-                continue;
-            };
-
-            var entries: []OwnedEntry = &.{};
-            if (want_data) {
-                // Below the ring the log reads the disk; counted, because
-                // a slice that never repairs from below the ring has not
-                // exercised the catch-up path.
-                if (!node.raft.log.contains(next)) self.catch_up_reads += 1;
-                const count = node.raft.log.getRange(next, self.range_entries, self.range_arena);
-                if (count > 0) {
-                    const owned = try self.allocator.alloc(OwnedEntry, count);
-                    var built: usize = 0;
-                    errdefer {
-                        for (owned[0..built]) |e| self.allocator.free(e.payload);
-                        self.allocator.free(owned);
-                    }
-                    for (self.range_entries[0..count], 0..) |e, k| {
-                        owned[k] = .{
-                            .entry_type = e.header.entry_type,
-                            .flags = e.header.flags,
-                            .term = e.header.term,
-                            .index = e.header.index,
-                            .timestamp_ns = e.header.timestamp_ns,
-                            .payload = try self.allocator.dupe(u8, e.payload),
-                        };
-                        built += 1;
-                    }
-                    entries = owned;
-                    node.raft.peers[i].inflight = true;
-                    node.raft.peers[i].sent_up_to = @max(node.raft.peers[i].sent_up_to, next + count - 1);
-                    node.sent_at[peer_id] = self.now;
-                }
-            }
-            node.last_heartbeat[peer_id] = self.now;
-            try self.net.send(&self.prng, &self.scenario, self.now, node.id, peer_id, .{ .append_req = .{
-                .term = node.raft.current_term,
-                .leader_id = node.id,
-                .prev_log_index = prev_index,
-                .prev_log_term = prev_term,
-                .leader_commit = node.raft.commit_index,
-                .entries = entries,
-            } });
-        }
-    }
-
     // ── Workload ───────────────────────────────────────────────────────
 
     fn submitOps(self: *Simulator) !void {
@@ -1165,9 +1246,23 @@ pub const Simulator = struct {
 
     // ── Apply loop ─────────────────────────────────────────────────────
 
-    fn applyLoop(self: *Simulator) void {
+    fn applyAll(self: *Simulator) void {
         for (self.nodes) |*node| {
-            if (!node.up) continue;
+            if (node.up) self.applyCommitted(node);
+        }
+    }
+
+    /// The host's apply: with sync durability the log is flushed and the
+    /// node told so first, as the shard does before every apply — a
+    /// leader's own copy counts toward commit only once on disk.
+    fn applyCommitted(self: *Simulator, node: *SimNode) void {
+        if (self.scenario.durability == .sync) {
+            node.disk.flush();
+            node.raft.markDurable(node.raft.log.lastIndex());
+        }
+        node.disk.applying = true;
+        defer node.disk.applying = false;
+        {
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
                 // Apply rewound (async flush lost committed history and the
@@ -1234,18 +1329,16 @@ pub const Simulator = struct {
     // ── Log durability (runs before fault injection) ───────────────────
     // Hard state is not synced here: it reaches the disk only through the
     // node's sink, so a term the node never persisted is a term it loses.
+    // Sync mode flushes where the host does (before an ack, before an
+    // apply); async mode on its interval alone.
 
     fn syncStableStorage(self: *Simulator) void {
+        if (self.scenario.durability != .async_flush) return;
         for (self.nodes) |*node| {
             if (!node.up) continue;
-            switch (self.scenario.durability) {
-                .sync => node.disk.durable_len = node.disk.entries.items.len,
-                .async_flush => {
-                    if (self.now - node.disk.last_flush >= self.scenario.flush_interval_ms) {
-                        node.disk.durable_len = node.disk.entries.items.len;
-                        node.disk.last_flush = self.now;
-                    }
-                },
+            if (self.now - node.disk.last_flush >= self.scenario.flush_interval_ms) {
+                node.disk.flush();
+                node.disk.last_flush = self.now;
             }
         }
     }
@@ -1396,19 +1489,26 @@ pub const Simulator = struct {
     // ── Main loop ──────────────────────────────────────────────────────
 
     /// Within-tick order is pinned (it defines ack-vs-crash semantics):
-    /// deliver → ticks + pump → submit → apply → ack sweep →
-    /// stable-storage sync → faults. An op acked in the tick its acker
-    /// crashes was acked before the crash — the client has the response;
-    /// the guarantee stands.
+    /// deliver → replica ticks → submit → apply → ack sweep →
+    /// stable-storage sync → diverged repair → faults. An op acked in the
+    /// tick its acker crashes was acked before the crash — the client has
+    /// the response; the guarantee stands.
     fn tick(self: *Simulator) !void {
+        for (self.nodes) |*node| node.sim = self;
+        // The replicas say what a node's operator reads; the run's own
+        // report is the checker's.
+        const level = log.getLevel();
+        if (!self.options.verbose) log.setLevel(.fatal);
+        defer log.setLevel(level);
         self.now += 1;
         self.setWallClocks();
         try self.deliverAll();
-        try self.tickNodes();
+        self.tickNodes();
         try self.submitOps();
-        self.applyLoop();
+        self.applyAll();
         try self.ackSweep();
         self.syncStableStorage();
+        try self.repairDiverged();
         try self.injectFaults();
     }
 
@@ -1454,7 +1554,10 @@ pub const Simulator = struct {
                     break;
                 }
             }
-            if (!converged_ok and self.checker.violations.items.len == 0) {
+            // Only async mode lets a crash erase applied history; sync
+            // fails on any divergence (`onDiverged`).
+            const excused = self.divergences_beyond_tolerance > 0 and self.scenario.durability == .async_flush;
+            if (!converged_ok and self.checker.violations.items.len == 0 and !excused) {
                 self.checker.fail(.{
                     .invariant = .convergence,
                     .node = 0,
@@ -1500,7 +1603,13 @@ pub const Simulator = struct {
             .messages_delivered = self.net.delivered,
             .messages_dropped = self.net.dropped,
             .apply_stalls = self.apply_stalls,
-            .catch_up_reads = self.catch_up_reads,
+            .catch_up_reads = blk: {
+                var n: u64 = 0;
+                for (self.nodes) |*node| n += node.disk.catch_up_reads;
+                break :blk n;
+            },
+            .divergences = self.divergences,
+            .divergences_beyond_tolerance = self.divergences_beyond_tolerance,
             .canonical_hash = h.final(),
             .violation_count = self.checker.violations.items.len,
         };
@@ -1529,6 +1638,16 @@ pub const Simulator = struct {
                     node.disk.durable_len,
                 },
             );
+            // Its view of the group: who it hears from, and who votes.
+            try writer.print("    guard={s} diverged={} config@{d} (committed {d}):", .{ @tagName(node.raft.lost_log), node.replica.diverged, node.raft.membership_index, node.raft.commit_index });
+            for (node.raft.latest_config.memberSlice()) |m| {
+                try writer.print(" {d}{s}", .{ m.id, if (m.voter) "v" else if (m.caught_up) "r+" else "r" });
+            }
+            try writer.print("; committed config@{d}:", .{node.raft.committed_config_index});
+            for (node.raft.committed_config.memberSlice()) |m| {
+                try writer.print(" {d}{s}", .{ m.id, if (m.voter) "v" else if (m.caught_up) "r+" else "r" });
+            }
+            try writer.print("\n", .{});
         }
     }
 };

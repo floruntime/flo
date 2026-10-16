@@ -132,6 +132,10 @@ pub fn Replica(comptime Io: type) type {
         /// group; a node with the secret but no seat can still ask for one.
         pub fn handleRaftFrame(self: *Self, frame: RaftFrame) void {
             const raft = self.raftNode();
+            // The clock before each frame: a vote that arrives past the
+            // candidacy's deadline is not counted on an older clock, even
+            // after a stall part way through a queue of them.
+            raft.observeTime(Io.nowMs(self));
             if (self.diverged or self.isRemoved()) return;
             if (frame.msg_type != .join_request and (raft.peer_count > 0 or raft.self_named)) {
                 // Members of the latest config, and of the committed one until
@@ -206,7 +210,7 @@ pub fn Replica(comptime Io: type) type {
                             self.leadershipLost("a follower is at a newer term");
                         }
                     }
-                    if (raft.role == .leader) self.pump(Io.nowMs());
+                    if (raft.role == .leader) self.pump(Io.nowMs(self));
                 },
                 .request_vote => {
                     const req = transport.deserializeVoteRequest(frame.payload) orelse return self.badFrame(frame);
@@ -232,7 +236,7 @@ pub fn Replica(comptime Io: type) type {
                         },
                         .won => {
                             log.info("shard {d}: elected leader for term {d}", .{ self.id, raft.current_term });
-                            self.pump(Io.nowMs());
+                            self.pump(Io.nowMs(self));
                         },
                     }
                 },
@@ -260,7 +264,7 @@ pub fn Replica(comptime Io: type) type {
 
         /// A member's bug can arrive at heartbeat rate; one line per interval.
         fn frameWarnDue(self: *Self) bool {
-            const now = Io.nowMs();
+            const now = Io.nowMs(self);
             if (now -| self.frame_warn_ms < WARN_INTERVAL_MS) return false;
             self.frame_warn_ms = now;
             return true;
@@ -285,7 +289,7 @@ pub fn Replica(comptime Io: type) type {
         }
 
         fn replicaFrame(self: *Self, frame: RaftFrame) void {
-            const now = Io.nowMs();
+            const now = Io.nowMs(self);
             if (now -| self.replica_frame_warn_ms < WARN_INTERVAL_MS) return;
             self.replica_frame_warn_ms = now;
             log.warn("shard {d}: replica {d} sent a {s} frame; a replica only takes the log, so it was dropped", .{ self.id, frame.source_node, @tagName(frame.msg_type) });
@@ -306,7 +310,7 @@ pub fn Replica(comptime Io: type) type {
         pub fn tickRaft(self: *Self) void {
             if (!Io.networked(self) or self.diverged) return;
             const raft = self.raftNode();
-            const now = Io.nowMs();
+            const now = Io.nowMs(self);
             if (self.checkRemoved(now)) return;
             if (raft.left_group) {
                 raft.left_group = false;
