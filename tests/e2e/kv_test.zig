@@ -1613,6 +1613,36 @@ test "e2e/kv: mget with a routing key finds keys written with it, and without on
     try testing.expectEqualStrings(want.items, plain.stdout);
 }
 
+test "e2e/kv: mget across shards pages answers too large for one, keeping the order asked" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const a = testing.allocator;
+
+    // Eight values of 60 KB on whichever shards their keys hash to: one
+    // answer holds four at most, so the client follows `next`.
+    var names: [8][8]u8 = undefined;
+    var keys: [8][]const u8 = undefined;
+    var vals: [8][]u8 = undefined;
+    for (&keys, &vals, 0..) |*k, *v, i| {
+        k.* = try std.fmt.bufPrint(&names[i], "big-{d}", .{i});
+        v.* = try a.alloc(u8, 60 * 1024);
+        @memset(v.*, @intCast('a' + i));
+        try ctx.exec(&.{ "kv", "set", k.*, v.* });
+    }
+    defer for (vals) |v| a.free(v);
+
+    var args: [4 + 8][]const u8 = undefined;
+    args[0..4].* = .{ "kv", "mget", "-o", "raw" };
+    @memcpy(args[4..], &keys);
+    var result = try ctx.cli.run(&args);
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    var want = std.ArrayList(u8).empty;
+    defer want.deinit(a);
+    for (keys, vals) |k, v| try want.print(a, "{s}\t{s}\n", .{ k, v });
+    try testing.expectEqualStrings(want.items, result.stdout);
+}
+
 test "e2e/kv: mget across shards returns all results" {
     // 4 shards — keys hash to different shards via Wyhash
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{

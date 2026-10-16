@@ -42,6 +42,8 @@ const Mailbox = mailbox_mod.Mailbox;
 const ReplyTo = @import("reply_to.zig").ReplyTo;
 const reply_pool_mod = @import("reply_pool.zig");
 const ReplyPool = reply_pool_mod.ReplyPool;
+const gather_mod = @import("gather.zig");
+const mget_mod = @import("../kv/mget.zig");
 const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
 const run_mod = @import("run.zig");
@@ -268,6 +270,9 @@ pub const Shard = struct {
     /// A slot per client request forwarded to another shard, until its
     /// answer comes back or `expireReplySlots` takes it back.
     reply_pool: ReplyPool,
+    /// Reads under way that other shards answer in parts (a kv.mget whose
+    /// keys several shards own); see `startMgetGather`.
+    gathers: Gathers,
     /// Answers dropped for want of a reply slot or of room on the asker's
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
@@ -612,6 +617,8 @@ pub const Shard = struct {
         // timeout; a shard that cannot have one does not start.
         var reply_pool = try ReplyPool.init(allocator, ReplyPool.slotsFor(shard_count), shard_count);
         errdefer reply_pool.deinit(allocator);
+        var gathers = try Gathers.init(allocator);
+        errdefer gathers.deinit(allocator);
         var waiter_pool = try WaiterPool.init(allocator);
         errdefer waiter_pool.deinit(allocator);
         waiter_pool.owner = shard_id;
@@ -960,6 +967,7 @@ pub const Shard = struct {
             .reactor = reactor,
             .mailbox = mailbox,
             .reply_pool = reply_pool,
+            .gathers = gathers,
             .dispatcher = dispatcher,
             .connections = .{},
             .router = Router.init(partition_count, shard_count, shard_id),
@@ -1286,6 +1294,7 @@ pub const Shard = struct {
 
         self.freeUndelivered();
         self.mailbox.destroy(self.allocator);
+        self.gathers.deinit(self.allocator);
         self.reply_pool.deinit(self.allocator);
         self.waiter_pool.deinit(self.allocator);
         self.slab.deinit();
@@ -1825,6 +1834,158 @@ pub const Shard = struct {
         log.warn("shard {d}: refusing client requests for shard {d}: {s} ({d} refused so far; {d} in flight to other shards, {d} ordinary and {d} blocking to shard {d})", .{ self.id, target, reason, self.forwards_refused, self.reply_pool.taken(), self.reply_pool.heldBy(.ordinary, target), self.reply_pool.heldBy(.blocking, target), target });
     }
 
+    // ─── Gathers: one read, answered in parts by other shards ─────────────
+
+    pub const Gathers = gather_mod.GatherTable(mget_mod.Gather);
+
+    pub fn shardCount(self: *const Shard) usize {
+        return if (self.peer_shards) |p| p.len else 1;
+    }
+
+    /// Send each part of `plan` another shard owns to that shard, as a
+    /// kv.mget of its keys, and answer the client once every part has
+    /// answered. Part `local`, if any, is this shard's: its answer is
+    /// `local_body`, owned from here on. The client's request counts once
+    /// against its in-flight limit, however many parts it has; each part
+    /// holds a reply slot from its owner's share.
+    ///
+    /// `GatherBusy` when there is no room for every part, before anything
+    /// is sent: the request did not run. Past here the client is answered
+    /// exactly once: merged, a part's refusal, or `unavailable` at the
+    /// first part's deadline.
+    pub fn startMgetGather(self: *Shard, conn: *Connection, req: proto.Request, plan: *const mget_mod.Plan, local: ?usize, local_body: ?[]u8) error{ GatherBusy, OutOfMemory }!void {
+        var body_owned = local_body;
+        defer if (body_owned) |b| self.allocator.free(b);
+        const mailboxes = self.peer_mailboxes orelse return error.GatherBusy;
+        std.debug.assert(self.raft_network == null); // a cluster member runs one shard
+        // Room for every part before any is sent: a slot each (they share
+        // one pool), each owner's share of slots, and this shard's share of
+        // each owner's inbox. Only this shard raises its share's count, so
+        // room seen here is still there at the send.
+        const remote = plan.owners.len - @intFromBool(local != null);
+        const busy = !self.gathers.hasRoom() or conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT or
+            self.reply_pool.freeCount(.ordinary) < remote or for (plan.owners) |o|
+        {
+            if (o == self.id) continue;
+            if (!self.reply_pool.canTake(.ordinary, o) or !mailboxes[o].hasShare(@intCast(self.id))) break true;
+        } else false;
+        if (busy) {
+            if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.gather);
+            return error.GatherBusy;
+        }
+
+        const slots = try self.allocator.dupe(mget_mod.Slot, plan.slots);
+        const ticket = self.gathers.start(self.allocator, conn.fd, conn.id, req.header.request_id, @intCast(plan.owners.len), .{ .slots = slots }) catch |err| switch (err) {
+            error.Full => unreachable, // room checked above
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (local) |p| {
+            _ = self.gathers.arrive(self.allocator, .{ .index = ticket.index, .gen = ticket.gen, .part = @intCast(p) }, body_owned.?);
+            body_owned = null;
+        }
+
+        const now = nowMs();
+        const since = conn.head_since_ms orelse now;
+        const seq: u64 = (@as(u64, conn.id) << 32) | @as(u32, @bitCast(conn.fd));
+        const body_buf = try self.allocator.alloc(u8, req.value.len);
+        defer self.allocator.free(body_buf);
+        for (plan.owners, plan.keys, 0..) |owner, keys, p| {
+            if (owner == self.id) continue;
+            var piece = req;
+            piece.value = mget_mod.pieceBody(body_buf, keys) catch unreachable; // a part is smaller than the whole
+            const sent = self.sendGatherPart(mailboxes[owner], owner, conn, piece, seq, since, now, .{ .index = ticket.index, .gen = ticket.gen, .part = @intCast(p) });
+            if (!sent) {
+                // Only a full inbox ring, or no memory for the request, gets
+                // here past the checks above.
+                // The parts already sent answer into an ended gather and
+                // are dropped there; their slots come back as they do.
+                self.gathers.finish(self.allocator, self.gathers.get(ticket).?);
+                if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.gather);
+                return error.GatherBusy;
+            }
+        }
+        conn.forwards_in_flight += 1;
+        conn.recordForward();
+        if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
+    }
+
+    fn sendGatherPart(self: *Shard, target: *Mailbox, owner: u16, conn: *Connection, piece: proto.Request, seq: u64, since: u64, now: u64, part: ReplyPool.GatherPart) bool {
+        const ticket = self.reply_pool.take(.ordinary, owner, conn.fd, conn.id, piece.header.request_id, false, since, now, reply_pool_mod.DEADLINE_MS, 0) catch return false;
+        self.reply_pool.tagGather(ticket, part);
+        const buf = serializeRequest(self.allocator, piece) catch {
+            _ = self.reply_pool.release(ticket, owner);
+            return false;
+        };
+        var msg: InboxMessage = .{ .tag = .forward_request, .src_shard = @intCast(self.id), .payload_len = @intCast(buf.len), .sequence = seq, .payload_ptr = buf.ptr };
+        msg.setReplySlot(ticket.slot, ticket.gen);
+        if (!target.sendOnShare(msg)) {
+            self.allocator.free(buf);
+            _ = self.reply_pool.release(ticket, owner);
+            return false;
+        }
+        return true;
+    }
+
+    /// A gather's part answered, its slot already freed. A refusal ends the
+    /// gather and goes to the client as it came; the last answer merges.
+    fn gatherPartAnswered(self: *Shard, slot: ReplyPool.Slot, part: ReplyPool.GatherPart, bytes: []const u8) void {
+        const e = self.gathers.get(.{ .index = part.index, .gen = part.gen }) orelse return; // ended
+        if (bytes.len == 0) {
+            var buf: [128]u8 = undefined;
+            const message = std.fmt.bufPrint(&buf, "internal error: shard {d} lost its answer — retry", .{slot.target}) catch "internal error: an answer was lost — retry";
+            return self.failGather(e, .internal_error, .{ .reason = .answer_lost, .ran = .no, .message = message });
+        }
+        const resp = proto.Response.parse(bytes) catch
+            return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: another shard's answer did not read — retry" });
+        if (resp.header.status != @backingInt(proto.StatusCode.ok)) {
+            if (self.gatherClient(e)) |conn| {
+                _ = conn.queueWrite(bytes);
+                self.flushToClient(conn.fd);
+            }
+            return self.endGather(e);
+        }
+        const body = self.allocator.dupe(u8, resp.data) catch
+            return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory for an answer — retry" });
+        const done = self.gathers.arrive(self.allocator, part, body) orelse return;
+        const conn = self.gatherClient(done) orelse return self.endGather(done);
+        const merged = mget_mod.mergeBodies(&self.kv_handler.answer_buf, done.context.slots, done.answers) catch
+            return self.failGather(done, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
+        table_run.answer(mget_mod.Response, self, conn, done.request_id, merged);
+        self.flushToClient(conn.fd);
+        self.endGather(done);
+    }
+
+    /// A gather's part not answered by its deadline: the gather ends, and
+    /// its client is told once. A part of a gather already ended is let go.
+    fn gatherPartLate(self: *Shard, slot: ReplyPool.Slot, part: ReplyPool.GatherPart) void {
+        const e = self.gathers.get(.{ .index = part.index, .gen = part.gen }) orelse return;
+        if (self.shard_metrics) |sm| sm.recordGatherTimeout();
+        var buf: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "unavailable: shard {d} did not answer in {d} s — retry", .{ slot.target, slot.answer_after_ms / 1000 }) catch "unavailable: no answer — retry";
+        self.failGather(e, .unavailable, .{ .reason = .unclassified, .ran = .no, .message = message });
+    }
+
+    fn failGather(self: *Shard, e: *Gathers.Entry, status: proto.StatusCode, r: proto.Refusal) void {
+        if (self.gatherClient(e)) |conn| {
+            self.sendRefusal(conn, e.request_id, status, r);
+            self.flushToClient(conn.fd);
+        }
+        self.endGather(e);
+    }
+
+    /// The client a gather answers, if still connected.
+    fn gatherClient(self: *Shard, e: *const Gathers.Entry) ?*Connection {
+        const conn = self.getConnection(e.fd) orelse return null;
+        return if (conn.id == e.conn_id) conn else null;
+    }
+
+    /// The gather is done: its client has one fewer request in flight, and
+    /// any part still out is dropped when it comes.
+    fn endGather(self: *Shard, e: *Gathers.Entry) void {
+        if (self.gatherClient(e)) |conn| conn.forwards_in_flight -|= 1;
+        self.gathers.finish(self.allocator, e);
+    }
+
     // ─── Cross-Shard Walk ────────────────────────────────────────────────
 
     /// Execute a cross-shard walk (list/scan) for the given request.
@@ -2156,6 +2317,7 @@ pub const Shard = struct {
         const slot = self.reply_pool.release(.{ .slot = held.slot, .gen = held.gen }, msg.src_shard) orelse return;
         if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
         if (slot.answered) return; // its client was told at the deadline
+        if (slot.gather) |part| return self.gatherPartAnswered(slot, part, bytes);
         const conn = self.forwardAnswered(slot) orelse return;
         if (bytes.len == 0) {
             var buf: [128]u8 = undefined;
@@ -2200,6 +2362,7 @@ pub const Shard = struct {
             /// Expired per target, to name the one with the most.
             per_target: [@import("../config/server.zig").MAX_SHARDS]u32 = @splat(0),
             pub fn late(ctx: *@This(), slot: ReplyPool.Slot) void {
+                if (slot.gather) |part| return ctx.shard.gatherPartLate(slot, part);
                 ctx.count += 1;
                 ctx.per_target[slot.target] += 1;
                 if (ctx.shard.shard_metrics) |sm| sm.recordCrossShardTimeout();
@@ -6671,6 +6834,16 @@ const TwoShards = struct {
         }
     }
 
+    /// Each shard takes what the other sent it, until neither has more:
+    /// requests run, and their answers come back.
+    fn settle(self: *TwoShards) void {
+        while (true) {
+            var n: usize = 0;
+            for (&self.shards) |*s| n += s.drainInbox();
+            if (n == 0) return;
+        }
+    }
+
     fn deinit(self: *TwoShards) void {
         for (&self.shards) |*s| s.deinit();
         for (self.pipes) |p| {
@@ -6690,6 +6863,39 @@ fn nextAnswer(c: TestClient, shard: *Shard, out: []u8) !proto.Response {
 fn txnGet(buf: []u8, id: u64) proto.Request {
     const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = id }) catch unreachable;
     return .{ .header = proto.RequestHeader.init(.kv_get, 9), .namespace = "", .key = "k", .value = body };
+}
+
+test "Shard: a kv.mget another shard sent refuses a key it doesn't own, and answers its own" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const b = &two.shards[1];
+    // A key each shard owns.
+    var names: [2][8]u8 = undefined;
+    var owned: [2]?[]const u8 = .{ null, null };
+    var i: u8 = 0;
+    while (owned[0] == null or owned[1] == null) : (i += 1) {
+        var scratch: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&scratch, "k{d}", .{i});
+        const owner = b.router.partitionToShard(b.router.hashToPartition(node_router.hashKeyWithNamespace("", k)));
+        if (owned[owner] == null) {
+            @memcpy(names[owner][0..k.len], k);
+            owned[owner] = names[owner][0..k.len];
+        }
+    }
+
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    c.conn.proxy_for = ReplyTo.socketOf(0, 99, 1);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    b.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_mget, 5), .namespace = "", .key = "", .value = try mget_mod.pieceBody(&body, &.{owned[0].?}) }, .shard);
+    const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), refused.header.status);
+
+    b.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_mget, 6), .namespace = "", .key = "", .value = try mget_mod.pieceBody(&body, &.{owned[1].?}) }, .shard);
+    const own = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), own.header.status);
 }
 
 test "Shard: a request in a transaction goes to the shard its id names, and commit and rollback by the id alone" {
@@ -6730,7 +6936,8 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
     defer two.deinit();
     const shardOf = struct {
         fn of(sh: *Shard, key: []const u8) u16 {
-            return sh.router.partitionToShard(sh.router.hashToPartition(node_router.hashKeyWithNamespace("", key)));
+            // Parsed requests name the default namespace "default".
+            return sh.router.partitionToShard(sh.router.hashToPartition(node_router.hashKeyWithNamespace("default", key)));
         }
     }.of;
     const a = &two.shards[0];
@@ -6758,7 +6965,7 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
             var keys = Keys.Builder.init(&self.kbuf);
             try std.testing.expect(try keys.add(key));
             const body = try op.request.encodeInto(&self.body_buf, .{ .keys = keys.value(), .routing_key = routing_key });
-            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "", .key = "", .value = body };
+            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "default", .key = "", .value = body };
         }
     };
     var m: Mget = .{};
@@ -6788,6 +6995,7 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
         const c = try TestClient.open(sh);
         defer _ = std.c.close(c.pair[1]);
         sh.runRequest(c.conn, try m.req(id, case.key, case.routing_key), .client);
+        two.settle();
         const resp = try nextAnswer(c, sh, &out);
         try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), resp.header.status);
         const got = try op.response.decodeAll(resp.data, &diag);
@@ -6796,6 +7004,219 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
         try std.testing.expectEqual(case.value != null, e.found);
         if (case.value) |v| try std.testing.expectEqualStrings(v, e.value);
     }
+}
+
+/// Two shards with keys on each, and a client on shard 0 asking kv.mget
+/// without a routing key: the gather's tests.
+const MgetGatherFixture = struct {
+    two: TwoShards,
+    client: TestClient,
+    /// keys[i] is owned by shard i % 2, valued `vals[i]`.
+    names: [8][12]u8,
+    keys: [8][]const u8,
+    body_buf: [512]u8,
+    out: []u8,
+
+    const N = 8;
+
+    fn init(self: *MgetGatherFixture, value_len: usize) !void {
+        try self.two.init();
+        errdefer self.two.deinit();
+        const a = &self.two.shards[0];
+        var found: [2]usize = .{ 0, 0 };
+        var i: usize = 0;
+        while (found[0] + found[1] < N) : (i += 1) {
+            var scratch: [12]u8 = undefined;
+            const k = try std.fmt.bufPrint(&scratch, "key{d}", .{i});
+            const owner = a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("default", k)));
+            const slot = 2 * found[owner] + owner;
+            if (found[owner] == N / 2) continue;
+            @memcpy(self.names[slot][0..k.len], k);
+            self.keys[slot] = self.names[slot][0..k.len];
+            found[owner] += 1;
+        }
+        const value = try std.testing.allocator.alloc(u8, value_len);
+        defer std.testing.allocator.free(value);
+        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+        for (self.keys, 0..) |k, n| {
+            // Each value names its key, so order shows in the answer.
+            @memset(value, @intCast('a' + n));
+            try self.two.shards[n % 2].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "default", k), value, 1, 0, 0, 0);
+        }
+        self.client = try TestClient.open(a);
+        self.out = try std.testing.allocator.alloc(u8, proto.MAX_ANSWER_BYTES);
+    }
+
+    fn deinit(self: *MgetGatherFixture) void {
+        std.testing.allocator.free(self.out);
+        _ = std.c.close(self.client.pair[1]);
+        self.two.deinit();
+    }
+
+    fn ask(self: *MgetGatherFixture, id: u64, keys: []const []const u8) !void {
+        const a = &self.two.shards[0];
+        a.runRequest(self.client.conn, .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "default", .key = "", .value = try mget_mod.pieceBody(&self.body_buf, keys) }, .client);
+    }
+
+    /// The next whole answer, however large.
+    fn answer(self: *MgetGatherFixture) !proto.Response {
+        const a = &self.two.shards[0];
+        const head = @sizeOf(proto.ResponseHeader);
+        var got = try readAnswer(self.client.pair[1], a, self.client.conn.fd, self.out, head);
+        if (got < head) return error.IncompleteResponse;
+        const header = @as(*align(1) const proto.ResponseHeader, @ptrCast(self.out.ptr)).*;
+        const total = head + header.data_len;
+        if (got < total) got += try readAnswer(self.client.pair[1], a, self.client.conn.fd, self.out[got..], total - got);
+        return proto.Response.parse(self.out[0..got]);
+    }
+
+    /// Nothing left behind: every slot back, no gather open, and the
+    /// client's in-flight count where it started.
+    fn expectSettled(self: *MgetGatherFixture, in_flight: u16) !void {
+        const a = &self.two.shards[0];
+        try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+        try std.testing.expectEqual(@as(usize, 0), a.gathers.inUse());
+        if (a.getConnection(self.client.conn.fd)) |conn| try std.testing.expectEqual(in_flight, conn.forwards_in_flight);
+    }
+};
+
+test "Shard: kv.mget gathers keys from every shard that owns one, answered in the order asked" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    try f.ask(1, &f.keys);
+    // Nothing comes back until shard 1 has answered its part.
+    try std.testing.expectEqual(@as(usize, 1), f.two.shards[0].gathers.inUse());
+    try std.testing.expectEqual(@as(u16, 1), f.client.conn.forwards_in_flight);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const got = try mget_mod.Response.decodeAll(resp.data, &diag);
+    try std.testing.expectEqual(@as(?u16, null), got.next);
+    try std.testing.expectEqual(@as(u16, MgetGatherFixture.N), got.entries.count);
+    var it = got.entries.iterator();
+    for (0..MgetGatherFixture.N) |n| {
+        const e = (try it.next()).?;
+        try std.testing.expect(e.found);
+        try std.testing.expectEqual(@as(u8, @intCast('a' + n)), e.value[0]);
+    }
+    try f.expectSettled(0);
+}
+
+test "Shard: a gathered kv.mget too large for one answer stops at the first key left out, in the order asked" {
+    var f: MgetGatherFixture = undefined;
+    // Eight values of a sixth of an answer: some fit, the rest page.
+    try f.init(mget_mod.Response.max_size / 6);
+    defer f.deinit();
+    try f.ask(1, &f.keys);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const got = try mget_mod.Response.decodeAll(resp.data, &diag);
+    const next = got.next orelse return error.TestExpectedNext;
+    // Every key before `next` is answered, in order, from both shards.
+    try std.testing.expectEqual(next, got.entries.count);
+    try std.testing.expect(next >= 2 and next < MgetGatherFixture.N);
+    var it = got.entries.iterator();
+    for (0..next) |n| try std.testing.expectEqual(@as(u8, @intCast('a' + n)), (try it.next()).?.value[0]);
+    try f.expectSettled(0);
+}
+
+test "Shard: a gathered kv.mget whose part is refused answers with that refusal, once" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    f.two.shards[1].offline = silent_loss.Damage.init(.router_error, "test", .{});
+    try f.ask(1, &f.keys);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.data, "offline") != null);
+    try f.expectSettled(0);
+    f.two.shards[1].offline = null;
+}
+
+test "Shard: a gathered kv.mget whose part misses its deadline is told unavailable once, and the late part is dropped" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const a = &f.two.shards[0];
+    try f.ask(1, &f.keys);
+    // Shard 1 hasn't run its part; make that part overdue.
+    for (a.reply_pool.slots) |*slot| {
+        if (slot.active) slot.answer_due_ms = 0;
+    }
+    a.reply_sweep_ms = 0;
+    a.expireReplySlots();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(usize, 0), a.gathers.inUse());
+    try std.testing.expectEqual(@as(u16, 0), f.client.conn.forwards_in_flight);
+    // The part's answer, late: its slot comes back, nothing reaches the client.
+    try std.testing.expectEqual(@as(usize, 1), a.reply_pool.taken());
+    f.two.settle();
+    try f.expectSettled(0);
+    var one: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, -1), std.c.read(f.client.pair[1], &one, 1));
+}
+
+test "Shard: a client gone mid-gather leaves no slot or gather behind" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const a = &f.two.shards[0];
+    try f.ask(1, &f.keys);
+    a.closeConnection(f.client.conn.fd);
+    f.two.settle();
+    try f.expectSettled(0);
+}
+
+test "Shard: a gather counts once against its client's in-flight limit, and is refused unrun at it" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const conn = f.client.conn;
+    // At the limit: refused before anything is sent.
+    conn.forwards_in_flight = Connection.MAX_FORWARDS_IN_FLIGHT;
+    try f.ask(1, &f.keys);
+    const refused = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), refused.header.status);
+    try f.expectSettled(Connection.MAX_FORWARDS_IN_FLIGHT);
+    // One below it: the gather goes, holding one place however many parts.
+    conn.forwards_in_flight = Connection.MAX_FORWARDS_IN_FLIGHT - 1;
+    try f.ask(2, &f.keys);
+    try std.testing.expectEqual(Connection.MAX_FORWARDS_IN_FLIGHT, conn.forwards_in_flight);
+    f.two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try f.answer()).header.status);
+    try f.expectSettled(Connection.MAX_FORWARDS_IN_FLIGHT - 1);
+    conn.forwards_in_flight = 0;
+}
+
+test "Shard: a kv.mget of no keys on a node of several shards answers empty, with no gather" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    try f.ask(1, &.{});
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].gathers.inUse());
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const got = try mget_mod.Response.decodeAll(resp.data, &diag);
+    try std.testing.expectEqual(@as(u16, 0), got.entries.count);
+    try std.testing.expectEqual(@as(?u16, null), got.next);
+}
+
+test "Shard: a kv.mget whose keys are all this shard's runs here, with no gather" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const own = [_][]const u8{ f.keys[0], f.keys[2] };
+    try f.ask(1, &own);
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].gathers.inUse());
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
 }
 
 test "Shard: a transaction id naming a shard that exists but doesn't hold it is refused there" {

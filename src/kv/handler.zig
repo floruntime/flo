@@ -48,6 +48,7 @@ const schema = @import("../protocol/schema.zig");
 const json_path = @import("../util/json_path.zig");
 const json_depth = @import("../util/json_depth.zig");
 const table_run = @import("../node/table_run.zig");
+const mget_mod = @import("mget.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
@@ -191,6 +192,8 @@ pub const KVHandler = struct {
         TooDeep,
         TooManyTransactions,
         ScanShort,
+        NotOwner,
+        GatherBusy,
         Internal,
     };
 
@@ -222,6 +225,8 @@ pub const KVHandler = struct {
             error.TooDeep => refused(.bad_request, .field_too_long, "bad request: " ++ json_depth.TOO_DEEP_MESSAGE),
             error.TooManyTransactions => refused(.overloaded, .too_many_transactions, "overloaded: too many open transactions on this shard — commit or roll some back, or retry"),
             error.ScanShort => refused(.overloaded, .shard_busy, "overloaded: no memory to list this page — retry"),
+            error.GatherBusy => refused(.overloaded, .shard_busy, "overloaded: too many reads across shards are under way; this request was not run — retry"),
+            error.NotOwner => refused(.internal_error, .internal, "internal error: a shard was asked for a key another shard owns"),
             error.Internal => refused(.internal_error, .internal, "internal error: the request couldn't be run"),
         };
     }
@@ -484,29 +489,91 @@ pub const KVHandler = struct {
 
     /// Many keys at once, in the order asked, as many as one answer holds;
     /// `next` is the first key left out.
-    fn mget(shard: *Shard, _: *Connection, req: Request, keys: MgetKeys.Value, routing_key: ?[]const u8) Error!table_run.Outcome(MgetResponse) {
+    fn mget(shard: *Shard, conn: *Connection, req: Request, keys: MgetKeys.Value, routing_key: ?[]const u8) Error!table_run.Outcome(MgetResponse) {
+        // Another shard asked this one for the keys it owns: a key that
+        // routes elsewhere is refused, never read here or answered missing.
+        const forwarded = conn.proxy_for != null;
+        // Keys other shards own are read on those shards: each owner gets
+        // its part, and the answers are merged here once all have come.
+        if (routing_key == null and !forwarded and shard.shardCount() > 1) {
+            var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .namespace = req.namespace }, MgetOwner.of) catch return error.Internal;
+            defer plan.deinit(shard.allocator);
+            if (plan.owners.len > 1 or (plan.owners.len == 1 and plan.owners[0] != shard.id)) {
+                const local = std.mem.indexOfScalar(u16, plan.owners, shard.id);
+                const local_body: ?[]u8 = if (local) |p| try localPart(shard, req.namespace, plan.keys[p]) else null;
+                shard.startMgetGather(conn, req, &plan, local, local_body) catch |err| return switch (err) {
+                    error.GatherBusy => error.GatherBusy,
+                    error.OutOfMemory => error.Internal,
+                };
+                return .wait;
+            }
+        }
         const self = shard.kv_handler;
         const Entries = MgetResponse.field_list[0].T;
         var entries = Entries.Builder.init(&self.answer_buf);
         var it = keys.iterator();
         var index: u16 = 0;
         while (it.next() catch return error.Internal) |raw_key| : (index += 1) {
-            var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-            // A key that can't be one, or one the server keeps, is not found.
-            const found: MgetLookup = if (raw_key.len == 0 or isReservedKey(raw_key))
-                .{ .found = false, .value = "", .version = 0 }
-            else if (qualifyKey(&qbuf, req.namespace, raw_key)) |qkey|
-                // With a routing key the request was routed to its shard,
-                // where every key lives: read here.
-                if (routing_key != null) localLookup(shard, qkey) else lookupKeyOnShard(shard, req.namespace, raw_key, qkey)
-            else |_|
-                .{ .found = false, .value = "", .version = 0 };
+            const found = try mgetLookup(shard, req.namespace, raw_key, routing_key != null);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 return .{ .answer = .{ .entries = entries.value(), .next = index } };
             }
         }
         return .{ .answer = .{ .entries = entries.value(), .next = null } };
     }
+
+    /// One key of an mget, from this shard's own map. A key that can't be
+    /// one, or one the server keeps, is not found. Without a routing key the
+    /// key must be this shard's: one another shard owns is never read here
+    /// or answered missing.
+    fn mgetLookup(shard: *Shard, namespace: []const u8, raw_key: []const u8, routed: bool) Error!MgetLookup {
+        const none: MgetLookup = .{ .found = false, .value = "", .version = 0 };
+        if (raw_key.len == 0 or isReservedKey(raw_key)) return none;
+        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+        const qkey = qualifyKey(&qbuf, namespace, raw_key) catch return none;
+        // With a routing key the request was routed to its shard, where
+        // every key lives.
+        if (!routed) {
+            const owner = MgetOwner.of(.{ .shard = shard, .namespace = namespace }, raw_key);
+            if (owner != shard.id) {
+                log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
+                return error.NotOwner;
+            }
+        }
+        const entry = shard.kv_handler.*.kv.get(qkey) orelse return none;
+        return .{ .found = true, .value = entry.value, .version = entry.version };
+    }
+
+    /// The part of a gathered mget this shard owns, answered here as the
+    /// body another owner would send.
+    fn localPart(shard: *Shard, namespace: []const u8, keys: []const []const u8) Error![]u8 {
+        const Entries = MgetResponse.field_list[0].T;
+        var entries = Entries.Builder.init(&shard.kv_handler.answer_buf);
+        var next: ?u16 = null;
+        for (keys, 0..) |raw_key, i| {
+            const found = try mgetLookup(shard, namespace, raw_key, false);
+            if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
+                next = @intCast(i);
+                break;
+            }
+        }
+        return mget_mod.encodeBody(shard.allocator, .{ .entries = entries.value(), .next = next }) catch error.Internal;
+    }
+
+    /// Which shard owns a key of an mget: a key that can't be one, or one
+    /// the server keeps, is answered where the request is.
+    const MgetOwner = struct {
+        shard: *const Shard,
+        namespace: []const u8,
+
+        fn of(self: MgetOwner, raw_key: []const u8) u16 {
+            if (raw_key.len == 0 or isReservedKey(raw_key)) return self.shard.id;
+            var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
+            _ = qualifyKey(&qbuf, self.namespace, raw_key) catch return self.shard.id;
+            const r = &self.shard.router;
+            return r.partitionToShard(r.hashToPartition(router.hashKeyWithNamespace(self.namespace, raw_key)));
+        }
+    };
 
     const MgetKeys = table_run.op("kv.mget").request.field_list[0].T;
 
@@ -837,38 +904,6 @@ pub const KVHandler = struct {
         value: []const u8,
         version: u64,
     };
-
-    /// Look up a single key, routing to the correct shard via peer_shards.
-    fn lookupKeyOnShard(shard: *Shard, namespace: []const u8, raw_key: []const u8, qkey: []const u8) MgetLookup {
-        const hash = router.hashKeyWithNamespace(namespace, raw_key);
-        const target_shard_id = shard.router.partitionToShard(shard.router.hashToPartition(hash));
-
-        if (target_shard_id == shard.id) {
-            // Local lookup
-            if (shard.kv_handler.*.kv.get(qkey)) |entry| {
-                return .{ .found = true, .value = entry.value, .version = entry.version };
-            }
-            return .{ .found = false, .value = &[_]u8{}, .version = 0 };
-        }
-
-        // Cross-shard lookup via peer_shards
-        if (shard.peer_shards) |peers| {
-            if (target_shard_id < peers.len) {
-                if (peers[target_shard_id].kv_handler.*.kv.get(qkey)) |entry| {
-                    return .{ .found = true, .value = entry.value, .version = entry.version };
-                }
-            }
-        }
-        return .{ .found = false, .value = &[_]u8{}, .version = 0 };
-    }
-
-    /// `qkey` in this shard's own map.
-    fn localLookup(shard: *Shard, qkey: []const u8) MgetLookup {
-        if (shard.kv_handler.*.kv.get(qkey)) |entry| {
-            return .{ .found = true, .value = entry.value, .version = entry.version };
-        }
-        return .{ .found = false, .value = &[_]u8{}, .version = 0 };
-    }
 
     // ── Raft Propose ────────────────────────────────────────────────────
 
