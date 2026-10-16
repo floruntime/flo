@@ -143,9 +143,11 @@ test "e2e/worker: list with no workers" {
     // Fresh server — no workers registered
     var result = try ctx.cli.run(&.{ "worker", "list" });
     defer result.deinit();
+    try testing.expectEqualStrings("(no workers)", std.mem.trim(u8, result.stdout, &std.ascii.whitespace));
 
-    // Should succeed (empty list is valid)
-    try stdx.testing.assertSucceeded(result);
+    var json = try ctx.cli.run(&.{ "worker", "list", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqualStrings("[]", std.mem.trim(u8, json.stdout, &std.ascii.whitespace));
 }
 
 test "e2e/worker: list with limit" {
@@ -157,11 +159,32 @@ test "e2e/worker: list with limit" {
     try ctx.exec(&.{ "worker", "register", "lim-w2", "task_b" });
     try ctx.exec(&.{ "worker", "register", "lim-w3", "task_c" });
 
-    // List with limit
-    var result = try ctx.cli.run(&.{ "worker", "list", "--limit", "2" });
+    // The first two by id.
+    var result = try ctx.cli.run(&.{ "worker", "list", "--limit", "2", "-o", "raw" });
     defer result.deinit();
+    try testing.expectEqualStrings("lim-w1\nlim-w2", std.mem.trim(u8, result.stdout, &std.ascii.whitespace));
+}
 
-    try stdx.testing.assertSucceeded(result);
+test "e2e/worker: list on a node of several shards shows every shard's workers once, in id order" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    // Registrations land on their workers' shards; enough ids to reach all four.
+    var name: [8]u8 = undefined;
+    for (0..12) |i| try ctx.exec(&.{ "worker", "register", try std.fmt.bufPrint(&name, "sh-w{d:0>2}", .{i}), "task_a" });
+
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(testing.allocator);
+    for (0..12) |i| try want.print(testing.allocator, "sh-w{d:0>2}\n", .{i});
+
+    var all = try ctx.cli.run(&.{ "worker", "list", "-o", "raw" });
+    defer all.deinit();
+    try testing.expectEqualStrings(want.items, all.stdout);
+
+    var json = try ctx.cli.run(&.{ "worker", "list", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(usize, 12), json.stdoutCount("\"worker_id\":\"sh-w"));
+    try testing.expectEqual(@as(usize, 12), json.stdoutCount("\"status\":\"active\""));
 }
 
 // =============================================================================

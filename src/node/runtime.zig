@@ -626,6 +626,12 @@ pub const Runtime = struct {
         const shards_created = shards.len;
 
         try self.wireWalkContexts(shards);
+        for (shards) |*s| {
+            if (s.dispatcher.unwiredWalk()) |op| {
+                log.err("op 0x{x} lists across shards, but no shard's walk contexts are wired for it", .{op});
+                return error.UnwiredWalk;
+            }
+        }
 
         // 2.55 Wire cross-shard stream handler references for processing pipelines.
         try self.wirePeerStreamHandlers(shards);

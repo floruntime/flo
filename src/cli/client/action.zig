@@ -15,6 +15,7 @@ const Client = base.Client;
 const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
 const action_ops = @import("../../protocol/action_ops.zig");
+const worker_ops = @import("../../protocol/worker_ops.zig");
 const FixedWireWriter = wire.FixedWireWriter;
 
 // =============================================================================
@@ -296,29 +297,9 @@ pub fn workerFail(
     return client.sendRequest(.action_fail, namespace, worker_id, value);
 }
 
-/// List workers in namespace
-/// key = empty
-/// value = [limit:u32][cursor...]
-pub fn workerList(
-    client: *Client,
-    namespace: []const u8,
-    limit: ?u32,
-    cursor: ?[]const u8,
-) !Response {
-    var value_buf: [256]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    // Write limit (default 100)
-    try writer.writeInt(u32, limit orelse 100, .little);
-
-    // Write cursor if provided (for shard walking)
-    if (cursor) |c| {
-        _ = writer.write(c) catch return error.BufferOverflow;
-    }
-
-    const value = fbs.buffered();
-    return client.sendRequest(.worker_list, namespace, "", value);
+/// A page of the namespace's workers after `cursor` (empty: from the start).
+pub fn workerList(client: *Client, namespace: []const u8, limit: u32, cursor: []const u8) !Response {
+    return client.call(worker_ops.op("worker.list"), namespace, "", .{ .limit = limit, .cursor = cursor });
 }
 
 /// Drain a worker (mark as draining — stops new task assignments)
