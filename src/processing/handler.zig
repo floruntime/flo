@@ -34,6 +34,7 @@ const ts_mod = @import("../projection/ts.zig");
 const StoredPoint = ts_mod.StoredPoint;
 
 const shard_mod = @import("../node/shard.zig");
+const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
@@ -1095,13 +1096,11 @@ pub const ProcessingHandler = struct {
     }
 
     /// `{"measurement":<name>,"value":<v>,"timestamp_ms":<ms>}`, the name
-    /// escaped as a JSON string and a non-finite value as null; null when
-    /// it doesn't fit `buf`.
-    fn tsPointJson(buf: []u8, measurement: []const u8, value: f64, ts_ms: i64) ?[]const u8 {
-        var w: std.Io.Writer = .fixed(buf);
+    /// escaped as a JSON string and a non-finite value as null, in an
+    /// allocation sized to it.
+    fn tsPointJson(allocator: Allocator, measurement: []const u8, value: f64, ts_ms: i64) ![]u8 {
         const v: ?f64 = if (std.math.isFinite(value)) value else null;
-        std.json.Stringify.value(.{ .measurement = measurement, .value = v, .timestamp_ms = ts_ms }, .{}, &w) catch return null;
-        return w.buffered();
+        return std.json.Stringify.valueAlloc(allocator, .{ .measurement = measurement, .value = v, .timestamp_ms = ts_ms }, .{});
     }
 
     /// A PipelineState with source/sink config (no operators). Out of
@@ -1216,10 +1215,11 @@ pub const ProcessingHandler = struct {
         if (points.len == 0) return;
 
         for (points) |pt| {
-            // Format TS point as JSON record
-            var json_buf: [512]u8 = undefined;
+            // Format TS point as JSON record. Short of memory, the tick
+            // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(&json_buf, pipe.src_measurement, pt.field_value, ts_ms) orelse continue;
+            const json = tsPointJson(shard.allocator, pipe.src_measurement, pt.field_value, ts_ms) catch break;
+            defer shard.allocator.free(json);
 
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
@@ -1402,9 +1402,9 @@ pub const ProcessingHandler = struct {
 
     /// A record a sink could not write is lost to that sink (the cursor
     /// has moved past it); said once per interval with the count.
-    fn noteSinkDrop(self: *ProcessingHandler, shard: *Shard, kind: []const u8, target: []const u8, why: []const u8) void {
+    fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
         self.sink_drops += 1;
-        if (shard.metrics_registry) |m| m.processing.recordDropped();
+        if (metrics) |m| m.processing.recordDropped();
         const now = @import("stdx").time.milliTimestamp();
         if (now - self.sink_warn_ms < 30_000) return;
         self.sink_warn_ms = now;
@@ -1432,7 +1432,7 @@ pub const ProcessingHandler = struct {
             // A sink writes without passing a client's request gate: a
             // namespace this shard may not create takes no write.
             if (shard.namespace_handler.admission(snk.namespace)) |r| {
-                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                self.noteSinkDrop(shard.metrics_registry, @tagName(snk.kind), snk.target, r.message);
                 continue;
             }
             switch (snk.kind) {
@@ -1444,7 +1444,7 @@ pub const ProcessingHandler = struct {
                     // by its bare name until the namespace exists there.
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        self.noteSinkDrop(shard, "stream", snk.target, @errorName(err));
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
                     };
                 },
@@ -1460,7 +1460,7 @@ pub const ProcessingHandler = struct {
                         ual_idx,
                         src_tags,
                     ) catch |err| {
-                        self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
+                        self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
                         continue;
                     };
                 },
@@ -1480,7 +1480,7 @@ pub const ProcessingHandler = struct {
             // A sink writes without passing a client's request gate: a
             // namespace this shard may not create takes no write.
             if (shard.namespace_handler.admission(snk.namespace)) |r| {
-                self.noteSinkDrop(shard, @tagName(snk.kind), snk.target, r.message);
+                self.noteSinkDrop(shard.metrics_registry, @tagName(snk.kind), snk.target, r.message);
                 continue;
             }
             switch (snk.kind) {
@@ -1492,7 +1492,7 @@ pub const ProcessingHandler = struct {
                     // by its bare name until the namespace exists there.
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
-                        self.noteSinkDrop(shard, "stream", snk.target, @errorName(err));
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
                     };
                 },
@@ -1518,16 +1518,16 @@ pub const ProcessingHandler = struct {
             while (it.next()) |pair| {
                 // pair.key = TS field name, pair.value = JSON field to extract from.
                 const value = extractJsonFloat(payload, pair.value) orelse {
-                    self.noteSinkDrop(shard, "ts", snk.measurement, "the record has no numeric field for it");
+                    self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record has no numeric field for it");
                     continue;
                 };
                 if (!std.math.isFinite(value)) {
-                    self.noteSinkDrop(shard, "ts", snk.measurement, "the value is not a finite number");
+                    self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
                     continue;
                 }
                 const ual_idx = ts_h.nextUalIndex();
                 ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
-                    self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
+                    self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
                     continue;
                 };
             }
@@ -1536,21 +1536,41 @@ pub const ProcessingHandler = struct {
 
         // value_field shorthand — extract the named JSON field and store it as "value".
         const value = extractJsonFloat(payload, snk.value_field) orelse
-            (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard, "ts", snk.measurement, "the record is not a number"));
-        if (!std.math.isFinite(value)) return self.noteSinkDrop(shard, "ts", snk.measurement, "the value is not a finite number");
+            (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
+        if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard, "ts", snk.measurement, @errorName(err));
+        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
+    }
+
+    const MAX_SINK_KEY = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+
+    /// A KV sink's key for a record: `prefix + separator + record_key` (a
+    /// record with no key writes `prefix + separator`), or the record's key
+    /// alone with no prefix, when it has one.
+    fn kvSinkKey(buf: *[MAX_SINK_KEY]u8, prefix: []const u8, separator: []const u8, record_key: []const u8) error{ NoKey, KeyTooLong }![]const u8 {
+        if (prefix.len == 0) {
+            if (record_key.len == 0) return error.NoKey;
+            return if (record_key.len > MAX_SINK_KEY) error.KeyTooLong else record_key;
+        }
+        return std.fmt.bufPrint(buf, "{s}{s}{s}", .{ prefix, separator, record_key }) catch error.KeyTooLong;
+    }
+
+    /// The sink's key for a record, or null with the record counted as dropped.
+    fn kvSinkKeyOrDrop(self: *ProcessingHandler, buf: *[MAX_SINK_KEY]u8, snk: SinkConfig, metrics: ?*MetricsRegistry, record_key: []const u8) ?[]const u8 {
+        return kvSinkKey(buf, snk.kv_key_prefix, snk.kv_separator, record_key) catch |err| {
+            self.noteSinkDrop(metrics, "kv", if (snk.kv_key_prefix.len > 0) snk.kv_key_prefix else "(no prefix)", switch (err) {
+                error.NoKey => "the record has no key",
+                error.KeyTooLong => std.fmt.comptimePrint("the key is longer than {d} bytes", .{MAX_SINK_KEY}),
+            });
+            return null;
+        };
     }
 
     /// KV sink: write the record under `key_prefix + separator + record_key`,
     /// routed to the shard that owns that key so a later `kv get` finds it.
     fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
-        var key_buf: [1024]u8 = undefined;
-        const full_key = if (snk.kv_key_prefix.len > 0)
-            (std.fmt.bufPrint(&key_buf, "{s}{s}{s}", .{ snk.kv_key_prefix, snk.kv_separator, record_key }) catch return)
-        else
-            record_key;
-        if (full_key.len == 0) return;
+        var key_buf: [MAX_SINK_KEY]u8 = undefined;
+        const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
 
         var opt_buf: [64]u8 = undefined;
         var ob = proto.OptionsBuilder.init(&opt_buf);
@@ -1565,7 +1585,7 @@ pub const ProcessingHandler = struct {
         };
         const kv = self.resolveKvHandler(shard.kv_handler, snk.namespace, full_key);
         const result = kv.sinkPut(req);
-        if (result == .err) self.noteSinkDrop(shard, "kv", full_key, result.err.message);
+        if (result == .err) self.noteSinkDrop(shard.metrics_registry, "kv", full_key, result.err.message);
     }
 
     /// Queue sink: enqueue the record payload into the configured queue (durable,
@@ -1589,7 +1609,7 @@ pub const ProcessingHandler = struct {
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
-        if (result == .err) self.noteSinkDrop(shard, "queue", snk.target, result.err.message);
+        if (result == .err) self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, result.err.message);
     }
 
     /// Build a minimal in-process request header carrying just the opcode.
@@ -1923,8 +1943,8 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
 }
 
 test "ProcessingHandler: a TS source record is JSON for any measurement name" {
-    var buf: [512]u8 = undefined;
-    const json = ProcessingHandler.tsPointJson(&buf, "cp\"u\\", 1.5, 7).?;
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "cp\"u\\", 1.5, 7);
+    defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("cp\"u\\", parsed.value.object.get("measurement").?.string);
@@ -1932,10 +1952,49 @@ test "ProcessingHandler: a TS source record is JSON for any measurement name" {
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("timestamp_ms").?.integer);
 }
 
+test "ProcessingHandler: a TS source record holds a measurement name of any length" {
+    // Past the 512-byte buffer a point was built in, whose points were skipped.
+    const name = comptime @import("stdx").repeat("\"", 600);
+    const json = try ProcessingHandler.tsPointJson(std.testing.allocator, name, 1.5, 7);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(name, parsed.value.object.get("measurement").?.string);
+}
+
+test "ProcessingHandler: a KV sink key is refused when there is none at all or it's too long, not dropped unseen" {
+    var buf: [ProcessingHandler.MAX_SINK_KEY]u8 = undefined;
+    try std.testing.expectEqualStrings("user:42", try ProcessingHandler.kvSinkKey(&buf, "user", ":", "42"));
+    try std.testing.expectEqualStrings("42", try ProcessingHandler.kvSinkKey(&buf, "", ":", "42"));
+    try std.testing.expectEqualStrings("user:", try ProcessingHandler.kvSinkKey(&buf, "user", ":", ""));
+    try std.testing.expectError(error.NoKey, ProcessingHandler.kvSinkKey(&buf, "", ":", ""));
+    // Past the old 1024-byte buffer, and still within a key.
+    const long = comptime @import("stdx").repeat("k", 2000);
+    try std.testing.expectEqual(@as(usize, 2005), (try ProcessingHandler.kvSinkKey(&buf, "user", ":", long)).len);
+    const too_long = comptime @import("stdx").repeat("k", ProcessingHandler.MAX_SINK_KEY);
+    try std.testing.expectError(error.KeyTooLong, ProcessingHandler.kvSinkKey(&buf, "user", ":", too_long));
+    try std.testing.expectError(error.KeyTooLong, ProcessingHandler.kvSinkKey(&buf, "", ":", too_long ++ "k"));
+}
+
+test "ProcessingHandler: a KV sink record with no key, or one too long, is counted as dropped" {
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [ProcessingHandler.MAX_SINK_KEY]u8 = undefined;
+    const bare: ProcessingHandler.SinkConfig = .{ .kind = .kv, .kv_separator = ":" };
+    const prefixed: ProcessingHandler.SinkConfig = .{ .kind = .kv, .kv_key_prefix = "user", .kv_separator = ":" };
+    try std.testing.expectEqualStrings("42", handler.kvSinkKeyOrDrop(&buf, bare, null, "42").?);
+    try std.testing.expectEqual(@as(u64, 0), handler.sink_drops);
+    try std.testing.expect(handler.kvSinkKeyOrDrop(&buf, bare, null, "") == null);
+    try std.testing.expectEqual(@as(u64, 1), handler.sink_drops);
+    const too_long = comptime @import("stdx").repeat("k", ProcessingHandler.MAX_SINK_KEY);
+    try std.testing.expect(handler.kvSinkKeyOrDrop(&buf, prefixed, null, too_long) == null);
+    try std.testing.expectEqual(@as(u64, 2), handler.sink_drops);
+}
+
 test "ProcessingHandler: a TS source record writes a non-finite value as null" {
-    var buf: [512]u8 = undefined;
     for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |v| {
-        const json = ProcessingHandler.tsPointJson(&buf, "m", v, 7).?;
+        const json = try ProcessingHandler.tsPointJson(std.testing.allocator, "m", v, 7);
+        defer std.testing.allocator.free(json);
         try std.testing.expectEqualStrings("{\"measurement\":\"m\",\"value\":null,\"timestamp_ms\":7}", json);
     }
 }

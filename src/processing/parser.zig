@@ -250,6 +250,14 @@ fn parseJobDefinitionFromJson(allocator: Allocator, root: JsonValue, fallback_na
         }
     }
     if (def.sinks.items.len == 0) return d.fail(ParseError.MissingSink, "a job needs at least one sink", .{});
+    // A TS source's records have no key, so a KV sink would write none, or
+    // every point over the last under its bare prefix.
+    for (def.sources.items) |src| {
+        if (src.kind != .ts) continue;
+        for (def.sinks.items) |snk| {
+            if (snk.kind == .kv) return d.fail(ParseError.InvalidFormat, "KV sink '{s}' can't take TS source '{s}': its records have no key to write under; use a stream, queue or TS sink", .{ snk.name, src.name });
+        }
+    }
 
     return def;
 }
@@ -652,6 +660,9 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
             snk.separator = "";
             snk.separator = try dupe(allocator, sep);
         }
+        // Every key a sink writes is prefix + separator + the record's key.
+        const max_key = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+        if (snk.key_prefix.len > 0 and snk.key_prefix.len + snk.separator.len >= max_key) return d.fail(ParseError.InvalidFormat, "\"key_prefix\" and \"separator\" take {d} bytes, leaving no room for a key of at most {d}", .{ snk.key_prefix.len + snk.separator.len, max_key });
         if (try optPositive(u64, d, obj, "ttl_ms", ParseError.InvalidFormat)) |ttl| {
             // A TTL is applied in nanoseconds; one that can't be is refused here.
             if (ttl > std.math.maxInt(u64) / std.time.ns_per_ms) return d.fail(ParseError.InvalidFormat, "\"ttl_ms\" must be at most {d}, not {d}", .{ std.math.maxInt(u64) / std.time.ns_per_ms, ttl });
@@ -2053,4 +2064,26 @@ test "parser: a KV sink's empty separator is kept, not replaced by the default" 
     defer def.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", def.sinks.items[0].separator);
     try std.testing.expectEqualStrings(":", def.sinks.items[1].separator);
+}
+
+test "parser: a KV sink fed by a TS source is refused, prefixed or not" {
+    for ([_][]const u8{ "{}", "{ \"key_prefix\": \"cpu\" }" }) |kv| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\{{ "kind": "Processing", "sources": [ {{ "name": "t", "ts": {{ "measurement": "cpu" }} }} ],
+            \\  "sinks": [ {{ "name": "k", "kv": {s} }} ] }}
+        , .{kv});
+        try expectRefused(text, ParseError.InvalidFormat, "KV sink 'k' can't take TS source 't': its records have no key to write under; use a stream, queue or TS sink at the top level");
+    }
+}
+
+test "parser: a KV sink whose prefix and separator leave no room for a key is refused" {
+    const max_key = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+    const prefix = comptime @import("stdx").repeat("p", max_key);
+    try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(std.testing.allocator,
+        \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "kv": { "key_prefix": "
+    ++ prefix ++
+        \\" } } ] }
+    , null));
 }
