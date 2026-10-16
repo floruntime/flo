@@ -17,6 +17,8 @@ const cli_output = @import("../output.zig");
 const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
 const cli_config = @import("../config.zig");
+const schema = @import("../../protocol/schema.zig");
+const action_ops = @import("../../protocol/action_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -316,79 +318,26 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
 
     try outcome.check(ctx, result);
 
-    ctx.print("Run: {s}\n", .{run_id});
-    if (result.asRawData()) |data| {
-        try printActionRunStatus(ctx, data);
+    var diag: schema.Diagnostic = .{};
+    const s = action_ops.op("action.status").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "action.status answer");
+    if (cli_output.getFormat(ctx) == .json) {
+        ctx.print("{{\"run_id\":{f},\"status\":\"{s}\",\"created_at_ms\":{d},\"started_at_ms\":", .{ cli_output.jsonString(run_id), @tagName(s.status), s.created_at_ms });
+        if (s.started_at_ms) |v| ctx.print("{d}", .{v}) else ctx.print("null", .{});
+        ctx.print(",\"completed_at_ms\":", .{});
+        if (s.completed_at_ms) |v| ctx.print("{d}", .{v}) else ctx.print("null", .{});
+        ctx.print(",\"attempt\":{d},\"output\":", .{s.attempt});
+        if (s.output) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
+        ctx.print(",\"error\":", .{});
+        if (s.error_message) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
+        ctx.print("}}\n", .{});
+        return;
     }
-}
-
-/// Parse and print the binary action_run_status wire format.
-/// Format: [run_id_len:u32][run_id][status:u8][created_at:i64]
-///         [has_started:u8][started_at?:i64][has_completed:u8][completed_at?:i64]
-///         [has_output:u8][output_len?:u32][output?][has_error:u8][error_len?:u32][error?]
-///         [retry_count:u32]
-fn printActionRunStatus(ctx: *commander.Context, data: []const u8) commander.Error!void {
-    printRunFields(ctx, data) catch return outcome.malformed(ctx, "action run status");
-}
-
-fn printRunFields(ctx: *commander.Context, data: []const u8) error{Truncated}!void {
-    var off: usize = 0;
-    _ = try readSlice(data, &off); // run_id, already printed by the caller
-
-    if (off >= data.len) return error.Truncated;
-    const status_str: []const u8 = switch (data[off]) {
-        0 => "pending",
-        1 => "running",
-        2 => "completed",
-        3 => "failed",
-        4 => "cancelled",
-        5 => "timed_out",
-        else => "unknown",
-    };
-    off += 1;
-    ctx.print("status: {s}\n", .{status_str});
-
-    if (off + 8 > data.len) return error.Truncated;
-    ctx.print("created_at: {d}\n", .{std.mem.readInt(i64, data[off..][0..8], .little)});
-    off += 8;
-
-    if (try readOptionalI64(data, &off)) |started| ctx.print("started_at: {d}\n", .{started});
-    if (try readOptionalI64(data, &off)) |completed| ctx.print("completed_at: {d}\n", .{completed});
-    if (try readOptionalSlice(data, &off)) |output| ctx.print("output: {s}\n", .{output});
-    if (try readOptionalSlice(data, &off)) |err_msg| ctx.print("error: {s}\n", .{err_msg});
-
-    if (off + 4 > data.len) return error.Truncated;
-    const retries = std.mem.readInt(u32, data[off..][0..4], .little);
-    if (retries > 0) ctx.print("retry_count: {d}\n", .{retries});
-}
-
-fn readSlice(data: []const u8, off: *usize) error{Truncated}![]const u8 {
-    if (off.* + 4 > data.len) return error.Truncated;
-    const len = std.mem.readInt(u32, data[off.*..][0..4], .little);
-    off.* += 4;
-    if (off.* + len > data.len) return error.Truncated;
-    const slice = data[off.* .. off.* + len];
-    off.* += len;
-    return slice;
-}
-
-fn readOptionalI64(data: []const u8, off: *usize) error{Truncated}!?i64 {
-    if (off.* >= data.len) return error.Truncated;
-    const has = data[off.*];
-    off.* += 1;
-    if (has == 0) return null;
-    if (off.* + 8 > data.len) return error.Truncated;
-    const val = std.mem.readInt(i64, data[off.*..][0..8], .little);
-    off.* += 8;
-    return val;
-}
-
-fn readOptionalSlice(data: []const u8, off: *usize) error{Truncated}!?[]const u8 {
-    if (off.* >= data.len) return error.Truncated;
-    const has = data[off.*];
-    off.* += 1;
-    if (has == 0) return null;
-    return try readSlice(data, off);
+    ctx.print("Run: {s}\nstatus: {s}\ncreated_at: {d}\n", .{ run_id, @tagName(s.status), s.created_at_ms });
+    if (s.started_at_ms) |v| ctx.print("started_at: {d}\n", .{v});
+    if (s.completed_at_ms) |v| ctx.print("completed_at: {d}\n", .{v});
+    ctx.print("attempt: {d}\n", .{s.attempt});
+    if (s.output) |v| ctx.print("output: {s}\n", .{v});
+    if (s.error_message) |v| ctx.print("error: {s}\n", .{v});
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
@@ -885,16 +834,4 @@ test "create worker command" {
 
     try std.testing.expectEqualStrings("worker", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 3);
-}
-
-test "action status: a run status cut short is Truncated" {
-    var q = try outcome.QuietContext.init(std.testing.allocator);
-    defer q.deinit();
-    // [run_id_len:u32][run_id][status:u8][created_at:i64][has_started:u8][has_completed:u8]
-    // [has_output:u8][has_error:u8][retry_count:u32]
-    const answer = [_]u8{ 1, 0, 0, 0 } ++ "r".* ++ [_]u8{2} ++ @as([8]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 } ++ @as([4]u8, @splat(0));
-    try printRunFields(&q.ctx, &answer);
-    for (0..answer.len) |n| {
-        try std.testing.expectError(error.Truncated, printRunFields(&q.ctx, answer[0..n]));
-    }
 }

@@ -12483,3 +12483,45 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     try std.testing.expectEqual(@as(u64, 1), snap.duplicate_index);
     for (snap.silent_loss) |n| try std.testing.expectEqual(@as(u64, 0), n);
 }
+
+test "Shard: action.status for a run on another shard goes there, by the run id's partition bits" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    // A run minted for a partition shard 1 owns, as an invoke there would.
+    const partition: u32 = for (0..a.router.partition_count) |p| {
+        if (a.router.partitionToShard(@intCast(p)) == 1) break @intCast(p);
+    } else return error.TestUnexpectedResult;
+    // One whose text, hashed as a key, lands on shard 0: the old routing
+    // sent status there, where the run isn't.
+    var gen: run_id_mod.Generator = .{ .shard = 1 };
+    var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
+    const run_id = for (0..256) |_| {
+        const id = gen.next(.action, partition, &id_buf);
+        if (a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("", id))) == 0) break id;
+    } else return error.TestUnexpectedResult;
+    const b = two.shards[1].actions_handler;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, b.replayRegister("echo", "", 1));
+    var inv_buf: [512]u8 = undefined;
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
+    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, b.replayInvoke(run_id, inv, 1000 * std.time.ns_per_ms));
+
+    // Asked on shard 0, it's sent to shard 1 before anything runs; before,
+    // the id was hashed as a key and could land on a shard without the run.
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.action_status, 1), .namespace = "", .key = run_id, .value = "" };
+    switch (a.resolveTarget(@backingInt(proto.OpCode.action_status), req)) {
+        .local => return error.TestUnexpectedResult,
+        .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
+    }
+    // There, it answers the run.
+    const c = try TestClient.open(&two.shards[1]);
+    defer _ = std.c.close(c.pair[1]);
+    two.shards[1].runRequest(c.conn, req, .client);
+    var out: [4096]u8 = undefined;
+    const resp = try nextAnswer(c, &two.shards[1], &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const s = try table_run.op("action.status").response.decodeAll(resp.data, &diag);
+    try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, s.status);
+}
