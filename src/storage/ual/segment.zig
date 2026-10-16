@@ -199,9 +199,10 @@ test "segment: entry type bitmap" {
 test "segment: the version moves with the stored entry layouts" {
     // A change to the entry table changes this hash. Then bump
     // SEGMENT_VERSION, so data written before it is refused at open, and
-    // pin the new hash beside it.
-    const pinned = .{ .version = 2, .entries = 0xe484fb0836e72862 };
-    const entries_hash = comptime @import("../../protocol/ops.zig").tableHash(&.{}, &@import("../../protocol/table.zig").entry_table);
+    // pin the new hash beside it. Refusal reasons and ops are never stored,
+    // so they are left out and don't force a bump.
+    const pinned = .{ .version = 2, .entries = 0x69be2cbe871ae8d3 };
+    const entries_hash = comptime @import("../../protocol/ops.zig").entryTableHash(&@import("../../protocol/table.zig").entry_table);
     try std.testing.expectEqual(@as(u16, pinned.version), SEGMENT_VERSION);
     try std.testing.expectEqual(@as(u64, pinned.entries), entries_hash);
 }

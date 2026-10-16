@@ -370,14 +370,26 @@ pub const ActionsHandler = struct {
 
         const worker_id = req.key;
 
-        // Reject if worker is draining (no new task assignments)
-        if (worker_id.len > 0 and shard.worker_handler.isDraining(req.namespace, worker_id)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker is draining");
+        // A draining or unhealthy worker takes no new task.
+        if (worker_id.len > 0) if (shard.worker_handler.refusesWork(req.namespace, worker_id)) |no_work| {
+            shard.sendRefusal(conn, req.header.request_id, .bad_request, no_work);
+            return;
+        };
+        if (action_name.len > MAX_ACTION_NAME_LEN) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "action name too long");
             return;
         }
 
-        // The worker's labels, for runs that require some.
+        // The key it would wait under, built first: an await that could
+        // not wait is refused the same whether or not work is pending.
         const namespace = if (req.namespace.len == 0) "default" else req.namespace;
+        var key_buf: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
+        const key = AwaitKey.build(&key_buf, namespace, action_name, worker_id) orelse {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker id too long");
+            return;
+        };
+
+        // The worker's labels, for runs that require some.
         const worker_labels: ?[]const u8 = if (worker_id.len > 0) blk: {
             break :blk if (shard.worker_handler.find(namespace, worker_id)) |w| w.metadata_owned else null;
         } else null;
@@ -387,30 +399,15 @@ pub const ActionsHandler = struct {
         // runs for any of them.
         if (tryClaimAnyAction(shard, conn, req, worker_id, worker_labels)) return;
 
-        // No pending work — register blocking waiter.
-        // Encode compound key: [namespace\x00][action_name][worker_id]
-        // min_version packs both lengths: (ns_len << 16) | action_name_len
-        // Absent means 30 s; 0 means do not wait.
+        // No pending work: wait for some. Absent means 30 s; 0 means do not wait.
         const block_ms: u32 = if (req.findOption(.block_ms)) |opt| (opt.asU32() orelse 30_000) else 30_000;
         if (block_ms == 0) return shard.sendOkResponse(conn, req.header.request_id, "");
-        var compound_key_buf: [256]u8 = undefined;
-        const ns_len: usize = @min(namespace.len, 64);
-        const action_len: usize = @min(action_name.len, 128);
-        const remaining: usize = 256 - ns_len - 1 - action_len;
-        const wid_len: usize = @min(worker_id.len, remaining);
-        @memcpy(compound_key_buf[0..ns_len], namespace[0..ns_len]);
-        compound_key_buf[ns_len] = 0; // separator
-        @memcpy(compound_key_buf[ns_len + 1 ..][0..action_len], action_name[0..action_len]);
-        if (wid_len > 0) {
-            @memcpy(compound_key_buf[ns_len + 1 + action_len ..][0..wid_len], worker_id[0..wid_len]);
-        }
-        const total_len = ns_len + 1 + action_len + wid_len;
         const registered = shard.waiter_pool.register(.{
             .kind = .action_await,
             .reply_to = conn.replyTo(),
             .request_id = req.header.request_id,
-            .key = compound_key_buf[0..total_len],
-            .min_version = (@as(u64, ns_len) << 16) | @as(u64, action_len),
+            .key = key.bytes,
+            .min_version = key.lengths,
             .timeout_ms = block_ms,
         });
         if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
@@ -427,7 +424,6 @@ pub const ActionsHandler = struct {
         while (it.next()) |name| {
             const target = resolveActionShard(shard, namespace, name);
             if (target.actions_handler.claimPendingRun(shard.allocator, namespace, name, worker_labels, worker_id)) |task| {
-                shard.worker_handler.recordTaskAssigned(namespace, worker_id);
                 answerTaskAssignment(shard, conn, req.header.request_id, task);
                 return true;
             }
@@ -1814,22 +1810,19 @@ fn wallNs() u64 {
 /// Uses hash-based routing to check only the shard that owns each action.
 fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const full_key = waiter.key_buf[0..waiter.key_len];
-    const ns_len: usize = @intCast(waiter.min_version >> 16);
-    const action_name_len: usize = @intCast(waiter.min_version & 0xFFFF);
-    if (ns_len + 1 + action_name_len > full_key.len) return false;
-    const namespace = full_key[0..ns_len];
-    const action_name = full_key[ns_len + 1 ..][0..action_name_len];
-    const worker_id = full_key[ns_len + 1 + action_name_len ..];
+    const parts = AwaitKey.parse(waiter.key(), waiter.min_version) orelse return false;
+    const namespace = parts.namespace;
+    const action_name = parts.action_name;
+    const worker_id = parts.worker_id;
 
     // The worker's labels and actions: the await was routed to the shard
     // its registration lives on.
     var worker_labels: ?[]const u8 = null;
     var worker_ptr: ?*const WorkerRecord = null;
     if (worker_id.len > 0) {
-        // A worker drained while it waited takes no more work.
-        if (shard.worker_handler.isDraining(namespace, worker_id)) {
-            shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .bad_request, "worker is draining");
+        // A worker drained, or gone silent, while it waited takes no more work.
+        if (shard.worker_handler.refusesWork(namespace, worker_id)) |refusal| {
+            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .bad_request, refusal);
             return true;
         }
         if (shard.worker_handler.find(namespace, worker_id)) |w| {
@@ -1859,6 +1852,34 @@ fn resolveActionAwait(waiter: *Waiter, ctx: *anyopaque) bool {
 
     return false;
 }
+
+/// A parked await's waiter key, `[namespace\x00][action_name][worker_id]`,
+/// whole: a cut worker id would find no registration, and with it lose the
+/// worker's labels and other actions. The waiter's min_version packs the
+/// lengths, `(ns_len << 16) | action_name_len`.
+const AwaitKey = struct {
+    bytes: []const u8,
+    lengths: u64,
+
+    fn build(buf: []u8, namespace: []const u8, action_name: []const u8, worker_id: []const u8) ?AwaitKey {
+        if (action_name.len > std.math.maxInt(u16) or namespace.len > std.math.maxInt(u16)) return null;
+        const bytes = std.fmt.bufPrint(buf, "{s}\x00{s}{s}", .{ namespace, action_name, worker_id }) catch return null;
+        return .{ .bytes = bytes, .lengths = (@as(u64, namespace.len) << 16) | action_name.len };
+    }
+
+    const Parts = struct { namespace: []const u8, action_name: []const u8, worker_id: []const u8 };
+
+    fn parse(key: []const u8, lengths: u64) ?Parts {
+        const ns_len: usize = @intCast(lengths >> 16);
+        const action_name_len: usize = @intCast(lengths & 0xFFFF);
+        if (ns_len + 1 + action_name_len > key.len) return null;
+        return .{
+            .namespace = key[0..ns_len],
+            .action_name = key[ns_len + 1 ..][0..action_name_len],
+            .worker_id = key[ns_len + 1 + action_name_len ..],
+        };
+    }
+};
 
 /// Claim a pending run from the shard that owns the action (via hash routing).
 /// O(1) — no peer scan needed since action_invoke is pre-routed by action name.
@@ -2915,4 +2936,18 @@ test "actions: a run of a deleted action ends on the default timeout" {
     try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS - 1));
     try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS));
     try testing.expectEqual(ActionRunStatus.timed_out, h.runs.get("act-1").?.status);
+}
+
+test "actions: a parked await's key holds a long worker id whole" {
+    var buf: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
+    const long_id = comptime @import("stdx").repeat("w", 1000);
+    const name = comptime @import("stdx").repeat("a", 256);
+    const key = AwaitKey.build(&buf, "orders", name, long_id).?;
+    const parts = AwaitKey.parse(key.bytes, key.lengths).?;
+    try std.testing.expectEqualStrings("orders", parts.namespace);
+    try std.testing.expectEqualStrings(name, parts.action_name);
+    try std.testing.expectEqualStrings(long_id, parts.worker_id);
+    // Past what a waiter holds: refused, not cut.
+    const too_long = comptime @import("stdx").repeat("w", waiter_pool_mod.MAX_WAITER_KEY);
+    try std.testing.expect(AwaitKey.build(&buf, "orders", "a", too_long) == null);
 }

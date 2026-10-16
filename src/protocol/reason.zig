@@ -71,6 +71,11 @@ pub const Reason = enum(u16) {
     /// worker holds it now, or it finished with another outcome. The
     /// report was dropped; resending it is refused the same way.
     stale_report = 26,
+    /// The worker missed its heartbeats and takes no work until it sends
+    /// one or registers again.
+    worker_unhealthy = 27,
+    /// The worker is draining and takes no new work.
+    worker_draining = 28,
 };
 
 /// Whether a refused request took effect.
