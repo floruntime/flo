@@ -7,9 +7,14 @@ expects them green; one failing is a regression. Known-failing scenarios live
 in `../pins/`.
 
 Each seed was recorded by undoing its fix locally, swarming until a seed
-failed, and checking the same seed passes with the fix in. A seed that drifts
-off its bug after an unrelated change (the interleaving shifts) is re-recorded
-the same way; the row names the bug, not the seed.
+failed, and checking the same seed passes with the fix in. The row names the
+bug, not the seed.
+
+**A seed, or a pin, holds only on the random stream it was recorded on.** Every
+message a node sends draws from that stream, so any change to what Raft sends,
+or when, moves every scenario. A change like that re-checks each seed with its
+fix undone (and each pin as still failing), and re-records any that no longer
+reach their bug.
 
 | Seed | Fails when | What it guards |
 |---|---|---|

@@ -449,6 +449,7 @@ pub fn Replica(comptime Io: type) type {
                         entries = self.rpc_entries[0..count];
                         p.inflight = true;
                         p.sent_up_to = @max(p.sent_up_to, next + count - 1);
+                        p.batch_end = next + count - 1;
                         p.sent_at_ms = now;
                     } else if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                         // An empty batch here would be sent as a heartbeat and
@@ -474,4 +475,170 @@ pub fn Replica(comptime Io: type) type {
             }
         }
     };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — the replica alone, through a fake Io that records what it sends
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const testing = std.testing;
+
+const TestIo = struct {
+    fn of(r: *TestReplica) *Harness {
+        return @alignCast(@fieldParentPtr("replica", r));
+    }
+
+    pub fn nowMs(r: *TestReplica) u64 {
+        return of(r).now;
+    }
+
+    pub fn networked(_: *TestReplica) bool {
+        return true;
+    }
+
+    pub fn send(r: *TestReplica, peer: u32, msg_type: transport.MsgType, _: u32, payload: []const u8) bool {
+        const h = of(r);
+        if (msg_type == .append_entries) {
+            const hdr = transport.deserializeAppendRequestHeader(payload).?;
+            h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count }) catch @panic("OOM");
+        }
+        return true;
+    }
+
+    pub fn durableCommits(_: *TestReplica) bool {
+        return false;
+    }
+
+    pub fn flushForAck(_: *TestReplica) bool {
+        return true;
+    }
+
+    pub fn setVoters(_: *TestReplica, _: []const u32) void {}
+
+    pub const Host = struct {
+        pub fn raftNode(r: *TestReplica) *RaftNode {
+            return &of(r).raft;
+        }
+        pub fn isRemoved(_: *TestReplica) bool {
+            return false;
+        }
+        pub fn checkRemoved(_: *TestReplica, _: u64) bool {
+            return false;
+        }
+        pub fn tickMembership(_: *TestReplica, _: u64) void {}
+        pub fn applyCommitted(_: *TestReplica) bool {
+            return true;
+        }
+        pub fn clearRemovalNotices(_: *TestReplica) void {}
+        pub fn strangerFrame(_: *TestReplica, _: RaftFrame) void {}
+        pub fn handleJoinRequest(_: *TestReplica, _: u32) void {}
+        pub fn takeRemovedNotice(_: *TestReplica, _: RaftFrame) void {}
+        pub fn runForwardedWrite(_: *TestReplica, _: RaftFrame) void {}
+        pub fn takeForwardReply(_: *TestReplica, _: RaftFrame) void {}
+        pub fn stopTakingPart(_: *TestReplica, _: []const u8) void {}
+        pub fn stoppedLeading(_: *TestReplica, _: []const u8) void {}
+    };
+};
+
+const TestReplica = Replica(TestIo);
+
+/// Node 1 leading peers 2 and 3; the appends it sends are recorded.
+const Harness = struct {
+    replica: TestReplica,
+    raft: RaftNode,
+    now: u64 = 1_000_000,
+    appends: std.ArrayListUnmanaged(Append) = .empty,
+    entries: [8]entry_mod.Entry = undefined,
+    arena: [4096]u8 = undefined,
+    out: [8192]u8 = undefined,
+
+    const Append = struct { to: u32, entries: u32 };
+
+    fn init(self: *Harness) !void {
+        self.* = .{ .replica = undefined, .raft = try RaftNode.init(testing.allocator, 1, 1, 1 << 16, .{ .durable_commits = false }) };
+        self.replica = .{ .id = 0, .rpc_entries = &self.entries, .rpc_arena = &self.arena, .rpc_out = &self.out, .diverged = false };
+        self.raft.addPeer(2);
+        self.raft.addPeer(3);
+        self.raft.observeTime(self.now);
+        _ = self.raft.startElectionNow().?;
+        _ = self.raft.handleVoteResponse(.{ .term = self.raft.current_term, .vote_granted = true, .from = 2 });
+        try testing.expectEqual(raft_node_mod.Role.leader, self.raft.role);
+    }
+
+    fn deinit(self: *Harness) void {
+        self.appends.deinit(testing.allocator);
+        self.raft.deinit();
+    }
+
+    /// Appends with entries sent to `to` so far.
+    fn batchesTo(self: *const Harness, to: u32) usize {
+        var n: usize = 0;
+        for (self.appends.items) |a| n += @intFromBool(a.to == to and a.entries > 0);
+        return n;
+    }
+
+    fn reject(self: *Harness, from: u32, hint: u64) void {
+        var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
+        const n = transport.serializeAppendResponse(.{ .term = self.raft.current_term, .success = false, .match_index = 0, .hint_index = hint, .from = from }, &buf).?;
+        self.replica.handleRaftFrame(.{ .source_node = from, .group_id = 1, .msg_type = .append_entries_response, .payload = buf[0..n] });
+    }
+
+    fn ack(self: *Harness, from: u32, match: u64) void {
+        var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
+        const n = transport.serializeAppendResponse(.{ .term = self.raft.current_term, .success = true, .match_index = match, .from = from }, &buf).?;
+        self.replica.handleRaftFrame(.{ .source_node = from, .group_id = 1, .msg_type = .append_entries_response, .payload = buf[0..n] });
+    }
+};
+
+test "replica: a stale ack sends no second batch, and a lost latest ack is resent after the RPC timeout" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    _ = try h.raft.propose(.kv_put, 0, "a");
+    h.replica.pump(h.now);
+    const first = h.batchesTo(2);
+    try testing.expect(first >= 1);
+    const sent_through = h.raft.log.lastIndex();
+
+    // More is written; peer 2 is behind and in flight.
+    _ = try h.raft.propose(.kv_put, 0, "b");
+    // An ack for less than was sent: no new batch to peer 2.
+    h.ack(2, sent_through - 1);
+    try testing.expectEqual(first, h.batchesTo(2));
+    // Again, as a duplicate would.
+    h.ack(2, sent_through - 1);
+    try testing.expectEqual(first, h.batchesTo(2));
+
+    // The latest ack never comes: after the RPC timeout the batch goes again.
+    h.now += h.raft.config.rpcTimeoutMs();
+    h.replica.pump(h.now);
+    try testing.expectEqual(first + 1, h.batchesTo(2));
+}
+
+test "replica: after a rejection sends from earlier, the ack for that shorter batch sends the next at once" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    for (0..30) |_| _ = try h.raft.propose(.kv_put, 0, "e");
+    // Sent as far as the log goes, in batches of at most eight.
+    var batches = h.batchesTo(2);
+    while (h.raft.peers[0].next_index <= h.raft.log.lastIndex()) {
+        h.replica.pump(h.now);
+        h.ack(2, h.raft.peers[0].batch_end);
+        if (h.batchesTo(2) == batches) break;
+        batches = h.batchesTo(2);
+    }
+    const high = h.raft.peers[0].sent_up_to;
+    try testing.expect(high >= 30);
+
+    // The follower lost its tail: it rejects, hinting it holds only 2.
+    h.reject(2, 2);
+    h.replica.pump(h.now);
+    const retry = h.raft.peers[0].batch_end;
+    try testing.expect(retry < high);
+    const sent = h.batchesTo(2);
+    // Its ack ends below the old high-water mark, yet it is the latest
+    // batch's: the next goes now, not after an RPC timeout.
+    h.ack(2, retry);
+    try testing.expectEqual(sent + 1, h.batchesTo(2));
 }

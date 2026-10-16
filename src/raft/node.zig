@@ -52,6 +52,10 @@ pub const PeerState = struct {
     /// The highest index ever sent to this peer; a success ack past it is
     /// a peer confusing us and is clamped.
     sent_up_to: u64 = 0,
+    /// The last index of the batch most recently sent: its ack, not an
+    /// older one, frees the peer for the next. Unlike `sent_up_to` it goes
+    /// back down when a rejection resends from earlier.
+    batch_end: u64 = 0,
     /// Last tick a current-term response arrived from this peer.
     last_contact_ms: u64 = 0,
     /// When the batch in flight was sent, and when this peer last heard
@@ -1218,7 +1222,13 @@ pub const RaftNode = struct {
         // Find the peer
         for (0..self.peer_count) |i| {
             if (self.peer_ids[i] == resp.from) {
-                self.peers[i].inflight = false;
+                // Only the answer to the latest batch frees the peer for the
+                // next: an ack for an older one, late or duplicated, would
+                // start a second stream of batches to it beside the first,
+                // and each answer would keep both going. A rejection always
+                // frees it, to retry from the hint; a lost answer is resent
+                // after the RPC timeout.
+                if (!resp.success or resp.match_index >= self.peers[i].batch_end) self.peers[i].inflight = false;
                 self.peers[i].last_contact_ms = self.current_time_ms;
                 self.noteClock(i, resp.clock_ns);
                 self.peers[i].guarded = resp.guarded;
@@ -1651,6 +1661,7 @@ pub const RaftNode = struct {
             self.peers[i].match_index = 0;
             self.peers[i].inflight = false;
             self.peers[i].sent_up_to = 0;
+            self.peers[i].batch_end = 0;
             self.peers[i].last_contact_ms = 0;
             self.peers[i].caught_up_streak = 0;
             self.peers[i].joining_since_ms = self.current_time_ms;
@@ -2570,6 +2581,42 @@ test "raft node: reordered success acks keep match_index monotonic" {
     node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 1, .from = 2 });
     try testing.expectEqual(@as(u64, 3), node.peers[0].match_index);
     try testing.expectEqual(@as(u64, 4), node.peers[0].next_index);
+}
+
+test "raft node: only the ack for the latest batch frees a peer for the next; a late or repeated one does not" {
+    const allocator = testing.allocator;
+
+    var node = try RaftNode.init(allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    for (0..3) |_| _ = try node.propose(.kv_put, 0, "e");
+    // Batch 1-2 went out, its ack is still on the wire, and then batch 3
+    // went after an RPC timeout: two answers are coming.
+    const p = &node.peers[0];
+    p.inflight = true;
+    p.sent_up_to = 3;
+    p.batch_end = 3;
+
+    // The older batch's ack moves match, but the peer stays in flight.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 2, .from = 2 });
+    try testing.expectEqual(@as(u64, 2), p.match_index);
+    try testing.expect(p.inflight);
+    // The latest batch's ack frees it.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 3, .from = 2 });
+    try testing.expect(!p.inflight);
+    // Sent again; a repeat of the last ack does not free it a second time.
+    p.inflight = true;
+    _ = try node.propose(.kv_put, 0, "e");
+    p.sent_up_to = 4;
+    p.batch_end = 4;
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 3, .from = 2 });
+    try testing.expect(p.inflight);
+    // A rejection frees it, to retry from the hint.
+    node.handleAppendResponse(.{ .term = 1, .success = false, .match_index = 0, .hint_index = 3, .from = 2 });
+    try testing.expect(!p.inflight);
 }
 
 test "raft node: a fresh follower arms its timer on the first tick" {

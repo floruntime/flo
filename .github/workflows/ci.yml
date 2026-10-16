@@ -144,17 +144,12 @@ jobs:
         # toolchain bump must not quietly swap in Zig's slower default.
         run: ./zig-out/bin/flo version --verbose | tee /dev/stderr | grep -qF 'alloc=libc'
       - name: Swarm
-        # Seed 4 is pinned (src/vopr/pins/stale-member-wedge.json): a member
-        # that falls behind across a membership change can't follow the new
-        # leader (#278). Run it again once that fix lands.
-        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --skip=4 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
         timeout-minutes: 20
       - name: Swarm with lost disks
         # Crashes that lose a disk or its hard state, up to two nodes at once:
         # the lost-log guard's slice.
-        # Seed 3 is pinned (src/vopr/pins/stale-member-wedge-wipes.json): the
-        # same bug as the swarm's seed 4 (#278).
-        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --skip=3 --jobs=4 --wipes --seed-timeout=120 --out-dir=/tmp/vopr-wipes
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --wipes --seed-timeout=120 --out-dir=/tmp/vopr-wipes
         timeout-minutes: 20
       - name: Regression seeds stay green
         # Each seed reaches a bug whose fix landed; it fails if the fix is
