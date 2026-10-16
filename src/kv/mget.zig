@@ -5,6 +5,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const table_run = @import("../node/table_run.zig");
+const gather = @import("../node/gather.zig");
+const Shard = @import("../node/shard.zig").Shard;
+const Connection = @import("../node/connection.zig").Connection;
 const schema = @import("../protocol/schema.zig");
 
 const Op = table_run.op("kv.mget");
@@ -84,10 +87,21 @@ pub fn plan(allocator: Allocator, keys: Keys.Value, ctx: anytype, comptime owner
 /// longer than the client's, which held these keys and more.
 pub fn pieceBody(buf: []u8, keys: []const []const u8) ![]const u8 {
     var w: schema.Writer = .{ .buf = buf };
-    try Keys.encodeSlice(&w, keys);
-    // No routing key: the owner looks each key up on its own.
-    try Request.field_list[1].T.encode(&w, null);
+    try encodePiece(&w, keys);
     return w.written();
+}
+
+/// The bytes `pieceBody` writes for `keys`.
+pub fn pieceBodySize(keys: []const []const u8) !usize {
+    var w: schema.Writer = .{ .buf = &.{}, .counting = true };
+    try encodePiece(&w, keys);
+    return w.pos;
+}
+
+fn encodePiece(w: *schema.Writer, keys: []const []const u8) !void {
+    try Keys.encodeSlice(w, keys);
+    // No routing key: the owner looks each key up on its own.
+    try Request.field_list[1].T.encode(w, null);
 }
 
 /// The mget's answer from its pieces' answers (`answers[p]` answers piece
@@ -120,8 +134,26 @@ pub fn merge(buf: []u8, slots: []const Slot, answers: []const Response.Value) er
 pub const Gather = struct {
     slots: []Slot,
 
-    pub fn deinit(self: *Gather, allocator: Allocator) void {
-        allocator.free(self.slots);
+    pub const op: gather.Op = .{ .merge = mergeAnswer, .deinit = deinit };
+
+    /// The state for `op`: where each key's answer comes from.
+    pub fn create(allocator: Allocator, slots: []const Slot) !*Gather {
+        const g = try allocator.create(Gather);
+        errdefer allocator.destroy(g);
+        g.* = .{ .slots = try allocator.dupe(Slot, slots) };
+        return g;
+    }
+
+    fn deinit(state: *anyopaque, allocator: Allocator) void {
+        const g: *Gather = @ptrCast(@alignCast(state));
+        allocator.free(g.slots);
+        allocator.destroy(g);
+    }
+
+    fn mergeAnswer(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
+        const g: *Gather = @ptrCast(@alignCast(state));
+        const merged = try mergeBodies(&shard.kv_handler.answer_buf, g.slots, bodies);
+        table_run.answer(Response, shard, conn, request_id, merged);
     }
 };
 
@@ -138,12 +170,12 @@ pub fn encodeBody(allocator: Allocator, v: Response.Value) ![]u8 {
 
 /// The mget's answer from its parts' bodies, merged in `buf` as `merge`
 /// does. A body that does not decode is a server bug: `Corrupt`.
-pub fn mergeBodies(buf: []u8, slots: []const Slot, bodies: []const ?[]u8) error{ Corrupt, TooManyPieces }!Response.Value {
+pub fn mergeBodies(buf: []u8, slots: []const Slot, bodies: []const []const u8) error{ Corrupt, TooManyPieces }!Response.Value {
     if (bodies.len > MAX_PIECES) return error.TooManyPieces;
     var answers: [MAX_PIECES]Response.Value = undefined;
     for (bodies, 0..) |b, p| {
         var diag: schema.Diagnostic = .{};
-        answers[p] = Response.decodeAll(b orelse return error.Corrupt, &diag) catch return error.Corrupt;
+        answers[p] = Response.decodeAll(b, &diag) catch return error.Corrupt;
     }
     return merge(buf, slots, answers[0..bodies.len]);
 }
@@ -161,6 +193,13 @@ fn testKeys(buf: []u8, keys: []const []const u8) !Keys.Value {
 /// Owner by the key's first byte: 'a' → 0, 'b' → 1, …
 fn byFirstByte(_: void, key: []const u8) u16 {
     return key[0] - 'a';
+}
+
+test "mget: a piece's body is exactly the size counted for it" {
+    var buf: [256]u8 = undefined;
+    for ([_][]const []const u8{ &.{}, &.{"a"}, &.{ "b1", "a22", "c333" } }) |keys| {
+        try std.testing.expectEqual((try pieceBody(&buf, keys)).len, try pieceBodySize(keys));
+    }
 }
 
 test "mget: keys are split by owner, in the order asked" {

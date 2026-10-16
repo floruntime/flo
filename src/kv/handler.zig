@@ -50,6 +50,7 @@ const json_path = @import("../util/json_path.zig");
 const json_depth = @import("../util/json_depth.zig");
 const table_run = @import("../node/table_run.zig");
 const mget_mod = @import("mget.zig");
+const gather_mod = @import("../node/gather.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
@@ -496,12 +497,7 @@ pub const KVHandler = struct {
             var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .namespace = req.namespace }, MgetOwner.of) catch return error.Internal;
             defer plan.deinit(shard.allocator);
             if (plan.owners.len > 1 or (plan.owners.len == 1 and plan.owners[0] != shard.id)) {
-                const local = std.mem.indexOfScalar(u16, plan.owners, shard.id);
-                const local_body: ?[]u8 = if (local) |p| try localPart(shard, req.namespace, plan.keys[p]) else null;
-                shard.startMgetGather(conn, req, &plan, local, local_body) catch |err| return switch (err) {
-                    error.GatherBusy => error.GatherBusy,
-                    error.OutOfMemory => error.Internal,
-                };
+                try startMgetGather(shard, conn, req, &plan);
                 return .wait;
             }
         }
@@ -539,6 +535,40 @@ pub const KVHandler = struct {
         }
         const entry = shard.kv_handler.*.kv.get(qkey) orelse return none;
         return .{ .found = true, .value = entry.value, .version = entry.version };
+    }
+
+    /// Ask each owner for its keys, as a kv.mget of them, and answer from
+    /// their answers in the order asked. This shard's own keys are answered
+    /// here, as the body another owner would send.
+    fn startMgetGather(shard: *Shard, conn: *Connection, req: Request, plan: *const mget_mod.Plan) Error!void {
+        // The other owners' bodies end to end, sized exactly; the gather
+        // copies them at the send.
+        var size: usize = 0;
+        for (plan.owners, plan.keys) |owner, part_keys| {
+            if (owner != shard.id) size += mget_mod.pieceBodySize(part_keys) catch return error.Internal;
+        }
+        const scratch = shard.allocator.alloc(u8, size) catch return error.Internal;
+        defer shard.allocator.free(scratch);
+        var parts: [mget_mod.MAX_PIECES]gather_mod.Part = undefined;
+        var used: usize = 0;
+        var local: ?[]u8 = null;
+        errdefer if (local) |b| shard.allocator.free(b);
+        for (plan.owners, plan.keys, 0..) |owner, part_keys, i| {
+            if (owner == shard.id) {
+                local = try localPart(shard, req.namespace, part_keys);
+                parts[i] = .{ .owner = owner, .body = local.? };
+            } else {
+                const body = mget_mod.pieceBody(scratch[used..], part_keys) catch unreachable; // sized above
+                used += body.len;
+                parts[i] = .{ .owner = owner, .body = body };
+            }
+        }
+        const state = mget_mod.Gather.create(shard.allocator, plan.slots) catch return error.Internal;
+        local = null; // the gather owns it from the call, failed or not
+        shard.startGather(conn, req, parts[0..plan.owners.len], &mget_mod.Gather.op, state) catch |err| return switch (err) {
+            error.GatherBusy => error.GatherBusy,
+            error.OutOfMemory => error.Internal,
+        };
     }
 
     /// The part of a gathered mget this shard owns, answered here as the
