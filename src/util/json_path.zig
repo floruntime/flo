@@ -169,7 +169,9 @@ pub fn jsonPathSet(
     switch (leaf) {
         .field => |name| switch (parent_ptr.*) {
             .object => |*obj| {
-                obj.put(allocator, name, new_parsed.value) catch return error.OutOfMemory;
+                // The map belongs to the parse's arena: growing it with any
+                // other allocator would free memory that allocator doesn't own.
+                obj.put(root_parsed.arena.allocator(), name, new_parsed.value) catch return error.OutOfMemory;
             },
             else => return error.NotAnObject,
         },
@@ -368,4 +370,17 @@ test "jsonPathSet: the result nests at most 128 levels" {
             try std.testing.expectError(error.TooDeep, jsonPathSet(a, "{\"a\":1}", "$.a", inner));
         }
     }
+}
+
+test "jsonPathSet: adding fields to an object grows it in the document's own memory" {
+    var doc = try std.testing.allocator.dupe(u8, "{}");
+    defer std.testing.allocator.free(doc);
+    // Enough new fields that the object's map grows more than once.
+    for ("abcdefghijklmnop") |c| {
+        const path = [_]u8{ '$', '.', c };
+        const next = try jsonPathSet(std.testing.allocator, doc, &path, "1");
+        std.testing.allocator.free(doc);
+        doc = next;
+    }
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":1,\"c\":1,\"d\":1,\"e\":1,\"f\":1,\"g\":1,\"h\":1,\"i\":1,\"j\":1,\"k\":1,\"l\":1,\"m\":1,\"n\":1,\"o\":1,\"p\":1}", doc);
 }

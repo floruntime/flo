@@ -2328,3 +2328,17 @@ test "e2e/kv: jset refuses a merge past the largest value" {
     try testing.expectEqual(@as(u8, 0), after.exit_code);
     try testing.expectEqualStrings(before.stdout, after.stdout);
 }
+
+// Each set at a new path adds a field to the document's object, which grows
+// as the fields arrive; the server stays up and the document holds them all.
+test "e2e/kv: jset adds field after field to one object" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "jset", "grown", "{\"a\":1,\"b\":2}" });
+    for ([_][]const u8{ "$.c", "$.d", "$.e", "$.f", "$.g", "$.h", "$.i", "$.j" }) |path| {
+        try ctx.exec(&.{ "kv", "jset", "grown", "3", "--path", path });
+    }
+    const doc = try ctx.execCapture(&.{ "kv", "jget", "grown" });
+    try testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":3,\"d\":3,\"e\":3,\"f\":3,\"g\":3,\"h\":3,\"i\":3,\"j\":3}", std.mem.trimEnd(u8, doc, "\n"));
+}
