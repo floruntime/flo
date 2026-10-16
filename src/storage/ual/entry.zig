@@ -117,10 +117,11 @@ pub const EntryType = enum(u8) {
     processing_cancel = 0x82,
     processing_checkpoint = 0x85,
 
-    /// Returns true if this type carries a key-value command payload.
+    /// Returns true if this type carries a key-value command payload. KV
+    /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
-            .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire => true,
+            .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire => false,
             .stream_append, .stream_trim, .stream_delete => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
@@ -470,7 +471,7 @@ test "entry: buildCommandEntry end-to-end" {
     var payload_buf: [256]u8 = undefined;
 
     const entry = buildCommandEntry(
-        .kv_put,
+        .queue_enqueue,
         Flags.NONE,
         2,
         50,
@@ -503,7 +504,8 @@ test "entry: empty payload (raft_noop)" {
 }
 
 test "entry: EntryType hasKeyValue" {
-    try std.testing.expect(EntryType.kv_put.hasKeyValue());
+    try std.testing.expect(!EntryType.kv_put.hasKeyValue());
+    try std.testing.expect(!EntryType.kv_batch.hasKeyValue());
     try std.testing.expect(EntryType.stream_append.hasKeyValue());
     try std.testing.expect(EntryType.queue_enqueue.hasKeyValue());
     try std.testing.expect(EntryType.ts_write.hasKeyValue());
@@ -559,7 +561,7 @@ test "entry: a command payload with a key near the u16 limit decodes" {
 
 test "entry: an unknown entry type has no command payload" {
     var buf: [64]u8 = undefined;
-    var e = buildCommandEntry(.kv_put, Flags.NONE, 1, 1, 0, 0, "k", "v", &buf).?;
+    var e = buildCommandEntry(.queue_enqueue, Flags.NONE, 1, 1, 0, 0, "k", "v", &buf).?;
     try std.testing.expect(e.commandPayload() != null);
     e.header.entry_type = 0xfe;
     try std.testing.expect(e.commandPayload() == null);
