@@ -189,24 +189,6 @@ pub const CommandResult = union(enum) {
         queue_position: ?u32 = null,
     },
 
-    /// Action run status
-    action_run_status: struct {
-        run_id: []const u8,
-        status: ActionRunStatus,
-        /// When action run was created
-        created_at: i64,
-        /// When action started executing (null if pending)
-        started_at: ?i64,
-        /// When action completed (null if not complete)
-        completed_at: ?i64,
-        /// Output data (if completed)
-        output: ?[]const u8,
-        /// Error message (if failed)
-        error_message: ?[]const u8,
-        /// Current retry attempt
-        retry_count: u32,
-    },
-
     /// Action list response
     action_list_result: struct {
         /// Pre-serialized wire data

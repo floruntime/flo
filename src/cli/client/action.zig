@@ -14,6 +14,7 @@ const wire = @import("../../util/wire.zig");
 const Client = base.Client;
 const Response = base.Response;
 const proto = @import("../../protocol/proto.zig");
+const action_ops = @import("../../protocol/action_ops.zig");
 const FixedWireWriter = wire.FixedWireWriter;
 
 // =============================================================================
@@ -79,7 +80,7 @@ pub fn invoke(
 /// Get action run status
 /// key = run_id
 pub fn status(client: *Client, namespace: []const u8, run_id: []const u8) !Response {
-    return client.sendRequest(.action_status, namespace, run_id, "");
+    return client.call(action_ops.op("action.status"), namespace, run_id, .{});
 }
 
 /// List registered actions. key = prefix (or empty); value [limit:u32][cursor]

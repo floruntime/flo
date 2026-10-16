@@ -35,6 +35,8 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
+const table_run = @import("../node/table_run.zig");
+const action_ops = @import("../protocol/action_ops.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
@@ -83,6 +85,10 @@ pub const ActionsHandler = struct {
 
     /// Mutex protecting runs for cross-shard access.
     runs_mu: @import("stdx").Mutex = .{},
+    /// action.status copies a run's output and error here while it holds
+    /// runs_mu, since the answer is encoded after it lets go. Allocated on
+    /// first use.
+    status_buf: ?[]u8 = null,
     /// The run the last applied invoke created; a key of `runs` (see
     /// `Shard.answering_index`).
     last_invoked_run_id: ?[]const u8 = null,
@@ -173,6 +179,7 @@ pub const ActionsHandler = struct {
     }
 
     pub fn deinit(self: *ActionsHandler) void {
+        if (self.status_buf) |b| self.allocator.free(b);
         // Free all owned action names
         var ait = self.actions.iterator();
         while (ait.next()) |entry| {
@@ -206,7 +213,8 @@ pub const ActionsHandler = struct {
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.action_register, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
-        dispatcher.registerWithRoute(.action_status, dispatchAction, preRouteByAction);
+        // The run id's bits name the partition the run lives on.
+        dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
@@ -527,7 +535,6 @@ pub const ActionsHandler = struct {
         return switch (op) {
             .action_register => self.handleRegister(shard, req),
             .action_invoke => self.handleInvoke(shard, req),
-            .action_status => self.handleStatus(req),
             .action_list => self.handleList(req),
             .action_list_runs => self.handleListRuns(req),
             .action_delete => self.handleDelete(shard, req),
@@ -695,30 +702,62 @@ pub const ActionsHandler = struct {
 
     // ── STATUS ──────────────────────────────────────────────────────────
 
-    fn handleStatus(self: *ActionsHandler, req: Request) CommandResult {
+    const StatusResponse = table_run.op("action.status").response;
+
+    comptime {
+        // action.status answers with the run's own status values.
+        for (@typeInfo(ActionRunStatus).@"enum".field_names, @typeInfo(ActionRunStatus).@"enum".field_values) |name, value| {
+            if (@backingInt(@field(action_ops.RunStatus, name)) != value) @compileError("action.status RunStatus." ++ name ++ " differs from the run's");
+        }
+    }
+
+    pub const Error = error{ NotFound, OutOfMemory };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" } },
+            error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
+        };
+    }
+
+    /// A run's status, times and attempts, its output once it completed,
+    /// and the error its last attempt failed with.
+    fn runStatus(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(StatusResponse) {
+        return .{ .answer = try shard.actions_handler.answerStatus(req.namespace, req.key) };
+    }
+
+    fn answerStatus(self: *ActionsHandler, namespace: []const u8, run_id: []const u8) Error!StatusResponse.Value {
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
-
-        const run_id = req.key;
-
-        if (run_id.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "run_id is required" } };
-        }
-
-        if (self.runs.getPtr(run_id)) |run| {
-            if (runIn(run, req.namespace)) return .{ .action_run_status = .{
-                .run_id = run.run_id_owned,
-                .status = run.status,
-                .created_at = run.created_at_ms,
-                .started_at = run.started_at_ms,
-                .completed_at = run.completed_at_ms,
-                .output = null,
-                .error_message = run.error_owned,
-                .retry_count = if (run.attempt > 0) run.attempt - 1 else 0,
-            } };
-        }
-
-        return .{ .err = .{ .code = .not_found, .message = "run not found" } };
+        const run = self.runs.getPtr(run_id) orelse return error.NotFound;
+        if (!runIn(run, namespace)) return error.NotFound;
+        const buf = self.status_buf orelse blk: {
+            const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR);
+            self.status_buf = b;
+            break :blk b;
+        };
+        var used: usize = 0;
+        const output: ?[]const u8 = if (run.status == .completed) blk: {
+            const r = run.result_owned orelse "";
+            const n = @min(r.len, action_ops.MAX_OUTPUT);
+            @memcpy(buf[0..n], r[0..n]);
+            used = n;
+            break :blk buf[0..n];
+        } else null;
+        const error_message: ?[]const u8 = if (run.error_owned) |e| if (e.len == 0) null else blk: {
+            const n = @min(e.len, action_ops.MAX_ERROR);
+            @memcpy(buf[used..][0..n], e[0..n]);
+            break :blk buf[used..][0..n];
+        } else null;
+        return .{
+            .status = @fromBackingInt(@intCast(@backingInt(run.status))),
+            .created_at_ms = run.created_at_ms,
+            .started_at_ms = run.started_at_ms,
+            .completed_at_ms = run.completed_at_ms,
+            .attempt = run.attempt,
+            .output = output,
+            .error_message = error_message,
+        };
     }
 
     // ── LIST ────────────────────────────────────────────────────────────
@@ -1446,7 +1485,7 @@ pub const ActionsHandler = struct {
 
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
+    pub fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
         var name = key;
@@ -1515,7 +1554,7 @@ pub const ActionsHandler = struct {
     }
 
     /// Rebuild a RunRecord from a persisted invoke entry.
-    fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
+    pub fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
         // An id already taken is refused, not overwritten: the run under it
         // may be running or finished, and its caller waits on that run.
         if (self.runs.contains(run_id)) {
@@ -2041,52 +2080,6 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             writer.writeByte(0) catch return; // has_output (always false)
             shard.sendOkResponse(conn, request_id, fbs.buffered());
         },
-        .action_run_status => |s| {
-            // The run status answer, field by field.
-            var buf: [4096]u8 = undefined;
-            var fbs: std.Io.Writer = .fixed(&buf);
-            const writer = &fbs;
-            // run_id
-            writer.writeInt(u32, @intCast(s.run_id.len), .little) catch return;
-            writer.writeAll(s.run_id) catch return;
-            // status
-            writer.writeByte(@backingInt(s.status)) catch return;
-            // created_at
-            writer.writeInt(i64, s.created_at, .little) catch return;
-            // started_at (optional i64)
-            if (s.started_at) |v| {
-                writer.writeByte(1) catch return;
-                writer.writeInt(i64, v, .little) catch return;
-            } else {
-                writer.writeByte(0) catch return;
-            }
-            // completed_at (optional i64)
-            if (s.completed_at) |v| {
-                writer.writeByte(1) catch return;
-                writer.writeInt(i64, v, .little) catch return;
-            } else {
-                writer.writeByte(0) catch return;
-            }
-            // output (optional slice)
-            if (s.output) |o| {
-                writer.writeByte(1) catch return;
-                writer.writeInt(u32, @intCast(o.len), .little) catch return;
-                writer.writeAll(o) catch return;
-            } else {
-                writer.writeByte(0) catch return;
-            }
-            // error_message (optional slice)
-            if (s.error_message) |e| {
-                writer.writeByte(1) catch return;
-                writer.writeInt(u32, @intCast(e.len), .little) catch return;
-                writer.writeAll(e) catch return;
-            } else {
-                writer.writeByte(0) catch return;
-            }
-            // retry_count
-            writer.writeInt(u32, s.retry_count, .little) catch return;
-            shard.sendOkResponse(conn, request_id, fbs.buffered());
-        },
         .action_list_result => |l| {
             shard.sendOkResponse(conn, request_id, l.data);
         },
@@ -2272,41 +2265,66 @@ test "actions handler: invoke non-existent action" {
     }
 }
 
-test "actions handler: status" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(null, makeRequest(.action_register, "job", ""));
-    const invoke_result = handler.handleCommand(null, makeRequest(.action_invoke, "job", "\x00"));
-
-    // Get the run_id from invoke result
-    var run_id: []const u8 = "";
-    switch (invoke_result) {
-        .action_invoked => |r| run_id = r.run_id,
-        else => return error.TestUnexpectedResult,
-    }
-
-    const status_result = handler.handleCommand(null, makeRequest(.action_status, run_id, ""));
-    switch (status_result) {
-        .action_run_status => |r| {
-            try testing.expectEqual(ActionRunStatus.pending, r.status);
-            try testing.expect(r.created_at != 0);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+test "actions: status answers a pending run's status and times, and no output" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    var inv_buf: [512]u8 = undefined;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
+    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    const s = try h.answerStatus("default", "act-1");
+    try testing.expectEqual(action_ops.RunStatus.pending, s.status);
+    try testing.expectEqual(@as(i64, 1000), s.created_at_ms);
+    try testing.expectEqual(@as(?i64, null), s.started_at_ms);
+    try testing.expectEqual(@as(u32, 0), s.attempt);
+    try testing.expectEqual(@as(?[]const u8, null), s.output);
+    try testing.expectEqual(@as(?[]const u8, null), s.error_message);
 }
 
-test "actions handler: status non-existent run" {
-    const allocator = testing.allocator;
-    var handler = ActionsHandler.init(allocator);
-    defer handler.deinit();
+test "actions: status of a completed run carries the output its worker completed it with" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    var buf: [128]u8 = undefined;
+    try testing.expect(h.handleActionComplete(null, testReport(&buf, .action_complete, "w-1", "act-1", false)) == .applied);
+    const s = try h.answerStatus("default", "act-1");
+    try testing.expectEqual(action_ops.RunStatus.completed, s.status);
+    try testing.expectEqualStrings("{}", s.output.?);
+    try testing.expectEqual(@as(u32, 1), s.attempt);
+    try testing.expect(s.completed_at_ms != null);
+}
 
-    const result = handler.handleCommand(null, makeRequest(.action_status, "9999", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
-        else => return error.TestUnexpectedResult,
+test "actions: status of a failed run carries its error and no output" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    // [action_name][run id][retry=0][error...]
+    const error_len = 1000;
+    const buf = try std.testing.allocator.alloc(u8, 2 + 4 + 2 + 5 + 1 + error_len);
+    defer std.testing.allocator.free(buf);
+    var off: usize = 0;
+    for ([_][]const u8{ "echo", "act-1" }) |f| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(f.len), .little);
+        @memcpy(buf[off + 2 ..][0..f.len], f);
+        off += 2 + f.len;
     }
+    buf[off] = 0;
+    @memset(buf[off + 1 ..], 'e');
+    const req: Request = .{ .header = proto.RequestHeader.init(.action_fail, 1), .namespace = "default", .key = "w-1", .value = buf, .options = "" };
+    try testing.expect(h.handleActionFail(null, req) == .applied);
+    const s = try h.answerStatus("default", "act-1");
+    try testing.expectEqual(action_ops.RunStatus.failed, s.status);
+    try testing.expectEqual(@as(?[]const u8, null), s.output);
+    try testing.expectEqual(@as(usize, error_len), s.error_message.?.len);
+    try testing.expect(std.mem.allEqual(u8, s.error_message.?, 'e'));
+}
+
+test "actions: status of a run that doesn't exist, or is in another namespace, is not found" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    try testing.expectError(error.NotFound, h.answerStatus("default", "act-9999"));
+    try testing.expectError(error.NotFound, h.answerStatus("elsewhere", "act-1"));
 }
 
 test "actions handler: list" {

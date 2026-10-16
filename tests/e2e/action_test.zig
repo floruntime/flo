@@ -442,10 +442,19 @@ test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
     }
     try stdx.testing.assertSucceeded(complete_result);
 
-    // 7. Check final status (should be completed with output)
-    var status2 = try ctx.cli.run(&.{ "action", "status", run_id });
+    // 7. The final status is completed, with the output the worker sent.
+    var status2 = try ctx.cli.run(&.{ "action", "status", run_id, "-o", "json" });
     defer status2.deinit();
-    try stdx.testing.assertSucceeded(status2);
+    try testing.expectEqual(@as(u8, 0), status2.exit_code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, status2.stdout, .{});
+    defer parsed.deinit();
+    const s = parsed.value.object;
+    try testing.expectEqualStrings(run_id, s.get("run_id").?.string);
+    try testing.expectEqualStrings("completed", s.get("status").?.string);
+    try testing.expectEqualStrings(result_payload, s.get("output").?.string);
+    try testing.expectEqual(@as(i64, 1), s.get("attempt").?.integer);
+    try testing.expect(s.get("completed_at_ms").? == .integer);
+    try testing.expect(s.get("error").? == .null);
 }
 
 test "e2e/action/worker: worker fails task with retry" {
