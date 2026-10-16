@@ -81,7 +81,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             },
         })
         .flag("verbose", .{ .short = 'v', .desc = "Enable verbose output", .persistent = true })
-        .persistentFlag("output", .{ .short = 'o', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw" })
+        .persistentFlag("output", .{ .short = 'o', .value = .{ .string = "table" }, .desc = "Output format: table, json, raw (json replaces invalid UTF-8; use -o raw for exact bytes)" })
         .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .persistentFlag("port", .{ .short = 'p', .value = .{ .uint = 0 }, .desc = "Server port (shorthand for --endpoint 127.0.0.1:<port>)" })
         .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })

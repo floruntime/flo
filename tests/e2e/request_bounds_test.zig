@@ -148,7 +148,8 @@ test "e2e/bounds: a ts write value that isn't one finite f64 is refused by name"
 
     var read = try ctx.cli.run(&.{ "ts", "read", "m", "--from", "0", "-o", "raw" });
     defer read.deinit();
-    try testing.expectEqualStrings("(no data)\n", read.stdout);
+    // Nothing was written: raw prints an empty read as nothing.
+    try testing.expectEqualStrings("", read.stdout);
 }
 
 /// Sends one `op` request on `fd` and returns its answer, which must be

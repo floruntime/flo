@@ -481,7 +481,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     // An existing series with no points in range answers ok and empty (0);
     // not_found means the measurement itself is absent.
     if (result.isNotFound()) {
-        ctx.print("(no data)\n", .{});
+        output.printEmptyList(ctx, "(no data)");
         return error.NotFound;
     }
 
@@ -492,7 +492,7 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     const points = parsePoints(data) catch return outcome.malformed(ctx, "read response");
 
     if (points.len() == 0) {
-        ctx.print("(no data)\n", .{});
+        output.printEmptyList(ctx, "(no data)");
         return;
     }
 
@@ -531,6 +531,16 @@ fn runRead(ctx: *commander.Context) commander.Error!void {
     }
 }
 
+/// A query with no series, in the output format: json keeps the object
+/// shape a query with series has.
+fn printNoSeries(ctx: *commander.Context) void {
+    switch (output.getFormat(ctx)) {
+        .json => ctx.print("{{\"series\":[]}}\n", .{}),
+        .raw => {},
+        .table => ctx.print("(no data)\n", .{}),
+    }
+}
+
 fn runQuery(ctx: *commander.Context) commander.Error!void {
     const measurement = ctx.getPositional("measurement").?;
     const namespace = cli_config.getNamespace(ctx);
@@ -565,7 +575,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     // An existing series with no points in range answers ok and empty (0);
     // not_found means the measurement itself is absent.
     if (result.isNotFound()) {
-        ctx.print("(no data)\n", .{});
+        printNoSeries(ctx);
         return error.NotFound;
     }
 
@@ -581,7 +591,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
     defer ctx.allocator.free(series);
 
     if (series.len == 0) {
-        ctx.print("(no data)\n", .{});
+        printNoSeries(ctx);
         return;
     }
 
@@ -611,7 +621,7 @@ fn runQuery(ctx: *commander.Context) commander.Error!void {
             ctx.print("{{\n  \"series\": [\n", .{});
             for (series, 0..) |sr, s| {
                 if (s > 0) ctx.print(",\n", .{});
-                ctx.print("    {{\"series\": \"{s}\", \"buckets\": [\n", .{sr.key});
+                ctx.print("    {{\"series\": {f}, \"buckets\": [\n", .{output.jsonString(sr.key)});
                 for (0..sr.points.len()) |b| {
                     const p = sr.points.at(b);
                     if (b > 0) ctx.print(",\n", .{});
@@ -697,7 +707,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             ctx.print("[", .{});
             for (all_names.items, 0..) |name, i| {
                 if (i > 0) ctx.print(", ", .{});
-                ctx.print("\"{s}\"", .{name});
+                ctx.print("{f}", .{output.jsonString(name)});
             }
             ctx.print("]\n", .{});
         },

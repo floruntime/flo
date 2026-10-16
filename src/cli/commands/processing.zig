@@ -237,7 +237,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse {
-        ctx.print("(no processing jobs)\n", .{});
+        output.printEmptyList(ctx, "(no processing jobs)");
         return;
     };
 

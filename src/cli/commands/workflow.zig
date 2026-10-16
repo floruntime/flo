@@ -304,7 +304,7 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // The answer is the run id.
     const data = result.asRawData() orelse return outcome.malformed(ctx, "start response (no run id)");
     switch (output.getFormat(ctx)) {
-        .json => ctx.print("{{\"run_id\":\"{s}\"}}\n", .{data}),
+        .json => ctx.print("{{\"run_id\":{f}}}\n", .{output.jsonString(data)}),
         .raw => ctx.print("{s}\n", .{data}),
         .table => ctx.print("Started workflow run: {s}\n", .{data}),
     }

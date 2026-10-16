@@ -2205,3 +2205,21 @@ test "e2e/kv: JSON nesting is limited to 128 levels" {
     const again = try ctx.execCapture(&.{ "kv", "jget", "deep128", "--path", "$" });
     try testing.expect(std.mem.indexOf(u8, again, ok) != null);
 }
+
+test "e2e/kv: a value that isn't UTF-8 is a JSON string with U+FFFD under -o json, and exact under -o raw" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "kv", "set", "bin", "a\xffb\"" });
+
+    var raw = try ctx.cli.run(&.{ "kv", "get", "bin", "-o", "raw" });
+    defer raw.deinit();
+    try testing.expectEqual(@as(u8, 0), raw.exit_code);
+    try testing.expectEqualStrings("a\xffb\"\n", raw.stdout);
+
+    var json = try ctx.cli.run(&.{ "kv", "get", "bin", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json.stdout, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a\u{fffd}b\"", parsed.value.object.get("value").?.string);
+}

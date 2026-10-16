@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const commander = @import("commander/mod.zig");
+const output = @import("output.zig");
 
 /// Default endpoint for CLI commands.
 /// Precedence: FLO_ENDPOINT env → "127.0.0.1:9000"
@@ -289,7 +290,7 @@ pub const Config = struct {
         defer aw.deinit();
         const writer = &aw.writer;
         try writer.writeAll("{\n");
-        try writer.print("  \"current_context\": \"{s}\",\n", .{self.current_context});
+        try writer.print("  \"current_context\": {f},\n", .{output.jsonString(self.current_context)});
         try writer.writeAll("  \"contexts\": {\n");
 
         var first = true;
@@ -300,12 +301,12 @@ pub const Config = struct {
             }
             first = false;
 
-            try writer.print("    \"{s}\": {{\n", .{entry.key_ptr.*});
-            try writer.print("      \"endpoint\": \"{s}\"", .{entry.value_ptr.endpoint});
+            try writer.print("    {f}: {{\n", .{output.jsonString(entry.key_ptr.*)});
+            try writer.print("      \"endpoint\": {f}", .{output.jsonString(entry.value_ptr.endpoint)});
 
             if (entry.value_ptr.namespace) |ns| {
                 try writer.writeAll(",\n");
-                try writer.print("      \"namespace\": \"{s}\"\n", .{ns});
+                try writer.print("      \"namespace\": {f}\n", .{output.jsonString(ns)});
             } else {
                 try writer.writeAll("\n");
             }

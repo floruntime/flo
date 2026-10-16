@@ -10,6 +10,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
+const output = @import("../output.zig");
 const build_info = @import("../../build_info.zig");
 const server_config = @import("../../config/mod.zig").server;
 const cluster_config = @import("../../config/cluster.zig");
@@ -828,43 +829,6 @@ fn runServerStatus(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-/// `text` as a JSON string, escaped, with each byte that isn't valid UTF-8
-/// as U+FFFD: a string either way, never the byte array `std.json` writes
-/// for bytes that aren't text.
-fn jsonString(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    try out.append(allocator, '"');
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
-        if (len == 0 or i + len > text.len or (if (std.unicode.utf8Decode(text[i..][0..len])) |_| false else |_| true)) {
-            try out.appendSlice(allocator, "\\ufffd");
-            i += 1;
-            continue;
-        }
-        if (len == 1) switch (text[i]) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            0...8, 11, 12, 14...0x1f, 0x7f => try out.print(allocator, "\\u{x:0>4}", .{text[i]}),
-            else => try out.append(allocator, text[i]),
-        } else try out.appendSlice(allocator, text[i..][0..len]);
-        i += len;
-    }
-    try out.append(allocator, '"');
-}
-
-test "server metrics json: quotes, newlines and bytes that aren't UTF-8 make a valid string" {
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try jsonString(a, &out, "a{x=\"1\"}\n\\\x01m\xffz\xe2\x82");
-    const parsed = try std.json.parseFromSlice([]const u8, a, out.items, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("a{x=\"1\"}\n\\\x01m\u{fffd}z\u{fffd}\u{fffd}", parsed.value);
-}
-
 /// The most of a metrics answer read; past it the answer is refused as cut
 /// off rather than printed in part.
 const MAX_METRICS_ANSWER: usize = 4 * 1024 * 1024;
@@ -932,10 +896,7 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     }
     const body = answer.items[head_end + 4 ..];
     if (json) {
-        var quoted: std.ArrayList(u8) = .empty;
-        defer quoted.deinit(allocator);
-        try jsonString(allocator, &quoted, body);
-        ctx.print("{{\"metrics\":{s}}}\n", .{quoted.items});
+        ctx.print("{{\"metrics\":{f}}}\n", .{output.jsonString(body)});
     } else {
         ctx.print("{s}", .{body});
     }

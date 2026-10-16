@@ -397,8 +397,8 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     while (it.next() catch return outcome.malformed(ctx, "kv.history answer")) |v| : (i += 1) switch (format) {
         .json => {
             if (i > 0) ctx.print(",", .{});
-            const Version = struct { version: u64, at_ms: i64, value: []const u8 };
-            output.Json.printInline(ctx, ctx.allocator, Version{ .version = v.version, .at_ms = v.at_ms, .value = v.value });
+            const Version = struct { version: u64, at_ms: i64, value: output.JsonString };
+            output.Json.printInline(ctx, ctx.allocator, Version{ .version = v.version, .at_ms = v.at_ms, .value = output.jsonString(v.value) });
         },
         .table, .raw => ctx.print("{d}\t{d}\t{s}\n", .{ v.version, v.at_ms, v.value }),
     };
@@ -435,8 +435,8 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
             switch (format) {
                 .json => {
                     if (i > 0) ctx.print(",", .{});
-                    const Entry = struct { key: []const u8, value: ?[]const u8, version: ?u64 };
-                    output.Json.printInline(ctx, ctx.allocator, Entry{ .key = keys[i], .value = value, .version = if (e.found) e.version else null });
+                    const Entry = struct { key: output.JsonString, value: ?output.JsonString, version: ?u64 };
+                    output.Json.printInline(ctx, ctx.allocator, Entry{ .key = output.jsonString(keys[i]), .value = if (value) |v| output.jsonString(v) else null, .version = if (e.found) e.version else null });
                 },
                 .table => {
                     var ver_buf: [32]u8 = undefined;
@@ -460,11 +460,11 @@ fn outputKvResult(ctx: *commander.Context, format: output.Format, key: []const u
         .json => {
             // Use the output.Json helper for clean JSON
             const KvResult = struct {
-                key: []const u8,
-                value: ?[]const u8,
+                key: output.JsonString,
+                value: ?output.JsonString,
                 version: ?u64 = null,
             };
-            const result = KvResult{ .key = key, .value = value, .version = version };
+            const result = KvResult{ .key = output.jsonString(key), .value = if (value) |v| output.jsonString(v) else null, .version = version };
             output.Json.printCompact(ctx, ctx.allocator, result);
         },
         .table => {
