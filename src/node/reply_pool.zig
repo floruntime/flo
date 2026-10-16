@@ -83,9 +83,23 @@ pub const ReplyPool = struct {
         answered: bool = false,
         /// When the slot is taken back: `taken_ms + SLOT_DEADLINE_MS`.
         due_ms: u64 = 0,
+        /// A part of a gather (`gather.zig`): its answer goes there, not
+        /// to the client.
+        gather: ?GatherPart = null,
     };
 
     pub const Ticket = struct { slot: u16, gen: u32 };
+
+    /// The gather entry a part's answer belongs to, its generation, and the
+    /// part's place.
+    pub const GatherPart = struct { index: u16, gen: u32, part: u16 };
+
+    /// Mark a slot just taken as a gather's part.
+    pub fn tagGather(self: *ReplyPool, ticket: Ticket, part: GatherPart) void {
+        const slot = &self.slots[ticket.slot];
+        std.debug.assert(slot.active and slot.gen == ticket.gen);
+        slot.gather = part;
+    }
 
     /// The target holds its full share of the class's slots.
     pub const TargetBusy = error{TargetBusy};
@@ -154,6 +168,11 @@ pub const ReplyPool = struct {
     /// taken again.
     pub fn ringCapacity(self: *const ReplyPool) usize {
         return 2 * self.slots.len;
+    }
+
+    /// Free slots of `class`, whatever their target.
+    pub fn freeCount(self: *const ReplyPool, class: Class) usize {
+        return self.classes[@backingInt(class)].free_len;
     }
 
     /// Whether a request of `class` to `target` would get a slot now.

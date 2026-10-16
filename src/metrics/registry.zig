@@ -559,7 +559,7 @@ pub const ShardMetrics = struct {
     cross_shard_in_flight: Atomic(u64) = Atomic(u64).init(0),
     /// Requests to another shard refused at once, before they ran, for want
     /// of a reply slot or of room in its inbox, by class (`CrossShardClass`).
-    cross_shard_overloaded: [2]Atomic(u64) = .{ Atomic(u64).init(0), Atomic(u64).init(0) },
+    cross_shard_overloaded: [3]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Answers dropped for want of a reply slot or of room on the asker's
     /// reply ring. Both are reserved before every request, so a count means
     /// an answer came twice or long after its slot expired.
@@ -578,6 +578,8 @@ pub const ShardMetrics = struct {
     /// Client requests another shard did not answer by their deadline;
     /// clients still connected were told.
     cross_shard_timeouts: Atomic(u64) = Atomic(u64).init(0),
+    /// Gathers ended because a part went unanswered past its deadline.
+    gather_timeouts: Atomic(u64) = Atomic(u64).init(0),
     /// How long the oldest unanswered request to another shard has waited,
     /// in seconds, blocking reads aside, as of the last sweep.
     oldest_cross_shard_wait_s: Atomic(u64) = Atomic(u64).init(0),
@@ -602,7 +604,7 @@ pub const ShardMetrics = struct {
     /// then paused for unsent answers.
     pub const PAUSE_REASONS = [_][]const u8{ "in_flight", "blocking_reads", "slots", "inbox", "unsent_answers" };
 
-    pub const CrossShardClass = enum(u1) { client_forward, engine };
+    pub const CrossShardClass = enum(u2) { client_forward, engine, gather };
 
     pub const LivePending = struct {
         ctx: *const anyopaque,
@@ -675,6 +677,10 @@ pub const ShardMetrics = struct {
         _ = self.cross_shard_timeouts.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordGatherTimeout(self: *ShardMetrics) void {
+        _ = self.gather_timeouts.fetchAdd(1, .monotonic);
+    }
+
     pub fn setConnectionsPaused(self: *ShardMetrics, counts: [PAUSE_REASONS.len]u64) void {
         for (counts, &self.connections_paused) |n, *g| g.store(n, .monotonic);
     }
@@ -723,13 +729,14 @@ pub const ShardMetrics = struct {
         inbox_processed: u64,
         inbox_pending: u64,
         cross_shard_in_flight: u64,
-        cross_shard_overloaded: [2]u64,
+        cross_shard_overloaded: [3]u64,
         replies_dropped: u64,
         removal_notices: [4]u64,
         handler_no_answer: u64,
         stream_skipped_appends: u64,
         kv_txns_reaped: u64,
         cross_shard_timeouts: u64,
+        gather_timeouts: u64,
         oldest_cross_shard_wait_s: u64,
         connections_paused: [PAUSE_REASONS.len]u64,
         stamp_skew_ms: i64,
@@ -751,13 +758,14 @@ pub const ShardMetrics = struct {
             .inbox_processed = self.inbox_processed.load(.monotonic),
             .inbox_pending = if (self.live_pending) |lp| lp.read(lp.ctx) else self.inbox_pending.load(.monotonic),
             .cross_shard_in_flight = self.cross_shard_in_flight.load(.monotonic),
-            .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic) },
+            .cross_shard_overloaded = .{ self.cross_shard_overloaded[0].load(.monotonic), self.cross_shard_overloaded[1].load(.monotonic), self.cross_shard_overloaded[2].load(.monotonic) },
             .replies_dropped = self.replies_dropped.load(.monotonic),
             .removal_notices = .{ self.removal_notices[0].load(.monotonic), self.removal_notices[1].load(.monotonic), self.removal_notices[2].load(.monotonic), self.removal_notices[3].load(.monotonic) },
             .handler_no_answer = self.handler_no_answer.load(.monotonic),
             .stream_skipped_appends = self.stream_skipped_appends.load(.monotonic),
             .kv_txns_reaped = self.kv_txns_reaped.load(.monotonic),
             .cross_shard_timeouts = self.cross_shard_timeouts.load(.monotonic),
+            .gather_timeouts = self.gather_timeouts.load(.monotonic),
             .oldest_cross_shard_wait_s = self.oldest_cross_shard_wait_s.load(.monotonic),
             .stamp_skew_ms = self.stamp_skew_ms.load(.monotonic),
             .silent_loss = blk: {
@@ -1494,6 +1502,7 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
         try writer.print("flo_shard_cross_shard_overloaded_total{{shard_id=\"{d}\",class=\"" ++ cname ++ "\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_overloaded[cvalue] });
     }
     try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"client_forward\"}} {d}\n", .{ snap.shard_id, snap.cross_shard_timeouts });
+    try writer.print("flo_shard_cross_shard_timeouts_total{{shard_id=\"{d}\",class=\"gather\"}} {d}\n", .{ snap.shard_id, snap.gather_timeouts });
     try writer.print("flo_shard_oldest_cross_shard_wait_seconds{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.oldest_cross_shard_wait_s });
     try writer.print("flo_shard_replies_dropped_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.replies_dropped });
     const rinfo = @typeInfo(ShardMetrics.RemovalOutcome).@"enum";
