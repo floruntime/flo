@@ -2079,7 +2079,7 @@ pub const Shard = struct {
             // queue_list uses rich binary format with per-queue stats
             .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // processing_list and workflow_list_definitions use binary wire format with rich fields
-            .processing_list => serializeWalkProcessingJobs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
+            .processing_list => ProcessingHandler.serializeWalkJobs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
             // action_list uses scan wire format with action metadata
             .action_list => serializeWalkActionEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
@@ -3108,7 +3108,10 @@ pub const Shard = struct {
     /// Publish this shard's state and losses. The runtime calls it once
     /// before the client port opens, so the first answers are already right.
     pub fn publishHealth(self: *Shard) void {
-        if (self.shard_metrics) |sm| sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
+        if (self.shard_metrics) |sm| {
+            sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
+            sm.processing_failed_jobs.store(self.processing_handler.failed_jobs, .monotonic);
+        }
         const slot = self.health orelse return;
         // The reason before the state: a reader that sees offline finds it.
         if (self.offline) |*damage| slot.setReason(damage.reason());
@@ -5136,88 +5139,6 @@ fn serializeWalkActionEntries(
         @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
     }
 
-    return buf;
-}
-
-/// Serialize walk results as binary wire format for processing jobs.
-///
-/// Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-///              [status_len:u16][status][created_at:i64])*
-///              [has_more:u8][cursor_len:u16]
-fn serializeWalkProcessingJobs(
-    allocator: std.mem.Allocator,
-    names: []const []const u8,
-    next_cursor: ?[]const u8,
-    contexts: []const *anyopaque,
-    namespace: []const u8,
-) ![]u8 {
-    const JobInfo = struct { name: []const u8, job_id: []const u8, status: []const u8, created_at: i64 };
-    var jobs: std.ArrayListUnmanaged(JobInfo) = .empty;
-    defer jobs.deinit(allocator);
-
-    const req_ns = if (namespace.len > 0) namespace else "default";
-
-    for (names) |name| {
-        for (contexts) |ctx| {
-            const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
-            var it = handler.jobs.iterator();
-            while (it.next()) |entry| {
-                const job = entry.value_ptr;
-                if (std.mem.eql(u8, job.name_owned, name) and std.mem.eql(u8, job.namespace_owned, req_ns)) {
-                    try jobs.append(allocator, .{
-                        .name = job.name_owned,
-                        .job_id = job.job_id_owned,
-                        .status = job.status.toString(),
-                        .created_at = job.created_at_ms,
-                    });
-                    break;
-                }
-            }
-        }
-    }
-
-    // Calculate total size
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-    var total: usize = 4; // count: u32
-    for (jobs.items) |j| {
-        total += 2 + j.name.len; // name_len:u16 + name
-        total += 2 + j.job_id.len; // job_id_len:u16 + job_id
-        total += 2 + j.status.len; // status_len:u16 + status
-        total += 8; // created_at:i64
-    }
-    total += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    std.mem.writeInt(u32, buf[0..4], @intCast(jobs.items.len), .little);
-    var pos: usize = 4;
-    for (jobs.items) |j| {
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.name.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..j.name.len], j.name);
-        pos += j.name.len;
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.job_id.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..j.job_id.len], j.job_id);
-        pos += j.job_id.len;
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(j.status.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..j.status.len], j.status);
-        pos += j.status.len;
-        std.mem.writeInt(i64, buf[pos..][0..8], j.created_at, .little);
-        pos += 8;
-    }
-
-    // pagination trailer
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
     return buf;
 }
 

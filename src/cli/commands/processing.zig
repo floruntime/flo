@@ -212,10 +212,17 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     const batch_size = r.readU32() orelse return outcome.malformed(ctx, what);
     const records = r.readU64() orelse return outcome.malformed(ctx, what);
     const created_at = r.readI64() orelse return outcome.malformed(ctx, what);
+    // Why the job failed; empty otherwise.
+    const reason = r.readLengthPrefixed(u16) orelse return outcome.malformed(ctx, what);
+    if (r.remainingLen() != 0) return outcome.malformed(ctx, what);
 
     ctx.print("Job:        {s}\n", .{job_id});
     ctx.print("Name:       {s}\n", .{name});
-    ctx.print("Status:     {s}\n", .{status_str});
+    if (reason.len > 0) {
+        ctx.print("Status:     {s}: {s}\n", .{ status_str, reason });
+    } else {
+        ctx.print("Status:     {s}\n", .{status_str});
+    }
     ctx.print("Batch size: {d}\n", .{batch_size});
     ctx.print("Processed:  {d} records\n", .{records});
     ctx.print("Created:    {d}ms\n", .{created_at});
