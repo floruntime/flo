@@ -10,6 +10,8 @@ const action_ops = @import("action_ops.zig");
 const kv_entries = @import("kv_entries.zig");
 
 pub const op_table = kv_ops.table ++ action_ops.table;
+/// The groups the table's ops form under their families.
+pub const op_groups = kv_ops.groups;
 pub const entry_table = kv_entries.table;
 
 comptime {

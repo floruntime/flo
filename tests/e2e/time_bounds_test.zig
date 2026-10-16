@@ -94,7 +94,7 @@ test "e2e/time: the dashboard's KV put takes ttl_ms in milliseconds and refuses 
     }
     var absent = try ctx.cli.run(&.{ "kv", "get", "k", "--output", "table" });
     defer absent.deinit();
-    try stdx.testing.assertContains(absent, "(nil)");
+    try std.testing.expectEqual(@as(u8, 1), absent.exit_code); // not found
 
     // The read reports an absolute expiry, not a duration a client could
     // send back as ttl_ms.
@@ -108,7 +108,7 @@ test "e2e/time: the dashboard's KV put takes ttl_ms in milliseconds and refuses 
     stdx.time.sleep(2000 * std.time.ns_per_ms);
     var gone = try ctx.cli.run(&.{ "kv", "get", "k", "--output", "table" });
     defer gone.deinit();
-    try stdx.testing.assertContains(gone, "(nil)");
+    try std.testing.expectEqual(@as(u8, 1), gone.exit_code); // not found
 }
 
 /// 90 years: older than the clock, and under the 100-year limit on ages.

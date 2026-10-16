@@ -6940,7 +6940,7 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
             .shard => |t| try std.testing.expectEqual(case.to.?, t.shard_id),
         }
     }
-    inline for (.{ "kv.txn_commit", "kv.txn_rollback" }) |name| {
+    inline for (.{ "kv.txn.commit", "kv.txn.rollback" }) |name| {
         const op = table_run.op(name);
         var body_buf: [16]u8 = undefined;
         const body = try op.request.encodeInto(&body_buf, .{ .txn = makeId(1, 3) });
@@ -9459,7 +9459,7 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
 
     // The commit proposes its batch and waits on the peer's ack.
-    const commit = table_run.op("kv.txn_commit");
+    const commit = table_run.op("kv.txn.commit");
     var txn_buf: [16]u8 = undefined;
     const by_id = try commit.request.encodeInto(&txn_buf, .{ .txn = id });
     send(&shard, conn, .kv_commit_txn, 2, "", by_id);
@@ -9517,7 +9517,7 @@ test "Shard: a KV commit answered with a failure instead of its batch drops its 
         var one: [1]proto.Response = undefined;
 
         const table_ = &shard.kv_handler.txn_table;
-        const commit = table_run.op("kv.txn_commit");
+        const commit = table_run.op("kv.txn.commit");
         var txn_buf: [16]u8 = undefined;
         const id2 = try table_.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""));
         try table_.appendOp(id2, .put, "k", "v", 0);

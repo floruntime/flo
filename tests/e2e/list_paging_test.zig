@@ -191,7 +191,7 @@ test "e2e/list: queue, ts and kv lists take --limit as the page size" {
     }
     try expectThreeListed(ctx, &.{ "queue", "list", "--limit", "3" });
     try expectThreeListed(ctx, &.{ "ts", "list", "--limit", "3" });
-    try expectThreeListed(ctx, &.{ "kv", "list", "--limit", "3" });
+    try expectThreeListed(ctx, &.{ "kv", "scan", "--limit", "3" });
 }
 
 /// [key_len:u16][key][value_len:u32][value]

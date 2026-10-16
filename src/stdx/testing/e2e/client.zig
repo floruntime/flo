@@ -173,7 +173,7 @@ pub const CliRunner = struct {
     }
 
     /// Run a CLI command asynchronously (returns handle to wait on)
-    /// Useful for testing blocking operations like `kv get --block`
+    /// Useful for testing blocking operations like `kv get --wait-ms`
     pub fn runAsync(self: *Self, args: []const []const u8) !*AsyncCommand {
         // Build full argument list, inserting --endpoint before any "--" separator
         const extra_flags: usize = 2;

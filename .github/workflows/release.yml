@@ -149,6 +149,18 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The op table as SDK generators and the docs read it.
+      - name: ops.json
+        run: |
+          zig build gen
+          cp zig-out/gen/ops.json artifacts/ops.json
+          (cd artifacts && sha256sum ops.json > ops.json.sha256)
+
       - name: Determine tag
         id: tag
         env:
@@ -174,6 +186,8 @@ jobs:
             artifacts/flo_*.deb.sha256
             artifacts/flo-*.rpm
             artifacts/flo-*.rpm.sha256
+            artifacts/ops.json
+            artifacts/ops.json.sha256
 
   # Points floruntime/homebrew-tap at this release. HOMEBREW_TAP_TOKEN may
   # write to that repo only; until it exists the job says so and passes, so

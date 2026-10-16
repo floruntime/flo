@@ -242,7 +242,7 @@ test "kv table: every op that takes a key refuses one in a reserved prefix" {
         // scan's key is a prefix and mget's keys are in its body (both
         // tested on their own); a transaction's begin key is its routing
         // key, and commit and rollback take none.
-        const skip = comptime for ([_][]const u8{ "kv.scan", "kv.mget", "kv.txn_begin", "kv.txn_commit", "kv.txn_rollback" }) |name| {
+        const skip = comptime for ([_][]const u8{ "kv.scan", "kv.mget", "kv.txn.begin", "kv.txn.commit", "kv.txn.rollback" }) |name| {
             if (std.mem.eql(u8, op.name, name)) break true;
         } else false;
         if (!skip) {
@@ -477,7 +477,7 @@ test "kv ops: delete, incr, expire and exists in a transaction are buffered, and
     try h.init();
     defer h.deinit();
     for ([_][]const u8{ "gone", "ttl" }) |k| try expectSet(try h.set(k, setBody("v", .{ .routing_key = "rk" })), 1);
-    const begun = try h.ok("kv.txn_begin", "rk", .{});
+    const begun = try h.ok("kv.txn.begin", "rk", .{});
     try testing.expectEqual(router.hashKeyWithNamespace("", "rk"), begun.pinned);
     const txn = begun.txn;
 
@@ -491,28 +491,28 @@ test "kv ops: delete, incr, expire and exists in a transaction are buffered, and
     try testing.expect((try h.ok("kv.exists", "gone", .{ .routing_key = "rk", .txn = null })).exists);
     try h.no("kv.incr", "count", .{ .delta = 1, .routing_key = "other", .txn = txn }, .bad_request, .wrong_routing_key);
 
-    try testing.expectEqual(@as(u16, 3), (try h.ok("kv.txn_commit", "", .{ .txn = txn })).ops);
+    try testing.expectEqual(@as(u16, 3), (try h.ok("kv.txn.commit", "", .{ .txn = txn })).ops);
     var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
     const kv = &h.shard.defaultPartition().kv;
     try testing.expect(kv.get(qualified(&qbuf, "gone")) == null);
     try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, kv.get(qualified(&qbuf, "count")).?.value[0..8], .little));
     try testing.expect(kv.get(qualified(&qbuf, "ttl")).?.expiry_ns != 0);
     // Committed: the id names no transaction now.
-    try h.no("kv.txn_commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
+    try h.no("kv.txn.commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
 }
 
 test "kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const txn = (try h.ok("kv.txn_begin", "rk", .{})).txn;
+    const txn = (try h.ok("kv.txn.begin", "rk", .{})).txn;
     try expectSet(try h.set("k", setBody("v", .{ .routing_key = "rk", .txn = txn })), null);
-    _ = try h.ok("kv.txn_rollback", "", .{ .txn = txn });
+    _ = try h.ok("kv.txn.rollback", "", .{ .txn = txn });
     _ = try expectRefused((try h.get("k", getBody(.{}))).?, .not_found, .not_found);
-    try h.no("kv.txn_rollback", "", .{ .txn = txn }, .not_found, .no_such_transaction);
-    try h.no("kv.txn_commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
+    try h.no("kv.txn.rollback", "", .{ .txn = txn }, .not_found, .no_such_transaction);
+    try h.no("kv.txn.commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
     // Begun with no key, a transaction has nothing to pin it.
-    try h.no("kv.txn_begin", "", .{}, .bad_request, .malformed);
+    try h.no("kv.txn.begin", "", .{}, .bad_request, .malformed);
 }
 
 test "kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys" {
@@ -687,21 +687,21 @@ test "kv ops: json_get, json_set and json_del work at a path, and $ is the whole
     try h.init();
     defer h.deinit();
     // $ on a missing key writes the whole document; another path is not found.
-    try h.no("kv.json_set", "doc", .{ .path = "$.a", .document = "1", .routing_key = null }, .not_found, .not_found);
-    try testing.expectEqual(@as(u64, 1), (try h.ok("kv.json_set", "doc", .{ .path = "$", .document = "{\"a\":1,\"b\":{\"c\":2}}", .routing_key = null })).version);
-    try testing.expectEqual(@as(u64, 2), (try h.ok("kv.json_set", "doc", .{ .path = "$.a", .document = "5", .routing_key = null })).version);
-    const a = try h.ok("kv.json_get", "doc", .{ .path = "$.a", .routing_key = null });
+    try h.no("kv.json.set", "doc", .{ .path = "$.a", .document = "1", .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(u64, 1), (try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":1,\"b\":{\"c\":2}}", .routing_key = null })).version);
+    try testing.expectEqual(@as(u64, 2), (try h.ok("kv.json.set", "doc", .{ .path = "$.a", .document = "5", .routing_key = null })).version);
+    const a = try h.ok("kv.json.get", "doc", .{ .path = "$.a", .routing_key = null });
     try testing.expectEqualStrings("5", a.document);
     try testing.expectEqual(@as(u64, 2), a.version);
-    try testing.expectEqual(@as(?u64, 3), (try h.ok("kv.json_del", "doc", .{ .path = "$.b", .routing_key = null })).version);
-    try h.no("kv.json_get", "doc", .{ .path = "$.b", .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(?u64, 3), (try h.ok("kv.json.del", "doc", .{ .path = "$.b", .routing_key = null })).version);
+    try h.no("kv.json.get", "doc", .{ .path = "$.b", .routing_key = null }, .not_found, .not_found);
 
-    try h.no("kv.json_set", "doc", .{ .path = "$", .document = "{not json", .routing_key = null }, .bad_request, .malformed);
-    try h.no("kv.json_get", "doc", .{ .path = "a.b[", .routing_key = null }, .bad_request, .malformed);
+    try h.no("kv.json.set", "doc", .{ .path = "$", .document = "{not json", .routing_key = null }, .bad_request, .malformed);
+    try h.no("kv.json.get", "doc", .{ .path = "a.b[", .routing_key = null }, .bad_request, .malformed);
     try expectSet(try h.set("text", setBody("hello", .{})), 1);
-    try h.no("kv.json_get", "text", .{ .path = "$.a", .routing_key = null }, .bad_request, .wrong_type);
+    try h.no("kv.json.get", "text", .{ .path = "$.a", .routing_key = null }, .bad_request, .wrong_type);
 
     // $ deletes the key.
-    try testing.expectEqual(@as(?u64, null), (try h.ok("kv.json_del", "doc", .{ .path = "$", .routing_key = null })).version);
-    try h.no("kv.json_get", "doc", .{ .path = "$", .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(?u64, null), (try h.ok("kv.json.del", "doc", .{ .path = "$", .routing_key = null })).version);
+    try h.no("kv.json.get", "doc", .{ .path = "$", .routing_key = null }, .not_found, .not_found);
 }

@@ -23,7 +23,7 @@
 //!     try std.testing.expectEqualStrings("value", value);
 //!
 //!     // Full control when needed
-//!     var result = try ctx.cli.run(&.{ "kv", "get", "key", "--format", "json" });
+//!     var result = try ctx.cli.run(&.{ "kv", "get", "key", "--output", "json" });
 //!     defer result.deinit();
 //! }
 //! ```

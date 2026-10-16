@@ -2433,19 +2433,19 @@ test "e2e/processing: filter with AND condition — keeps records matching all b
 // the bugs are fixed and these lock the behavior in. Do not weaken the assertions.
 // =============================================================================
 
-/// Poll `kv get <key>` until the value is present (not "(nil)") and contains `expected`.
+/// Poll `kv get <key>` until the key exists and its value contains `expected`.
 fn kvGetBlocking(ctx: *stdx.testing.TestContext, key: []const u8, ns: []const u8, expected: []const u8, timeout_ms: u64) !bool {
     const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
     const max_attempts = @max(timeout_ms / 100, 1);
     for (0..max_attempts) |_| {
         var result = try ctx.cli.run(&.{ "kv", "get", key, "-n", ns });
         defer result.deinit();
-        if (result.succeeded() and !result.stdoutContains("(nil)") and result.stdoutContains(expected)) return true;
+        if (result.succeeded() and result.stdoutContains(expected)) return true;
         @import("stdx").time.sleep(poll_interval_ns);
     }
     var result = try ctx.cli.run(&.{ "kv", "get", key, "-n", ns });
     defer result.deinit();
-    return result.succeeded() and !result.stdoutContains("(nil)") and result.stdoutContains(expected);
+    return result.succeeded() and result.stdoutContains(expected);
 }
 
 /// Poll `queue list` until the named queue appears (queues are auto-created on first enqueue,
@@ -2534,7 +2534,7 @@ test "e2e/processing: a kv sink's sub-second ttl_ms expires the keys it writes" 
     @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
     var gone = try ctx.cli.run(&.{ "kv", "get", "user:u1", "-n", "proc_kvttl", "--output", "table" });
     defer gone.deinit();
-    try stdx.testing.assertContains(gone, "(nil)");
+    try std.testing.expectEqual(@as(u8, 1), gone.exit_code); // not found
 }
 
 // Regression: the queue sink used to be a silent no-op.

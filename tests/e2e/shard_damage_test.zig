@@ -73,7 +73,7 @@ test "e2e/damage: a corrupted segment takes its shard offline, and the other sha
 
     // A list reads every shard, so it is refused rather than answered
     // without shard 1's part.
-    for ([_][]const []const u8{ &.{ "kv", "list" }, &.{ "stream", "list" } }) |argv| {
+    for ([_][]const []const u8{ &.{ "kv", "scan" }, &.{ "stream", "list" } }) |argv| {
         var r = try ctx.cli.run(argv);
         defer r.deinit();
         const said = std.mem.indexOf(u8, r.stderr, "shard 1 is offline on this node: segment") != null or r.stdoutContains("shard 1 is offline on this node: segment");
