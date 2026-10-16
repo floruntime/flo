@@ -2941,3 +2941,58 @@ test "e2e/processing: kv_lookup is refused on a server of more than one shard" {
     try testing.expectEqual(@as(u8, 0), listed.exit_code);
     try testing.expect(!listed.contains("e2e-kvlookup-shards"));
 }
+
+test "e2e/processing: a key the engine doesn't run yet is refused by name, and window_count emits counts" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_notyet" });
+
+    const refused_def =
+        \\kind: Processing
+        \\name: e2e-not-yet
+        \\namespace: proc_notyet
+        \\sources.[0].stream.name: ny-in
+        \\sinks.[0].stream.name: ny-out
+        \\operators.[0].type: aggregate
+        \\operators.[0].function: count
+        \\operators.[0].window: tumbling
+    ;
+    const refused_path = try writeDottedToTempYaml(testing.allocator, refused_def, "e2e-not-yet.yaml");
+    defer cleanupTempFile(testing.allocator, refused_path);
+    var r = try ctx.cli.run(&.{ "processing", "submit", refused_path, "-n", "proc_notyet" });
+    defer r.deinit();
+    try testing.expectEqual(@as(u8, 3), r.exit_code);
+    try testing.expect(r.contains("\"window\": tumbling isn't supported yet; use window: count with window_count, or no window for a running aggregate at operators[0]"));
+    var listed = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_notyet" });
+    defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
+    try testing.expect(!listed.contains("e2e-not-yet"));
+
+    // Four records in windows of two: two counts of two.
+    for (0..4) |_| try ctx.exec(&.{ "stream", "append", "ny-in", "{\"a\":1}", "-n", "proc_notyet" });
+    const counted_def =
+        \\kind: Processing
+        \\name: e2e-window-count
+        \\namespace: proc_notyet
+        \\sources.[0].stream.name: ny-in
+        \\sinks.[0].stream.name: ny-out
+        \\operators.[0].type: aggregate
+        \\operators.[0].function: count
+        \\operators.[0].window: count
+        \\operators.[0].window_count: 2
+    ;
+    const counted_path = try writeDottedToTempYaml(testing.allocator, counted_def, "e2e-window-count.yaml");
+    defer cleanupTempFile(testing.allocator, counted_path);
+    const job_id = extractJobId(try ctx.execCapture(&.{ "processing", "submit", counted_path, "-n", "proc_notyet" })) orelse return error.NoJobId;
+    var counts: usize = 0;
+    for (0..80) |_| {
+        var out = try ctx.cli.run(&.{ "stream", "read", "ny-out", "-n", "proc_notyet", "--start", "0-0", "--limit", "20" });
+        defer out.deinit();
+        try testing.expectEqual(@as(u8, 0), out.exit_code);
+        counts = std.mem.count(u8, out.stdout, "\"count\":2");
+        if (counts >= 2) break;
+        @import("stdx").time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 2), counts);
+    try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_notyet" });
+}

@@ -70,6 +70,8 @@ pub const ParseError = error{
     MissingSinkTarget,
     InvalidPartitions,
     InvalidFormat,
+    /// A key or operator type the format reserves for a feature the engine doesn't run yet.
+    NotYetSupported,
     OutOfMemory,
 };
 
@@ -272,12 +274,36 @@ const operator_keys = [_]struct { []const u8, ?[]const []const u8 }{
     .{ "filter", &.{"condition"} },
     .{ "passthrough", &.{} },
     .{ "keyby", &.{"key_expression"} },
-    .{ "aggregate", &.{ "function", "field", "window", "window_size" } },
+    .{ "aggregate", &.{ "function", "field", "window", "window_size", "window_count" } },
     .{ "map", null },
     .{ "flatmap", &.{ "array_field", "element_key" } },
     .{ "kv_lookup", &.{ "lookup_key", "namespace", "mode", "enrich_field" } },
     .{ "classify", &.{ "rules", "default_tag" } },
 };
+
+const NotYet = struct { []const u8, []const u8 };
+
+/// Keys the format defines for event time, which the engine doesn't have yet.
+/// Each names what a job can do today.
+const not_yet_source_keys = [_]NotYet{
+    .{ "event_time_field", "records are taken in the order they arrive" },
+    .{ "max_delay_ms", "records are taken in the order they arrive, so none is late" },
+};
+
+const not_yet_aggregate_keys = [_]NotYet{
+    .{ "window_size_ms", "use window: count with window_count" },
+    .{ "window_slide_ms", "use window: count with window_count" },
+    .{ "session_gap_ms", "use window: count with window_count" },
+};
+
+const not_yet_operator_types = [_][]const u8{ "dedup", "join", "no_event_for" };
+
+fn refuseNotYet(d: D, obj: JsonValue, comptime keys: []const NotYet) ParseError!void {
+    inline for (keys) |entry| {
+        if (obj.object.contains(entry[0]))
+            return d.fail(ParseError.NotYetSupported, "\"" ++ entry[0] ++ "\" isn't supported yet; " ++ entry[1], .{});
+    }
+}
 
 fn freeConfig(allocator: Allocator, entries: []const OperatorSpec.ConfigEntry) void {
     for (entries) |e| {
@@ -298,6 +324,15 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
     if (item != .object) return d.fail(ParseError.InvalidFieldType, "an operator must be a map, not {s}", .{kindName(item)});
     const op_type = try reqString(d, item, "type", ParseError.MissingRequiredField);
     const op_name = try optString(d, item, "name") orelse op_type;
+
+    for (not_yet_operator_types) |t| {
+        if (mem.eql(u8, op_type, t)) return d.fail(
+            ParseError.NotYetSupported,
+            "operator type \"{s}\" isn't supported yet (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify)",
+            .{op_type},
+        );
+    }
+    if (mem.eql(u8, op_type, "aggregate")) try refuseNotYet(d, item, &not_yet_aggregate_keys);
 
     const allowed: ?[]const []const u8 = inline for (operator_keys) |entry| {
         if (mem.eql(u8, op_type, entry[0])) break entry[1];
@@ -334,7 +369,9 @@ fn parseOperator(allocator: Allocator, d: D, item: JsonValue, default_namespace:
             .bool => |b| if (b) "true" else "false",
             else => |v| return wrongKind(d, key, "a string, number or boolean", v),
         };
-        try appendConfig(allocator, &config, key, value);
+        // The operator reads a count window's size as `window_size`.
+        const config_key = if (mem.eql(u8, key, "window_count")) "window_size" else key;
+        try appendConfig(allocator, &config, config_key, value);
     }
 
     // A classify operator's `rules:` list becomes indexed condition_N/tag_N pairs.
@@ -424,16 +461,24 @@ fn checkOperatorSettings(d: D, item: JsonValue, op_type: []const u8) ParseError!
         try need.oneOf(d, item, "function", &.{ "sum", "count", "avg", "min", "max" });
         const function = (try optString(d, item, "function")).?;
         if (!mem.eql(u8, function, "count")) try need.key(d, item, "field");
+        const has_size = item.object.contains("window_size");
+        const has_count = item.object.contains("window_count");
         if (item.object.contains("window")) {
             // A time window would need watermarks the engine doesn't have:
             // it would never emit.
-            if (mem.eql(u8, (try optString(d, item, "window")) orelse "", "tumbling"))
-                return d.fail(ParseError.InvalidFieldType, "\"window\": tumbling isn't supported; use a running aggregate (no window) or window: count", .{});
+            const window = (try optString(d, item, "window")) orelse "";
+            inline for (.{ "tumbling", "sliding", "session" }) |w| {
+                if (mem.eql(u8, window, w))
+                    return d.fail(ParseError.NotYetSupported, "\"window\": " ++ w ++ " isn't supported yet; use window: count with window_count, or no window for a running aggregate", .{});
+            }
             try need.oneOf(d, item, "window", &.{"count"});
-            if (try optPositive(u64, d, item, "window_size", ParseError.InvalidFormat) == null)
-                return d.fail(ParseError.MissingRequiredField, "missing required key \"window_size\"", .{});
-        } else if (item.object.contains("window_size")) {
-            return d.fail(ParseError.MissingRequiredField, "\"window_size\" needs \"window\"", .{});
+            if (has_size and has_count)
+                return d.fail(ParseError.InvalidFieldType, "a count window takes \"window_count\" or \"window_size\", not both", .{});
+            const size_key = if (has_count) "window_count" else "window_size";
+            if (try optPositive(u64, d, item, size_key, ParseError.InvalidFormat) == null)
+                return d.fail(ParseError.MissingRequiredField, "missing required key \"window_count\"", .{});
+        } else if (has_size or has_count) {
+            return d.fail(ParseError.MissingRequiredField, "\"{s}\" needs \"window\": count", .{if (has_count) "window_count" else "window_size"});
         }
     }
 }
@@ -485,6 +530,7 @@ fn appendSource(allocator: Allocator, sources: *std.ArrayList(SourceSpec), src: 
 ///   ```
 fn parseOneSource(allocator: Allocator, d: D, item: JsonValue, index: usize, default_batch_size: u32, default_namespace: []const u8, sources: *std.ArrayList(SourceSpec)) ParseError!void {
     if (item != .object) return d.fail(ParseError.InvalidFieldType, "a source must be a map, not {s}", .{kindName(item)});
+    try refuseNotYet(d, item, &not_yet_source_keys);
     try checkKeys(d, item, &.{ "name", "stream", "ts" });
 
     // Default the source name to a per-index unique value so multiple unnamed
@@ -543,6 +589,7 @@ fn appendTsSource(
     default_namespace: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
+    try refuseNotYet(d, ts_obj, &not_yet_source_keys);
     try checkKeys(d, ts_obj, &.{ "measurement", "namespace", "field", "tags", "batch_size", "poll_interval_ms" });
     const measurement = try reqString(d, ts_obj, "measurement", ParseError.MissingSourceStream);
     const ns = try optString(d, ts_obj, "namespace") orelse default_namespace;
@@ -569,6 +616,7 @@ fn appendStreamSource(
     default_namespace: []const u8,
     sources: *std.ArrayList(SourceSpec),
 ) ParseError!void {
+    try refuseNotYet(d, stream_obj, &not_yet_source_keys);
     try checkKeys(d, stream_obj, &.{ "name", "namespace", "partitions", "batch_size", "poll_interval_ms" });
     const stream_name = try reqString(d, stream_obj, "name", ParseError.MissingSourceStream);
     const ns = try optString(d, stream_obj, "namespace") orelse default_namespace;
@@ -1993,8 +2041,7 @@ test "parser: an operator missing what it needs, or with an unknown mode, is ref
     try expectRefused(job("\"operators\": [ { \"type\": \"filter\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"condition\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"median\", \"field\": \"$.a\" } ],", "", ""), ParseError.InvalidFieldType, "\"function\" must be one of sum|count|avg|min|max, not \"median\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"sum\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"field\" at operators[0]");
-    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of count, not \"sliding\" at operators[0]");
-    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"tumbling\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\": tumbling isn't supported; use a running aggregate (no window) or window: count at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"hopping\", \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "\"window\" must be one of count, not \"hopping\" at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_size\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_size\" must be at least 1, not 0 at operators[0]");
     try expectRefused(job("\"operators\": [ { \"type\": \"kv_lookup\", \"lookup_key\": \"k\", \"mode\": \"join\" } ],", "", ""), ParseError.InvalidFieldType, "\"mode\" must be one of filter|enrich, not \"join\" at operators[0]");
 }
@@ -2086,4 +2133,55 @@ test "parser: a KV sink whose prefix and separator leave no room for a key is re
     ++ prefix ++
         \\" } } ] }
     , null));
+}
+
+test "parser: an event-time source key is refused as not yet supported, naming what happens today" {
+    try expectRefused(job("", ", \"event_time_field\": \"$.ts\"", ""), ParseError.NotYetSupported, "\"event_time_field\" isn't supported yet; records are taken in the order they arrive at sources[0].stream");
+    try expectRefused(job("", ", \"max_delay_ms\": 5000", ""), ParseError.NotYetSupported, "\"max_delay_ms\" isn't supported yet; records are taken in the order they arrive, so none is late at sources[0].stream");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "ts": { "measurement": "cpu", "event_time_field": "$.ts" } } ],
+        \\  "sinks": [ { "stream": { "name": "out" } } ] }
+    , ParseError.NotYetSupported, "\"event_time_field\" isn't supported yet; records are taken in the order they arrive at sources[0].ts");
+    try expectRefused(
+        \\{ "kind": "Processing", "sources": [ { "max_delay_ms": 10, "stream": { "name": "in" } } ],
+        \\  "sinks": [ { "stream": { "name": "out" } } ] }
+    , ParseError.NotYetSupported, "\"max_delay_ms\" isn't supported yet; records are taken in the order they arrive, so none is late at sources[0]");
+}
+
+test "parser: a time window, or a time-window key, is refused as not yet supported, pointing to window_count" {
+    const today = " isn't supported yet; use window: count with window_count, or no window for a running aggregate at operators[0]";
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"tumbling\" } ],", "", ""), ParseError.NotYetSupported, "\"window\": tumbling" ++ today);
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"sliding\" } ],", "", ""), ParseError.NotYetSupported, "\"window\": sliding" ++ today);
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"session\" } ],", "", ""), ParseError.NotYetSupported, "\"window\": session" ++ today);
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"tumbling\", \"window_size_ms\": 60000 } ],", "", ""), ParseError.NotYetSupported, "\"window_size_ms\" isn't supported yet; use window: count with window_count at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window_slide_ms\": 1000 } ],", "", ""), ParseError.NotYetSupported, "\"window_slide_ms\" isn't supported yet; use window: count with window_count at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"session_gap_ms\": 1000 } ],", "", ""), ParseError.NotYetSupported, "\"session_gap_ms\" isn't supported yet; use window: count with window_count at operators[0]");
+}
+
+test "parser: a dedup, join or no_event_for operator is refused as not yet supported" {
+    const types = " isn't supported yet (filter|passthrough|keyby|aggregate|map|flatmap|kv_lookup|classify) at operators[0]";
+    try expectRefused(job("\"operators\": [ { \"type\": \"dedup\", \"key_expression\": \"$.id\", \"within_ms\": 1000 } ],", "", ""), ParseError.NotYetSupported, "operator type \"dedup\"" ++ types);
+    try expectRefused(job("\"operators\": [ { \"type\": \"join\", \"with\": \"other\" } ],", "", ""), ParseError.NotYetSupported, "operator type \"join\"" ++ types);
+    try expectRefused(job("\"operators\": [ { \"type\": \"no_event_for\", \"after_ms\": 1000 } ],", "", ""), ParseError.NotYetSupported, "operator type \"no_event_for\"" ++ types);
+}
+
+test "parser: window_count is a count window's size, the same as window_size" {
+    for ([_][]const u8{
+        job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_count\": 5 } ],", "", ""),
+        job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_size\": 5 } ],", "", ""),
+    }) |text| {
+        var def = try parseJobDefinition(std.testing.allocator, text, null);
+        defer def.deinit(std.testing.allocator);
+        const config = def.operators.items[0].config.?;
+        var size: ?[]const u8 = null;
+        for (config) |e| {
+            try std.testing.expect(!mem.eql(u8, e.key, "window_count"));
+            if (mem.eql(u8, e.key, "window_size")) size = e.value;
+        }
+        try std.testing.expectEqualStrings("5", size.?);
+    }
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_count\": 5, \"window_size\": 5 } ],", "", ""), ParseError.InvalidFieldType, "a count window takes \"window_count\" or \"window_size\", not both at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\", \"window_count\": 0 } ],", "", ""), ParseError.InvalidFormat, "\"window_count\" must be at least 1, not 0 at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window\": \"count\" } ],", "", ""), ParseError.MissingRequiredField, "missing required key \"window_count\" at operators[0]");
+    try expectRefused(job("\"operators\": [ { \"type\": \"aggregate\", \"function\": \"count\", \"window_count\": 5 } ],", "", ""), ParseError.MissingRequiredField, "\"window_count\" needs \"window\": count at operators[0]");
 }
