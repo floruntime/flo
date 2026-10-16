@@ -1522,8 +1522,8 @@ pub const StreamHandler = struct {
         var total: usize = 4; // count header
         for (records, 0..) |rec, i| {
             const r = self.getPayloadAndTier(rec.ual_index);
-            tiers[i] = r.tier;
-            blobs[i] = stream_mod.BatchIterator.init(r.payload) catch null;
+            tiers[i] = if (r) |p| p.tier else 0;
+            blobs[i] = if (r) |p| stream_mod.BatchIterator.init(p.payload) catch null else null;
             if (readable) |rd| rd[i] = blobs[i] != null;
             var it = blobs[i] orelse {
                 self.noteUnreadable(rec);
@@ -1633,7 +1633,7 @@ pub const StreamHandler = struct {
         var last_id = after_id;
         for (rec_buf[0..n]) |rec| {
             const result = self.getPayloadAndTier(rec.ual_index);
-            var it = stream_mod.BatchIterator.init(result.payload) catch null;
+            var it = if (result) |p| stream_mod.BatchIterator.init(p.payload) catch null else null;
             if (it == null) self.noteUnreadable(rec);
             if (it) |*batch| {
                 var j: u64 = 0;
@@ -1661,7 +1661,8 @@ pub const StreamHandler = struct {
     }
 
     /// Read a payload from the UAL by entry index (zero-copy fast path).
-    /// Returns the message value and the tier byte (0=hot, 1=warm).
+    /// Returns the message value and the tier byte (0=hot, 1=warm), or null
+    /// when the entry is in neither: its readers skip and count it.
     /// Falls back to the warm store when the entry has been evicted from the hot ring.
     ///
     /// Wrap-safety: the zero-copy `read` below returns null for an entry whose
@@ -1670,7 +1671,7 @@ pub const StreamHandler = struct {
     /// warm fallback serves the wrapped entry as tier=1. This is the canonical
     /// "null is OK, fall through" use of `read` — do not switch it to readCopy
     /// (that would force a copy + a response-lived buffer for no correctness gain).
-    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) struct { payload: []const u8, tier: u8 } {
+    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) ?struct { payload: []const u8, tier: u8 } {
         // Hot path — entry still in the UAL ring buffer. Strip the partition
         // prefix so callers see the bare batch blob `BatchIterator` reads.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
@@ -1687,7 +1688,7 @@ pub const StreamHandler = struct {
             }
         }
         if (self.tiered_metrics) |tm| tm.recordMiss();
-        return .{ .payload = "", .tier = 0 };
+        return null;
     }
 
     /// Free any heap-allocated data in a CommandResult returned by this handler.
@@ -2505,6 +2506,55 @@ test "stream handler: a read steps past an append it can't read" {
     // Read again from the start: the same lost append isn't counted twice.
     const again = handler.handleCommand(makeRequest(.stream_read, "s1", "", b.getOptions()));
     handler.freeResult(again);
+    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
+}
+
+test "stream handler: a group read skips and counts an append in no tier, and its cursor passes it" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    // A readable append, then one the projection knows but no tier holds,
+    // last, so only the cursor moving past it shows it was passed.
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    _ = try handler.stream.appendToStreamAt(h, 999_999, 0, 4_000_000_000_000, 1, 10);
+
+    for ([_]u32{ 1, 0 }) |want| {
+        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
+        switch (r) {
+            .group_messages => |m| {
+                defer handler.freeResult(r);
+                try testing.expectEqual(want, std.mem.readInt(u32, m.data[0..4], .little));
+                if (want == 1) try testing.expect(std.mem.endsWith(u8, m.data, "ok\x00\x00\x00\x00"));
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
+}
+
+test "stream handler: a processing read skips and counts an append in no tier, and its cursor passes it" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
+
+    const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
+    defer allocator.free(read.payloads);
+    defer allocator.free(read.ids);
+    try testing.expectEqual(@as(usize, 0), read.payloads.len);
+    // Passed, or a source would read it again forever.
+    try testing.expect(read.last_id.eql(lost));
     try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
 }
 
