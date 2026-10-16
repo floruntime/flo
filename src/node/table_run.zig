@@ -253,11 +253,13 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.json.del", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.txn.commit", .field = "txn", .tests = &.{ "kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one", "kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it" } },
     .{ .op = "kv.txn.rollback", .field = "txn", .tests = &.{"kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it"} },
+    .{ .op = "worker.list", .field = "limit", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
+    .{ .op = "worker.list", .field = "cursor", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
 };
 
 /// The files that bind table ops' functions: where `_ = field;` would
 /// drop a decoded field unread.
-const handler_files = [_][]const u8{"src/kv/handler.zig"};
+const handler_files = [_][]const u8{ "src/kv/handler.zig", "src/worker/handler.zig" };
 
 test "table_run: every request field of every table op has a test" {
     inline for (table.op_table) |o| {

@@ -7281,6 +7281,49 @@ test "Shard: a gather refused for room frees its state and this shard's part, an
     f.client.conn.forwards_in_flight = 0;
 }
 
+test "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const a = &f.two.shards[0];
+    // Each registration runs on its worker's shard.
+    var name: [8]u8 = undefined;
+    for (0..12) |i| {
+        const id = try std.fmt.bufPrint(&name, "w{d:0>2}", .{i});
+        a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.worker_register, 100 + i), .namespace = "default", .key = id, .value = "" }, .client);
+        f.two.settle();
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try f.answer()).header.status);
+    }
+    try std.testing.expect(f.two.shards[0].worker_handler.workers.count() > 0);
+    try std.testing.expect(f.two.shards[1].worker_handler.workers.count() > 0);
+
+    const List = table_run.op("worker.list");
+    var body_buf: [List.request.max_size]u8 = undefined;
+    var cursor_buf: [64]u8 = undefined;
+    var cursor: []const u8 = "";
+    var seen: usize = 0;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        const body = try List.request.encodeInto(&body_buf, .{ .limit = 5, .cursor = cursor });
+        a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.worker_list, 200 + pages), .namespace = "default", .key = "", .value = body }, .client);
+        f.two.settle();
+        const resp = try f.answer();
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+        var diag: schema.Diagnostic = .{};
+        const page = try List.response.decodeAll(resp.data, &diag);
+        var it = page.workers.iterator();
+        while (try it.next()) |w| : (seen += 1) {
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{seen}), w.id);
+        }
+        const next = page.cursor orelse break;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    try std.testing.expectEqual(@as(usize, 12), seen);
+    try std.testing.expectEqual(@as(usize, 2), pages);
+    try f.expectSettled(0);
+}
+
 test "Shard: a kv.mget of no keys on a node of several shards answers empty, with no gather" {
     var f: MgetGatherFixture = undefined;
     try f.init(8);
