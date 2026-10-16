@@ -55,15 +55,46 @@ pub const Wait = struct {
     max_ms: u64,
 };
 
+/// The envelope key as a positional argument.
+pub const KeyArg = struct {
+    /// Its name in usage and errors.
+    name: []const u8 = "key",
+    /// May be left out (an empty key).
+    optional: bool = false,
+    doc: []const u8 = "The key",
+};
+
+/// A short flag: `-letter` for the field's flag.
+pub const Short = struct { field: []const u8, letter: u8 };
+
 /// How the CLI exposes an op.
 pub const Cli = struct {
-    /// `none`: a person never types it (worker and task ops, txn steps).
-    expose: enum { command, none } = .command,
+    /// `command`: generated from this table. `hand`: a hand-written
+    /// command, one that sends more than one request or in a family not
+    /// generated yet; it still encodes through the op. `none`: a person
+    /// never types it (worker and task ops).
+    expose: enum { command, hand, none } = .command,
+    /// The envelope key as a positional argument, or null when the command
+    /// sends an empty key.
+    key: ?KeyArg = .{},
+    /// Request fields taken as positional arguments after the key, in
+    /// order. A list field takes the rest of the arguments.
+    args: []const []const u8 = &.{},
     /// Short flags, field name → letter.
-    short: []const struct { field: []const u8, letter: u8 } = &.{},
+    short: []const Short = &.{},
     /// A field read from a file or stdin rather than an argument.
     from_file: ?[]const u8 = null,
+    /// How the answer prints without `-o`: `record`, one `name: value`
+    /// line per field; `table`, a list field as rows; `raw`, the `show`
+    /// field's bytes alone.
     render: enum { table, record, raw } = .record,
+    /// The response field `raw` prints.
+    show: ?[]const u8 = null,
+    /// A boolean response field whose false exits 1, as not found does.
+    absent: ?[]const u8 = null,
+    /// Opaque byte fields (a cursor) a person reads and gives back as hex,
+    /// in the request and the response alike.
+    hex: []const []const u8 = &.{},
     examples: []const []const u8 = &.{},
 };
 
@@ -208,7 +239,61 @@ fn opRule(comptime op: Op, comptime before: []const Op) ?[]const u8 {
         if (op.fanout != .none) return "a transaction lives on one shard, so a walk can't take one";
     }
     if (op.doc.len == 0) return "has no doc line";
+    if (cliRule(op)) |m| return m;
     return null;
+}
+
+/// What's wrong with an op's `cli` column, or null. Every field it names
+/// exists, and a generated command can take every request field: one it
+/// doesn't take positionally becomes a flag, which a list can't be.
+fn cliRule(comptime op: Op) ?[]const u8 {
+    const c = op.cli;
+    for (c.args, 0..) |name, i| {
+        const f = fieldOf(op.request, name) orelse return "cli takes field '" ++ name ++ "' positionally, which its request doesn't have";
+        if (f.T.kind == .list and i != c.args.len - 1) return "cli list argument '" ++ name ++ "' must be the last";
+    }
+    for (c.short, 0..) |s, i| {
+        if (fieldOf(op.request, s.field) == null) return "cli short flag for '" ++ s.field ++ "', which its request doesn't have";
+        for (c.short[0..i]) |o| if (o.letter == s.letter) return "cli short flag letter used twice";
+    }
+    if (c.from_file) |name| if (fieldOf(op.request, name) == null) return "cli reads field '" ++ name ++ "' from a file, which its request doesn't have";
+    if (c.show) |name| if (fieldOf(op.response, name) == null) return "cli shows field '" ++ name ++ "', which its response doesn't have";
+    if (c.render == .raw and c.show == null) return "cli renders raw but shows no field";
+    if (c.absent) |name| {
+        const f = fieldOf(op.response, name) orelse return "cli exits absent on field '" ++ name ++ "', which its response doesn't have";
+        if (f.T.kind != .boolean) return "cli absent field '" ++ name ++ "' must be a bool";
+    }
+    for (c.hex) |name| {
+        const f = fieldOf(op.request, name) orelse (fieldOf(op.response, name) orelse return "cli shows field '" ++ name ++ "' as hex, which neither its request nor response has");
+        const T = if (f.T.kind == .optional or f.T.kind == .defaulted) f.T.Inner else f.T;
+        if (T.kind != .bytes) return "cli hex field '" ++ name ++ "' must be bytes";
+    }
+    const command = commandOf(op.name);
+    for (c.examples) |ex| {
+        if (!std.mem.startsWith(u8, ex, command) or (ex.len > command.len and ex[command.len] != ' '))
+            return "cli example '" ++ ex ++ "' doesn't run '" ++ command ++ "'";
+    }
+    if (c.expose == .command) for (op.request.field_list) |f| {
+        if (f.T.kind == .list and !isArg(c, f.name)) return "field '" ++ f.name ++ "' is a list, so the command must take it positionally";
+        if (f.doc.len == 0) return "field '" ++ f.name ++ "' has no doc, which its help line needs";
+    };
+    return null;
+}
+
+/// The command a person types for an op: `flo`, its family, its group if it
+/// has one, and its verb (`kv.txn.begin` is `flo kv txn begin`).
+pub fn commandOf(comptime name: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "flo";
+        var parts = std.mem.splitScalar(u8, name, '.');
+        while (parts.next()) |part| out = out ++ " " ++ dashed(part);
+        return out;
+    }
+}
+
+fn isArg(comptime c: Cli, comptime name: []const u8) bool {
+    for (c.args) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
 }
 
 fn fieldOf(comptime Schema: type, comptime name: []const u8) ?schema.Field {
@@ -218,7 +303,58 @@ fn fieldOf(comptime Schema: type, comptime name: []const u8) ?schema.Field {
 
 fn nameRule(comptime name: []const u8) ?[]const u8 {
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_' or c == '.')) return "its name must be lower case: [a-z0-9_.]";
+    const dots = std.mem.count(u8, name, ".");
+    if (dots < 1 or dots > 2) return "its name is family.verb or family.group.verb";
+    var parts = std.mem.splitScalar(u8, name, '.');
+    while (parts.next()) |part| if (part.len == 0) return "its name has an empty part";
     return null;
+}
+
+/// A group of ops one level below a family (`kv.txn` holds `kv.txn.begin`
+/// and its siblings): its CLI subcommand and help line.
+pub const Group = struct {
+    /// e.g. "kv.txn".
+    name: []const u8,
+    doc: []const u8,
+};
+
+/// An op's group, `family.group`, if its name has one.
+pub fn groupOf(comptime name: []const u8) ?[]const u8 {
+    const last = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    if (std.mem.indexOfScalar(u8, name, '.') == last) return null;
+    return name[0..last];
+}
+
+/// The verb a person types for an op: the last part of its name, `_` as `-`.
+pub fn verbOf(comptime name: []const u8) []const u8 {
+    const last = std.mem.lastIndexOfScalar(u8, name, '.').?;
+    return dashed(name[last + 1 ..]);
+}
+
+/// `name` with each `_` as `-`: a field's flag, or an op's verb.
+pub fn dashed(comptime name: []const u8) []const u8 {
+    comptime {
+        var out: [name.len]u8 = undefined;
+        for (name, 0..) |c, i| out[i] = if (c == '_') '-' else c;
+        const final = out;
+        return &final;
+    }
+}
+
+/// Checks that every grouped op in `table` has its group declared, and that
+/// every group declared holds an op.
+pub fn checkGroups(comptime table: []const Op, comptime groups: []const Group) void {
+    for (table) |op| if (groupOf(op.name)) |g| {
+        for (groups) |d| {
+            if (std.mem.eql(u8, d.name, g)) break;
+        } else @compileError("op '" ++ op.name ++ "': its group '" ++ g ++ "' isn't declared");
+    };
+    for (groups) |d| {
+        for (table) |op| {
+            if (groupOf(op.name)) |g| if (std.mem.eql(u8, g, d.name)) break;
+        } else @compileError("group '" ++ d.name ++ "' holds no op");
+        if (d.doc.len == 0) @compileError("group '" ++ d.name ++ "' has no doc line");
+    }
 }
 
 /// The op a code names, if the table has one.
@@ -338,10 +474,11 @@ const test_table = [_]Op{
         .class = .write,
         .creates = true,
         .request = schema.Record(&.{
-            .{ .name = "value", .T = fields.key_value },
-            .{ .name = "ttl_ms", .T = schema.Optional(schema.DurationMs(1 << 40)) },
+            .{ .name = "value", .T = fields.key_value, .doc = "The value" },
+            .{ .name = "ttl_ms", .T = schema.Optional(schema.DurationMs(1 << 40)), .doc = "Time to live" },
         }),
         .response = schema.Record(&.{.{ .name = "version", .T = fields.version }}),
+        .cli = .{ .args = &.{"value"} },
         .doc = "Set a key's value.",
     },
     .{
@@ -349,11 +486,39 @@ const test_table = [_]Op{
         .code = 0x101,
         .class = .read,
         .wait = .{ .field = "wait_ms", .default_ms = 0, .max_ms = 300_000 },
-        .request = schema.Record(&.{.{ .name = "wait_ms", .T = schema.Defaulted(schema.DurationMs(300_000), 0) }}),
+        .request = schema.Record(&.{.{ .name = "wait_ms", .T = schema.Defaulted(schema.DurationMs(300_000), 0), .doc = "How long to wait" }}),
         .response = schema.Record(&.{ .{ .name = "version", .T = fields.version }, .{ .name = "value", .T = fields.key_value } }),
+        .cli = .{ .render = .raw, .show = "value" },
         .doc = "Get a key's value.",
     },
 };
+
+test "ops: the cli column names only fields the op has, and a command can take every field" {
+    const base = test_table[0];
+    const cases = [_]Cli{
+        .{ .args = &.{"nope"} },
+        .{ .short = &.{.{ .field = "nope", .letter = 'n' }} },
+        .{ .render = .raw },
+        .{ .render = .raw, .show = "nope" },
+        .{ .absent = "version" },
+        .{ .hex = &.{"ttl_ms"} },
+        .{ .examples = &.{"flo kv sett k v"} },
+        .{ .examples = &.{"flo kv get k"} },
+    };
+    inline for (cases) |c| {
+        comptime var op = base;
+        op.cli = c;
+        try testing.expect(comptime cliRule(op) != null);
+    }
+    comptime var undocumented = base;
+    undocumented.request = schema.Record(&.{.{ .name = "value", .T = fields.key_value }});
+    try testing.expect(comptime cliRule(undocumented) != null);
+    try testing.expectEqualStrings("txn", comptime groupOf("kv.txn.begin").?[3..]);
+    try testing.expectEqual(@as(?[]const u8, null), comptime groupOf("kv.get"));
+    try testing.expectEqualStrings("json-get", comptime verbOf("kv.json_get"));
+    try testing.expectEqualStrings("flo kv txn begin", comptime commandOf("kv.txn.begin"));
+    try testing.expect(comptime nameRule("kv.a.b.c") != null);
+}
 
 test "ops: a table that follows the rules passes, and classes give writes" {
     comptime check(&test_table);

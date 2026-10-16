@@ -121,10 +121,10 @@ test "e2e/scoping: a job is seen and changed only from its own namespace" {
 test "e2e/scoping: a transaction is committed or rolled back only from its own namespace" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    const begun = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "k", "-n", "a" });
-    const tid = after(begun, "txn_id=") orelse return error.NoTxnId;
+    const begun = try ctx.execCapture(&.{ "kv", "txn", "begin", "k", "-n", "a" });
+    const tid = after(begun, "txn: ") orelse return error.NoTxnId;
     for ([_][]const u8{ "commit", "rollback" }) |verb| {
-        var r = try ctx.cli.run(&.{ "kv", verb, tid, "-n", "b" });
+        var r = try ctx.cli.run(&.{ "kv", "txn", verb, tid, "-n", "b" });
         defer r.deinit();
         try testing.expectEqual(@as(u8, 1), r.exit_code);
         try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, "\n"), "[not_found/no_such_transaction]"));
@@ -134,7 +134,7 @@ test "e2e/scoping: a transaction is committed or rolled back only from its own n
     defer put.deinit();
     try testing.expectEqual(@as(u8, 1), put.exit_code);
     try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, put.stderr, "\n"), "[not_found/no_such_transaction]"));
-    var own = try ctx.cli.run(&.{ "kv", "rollback", tid, "-n", "a" });
+    var own = try ctx.cli.run(&.{ "kv", "txn", "rollback", tid, "-n", "a" });
     defer own.deinit();
     try stdx.testing.assertStdoutContains(own, "OK");
 }

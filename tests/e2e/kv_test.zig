@@ -16,6 +16,12 @@ const stdx = @import("stdx");
 // Helper: Parse version from JSON output
 // =============================================================================
 
+/// A read of a key that isn't there: exit 1, named not found.
+fn expectNotFound(r: anytype) !void {
+    try testing.expectEqual(@as(u8, 1), r.exit_code);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, "\n"), "[not_found/not_found]"));
+}
+
 fn parseVersion(stdout: []const u8) ?u64 {
     const prefix = "\"version\":";
     const idx = std.mem.indexOf(u8, stdout, prefix) orelse return null;
@@ -51,7 +57,7 @@ test "e2e/kv: get non-existent key returns nil" {
     // flo kv get nonexistent --format table
     var result = try ctx.cli.run(&.{ "kv", "get", "nonexistent", "--output", "table" });
     defer result.deinit();
-    try stdx.testing.assertContains(result, "(nil)");
+    try expectNotFound(result);
 }
 
 test "e2e/kv: multiple keys" {
@@ -68,74 +74,128 @@ test "e2e/kv: multiple keys" {
     try testing.expect(std.mem.indexOf(u8, value, "bob") != null);
 }
 
-test "e2e/kv: ls lists all keys" {
+/// The names a scan printed with `-o raw`, sorted (a walk returns them
+/// shard by shard). Each name is a line.
+fn scannedNames(out: []const u8, buf: [][]const u8) [][]const u8 {
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| : (n += 1) buf[n] = line;
+    std.mem.sort([]const u8, buf[0..n], {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    return buf[0..n];
+}
+
+fn expectNames(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "e2e/kv: scan lists all keys" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Set up test data
     try ctx.exec(&.{ "kv", "set", "ls_alpha", "a" });
     try ctx.exec(&.{ "kv", "set", "ls_beta", "b" });
     try ctx.exec(&.{ "kv", "set", "ls_gamma", "c" });
 
-    // flo kv ls
-    var result = try ctx.cli.run(&.{ "kv", "ls" });
+    var result = try ctx.cli.run(&.{ "kv", "scan", "-o", "raw" });
     defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-    try stdx.testing.assertContains(result, "ls_alpha");
-    try stdx.testing.assertContains(result, "ls_beta");
-    try stdx.testing.assertContains(result, "ls_gamma");
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    var buf: [8][]const u8 = undefined;
+    try expectNames(&.{ "ls_alpha", "ls_beta", "ls_gamma" }, scannedNames(result.stdout, &buf));
+    // One page: no cursor.
+    try testing.expectEqualStrings("", result.stderr);
 }
 
-test "e2e/kv: ls with no keys shows empty" {
+test "e2e/kv: scan with no keys prints nothing" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // flo kv ls on fresh server — should succeed with no keys
-    var result = try ctx.cli.run(&.{ "kv", "ls" });
+    var result = try ctx.cli.run(&.{ "kv", "scan" });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
-    try stdx.testing.assertContains(result, "no keys");
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try testing.expectEqualStrings("", result.stdout);
 }
 
-test "e2e/kv: list with prefix" {
+test "e2e/kv: scan with a prefix lists only the keys starting with it" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Set up test data
     try ctx.exec(&.{ "kv", "set", "user:1", "alice" });
     try ctx.exec(&.{ "kv", "set", "user:2", "bob" });
     try ctx.exec(&.{ "kv", "set", "user:3", "charlie" });
     try ctx.exec(&.{ "kv", "set", "other:1", "other" });
 
-    // flo kv list --prefix user:
-    var result = try ctx.cli.run(&.{ "kv", "list", "--prefix", "user:" });
+    var result = try ctx.cli.run(&.{ "kv", "scan", "user:", "-o", "raw" });
     defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-    try stdx.testing.assertContains(result, "user:1");
-    try stdx.testing.assertContains(result, "user:2");
-    try stdx.testing.assertContains(result, "user:3");
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    var buf: [8][]const u8 = undefined;
+    try expectNames(&.{ "user:1", "user:2", "user:3" }, scannedNames(result.stdout, &buf));
 }
 
-test "e2e/kv: ls with --limit" {
+test "e2e/kv: scan with --limit prints a page, and in raw the cursor goes to stderr" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Set up several keys
-    var i: usize = 0;
-    while (i < 10) : (i += 1) {
-        var key_buf: [32]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "limit_key_{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "kv", "set", key, "v" });
-    }
+    var key_buf: [32]u8 = undefined;
+    for (0..10) |i| try ctx.exec(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "limit_key_{d}", .{i}), "v" });
 
-    // flo kv ls --limit 3
-    var result = try ctx.cli.run(&.{ "kv", "ls", "--limit", "3" });
+    var result = try ctx.cli.run(&.{ "kv", "scan", "--limit", "3", "-o", "raw" });
     defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    // stdout is names alone, for `while read`; the cursor is on stderr.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, result.stdout, "\n"));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "cursor") == null);
+    try testing.expect(std.mem.startsWith(u8, result.stderr, "cursor: "));
+}
 
-    try stdx.testing.assertSucceeded(result);
+test "e2e/kv: scan follows its cursor across pages to every key, once each" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    for (0..10) |i| try ctx.exec(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "page_key_{d}", .{i}), "v" });
+
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen.items) |name| testing.allocator.free(name);
+        seen.deinit(testing.allocator);
+    }
+    var cursor: [128]u8 = undefined;
+    var cursor_len: usize = 0;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        if (pages > 20) return error.TooManyPages;
+        var args: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer args.deinit(testing.allocator);
+        try args.appendSlice(testing.allocator, &.{ "kv", "scan", "page_key_", "--limit", "3", "-o", "raw" });
+        if (cursor_len > 0) try args.appendSlice(testing.allocator, &.{ "--cursor", cursor[0..cursor_len] });
+        var page = try ctx.cli.run(args.items);
+        defer page.deinit();
+        try testing.expectEqual(@as(u8, 0), page.exit_code);
+        var lines = std.mem.tokenizeScalar(u8, page.stdout, '\n');
+        while (lines.next()) |name| try seen.append(testing.allocator, try testing.allocator.dupe(u8, name));
+        const next = std.mem.trim(u8, page.stderr, "\n");
+        if (next.len == 0) break;
+        try testing.expect(std.mem.startsWith(u8, next, "cursor: "));
+        const hex = next["cursor: ".len..];
+        @memcpy(cursor[0..hex.len], hex);
+        cursor_len = hex.len;
+    }
+    try testing.expect(pages >= 3);
+    std.mem.sort([]const u8, seen.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    var want: [10][]const u8 = undefined;
+    var want_buf: [10][16]u8 = undefined;
+    for (0..10) |i| want[i] = try std.fmt.bufPrint(&want_buf[i], "page_key_{d}", .{i});
+    try expectNames(&want, seen.items);
 }
 
 test "e2e/kv: delete" {
@@ -155,7 +215,7 @@ test "e2e/kv: delete" {
     // Verify it's gone
     var after = try ctx.cli.run(&.{ "kv", "get", "to_delete", "--output", "table" });
     defer after.deinit();
-    try stdx.testing.assertContains(after, "(nil)");
+    try expectNotFound(after);
 }
 
 test "e2e/kv: overwrite value" {
@@ -406,7 +466,7 @@ test "e2e/kv: set with TTL expires after timeout" {
     // Should be expired now
     var after = try ctx.cli.run(&.{ "kv", "get", "ttl_key", "--output", "table" });
     defer after.deinit();
-    try stdx.testing.assertContains(after, "(nil)");
+    try expectNotFound(after);
 }
 
 test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it doesn't know, and expire --ttl-ms 0 clears" {
@@ -426,10 +486,10 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it 
     @import("stdx").time.sleep(2000 * std.time.ns_per_ms);
     var late = try ctx.cli.run(&.{ "kv", "get", "ms_key", "--output", "table" });
     defer late.deinit();
-    try stdx.testing.assertContains(late, "(nil)");
+    try expectNotFound(late);
     var late_touched = try ctx.cli.run(&.{ "kv", "get", "touched_key", "--output", "table" });
     defer late_touched.deinit();
-    try stdx.testing.assertContains(late_touched, "(nil)");
+    try expectNotFound(late_touched);
 
     // A unit the flag doesn't know is refused, and nothing set.
     var bare = try ctx.cli.run(&.{ "kv", "set", "bare_key", "v", "--ttl-ms", "1x" });
@@ -438,7 +498,7 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it 
     try testing.expect(bare.contains("not a duration"));
     var unset = try ctx.cli.run(&.{ "kv", "get", "bare_key", "--output", "table" });
     defer unset.deinit();
-    try stdx.testing.assertContains(unset, "(nil)");
+    try expectNotFound(unset);
 
     // 0 is the one bare number: it clears.
     try ctx.exec(&.{ "kv", "set", "cleared_key", "kept", "--ttl-ms", "1s" });
@@ -518,9 +578,9 @@ test "e2e/kv: delete non-existent key" {
     var result = try ctx.cli.run(&.{ "kv", "delete", "never_existed" });
     defer result.deinit();
     try testing.expectEqual(@as(u8, 0), result.exit_code);
-    try testing.expectEqualStrings("OK existed=false\n", result.stdout);
+    try testing.expectEqualStrings("existed: false\n", result.stdout);
     try ctx.exec(&.{ "kv", "set", "existed", "v" });
-    try testing.expectEqualStrings("OK existed=true", try ctx.execCapture(&.{ "kv", "delete", "existed" }));
+    try testing.expectEqualStrings("existed: true", try ctx.execCapture(&.{ "kv", "delete", "existed" }));
 }
 
 test "e2e/kv: delete then get returns nil" {
@@ -533,7 +593,7 @@ test "e2e/kv: delete then get returns nil" {
     // flo kv get delete_me --format table
     var result = try ctx.cli.run(&.{ "kv", "get", "delete_me", "--output", "table" });
     defer result.deinit();
-    try stdx.testing.assertContains(result, "(nil)");
+    try expectNotFound(result);
 }
 
 // =============================================================================
@@ -951,7 +1011,7 @@ test "e2e/kv/cluster: delete replicates across cluster" {
     try cluster.execOn(2, &.{ "kv", "delete", "to_delete_cluster" });
 
     // Verify deletion from node 1 (poll: GET returns stale value until delete replicates)
-    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "get", "to_delete_cluster", "--output", "table" }, "(nil)", 10, 500);
+    const after = try cluster.pollAnyUntilContains(0, &.{ "kv", "exists", "to_delete_cluster" }, "exists: false", 10, 500);
     defer testing.allocator.free(after);
 }
 
@@ -969,9 +1029,9 @@ test "e2e/kv/cluster: a TTL runs out on every node, the leader included" {
     const wait_ms = (set_at + 4_500) - stdx.time.milliTimestamp();
     if (wait_ms > 0) stdx.time.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
     for (0..3) |node| {
-        const out = try cluster.execCaptureAnyOn(node, &.{ "kv", "get", "ttl_everywhere", "--output", "table" });
+        const out = try cluster.execCaptureAnyOn(node, &.{ "kv", "exists", "ttl_everywhere" });
         defer testing.allocator.free(out);
-        if (std.mem.indexOf(u8, out, "(nil)") == null or std.mem.indexOf(u8, out, "short_lived") != null) {
+        if (std.mem.indexOf(u8, out, "exists: false") == null) {
             std.debug.print("node {d} still has the key: {s}\n", .{ node, out });
             return error.TestUnexpectedResult;
         }
@@ -1056,14 +1116,13 @@ test "e2e/kv: the longest wait receives the value, a wait of 0 answers at once, 
         const t0 = @import("stdx").time.monotonicMs();
         var now = try ctx.cli.run(&.{ "kv", "get", "never_set_key", "--wait-ms", "0", "--wait-for", wait_for, "-o", "json" });
         defer now.deinit();
-        try testing.expectEqual(@as(u8, 1), now.exit_code);
-        try testing.expect(now.stdoutContains("\"value\":null"));
+        try expectNotFound(now);
         try testing.expect(@import("stdx").time.monotonicMs() - t0 < 2_000);
 
         var over = try ctx.cli.run(&.{ "kv", "get", "never_set_key", "--wait-ms", "300001", "--wait-for", wait_for });
         defer over.deinit();
         try testing.expectEqual(@as(u8, 2), over.exit_code);
-        try testing.expectEqualStrings("Error: --wait-ms is at most 300000 (5m)", std.mem.trimEnd(u8, over.stderr, "\n"));
+        try testing.expectEqualStrings("Error: --wait-ms 300001 is out of range (0 to 300000)", std.mem.trimEnd(u8, over.stderr, "\n"));
     }
 
     // Start a blocking GET with the longest wait
@@ -1127,9 +1186,8 @@ test "e2e/kv: blocking get times out when key not set" {
     var result = try ctx.cli.run(&.{ "kv", "get", key, "--wait-ms", "500" });
     defer result.deinit();
 
-    // The wait ends with the key still absent: (nil), not found.
-    try testing.expectEqual(@as(u8, 1), result.exit_code);
-    try testing.expect(result.stdoutContains("(nil)"));
+    // The wait ends with the key still absent: not found.
+    try expectNotFound(result);
 }
 
 // =============================================================================
@@ -1154,8 +1212,8 @@ test "e2e/kv: list returns all keys across shards" {
         try ctx.exec(&.{ "kv", "set", k, "v" });
     }
 
-    // kv list should return ALL keys regardless of shard placement
-    var result = try ctx.cli.run(&.{ "kv", "ls" });
+    // kv scan should return ALL keys regardless of shard placement
+    var result = try ctx.cli.run(&.{ "kv", "scan" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1183,7 +1241,7 @@ test "e2e/kv: list with prefix returns correct subset across shards" {
     try ctx.exec(&.{ "kv", "set", "order:1002", "y" });
 
     // Prefix scan with walk — returns all user: keys from all shards
-    var result = try ctx.cli.run(&.{ "kv", "list", "--prefix", "user:" });
+    var result = try ctx.cli.run(&.{ "kv", "scan", "user:" });
     defer result.deinit();
 
     try stdx.testing.assertSucceeded(result);
@@ -1233,7 +1291,7 @@ test "e2e/kv: delete in one namespace does not affect another" {
     // Namespace A should be nil
     var result_a = try ctx.cli.run(&.{ "kv", "get", "shared", "-n", "kv_del_a", "--output", "table" });
     defer result_a.deinit();
-    try stdx.testing.assertContains(result_a, "(nil)");
+    try expectNotFound(result_a);
 
     // Namespace B should still have its value
     const val_b = try ctx.execCapture(&.{ "kv", "get", "shared", "-n", "kv_del_b" });
@@ -1275,13 +1333,13 @@ test "e2e/kv: list only shows keys in the requested namespace" {
     try ctx.exec(&.{ "kv", "set", "onlyInB", "b", "-n", "kv_ls_b" });
 
     // List namespace A — should see onlyInA but not onlyInB
-    var result_a = try ctx.cli.run(&.{ "kv", "ls", "-n", "kv_ls_a" });
+    var result_a = try ctx.cli.run(&.{ "kv", "scan", "-n", "kv_ls_a" });
     defer result_a.deinit();
     try stdx.testing.assertContains(result_a, "onlyInA");
     try stdx.testing.assertNotContains(result_a, "onlyInB");
 
     // List namespace B — should see onlyInB but not onlyInA
-    var result_b = try ctx.cli.run(&.{ "kv", "ls", "-n", "kv_ls_b" });
+    var result_b = try ctx.cli.run(&.{ "kv", "scan", "-n", "kv_ls_b" });
     defer result_b.deinit();
     try stdx.testing.assertContains(result_b, "onlyInB");
     try stdx.testing.assertNotContains(result_b, "onlyInA");
@@ -1901,17 +1959,17 @@ test "e2e/kv: exists returns 1 for existing, 0 for missing" {
 
     try ctx.exec(&.{ "kv", "set", "present", "yes" });
 
-    // Present key → exit 0, "1" and its version.
+    // Present key → exit 0, and its version.
     var ok = try ctx.cli.run(&.{ "kv", "exists", "present" });
     defer ok.deinit();
     try testing.expectEqual(@as(u8, 0), ok.exit_code);
-    try testing.expectEqualStrings("1 version=1\n", ok.stdout);
+    try testing.expectEqualStrings("exists: true\nversion: 1\n", ok.stdout);
 
-    // Missing key → exit 1, stdout "0".
+    // Missing key → exit 1.
     var missing = try ctx.cli.run(&.{ "kv", "exists", "absent" });
     defer missing.deinit();
     try testing.expectEqual(@as(u8, 1), missing.exit_code);
-    try testing.expectEqualStrings("0\n", missing.stdout);
+    try testing.expectEqualStrings("exists: false\nversion: 0\n", missing.stdout);
 }
 
 test "e2e/kv: expire sets a TTL, --ttl-ms 0 clears it, and --cas-version guards it" {
@@ -1942,56 +2000,56 @@ test "e2e/kv: expire on a missing key is not found, and --ttl-ms is required" {
     try testing.expectEqual(@as(u8, 2), bare.exit_code);
 }
 
-test "e2e/kv: jset + jget round trip" {
+test "e2e/kv: json set + json get round trip" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     // Set a full JSON document at root.
-    try ctx.exec(&.{ "kv", "jset", "user:1", "{\"name\":\"alice\",\"age\":30}" });
+    try ctx.exec(&.{ "kv", "json", "set", "user:1", "{\"name\":\"alice\",\"age\":30}" });
 
-    // jget with default path "$" returns full doc.
-    const root = try ctx.execCapture(&.{ "kv", "jget", "user:1" });
+    // json get with the default path "$" returns the whole document.
+    const root = try ctx.execCapture(&.{ "kv", "json", "get", "user:1" });
     try testing.expect(std.mem.indexOf(u8, root, "alice") != null);
     try testing.expect(std.mem.indexOf(u8, root, "30") != null);
 
-    // jget with explicit path returns the field.
-    const name = try ctx.execCapture(&.{ "kv", "jget", "user:1", "--path", "$.name" });
+    // json get with a path returns the field.
+    const name = try ctx.execCapture(&.{ "kv", "json", "get", "user:1", "--path", "$.name" });
     try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
 }
 
-test "e2e/kv: jset updates nested field" {
+test "e2e/kv: json set updates nested field" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "user:2", "{\"profile\":{\"name\":\"alice\",\"age\":30}}" });
+    try ctx.exec(&.{ "kv", "json", "set", "user:2", "{\"profile\":{\"name\":\"alice\",\"age\":30}}" });
 
     // Update nested field.
-    try ctx.exec(&.{ "kv", "jset", "user:2", "31", "--path", "$.profile.age" });
+    try ctx.exec(&.{ "kv", "json", "set", "user:2", "31", "--path", "$.profile.age" });
 
-    const age = try ctx.execCapture(&.{ "kv", "jget", "user:2", "--path", "$.profile.age" });
+    const age = try ctx.execCapture(&.{ "kv", "json", "get", "user:2", "--path", "$.profile.age" });
     try testing.expect(std.mem.indexOf(u8, age, "31") != null);
 
     // Original sibling still present.
-    const name = try ctx.execCapture(&.{ "kv", "jget", "user:2", "--path", "$.profile.name" });
+    const name = try ctx.execCapture(&.{ "kv", "json", "get", "user:2", "--path", "$.profile.name" });
     try testing.expect(std.mem.indexOf(u8, name, "alice") != null);
 }
 
-test "e2e/kv: jdel removes field, leaves rest intact" {
+test "e2e/kv: json del removes field, leaves rest intact" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "doc", "{\"a\":1,\"b\":2,\"c\":3}" });
-    try ctx.exec(&.{ "kv", "jdel", "doc", "--path", "$.b" });
+    try ctx.exec(&.{ "kv", "json", "set", "doc", "{\"a\":1,\"b\":2,\"c\":3}" });
+    try ctx.exec(&.{ "kv", "json", "del", "doc", "--path", "$.b" });
 
     // $.b is gone.
-    var missing = try ctx.cli.run(&.{ "kv", "jget", "doc", "--path", "$.b" });
+    var missing = try ctx.cli.run(&.{ "kv", "json", "get", "doc", "--path", "$.b" });
     defer missing.deinit();
     try stdx.testing.assertFailed(missing);
 
     // $.a and $.c remain.
-    const a = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.a" });
+    const a = try ctx.execCapture(&.{ "kv", "json", "get", "doc", "--path", "$.a" });
     try testing.expect(std.mem.indexOf(u8, a, "1") != null);
-    const c = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.c" });
+    const c = try ctx.execCapture(&.{ "kv", "json", "get", "doc", "--path", "$.c" });
     try testing.expect(std.mem.indexOf(u8, c, "3") != null);
 }
 
@@ -1999,42 +2057,42 @@ test "e2e/kv: json array index access and update" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "doc", "{\"tags\":[\"red\",\"green\",\"blue\"]}" });
+    try ctx.exec(&.{ "kv", "json", "set", "doc", "{\"tags\":[\"red\",\"green\",\"blue\"]}" });
 
-    const tag = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.tags[1]" });
+    const tag = try ctx.execCapture(&.{ "kv", "json", "get", "doc", "--path", "$.tags[1]" });
     try testing.expect(std.mem.indexOf(u8, tag, "green") != null);
 
-    try ctx.exec(&.{ "kv", "jset", "doc", "\"yellow\"", "--path", "$.tags[1]" });
+    try ctx.exec(&.{ "kv", "json", "set", "doc", "\"yellow\"", "--path", "$.tags[1]" });
 
-    const tag_after = try ctx.execCapture(&.{ "kv", "jget", "doc", "--path", "$.tags[1]" });
+    const tag_after = try ctx.execCapture(&.{ "kv", "json", "get", "doc", "--path", "$.tags[1]" });
     try testing.expect(std.mem.indexOf(u8, tag_after, "yellow") != null);
 }
 
-test "e2e/kv: jget invalid path errors" {
+test "e2e/kv: json get invalid path errors" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "doc2", "{\"a\":1}" });
+    try ctx.exec(&.{ "kv", "json", "set", "doc2", "{\"a\":1}" });
 
     // Path missing leading $ is refused by name.
-    var bad = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "no.dollar" });
+    var bad = try ctx.cli.run(&.{ "kv", "json", "get", "doc2", "--path", "no.dollar" });
     defer bad.deinit();
     try testing.expectEqual(@as(u8, 3), bad.exit_code);
     try testing.expectEqualStrings("Error: bad request: path isn't a JSON path [bad_request/malformed]", std.mem.trimEnd(u8, bad.stderr, "\n"));
 
     // Nothing at the path is not found.
-    var missing = try ctx.cli.run(&.{ "kv", "jget", "doc2", "--path", "$.nope" });
+    var missing = try ctx.cli.run(&.{ "kv", "json", "get", "doc2", "--path", "$.nope" });
     defer missing.deinit();
     try testing.expectEqual(@as(u8, 1), missing.exit_code);
     try testing.expectEqualStrings("Error: not found: nothing at that path in the document [not_found/not_found]", std.mem.trimEnd(u8, missing.stderr, "\n"));
 }
 
-test "e2e/kv: jdel root removes whole key" {
+test "e2e/kv: json del root removes whole key" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "ephemeral", "{\"x\":1}" });
-    try ctx.exec(&.{ "kv", "jdel", "ephemeral" });
+    try ctx.exec(&.{ "kv", "json", "set", "ephemeral", "{\"x\":1}" });
+    try ctx.exec(&.{ "kv", "json", "del", "ephemeral" });
 
     // Key should now be missing.
     var result = try ctx.cli.run(&.{ "kv", "exists", "ephemeral" });
@@ -2043,21 +2101,20 @@ test "e2e/kv: jdel root removes whole key" {
     try stdx.testing.assertStdoutContains(result, "0");
 }
 
-test "e2e/kv: json-get/set/del aliases work alongside canonical jget/jset/jdel" {
+test "e2e/kv: json set, get and del at a path, and del at $ removes the key" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Write with the alias, read with the canonical (and vice versa).
-    try ctx.exec(&.{ "kv", "json-set", "alias_doc", "{\"x\":1}" });
-    const v1 = try ctx.execCapture(&.{ "kv", "jget", "alias_doc", "--path", "$.x" });
+    try ctx.exec(&.{ "kv", "json", "set", "path_doc", "{\"x\":1}" });
+    const v1 = try ctx.execCapture(&.{ "kv", "json", "get", "path_doc", "--path", "$.x" });
     try testing.expect(std.mem.indexOf(u8, v1, "1") != null);
 
-    try ctx.exec(&.{ "kv", "jset", "alias_doc", "2", "--path", "$.x" });
-    const v2 = try ctx.execCapture(&.{ "kv", "json-get", "alias_doc", "--path", "$.x" });
+    try ctx.exec(&.{ "kv", "json", "set", "path_doc", "2", "--path", "$.x" });
+    const v2 = try ctx.execCapture(&.{ "kv", "json", "get", "path_doc", "--path", "$.x" });
     try testing.expect(std.mem.indexOf(u8, v2, "2") != null);
 
-    try ctx.exec(&.{ "kv", "json-del", "alias_doc" });
-    var missing = try ctx.cli.run(&.{ "kv", "exists", "alias_doc" });
+    try ctx.exec(&.{ "kv", "json", "del", "path_doc" });
+    var missing = try ctx.cli.run(&.{ "kv", "exists", "path_doc" });
     defer missing.deinit();
     try stdx.testing.assertFailed(missing);
 }
@@ -2071,9 +2128,9 @@ test "e2e/kv: txn begin/put/get-RYW/commit/get" {
     defer ctx.deinit();
 
     // BEGIN — pin to a routing key.
-    const begin_out = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "tenant-A" });
-    // Output: "txn_id=<N> pinned_hash=<M>\n"
-    const tid_prefix = "txn_id=";
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "tenant-A" });
+    // Output: "txn: <N>\npinned: <M>\n"
+    const tid_prefix = "txn: ";
     const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
     var end = idx + tid_prefix.len;
     while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
@@ -2089,13 +2146,13 @@ test "e2e/kv: txn begin/put/get-RYW/commit/get" {
     try testing.expect(std.mem.indexOf(u8, ryw, "v1") != null);
 
     // Outside the txn, the staged value must not yet be visible.
-    var pre_commit = try ctx.cli.run(&.{ "kv", "get", "txn:k1", "--output", "table" });
+    var pre_commit = try ctx.cli.run(&.{ "kv", "get", "txn:k1" });
     defer pre_commit.deinit();
-    try stdx.testing.assertContains(pre_commit, "(nil)");
+    try testing.expectEqual(@as(u8, 1), pre_commit.exit_code);
 
     // COMMIT — values become visible.
-    const commit_out = try ctx.execCapture(&.{ "kv", "commit", tid_str });
-    try testing.expect(std.mem.indexOf(u8, commit_out, "ops=2") != null);
+    const commit_out = try ctx.execCapture(&.{ "kv", "txn", "commit", tid_str });
+    try testing.expect(std.mem.endsWith(u8, commit_out, "ops: 2"));
 
     const post = try ctx.execCapture(&.{ "kv", "get", "txn:k1" });
     try testing.expect(std.mem.indexOf(u8, post, "v1") != null);
@@ -2107,19 +2164,19 @@ test "e2e/kv: txn rollback discards staged ops" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const begin_out = try ctx.execCapture(&.{ "kv", "begin", "--routing-key", "rb-tenant" });
-    const tid_prefix = "txn_id=";
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "rb-tenant" });
+    const tid_prefix = "txn: ";
     const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
     var end = idx + tid_prefix.len;
     while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
     const tid_str = begin_out[idx + tid_prefix.len .. end];
 
     try ctx.exec(&.{ "kv", "set", "rb:k", "should-not-persist", "--routing-key", "rb-tenant", "--txn", tid_str });
-    try ctx.exec(&.{ "kv", "rollback", tid_str });
+    try ctx.exec(&.{ "kv", "txn", "rollback", tid_str });
 
     var result = try ctx.cli.run(&.{ "kv", "get", "rb:k", "--output", "table" });
     defer result.deinit();
-    try stdx.testing.assertContains(result, "(nil)");
+    try expectNotFound(result);
 }
 
 test "e2e/kv: txn unknown id is rejected" {
@@ -2216,16 +2273,16 @@ test "e2e/kv: a 90 KB transaction batch is applied, not just acked" {
 
     // Three 30 KB values in one commit: a 90 KB kv_batch entry. It must be
     // readable immediately, not only after a restart replays the segment.
-    // `kv begin -o raw` prints `txn_id=N pinned_hash=H`.
-    const begin = try ctx.execCapture(&.{ "kv", "begin", "-r", "rk", "-o", "raw" });
-    const id_start = (std.mem.indexOf(u8, begin, "txn_id=") orelse return error.NoTxnId) + "txn_id=".len;
-    const id_end = std.mem.indexOfScalarPos(u8, begin, id_start, ' ') orelse begin.len;
+    // `kv txn begin` prints `txn: N` and `pinned: H`, a line each.
+    const begin = try ctx.execCapture(&.{ "kv", "txn", "begin", "rk", "-o", "raw" });
+    const id_start = (std.mem.indexOf(u8, begin, "txn: ") orelse return error.NoTxnId) + "txn: ".len;
+    const id_end = std.mem.indexOfScalarPos(u8, begin, id_start, '\n') orelse begin.len;
     const txn_id = begin[id_start..id_end];
     const value = stdx.repeat("t", 30_000);
     try ctx.exec(&.{ "kv", "set", "txn_a", value, "-t", txn_id, "-r", "rk" });
     try ctx.exec(&.{ "kv", "set", "txn_b", value, "-t", txn_id, "-r", "rk" });
     try ctx.exec(&.{ "kv", "set", "txn_c", value, "-t", txn_id, "-r", "rk" });
-    try ctx.exec(&.{ "kv", "commit", txn_id });
+    try ctx.exec(&.{ "kv", "txn", "commit", txn_id });
     for ([_][]const u8{ "txn_a", "txn_b", "txn_c" }) |key| {
         const got = try ctx.execCapture(&.{ "kv", "get", key, "-r", "rk", "-o", "raw" });
         try testing.expectEqualStrings(value, got);
@@ -2246,13 +2303,13 @@ test "e2e/kv: JSON nesting is limited to 128 levels" {
 
     const ok = try nestedArrays(128);
     defer testing.allocator.free(ok);
-    try ctx.exec(&.{ "kv", "jset", "deep128", ok });
-    const got = try ctx.execCapture(&.{ "kv", "jget", "deep128", "--path", "$" });
+    try ctx.exec(&.{ "kv", "json", "set", "deep128", ok });
+    const got = try ctx.execCapture(&.{ "kv", "json", "get", "deep128", "--path", "$" });
     try testing.expect(std.mem.indexOf(u8, got, ok) != null);
 
     const over = try nestedArrays(129);
     defer testing.allocator.free(over);
-    var set = try ctx.cli.run(&.{ "kv", "jset", "deep129", over });
+    var set = try ctx.cli.run(&.{ "kv", "json", "set", "deep129", over });
     defer set.deinit();
     try testing.expectEqual(@as(u8, 3), set.exit_code);
     try testing.expectEqualStrings(refusal, std.mem.trimEnd(u8, set.stderr, "\n"));
@@ -2261,13 +2318,13 @@ test "e2e/kv: JSON nesting is limited to 128 levels" {
     const far = try nestedArrays(300);
     defer testing.allocator.free(far);
     try ctx.exec(&.{ "kv", "set", "deep300", far });
-    var get = try ctx.cli.run(&.{ "kv", "jget", "deep300", "--path", "$" });
+    var get = try ctx.cli.run(&.{ "kv", "json", "get", "deep300", "--path", "$" });
     defer get.deinit();
     try testing.expectEqual(@as(u8, 3), get.exit_code);
     try testing.expectEqualStrings(refusal, std.mem.trimEnd(u8, get.stderr, "\n"));
 
     // The node still serves.
-    const again = try ctx.execCapture(&.{ "kv", "jget", "deep128", "--path", "$" });
+    const again = try ctx.execCapture(&.{ "kv", "json", "get", "deep128", "--path", "$" });
     try testing.expect(std.mem.indexOf(u8, again, ok) != null);
 }
 
@@ -2292,7 +2349,7 @@ test "e2e/kv: a value that isn't UTF-8 is a JSON string with U+FFFD under -o jso
 // A merge that would grow a document past the largest value a read can
 // answer is refused when it's written, so no key is stored that can't be
 // read back.
-test "e2e/kv: jset refuses a merge past the largest value" {
+test "e2e/kv: json set refuses a merge past the largest value" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2302,11 +2359,11 @@ test "e2e/kv: jset refuses a merge past the largest value" {
     const filler = try testing.allocator.alloc(u8, 100_000);
     defer testing.allocator.free(filler);
     @memset(filler, 'x');
-    try ctx.exec(&.{ "kv", "jset", "big", "{\"a\":\"\",\"b\":\"\",\"c\":\"\",\"d\":\"\"}" });
+    try ctx.exec(&.{ "kv", "json", "set", "big", "{\"a\":\"\",\"b\":\"\",\"c\":\"\",\"d\":\"\"}" });
     for ([_]struct { path: []const u8, len: usize }{ .{ .path = "$.a", .len = 100_000 }, .{ .path = "$.b", .len = 100_000 }, .{ .path = "$.c", .len = 51_000 } }) |part| {
         const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..part.len]});
         defer testing.allocator.free(more);
-        try ctx.exec(&.{ "kv", "jset", "big", more, "--path", part.path });
+        try ctx.exec(&.{ "kv", "json", "set", "big", more, "--path", part.path });
     }
     // About 251,000 bytes now, under the largest value.
     var before = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
@@ -2316,7 +2373,7 @@ test "e2e/kv: jset refuses a merge past the largest value" {
 
     const last = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
     defer testing.allocator.free(last);
-    var grown = try ctx.cli.run(&.{ "kv", "jset", "big", last, "--path", "$.d" });
+    var grown = try ctx.cli.run(&.{ "kv", "json", "set", "big", last, "--path", "$.d" });
     defer grown.deinit();
     try testing.expectEqual(@as(u8, 3), grown.exit_code);
     const want = std.fmt.comptimePrint("Error: bad request: the value to write is more than a key holds: at most {d} bytes [bad_request/field_too_long]", .{@import("src").protocol.kv_ops.MAX_VALUE});
@@ -2331,14 +2388,14 @@ test "e2e/kv: jset refuses a merge past the largest value" {
 
 // Each set at a new path adds a field to the document's object, which grows
 // as the fields arrive; the server stays up and the document holds them all.
-test "e2e/kv: jset adds field after field to one object" {
+test "e2e/kv: json set adds field after field to one object" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "kv", "jset", "grown", "{\"a\":1,\"b\":2}" });
+    try ctx.exec(&.{ "kv", "json", "set", "grown", "{\"a\":1,\"b\":2}" });
     for ([_][]const u8{ "$.c", "$.d", "$.e", "$.f", "$.g", "$.h", "$.i", "$.j" }) |path| {
-        try ctx.exec(&.{ "kv", "jset", "grown", "3", "--path", path });
+        try ctx.exec(&.{ "kv", "json", "set", "grown", "3", "--path", path });
     }
-    const doc = try ctx.execCapture(&.{ "kv", "jget", "grown" });
+    const doc = try ctx.execCapture(&.{ "kv", "json", "get", "grown" });
     try testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":3,\"d\":3,\"e\":3,\"f\":3,\"g\":3,\"h\":3,\"i\":3,\"j\":3}", std.mem.trimEnd(u8, doc, "\n"));
 }

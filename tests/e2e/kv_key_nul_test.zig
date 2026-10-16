@@ -66,7 +66,7 @@ test "e2e/kv: a key holding a NUL is refused, and a default listing shows only d
     }
     try testing.expect(try bKeyUnchanged(ctx));
 
-    const listed = try ctx.execCapture(&.{ "kv", "list" });
+    const listed = try ctx.execCapture(&.{ "kv", "scan" });
     try testing.expect(std.mem.indexOf(u8, listed, "mine") != null);
     try testing.expect(std.mem.indexOf(u8, listed, "b-value") == null);
 }

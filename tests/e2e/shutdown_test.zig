@@ -64,20 +64,6 @@ fn putUntilClosed(port: u16, client: usize, acked: *std.ArrayList(u64)) void {
     }
 }
 
-/// Whether `kv get`'s table has a row of exactly `key`, `value` and a version.
-fn hasRow(stdout: []const u8, key: []const u8, value: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.tokenizeAny(u8, line, " \t");
-        const k = fields.next() orelse continue;
-        const v = fields.next() orelse continue;
-        const version = fields.next() orelse continue;
-        _ = std.fmt.parseInt(u64, version, 10) catch continue;
-        if (std.mem.eql(u8, k, key) and std.mem.eql(u8, v, value) and fields.next() == null) return true;
-    }
-    return false;
-}
-
 test "e2e/shutdown: SIGTERM under load stops the server promptly, and every acknowledged write survives it" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .shards = 4, .durability = .sync },
@@ -123,7 +109,8 @@ test "e2e/shutdown: SIGTERM under load stops the server promptly, and every ackn
             const key = try std.fmt.bufPrint(&key_buf, "c{d}-{d}", .{ c, id - 1 });
             var r = try ctx.cli.run(&.{ "kv", "get", key });
             defer r.deinit();
-            if (!hasRow(r.stdout, key, "v")) {
+            // kv get prints the value alone, and exits 1 for a missing key.
+            if (r.exit_code != 0 or !std.mem.eql(u8, r.stdout, "v\n")) {
                 std.debug.print("acknowledged {s} ({d} acked) is missing after the restart: stdout '{s}' stderr '{s}'\n", .{ key, a.items.len, r.stdout, r.stderr });
                 return error.TestUnexpectedResult;
             }

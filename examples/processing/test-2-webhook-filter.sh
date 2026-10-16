@@ -74,7 +74,7 @@ info "Stored 5 known wallet accounts in KV"
 
 # List them for visibility
 echo ""
-$FLO kv list 2>&1 | head -20 || true
+$FLO kv scan --limit 20
 echo ""
 
 # --- Step 2: Create streams ---

@@ -232,13 +232,9 @@ test "e2e/namespace: an empty namespace is the default namespace on every shard"
         const value = try std.fmt.bufPrint(&value_buf, "v{d}", .{i});
         const write_ns, const read_ns = if (i % 2 == 0) .{ "", "default" } else .{ "default", "" };
         try ctx.exec(&.{ "kv", "set", key, value, "-n", write_ns });
-        // The answer is a header line, then one row: key, value, version.
+        // The answer is the value alone.
         const out = try ctx.execCapture(&.{ "kv", "get", key, "-n", read_ns });
-        var lines = std.mem.splitScalar(u8, out, '\n');
-        _ = lines.next();
-        var row = std.mem.tokenizeScalar(u8, lines.next() orelse return error.NoRow, ' ');
-        try testing.expectEqualStrings(key, row.next() orelse "");
-        try testing.expectEqualStrings(value, row.next() orelse "");
+        try testing.expectEqualStrings(value, std.mem.trimEnd(u8, out, "\n"));
     }
 
     try ctx.exec(&.{ "stream", "append", "s", "from-empty", "-n", "" });

@@ -65,6 +65,26 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ── Generated descriptions ──
+
+    // `zig build gen`: ops.json, the op table as SDK generators and the
+    // reference docs read it, into zig-out/gen.
+    const gen_exe = b.addExecutable(.{
+        .name = "gen-ops",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gen_ops.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    const gen_stdx = b.createModule(.{ .root_source_file = b.path("src/stdx/mod.zig"), .target = b.graph.host, .optimize = .Debug, .link_libc = true });
+    gen_exe.root_module.addImport("stdx", gen_stdx);
+    const gen_run = b.addRunArtifact(gen_exe);
+    const ops_json = gen_run.captureStdOut(.{});
+    const gen_step = b.step("gen", "Write zig-out/gen/ops.json from the op table");
+    gen_step.dependOn(&b.addInstallFile(ops_json, "gen/ops.json").step);
+
     // ── Run Step ──
 
     const run_cmd = b.addRunArtifact(exe);

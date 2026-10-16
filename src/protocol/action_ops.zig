@@ -41,18 +41,18 @@ pub const table = [_]ops.Op{
         .route = .run_id,
         .request = Record(&.{}),
         .response = Record(&.{
-            .{ .name = "status", .T = schema.Enum(RunStatus) },
-            .{ .name = "created_at_ms", .T = Int(i64) },
-            .{ .name = "started_at_ms", .T = Optional(Int(i64)) },
-            .{ .name = "completed_at_ms", .T = Optional(Int(i64)) },
+            .{ .name = "status", .T = schema.Enum(RunStatus), .doc = "Where the run is: pending, running, completed, failed, cancelled or timed_out" },
+            .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was invoked, in Unix milliseconds" },
+            .{ .name = "started_at_ms", .T = Optional(Int(i64)), .doc = "When a worker first took it" },
+            .{ .name = "completed_at_ms", .T = Optional(Int(i64)), .doc = "When it finished" },
             // Attempts begun so far, the current one included.
-            .{ .name = "attempt", .T = Int(u32) },
+            .{ .name = "attempt", .T = Int(u32), .doc = "Attempts so far, counting from 1 once a worker has taken it" },
             // What the worker completed it with.
-            .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)) },
+            .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)), .doc = "What a completed run returned" },
             // Why its last attempt failed.
-            .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)) },
+            .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
         }),
-        .cli = .{ .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
+        .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
         .doc = "A run's status, timestamps, attempts, and its output or last error.",
     },
 };

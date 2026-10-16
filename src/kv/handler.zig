@@ -140,12 +140,12 @@ pub const KVHandler = struct {
             .{ "kv.incr", OpCode.kv_incr, incr },
             .{ "kv.expire", OpCode.kv_expire, expire },
             .{ "kv.exists", OpCode.kv_exists, exists },
-            .{ "kv.json_get", OpCode.kv_json_get, jsonGet },
-            .{ "kv.json_set", OpCode.kv_json_set, jsonSet },
-            .{ "kv.json_del", OpCode.kv_json_del, jsonDel },
-            .{ "kv.txn_begin", OpCode.kv_begin_txn, txnBegin },
-            .{ "kv.txn_commit", OpCode.kv_commit_txn, txnCommit },
-            .{ "kv.txn_rollback", OpCode.kv_rollback_txn, txnRollback },
+            .{ "kv.json.get", OpCode.kv_json_get, jsonGet },
+            .{ "kv.json.set", OpCode.kv_json_set, jsonSet },
+            .{ "kv.json.del", OpCode.kv_json_del, jsonDel },
+            .{ "kv.txn.begin", OpCode.kv_begin_txn, txnBegin },
+            .{ "kv.txn.commit", OpCode.kv_commit_txn, txnCommit },
+            .{ "kv.txn.rollback", OpCode.kv_rollback_txn, txnRollback },
         }) |o| {
             dispatcher.registerWithRoute(o[1], table_run.handler(o[0], KVHandler, o[2]), table_run.routeByKey(o[0]));
             // A request in a transaction runs on the shard its id names.
@@ -386,12 +386,12 @@ pub const KVHandler = struct {
     const IncrResponse = table_run.op("kv.incr").response;
     const ExpireResponse = table_run.op("kv.expire").response;
     const ExistsResponse = table_run.op("kv.exists").response;
-    const JsonGetResponse = table_run.op("kv.json_get").response;
-    const JsonSetResponse = table_run.op("kv.json_set").response;
-    const JsonDelResponse = table_run.op("kv.json_del").response;
-    const TxnBeginResponse = table_run.op("kv.txn_begin").response;
-    const TxnCommitResponse = table_run.op("kv.txn_commit").response;
-    const TxnRollbackResponse = table_run.op("kv.txn_rollback").response;
+    const JsonGetResponse = table_run.op("kv.json.get").response;
+    const JsonSetResponse = table_run.op("kv.json.set").response;
+    const JsonDelResponse = table_run.op("kv.json.del").response;
+    const TxnBeginResponse = table_run.op("kv.txn.begin").response;
+    const TxnCommitResponse = table_run.op("kv.txn.commit").response;
+    const TxnRollbackResponse = table_run.op("kv.txn.rollback").response;
 
     /// Delete a key, if `cas_version` holds; deleting one that doesn't
     /// exist succeeds. Inside a transaction, buffer the delete.
@@ -804,7 +804,7 @@ pub const KVHandler = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         var diag: schema.Diagnostic = .{};
-        const body = table_run.op("kv.txn_commit").request.decodeAll(req.value, &diag) catch
+        const body = table_run.op("kv.txn.commit").request.decodeAll(req.value, &diag) catch
             return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
         const table = &shard.kv_handler.*.txn_table;
         const count: u16 = if (table.get(body.txn)) |t| @intCast(t.ops.items.len) else 0;
@@ -817,7 +817,7 @@ pub const KVHandler = struct {
     /// applies whole, on its own.
     pub fn commitFailed(self: *KVHandler, req: Request) void {
         var diag: schema.Diagnostic = .{};
-        const body = table_run.op("kv.txn_commit").request.decodeAll(req.value, &diag) catch return;
+        const body = table_run.op("kv.txn.commit").request.decodeAll(req.value, &diag) catch return;
         self.txn_table.drop(body.txn);
     }
 

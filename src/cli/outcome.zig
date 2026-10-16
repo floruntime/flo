@@ -261,13 +261,19 @@ pub const FakeServer = struct {
 /// A root command as the CLI builds it (with `--endpoint`), writing nowhere,
 /// for running one command family in a test.
 pub fn testRoot(allocator: std.mem.Allocator, family: *commander.Command) !*commander.Command {
+    return testRootTo(allocator, family, std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }));
+}
+
+/// `testRoot`, writing both stdout and stderr to `fd`, for a test that reads
+/// what a command printed.
+pub fn testRootTo(allocator: std.mem.Allocator, family: *commander.Command, fd: std.posix.fd_t) !*commander.Command {
     const root = commander.Command.init(allocator, .{ .name = "flo" });
     try root.addPersistentFlag(.{ .long = "endpoint", .short = 'e', .description = "", .value_type = .string, .default = .{ .string = "" } });
     try root.addPersistentFlag(.{ .long = "namespace", .short = 'n', .description = "", .value_type = .string, .default = .{ .string = "default" } });
     try root.addPersistentFlag(.{ .long = "output", .short = 'o', .description = "", .value_type = .string, .default = .{ .string = "table" } });
     try root.addCommand(family);
-    // Every command writes nowhere: the test runner owns stdout.
-    quiet(root, std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }));
+    // The test runner owns stdout, so no command writes there.
+    quiet(root, fd);
     return root;
 }
 
