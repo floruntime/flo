@@ -145,7 +145,7 @@ const MAX_READ_BUFFER = 2 * MAX_REQUEST_SIZE;
 /// pointer kept here would dangle; each call finds the shard from the
 /// replica's address.
 const ShardIo = struct {
-    pub fn nowMs() u64 {
+    pub fn nowMs(_: *Replica) u64 {
         return Shard.nowMs();
     }
 
@@ -2259,10 +2259,6 @@ pub const Shard = struct {
         const q = self.raft_queue orelse return;
         while (q.pop()) |frame| {
             defer self.allocator.free(frame.payload);
-            // The clock before each message: a vote that arrives past the
-            // candidacy's deadline is not counted on an older clock, even
-            // after a stall part way through the queue.
-            self.raft_node.observeTime(nowMs());
             self.replica.handleRaftFrame(frame);
         }
     }

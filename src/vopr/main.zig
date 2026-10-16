@@ -9,6 +9,7 @@
 //!                                   within, so the parent kills on timeout)
 //!        [--seed-timeout=SECS]      per-seed watchdog budget (default 300)
 //!        [--jobs=N]                 swarm children to run concurrently (default 1)
+//!        [--skip=N,M,...]           swarm: seeds not run (a pinned bug's), at most 8
 //!        [--out-dir=DIR]            per-seed child logs (default under /tmp);
 //!                                   the parent reads them to group failures
 //!                                   by invariant and to tell slow from hung
@@ -40,6 +41,8 @@ const Args = struct {
     small_ring: bool = false,
     wipes: bool = false,
     membership: bool = false,
+    skip: [8]u64 = undefined,
+    skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
     scenario_in: ?[]const u8 = null,
     verbose: bool = false,
@@ -54,7 +57,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] " ++
             "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -79,6 +82,13 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.wipes = true;
         } else if (std.mem.eql(u8, arg, "--membership")) {
             args.membership = true;
+        } else if (std.mem.startsWith(u8, arg, "--skip=")) {
+            var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
+            while (it.next()) |n| {
+                if (args.skip_len == args.skip.len) return error.TooManySkipped;
+                args.skip[args.skip_len] = try std.fmt.parseInt(u64, n, 10);
+                args.skip_len += 1;
+            }
         } else if (std.mem.startsWith(u8, arg, "--scenario-out=")) {
             args.scenario_out = arg["--scenario-out=".len..];
         } else if (std.mem.startsWith(u8, arg, "--scenario-in=")) {
@@ -155,7 +165,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} stranger_frames={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -172,6 +182,9 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.messages_dropped,
             s.apply_stalls,
             s.catch_up_reads,
+            s.divergences,
+            s.divergences_beyond_tolerance,
+            sim.stranger_frames,
         },
     );
     if (!s.ok) {
@@ -264,6 +277,16 @@ fn classify(allocator: std.mem.Allocator, log_path: []const u8) struct { class: 
     return .{ .class = class, .last_tick = last_tick, .last_elapsed_ms = last_elapsed_ms };
 }
 
+/// A passing child whose run was excused from converging: an async crash
+/// cost a diverged voter no config could spare.
+fn excused(allocator: std.mem.Allocator, log_path: []const u8) bool {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return false;
+    defer allocator.free(text);
+    const at = std.mem.indexOf(u8, text, " beyond_tolerance=") orelse return false;
+    const rest = text[at + " beyond_tolerance=".len ..];
+    return rest.len > 0 and rest[0] != '0';
+}
+
 /// A child killed by the watchdog either stopped advancing (hung) or was
 /// still going (slow): silence longer than this before the kill is a hang.
 const HANG_SILENCE_MS: u64 = 60_000;
@@ -289,11 +312,19 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     defer running.deinit(allocator);
     var next: u64 = 0;
     var ok_count: u64 = 0;
+    var skipped: u64 = 0;
+    var excused_seeds: std.ArrayListUnmanaged(u64) = .empty;
+    defer excused_seeds.deinit(allocator);
 
     while (next < iterations or running.items.len > 0) {
         // Top up the pool.
         while (next < iterations and running.items.len < args.jobs) : (next += 1) {
             const seed = base +% next;
+            if (std.mem.indexOfScalar(u64, args.skip[0..args.skip_len], seed) != null) {
+                std.debug.print("[vopr] seed={d} skipped\n", .{seed});
+                skipped += 1;
+                continue;
+            }
             const log_path = try std.fmt.allocPrint(allocator, "{s}/seed-{d}.log", .{ out_dir, seed });
             const pid = try spawnChild(allocator, args, seed, log_path);
             try running.append(allocator, .{
@@ -324,6 +355,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                     .ok => {
                         ok_count += 1;
                         std.debug.print("[vopr] seed={d} OK\n", .{r.seed});
+                        if (excused(allocator, r.log_path)) try excused_seeds.append(allocator, r.seed);
                     },
                     .failed, .timeout => {
                         var c = classify(allocator, r.log_path);
@@ -348,9 +380,14 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         if (running.items.len > 0) stdx.time.sleep(50 * std.time.ns_per_ms);
     }
 
-    std.debug.print("[vopr] swarm done: {d} seeds, {d} ok, {d} failed/timed out\n", .{
-        iterations, ok_count, failures.items.len,
+    std.debug.print("[vopr] swarm done: {d} seeds, {d} ok, {d} failed/timed out, {d} skipped\n", .{
+        iterations, ok_count, failures.items.len, skipped,
     });
+    if (excused_seeds.items.len > 0) {
+        std.debug.print("[vopr]   ok but excused from converging (a voter lost to an async crash beyond what its config tolerates): {d}:", .{excused_seeds.items.len});
+        for (excused_seeds.items) |seed| std.debug.print(" {d}", .{seed});
+        std.debug.print("\n", .{});
+    }
     // Group by class so a swarm reads as findings, not as a seed list.
     var printed: std.ArrayListUnmanaged([]const u8) = .empty;
     defer printed.deinit(allocator);
