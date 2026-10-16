@@ -3111,8 +3111,10 @@ pub const Shard = struct {
         if (self.shard_metrics) |sm| {
             sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
             sm.processing_failed_jobs.store(self.processing_handler.failed_jobs, .monotonic);
+            sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
         }
         const slot = self.health orelse return;
+        slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
         // The reason before the state: a reader that sees offline finds it.
         if (self.offline) |*damage| slot.setReason(damage.reason());
         const raft = self.raft_node;

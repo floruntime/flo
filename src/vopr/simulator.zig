@@ -237,6 +237,8 @@ const SimNode = struct {
     wiped: bool = false,
     /// Diverged where no config could spare it: left as it is.
     beyond_tolerance: bool = false,
+    /// Vouches its earlier lives took.
+    vouches_before_restart: u64 = 0,
     /// Only its hard state was lost: it restarts with its log, and must
     /// confirm the term before it votes.
     lost_hard_state: bool = false,
@@ -254,6 +256,9 @@ const SimNode = struct {
     applied_stamp_index: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
+    /// The tick it applied each index at (index i at [i - 1]), for judging
+    /// whether a crash could have erased what it applied.
+    applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -569,6 +574,9 @@ pub const Summary = struct {
     /// Diverged nodes no config could spare, left diverged; a run with one
     /// is excused from converging.
     divergences_beyond_tolerance: u64,
+    /// Committed configs taken on a member's word by a node that had
+    /// missed them.
+    vouches_taken: u64,
     /// Wyhash over the canonical history — two runs of one seed must agree.
     canonical_hash: u64,
     violation_count: usize,
@@ -582,6 +590,11 @@ pub const Simulator = struct {
     /// Clock skew and steps draw from their own stream, so a scenario
     /// without skew replays as it did before skew existed.
     clock_prng: PRNG,
+    /// The outsider's choices draw from their own stream, so every other
+    /// slice replays as it did before the outsider existed.
+    outsider_prng: PRNG,
+    /// Frames the outsider sent, by kind: votes, appends, term checks.
+    outsider_sent: [3]u64 = @splat(0),
     nodes: []SimNode,
     net: SimNetwork,
     workload: Workload,
@@ -630,12 +643,14 @@ pub const Simulator = struct {
 
     pub fn init(allocator: Allocator, scenario: Scenario, options: Options) !Simulator {
         std.debug.assert(scenario.node_count >= 3 and scenario.node_count <= MAX_NODES);
+        std.debug.assert(scenario.outsider_permille == 0 or scenario.node_count < MAX_NODES);
         var self = Simulator{
             .allocator = allocator,
             .scenario = scenario,
             .options = options,
             .prng = PRNG.init(scenario.seed ^ 0x51D0_2A7E),
             .clock_prng = PRNG.init(scenario.seed ^ 0xC10C_5EED),
+            .outsider_prng = PRNG.init(scenario.seed ^ 0x0075_1DE7),
             .nodes = try allocator.alloc(SimNode, scenario.node_count),
             .net = SimNetwork.init(allocator),
             .workload = try Workload.init(allocator, &scenario),
@@ -691,6 +706,7 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             node.raft.deinit();
             node.disk.deinit();
+            node.applied_ticks.deinit(self.allocator);
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
             self.allocator.free(node.replica.rpc_out);
@@ -739,6 +755,9 @@ pub const Simulator = struct {
 
     /// The replica a restarted node gets: its scratch, nothing else.
     fn resetReplica(node: *SimNode) void {
+        // What the run counts survives the restart; the replica's state
+        // does not.
+        node.vouches_before_restart += node.replica.vouches_taken;
         node.replica = .{
             .id = 0,
             .rpc_entries = node.replica.rpc_entries,
@@ -965,6 +984,8 @@ pub const Simulator = struct {
         while (self.delivery.items.len > 0) {
             var msg = self.delivery.orderedRemove(0);
             defer self.net.release(&msg);
+            // The outsider reads nothing it is sent.
+            if (msg.to > self.nodes.len) continue;
             const node = self.node_(msg.to);
             if (!node.up) continue;
             self.drive(node, .{
@@ -973,6 +994,65 @@ pub const Simulator = struct {
                 .msg_type = msg.msg_type,
                 .payload = msg.payload,
             });
+        }
+    }
+
+    // ── The outsider: the secret, no seat ──────────────────────────────
+
+    fn outsiderId(self: *const Simulator) NodeId {
+        return @intCast(self.nodes.len + 1);
+    }
+
+    /// Now and then the outsider sends a member something only a member
+    /// may: a vote request at a raised term, skipping pre-vote; an append
+    /// claiming to lead, its prefix a real member's history (as a removed
+    /// member's log would be) and forged entries after it with a commit
+    /// index covering them; or a term check. Whatever it gets back is
+    /// dropped. Taken as genuine, these elect it or commit what it forged:
+    /// the checker's election, state-machine and integrity invariants.
+    fn outsiderActs(self: *Simulator) !void {
+        if (self.scenario.outsider_permille == 0) return;
+        const r = self.outsider_prng.random();
+        if (r.uintLessThan(u16, 1000) >= self.scenario.outsider_permille) return;
+        const to: NodeId = @intCast(1 + r.uintLessThan(usize, self.nodes.len));
+        const me = self.outsiderId();
+        // The freshest history any member holds: what it claims to lead.
+        var src = &self.nodes[0];
+        for (self.nodes) |*node| {
+            if (node.raft.current_term > src.raft.current_term or (node.raft.current_term == src.raft.current_term and node.raft.log.lastIndex() > src.raft.log.lastIndex())) src = node;
+        }
+        const term = src.raft.current_term + 1 + r.uintLessThan(u64, 3);
+        const kind = r.uintLessThan(u8, 3);
+        self.outsider_sent[kind] += 1;
+        switch (kind) {
+            0 => {
+                var buf: [transport.VOTE_REQ_SIZE]u8 = undefined;
+                const n = transport.serializeVoteRequest(.{ .term = term, .candidate_id = me, .last_log_index = src.raft.log.lastIndex() + 10, .last_log_term = term, .is_pre_vote = false }, &buf).?;
+                try self.net.send(&self.prng, &self.scenario, self.now, me, to, .request_vote, buf[0..n]);
+            },
+            1 => {
+                const last = src.raft.log.lastIndex();
+                const prev = if (last == 0) 0 else r.uintAtMost(u64, last);
+                const prev_term = src.raft.log.entryTerm(prev) orelse return;
+                var entries: [3]entry_mod.Entry = undefined;
+                var payloads: [3][32]u8 = undefined;
+                const count = 1 + r.uintLessThan(usize, 3);
+                for (entries[0..count], 0..) |*e, k| {
+                    // An op id the workload made, with bytes it didn't.
+                    std.mem.writeInt(u64, payloads[k][0..8], 0, .little);
+                    r.bytes(payloads[k][8..]);
+                    e.* = entry_mod.buildEntry(.kv_put, 0, term, prev + 1 + k, (WALL_EPOCH_MS + self.now) * std.time.ns_per_ms, &payloads[k]);
+                    e.header.crc32c = e.computeCrc();
+                }
+                var buf: [transport.APPEND_REQ_PREFIX + 3 * (entry_mod.HEADER_SIZE + 32)]u8 = undefined;
+                const n = transport.serializeAppendRequest(.{ .term = term, .leader_id = me, .prev_log_index = prev, .prev_log_term = prev_term, .leader_commit = prev + count, .entries = entries[0..count] }, &buf).?;
+                try self.net.send(&self.prng, &self.scenario, self.now, me, to, .append_entries, buf[0..n]);
+            },
+            else => {
+                var buf: [transport.TERM_CHECK_SIZE]u8 = undefined;
+                const n = transport.serializeTermCheck(.{ .term = term, .from = me }, &buf).?;
+                try self.net.send(&self.prng, &self.scenario, self.now, me, to, .term_check, buf[0..n]);
+            },
         }
     }
 
@@ -1000,8 +1080,16 @@ pub const Simulator = struct {
     /// A replica stopped taking part: its log contradicts history it
     /// applied. Sync mode never erases applied history, and async mode
     /// only in a crash.
+    /// The history it applied that the leader contradicts begins just
+    /// past its rewound commit index. Only a crash at or after an ack for
+    /// that entry left its sender, one network delay before this node
+    /// applied it, could have erased it.
     fn onDiverged(self: *Simulator, node: *SimNode) void {
-        if (self.scenario.durability == .sync or self.crashes == 0) self.checker.fail(.{
+        const contradicted = node.raft.commit_index + 1;
+        const applied_at: ?u64 = if (contradicted <= node.applied_ticks.items.len) node.applied_ticks.items[contradicted - 1] else null;
+        const erasable = self.scenario.durability == .async_flush and self.crashes > 0 and
+            (applied_at == null or self.latest_crash_at + self.scenario.msg_delay_max_ms >= applied_at.?);
+        if (!erasable) self.checker.fail(.{
             .invariant = .divergence,
             .node = node.id,
             .index = node.raft.commit_index,
@@ -1292,6 +1380,8 @@ pub const Simulator = struct {
                 });
                 node.applied_stamp = e.header.timestamp_ns;
                 node.applied_stamp_index = idx;
+                while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
+                node.applied_ticks.items[idx - 1] = self.now;
                 node.raft.noteApplied(e.header.timestamp_ns);
                 self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
                 // A config applied is committed, as production's applier
@@ -1503,6 +1593,7 @@ pub const Simulator = struct {
         self.now += 1;
         self.setWallClocks();
         try self.deliverAll();
+        try self.outsiderActs();
         self.tickNodes();
         try self.submitOps();
         self.applyAll();
@@ -1610,6 +1701,11 @@ pub const Simulator = struct {
             },
             .divergences = self.divergences,
             .divergences_beyond_tolerance = self.divergences_beyond_tolerance,
+            .vouches_taken = blk: {
+                var n: u64 = 0;
+                for (self.nodes) |*node| n += node.vouches_before_restart + node.replica.vouches_taken;
+                break :blk n;
+            },
             .canonical_hash = h.final(),
             .violation_count = self.checker.violations.items.len,
         };

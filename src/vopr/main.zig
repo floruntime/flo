@@ -19,6 +19,8 @@
 //!        [--wipes]                  crashes often lose a disk or its hard
 //!                                   state, up to two nodes at once
 //!        [--membership]             the leader changes the membership often
+//!        [--byzantine]              a node with the secret but no seat sends
+//!                                   forged votes and appends
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -41,6 +43,7 @@ const Args = struct {
     small_ring: bool = false,
     wipes: bool = false,
     membership: bool = false,
+    byzantine: bool = false,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -57,7 +60,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] " ++
             "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -82,6 +85,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.wipes = true;
         } else if (std.mem.eql(u8, arg, "--membership")) {
             args.membership = true;
+        } else if (std.mem.eql(u8, arg, "--byzantine")) {
+            args.byzantine = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
             var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
             while (it.next()) |n| {
@@ -138,6 +143,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.wipes(seed)
     else if (args.membership)
         Scenario.memberships(seed)
+    else if (args.byzantine)
+        Scenario.outsider(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
@@ -165,7 +172,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     const s = try sim.run();
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} stranger_frames={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -184,9 +191,11 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.catch_up_reads,
             s.divergences,
             s.divergences_beyond_tolerance,
+            s.vouches_taken,
             sim.stranger_frames,
         },
     );
+    if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
         var vbuf: [16384]u8 = undefined;
         var vw: std.Io.Writer = .fixed(&vbuf);
@@ -201,11 +210,12 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 if (args.small_ring) " --small-ring" else "",
                 if (args.wipes) " --wipes" else "",
                 if (args.membership) " --membership" else "",
+                if (args.byzantine) " --byzantine" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
@@ -237,6 +247,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.small_ring) try argv.append(allocator, "--small-ring");
     if (args.wipes) try argv.append(allocator, "--wipes");
     if (args.membership) try argv.append(allocator, "--membership");
+    if (args.byzantine) try argv.append(allocator, "--byzantine");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -441,13 +452,13 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) > 1) {
-        std.debug.print("--small-ring, --wipes and --membership are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) > 1) {
+        std.debug.print("--small-ring, --wipes, --membership and --byzantine are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 

@@ -187,6 +187,12 @@ pub const TermCheckResponse = struct {
     config_term: u64,
     member_count: u8,
     members: [membership.MAX_MEMBERS]NodeId,
+    /// The responder's committed config, every member of it, and the entry
+    /// it came from: what a member that missed a membership change learns
+    /// the group from (the replica's vouch). Index 0 for none.
+    committed_index: u64 = 0,
+    committed_term: u64 = 0,
+    committed: membership.Config = .{},
 };
 
 /// Result of processing a tick (timer advancement).
@@ -1565,7 +1571,25 @@ pub const RaftNode = struct {
         const voters = self.ownCheckSet();
         @memcpy(resp.members[0..voters.count], voters.slice());
         resp.member_count = voters.count;
+        // A config whose term this node can't tell is no evidence to offer.
+        const term = self.committedConfigTerm();
+        if (self.committed_config_index > 0 and self.committed_config.member_count > 0 and term != 0) {
+            resp.committed_index = self.committed_config_index;
+            resp.committed_term = term;
+            resp.committed = self.committed_config;
+        }
         return resp;
+    }
+
+    /// The term of the entry the committed config came from, 0 for none.
+    /// Read from the log's term index, which survives eviction. Once
+    /// snapshots compact configs away it must come from the snapshot's
+    /// config record; until then an unknown term is a bug, checked in
+    /// debug builds, and in release the config is simply not offered.
+    pub fn committedConfigTerm(self: *const RaftNode) u64 {
+        const t = self.log.entryTerm(self.committed_config_index) orelse 0;
+        if (@import("builtin").mode == .debug) std.debug.assert(self.committed_config_index == 0 or t != 0);
+        return t;
     }
 
     /// The voters of the latest config; with none, the members this node

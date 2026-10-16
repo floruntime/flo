@@ -18,6 +18,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const node_mod = @import("node.zig");
+const membership = @import("membership.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const checksum_mod = @import("../util/checksum.zig");
 
@@ -298,13 +299,15 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — TermCheckRequest (12 bytes), TermCheckResponse (30 + 4n bytes)
+// Serialization — TermCheckRequest (12 bytes), TermCheckResponse (30 + 4n + 18 + config bytes)
 //   Response: term u64, from u32, config_index u64, config_term u64,
 //             flags u8 (bit 0: guarded), member_count u8, members u32 × n
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const TERM_CHECK_SIZE: usize = 12;
-pub const TERM_CHECK_RESP_MAX: usize = 30 + 4 * (node_mod.MAX_PEERS + 1);
+/// The fixed part, the latest config's voters, then the committed config:
+/// `[index:u64][term:u64][len:u16][membership.encode]`.
+pub const TERM_CHECK_RESP_MAX: usize = 30 + 4 * (node_mod.MAX_PEERS + 1) + 18 + membership.MAX_SIZE;
 
 pub fn serializeTermCheck(req: TermCheckRequest, buf: []u8) ?usize {
     if (buf.len < TERM_CHECK_SIZE) return null;
@@ -332,7 +335,14 @@ pub fn serializeTermCheckResponse(resp: TermCheckResponse, buf: []u8) ?usize {
     buf[28] = @intFromBool(resp.guarded);
     buf[29] = @intCast(n);
     for (resp.members[0..n], 0..) |id, i| std.mem.writeInt(u32, buf[30 + 4 * i ..][0..4], id, .little);
-    return size;
+    var enc: [membership.MAX_SIZE]u8 = undefined;
+    const cfg: []const u8 = if (resp.committed_index > 0) membership.encode(&resp.committed, &enc) else &.{};
+    if (buf.len < size + 18 + cfg.len) return null;
+    std.mem.writeInt(u64, buf[size..][0..8], resp.committed_index, .little);
+    std.mem.writeInt(u64, buf[size + 8 ..][0..8], resp.committed_term, .little);
+    std.mem.writeInt(u16, buf[size + 16 ..][0..2], @intCast(cfg.len), .little);
+    @memcpy(buf[size + 18 ..][0..cfg.len], cfg);
+    return size + 18 + cfg.len;
 }
 
 pub fn deserializeTermCheckResponse(data: []const u8) ?TermCheckResponse {
@@ -349,6 +359,15 @@ pub fn deserializeTermCheckResponse(data: []const u8) ?TermCheckResponse {
         .members = undefined,
     };
     for (0..n) |i| resp.members[i] = std.mem.readInt(u32, data[30 + 4 * i ..][0..4], .little);
+    const at = 30 + 4 * @as(usize, n);
+    if (data.len < at + 18) return null;
+    const len = std.mem.readInt(u16, data[at + 16 ..][0..2], .little);
+    if (data.len != at + 18 + len) return null;
+    resp.committed_index = std.mem.readInt(u64, data[at..][0..8], .little);
+    resp.committed_term = std.mem.readInt(u64, data[at + 8 ..][0..8], .little);
+    // An index with no config, or a config with no index, is not an answer.
+    if ((resp.committed_index == 0) != (len == 0)) return null;
+    if (len > 0) resp.committed = membership.decode(data[at + 18 ..][0..len]) orelse return null;
     return resp;
 }
 
@@ -841,6 +860,35 @@ test "transport: a batch stops at an entry of unknown type or with a bad CRC" {
     }
 }
 
+test "transport: a term check answer carries the responder's committed config whole, members and removals" {
+    var buf: [TERM_CHECK_RESP_MAX]u8 = undefined;
+    var cfg = membership.Config.ofVoters(&.{ 1, 2 });
+    cfg = cfg.withJoiner(4, true);
+    cfg = cfg.without(3, 77);
+    var resp: TermCheckResponse = .{ .term = 9, .from = 1, .config_index = 50, .config_term = 6, .member_count = 0, .members = undefined, .committed_index = 40, .committed_term = 5, .committed = cfg };
+    const n = serializeTermCheckResponse(resp, &buf).?;
+    const back = deserializeTermCheckResponse(buf[0..n]).?;
+    try testing.expectEqual(@as(u64, 40), back.committed_index);
+    try testing.expectEqual(@as(u64, 5), back.committed_term);
+    // The replica, not only the voters: a promotion in flight is seen.
+    try testing.expect(back.committed.names(4));
+    try testing.expect(!back.committed.isVoter(4));
+    try testing.expect(back.committed.removedAt(3) != null);
+    try testing.expect(membership.Config.eql(&cfg, &back.committed));
+
+    // A config whose bytes don't decode, an index with no config, or a
+    // trailing byte: not an answer.
+    try testing.expect(deserializeTermCheckResponse(buf[0 .. n - 1]) == null);
+    var long: [TERM_CHECK_RESP_MAX + 1]u8 = undefined;
+    @memcpy(long[0..n], buf[0..n]);
+    long[n] = 0;
+    try testing.expect(deserializeTermCheckResponse(long[0 .. n + 1]) == null);
+    resp.committed = .{};
+    resp.committed_index = 40;
+    const m = serializeTermCheckResponse(resp, &buf).?;
+    try testing.expect(deserializeTermCheckResponse(buf[0..m]) == null);
+}
+
 test "transport: a term check answer and an append ack carry the guarded flag" {
     var buf: [TERM_CHECK_RESP_MAX]u8 = undefined;
     var resp: TermCheckResponse = .{ .term = 9, .from = 3, .guarded = true, .config_index = 12, .config_term = 4, .member_count = 3, .members = undefined };
@@ -848,7 +896,8 @@ test "transport: a term check answer and an append ack carry the guarded flag" {
     resp.members[1] = 2;
     resp.members[2] = 3;
     const n = serializeTermCheckResponse(resp, &buf).?;
-    try testing.expectEqual(@as(usize, 30 + 12), n);
+    // With no committed config, its section is an index of 0 and no bytes.
+    try testing.expectEqual(@as(usize, 30 + 12 + 18), n);
     const back = deserializeTermCheckResponse(buf[0..n]).?;
     try testing.expectEqual(@as(u64, 9), back.term);
     try testing.expect(back.guarded);
