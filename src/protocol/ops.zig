@@ -27,7 +27,8 @@ pub const Scope = enum { namespace, server };
 pub const Route = union(enum) {
     /// The request's routing key if it has one, else its key.
     key,
-    /// A decoded request field (never a namespace field).
+    /// A decoded request field (never a namespace field). An optional one
+    /// that's absent leaves the request on the connection's shard.
     field: []const u8,
     /// The partition bits in a run id; an id that doesn't decode is refused.
     run_id,

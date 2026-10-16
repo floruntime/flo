@@ -140,6 +140,21 @@ pub fn routeByKey(comptime name: []const u8) dispatcher_mod.PreRouteFn {
     }.route;
 }
 
+/// The routing hash of a table op routed by `field`: the field's hash when
+/// the body carries it, else null, which leaves the request where it is.
+pub fn routeByField(comptime name: []const u8) dispatcher_mod.PreRouteFn {
+    const o = op(name);
+    const field = o.route.field;
+    return struct {
+        fn route(req: proto.Request) ?u64 {
+            var diag: schema.Diagnostic = .{};
+            const body = o.request.decodeAll(req.value, &diag) catch return null;
+            const v = @field(body, field) orelse return null;
+            return router.hashKeyWithNamespace(req.namespace, v);
+        }
+    }.route;
+}
+
 /// Whether a table op's body decodes.
 pub fn decodes(req: proto.Request) bool {
     inline for (table.op_table) |o| {
@@ -218,6 +233,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.scan", .field = "cursor", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
     .{ .op = "kv.history", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.history", .field = "limit", .tests = &.{"kv ops: history answers versions newest first, at most limit; a missing key is not found"} },
+    .{ .op = "kv.mget", .field = "routing_key", .tests = &.{ "Shard: kv.mget with a routing key is answered on that key's shard; without one, each key is found on its own", "kv table: kv.mget routes on its routing key, and stays where it lands without one" } },
     .{ .op = "kv.mget", .field = "keys", .tests = &.{"kv ops: mget answers each key in order, found or not, and next when they don't all fit"} },
     .{ .op = "kv.incr", .field = "delta", .tests = &.{"kv ops: incr adds delta to a counter from 0, and refuses a value that isn't one or a sum past i64"} },
     .{ .op = "kv.incr", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },

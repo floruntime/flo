@@ -1578,6 +1578,41 @@ test "e2e/kv: mget asks for every key when they overflow one request" {
     try testing.expectEqual(@as(usize, 256), n);
 }
 
+test "e2e/kv: mget with a routing key finds keys written with it, and without one finds each key on its own shard" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    // Sixteen keys co-located by a routing key, sixteen left to their own
+    // shards: across 4 shards most of the first live away from their own.
+    var names: [32][16]u8 = undefined;
+    var keys: [32][]const u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = try std.fmt.bufPrint(&names[i], "{s}-{d}", .{ if (i < 16) "routed" else "plain", i });
+        if (i < 16) try ctx.exec(&.{ "kv", "set", k.*, "r", "-r", "tenant-9" }) else try ctx.exec(&.{ "kv", "set", k.*, "p" });
+    }
+
+    var args: [6 + 16][]const u8 = undefined;
+    args[0..6].* = .{ "kv", "mget", "-r", "tenant-9", "-o", "raw" };
+    @memcpy(args[6..], keys[0..16]);
+    var routed = try ctx.cli.run(&args);
+    defer routed.deinit();
+    try testing.expectEqual(@as(u8, 0), routed.exit_code);
+    var want = std.ArrayList(u8).empty;
+    defer want.deinit(testing.allocator);
+    for (keys[0..16]) |k| try want.print(testing.allocator, "{s}\tr\n", .{k});
+    try testing.expectEqualStrings(want.items, routed.stdout);
+
+    var plain_args: [4 + 16][]const u8 = undefined;
+    plain_args[0..4].* = .{ "kv", "mget", "-o", "raw" };
+    @memcpy(plain_args[4..], keys[16..]);
+    var plain = try ctx.cli.run(&plain_args);
+    defer plain.deinit();
+    try testing.expectEqual(@as(u8, 0), plain.exit_code);
+    want.clearRetainingCapacity();
+    for (keys[16..]) |k| try want.print(testing.allocator, "{s}\tp\n", .{k});
+    try testing.expectEqualStrings(want.items, plain.stdout);
+}
+
 test "e2e/kv: mget across shards returns all results" {
     // 4 shards — keys hash to different shards via Wyhash
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{

@@ -153,8 +153,9 @@ pub const KVHandler = struct {
             // A request in a transaction runs on the shard its id names.
             if (table_run.op(o[0]).txn != null) dispatcher.setShardRoute(o[1], txnShardOfBody);
         }
-        // Many keys, on the shard the client is on.
-        dispatcher.register(.kv_mget, table_run.handler("kv.mget", KVHandler, mget));
+        // Many keys: on the routing key's shard when given, else where the
+        // client is.
+        dispatcher.registerWithRoute(.kv_mget, table_run.handler("kv.mget", KVHandler, mget), table_run.routeByField("kv.mget"));
         // Every shard: walked from the client's.
         dispatcher.registerWalk(.kv_scan, table_run.handler("kv.scan", KVHandler, scan), localScanKeys);
     }
@@ -483,7 +484,7 @@ pub const KVHandler = struct {
 
     /// Many keys at once, in the order asked, as many as one answer holds;
     /// `next` is the first key left out.
-    fn mget(shard: *Shard, _: *Connection, req: Request, keys: MgetKeys.Value) Error!table_run.Outcome(MgetResponse) {
+    fn mget(shard: *Shard, _: *Connection, req: Request, keys: MgetKeys.Value, routing_key: ?[]const u8) Error!table_run.Outcome(MgetResponse) {
         const self = shard.kv_handler;
         const Entries = MgetResponse.field_list[0].T;
         var entries = Entries.Builder.init(&self.answer_buf);
@@ -495,7 +496,9 @@ pub const KVHandler = struct {
             const found: MgetLookup = if (raw_key.len == 0 or isReservedKey(raw_key))
                 .{ .found = false, .value = "", .version = 0 }
             else if (qualifyKey(&qbuf, req.namespace, raw_key)) |qkey|
-                lookupKeyOnShard(shard, req.namespace, raw_key, qkey)
+                // With a routing key the request was routed to its shard,
+                // where every key lives: read here.
+                if (routing_key != null) localLookup(shard, qkey) else lookupKeyOnShard(shard, req.namespace, raw_key, qkey)
             else |_|
                 .{ .found = false, .value = "", .version = 0 };
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
@@ -859,6 +862,14 @@ pub const KVHandler = struct {
         return .{ .found = false, .value = &[_]u8{}, .version = 0 };
     }
 
+    /// `qkey` in this shard's own map.
+    fn localLookup(shard: *Shard, qkey: []const u8) MgetLookup {
+        if (shard.kv_handler.*.kv.get(qkey)) |entry| {
+            return .{ .found = true, .value = entry.value, .version = entry.version };
+        }
+        return .{ .found = false, .value = &[_]u8{}, .version = 0 };
+    }
+
     // ── Raft Propose ────────────────────────────────────────────────────
 
     /// Propose a KV entry; `ttl_ms` applies to a put, 0 for none.
@@ -1191,8 +1202,8 @@ test "kv handler: every KV op in the table has a handler, and the key-routed one
     KVHandler.register(&dispatcher);
     inline for (kv_ops.table) |o| {
         try testing.expect(dispatcher.serves(o.code));
-        // mget runs where the client is; scan walks every shard.
-        const routed = o.route == .key and o.fanout == .none;
+        // scan walks every shard; mget routes on its routing key.
+        const routed = (o.route == .key and o.fanout == .none) or o.route == .field;
         try testing.expectEqual(routed, dispatcher.pre_route[o.code] != null);
         try testing.expectEqual(o.txn != null, dispatcher.shard_route[o.code] != null);
     }

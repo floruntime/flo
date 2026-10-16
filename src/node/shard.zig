@@ -6728,6 +6728,80 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
     }
 }
 
+test "Shard: kv.mget with a routing key is answered on that key's shard; without one, each key is found on its own" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const shardOf = struct {
+        fn of(sh: *Shard, key: []const u8) u16 {
+            return sh.router.partitionToShard(sh.router.hashToPartition(node_router.hashKeyWithNamespace("", key)));
+        }
+    }.of;
+    const a = &two.shards[0];
+    // A routing key on shard 1, and a key whose own shard is 0: written
+    // with the routing key, it lives on shard 1 only.
+    var name_bufs: [2][12]u8 = undefined;
+    const tenant = for (0..64) |i| {
+        const k = try std.fmt.bufPrint(&name_bufs[0], "tenant{d}", .{i});
+        if (shardOf(a, k) == 1) break k;
+    } else return error.TestUnexpectedResult;
+    const far = for (0..64) |i| {
+        const k = try std.fmt.bufPrint(&name_bufs[1], "k{d}", .{i});
+        if (shardOf(a, k) == 0) break k;
+    } else return error.TestUnexpectedResult;
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    try two.shards[1].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "", far), "routed", 1, 0, 0, 0);
+    try two.shards[shardOf(a, "own")].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "", "own"), "plain", 1, 0, 0, 0);
+
+    const op = table_run.op("kv.mget");
+    const Keys = op.request.field_list[0].T;
+    const Mget = struct {
+        kbuf: [64]u8 = undefined,
+        body_buf: [128]u8 = undefined,
+        fn req(self: *@This(), id: u64, key: []const u8, routing_key: ?[]const u8) !proto.Request {
+            var keys = Keys.Builder.init(&self.kbuf);
+            try std.testing.expect(try keys.add(key));
+            const body = try op.request.encodeInto(&self.body_buf, .{ .keys = keys.value(), .routing_key = routing_key });
+            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "", .key = "", .value = body };
+        }
+    };
+    var m: Mget = .{};
+
+    // With the routing key, shard 0 sends the whole batch to shard 1, its
+    // keys' owning shard, before anything runs.
+    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_mget), try m.req(1, far, tenant))) {
+        .local => return error.TestUnexpectedResult,
+        .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
+    }
+    // Without one it runs where it lands.
+    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_mget), try m.req(2, far, null))) {
+        .local => {},
+        .shard => return error.TestUnexpectedResult,
+    }
+
+    var out: [4096]u8 = undefined;
+    var diag: schema.Diagnostic = .{};
+    for ([_]struct { on: u16, key: []const u8, routing_key: ?[]const u8, value: ?[]const u8 }{
+        // On the routing key's shard, a local read finds it.
+        .{ .on = 1, .key = far, .routing_key = tenant, .value = "routed" },
+        // Without it, the key is looked up on its own shard, 0, and isn't there.
+        .{ .on = 0, .key = far, .routing_key = null, .value = null },
+        .{ .on = 0, .key = "own", .routing_key = null, .value = "plain" },
+    }, 3..) |case, id| {
+        const sh = &two.shards[case.on];
+        const c = try TestClient.open(sh);
+        defer _ = std.c.close(c.pair[1]);
+        sh.runRequest(c.conn, try m.req(id, case.key, case.routing_key), .client);
+        const resp = try nextAnswer(c, sh, &out);
+        try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), resp.header.status);
+        const got = try op.response.decodeAll(resp.data, &diag);
+        var it = got.entries.iterator();
+        const e = (try it.next()).?;
+        try std.testing.expectEqual(case.value != null, e.found);
+        if (case.value) |v| try std.testing.expectEqualStrings(v, e.value);
+    }
+}
+
 test "Shard: a transaction id naming a shard that exists but doesn't hold it is refused there" {
     var two: TwoShards = undefined;
     try two.init();

@@ -316,7 +316,8 @@ test "kv table: routing_key routes the request in place of its key" {
     var buf: [512]u8 = undefined;
     var routed: usize = 0;
     inline for (kv_ops.table) |op| {
-        if (@hasField(op.request.Value, "routing_key")) {
+        // mget routes on its routing_key field alone: tested on its own.
+        if (@hasField(op.request.Value, "routing_key") and op.route == .key) {
             routed += 1;
             const route = table_run.routeByKey(op.name);
             const header = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 1);
@@ -329,6 +330,21 @@ test "kv table: routing_key routes the request in place of its key" {
         }
     }
     try testing.expectEqual(@as(usize, 10), routed);
+}
+
+test "kv table: kv.mget routes on its routing key, and stays where it lands without one" {
+    const op = table_run.op("kv.mget");
+    const route = table_run.routeByField("kv.mget");
+    var kbuf: [16]u8 = undefined;
+    var keys = op.request.field_list[0].T.Builder.init(&kbuf);
+    try testing.expect(try keys.add("balance"));
+    var buf: [64]u8 = undefined;
+    const header = proto.RequestHeader.init(.kv_mget, 1);
+    const routed: proto.Request = .{ .header = header, .namespace = "ns", .key = "", .value = try op.request.encodeInto(&buf, .{ .keys = keys.value(), .routing_key = "user:1" }) };
+    try testing.expectEqual(router.hashKeyWithNamespace("ns", "user:1"), route(routed).?);
+    var buf2: [64]u8 = undefined;
+    const plain: proto.Request = .{ .header = header, .namespace = "ns", .key = "", .value = try op.request.encodeInto(&buf2, .{ .keys = keys.value(), .routing_key = null }) };
+    try testing.expectEqual(@as(?u64, null), route(plain));
 }
 
 /// A body for `op` with every field absent, at its default, or empty.
@@ -604,7 +620,7 @@ test "kv ops: mget answers each key in order, found or not, and next when they d
     var kbuf: [256]u8 = undefined;
     var keys = Keys.Builder.init(&kbuf);
     for ([_][]const u8{ "small", "absent", "_flo:x", "b1", "b2", "b3" }) |k| try testing.expect(try keys.add(k));
-    const got = try h.ok("kv.mget", "", .{ .keys = keys.value() });
+    const got = try h.ok("kv.mget", "", .{ .keys = keys.value(), .routing_key = null });
     // Two 100 KiB values fill the answer; the third goes in the next ask.
     try testing.expectEqual(@as(?u16, 5), got.next);
     try testing.expectEqual(@as(u32, 5), got.entries.count);
@@ -618,7 +634,7 @@ test "kv ops: mget answers each key in order, found or not, and next when they d
 
     var rest = Keys.Builder.init(&kbuf);
     try testing.expect(try rest.add("b3"));
-    const last = try h.ok("kv.mget", "", .{ .keys = rest.value() });
+    const last = try h.ok("kv.mget", "", .{ .keys = rest.value(), .routing_key = null });
     try testing.expectEqual(@as(?u16, null), last.next);
     try testing.expectEqual(@as(u32, 1), last.entries.count);
 }
