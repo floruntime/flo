@@ -2266,24 +2266,35 @@ test "e2e/kv: jset refuses a merge past the largest value" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const filler = try testing.allocator.alloc(u8, 251_000);
+    // Built up in merges: Linux caps one argument at 128 KiB, so no
+    // argument here passes 100 KB. Each merge replaces a field the document
+    // already has.
+    const filler = try testing.allocator.alloc(u8, 100_000);
     defer testing.allocator.free(filler);
     @memset(filler, 'x');
-    const doc = try std.fmt.allocPrint(testing.allocator, "{{\"a\":\"{s}\"}}", .{filler});
-    defer testing.allocator.free(doc);
-    try ctx.exec(&.{ "kv", "jset", "big", doc });
+    try ctx.exec(&.{ "kv", "jset", "big", "{\"a\":\"\",\"b\":\"\",\"c\":\"\",\"d\":\"\"}" });
+    for ([_]struct { path: []const u8, len: usize }{ .{ .path = "$.a", .len = 100_000 }, .{ .path = "$.b", .len = 100_000 }, .{ .path = "$.c", .len = 51_000 } }) |part| {
+        const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..part.len]});
+        defer testing.allocator.free(more);
+        try ctx.exec(&.{ "kv", "jset", "big", more, "--path", part.path });
+    }
+    // About 251,000 bytes now, under the largest value.
+    var before = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
+    defer before.deinit();
+    try testing.expectEqual(@as(u8, 0), before.exit_code);
+    try testing.expect(before.stdout.len > 250_000);
 
-    const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
-    defer testing.allocator.free(more);
-    var grown = try ctx.cli.run(&.{ "kv", "jset", "big", more, "--path", "$.b" });
+    const last = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
+    defer testing.allocator.free(last);
+    var grown = try ctx.cli.run(&.{ "kv", "jset", "big", last, "--path", "$.d" });
     defer grown.deinit();
     try testing.expectEqual(@as(u8, 3), grown.exit_code);
     const want = std.fmt.comptimePrint("Error: bad request: the value to write is more than a key holds: at most {d} bytes [bad_request/field_too_long]", .{@import("src").protocol.kv_ops.MAX_VALUE});
     try testing.expectEqualStrings(want, std.mem.trimEnd(u8, grown.stderr, "\n"));
 
     // The document is as it was, and reads back whole.
-    var read = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
-    defer read.deinit();
-    try testing.expectEqual(@as(u8, 0), read.exit_code);
-    try testing.expectEqualStrings(doc, std.mem.trimEnd(u8, read.stdout, "\n"));
+    var after = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
+    defer after.deinit();
+    try testing.expectEqual(@as(u8, 0), after.exit_code);
+    try testing.expectEqualStrings(before.stdout, after.stdout);
 }
