@@ -207,19 +207,19 @@ test "e2e/action/worker: invoke and await task" {
     defer invoke_result.deinit();
     try stdx.testing.assertSucceeded(invoke_result);
 
-    // 4. Worker awaits task
-    // Note: The queue mechanism may not have the task immediately available.
-    // This test verifies the commands don't crash, not the full workflow.
+    const run_id = extractRunId(invoke_result.stdout) orelse return error.NoRunId;
+
+    // 4. The worker gets the run, its payload exactly as invoked: nothing of
+    // the assignment's caller block before it.
     var await_result = try ctx.cli.run(&.{
         "worker",      "await",   action_name,
-        "--worker-id", worker_id,
-        "--block", "500", // 500ms timeout
+        "--worker-id", worker_id, "--block",
+        "2000",
     });
     defer await_result.deinit();
-
-    // Just verify it doesn't crash - await may timeout or return "not found"
-    // Full workflow testing requires queue integration which may vary
-    _ = await_result.succeeded();
+    const want = try std.fmt.allocPrint(testing.allocator, "Task: {s}\nAction: {s}\nAttempt: 1\nPayload: {{\"task\":\"process-data\"}}\n", .{ run_id, action_name });
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, await_result.stdout);
 }
 
 // =============================================================================
@@ -505,11 +505,14 @@ test "e2e/action/worker: worker fails task with retry" {
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
 
-    // 6. Check status — poll to let Raft commit the fail
-    var status = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 3000);
+    // 6. The run is pending again, its first attempt's error kept.
+    const status = try runStatusJson(ctx, run_id);
     defer status.deinit();
-    try stdx.testing.assertSucceeded(status);
-    // The status indicates the task is back in pending/retry state
+    const s = status.value.object;
+    try testing.expectEqualStrings("pending", s.get("status").?.string);
+    try testing.expectEqual(@as(i64, 1), s.get("attempt").?.integer);
+    try testing.expectEqualStrings("Temporary failure", s.get("error").?.string);
+    try testing.expect(s.get("output").? == .null);
 }
 
 test "e2e/action/worker: worker fails task permanently" {
@@ -557,11 +560,26 @@ test "e2e/action/worker: worker fails task permanently" {
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
 
-    // 6. Check status — poll to let Raft commit the fail
-    var status = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 3000);
+    // 6. The run has failed, with the worker's error and no output.
+    const status = try runStatusJson(ctx, run_id);
     defer status.deinit();
-    try stdx.testing.assertSucceeded(status);
-    // The status indicates the task has failed permanently
+    const s = status.value.object;
+    try testing.expectEqualStrings("failed", s.get("status").?.string);
+    try testing.expectEqual(@as(i64, 1), s.get("attempt").?.integer);
+    try testing.expectEqualStrings("Permanent failure: invalid input", s.get("error").?.string);
+    try testing.expect(s.get("output").? == .null);
+    try testing.expect(s.get("completed_at_ms").? == .integer);
+}
+
+/// A run's `action status -o json`, which must exit 0 and parse.
+fn runStatusJson(ctx: *stdx.testing.TestContext, run_id: []const u8) !std.json.Parsed(std.json.Value) {
+    var result = try ctx.cli.run(&.{ "action", "status", run_id, "-o", "json" });
+    defer result.deinit();
+    if (result.exit_code != 0) {
+        std.debug.print("\naction status failed: '{s}' '{s}'\n", .{ result.stdout, result.stderr });
+        return error.TestFailed;
+    }
+    return std.json.parseFromSlice(std.json.Value, testing.allocator, result.stdout, .{});
 }
 // =============================================================================
 // Persistence / Restart

@@ -711,12 +711,13 @@ pub const ActionsHandler = struct {
         }
     }
 
-    pub const Error = error{ NotFound, OutOfMemory };
+    pub const Error = error{ NotFound, OutOfMemory, StoredTooLong };
 
     pub fn refusal(err: Error) table_run.Refused {
         return switch (err) {
             error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such run" } },
             error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
+            error.StoredTooLong => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: run output or error longer than status can carry" } },
         };
     }
 
@@ -736,18 +737,20 @@ pub const ActionsHandler = struct {
             self.status_buf = b;
             break :blk b;
         };
+        // Completes and fails store at most these lengths today; a longer
+        // value is refused, never cut short.
         var used: usize = 0;
         const output: ?[]const u8 = if (run.status == .completed) blk: {
             const r = run.result_owned orelse "";
-            const n = @min(r.len, action_ops.MAX_OUTPUT);
-            @memcpy(buf[0..n], r[0..n]);
-            used = n;
-            break :blk buf[0..n];
+            if (r.len > action_ops.MAX_OUTPUT) return error.StoredTooLong;
+            @memcpy(buf[0..r.len], r);
+            used = r.len;
+            break :blk buf[0..r.len];
         } else null;
         const error_message: ?[]const u8 = if (run.error_owned) |e| if (e.len == 0) null else blk: {
-            const n = @min(e.len, action_ops.MAX_ERROR);
-            @memcpy(buf[used..][0..n], e[0..n]);
-            break :blk buf[used..][0..n];
+            if (e.len > action_ops.MAX_ERROR) return error.StoredTooLong;
+            @memcpy(buf[used..][0..e.len], e);
+            break :blk buf[used..][0..e.len];
         } else null;
         return .{
             .status = @fromBackingInt(@intCast(@backingInt(run.status))),
@@ -2317,6 +2320,26 @@ test "actions: status of a failed run carries its error and no output" {
     try testing.expectEqual(@as(?[]const u8, null), s.output);
     try testing.expectEqual(@as(usize, error_len), s.error_message.?.len);
     try testing.expect(std.mem.allEqual(u8, s.error_message.?, 'e'));
+}
+
+test "actions: status refuses an output or error longer than its field rather than cutting it" {
+    var h = ActionsHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try testRunning(&h, "w-1");
+    var buf: [128]u8 = undefined;
+    try testing.expect(h.handleActionComplete(null, testReport(&buf, .action_complete, "w-1", "act-1", false)) == .applied);
+    // No complete or fail stores this much today, so store it directly.
+    const run = h.runs.getPtr("act-1").?;
+    if (run.result_owned) |r| h.allocator.free(r);
+    run.result_owned = try h.allocator.alloc(u8, action_ops.MAX_OUTPUT + 1);
+    @memset(@constCast(run.result_owned.?), 'o');
+    try testing.expectError(error.StoredTooLong, h.answerStatus("default", "act-1"));
+    h.allocator.free(run.result_owned.?);
+    run.result_owned = try h.allocator.dupe(u8, "ok");
+    if (run.error_owned) |e| h.allocator.free(e);
+    run.error_owned = try h.allocator.alloc(u8, action_ops.MAX_ERROR + 1);
+    @memset(@constCast(run.error_owned.?), 'e');
+    try testing.expectError(error.StoredTooLong, h.answerStatus("default", "act-1"));
 }
 
 test "actions: status of a run that doesn't exist, or is in another namespace, is not found" {
