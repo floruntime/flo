@@ -733,7 +733,7 @@ pub const ActionsHandler = struct {
         const run = self.runs.getPtr(run_id) orelse return error.NotFound;
         if (!runIn(run, namespace)) return error.NotFound;
         const buf = self.status_buf orelse blk: {
-            const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR);
+            const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR + action_ops.MAX_WORKER_ID);
             self.status_buf = b;
             break :blk b;
         };
@@ -750,7 +750,13 @@ pub const ActionsHandler = struct {
         const error_message: ?[]const u8 = if (run.error_owned) |e| if (e.len == 0) null else blk: {
             if (e.len > action_ops.MAX_ERROR) return error.StoredTooLong;
             @memcpy(buf[used..][0..e.len], e);
+            defer used += e.len;
             break :blk buf[used..][0..e.len];
+        } else null;
+        const worker_id: ?[]const u8 = if (run.worker_id_owned) |w| blk: {
+            if (w.len > action_ops.MAX_WORKER_ID) return error.StoredTooLong;
+            @memcpy(buf[used..][0..w.len], w);
+            break :blk buf[used..][0..w.len];
         } else null;
         return .{
             .status = @fromBackingInt(@intCast(@backingInt(run.status))),
@@ -760,6 +766,7 @@ pub const ActionsHandler = struct {
             .attempt = run.attempt,
             .output = output,
             .error_message = error_message,
+            .worker_id = worker_id,
         };
     }
 
@@ -2282,6 +2289,8 @@ test "actions: status answers a pending run's status and times, and no output" {
     try testing.expectEqual(@as(u32, 0), s.attempt);
     try testing.expectEqual(@as(?[]const u8, null), s.output);
     try testing.expectEqual(@as(?[]const u8, null), s.error_message);
+    // No worker has taken it.
+    try testing.expectEqual(@as(?[]const u8, null), s.worker_id);
 }
 
 test "actions: status of a completed run carries the output its worker completed it with" {
@@ -2294,6 +2303,7 @@ test "actions: status of a completed run carries the output its worker completed
     try testing.expectEqual(action_ops.RunStatus.completed, s.status);
     try testing.expectEqualStrings("{}", s.output.?);
     try testing.expectEqual(@as(u32, 1), s.attempt);
+    try testing.expectEqualStrings("w-1", s.worker_id.?);
     try testing.expect(s.completed_at_ms != null);
 }
 

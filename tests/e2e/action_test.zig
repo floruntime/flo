@@ -396,6 +396,11 @@ test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
     var status1 = try pollUntilSuccess(ctx, &.{ "action", "status", run_id }, 5000);
     defer status1.deinit();
     try stdx.testing.assertSucceeded(status1);
+    // No worker has taken it yet.
+    try testing.expect(!status1.stdoutContains("worker_id:"));
+    var pending_json = try ctx.cli.run(&.{ "action", "status", run_id, "-o", "json" });
+    defer pending_json.deinit();
+    try testing.expect(pending_json.stdoutContains("\"worker_id\":null"));
 
     // 5. Worker awaits and receives task (using blocking)
     var await_result = try ctx.cli.run(&.{
@@ -455,6 +460,11 @@ test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
     try testing.expectEqual(@as(i64, 1), s.get("attempt").?.integer);
     try testing.expect(s.get("completed_at_ms").? == .integer);
     try testing.expect(s.get("error").? == .null);
+    try testing.expectEqualStrings(worker_id, s.get("worker_id").?.string);
+
+    var human = try ctx.cli.run(&.{ "action", "status", run_id });
+    defer human.deinit();
+    try testing.expect(human.stdoutContains("worker_id: " ++ worker_id ++ "\n"));
 }
 
 test "e2e/action/worker: worker fails task with retry" {

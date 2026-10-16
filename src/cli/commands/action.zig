@@ -330,6 +330,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         if (s.output) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print(",\"error\":", .{});
         if (s.error_message) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
+        ctx.print(",\"worker_id\":", .{});
+        if (s.worker_id) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print("}}\n", .{});
         return;
     }
@@ -337,6 +339,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     if (s.started_at_ms) |v| ctx.print("started_at: {d}\n", .{v});
     if (s.completed_at_ms) |v| ctx.print("completed_at: {d}\n", .{v});
     ctx.print("attempt: {d}\n", .{s.attempt});
+    if (s.worker_id) |v| ctx.print("worker_id: {s}\n", .{v});
     if (s.output) |v| ctx.print("output: {s}\n", .{v});
     if (s.error_message) |v| ctx.print("error: {s}\n", .{v});
 }
