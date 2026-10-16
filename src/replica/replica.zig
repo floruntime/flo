@@ -392,6 +392,10 @@ pub fn Replica(comptime Io: type) type {
         /// vouch it holds.
         fn takeVouch(self: *Self, resp: raft_node_mod.TermCheckResponse) void {
             if (resp.committed_index == 0 or resp.guarded) return;
+            // A config committed in a term later than the responder's own is
+            // no history it has: taking it would hold a vouch no honest
+            // answer could replace.
+            if (resp.committed_term > resp.term) return;
             if (std.mem.indexOfScalar(u32, self.asked[0..self.asked_count], resp.from) == null) return;
             if (!self.isMember(resp.from)) return;
             const raft = self.raftNode();
@@ -940,8 +944,13 @@ const VouchHarness = struct {
 
     /// `from`'s answer: its committed config `cfg` at (term, index).
     fn answer(self: *VouchHarness, from: u32, cfg: membership.Config, term: u64, index: u64, guarded: bool) void {
+        self.answerIn(from, cfg, term, term, index, guarded);
+    }
+
+    /// `answer`, from a responder in `resp_term`.
+    fn answerIn(self: *VouchHarness, from: u32, cfg: membership.Config, resp_term: u64, term: u64, index: u64, guarded: bool) void {
         var buf: [transport.TERM_CHECK_RESP_MAX]u8 = undefined;
-        const n = transport.serializeTermCheckResponse(.{ .term = 1, .from = from, .guarded = guarded, .config_index = index, .config_term = term, .member_count = 0, .members = undefined, .committed_index = index, .committed_term = term, .committed = cfg }, &buf).?;
+        const n = transport.serializeTermCheckResponse(.{ .term = resp_term, .from = from, .guarded = guarded, .config_index = index, .config_term = term, .member_count = 0, .members = undefined, .committed_index = index, .committed_term = term, .committed = cfg }, &buf).?;
         self.frame(from, .term_check_response, buf[0..n]);
     }
 
@@ -1002,6 +1011,9 @@ test "replica: a vouch is taken only from an asked, unguarded member of this nod
     try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
     // A guarded member: its history is no evidence.
     h.answer(3, groupNow(), 2, 20, true);
+    try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
+    // Committed in a term after the responder's own: no history it has.
+    h.answerIn(3, groupNow(), 2, 99, 1 << 40, false);
     try testing.expectEqual(@as(u64, 0), h.replica.vouchedIndex());
     // Not newer than this node's own committed config (term 1, index 2).
     h.answer(3, groupNow(), 1, 2, false);
