@@ -46,6 +46,7 @@ const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
+const Result = persistence.Result;
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
 const Flags = entry_mod.Flags;
@@ -89,11 +90,11 @@ pub const ActionsHandler = struct {
     /// runs_mu, since the answer is encoded after it lets go. Allocated on
     /// first use.
     status_buf: ?[]u8 = null,
-    /// The run the last applied invoke created; a key of `runs` (see
-    /// `Shard.answering_index`).
-    last_invoked_run_id: ?[]const u8 = null,
-    /// The last invoke named a run id already taken, and was refused.
-    last_invoke_existed: bool = false,
+
+    /// Without a shard (unit tests) a write applies here: its result, which
+    /// the answer points into.
+    local_result: Result = .{},
+    local_ver_buf: [12]u8 = undefined,
 
     /// Monotonic counter used to produce unique run IDs when shard is null (tests).
     null_shard_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -246,32 +247,34 @@ pub const ActionsHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.actions_handler.handleCommand(shard, req);
         defer shard.actions_handler.freeResult(result);
-        if (result == .parked) return shard.park(conn, req, result.parked, respondAction);
+        if (result == .parked) {
+            const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
+            if (op == .action_register or op == .action_invoke) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+            return shard.park(conn, req, result.parked, switch (op) {
+                .action_register => answerRegister,
+                .action_invoke => answerInvoke,
+                .action_delete => answerDelete,
+                else => answerOk,
+            });
+        }
         sendActionResponse(shard, conn, req.header.request_id, result);
     }
 
-    /// A parked action write applied: read the outcome back and answer.
-    fn respondAction(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const h = shard.actions_handler;
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
+    fn answerRegister(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
         var ver_buf: [12]u8 = undefined;
-        const result: CommandResult = blk: {
-            h.runs_mu.lock();
-            defer h.runs_mu.unlock();
-            break :blk switch (op) {
-                .action_register => h.registerOutcome(req.namespace, req.key, &ver_buf),
-                .action_invoke => h.invoked(),
-                .action_delete => .{ .action_deleted = {} },
-                else => .ok,
-            };
-        };
-        switch (result) {
-            .action_registered, .action_invoked => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
-            else => {},
-        }
-        sendActionResponse(shard, conn, req.header.request_id, result);
+        sendActionResponse(shard, conn, request_id, registeredFrom(result, &ver_buf));
+    }
+
+    fn answerInvoke(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        sendActionResponse(shard, conn, request_id, invokedFrom(result));
+    }
+
+    fn answerDelete(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        sendActionResponse(shard, conn, request_id, .{ .action_deleted = {} });
+    }
+
+    fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        shard.sendOkResponse(conn, request_id, "");
     }
 
     /// A run exists for workers to take: wake this shard's action_await
@@ -309,8 +312,14 @@ pub const ActionsHandler = struct {
                 switch (outcome) {
                     // Refused before anything was proposed.
                     .refused => |e| shard.sendRefusal(conn, req.header.request_id, e.status, .{ .reason = e.reason, .ran = .no, .message = e.message }),
-                    .parked => |proposed| shard.park(conn, req, proposed, respondTask),
-                    .applied => respondTask(shard_ptr, conn_ptr, req),
+                    .parked => |proposed| {
+                        recordTask(shard, req, op);
+                        shard.park(conn, req, proposed, answerOk);
+                    },
+                    .applied => {
+                        recordTask(shard, req, op);
+                        shard.sendOkResponse(conn, req.header.request_id, "");
+                    },
                     .repeat => shard.sendOkResponse(conn, req.header.request_id, ""),
                 }
             },
@@ -327,18 +336,15 @@ pub const ActionsHandler = struct {
         }
     }
 
-    /// The run update applied: the worker's stats, then ok. The stats are
-    /// counted only when the worker is registered on this shard: another
-    /// shard's registry is that shard's thread's to change.
-    fn respondTask(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
+    /// A worker's report, taken: its stats. Counted where the report is
+    /// accepted, not once it applies: they are this node's view of the
+    /// worker, and only when the worker is registered on this shard, since
+    /// another shard's registry is that shard's thread's to change.
+    fn recordTask(shard: *Shard, req: Request, op: OpCode) void {
         const action_name = parseLeadingName(req.value);
         if (resolveWorkerShard(shard, req.namespace, req.key) == shard) {
             if (op == .action_complete) shard.worker_handler.recordCompletion(req.namespace, req.key, action_name) else shard.worker_handler.recordFailure(req.namespace, req.key, action_name);
         }
-        shard.sendOkResponse(conn, req.header.request_id, "");
     }
 
     /// Extract the leading [name_len:u16][name] from a value buffer.
@@ -603,28 +609,23 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        _ = self.replayRegister(qkey, value, wallNs());
-        var ver_buf: [12]u8 = undefined;
-        return self.registerOutcome(req.namespace, name, &ver_buf);
+        // Without a shard (unit tests): applied here, answered the same.
+        self.local_result = .{};
+        self.replayRegister(qkey, value, wallNs(), &self.local_result) catch
+            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
+        return registeredFrom(&self.local_result, &self.local_ver_buf);
     }
 
-    /// The register applied: the stored version is the answer. `ver_buf`
-    /// is the caller's, since the result points into it.
-    fn registerOutcome(self: *ActionsHandler, namespace: []const u8, name: []const u8, ver_buf: *[12]u8) CommandResult {
-        var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = defKey(&kbuf, namespace, name) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "namespace + name too long" } };
-        };
-        const stored = self.actions.get(key) orelse {
-            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
-        };
-        const ver_str = std.fmt.bufPrint(ver_buf, "{d}", .{stored.version}) catch "1";
-        return .{
-            .action_registered = .{
-                .name = name, // req-owned, same lifetime as request
-                .version = ver_str,
-            },
-        };
+    /// The register applied: the action's name and the version it stored.
+    /// The answer points into `result` and `ver_buf`.
+    fn registeredFrom(result: *const Result, ver_buf: *[12]u8) CommandResult {
+        var r = result.reader();
+        const version = r.int(u32) orelse 1;
+        const name = r.slice() orelse "";
+        return .{ .action_registered = .{
+            .name = name,
+            .version = std.fmt.bufPrint(ver_buf, "{d}", .{version}) catch "1",
+        } };
     }
 
     // ── INVOKE ──────────────────────────────────────────────────────────
@@ -679,25 +680,19 @@ pub const ActionsHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        _ = self.replayInvoke(run_id_str, value, wallNs());
-        return self.invoked();
+        self.local_result = .{};
+        self.replayInvoke(run_id_str, value, wallNs(), &self.local_result) catch
+            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
+        if (self.local_result.refused()) |r| return .{ .err = .{ .code = .internal_error, .message = r.refusal.message } };
+        return invokedFrom(&self.local_result);
     }
 
-    /// The invoke applied: the run it created was the last one.
-    fn invoked(self: *ActionsHandler) CommandResult {
-        if (self.last_invoke_existed) return .{ .err = .{ .code = .internal_error, .message = "internal error: the server minted a run id already in use — retry" } };
-        const run_id = self.last_invoked_run_id orelse {
-            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
-        };
-        const stored = self.runs.getPtr(run_id) orelse {
-            return .{ .err = .{ .code = .committed_not_applied, .message = persistence.COMMITTED_NOT_APPLIED } };
-        };
-        return .{
-            .action_invoked = .{
-                .run_id = stored.run_id_owned, // points to heap-owned copy in runs map
-                .queue_position = @intCast(self.runs.count()),
-            },
-        };
+    /// The invoke applied: the run it created, and how many runs the shard
+    /// held then. The answer points into `result`.
+    fn invokedFrom(result: *const Result) CommandResult {
+        var r = result.reader();
+        const run_id = r.slice() orelse "";
+        return .{ .action_invoked = .{ .run_id = run_id, .queue_position = r.int(u32) orelse 0 } };
     }
 
     // ── STATUS ──────────────────────────────────────────────────────────
@@ -944,7 +939,7 @@ pub const ActionsHandler = struct {
                 };
                 return .{ .parked = proposed };
             }
-            _ = self.replayDelete(qkey);
+            self.replayDelete(qkey);
             return .{ .action_deleted = {} };
         }
 
@@ -1375,7 +1370,7 @@ pub const ActionsHandler = struct {
         var value_buf: [65536]u8 = undefined;
         const value = encodeRunUpdateValue(&value_buf, u) orelse return .{ .refused = .{ .status = .bad_request, .message = "run update too large" } };
         const s = shard orelse {
-            _ = self.replayUpdateRun(run_id, value, wallNs());
+            self.replayUpdateRun(run_id, value, wallNs()) catch {};
             return .applied;
         };
         // Proposed, not waited for: the dispatcher parks the worker on it.
@@ -1466,36 +1461,32 @@ pub const ActionsHandler = struct {
     }
 
     /// Thunk for ReplayRegistry → ActionsHandler.replayEntry.
-    fn replayEntryThunk(ctx: *anyopaque, e: *const Entry) persistence.ApplyOutcome {
+    fn replayEntryThunk(ctx: *anyopaque, e: *const Entry, out: *Result) persistence.ApplyError!void {
         const self: *ActionsHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(e);
+        return self.replayEntry(e, out);
     }
 
     /// Dispatch a replayed entry to the appropriate replay handler.
-    pub fn replayEntry(self: *ActionsHandler, e: *const Entry) persistence.ApplyOutcome {
+    pub fn replayEntry(self: *ActionsHandler, e: *const Entry, out: *Result) persistence.ApplyError!void {
         const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
         // Workflows on other shard threads read the runs map under this
         // lock. Nothing holds it across an apply, so taking it here cannot
         // nest.
         self.runs_mu.lock();
         defer self.runs_mu.unlock();
-        if (etype == .action_invoke) {
-            self.last_invoked_run_id = null;
-            self.last_invoke_existed = false;
-        }
-        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return .failed;
+        const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse return error.Halt;
         return switch (etype) {
-            .action_register => self.replayRegister(cmd.key, cmd.value, e.header.timestamp_ns),
+            .action_register => self.replayRegister(cmd.key, cmd.value, e.header.timestamp_ns, out),
             .action_delete => self.replayDelete(cmd.key),
-            .action_invoke => self.replayInvoke(cmd.key, cmd.value, e.header.timestamp_ns),
+            .action_invoke => self.replayInvoke(cmd.key, cmd.value, e.header.timestamp_ns, out),
             .action_update_run => self.replayUpdateRun(cmd.key, cmd.value, e.header.timestamp_ns),
-            else => .failed,
+            else => error.Halt,
         };
     }
 
     /// Rebuild an ActionRecord from a persisted register entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    pub fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
+    pub fn replayRegister(self: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64, out: *Result) persistence.ApplyError!void {
         // Extract namespace from qualified key
         var namespace: []const u8 = "default";
         var name = key;
@@ -1512,21 +1503,21 @@ pub const ActionsHandler = struct {
         // Remove old entry if re-registering
         if (self.actions.fetchRemove(key)) |old| self.freeAction(old.value);
 
-        const owned_key = self.allocator.dupe(u8, key) catch return .failed;
+        const owned_key = self.allocator.dupe(u8, key) catch return error.OutOfMemory;
         const owned_name = self.allocator.dupe(u8, name) catch {
             self.allocator.free(owned_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         const owned_ns = self.allocator.dupe(u8, namespace) catch {
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         const owned_owner = self.allocator.dupe(u8, meta.owner) catch {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         self.actions.put(owned_key, .{
             .key_owned = owned_key,
@@ -1544,9 +1535,10 @@ pub const ActionsHandler = struct {
             self.allocator.free(owned_ns);
             self.allocator.free(owned_name);
             self.allocator.free(owned_key);
-            return .failed;
+            return error.OutOfMemory;
         };
-        return .applied;
+        out.putInt(u32, version);
+        out.putBytes(name);
     }
 
     fn freeAction(self: *ActionsHandler, rec: ActionRecord) void {
@@ -1558,25 +1550,24 @@ pub const ActionsHandler = struct {
 
     /// Remove an action on replay of a delete entry.
     /// Key may be namespace-qualified (ns\x00name) or plain name (default namespace).
-    fn replayDelete(self: *ActionsHandler, key: []const u8) persistence.ApplyOutcome {
+    fn replayDelete(self: *ActionsHandler, key: []const u8) void {
         if (self.actions.fetchRemove(key)) |old| self.freeAction(old.value);
-        return .applied;
     }
 
     /// Rebuild a RunRecord from a persisted invoke entry.
-    pub fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
+    /// Answered with the run's id and how many runs the shard holds.
+    pub fn replayInvoke(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64, out: *Result) persistence.ApplyError!void {
         // An id already taken is refused, not overwritten: the run under it
         // may be running or finished, and its caller waits on that run.
         if (self.runs.contains(run_id)) {
-            self.last_invoke_existed = true;
             // A workflow's own invoke has no client to see the refusal.
             log.warn("action invoke refused: run id '{s}' is already in use", .{run_id});
-            // Refused, and the client is answered so: not a loss.
-            return .applied;
+            return out.refuse(.internal_error, .internal, "internal error: the server minted a run id already in use — retry");
         }
-        const v = InvokeValue.parse(value) orelse return .failed;
-        self.last_invoked_run_id = self.insertRun(run_id, v, stamp_ns) catch return .failed;
-        return .applied;
+        const v = InvokeValue.parse(value) orelse return error.Halt;
+        _ = try self.insertRun(run_id, v, stamp_ns);
+        out.putBytes(run_id);
+        out.putInt(u32, @intCast(self.runs.count()));
     }
 
     /// Add the run an invoke entry creates, all of it or nothing.
@@ -1690,27 +1681,27 @@ pub const ActionsHandler = struct {
     }
 
     /// Apply a run status update from its entry.
-    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyOutcome {
+    fn replayUpdateRun(self: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) persistence.ApplyError!void {
         var off: usize = 0;
 
         // status
-        if (off >= value.len) return .failed;
-        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return .failed;
+        if (off >= value.len) return error.Halt;
+        const status = std.enums.fromInt(ActionRunStatus, value[off]) orelse return error.Halt;
         off += 1;
 
         // started_at_ms
-        if (off >= value.len) return .failed;
+        if (off >= value.len) return error.Halt;
         const has_started = value[off] == 1;
         off += 1;
         var started_at_ms: ?i64 = null;
         if (has_started) {
-            if (off + 8 > value.len) return .failed;
+            if (off + 8 > value.len) return error.Halt;
             started_at_ms = std.mem.readInt(i64, value[off..][0..8], .little);
             off += 8;
         }
 
         // result data
-        if (off + 4 > value.len) return .failed;
+        if (off + 4 > value.len) return error.Halt;
         const rlen: usize = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
         var fields: RunUpdateFields = .{};
@@ -1744,14 +1735,13 @@ pub const ActionsHandler = struct {
         const run = self.runs.getPtr(run_id) orelse {
             // An update for a run this shard never created: the log
             // orders invoke first, so the update has nothing to change.
-            log.err("action run update for unknown run '{s}' skipped", .{run_id});
-            return .failed;
+            log.err("action run update for unknown run '{s}': no run to change", .{run_id});
+            return error.Halt;
         };
         // A finished run stays finished: two reports can both pass the
         // leader's check before either applies.
-        if (finished(run.status)) return .applied;
-        self.updateRun(run, status, started_at_ms, @intCast(stamp_ns / std.time.ns_per_ms), fields) catch return .failed;
-        return .applied;
+        if (finished(run.status)) return;
+        self.updateRun(run, status, started_at_ms, @intCast(stamp_ns / std.time.ns_per_ms), fields) catch return error.OutOfMemory;
     }
 
     /// The optional fields of a run update, borrowed from its entry.
@@ -2115,6 +2105,21 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
     };
 }
 
+fn applyRegister(h: *ActionsHandler, key: []const u8, value: []const u8, stamp_ns: u64) !void {
+    var out: Result = .{};
+    return h.replayRegister(key, value, stamp_ns, &out);
+}
+
+fn applyInvoke(h: *ActionsHandler, run_id: []const u8, value: []const u8, stamp_ns: u64) !void {
+    var out: Result = .{};
+    return h.replayInvoke(run_id, value, stamp_ns, &out);
+}
+
+fn applyLogged(h: *ActionsHandler, e: *const Entry) !void {
+    var out: Result = .{};
+    return h.replayEntry(e, &out);
+}
+
 test "actions handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     ActionsHandler.register(&dispatcher);
@@ -2235,6 +2240,20 @@ test "actions handler: invoke" {
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 }
 
+test "actions handler: a register answers with its name whole, at the longest key an entry carries" {
+    var handler = ActionsHandler.init(testing.allocator);
+    defer handler.deinit();
+    var key: [persistence.MAX_ENTRY_KEY]u8 = @splat('a');
+    key[3] = ns_keys.NAMESPACE_SEPARATOR;
+    var out: Result = .{};
+    try handler.replayRegister(&key, "", 1, &out);
+    try testing.expect(!out.overflowed);
+    var ver: [12]u8 = undefined;
+    const answer = ActionsHandler.registeredFrom(&out, &ver).action_registered;
+    try testing.expectEqualSlices(u8, key[4..], answer.name);
+    try testing.expectEqualStrings("1", answer.version);
+}
+
 test "actions handler: an invoke naming a run id already taken is refused, and the run it names is kept" {
     const allocator = testing.allocator;
     var handler = ActionsHandler.init(allocator);
@@ -2243,20 +2262,15 @@ test "actions handler: an invoke naming a run id already taken is refused, and t
 
     var buf: [256]u8 = undefined;
     const value = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "first", null, null, null).?;
-    handler.last_invoked_run_id = null;
-    handler.last_invoke_existed = false;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, handler.replayInvoke("act-1", value, 1));
-    try testing.expect(handler.invoked() == .action_invoked);
+    var out: Result = .{};
+    try handler.replayInvoke("act-1", value, 1, &out);
+    try testing.expect(ActionsHandler.invokedFrom(&out) == .action_invoked);
     handler.runs.getPtr("act-1").?.status = .running;
 
     const again = ActionsHandler.encodeInvokeValue(&buf, "default", "process", "second", null, null, null).?;
-    handler.last_invoked_run_id = null;
-    handler.last_invoke_existed = false;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, handler.replayInvoke("act-1", again, 2));
-    switch (handler.invoked()) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.internal_error, e.code),
-        else => return error.TestUnexpectedResult,
-    }
+    var refused: Result = .{};
+    try handler.replayInvoke("act-1", again, 2, &refused);
+    try testing.expectEqual(proto.StatusCode.internal_error, refused.refused().?.status);
     const kept = handler.runs.getPtr("act-1").?;
     try testing.expectEqual(ActionRunStatus.running, kept.status);
     try testing.expectEqualStrings("first", kept.input_owned.?);
@@ -2279,9 +2293,9 @@ test "actions: status answers a pending run's status and times, and no output" {
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
     var inv_buf: [512]u8 = undefined;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    try applyRegister(&h, "echo", "", 1);
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    try applyInvoke(&h, "act-1", inv, 1000 * std.time.ns_per_ms);
     const s = try h.answerStatus("default", "act-1");
     try testing.expectEqual(action_ops.RunStatus.pending, s.status);
     try testing.expectEqual(@as(i64, 1000), s.created_at_ms);
@@ -2475,11 +2489,11 @@ test "actions: a run update applied from its entry carries outcome, error and wo
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
 
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    try applyRegister(&h, "echo", "", 1);
 
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{\"k\":1}", "gpu", "wf-run-9", "parent-wf") orelse return error.EncodeFailed;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    try applyInvoke(&h, "act-1", inv, 1000 * std.time.ns_per_ms);
     const created = h.runs.get("act-1") orelse return error.RunMissing;
     try std.testing.expectEqualStrings("gpu", created.labels_owned.?);
     try std.testing.expectEqualStrings("wf-run-9", created.caller_run_id_owned.?);
@@ -2538,9 +2552,9 @@ fn testReport(buf: []u8, op: proto.OpCode, worker: []const u8, run_id: []const u
 fn testRunning(h: *ActionsHandler, worker: []const u8) !void {
     var inv_buf: [512]u8 = undefined;
     if (h.runs.get("act-1") == null) {
-        try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+        try applyRegister(h, "echo", "", 1);
         const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
-        try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+        try applyInvoke(h, "act-1", inv, 1000 * std.time.ns_per_ms);
     }
     const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, worker) orelse return error.NothingToClaim;
     std.testing.allocator.free(task.body);
@@ -2617,39 +2631,38 @@ test "actions: an apply that runs out of memory fails and changes nothing" {
             defer h.deinit();
 
             if (stage == 0) fa.fail_index = fa.alloc_index + fail_at;
-            const registered = h.replayRegister("echo", "", 1);
+            var out: Result = .{};
+            const registered = h.replayRegister("echo", "", 1, &out);
             if (stage == 0 and fa.has_induced_failure) {
-                try testing.expectEqual(persistence.ApplyOutcome.failed, registered);
+                try testing.expectError(error.OutOfMemory, registered);
                 try testing.expectEqual(@as(usize, 0), h.actions.count());
                 continue;
             }
-            try testing.expectEqual(persistence.ApplyOutcome.applied, registered);
+            try registered;
             if (stage == 0) break;
 
             if (stage == 1) fa.fail_index = fa.alloc_index + fail_at;
-            h.last_invoked_run_id = null;
-            const invoked = h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms);
+            var inv_out: Result = .{};
+            const invoked = h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms, &inv_out);
             if (stage == 1 and fa.has_induced_failure) {
-                try testing.expectEqual(persistence.ApplyOutcome.failed, invoked);
+                try testing.expectError(error.OutOfMemory, invoked);
                 try testing.expectEqual(@as(usize, 0), h.runs.count());
-                // The client's answer must not name a run that is not there.
-                try testing.expect(h.last_invoked_run_id == null);
                 continue;
             }
-            try testing.expectEqual(persistence.ApplyOutcome.applied, invoked);
+            try invoked;
             if (stage == 1) break;
 
             fa.fail_index = fa.alloc_index + fail_at;
             const updated = h.replayUpdateRun("act-1", upd, 2000 * std.time.ns_per_ms);
             const run = h.runs.get("act-1") orelse return error.RunMissing;
             if (fa.has_induced_failure) {
-                try testing.expectEqual(persistence.ApplyOutcome.failed, updated);
+                try testing.expectError(error.OutOfMemory, updated);
                 // All or nothing: the run is as the invoke left it.
                 try testing.expectEqual(ActionRunStatus.pending, run.status);
                 try testing.expect(run.result_owned == null and run.worker_id_owned == null and run.outcome_owned == null and run.error_owned == null);
                 continue;
             }
-            try testing.expectEqual(persistence.ApplyOutcome.applied, updated);
+            try updated;
             try testing.expectEqualStrings("late", run.error_owned.?);
             break;
         }
@@ -2666,20 +2679,20 @@ test "actions: an action's created, run's created and run's finished times are t
         const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
         var pbuf: [512]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
-        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, stamp_ns, 0, "echo", "", &pbuf).?));
+        try applyLogged(&h, &entry_mod.buildCommandEntry(.action_register, 0, 1, 1, stamp_ns, 0, "echo", "", &pbuf).?);
         try std.testing.expectEqual(stamp_ns, h.actions.get("echo").?.created_at_ns);
 
         var inv_buf: [512]u8 = undefined;
         // A namespace other than default: its field comes last, after every
         // field the layout has.
         const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "ns1", "echo", "", null, null, null).?;
-        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, stamp_ns + 5 * std.time.ns_per_ms, 0, "act-1", inv, &pbuf).?));
+        try applyLogged(&h, &entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, stamp_ns + 5 * std.time.ns_per_ms, 0, "act-1", inv, &pbuf).?);
         try std.testing.expectEqual(stamp_ms + 5, h.runs.get("act-1").?.created_at_ms);
         try std.testing.expectEqualStrings("ns1", h.runs.get("act-1").?.namespace_owned);
 
         var upd_buf: [256]u8 = undefined;
         const upd = ActionsHandler.encodeRunUpdateValue(&upd_buf, .{ .status = .completed, .started_at_ms = 7, .result = "", .worker_id = null, .outcome = "", .error_message = "" }).?;
-        try std.testing.expectEqual(persistence.ApplyOutcome.applied, h.replayEntry(&entry_mod.buildCommandEntry(.action_update_run, 0, 1, 3, stamp_ns + 9 * std.time.ns_per_ms, 0, "act-1", upd, &pbuf).?));
+        try applyLogged(&h, &entry_mod.buildCommandEntry(.action_update_run, 0, 1, 3, stamp_ns + 9 * std.time.ns_per_ms, 0, "act-1", upd, &pbuf).?);
         const done = h.runs.get("act-1").?;
         try std.testing.expectEqual(@as(?i64, stamp_ms + 9), done.completed_at_ms);
         // The claim's time is carried as the claiming node took it.
@@ -2711,10 +2724,10 @@ test "actions: an action name holding a NUL has no registry key" {
 test "actions: a claimed task owns its bytes, so the run can be freed while it is sent" {
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    try applyRegister(&h, "echo", "", 1);
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "payload", "", "", "") orelse return error.EncodeFailed;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    try applyInvoke(&h, "act-1", inv, 1000 * std.time.ns_per_ms);
 
     const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
     defer std.testing.allocator.free(task.body);
@@ -2729,10 +2742,10 @@ test "actions: a claimed task owns its bytes, so the run can be freed while it i
 test "actions: a claim with no memory for its task leaves the run as it was" {
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", "", 1));
+    try applyRegister(&h, "echo", "", 1);
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "payload", "", "", "") orelse return error.EncodeFailed;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    try applyInvoke(&h, "act-1", inv, 1000 * std.time.ns_per_ms);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try testing.expect(h.claimPendingRun(failing.allocator(), "default", "echo", null, "w-1") == null);
@@ -2787,10 +2800,10 @@ fn testTimedRun(h: *ActionsHandler, timeout_ms: u32, max_retries: u32, started_a
     reg[0] = 0;
     std.mem.writeInt(u32, reg[1..5], timeout_ms, .little);
     std.mem.writeInt(u32, reg[5..9], max_retries, .little);
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", &reg, 1));
+    try applyRegister(h, "echo", &reg, 1);
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayInvoke("act-1", inv, 1000 * std.time.ns_per_ms));
+    try applyInvoke(h, "act-1", inv, 1000 * std.time.ns_per_ms);
     const task = h.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1") orelse return error.NothingToClaim;
     std.testing.allocator.free(task.body);
     h.runs.getPtr("act-1").?.lease_from_ms = started_at_ms;
@@ -2836,7 +2849,7 @@ test "actions: a timeout of 0 never expires, touched or not, and a re-registered
     reg[0] = 0;
     std.mem.writeInt(u32, reg[1..5], 500, .little);
     std.mem.writeInt(u32, reg[5..9], 3, .little);
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayRegister("echo", &reg, 2));
+    try applyRegister(&h, "echo", &reg, 2);
     try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 10_500));
 }
 
@@ -2898,7 +2911,7 @@ test "actions: a run of a deleted action ends on the default timeout" {
     var h = ActionsHandler.init(std.testing.allocator);
     defer h.deinit();
     try testTimedRun(&h, 0, 1, 10_000);
-    try testing.expectEqual(persistence.ApplyOutcome.applied, h.replayDelete("echo"));
+    h.replayDelete("echo");
     try testing.expectEqual(@as(usize, 0), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS - 1));
     try testing.expectEqual(@as(usize, 1), h.expireRuns(null, 10_000 + DEFAULT_ACTION_TIMEOUT_MS));
     try testing.expectEqual(ActionRunStatus.timed_out, h.runs.get("act-1").?.status);

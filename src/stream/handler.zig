@@ -64,6 +64,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const EntryType = entry_mod.EntryType;
 const UAL = @import("../storage/ual/ual.zig").UAL;
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const ReplayRegistry = persistence_mod.ReplayRegistry;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const TieredLogMetrics = @import("../metrics/registry.zig").TieredLogMetrics;
@@ -88,8 +89,6 @@ pub const StreamHandler = struct {
     /// read path does not do a registry lookup per record.
     tiered_metrics: ?*TieredLogMetrics = null,
 
-    /// The id the last applied append got (see `Shard.answering_index`).
-    last_append: ?StreamID = null,
     /// Appends a read had to skip: not in hot or warm storage, or not a
     /// well-formed batch. Each is counted and logged once.
     skipped_appends: u64 = 0,
@@ -99,8 +98,6 @@ pub const StreamHandler = struct {
     /// Backs a refusal message that names request values; sent before the
     /// next command runs.
     err_buf: [128]u8 = undefined,
-    /// What the last applied trim removed (see `Shard.answering_index`).
-    last_trim_count: u64 = 0,
 
     /// Maximum number of messages in a single read response.
     pub const MAX_READ_BATCH: usize = proto.MAX_STREAM_READ_RECORDS;
@@ -213,7 +210,7 @@ pub const StreamHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
-        if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
+        if (cmd_result == .parked) return parkStream(shard, conn, req, cmd_result.parked);
 
         // Track namespace data for stream create operations
         const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
@@ -229,20 +226,38 @@ pub const StreamHandler = struct {
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
 
-    /// A parked stream write applied: read the outcome back and answer.
-    fn respondStream(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+    /// Park a stream write on its entry, answered from what its applier
+    /// recorded. An append counts against its namespace here, where it is
+    /// accepted.
+    fn parkStream(shard: *Shard, conn: *Connection, req: Request, proposed: persistence_mod.ProposeResult) void {
         const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        const cmd_result: CommandResult = switch (op) {
-            .stream_append => shard.stream_handler.respondAppend(),
-            .stream_trim => shard.stream_handler.respondTrim(req),
-            else => .ok,
-        };
-        // Waiters and triggers are woken by the applier on every node; the
-        // write is counted against its namespace where the client is answered.
         if (op == .stream_append) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+        shard.park(conn, req, proposed, switch (op) {
+            .stream_append => answerAppend,
+            .stream_trim => answerTrim,
+            else => answerOk,
+        });
+    }
+
+    fn answerAppend(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        sendStreamResponse(shard, conn, request_id, appendedFrom(result));
+    }
+
+    fn answerTrim(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        const deleted = r.int(u64) orelse 0;
+        sendStreamResponse(shard, conn, request_id, .{ .stream_trimmed = .{ .deleted_count = deleted, .first_seq = r.int(u64) orelse 0 } });
+    }
+
+    fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        sendStreamResponse(shard, conn, request_id, .ok);
+    }
+
+    /// An append's answer: the id its applier gave it.
+    fn appendedFrom(result: *const Result) CommandResult {
+        var r = result.reader();
+        const seq = r.int(u64) orelse 0;
+        return appendOk(.{ .sequence = seq, .timestamp_ms = r.int(u64) orelse 0 });
     }
 
     /// Dedicated dispatch for stream_append; parks until the append commits.
@@ -251,7 +266,7 @@ pub const StreamHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
-        if (cmd_result == .parked) return shard.park(conn, req, cmd_result.parked, respondStream);
+        if (cmd_result == .parked) return parkStream(shard, conn, req, cmd_result.parked);
         switch (cmd_result) {
             .stream_append_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
@@ -476,8 +491,8 @@ pub const StreamHandler = struct {
         } };
         // The append goes through Raft and is applied from the committed log
         // by the shard's one applier, so it replicates and survives restart;
-        // the client is parked until then and `respondAppend` reads the
-        // StreamID back. Without a shard (unit tests) the same applier runs
+        // the client is parked until then and answered with the StreamID its
+        // applier recorded. Without a shard (unit tests) the same applier runs
         // on a locally built entry.
         if (self.shard_ptr) |sptr| {
             const shard = shardFromPtr(sptr);
@@ -499,13 +514,6 @@ pub const StreamHandler = struct {
         };
         self.registerStreamName(req);
         return appendOk(stream_id);
-    }
-
-    /// The append applied: the applier recorded its id and registered the
-    /// stream's name.
-    pub fn respondAppend(self: *StreamHandler) CommandResult {
-        const id = self.last_append orelse return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
-        return appendOk(id);
     }
 
     fn appendOk(stream_id: StreamID) CommandResult {
@@ -723,12 +731,6 @@ pub const StreamHandler = struct {
         }
         const trim_id = bound.resolve(self.nowNs()) orelse return trimmed(name_hash, 0, self.stream);
         return trimmed(name_hash, self.stream.trimStream(name_hash, trim_id), self.stream);
-    }
-
-    /// The trim applied; the applier recorded what it removed.
-    fn respondTrim(self: *StreamHandler, req: Request) CommandResult {
-        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
-        return trimmed(name_hash, self.last_trim_count, self.stream);
     }
 
     fn trimmed(name_hash: u64, deleted: u64, stream: *StreamProjection) CommandResult {
@@ -1728,8 +1730,10 @@ pub const StreamHandler = struct {
         ) orelse return error.PayloadTooLarge;
 
         _ = try self.partition.apply(&entry);
-        _ = replayEntry(@ptrCast(self), &entry);
-        return self.last_append orelse error.AppendNotApplied;
+        var out = Result.start(&entry);
+        replayEntry(@ptrCast(self), &entry, &out) catch return error.AppendNotApplied;
+        const answer = appendedFrom(&out).stream_append_ok;
+        return .{ .sequence = answer.sequence, .timestamp_ms = @intCast(answer.timestamp_ms) };
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1750,28 +1754,30 @@ pub const StreamHandler = struct {
     /// commit, a replicated entry and boot replay alike. The partition has
     /// already appended the entry to the ring, so `entry.header.index` is
     /// the UAL index for stream lookups.
-    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    ///
+    /// Answers: an append, its id's sequence and milliseconds (two u64); a
+    /// trim, what it removed and the stream's first sequence after (two
+    /// u64); the rest, nothing.
+    fn replayEntry(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const self: *StreamHandler = @ptrCast(@alignCast(ctx));
         const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
 
-        if (etype == .stream_append) {
-            self.last_append = null;
-            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
-            {
+        switch (etype) {
+            .stream_append => {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
                 const av = stream_mod.decodeAppendValue(cmd.value);
-                const partition_index = av.partition_index;
                 const record_count = stream_mod.batchRecordCount(av.payload);
                 const byte_len: u32 = @intCast(av.payload.len);
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply.
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                self.last_append = self.stream.appendToStreamAt(name_hash, entry.header.index, partition_index, ts_ms, record_count, byte_len) catch |err| blk: {
+                const id = self.stream.appendToStreamAt(name_hash, entry.header.index, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
                     log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
-                    break :blk null;
+                    return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
                 };
                 // Register the NAMESPACE-QUALIFIED name: a client's append,
                 // and a pipeline sink's on this shard, proposed any implicit
@@ -1788,62 +1794,48 @@ pub const StreamHandler = struct {
                 if (ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key)) |ns_name| {
                     self.stream.registerStream(ns_name) catch |err| {
                         log.err("stream '{s}': name not registered, so lists miss it: {s}", .{ cmd.key, @errorName(err) });
-                        return .failed;
+                        return error.OutOfMemory;
                     };
                 } else |_| {}
-            }
-            return if (self.last_append == null) .failed else .applied;
+                out.putInt(u64, id.sequence);
+                out.putInt(u64, id.timestamp_ms);
+            },
+            .stream_trim => {
+                if (cmd.value.len < 8) return error.Halt;
+                const nh = std.mem.readInt(u64, cmd.value[0..8], .little);
+                const bound = TrimBound.decode(cmd.key) orelse return error.Halt;
+                // An age resolves against this entry's stamp, so every replica
+                // cuts at the same place.
+                const deleted = if (bound.resolve(entry.header.timestamp_ns)) |trim_id| self.stream.trimStream(nh, trim_id) else 0;
+                const first_id = self.stream.streamFirstId(nh);
+                out.putInt(u64, deleted);
+                out.putInt(u64, if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0);
+            },
+            // Stream delete: key = raw stream name, value = qualified name.
+            // Applied from the committed log everywhere, like stream_trim.
+            .stream_delete => {
+                if (cmd.key.len == 0) return error.Halt;
+                _ = self.stream.deleteStream(router.nameHash(cmd.namespace_hash, cmd.key), cmd.key, cmd.value);
+            },
+            // Consumer-group durability: cg_commit carries a group's
+            // ack-floor cursor + sweeper config; cg_delete removes the group. The
+            // CommandPayload key is the namespace-qualified group name. Cursor
+            // advance is monotonic (see StreamProjection.applyCommit), so this is
+            // safe to run on the originating leader as well as on followers/replay.
+            .cg_commit => {
+                if (cmd.key.len == 0) return error.Halt;
+                const commit = stream_mod.GroupCommit.decode(cmd.value) orelse return error.Halt;
+                self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch |err| {
+                    log.err("consumer group '{s}': commit at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
+                    return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
+                };
+            },
+            .cg_delete => {
+                if (cmd.key.len == 0) return error.Halt;
+                _ = self.stream.deleteGroup(cmd.key);
+            },
+            else => return error.Halt,
         }
-
-        if (etype == .stream_trim) {
-            self.last_trim_count = 0;
-            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
-            const nh = if (cmd.value.len >= 8) std.mem.readInt(u64, cmd.value[0..8], .little) else 0;
-            const bound = TrimBound.decode(cmd.key) orelse {
-                log.err("stream trim entry index={d} is malformed; skipped, so nothing is trimmed", .{entry.header.index});
-                return .failed;
-            };
-            // An age resolves against this entry's stamp, so every replica
-            // cuts at the same place.
-            if (bound.resolve(entry.header.timestamp_ns)) |trim_id| {
-                self.last_trim_count = self.stream.trimStream(nh, trim_id);
-            }
-            return .applied;
-        }
-
-        // Stream delete: key = raw stream name, value = qualified name.
-        // Applied from the committed log everywhere, like stream_trim.
-        if (etype == .stream_delete) {
-            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
-            if (cmd.key.len == 0) return .failed;
-            const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
-            _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
-            return .applied;
-        }
-
-        // Consumer-group durability: cg_commit carries a group's
-        // ack-floor cursor + sweeper config; cg_delete removes the group. The
-        // CommandPayload key is the namespace-qualified group name. Cursor
-        // advance is monotonic (see StreamProjection.applyCommit), so this is
-        // safe to run on the originating leader as well as on followers/replay.
-        if (etype == .cg_commit) {
-            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
-            if (cmd.key.len == 0) return .failed;
-            const commit = stream_mod.GroupCommit.decode(cmd.value) orelse return .failed;
-            self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch |err| {
-                log.err("consumer group '{s}': commit at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
-                return .failed;
-            };
-            return .applied;
-        }
-
-        if (etype == .cg_delete) {
-            const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
-            if (cmd.key.len == 0) return .failed;
-            _ = self.stream.deleteGroup(cmd.key);
-            return .applied;
-        }
-        return .failed;
     }
 
     // ── Trim Persistence ────────────────────────────────────────────────
@@ -2225,6 +2217,12 @@ fn readPartitionCount(handler: *StreamHandler, stream: []const u8, partition_ind
         .stream_messages => |m| std.mem.readInt(u32, m.data[0..4], .little),
         else => error.TestUnexpectedResult,
     };
+}
+
+fn applyLogged(h: *StreamHandler, e: *const entry_mod.Entry) persistence_mod.ApplyError!Result {
+    var out = Result.start(e);
+    try StreamHandler.replayEntry(h, e, &out);
+    return out;
 }
 
 test "stream handler: dispatcher registration" {
@@ -2700,7 +2698,7 @@ test "stream handler: partition_index survives restart/replay" {
     var idx: u64 = 1;
     while (idx <= partition.committed_index) : (idx += 1) {
         if (partition.ual.read(idx)) |entry| {
-            _ = StreamHandler.replayEntry(&handler, &entry);
+            _ = try applyLogged(&handler, &entry);
         }
     }
 
@@ -2727,10 +2725,10 @@ test "stream handler: an append that runs out of memory fails, rather than apply
         // Replayed from scratch, each allocation failed in turn.
         handler.stream.reset();
         fa.fail_index = fa.alloc_index + fail_at;
-        const outcome = StreamHandler.replayEntry(&handler, &entry);
-        if (outcome == .applied) try testing.expect(handler.stream.stream_names.contains("s1"));
+        const outcome = applyLogged(&handler, &entry);
+        if (outcome) |_| try testing.expect(handler.stream.stream_names.contains("s1")) else |err| try testing.expectEqual(error.OutOfMemory, err);
         if (!fa.has_induced_failure) {
-            try testing.expectEqual(persistence_mod.ApplyOutcome.applied, outcome);
+            _ = try outcome;
             break;
         }
     }
@@ -2793,7 +2791,7 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
     const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
-    try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &del));
+    _ = try applyLogged(&handler, &del);
     try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
 
@@ -2941,14 +2939,16 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         var pbuf: [128]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old records.
         const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
-        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &trim));
-        try testing.expectEqual(@as(u64, 2), handler.last_trim_count);
+        var trimmed_out = try applyLogged(&handler, &trim);
+        var tr = trimmed_out.reader();
+        try testing.expectEqual(@as(?u64, 2), tr.int(u64));
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
 
         // An age past the stamp trims nothing, never everything.
         const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
-        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, StreamHandler.replayEntry(&handler, &past));
-        try testing.expectEqual(@as(u64, 0), handler.last_trim_count);
+        trimmed_out = try applyLogged(&handler, &past);
+        tr = trimmed_out.reader();
+        try testing.expectEqual(@as(?u64, 0), tr.int(u64));
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
     }
 }

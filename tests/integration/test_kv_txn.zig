@@ -108,7 +108,11 @@ test "integration: kv_txn — projection applies kv_batch atomically" {
     defer testing.allocator.free(payload);
 
     const entry = ual_entry.buildEntry(.kv_batch, 0, 1, 100, 12345, payload);
-    try kv.applyEntry(&entry);
+    var result = src.projection.kv.Result.start(&entry);
+    try kv.applyEntry(&entry, &result);
+    // The batch answers with its op count.
+    var r = result.reader();
+    try testing.expectEqual(@as(?u16, 4), r.int(u16));
 
     // Verify final state.
     try testing.expect(kv.get("doomed") == null); // deleted

@@ -141,16 +141,18 @@ pub const Partition = struct {
     /// `applyRouted`, for a caller that needs only the index: tests and
     /// the handlers' no-shard paths.
     pub fn apply(self: *Partition, e: *const Entry) !u64 {
-        return (try self.applyRouted(e)).index;
+        var out = router_mod.Result.start(e);
+        return (try self.applyRouted(e, &out)).index;
     }
 
-    pub const Applied = struct { index: u64, route: router_mod.ApplyResult };
+    /// `failed`: why the projection the router owns could not apply it.
+    pub const Applied = struct { index: u64, route: router_mod.ApplyResult, failed: ?router_mod.ApplyError = null };
 
     /// Apply a committed entry: route it to its projection and, for every
     /// type but KV, append it to the hot ring and warm store. Returns the
     /// entry's index and what the router made of it, which the shard counts
     /// when a projection failed.
-    pub fn applyRouted(self: *Partition, e: *const Entry) !Applied {
+    pub fn applyRouted(self: *Partition, e: *const Entry, out: *router_mod.Result) !Applied {
         // The hot ring and the warm store exist for the stream read path,
         // which fetches record payloads by index. The KV projection holds its
         // own values and nothing reads a KV payload back from the partition
@@ -159,7 +161,11 @@ pub const Partition = struct {
         const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
-        const route = self.router.apply(e);
+        var failed: ?router_mod.ApplyError = null;
+        const route = self.router.apply(e, out) catch |err| blk: {
+            failed = err;
+            break :blk .skipped_no_projection;
+        };
 
         // Track committed index
         if (e.header.index > self.committed_index) {
@@ -171,7 +177,7 @@ pub const Partition = struct {
         // Save payload to warm store (survives UAL hot ring eviction).
         // Uses the entry's own index as key.
         if (e.payload.len > 0 and !is_kv) {
-            const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route };
+            const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route, .failed = failed };
 
             // Free old copy if this index was already in warm store (idempotent apply)
             if (self.warm_store.fetchRemove(e.header.index)) |old| {
@@ -182,7 +188,7 @@ pub const Partition = struct {
 
             self.warm_store.put(self.allocator, e.header.index, copy) catch {
                 self.allocator.free(copy);
-                return .{ .index = index, .route = route };
+                return .{ .index = index, .route = route, .failed = failed };
             };
             self.warm_bytes_used += copy.len;
 
@@ -190,7 +196,7 @@ pub const Partition = struct {
             self.evictWarmIfNeeded();
         }
 
-        return .{ .index = index, .route = route };
+        return .{ .index = index, .route = route, .failed = failed };
     }
 
     /// Evict oldest entries from the warm store when over budget.
