@@ -12,4 +12,3 @@ pub const ual = struct {
 pub const partition = @import("partition.zig");
 pub const tombstones = @import("tombstones.zig");
 pub const durable_log = @import("durable_log.zig");
-pub const snapshot = @import("snapshot.zig");

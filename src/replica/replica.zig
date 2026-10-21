@@ -308,7 +308,7 @@ pub fn Replica(comptime Io: type) type {
                 .removed_notice => self.takeRemovedNotice(frame),
                 .forward_write => self.runForwardedWrite(frame),
                 .forward_reply => self.takeForwardReply(frame),
-                .install_snapshot, .peer_info, .hello, .hello_back, .verify, .welcome => {},
+                .peer_info, .hello, .hello_back, .verify, .welcome => {},
             }
         }
 

@@ -182,11 +182,14 @@ test "framer: oversize, unknown type, wrong source, and a frame altered, replaye
     f.len = 0;
 
     hdr.payload_len = 0;
-    hdr.msg_type = 200;
-    @memcpy(f.space()[0..HEADER_SIZE], hdr.asBytes());
-    f.commit(HEADER_SIZE);
-    try testing.expectError(error.UnknownType, f.next(1));
-    f.len = 0;
+    // 5 is a gap left by a removed frame type: it names none.
+    for ([_]u8{ 200, 5 }) |t| {
+        hdr.msg_type = t;
+        @memcpy(f.space()[0..HEADER_SIZE], hdr.asBytes());
+        f.commit(HEADER_SIZE);
+        try testing.expectError(error.UnknownType, f.next(1));
+        f.len = 0;
+    }
 
     var wire: [64]u8 = undefined;
     var n = frameInto(&wire, &k.send, .append_entries, 1, "x");

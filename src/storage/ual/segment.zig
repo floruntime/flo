@@ -1,7 +1,9 @@
-//! UAL Segment — on-disk immutable segment format
+//! UAL Segment — on-disk segment format
 //!
 //! Sealed segment files (`.flseg`) contain sequential UAL entries with
-//! a sparse index for O(log N) lookups and a footer for integrity.
+//! a sparse index for O(log N) lookups and a footer for integrity. A sealed
+//! segment is not appended to, but a log truncation rewrites the one it
+//! cuts through (`DurableLog`).
 //!
 //! ## Layout
 //!
