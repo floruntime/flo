@@ -646,7 +646,6 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
     } else {
         ctx.print("members:     no member list in the log\n", .{});
     }
-    ctx.print("snapshot:    {s}\n", .{sum.snapshot orelse "none"});
     if (sum.truncation_pending) ctx.print("note:        a log truncation is pending; the server finishes it at its next start\n", .{});
     return sum;
 }
@@ -658,9 +657,8 @@ fn runInspect(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     defer ctx.allocator.free(data_dir);
     var lock: stdx.fs.File = undefined;
-    var sum = try openOffline(ctx, data_dir, &lock);
+    _ = try openOffline(ctx, data_dir, &lock);
     defer stdx.fs.closeFile(lock);
-    defer sum.deinit(ctx.allocator);
 }
 
 fn runForceMembers(ctx: *commander.Context) commander.Error!void {
@@ -676,7 +674,6 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     var lock: stdx.fs.File = undefined;
     var sum = try openOffline(ctx, data_dir, &lock);
     defer stdx.fs.closeFile(lock);
-    defer sum.deinit(ctx.allocator);
 
     if (sum.last_index == 0) {
         return outcome.localRefusal(ctx, "this node has no log; there is nothing to recover from. Run force-members on a node that has one (see inspect)", .{});

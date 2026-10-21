@@ -10,7 +10,6 @@ const membership = @import("../raft/membership.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const durable_log_mod = @import("../storage/durable_log.zig");
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
-const ShardManifest = @import("shard_manifest.zig").ShardManifest;
 
 const Entry = entry_mod.Entry;
 
@@ -30,13 +29,7 @@ pub const Summary = struct {
     /// The config's member ids, voters and replicas.
     members: [membership.MAX_MEMBERS]u32 = undefined,
     member_count: usize = 0,
-    /// The latest snapshot's file name; its entries are not in the segments.
-    snapshot: ?[]const u8 = null,
     truncation_pending: bool = false,
-
-    pub fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
-        if (self.snapshot) |s| allocator.free(s);
-    }
 
     pub fn configMembers(self: *const Summary) []const u32 {
         return self.members[0..self.member_count];
@@ -55,12 +48,6 @@ pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
 
     var sum: Summary = .{ .hard_state = try hard_state_mod.load(dir) };
-    errdefer sum.deinit(allocator);
-    if (try ShardManifest.load(allocator, dir)) |sm_val| {
-        var sm = sm_val;
-        defer sm.deinit(allocator);
-        if (sm.latest_snapshot) |s| sum.snapshot = try allocator.dupe(u8, s);
-    }
     var intent_buf: [std.fs.max_path_bytes]u8 = undefined;
     const intent = try std.fmt.bufPrint(&intent_buf, "{s}/{s}", .{ segs, durable_log_mod.INTENT_FILENAME });
     sum.truncation_pending = if (stdx.fs.openFile(intent, .{})) |f| blk: {
@@ -253,7 +240,6 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
     try hard_state_mod.save(dir, .{ .node_id = 2, .term = 5, .voted_for = 3, .lost_log = true });
 
     var sum = try summarize(testing.allocator, root);
-    defer sum.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 1), sum.first_index);
     try testing.expectEqual(@as(u64, 3), sum.last_index);
     try testing.expectEqual(@as(u64, 4), sum.last_term);
@@ -263,7 +249,6 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
 
     try forceMembers(testing.allocator, root, &sum);
     var after = try summarize(testing.allocator, root);
-    defer after.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 4), after.last_index);
     try testing.expectEqual(@as(u64, 4), after.commit);
     try testing.expectEqual(@as(u64, 4), after.config_index);
@@ -278,7 +263,6 @@ test "offline: force-members refuses a data dir with no log" {
     const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
     defer testing.allocator.free(root);
     var sum = try summarize(testing.allocator, root);
-    defer sum.deinit(testing.allocator);
     try testing.expectError(error.NoLog, forceMembers(testing.allocator, root, &sum));
 }
 

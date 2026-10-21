@@ -52,7 +52,6 @@ pub const MsgType = enum(u8) {
     append_entries_response = 2,
     request_vote = 3,
     request_vote_response = 4,
-    install_snapshot = 5,
     /// A client write a follower received, carried to the leader as the
     /// request bytes it was sent, and the leader's answer carried back.
     forward_write = 6,

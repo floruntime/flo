@@ -116,9 +116,6 @@ const queue_handler_mod = @import("../queue/handler.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
 const ReplayRegistry = persistence_mod.ReplayRegistry;
-const snapshot_mod = @import("../storage/snapshot.zig");
-const shard_manifest = @import("shard_manifest.zig");
-const ShardManifest = shard_manifest.ShardManifest;
 pub const run_id_mod = @import("run_id.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const ShardMetrics = @import("../metrics/registry.zig").ShardMetrics;
@@ -809,13 +806,6 @@ pub const Shard = struct {
             };
             durable_log = dl;
 
-            const snaps_dir_path = try std.fmt.allocPrint(allocator, "{s}/snaps", .{shard_dir});
-            defer allocator.free(snaps_dir_path);
-            @import("stdx").fs.makePathDurable(snaps_dir_path) catch |err| {
-                log.err("shard {d}: cannot create or sync {s}: {s}", .{ shard_id, snaps_dir_path, @errorName(err) });
-                return err;
-            };
-
             // ── Hard state ──────────────────────────────────────────────
             // The term and vote this shard's Raft node must not forget.
             const loaded = hard_state_mod.load(shard_dir) catch |err| {
@@ -837,32 +827,7 @@ pub const Shard = struct {
             hard_state_store = store;
             raft_node.hard_state_sink = .{ .ctx = @ptrCast(store), .persist = HardStateStore.persist };
 
-            // ── Recovery from shard MANIFEST ────────────────────────────
-            // The MANIFEST names the latest snapshot to load from snaps/.
-            var replay_from: u64 = 0;
-
-            // A MANIFEST or snapshot that will not load is damage: a full
-            // replay would land on whatever the snapshot half-restored.
-            if (ShardManifest.load(allocator, shard_dir)) |maybe_sm| {
-                if (maybe_sm) |sm_val| {
-                    var sm = sm_val;
-                    defer sm.deinit(allocator);
-
-                    if (sm.latest_snapshot) |snap_name| {
-                        if (boot.cancelled()) return error.BootCancelled;
-                        if (restoreSnapshot(allocator, snaps_dir_path, snap_name, partition)) |snap_index| {
-                            replay_from = snap_index;
-                        } else |err| {
-                            boot_damage = silent_loss.Damage.init(.snapshot_unloadable, "snapshot {s} would not load ({s})", .{ snap_name, @errorName(err) });
-                        }
-                    }
-                }
-            } else |err| {
-                boot_damage = silent_loss.Damage.init(.snapshot_unloadable, "MANIFEST would not load ({s})", .{@errorName(err)});
-            }
-
             // Replay existing segment files from segs/ into partition.
-            // If a snapshot was loaded, skip entries at or below replay_from.
             // Replay also rebuilds the Raft log (last index, term index and
             // the hot-ring tail) from the same pass over the segments.
             //
@@ -879,31 +844,19 @@ pub const Shard = struct {
                 const log_files = durable_log.?;
                 if (listDurable(log_files)) |files| {
                     for (files) |f| watermark = @max(watermark, f.commit_index_at_seal);
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, replay_from, watermark, &raft_node.log, shard_id, &losses, boot);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
-                    // A snapshot covers its prefix already; draining from
-                    // below it would apply those entries a second time.
-                    raft_node.last_applied = @max(replay_from, replayed.applied_through);
+                    raft_node.last_applied = replayed.applied_through;
                 } else |err| {
                     if (log_files.badHeaderSegment().len == 0) return err;
                     boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
                 }
             }
             if (watermark == 0 and !raft_node.log.isEmpty()) {
-                log.warn("shard {d}: no segment carries a commit watermark; everything above the snapshot is applied at boot through the log instead of replay", .{shard_id});
+                log.warn("shard {d}: no segment carries a commit watermark; everything is applied at boot through the log instead of replay", .{shard_id});
             }
 
-            // A snapshot ahead of the flushed segments (async flush, crash
-            // after the snapshot) would leave the log below what the
-            // projections hold, and every later index would be skipped as
-            // already applied. The log continues from the snapshot instead.
-            if (raft_node.log.lastIndex() < replay_from) {
-                raft_node.log.resetToSnapshot(replay_from, partition.current_term);
-            }
-            // A snapshot's prefix may be gone from the segments; its stamp
-            // is the floor for the next one this node gives.
-            raft_node.log.last_stamp = @max(raft_node.log.last_stamp, partition.router.applied_stamp);
             raft_node.noteApplied(partition.router.applied_stamp);
 
             shard_data_dir = shard_dir;
@@ -5906,21 +5859,10 @@ fn listDurable(dl: *DurableLog) ![]const durable_log_mod.SegmentFile {
     return dl.segments();
 }
 
-/// Restore the projections from snapshot `name` in `snaps_dir_path`.
-/// Returns the index it covers.
-fn restoreSnapshot(allocator: std.mem.Allocator, snaps_dir_path: []const u8, name: []const u8, partition: *Partition) !u64 {
-    const snap_dir = try @import("stdx").fs.openDir(snaps_dir_path, .{});
-    defer @import("stdx").fs.closeDir(snap_dir);
-    const snap = (try snapshot_mod.loadSnapshotByName(allocator, snap_dir, name)) orelse return error.SnapshotMissing;
-    defer allocator.free(snap.data);
-    return partition.recover(snap.data);
-}
-
 /// Feed a durable entry back into the Raft log at boot: the last index, the
-/// term index and the hot-ring tail all come from this pass. A hole below
-/// a snapshot is its compacted prefix, and the log continues past it. Any
-/// other hole is damage: an entry this node committed is gone.
-fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry, replay_from: u64) ?silent_loss.Damage {
+/// term index and the hot-ring tail all come from this pass. A hole is
+/// damage: an entry this node committed is gone.
+fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry) ?silent_loss.Damage {
     _ = raft_log.append(e) catch |err| switch (err) {
         error.IndexGap => {
             const tip = raft_log.lastIndex();
@@ -5928,14 +5870,7 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
                 log.err("shard {d}: segments hold index {d} twice (log tip {d}); the later copy is ignored", .{ shard_id, e.header.index, tip });
                 return null;
             }
-            if (e.header.index - 1 > replay_from) {
-                return silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 });
-            }
-            log.info("shard {d}: no segment holds indices {d}..{d}, below the snapshot at {d}; the log continues from it", .{ shard_id, tip + 1, e.header.index - 1, replay_from });
-            raft_log.resetToSnapshot(e.header.index - 1, raft_log.lastTerm());
-            _ = raft_log.append(e) catch |again| {
-                log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(again) });
-            };
+            return silent_loss.Damage.init(.index_hole, "no segment holds entries {d}..{d}", .{ tip + 1, e.header.index - 1 });
         },
         else => log.err("shard {d}: cannot restore index {d}: {s}", .{ shard_id, e.header.index, @errorName(err) }),
     };
@@ -5967,15 +5902,12 @@ const REPLAY_PROGRESS_MS: u64 = 5_000;
 /// it was first committed. Replay stops at the first damage: what follows
 /// it would apply over a hole.
 ///
-/// If `replay_from` > 0, entries with index <= replay_from are skipped
-/// (already restored from a snapshot). Entries above `watermark` are
-/// restored into the Raft log but not applied.
+/// Entries above `watermark` are restored into the Raft log but not applied.
 fn replaySegments(
     allocator: std.mem.Allocator,
     files: []const durable_log_mod.SegmentFile,
     partition: *Partition,
     replay_registry: *const ReplayRegistry,
-    replay_from: u64,
     watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
@@ -5995,7 +5927,7 @@ fn replaySegments(
             out.cancelled = true;
             break;
         }
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, replay_from, watermark, raft_log, shard_id, losses, boot, last, &out);
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, boot, last, &out);
         if (out.damage != null or out.cancelled) break;
     }
     if (out.entries > 0 and !out.cancelled) {
@@ -6009,7 +5941,6 @@ fn replaySegmentFile(
     full_path: []const u8,
     partition: *Partition,
     replay_registry: *const ReplayRegistry,
-    replay_from: u64,
     watermark: u64,
     raft_log: *RaftLog,
     shard_id: u16,
@@ -6058,14 +5989,12 @@ fn replaySegmentFile(
             }
         }
 
-        // Every durable entry is part of the Raft log, snapshot or not.
-        if (restoreRaftEntry(shard_id, raft_log, &seg_entry, replay_from)) |damage| {
+        // Every durable entry is part of the Raft log.
+        if (restoreRaftEntry(shard_id, raft_log, &seg_entry)) |damage| {
             out.damage = damage;
             return;
         }
 
-        // Skip entries already covered by snapshot
-        if (replay_from > 0 and seg_entry.header.index <= replay_from) continue;
         // Above the watermark: in the log, not yet in the projections.
         if (seg_entry.header.index > watermark) continue;
 
@@ -10855,54 +10784,6 @@ test "a truncation the previous run recorded is finished before replay" {
     try std.testing.expectError(error.FileNotFound, @import("stdx").fs.access(intent, .{}));
 }
 
-test "a snapshot ahead of the commit watermark is not drained over at boot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const data_dir = try testDataDir(&tmp);
-    defer std.testing.allocator.free(data_dir);
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-
-    {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
-        defer shard.deinit();
-        shard.wireHandlerShardPtrs();
-        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
-        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
-        try std.testing.expect(shard.applyCommitted());
-        // Sealed under a lagging commit, as a follower's segment is, then a
-        // snapshot taken past it.
-        shard.raft_node.commit_index = 1;
-        try shard.flushSegmentToDisk();
-        shard.raft_node.commit_index = 3;
-        const partition = shard.partitions[0];
-        const snap = try partition.snapshot();
-        defer std.testing.allocator.free(snap);
-        var name_buf: [128]u8 = undefined;
-        const name = snapshot_mod.snapshotFilename(&name_buf, partition.router.applied_index, 1);
-        const snaps = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/snaps/{s}", .{ data_dir, name });
-        defer std.testing.allocator.free(snaps);
-        {
-            const f = try @import("stdx").fs.createFile(snaps, .{});
-            defer @import("stdx").fs.closeFile(f);
-            try @import("stdx").fs.writeAll(f, snap);
-        }
-        const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
-        defer std.testing.allocator.free(shard_dir);
-        try ShardManifest.setLatestSnapshot(std.testing.allocator, shard_dir, name);
-    }
-
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
-    defer shard.deinit();
-    shard.wireHandlerShardPtrs();
-    shard.applyDeferredTail();
-    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
-    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
-    // Nothing the snapshot covers was offered to the projections again.
-    try std.testing.expectEqual(@as(u64, 0), shard.partitions[0].router.stats.entries_skipped);
-}
-
 test "a restarted node stamps after the last entry its log replays, though its clock is now behind it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12170,16 +12051,6 @@ test "an entry of a type this build doesn't know takes its shard offline, not th
     try t.expectOffline(.segment_bad_entry, 1);
 }
 
-test "a MANIFEST naming a snapshot that will not load takes its shard offline, not a full replay" {
-    var t: DamageTest = undefined;
-    try t.init();
-    defer t.deinit();
-    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
-    defer std.testing.allocator.free(shard_dir);
-    try ShardManifest.setLatestSnapshot(std.testing.allocator, shard_dir, "0000000002-1.fsnap");
-    try t.expectOffline(.snapshot_unloadable, 0);
-}
-
 test "an entry no projection or applier can take is counted on its path, and its client told it did not apply" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -12341,18 +12212,6 @@ test "an entry that cannot apply at boot is counted, and replay carries on past 
     try std.testing.expect(shard.offline == null);
     try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
     try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
-}
-
-test "a MANIFEST that will not load takes its shard offline, not a full replay" {
-    for ([_][]const u8{ "not json", "[]" }) |content| {
-        var t: DamageTest = undefined;
-        try t.init();
-        defer t.deinit();
-        const manifest = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/MANIFEST", .{t.data_dir});
-        defer std.testing.allocator.free(manifest);
-        try DamageTest.writeFile(manifest, content);
-        try t.expectOffline(.snapshot_unloadable, 0);
-    }
 }
 
 test "Shard: the state it publishes follows the fields that decide it, the one needing an operator first" {

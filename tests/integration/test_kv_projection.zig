@@ -206,29 +206,6 @@ test "integration: KV TOUCH on missing key" {
     try testing.expectError(error.NotFound, kv.applyTouch("nope", 0, 1, 1, 0));
 }
 
-test "integration: KV snapshot round-trip preserves value_type" {
-    var kv = KVProjection.init(testing.allocator, 0);
-    defer kv.deinit();
-
-    _ = try kv.applyIncr("counter", 100, 1, 1, 0);
-    try kv.put("string", "hello", 2, 1, 0, 0);
-    try kv.put("json", "{\"k\":1}", 3, 1, 0, 0);
-
-    const snapshot = try kv.serialize(testing.allocator);
-    defer testing.allocator.free(snapshot);
-
-    var kv2 = KVProjection.init(testing.allocator, 0);
-    defer kv2.deinit();
-    try kv2.deserialize(snapshot);
-
-    const counter = kv2.get("counter").?;
-    try testing.expectEqual(src.projection.kv.ValueType.counter, counter.value_type);
-    try testing.expectEqual(@as(i64, 100), std.mem.readInt(i64, counter.value[0..8], .little));
-
-    const string_entry = kv2.get("string").?;
-    try testing.expectEqual(src.projection.kv.ValueType.string, string_entry.value_type);
-}
-
 // =============================================================================
 // JSON path integration — validates util.json_path against the projection.
 // End-to-end coverage of the same opcodes through the CLI lives in

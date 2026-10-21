@@ -1,16 +1,10 @@
-//! Partition — owns a UAL, projections, and snapshot state
+//! Partition — owns a UAL and its projections
 //!
 //! Each Partition represents one Raft group's data. The Shard owns
 //! multiple Partitions (those where `partition_id % shard_count == shard_id`).
 //!
 //! Data flow:
 //!   propose(entry) → UAL.append → ProjectionRouter.apply → advance applied_index
-//!
-//! Snapshot flow:
-//!   snapshot() → serialize projections → atomic .fsnap write → MANIFEST update
-//!
-//! Recovery flow:
-//!   recover() → load .fsnap → restore projections → replay UAL from snapshot+1
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,7 +12,6 @@ const entry_mod = @import("ual/entry.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const ual_mod = @import("ual/ual.zig");
 const tombstones = @import("tombstones.zig");
-const snapshot_mod = @import("snapshot.zig");
 const router_mod = @import("../projection/router.zig");
 const kv_mod = @import("../projection/kv.zig");
 const queue_mod = @import("../projection/queue.zig");
@@ -268,84 +261,6 @@ pub const Partition = struct {
 
     // ── Snapshot ────────────────────────────────────────────────────────
 
-    /// Create a snapshot of the current partition state.
-    /// Serializes all four projections into separate sections.
-    /// Returns the sealed snapshot bytes. Caller owns the allocation.
-    pub fn snapshot(self: *Partition) ![]u8 {
-        const applied = self.router.applied_index;
-        // The header's time is the last applied stamp, not this node's clock.
-        const timestamp = self.router.applied_stamp;
-        log.debug("Partition: taking snapshot, partition_id={d}, applied_index={d}", .{ self.id, applied });
-
-        var builder = snapshot_mod.SnapshotBuilder.init(
-            self.allocator,
-            self.id,
-            applied,
-            self.current_term,
-            timestamp,
-        );
-        defer builder.deinit();
-
-        // ── KV Projection ──────────────────────────────────────────────
-        const kv_data = try self.kv.serialize(self.allocator);
-        defer self.allocator.free(kv_data);
-        try builder.addSection(.kv, kv_data);
-
-        // ── Queue Projection ───────────────────────────────────────────
-        const queue_data = try self.queue.serialize(self.allocator);
-        defer self.allocator.free(queue_data);
-        try builder.addSection(.queue, queue_data);
-
-        // ── Stream Projection ──────────────────────────────────────────
-        const stream_data = try self.stream.serialize(self.allocator);
-        defer self.allocator.free(stream_data);
-        try builder.addSection(.stream, stream_data);
-
-        // ── TS Projection ──────────────────────────────────────────────
-        const ts_data = try self.ts.serialize(self.allocator);
-        defer self.allocator.free(ts_data);
-        try builder.addSection(.ts, ts_data);
-
-        return try builder.seal();
-    }
-
-    /// Recover partition state from a snapshot.
-    /// Deserializes all projection sections and restores metadata.
-    /// Returns the snapshot's applied UAL index (replay UAL from index+1).
-    pub fn recover(self: *Partition, snapshot_data: []const u8) !u64 {
-        const reader = try snapshot_mod.SnapshotReader.init(snapshot_data);
-
-        // Restore metadata from snapshot header
-        const snap_index = reader.snapshotIndex();
-        log.debug("Partition: recovering from snapshot, partition_id={d}, snap_index={d}, data_len={d}", .{ self.id, snap_index, snapshot_data.len });
-        self.current_term = reader.snapshotTerm();
-        self.router.applied_index = snap_index;
-        self.router.applied_stamp = reader.header.timestamp_ns;
-        self.committed_index = snap_index; // at snapshot time, committed == applied
-
-        // ── KV Projection ──────────────────────────────────────────────
-        if (reader.findSection(.kv)) |kv_ref| {
-            try self.kv.deserialize(kv_ref.data);
-        }
-
-        // ── Queue Projection ───────────────────────────────────────────
-        if (reader.findSection(.queue)) |queue_ref| {
-            try self.queue.deserialize(queue_ref.data);
-        }
-
-        // ── Stream Projection ──────────────────────────────────────────
-        if (reader.findSection(.stream)) |stream_ref| {
-            try self.stream.deserialize(stream_ref.data);
-        }
-
-        // ── TS Projection ──────────────────────────────────────────────
-        if (reader.findSection(.ts)) |ts_ref| {
-            try self.ts.deserialize(ts_ref.data);
-        }
-
-        return snap_index;
-    }
-
     // ── Queries ─────────────────────────────────────────────────────────
 
     /// The last applied UAL index (projections are up to date through this).
@@ -515,42 +430,6 @@ test "partition: idempotent apply" {
 
     // Router stats should show 1 applied, 1 skipped
     try testing.expectEqual(@as(u64, 1), part.router.stats.entries_applied);
-}
-
-test "partition: snapshot and recover" {
-    const allocator = testing.allocator;
-
-    // Create partition and apply some entries
-    var part = try Partition.init(allocator, 5, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    var buf1: [128]u8 = undefined;
-    const e1 = kvTestEntry(&buf1, .kv_put, .{ .key = "k1", .value = "v1", .ttl_ms = null }, 1, 1000);
-    _ = try part.apply(&e1);
-
-    var buf2: [128]u8 = undefined;
-    const e2 = kvTestEntry(&buf2, .kv_put, .{ .key = "k2", .value = "v2", .ttl_ms = null }, 2, 2000);
-    _ = try part.apply(&e2);
-
-    // Take snapshot
-    const snap_data = try part.snapshot();
-    defer allocator.free(snap_data);
-
-    // Create a fresh partition and recover from snapshot
-    var part2 = try Partition.init(allocator, 5, 8192, 0);
-    defer part2.deinit();
-    part2.wireProjections();
-
-    const snap_index = try part2.recover(snap_data);
-    try testing.expect(snap_index > 0);
-
-    // Applied index and committed_index restored
-    try testing.expectEqual(part.router.applied_index, part2.router.applied_index);
-    try testing.expectEqual(part.committed_index, part2.committed_index);
-    // And the last applied stamp, the floor for the next one this node
-    // gives once the log below the snapshot is gone.
-    try testing.expectEqual(@as(u64, 2000), part2.router.applied_stamp);
 }
 
 test "partition: contains check" {
