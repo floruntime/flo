@@ -218,6 +218,15 @@ pub const Dispatcher = struct {
         return self.walk_fn[op_code] != null;
     }
 
+    /// A walk op with no walk contexts, if any: on a node of several shards
+    /// it would list the connection's shard alone.
+    pub fn unwiredWalk(self: *const Dispatcher) ?u16 {
+        for (self.walk_fn, self.walk_contexts, 0..) |scan, contexts, op| {
+            if (scan != null and contexts == null) return @intCast(op);
+        }
+        return null;
+    }
+
     /// Register a handler for a contiguous range of opcode values [lo, hi] inclusive.
     pub fn registerRange(self: *Dispatcher, lo: u16, hi: u16, handler: HandlerFn) void {
         var i: u16 = lo;

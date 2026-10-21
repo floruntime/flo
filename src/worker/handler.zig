@@ -28,6 +28,10 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const ns_keys = @import("../namespace/handler.zig");
+const table_run = @import("../node/table_run.zig");
+const gather_mod = @import("../node/gather.zig");
+const schema = @import("../protocol/schema.zig");
+const worker_ops = @import("../protocol/worker_ops.zig");
 
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -83,10 +87,27 @@ pub const WorkerRecord = struct {
     last_heartbeat_ms: i64,
 };
 
+comptime {
+    // worker.list answers with the record's own type and status values.
+    for (.{ .{ WorkerType, worker_ops.WorkerType }, .{ WorkerStatus, worker_ops.WorkerStatus } }) |pair| {
+        const info = @typeInfo(pair[0]).@"enum";
+        if (info.field_names.len != @typeInfo(pair[1]).@"enum".field_names.len) @compileError("worker.list's " ++ @typeName(pair[0]) ++ " differs from the record's");
+        for (info.field_names, info.field_values) |name, value| {
+            if (@backingInt(@field(pair[1], name)) != value) @compileError("worker.list's " ++ @typeName(pair[0]) ++ "." ++ name ++ " differs from the record's");
+        }
+    }
+}
+
+const ListResponse = table_run.op("worker.list").response;
+const Workers = ListResponse.field_list[0].T;
+const Row = worker_ops.WorkerRow;
+
 pub const WorkerHandler = struct {
     allocator: Allocator,
     /// Keyed by `workerKey`: one worker id in two namespaces is two workers.
     workers: std.StringHashMap(WorkerRecord),
+    /// worker.list builds its page here; allocated on first use.
+    list_buf: ?[]u8 = null,
 
     const MAX_WORKERS: usize = 10_000;
     const HEARTBEAT_TIMEOUT_MS: i64 = 90_000; // 90s — unhealthy if no heartbeat
@@ -104,6 +125,7 @@ pub const WorkerHandler = struct {
             self.freeWorkerRecord(entry.value_ptr);
         }
         self.workers.deinit();
+        if (self.list_buf) |b| self.allocator.free(b);
     }
 
     fn freeWorkerRecord(self: *WorkerHandler, w: *WorkerRecord) void {
@@ -143,7 +165,7 @@ pub const WorkerHandler = struct {
         dispatcher.registerWithRoute(.worker_heartbeat, dispatchWorkerCmd, preRouteByWorker);
         dispatcher.registerWithRoute(.worker_deregister, dispatchWorkerCmd, preRouteByWorker);
         dispatcher.registerWithRoute(.worker_drain, dispatchWorkerCmd, preRouteByWorker);
-        dispatcher.registerWalk(.worker_list, dispatchWorkerCmd, localScanWorkers);
+        dispatcher.register(.worker_list, table_run.handler("worker.list", WorkerHandler, runList));
         dispatcher.registerWithRoute(.worker_info, dispatchWorkerCmd, preRouteByWorker);
     }
 
@@ -190,14 +212,6 @@ pub const WorkerHandler = struct {
                 } else {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
                 }
-            },
-            .worker_list => {
-                const data = shard.worker_handler.serializeWorkerList(req.namespace) catch {
-                    shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
-                    return;
-                };
-                defer shard.worker_handler.allocator.free(data);
-                shard.sendOkResponse(conn, req.header.request_id, data);
             },
             .worker_info => {
                 const data = shard.worker_handler.serializeWorkerInfo(req.namespace, req.key) catch |err| switch (err) {
@@ -308,6 +322,12 @@ pub const WorkerHandler = struct {
                 }
             }
         }
+        // worker.list answers with it, so it must fit the list's bound.
+        if (machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID) {
+            for (processes.items) |p| self.allocator.free(p.name_owned);
+            processes.deinit(self.allocator);
+            return std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID});
+        };
 
         // Remove old registration if exists
         if (self.workers.fetchRemove(key)) |old| {
@@ -566,45 +586,6 @@ pub const WorkerHandler = struct {
         return offset;
     }
 
-    /// Serialize worker list for wire response.
-    /// Wire format: [count:u32](worker_record)* [has_more:u8][cursor_len:u16]
-    /// worker_record: [id_len:u16][id][type:u8][status:u8]
-    ///   [tasks_completed:u64][tasks_failed:u64][current_load:u32][max_concurrency:u32]
-    ///   [registered_at:i64][last_heartbeat:i64]
-    ///   [process_count:u16]([name_len:u16][name][kind:u8][run_count:u64][fail_count:u64][last_run_at:i64])*
-    ///   [has_metadata:u8][metadata_len:u16][metadata]?
-    fn serializeWorkerList(self: *WorkerHandler, namespace: []const u8) ![]u8 {
-        var total_size: usize = 4; // count
-        var entry_count: u32 = 0;
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
-            total_size += workerWireSize(entry.value_ptr);
-            entry_count += 1;
-        }
-        total_size += 1 + 2; // has_more + cursor_len
-
-        const buf = try self.allocator.alloc(u8, total_size);
-        errdefer self.allocator.free(buf);
-        var offset: usize = 0;
-
-        std.mem.writeInt(u32, buf[offset..][0..4], entry_count, .little);
-        offset += 4;
-
-        var it2 = self.workers.iterator();
-        while (it2.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
-            offset = writeWorkerRecord(buf, offset, entry.value_ptr);
-        }
-
-        buf[offset] = 0; // has_more = false
-        offset += 1;
-        std.mem.writeInt(u16, buf[offset..][0..2], 0, .little); // cursor_len = 0
-        offset += 2;
-
-        return buf;
-    }
-
     /// Serialize a single worker's info.
     fn serializeWorkerInfo(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) ![]u8 {
         const w = self.find(namespace, worker_id) orelse return error.NotFound;
@@ -617,29 +598,160 @@ pub const WorkerHandler = struct {
         return buf;
     }
 
-    /// ShardWalker LocalScanFn for worker_list.
-    fn localScanWorkers(
-        ctx: *anyopaque,
-        namespace: []const u8,
-        _: []const u8,
-        _: ?[]const u8,
-        _: u32,
-    ) dispatcher_mod.NameWalker.ScanResult {
-        const handler: *WorkerHandler = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(handler.workers.count());
+    // ── LIST ────────────────────────────────────────────────────────────
 
-        var count: usize = 0;
-        var it = handler.workers.iterator();
-        while (it.next()) |entry| {
-            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, homeOf(namespace))) continue;
-            if (count >= name_buf.len) break;
-            name_buf[count] = entry.value_ptr.id_owned;
-            count += 1;
+    pub const Error = error{ OutOfMemory, GatherBusy };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
+            error.GatherBusy => .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many reads across shards are under way; this request was not run — retry" } },
+        };
+    }
+
+    /// worker.list: each shard holds the workers that registered on it, so
+    /// every shard answers its own page after `cursor` and the pages merge.
+    /// A worker.list another shard sent here is that gather's part.
+    fn runList(shard: *Shard, conn: *Connection, req: Request, limit: u32, cursor: []const u8) Error!table_run.Outcome(ListResponse) {
+        const h = shard.worker_handler;
+        if (conn == shard.forward_proxy) return .{ .answer = try h.page(req.namespace, limit, cursor) };
+
+        const shards: usize = if (shard.peer_mailboxes) |m| m.len else 1;
+        var parts: [gather_mod.MAX_PARTS]gather_mod.Part = undefined;
+        const local = try encodeBody(h.allocator, try h.page(req.namespace, limit, cursor));
+        const state = ListGather.create(h.allocator, limit) catch |err| {
+            h.allocator.free(local);
+            return err;
+        };
+        for (parts[0..shards], 0..) |*p, i| {
+            p.* = .{ .owner = @intCast(i), .body = if (i == shard.id) local else req.value };
         }
+        try shard.startGather(conn, req, parts[0..shards], &ListGather.op, state);
+        return .wait;
+    }
 
-        return .{ .items = name_buf[0..count], .next_cursor = null };
+    /// This shard's workers in `namespace` after `cursor`, in id order, as
+    /// many as `limit` and the answer allow. The cursor is the last id given
+    /// when more are left.
+    fn page(self: *WorkerHandler, namespace: []const u8, limit: u32, cursor: []const u8) Error!ListResponse.Value {
+        var after: std.ArrayList(*const WorkerRecord) = .empty;
+        defer after.deinit(self.allocator);
+        var it = self.workers.valueIterator();
+        while (it.next()) |w| {
+            if (!std.mem.eql(u8, w.namespace_owned, homeOf(namespace))) continue;
+            if (std.mem.order(u8, w.id_owned, cursor) != .gt) continue;
+            try after.append(self.allocator, w);
+        }
+        std.mem.sort(*const WorkerRecord, after.items, {}, struct {
+            fn lessThan(_: void, a: *const WorkerRecord, b: *const WorkerRecord) bool {
+                return std.mem.order(u8, a.id_owned, b.id_owned) == .lt;
+            }
+        }.lessThan);
+
+        var out = Workers.Builder.init(try self.listBuf());
+        for (after.items) |w| {
+            if (out.count == limit or !(out.add(row(w)) catch unreachable)) break; // a row never breaks its schema
+        }
+        const more = out.count < after.items.len;
+        return .{ .workers = out.value(), .cursor = if (more) after.items[out.count - 1].id_owned else null };
+    }
+
+    fn listBuf(self: *WorkerHandler) Error![]u8 {
+        if (self.list_buf) |b| return b;
+        const b = try self.allocator.alloc(u8, Workers.byte_bound.?);
+        self.list_buf = b;
+        return b;
+    }
+
+    fn row(w: *const WorkerRecord) Row.Value {
+        return .{
+            .id = w.id_owned,
+            .worker_type = @fromBackingInt(@backingInt(w.worker_type)),
+            .status = @fromBackingInt(@backingInt(w.status)),
+            .current_load = w.current_load,
+            .max_concurrency = w.max_concurrency,
+            .tasks_completed = w.tasks_completed,
+            .tasks_failed = w.tasks_failed,
+            .registered_at_ms = w.registered_at_ms,
+            .last_heartbeat_ms = w.last_heartbeat_ms,
+            .machine_id = w.machine_id_owned,
+        };
     }
 };
+
+/// A worker.list answer's body, owned: the part a shard gives its gather.
+fn encodeBody(allocator: Allocator, v: ListResponse.Value) error{OutOfMemory}![]u8 {
+    const size = ListResponse.encodedSize(v) catch unreachable; // a page keeps its bounds
+    const buf = try allocator.alloc(u8, size);
+    _ = ListResponse.encodeInto(buf, v) catch unreachable;
+    return buf;
+}
+
+/// What a gathered worker.list keeps while its parts are out.
+const ListGather = struct {
+    limit: u32,
+
+    const op: gather_mod.Op = .{ .merge = mergeAnswer, .deinit = deinit };
+
+    fn create(allocator: Allocator, limit: u32) error{OutOfMemory}!*ListGather {
+        const g = try allocator.create(ListGather);
+        g.* = .{ .limit = limit };
+        return g;
+    }
+
+    fn deinit(state: *anyopaque, allocator: Allocator) void {
+        allocator.destroy(@as(*ListGather, @ptrCast(@alignCast(state))));
+    }
+
+    fn mergeAnswer(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
+        const g: *ListGather = @ptrCast(@alignCast(state));
+        const h = shard.worker_handler;
+        const merged = try mergePages(h.allocator, try h.listBuf(), g.limit, bodies);
+        table_run.answer(ListResponse, shard, conn, request_id, merged);
+    }
+};
+
+/// The shards' pages as one: each page is the first of its shard's rows
+/// after one cursor, in id order, so rows are taken in id order up to the
+/// smallest last id of a page that has more (past it, that page may have
+/// left rows out), as many as `limit` and `buf` allow. A page that doesn't
+/// decode is a server bug: `Corrupt`.
+pub fn mergePages(allocator: Allocator, buf: []u8, limit: u32, bodies: []const []const u8) error{ Corrupt, OutOfMemory }!ListResponse.Value {
+    var rows: std.ArrayList(Row.Value) = .empty;
+    defer rows.deinit(allocator);
+    var cut: ?[]const u8 = null;
+    for (bodies) |b| {
+        var diag: schema.Diagnostic = .{};
+        const p = ListResponse.decodeAll(b, &diag) catch return error.Corrupt;
+        if (p.cursor) |c| {
+            if (cut == null or std.mem.order(u8, c, cut.?) == .lt) cut = c;
+        }
+        var it = p.workers.iterator();
+        while (try it.next()) |r| try rows.append(allocator, r);
+    }
+    std.mem.sort(Row.Value, rows.items, {}, struct {
+        fn lessThan(_: void, a: Row.Value, b: Row.Value) bool {
+            return std.mem.order(u8, a.id, b.id) == .lt;
+        }
+    }.lessThan);
+
+    var kept = rows.items;
+    if (cut) |c| {
+        for (rows.items, 0..) |r, i| {
+            if (std.mem.order(u8, r.id, c) == .gt) {
+                kept = rows.items[0..i];
+                break;
+            }
+        }
+    }
+    var out = Workers.Builder.init(buf);
+    for (kept) |r| {
+        if (out.count == limit or !(out.add(r) catch return error.Corrupt)) break;
+    }
+    const more = out.count < rows.items.len or cut != null;
+    if (more and out.count == 0) return error.Corrupt; // a page with more gave a row
+    return .{ .workers = out.value(), .cursor = if (more) rows.items[out.count - 1].id else null };
+}
 
 fn testRequest(namespace: []const u8, id: []const u8) Request {
     const header = proto.RequestHeader.init(.worker_register, 0);
@@ -672,3 +784,166 @@ test "workers: an unknown worker type or process kind is refused, and nothing is
     try std.testing.expectEqualStrings("unknown process kind", h.handleRegister(bad_kind).?);
     try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 }
+
+test "workers: a machine id longer than worker.list's bound is refused" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    // [type][max_concurrency:u32][count:u16][has_metadata][has_machine_id][len:u16][machine_id]
+    var value: [11 + worker_ops.MAX_MACHINE_ID + 1]u8 = undefined;
+    @memcpy(value[0..9], &[_]u8{ 0, 4, 0, 0, 0, 0, 0, 0, 1 });
+    std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID + 1, .little);
+    @memset(value[11..], 'm');
+    var req = testRequest("", "w");
+    req.value = &value;
+    try std.testing.expect(h.handleRegister(req) != null);
+    req.value = value[0 .. value.len - 1];
+    std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID, .little);
+    try std.testing.expect(h.handleRegister(req) == null);
+    try std.testing.expectEqual(@as(usize, worker_ops.MAX_MACHINE_ID), h.find("", "w").?.machine_id_owned.?.len);
+}
+
+/// Shards' registries, each listed as its shard would answer a gather part.
+const ListShards = struct {
+    registries: [3]WorkerHandler,
+
+    fn init(self: *ListShards) void {
+        for (&self.registries) |*h| h.* = WorkerHandler.init(std.testing.allocator);
+    }
+
+    fn deinit(self: *ListShards) void {
+        for (&self.registries) |*h| h.deinit();
+    }
+
+    fn add(self: *ListShards, shard: usize, namespace: []const u8, id: []const u8) !void {
+        if (self.registries[shard].handleRegister(testRequest(namespace, id))) |why| {
+            std.debug.print("{s}\n", .{why});
+            return error.Refused;
+        }
+    }
+
+    /// Every page from the start, merged as a gather merges them; the ids
+    /// in order, and the number of pages.
+    fn listAll(self: *ListShards, namespace: []const u8, limit: u32, ids: *std.ArrayList([]u8)) !usize {
+        const a = std.testing.allocator;
+        var buf: [Workers.byte_bound.?]u8 = undefined;
+        var cursor: std.ArrayList(u8) = .empty;
+        defer cursor.deinit(a);
+        var pages: usize = 0;
+        while (true) : (pages += 1) {
+            var bodies: [3][]u8 = undefined;
+            for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(namespace, limit, cursor.items));
+            defer for (bodies) |b| a.free(b);
+            const merged = try mergePages(a, &buf, limit, &bodies);
+            try std.testing.expect(merged.workers.count <= limit);
+            var it = merged.workers.iterator();
+            while (try it.next()) |r| try ids.append(a, try a.dupe(u8, r.id));
+            const next = merged.cursor orelse return pages + 1;
+            cursor.clearRetainingCapacity();
+            try cursor.appendSlice(a, next);
+        }
+    }
+};
+
+fn freeIds(ids: *std.ArrayList([]u8)) void {
+    for (ids.items) |id| std.testing.allocator.free(id);
+    ids.deinit(std.testing.allocator);
+}
+
+test "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit" {
+    var s: ListShards = undefined;
+    s.init();
+    defer s.deinit();
+    // Ids spread so each page boundary falls between two shards' ids.
+    var name: [8]u8 = undefined;
+    for (0..20) |i| try s.add(i * 7 % 3, "ns", try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
+    try s.add(0, "other", "w99");
+
+    for ([_]u32{ 1, 2, 3, 7, 20, worker_ops.MAX_LIST }) |limit| {
+        var ids: std.ArrayList([]u8) = .empty;
+        defer freeIds(&ids);
+        const pages = try s.listAll("ns", limit, &ids);
+        try std.testing.expectEqual(@as(usize, 20), ids.items.len);
+        for (ids.items, 0..) |id, i| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}), id);
+        try std.testing.expectEqual((20 + limit - 1) / limit, pages);
+    }
+}
+
+test "worker.list: workers all on one shard are paged to the last, though the other shards have none" {
+    var s: ListShards = undefined;
+    s.init();
+    defer s.deinit();
+    var name: [8]u8 = undefined;
+    for (0..20) |i| try s.add(1, "ns", try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
+    for ([_]u32{ 1, 5, 20 }) |limit| {
+        var ids: std.ArrayList([]u8) = .empty;
+        defer freeIds(&ids);
+        _ = try s.listAll("ns", limit, &ids);
+        try std.testing.expectEqual(@as(usize, 20), ids.items.len);
+    }
+}
+
+test "worker.list: a page cut short by the answer's room still loses no worker" {
+    var s: ListShards = undefined;
+    s.init();
+    defer s.deinit();
+    // Ids this long fill a page well before its limit, so shards' pages
+    // stop at different ids.
+    var name: [ops_max_key]u8 = undefined;
+    @memset(&name, 'x');
+    for (0..150) |i| {
+        _ = std.fmt.bufPrint(name[name.len - 4 ..], "{d:0>4}", .{i}) catch unreachable;
+        try s.add(i * 5 % 3, "ns", &name);
+    }
+    var ids: std.ArrayList([]u8) = .empty;
+    defer freeIds(&ids);
+    const pages = try s.listAll("ns", worker_ops.MAX_LIST, &ids);
+    try std.testing.expect(pages > 1);
+    try std.testing.expectEqual(@as(usize, 150), ids.items.len);
+    for (ids.items, 0..) |id, i| {
+        _ = std.fmt.bufPrint(name[name.len - 4 ..], "{d:0>4}", .{i}) catch unreachable;
+        try std.testing.expectEqualStrings(&name, id);
+    }
+}
+
+/// A page of workers with `ids`, and `cursor`, as a shard would answer it.
+fn testPage(buf: []u8, ids: []const []const u8, cursor: ?[]const u8) ![]const u8 {
+    var rows = Workers.Builder.init(buf[buf.len / 2 ..]);
+    for (ids) |id| try std.testing.expect(try rows.add(.{ .id = id, .worker_type = .action, .status = .active, .current_load = 0, .max_concurrency = 1, .tasks_completed = 0, .tasks_failed = 0, .registered_at_ms = 0, .last_heartbeat_ms = 0, .machine_id = null }));
+    return ListResponse.encodeInto(buf[0 .. buf.len / 2], .{ .workers = rows.value(), .cursor = cursor });
+}
+
+test "worker.list: a merge stops at the last id of a page that stopped early, where that page may have left workers out" {
+    var a_buf: [1024]u8 = undefined;
+    var b_buf: [1024]u8 = undefined;
+    var buf: [Workers.byte_bound.?]u8 = undefined;
+    // Shard a stopped after a3 (its page was full); shard b gave all it has.
+    const pages = [_][]const u8{
+        try testPage(&a_buf, &.{ "a1", "a3" }, "a3"),
+        try testPage(&b_buf, &.{ "a2", "a4", "a5" }, null),
+    };
+    const merged = try mergePages(std.testing.allocator, &buf, 10, &pages);
+    var it = merged.workers.iterator();
+    for ([_][]const u8{ "a1", "a2", "a3" }) |want| try std.testing.expectEqualStrings(want, (try it.next()).?.id);
+    try std.testing.expectEqual(@as(?Row.Value, null), try it.next());
+    try std.testing.expectEqualStrings("a3", merged.cursor.?);
+}
+
+test "worker.list: a namespace with no workers is one empty page" {
+    var s: ListShards = undefined;
+    s.init();
+    defer s.deinit();
+    try s.add(1, "other", "w1");
+    var ids: std.ArrayList([]u8) = .empty;
+    defer freeIds(&ids);
+    try std.testing.expectEqual(@as(usize, 1), try s.listAll("ns", 10, &ids));
+    try std.testing.expectEqual(@as(usize, 0), ids.items.len);
+}
+
+test "worker.list: a page that doesn't decode is refused before anything is answered" {
+    var buf: [Workers.byte_bound.?]u8 = undefined;
+    try std.testing.expectError(error.Corrupt, mergePages(std.testing.allocator, &buf, 10, &.{"\x01"}));
+}
+
+// A worker id is a qualified registry key at most; the id alone is shorter
+// by its namespace and separator.
+const ops_max_key = @import("../protocol/ops.zig").MAX_KEY - 8;

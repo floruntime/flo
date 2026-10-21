@@ -19,6 +19,7 @@ const WireReader = wire.WireReader;
 const cli_config = @import("../config.zig");
 const schema = @import("../../protocol/schema.zig");
 const action_ops = @import("../../protocol/action_ops.zig");
+const worker_ops = @import("../../protocol/worker_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -196,7 +197,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .name("list")
                 .about("List registered workers")
                 .aliases(&.{"ls"})
-                .uintFlag("limit", 'l', 100, "Maximum workers to show")
+                .uintFlag("limit", 'l', 0, "Most workers to show (0: all)")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerList)),
@@ -673,51 +674,69 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
 fn runWorkerList(ctx: *commander.Context) commander.Error!void {
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
+    // 0 shows every worker.
+    const most = ctx.getUint("limit") orelse 0;
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.action.workerList(&client, namespace, 100, null) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
+    const format = cli_output.getFormat(ctx);
+    var table = cli_output.Table.init(ctx.allocator);
+    defer table.deinit();
+    for ([_][]const u8{ "WORKER ID", "TYPE", "STATUS", "LOAD", "COMPLETED", "FAILED", "MACHINE" }) |h| {
+        table.addColumn(h, .left) catch return outcome.malformed(ctx, "worker.list answer");
+    }
 
-    try outcome.check(ctx, result);
+    var cursor_buf: [worker_ops.WorkerId.bound]u8 = undefined;
+    var cursor: []const u8 = "";
+    var shown: u64 = 0;
+    if (format == .json) ctx.print("[", .{});
+    while (true) {
+        const page_limit: u32 = if (most == 0) worker_ops.MAX_LIST else @intCast(@min(most - shown, worker_ops.MAX_LIST));
+        var result = client_mod.action.workerList(&client, namespace, page_limit, cursor) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
 
-    // Wire format: [count:u32](worker_record)*[has_more:u8][cursor_len:u16]
-    const data = result.asRawData() orelse {
-        cli_output.printEmptyList(ctx, "(no workers)");
-        return;
-    };
-
-    // Server wire format is read directly — enum_u8 maps type/status bytes,
-    // skip_counted_records_u16 skips the nested process list,
-    // optional_str_u16 handles metadata and machine_id.
-    cli_output.printWireList(ctx, data, "(no workers)", &.{
-        .{ .field = "worker_id", .header = "WORKER ID", .field_type = .str_u16 },
-        .{ .field = "type", .header = "TYPE", .field_type = .enum_u8, .enum_labels = &.{ "action", "stream" } },
-        .{ .field = "status", .header = "STATUS", .field_type = .enum_u8, .enum_labels = &.{ "active", "idle", "draining", "unhealthy" } },
-        .{ .field = "completed", .header = "COMPLETED", .field_type = .uint_u64 },
-        .{ .field = "failed", .header = "FAILED", .field_type = .uint_u64 },
-        .{ .field = "load", .header = "LOAD", .field_type = .uint_u32 },
-        .{ .field = "", .header = "", .field_type = .uint_u32 }, // max_concurrency (skip)
-        .{ .field = "", .header = "", .field_type = .int_i64 }, // registered_at (skip)
-        .{ .field = "", .header = "", .field_type = .int_i64 }, // last_heartbeat (skip)
-        .{
-            .field = "",
-            .header = "",
-            .field_type = .skip_counted_records_u16,
-            .sub_columns = &.{
-                .{ .field = "", .header = "", .field_type = .str_u16 }, // name
-                .{ .field = "", .header = "", .field_type = .enum_u8 }, // kind
-                .{ .field = "", .header = "", .field_type = .uint_u64 }, // run_count
-                .{ .field = "", .header = "", .field_type = .uint_u64 }, // fail_count
-                .{ .field = "", .header = "", .field_type = .int_i64 }, // last_run_at
-            },
-        },
-        .{ .field = "", .header = "", .field_type = .optional_str_u16 }, // metadata (skip)
-        .{ .field = "machine", .header = "MACHINE", .field_type = .optional_str_u16 },
-    }) catch return outcome.malformed(ctx, "list");
+        var diag: schema.Diagnostic = .{};
+        const page = worker_ops.op("worker.list").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "worker.list answer");
+        var it = page.workers.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "worker.list answer")) |w| {
+            switch (format) {
+                .json => {
+                    if (shown > 0) ctx.print(",", .{});
+                    ctx.print("{{\"worker_id\":{f},\"type\":\"{s}\",\"status\":\"{s}\",\"current_load\":{d},\"max_concurrency\":{d},\"tasks_completed\":{d},\"tasks_failed\":{d},\"registered_at_ms\":{d},\"last_heartbeat_ms\":{d},\"machine_id\":", .{ cli_output.jsonString(w.id), @tagName(w.worker_type), @tagName(w.status), w.current_load, w.max_concurrency, w.tasks_completed, w.tasks_failed, w.registered_at_ms, w.last_heartbeat_ms });
+                    if (w.machine_id) |m| ctx.print("{f}}}", .{cli_output.jsonString(m)}) else ctx.print("null}}", .{});
+                },
+                .raw => ctx.print("{s}\n", .{w.id}),
+                .table => {
+                    var load: [24]u8 = undefined;
+                    var done: [24]u8 = undefined;
+                    var failed: [24]u8 = undefined;
+                    table.addRow(&.{
+                        w.id,
+                        @tagName(w.worker_type),
+                        @tagName(w.status),
+                        std.fmt.bufPrint(&load, "{d}/{d}", .{ w.current_load, w.max_concurrency }) catch unreachable,
+                        std.fmt.bufPrint(&done, "{d}", .{w.tasks_completed}) catch unreachable,
+                        std.fmt.bufPrint(&failed, "{d}", .{w.tasks_failed}) catch unreachable,
+                        w.machine_id orelse "",
+                    }) catch return outcome.malformed(ctx, "worker.list answer");
+                },
+            }
+            shown += 1;
+        }
+        const next = page.cursor orelse break;
+        if (most != 0 and shown >= most) break;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    switch (format) {
+        .json => ctx.print("]\n", .{}),
+        .raw => {},
+        .table => if (shown == 0) ctx.print("(no workers)\n", .{}) else table.print(ctx),
+    }
 }
 
 fn runWorkerDrain(ctx: *commander.Context) commander.Error!void {
