@@ -32,6 +32,8 @@ pub const MAX_OUTPUT: u32 = 65_535;
 /// The longest error message a run answers with: a run stores its error
 /// with a u16 length.
 pub const MAX_ERROR: u32 = 65_535;
+/// The longest worker id: a worker's id is its request's key.
+pub const MAX_WORKER_ID: u32 = ops.MAX_KEY;
 
 pub const table = [_]ops.Op{
     .{
@@ -51,9 +53,14 @@ pub const table = [_]ops.Op{
             .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)), .doc = "What a completed run returned" },
             // Why its last attempt failed.
             .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
+            // Set when a worker takes the run. The take isn't logged, so only
+            // the leader knows it at once; followers, a restarted node and a
+            // new leader learn it at the run's next update, and until then
+            // show none, or the worker before a reclaim.
+            .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it; only the leader knows a take at once, other nodes learn it at the run's next update" },
         }),
         .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
-        .doc = "A run's status, timestamps, attempts, and its output or last error.",
+        .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",
     },
 };
 
