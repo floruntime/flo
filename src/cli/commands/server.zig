@@ -17,6 +17,7 @@ const cluster_config = @import("../../config/cluster.zig");
 const Runtime = @import("../../node/runtime.zig").Runtime;
 const runtime_mod = @import("../../node/runtime.zig");
 const offline = @import("../../node/offline.zig");
+const data_format = @import("../../node/data_format.zig");
 const membership = @import("../../raft/membership.zig");
 const RuntimeConfig = @import("../../node/runtime.zig").RuntimeConfig;
 const posix = std.posix;
@@ -624,6 +625,16 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         error.DataDirInUse => outcome.localRefusal(ctx, "data directory {s} is in use by a running flo server; stop it first", .{data_dir}),
         else => outcome.localRefusal(ctx, "cannot lock data directory {s}: {}", .{ data_dir, err }),
     };
+    // A format this binary doesn't read is refused before anything in it is.
+    var why: [data_format.MESSAGE_MAX]u8 = undefined;
+    const refusal = data_format.checkReadOnly(ctx.allocator, data_dir, &why) catch |err| {
+        stdx.fs.closeFile(lock.*);
+        return outcome.localRefusal(ctx, "cannot read {s}/{s}: {}", .{ data_dir, data_format.FILENAME, err });
+    };
+    if (refusal) |r| {
+        stdx.fs.closeFile(lock.*);
+        return outcome.localRefusal(ctx, "{s}", .{r.message});
+    }
     const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
         stdx.fs.closeFile(lock.*);
         return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });

@@ -4,6 +4,7 @@
 pub const inbox = @import("inbox.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const manifest = @import("manifest.zig");
+pub const data_format = @import("data_format.zig");
 pub const reactor = @import("reactor.zig");
 pub const shard = @import("shard.zig");
 pub const connection = @import("connection.zig");
