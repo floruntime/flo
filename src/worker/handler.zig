@@ -255,7 +255,11 @@ pub const WorkerHandler = struct {
     /// Register a worker. key = worker_id.
     /// value = [type:u8][max_concurrency:u32][process_count:u16]
     ///   ([name_len:u16][name][kind:u8])*
-    ///   [has_metadata:u8][metadata_len:u16][metadata]?
+    ///   [has_metadata:u8]([metadata_len:u16][metadata])?
+    ///   [has_machine_id:u8]([machine_id_len:u16][machine_id])?
+    /// A value may stop after any whole field, and the rest take their
+    /// defaults; one cut inside a field, a flag other than 0 or 1, or bytes
+    /// past the end is refused, never read around.
     /// Why the worker was not registered, or null.
     fn handleRegister(self: *WorkerHandler, req: Request) ?[]const u8 {
         if (req.key.len == 0) return "worker id is required";
@@ -263,147 +267,149 @@ pub const WorkerHandler = struct {
         const key = workerKey(&kbuf, req.namespace, req.key) orelse return "worker id too long, or holds a NUL";
         if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return "worker limit reached";
 
-        const value = req.value;
-        var offset: usize = 0;
+        var reg = switch (parseRegistration(self.allocator, req.value) catch return "worker not registered: out of memory") {
+            .refused => |why| return why,
+            .ok => |r| r,
+        };
+        self.storeRegistration(key, req, &reg) catch {
+            reg.deinit(self.allocator);
+            return "worker not registered: out of memory";
+        };
+        return null;
+    }
 
-        // Parse worker type
-        const worker_type: WorkerType = if (value.len > 0)
-            std.enums.fromInt(WorkerType, value[0]) orelse return "unknown worker type"
-        else
-            .action;
-        offset += 1;
+    const Registration = struct {
+        worker_type: WorkerType = .action,
+        max_concurrency: u32 = 10,
+        processes: std.ArrayList(ProcessInfo) = .empty,
+        /// Slices of the request.
+        metadata: ?[]const u8 = null,
+        machine_id: ?[]const u8 = null,
 
-        // Parse max_concurrency
-        var max_concurrency: u32 = 10;
-        if (offset + 4 <= value.len) {
-            max_concurrency = std.mem.readInt(u32, value[offset..][0..4], .little);
-            offset += 4;
+        fn deinit(self: *Registration, allocator: Allocator) void {
+            for (self.processes.items) |p| allocator.free(p.name_owned);
+            self.processes.deinit(allocator);
         }
+    };
 
-        // Parse process list
-        var processes: std.ArrayList(ProcessInfo) = .empty;
-        if (offset + 2 <= value.len) {
-            const process_count = std.mem.readInt(u16, value[offset..][0..2], .little);
-            offset += 2;
+    const Parsed = union(enum) { ok: Registration, refused: []const u8 };
 
-            for (0..process_count) |_| {
-                if (offset + 2 > value.len) break;
-                const name_len = std.mem.readInt(u16, value[offset..][0..2], .little);
-                offset += 2;
-                if (offset + name_len + 1 > value.len) break;
-                const name = value[offset .. offset + name_len];
-                offset += name_len;
-                const kind = std.enums.fromInt(ProcessKind, value[offset]) orelse {
-                    for (processes.items) |p| self.allocator.free(p.name_owned);
-                    processes.deinit(self.allocator);
-                    return "unknown process kind";
-                };
-                offset += 1;
-
-                const owned_name = self.allocator.dupe(u8, name) catch continue;
-                processes.append(self.allocator, .{
-                    .name_owned = owned_name,
-                    .kind = kind,
-                }) catch {
-                    self.allocator.free(owned_name);
-                    continue;
-                };
+    fn parseRegistration(allocator: Allocator, value: []const u8) Allocator.Error!Parsed {
+        var r: Reader = .{ .bytes = value };
+        var reg: Registration = .{};
+        errdefer reg.deinit(allocator);
+        const refuse = struct {
+            fn f(a: Allocator, g: *Registration, why: []const u8) Parsed {
+                g.deinit(a);
+                return .{ .refused = why };
             }
+        }.f;
+
+        if (r.done()) return .{ .ok = reg };
+        reg.worker_type = std.enums.fromInt(WorkerType, r.byte().?) orelse return refuse(allocator, &reg, "unknown worker type");
+
+        if (r.done()) return .{ .ok = reg };
+        reg.max_concurrency = r.int(u32) orelse return refuse(allocator, &reg, "registration cut short in max_concurrency");
+
+        if (r.done()) return .{ .ok = reg };
+        const count = r.int(u16) orelse return refuse(allocator, &reg, "registration cut short in the process count");
+        for (0..count) |_| {
+            const name = r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its process list");
+            const kind_byte = r.byte() orelse return refuse(allocator, &reg, "registration cut short in its process list");
+            const kind = std.enums.fromInt(ProcessKind, kind_byte) orelse return refuse(allocator, &reg, "unknown process kind");
+            const owned = try allocator.dupe(u8, name);
+            reg.processes.append(allocator, .{ .name_owned = owned, .kind = kind }) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
         }
 
-        // Parse optional metadata (JSON string)
-        var metadata: ?[]const u8 = null;
-        if (offset < value.len) {
-            const has_metadata = value[offset];
-            offset += 1;
-            if (has_metadata == 1 and offset + 2 <= value.len) {
-                const mlen = std.mem.readInt(u16, value[offset..][0..2], .little);
-                offset += 2;
-                if (offset + mlen <= value.len) {
-                    metadata = value[offset .. offset + mlen];
-                    offset += mlen;
-                }
-            }
-        }
-
-        // Parse optional machine_id
-        var machine_id: ?[]const u8 = null;
-        if (offset < value.len) {
-            const has_machine_id = value[offset];
-            offset += 1;
-            if (has_machine_id == 1 and offset + 2 <= value.len) {
-                const mid_len = std.mem.readInt(u16, value[offset..][0..2], .little);
-                offset += 2;
-                if (offset + mid_len <= value.len) {
-                    machine_id = value[offset .. offset + mid_len];
-                }
-            }
-        }
-        // worker.list answers with it, so it must fit the list's bound.
-        if (machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID) {
-            for (processes.items) |p| self.allocator.free(p.name_owned);
-            processes.deinit(self.allocator);
-            return std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID});
+        if (r.done()) return .{ .ok = reg };
+        reg.metadata = switch (r.flag() orelse return refuse(allocator, &reg, "metadata flag must be 0 or 1")) {
+            false => null,
+            true => r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its metadata"),
         };
 
-        // Remove old registration if exists
+        if (r.done()) return .{ .ok = reg };
+        reg.machine_id = switch (r.flag() orelse return refuse(allocator, &reg, "machine id flag must be 0 or 1")) {
+            false => null,
+            true => r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its machine id"),
+        };
+        // worker.list answers with it, so it must fit the list's bound.
+        if (reg.machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID)
+            return refuse(allocator, &reg, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
+
+        if (!r.done()) return refuse(allocator, &reg, "registration has bytes past its end");
+        return .{ .ok = reg };
+    }
+
+    /// A cursor over a registration's bytes: each read takes a whole field or nothing.
+    const Reader = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        fn done(self: *const Reader) bool {
+            return self.pos == self.bytes.len;
+        }
+        fn take(self: *Reader, n: usize) ?[]const u8 {
+            if (self.bytes.len - self.pos < n) return null;
+            defer self.pos += n;
+            return self.bytes[self.pos..][0..n];
+        }
+        fn byte(self: *Reader) ?u8 {
+            return (self.take(1) orelse return null)[0];
+        }
+        fn int(self: *Reader, comptime T: type) ?T {
+            return std.mem.readInt(T, (self.take(@sizeOf(T)) orelse return null)[0..@sizeOf(T)], .little);
+        }
+        fn prefixed(self: *Reader) ?[]const u8 {
+            return self.take(self.int(u16) orelse return null);
+        }
+        /// A 0 or 1 byte; null for anything else or nothing.
+        fn flag(self: *Reader) ?bool {
+            return switch (self.byte() orelse return null) {
+                0 => false,
+                1 => true,
+                else => null,
+            };
+        }
+    };
+
+    /// Replace worker `key`'s registration with `reg`, which it takes on
+    /// success. The old one goes only once the new one is whole.
+    fn storeRegistration(self: *WorkerHandler, key: []const u8, req: Request, reg: *Registration) Allocator.Error!void {
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_id = try self.allocator.dupe(u8, req.key);
+        errdefer self.allocator.free(owned_id);
+        const owned_namespace = try self.allocator.dupe(u8, homeOf(req.namespace));
+        errdefer self.allocator.free(owned_namespace);
+        const owned_metadata: ?[]const u8 = if (reg.metadata) |m| try self.allocator.dupe(u8, m) else null;
+        errdefer if (owned_metadata) |m| self.allocator.free(m);
+        const owned_machine_id: ?[]const u8 = if (reg.machine_id) |m| try self.allocator.dupe(u8, m) else null;
+        errdefer if (owned_machine_id) |m| self.allocator.free(m);
+        // Room for the new record before the old one is dropped.
+        try self.workers.ensureUnusedCapacity(1);
+
         if (self.workers.fetchRemove(key)) |old| {
             var old_val = old.value;
             self.freeWorkerRecord(&old_val);
         }
-
         const now_ms = @import("stdx").time.milliTimestamp();
-        const owned_key = self.allocator.dupe(u8, key) catch {
-            for (processes.items) |p| self.allocator.free(p.name_owned);
-            processes.deinit(self.allocator);
-            return "worker not registered: out of memory";
-        };
-        const owned_id = self.allocator.dupe(u8, req.key) catch {
-            self.allocator.free(owned_key);
-            for (processes.items) |p| self.allocator.free(p.name_owned);
-            processes.deinit(self.allocator);
-            return "worker not registered: out of memory";
-        };
-        const owned_namespace = self.allocator.dupe(u8, homeOf(req.namespace)) catch {
-            self.allocator.free(owned_key);
-            self.allocator.free(owned_id);
-            for (processes.items) |p| self.allocator.free(p.name_owned);
-            processes.deinit(self.allocator);
-            return "worker not registered: out of memory";
-        };
-        const owned_metadata: ?[]const u8 = if (metadata) |m|
-            self.allocator.dupe(u8, m) catch null
-        else
-            null;
-        const owned_machine_id: ?[]const u8 = if (machine_id) |mid|
-            self.allocator.dupe(u8, mid) catch null
-        else
-            null;
-
-        self.workers.put(owned_key, .{
+        self.workers.putAssumeCapacityNoClobber(owned_key, .{
             .key_owned = owned_key,
             .id_owned = owned_id,
-            .worker_type = worker_type,
+            .worker_type = reg.worker_type,
             .status = .active,
             .namespace_owned = owned_namespace,
             .metadata_owned = owned_metadata,
             .machine_id_owned = owned_machine_id,
-            .processes = processes,
-            .max_concurrency = max_concurrency,
+            .processes = reg.processes,
+            .max_concurrency = reg.max_concurrency,
             .registered_at_ms = now_ms,
             .last_heartbeat_ms = now_ms,
             .last_seen_ms = @import("stdx").time.monotonicMs(),
-        }) catch {
-            for (processes.items) |p| self.allocator.free(p.name_owned);
-            processes.deinit(self.allocator);
-            self.allocator.free(owned_key);
-            self.allocator.free(owned_id);
-            self.allocator.free(owned_namespace);
-            if (owned_metadata) |m| self.allocator.free(m);
-            if (owned_machine_id) |mid| self.allocator.free(mid);
-            return "worker not registered: out of memory";
-        };
-        return null;
+        });
     }
 
     /// Heartbeat from a worker — lightweight keep-alive.
@@ -1040,4 +1046,79 @@ test "workers: expiry reads the monotonic clock, so a wall-clock step expires no
     w.last_heartbeat_ms -= std.time.ms_per_day;
     try std.testing.expectEqual(@as(usize, 0), h.checkHealth(w.last_seen_ms + 1000));
     try std.testing.expectEqual(WorkerStatus.active, w.status);
+}
+
+test "workers: a registration cut inside a field, with a bad flag, or with bytes past its end is refused, not read around" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    // [type][max_concurrency:u32][count:u16]([len:u16][name][kind])*[has_metadata]([len:u16][metadata])?[has_machine_id]([len:u16][machine_id])?
+    const Case = struct { value: []const u8, why: []const u8 };
+    for ([_]Case{
+        .{ .value = &.{ 0, 4, 0 }, .why = "registration cut short in max_concurrency" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 1 }, .why = "registration cut short in the process count" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0 }, .why = "registration cut short in its process list" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 1, 0, 3, 0, 'a' }, .why = "registration cut short in its process list" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 2 }, .why = "metadata flag must be 0 or 1" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 1, 9, 0, '{' }, .why = "registration cut short in its metadata" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 0, 7 }, .why = "machine id flag must be 0 or 1" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 0, 1, 5, 0, 'h' }, .why = "registration cut short in its machine id" },
+        .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 0, 0, 0xff }, .why = "registration has bytes past its end" },
+    }) |c| {
+        var req = testRequest("", "w");
+        req.value = c.value;
+        try std.testing.expectEqualStrings(c.why, h.handleRegister(req).?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), h.workers.count());
+
+    // Whole, it is kept in full; one that stops after a whole field takes defaults.
+    var full = testRequest("", "w");
+    full.value = &.{ 1, 4, 0, 0, 0, 1, 0, 1, 0, 'a', 1, 1, 2, 0, '{', '}', 1, 1, 0, 'h' };
+    try std.testing.expect(h.handleRegister(full) == null);
+    const w = h.find("", "w").?;
+    try std.testing.expectEqual(WorkerType.stream, w.worker_type);
+    try std.testing.expectEqual(@as(u32, 4), w.max_concurrency);
+    try std.testing.expectEqualStrings("a", w.processes.items[0].name_owned);
+    try std.testing.expectEqualStrings("{}", w.metadata_owned.?);
+    try std.testing.expectEqualStrings("h", w.machine_id_owned.?);
+    var short = testRequest("", "v");
+    short.value = &.{ 0, 7, 0, 0, 0 };
+    try std.testing.expect(h.handleRegister(short) == null);
+    try std.testing.expectEqual(@as(u32, 7), h.find("", "v").?.max_concurrency);
+}
+
+test "workers: a re-registration short of memory at any point keeps the old one whole" {
+    const run = struct {
+        fn f(allocator: Allocator) !void {
+            var h = WorkerHandler.init(allocator);
+            defer h.deinit();
+            var first = testRequest("", "w");
+            first.value = &.{ 0, 1, 0, 0, 0, 1, 0, 1, 0, 'a', 0, 0, 0 };
+            if (h.handleRegister(first)) |_| return error.OutOfMemory;
+            var again = testRequest("", "w");
+            again.value = &.{ 0, 9, 0, 0, 0, 1, 0, 1, 0, 'b', 0, 1, 2, 0, '{', '}', 1, 1, 0, 'h' };
+            if (h.handleRegister(again)) |why| {
+                try std.testing.expectEqualStrings("worker not registered: out of memory", why);
+                // The old registration is still there, untouched.
+                const w = h.find("", "w").?;
+                try std.testing.expectEqual(@as(u32, 1), w.max_concurrency);
+                try std.testing.expectEqualStrings("a", w.processes.items[0].name_owned);
+                return error.OutOfMemory;
+            }
+            const w = h.find("", "w").?;
+            try std.testing.expectEqual(@as(u32, 9), w.max_concurrency);
+            try std.testing.expectEqual(@as(usize, 1), w.processes.items.len);
+            try std.testing.expectEqualStrings("b", w.processes.items[0].name_owned);
+            try std.testing.expectEqualStrings("{}", w.metadata_owned.?);
+            try std.testing.expectEqualStrings("h", w.machine_id_owned.?);
+        }
+    }.f;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, run, .{});
+}
+
+test "workers: a process name that can't be copied fails the registration, not just that process" {
+    // Only the name's copy fails: a later allocation can't stand in for it.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const value = [_]u8{ 0, 1, 0, 0, 0, 1, 0, 1, 0, 'a', 0 };
+    try std.testing.expectError(error.OutOfMemory, WorkerHandler.parseRegistration(failing.allocator(), &value));
+    try std.testing.expect(failing.has_induced_failure);
 }
