@@ -127,14 +127,16 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     defer response.deinit();
 
     // Parse response data
-    // Expected format: [node_id: u32][leader_id: u32][term: u64][state: u8][member_count: u32]
-    if (response.data.len < 21) return outcome.malformed(ctx, "cluster status");
+    // [node_id:u32][leader_id:u32][term:u64][state:u8][member_count:u32][vouched_index:u64][strangers_while_quiet:u8]
+    if (response.data.len != 30) return outcome.malformed(ctx, "cluster status");
 
     const node_id = std.mem.readInt(u32, response.data[0..4], .little);
     const leader_id = std.mem.readInt(u32, response.data[4..8], .little);
     const term = std.mem.readInt(u64, response.data[8..16], .little);
     const state = response.data[16];
     const member_count = std.mem.readInt(u32, response.data[17..21], .little);
+    const vouched_index = std.mem.readInt(u64, response.data[21..29], .little);
+    const strangers_while_quiet = response.data[29] != 0;
 
     // Generate human-readable node names
     var node_name_buf: [11]u8 = undefined;
@@ -161,7 +163,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         ctx.print("{{\"node_id\":{f},\"address\":{f},\"leader_id\":", .{ output.jsonString(node_name), output.jsonString(endpoint) });
         // No leader is known while electing or joining.
         if (leader_id == 0) ctx.print("null", .{}) else ctx.print("{f}", .{output.jsonString(leader_name)});
-        ctx.print(",\"term\":{d},\"role\":{f},\"members\":{d}}}\n", .{ term, output.jsonString(role_str), member_count });
+        ctx.print(",\"term\":{d},\"role\":{f},\"members\":{d},\"vouched_index\":{d},\"strangers_while_quiet\":{}}}\n", .{ term, output.jsonString(role_str), member_count, vouched_index, strangers_while_quiet });
     } else {
         ctx.print("\nCluster Status\n", .{});
         ctx.print("──────────────\n", .{});
@@ -171,6 +173,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         ctx.print("Leader:     {s}\n", .{leader_shown});
         ctx.print("Term:       {d}\n", .{term});
         ctx.print("Members:    {d}\n", .{member_count});
+        if (vouched_index != 0) ctx.print("\nThis node missed a membership change and is catching up: another member vouched for the config\ncommitted at index {d}. Until its own log reaches it, it also takes appends and vote requests from that config's members.\n", .{vouched_index});
+        if (strangers_while_quiet) ctx.print("\nThis node is dropping frames from a node no config of its names, and has heard no leader:\nit may be stuck on an old membership config. Check that a member its last config names is reachable.\n", .{});
         if (state == 5 or state == 6) ctx.print("\nThis node has no log or no hard state of its own (new, or lost). It votes only once a leader has caught\nit up and the members have confirmed the term. If a majority lost their data, see flo server inspect / force-members.\n", .{});
         if (state == 4) ctx.print("\nThis node's data diverged from the group and it takes no writes.\nStop it, move its data directory aside, and start it again with --join <a live member>.\nIt rejoins with no log and votes only once it has caught up.\n", .{});
         ctx.print("\n", .{});

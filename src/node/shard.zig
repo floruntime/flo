@@ -4610,11 +4610,19 @@ pub const Shard = struct {
 
     // ─── Response helpers ────────────────────────────────────────────────
 
-    /// `cluster_status` — this node's identity, role and group. A node
-    /// running alone is the leader of a one-member group. States: 0
-    /// follower, 1 electing, 2 leader, 3 joining (no seat yet), 4
-    /// diverged, 5 and 6 guarded (no log or no hard state of its own, new
-    /// or lost): catching up, then confirming the term.
+    /// `cluster_status` — this node's identity, role and group:
+    /// `[node:u32][leader:u32][term:u64][state:u8][members:u32]
+    /// [vouched_index:u64][strangers_while_quiet:u8]`. A node running alone
+    /// is the leader of a one-member group. States: 0 follower, 1 electing,
+    /// 2 leader, 3 joining (no seat yet), 4 diverged, 5 and 6 guarded (no
+    /// log or no hard state of its own, new or lost): catching up, then
+    /// confirming the term; 7 replica, 8 removed. `vouched_index` is the
+    /// index of a committed membership config another member vouched for
+    /// while this node is behind it (0 for none): it missed a membership
+    /// change and is catching up, and also takes appends and vote requests
+    /// from that config's members. `strangers_while_quiet` is set while it
+    /// drops frames from a node no config of its names and has heard no
+    /// leader: a member stuck on an old config looks like this.
     fn dispatchClusterStatus(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -4644,12 +4652,14 @@ pub const Shard = struct {
         const member_count: u32 = @intCast(@max(1, raft.memberIds(&ids).len));
         const leader_id: u32 = if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id;
 
-        var buf: [21]u8 = undefined;
+        var buf: [30]u8 = undefined;
         std.mem.writeInt(u32, buf[0..4], shard.cluster_node_id, .little);
         std.mem.writeInt(u32, buf[4..8], leader_id, .little);
         std.mem.writeInt(u64, buf[8..16], raft.current_term, .little);
         buf[16] = state;
         std.mem.writeInt(u32, buf[17..21], member_count, .little);
+        std.mem.writeInt(u64, buf[21..29], shard.replica.vouchedIndex(), .little);
+        buf[29] = @intFromBool(shard.replica.strangersWhileQuiet(nowMs()));
 
         shard.sendOkResponse(conn, req.header.request_id, &buf);
     }
@@ -11822,6 +11832,32 @@ test "Shard: promote and remove refuse by name; promoting a voter is done alread
     const three = membership.Config.ofVoters(&.{ 1, 2, 3 });
     raft.setMembership(&three, raft.commit_index);
     try expectAnswer(try t.remove(3, false, &buf), .bad_request, "leaves 2 voters, which tolerate no failure; add --yes");
+}
+
+test "Shard: cluster status answers the vouched index while the node is behind it, and the stuck-member sign" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    var resp = try t.ask(.cluster_status, "", &buf);
+    try std.testing.expectEqual(proto.StatusCode.ok, resp.getStatus());
+    try std.testing.expectEqual(@as(usize, 30), resp.data.len);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, resp.data[21..29], .little));
+    try std.testing.expectEqual(@as(u8, 0), resp.data[29]);
+
+    // A vouch for a config committed past this node's log, and a stranger
+    // dropped just now with no leader heard.
+    const raft = t.shard.raft_node;
+    t.shard.replica.vouch.index = raft.commit_index + 50;
+    t.shard.replica.strangers_quiet_ms = Shard.nowMs();
+    resp = try t.ask(.cluster_status, "", &buf);
+    try std.testing.expectEqual(raft.commit_index + 50, std.mem.readInt(u64, resp.data[21..29], .little));
+    try std.testing.expectEqual(@as(u8, 1), resp.data[29]);
+
+    // Once its own log reaches the vouched index, it answers none.
+    raft.commit_index += 50;
+    resp = try t.ask(.cluster_status, "", &buf);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, resp.data[21..29], .little));
 }
 
 test "Shard: a removed node answers clients with when, takes no frames, ticks nothing and dials no one" {
