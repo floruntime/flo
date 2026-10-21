@@ -689,10 +689,14 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         table.addColumn(h, .left) catch return outcome.malformed(ctx, "worker.list answer");
     }
 
+    // JSON and raw rows are kept until the last page, so a page that fails
+    // leaves no half-printed list behind.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ctx.allocator);
+
     var cursor_buf: [worker_ops.WorkerId.bound]u8 = undefined;
     var cursor: []const u8 = "";
     var shown: u64 = 0;
-    if (format == .json) ctx.print("[", .{});
     while (true) {
         const page_limit: u32 = if (most == 0) worker_ops.MAX_LIST else @intCast(@min(most - shown, worker_ops.MAX_LIST));
         var result = client_mod.action.workerList(&client, namespace, page_limit, cursor) catch |err| return outcome.requestFailed(ctx, err);
@@ -705,11 +709,11 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         while (it.next() catch return outcome.malformed(ctx, "worker.list answer")) |w| {
             switch (format) {
                 .json => {
-                    if (shown > 0) ctx.print(",", .{});
-                    ctx.print("{{\"worker_id\":{f},\"type\":\"{s}\",\"status\":\"{s}\",\"current_load\":{d},\"max_concurrency\":{d},\"tasks_completed\":{d},\"tasks_failed\":{d},\"registered_at_ms\":{d},\"last_heartbeat_ms\":{d},\"machine_id\":", .{ cli_output.jsonString(w.id), @tagName(w.worker_type), @tagName(w.status), w.current_load, w.max_concurrency, w.tasks_completed, w.tasks_failed, w.registered_at_ms, w.last_heartbeat_ms });
-                    if (w.machine_id) |m| ctx.print("{f}}}", .{cli_output.jsonString(m)}) else ctx.print("null}}", .{});
+                    if (shown > 0) out.append(ctx.allocator, ',') catch return outcome.malformed(ctx, "worker.list answer");
+                    out.print(ctx.allocator, "{{\"worker_id\":{f},\"type\":\"{s}\",\"status\":\"{s}\",\"current_load\":{d},\"max_concurrency\":{d},\"tasks_completed\":{d},\"tasks_failed\":{d},\"registered_at_ms\":{d},\"last_heartbeat_ms\":{d},\"machine_id\":", .{ cli_output.jsonString(w.id), @tagName(w.worker_type), @tagName(w.status), w.current_load, w.max_concurrency, w.tasks_completed, w.tasks_failed, w.registered_at_ms, w.last_heartbeat_ms }) catch return outcome.malformed(ctx, "worker.list answer");
+                    (if (w.machine_id) |m| out.print(ctx.allocator, "{f}}}", .{cli_output.jsonString(m)}) else out.appendSlice(ctx.allocator, "null}")) catch return outcome.malformed(ctx, "worker.list answer");
                 },
-                .raw => ctx.print("{s}\n", .{w.id}),
+                .raw => out.print(ctx.allocator, "{s}\n", .{w.id}) catch return outcome.malformed(ctx, "worker.list answer"),
                 .table => {
                     var load: [24]u8 = undefined;
                     var done: [24]u8 = undefined;
@@ -729,12 +733,15 @@ fn runWorkerList(ctx: *commander.Context) commander.Error!void {
         }
         const next = page.cursor orelse break;
         if (most != 0 and shown >= most) break;
+        // Pages run in id order: a cursor that doesn't move on would ask
+        // for the same page forever.
+        if (std.mem.order(u8, next, cursor) != .gt) return outcome.malformed(ctx, "worker.list answer (its cursor didn't move on)");
         @memcpy(cursor_buf[0..next.len], next);
         cursor = cursor_buf[0..next.len];
     }
     switch (format) {
-        .json => ctx.print("]\n", .{}),
-        .raw => {},
+        .json => ctx.print("[{s}]\n", .{out.items}),
+        .raw => ctx.print("{s}", .{out.items}),
         .table => if (shown == 0) ctx.print("(no workers)\n", .{}) else table.print(ctx),
     }
 }
