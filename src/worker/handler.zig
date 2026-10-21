@@ -830,6 +830,8 @@ const ListShards = struct {
         defer cursor.deinit(a);
         var pages: usize = 0;
         while (true) : (pages += 1) {
+            // Every page moves the cursor on; one that doesn't would loop.
+            if (pages > 10_000) return error.CursorStuck;
             var bodies: [3][]u8 = undefined;
             for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(namespace, limit, cursor.items));
             defer for (bodies) |b| a.free(b);
@@ -838,6 +840,7 @@ const ListShards = struct {
             var it = merged.workers.iterator();
             while (try it.next()) |r| try ids.append(a, try a.dupe(u8, r.id));
             const next = merged.cursor orelse return pages + 1;
+            try std.testing.expect(std.mem.order(u8, next, cursor.items) == .gt);
             cursor.clearRetainingCapacity();
             try cursor.appendSlice(a, next);
         }

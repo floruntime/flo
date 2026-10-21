@@ -7316,6 +7316,8 @@ test "Shard: worker.list on a node of two shards lists both shards' workers, in 
             try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{seen}), w.id);
         }
         const next = page.cursor orelse break;
+        // Each page moves the cursor on, so a regression fails, not hangs.
+        try std.testing.expect(std.mem.order(u8, next, cursor) == .gt and pages < 12);
         @memcpy(cursor_buf[0..next.len], next);
         cursor = cursor_buf[0..next.len];
     }
