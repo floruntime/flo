@@ -6,7 +6,7 @@
 //!   2. Propose the entry to RaftNode
 //!   3. `Shard.park` the request until the entry commits and is applied
 //!      (at once with no peers, after a quorum acks otherwise)
-//!   4. A responder reads the projection and answers the client
+//!   4. The client is answered from what the entry's applier recorded
 //!
 //! ## Handler Registration
 //!
@@ -41,6 +41,7 @@ const network_mode = @import("../raft/network.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const router = @import("../node/router.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const txn_mod = @import("./txn.zig");
 const kv_ops = @import("../protocol/kv_ops.zig");
 const ops = @import("../protocol/ops.zig");
@@ -322,21 +323,14 @@ pub const KVHandler = struct {
             return .{ .answer = .{ .version = null } };
         }
         const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = if (ttl == 0) null else ttl }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondSet } };
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        return .{ .park = .{ .proposed = proposed, .answer = answerSet } };
     }
 
-    /// The set applied: its version is the key's, and the namespace now
-    /// holds data.
-    fn respondSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        const entry = shard.kv_handler.*.kv.get(qkey) orelse
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        table_run.answer(SetResponse, shard, conn, req.header.request_id, .{ .version = entry.version });
+    /// The set applied: answered with the version its applier gave the key.
+    fn answerSet(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        table_run.answer(SetResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
     }
 
     /// The request's key, namespace-qualified, once it passes the checks
@@ -415,13 +409,14 @@ pub const KVHandler = struct {
         }
         if (current == null) return .{ .answer = .{ .existed = false } };
         const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondDeleted } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerDeleted } };
     }
 
-    fn respondDeleted(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        table_run.answer(DeleteResponse, shard, conn, req.header.request_id, .{ .existed = true });
+    /// Whether the key was there when the delete applied: another delete
+    /// can apply first.
+    fn answerDeleted(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        table_run.answer(DeleteResponse, shard, conn, request_id, .{ .existed = (r.int(u8) orelse 0) == 1 });
     }
 
     /// The names of keys starting with the request's key, a page at a time
@@ -629,22 +624,17 @@ pub const KVHandler = struct {
             return .{ .answer = .{ .version = null, .value = null } };
         }
         const proposed = proposeKV(shard, .kv_incr, .{ .key = qkey, .delta = delta }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondIncr } };
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        return .{ .park = .{ .proposed = proposed, .answer = answerIncr } };
     }
 
-    /// The counter applied: its value now.
-    fn respondIncr(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        const e = shard.kv_handler.*.kv.get(qkey) orelse
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        if (e.value.len != 8)
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        table_run.answer(IncrResponse, shard, conn, req.header.request_id, .{ .version = e.version, .value = std.mem.readInt(i64, e.value[0..8], .little) });
+    /// The counter applied: its version and value then. One that would
+    /// overflow, or met a value that isn't a counter, was refused where it
+    /// applied.
+    fn answerIncr(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        const version = r.int(u64) orelse 0;
+        table_run.answer(IncrResponse, shard, conn, request_id, .{ .version = version, .value = r.int(i64) orelse 0 });
     }
 
     /// Set a key's TTL, counted from this write, or clear it (`ttl_ms` 0),
@@ -668,13 +658,12 @@ pub const KVHandler = struct {
             return .{ .answer = .{} };
         }
         const proposed = proposeKV(shard, .kv_expire, .{ .key = qkey, .ttl_ms = ttl_ms }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondExpired } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerExpired } };
     }
 
-    fn respondExpired(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        table_run.answer(ExpireResponse, shard, conn, req.header.request_id, .{});
+    /// A key gone by the time the expire applied was refused there.
+    fn answerExpired(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        table_run.answer(ExpireResponse, shard, conn, request_id, .{});
     }
 
     /// Whether a key exists, and its version; inside a transaction, as the
@@ -743,19 +732,13 @@ pub const KVHandler = struct {
             return error.NotFound;
         defer self.allocator.free(merged);
         const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = merged, .ttl_ms = null }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondJsonSet } };
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        return .{ .park = .{ .proposed = proposed, .answer = answerJsonSet } };
     }
 
-    fn respondJsonSet(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        const e = shard.kv_handler.*.kv.get(qkey) orelse
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        table_run.answer(JsonSetResponse, shard, conn, req.header.request_id, .{ .version = e.version });
+    fn answerJsonSet(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        table_run.answer(JsonSetResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
     }
 
     /// Delete the JSON at `path`; `$` deletes the key.
@@ -772,23 +755,23 @@ pub const KVHandler = struct {
         const e = self.kv.get(qkey) orelse return error.NotFound;
         if (std.mem.eql(u8, path, "$")) {
             const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
-            return .{ .park = .{ .proposed = proposed, .responder = respondJsonDel } };
+            return .{ .park = .{ .proposed = proposed, .answer = answerJsonDeleted } };
         }
         const rest = json_path.jsonPathDel(self.allocator, e.value, path) catch |err| return jsonError(err);
         defer self.allocator.free(rest);
         const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = rest, .ttl_ms = null }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .responder = respondJsonDel } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerJsonPut } };
     }
 
-    /// The document's version, or null when the delete took the key.
-    fn respondJsonDel(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        const version: ?u64 = if (shard.kv_handler.*.kv.get(qkey)) |e| e.version else null;
-        table_run.answer(JsonDelResponse, shard, conn, req.header.request_id, .{ .version = version });
+    /// The path was deleted from the document: its version now.
+    fn answerJsonPut(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
+    }
+
+    /// `$` was deleted: the key went with it, and has no version.
+    fn answerJsonDeleted(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = null });
     }
 
     fn jsonError(err: json_path.PathError) Error {
@@ -824,31 +807,21 @@ pub const KVHandler = struct {
         const payload = txn_mod.encodeBatch(self.allocator, t.ops.items) catch return error.Internal;
         defer self.allocator.free(payload);
         const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload) catch |err| return proposeError(err);
-        // The transaction stays until its batch applies, and the responder
-        // drops it; until then a second commit would propose it again.
+        // The transaction stays until its batch is answered for, applied
+        // or not; until then a second commit would propose it again. If the
+        // batch applies after a failure was answered, it applies whole.
         t.committing = true;
-        return .{ .park = .{ .proposed = proposed, .responder = respondCommitted } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerCommitted, .release = dropTxn, .ctx = txn } };
     }
 
-    fn respondCommitted(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var diag: schema.Diagnostic = .{};
-        const body = table_run.op("kv.txn.commit").request.decodeAll(req.value, &diag) catch
-            return shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-        const table = &shard.kv_handler.*.txn_table;
-        const count: u16 = if (table.get(body.txn)) |t| @intCast(t.ops.items.len) else 0;
-        table.drop(body.txn);
-        table_run.answer(TxnCommitResponse, shard, conn, req.header.request_id, .{ .commit_index = shard.raft_node.last_applied, .ops = count });
+    /// The batch applied: its index, and the ops its applier counted.
+    fn answerCommitted(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        table_run.answer(TxnCommitResponse, shard, conn, request_id, .{ .commit_index = result.index, .ops = r.int(u16) orelse 0 });
     }
 
-    /// A commit whose batch won't be answered for (a leader change, a
-    /// failed flush): drop its transaction. If the batch still applies it
-    /// applies whole, on its own.
-    pub fn commitFailed(self: *KVHandler, req: Request) void {
-        var diag: schema.Diagnostic = .{};
-        const body = table_run.op("kv.txn.commit").request.decodeAll(req.value, &diag) catch return;
-        self.txn_table.drop(body.txn);
+    fn dropTxn(shard: *Shard, txn: u64) void {
+        shard.kv_handler.*.txn_table.drop(txn);
     }
 
     /// Drop a transaction and its buffered writes.

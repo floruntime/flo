@@ -48,6 +48,7 @@ const Connection = connection_mod.Connection;
 
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const EntryType = entry_mod.EntryType;
 const Flags = entry_mod.Flags;
 
@@ -80,11 +81,6 @@ pub const ProcessingHandler = struct {
 
     /// In-memory job store: job_id → JobRecord.
     jobs: std.StringHashMap(JobRecord),
-    /// What the last applied submit created; a key of `jobs` (see
-    /// `Shard.answering_index`).
-    last_submitted_job_id: ?[]const u8 = null,
-    /// The last applied submit was refused: the server held `max_jobs`.
-    last_submit_at_limit: bool = false,
     sink_drops: u64 = 0,
     sink_warn_ms: i64 = 0,
     chain_errors: u64 = 0,
@@ -435,40 +431,22 @@ pub const ProcessingHandler = struct {
         shard.processing_handler.handleCommand(shard, conn, req);
     }
 
-    /// A parked processing write applied: read the outcome back and answer.
-    fn respondProcessing(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const h = shard.processing_handler;
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        switch (op) {
-            .processing_submit => {
-                if (h.last_submit_at_limit) return h.refuseAtJobLimit(shard, conn, req.header.request_id);
-                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-                const job_id = h.last_submitted_job_id orelse {
-                    shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-                    return;
-                };
-                const job = h.jobs.getPtr(job_id) orelse {
-                    shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-                    return;
-                };
-                if (job.status == .failed) {
-                    // The job is stored, and takes a slot until cancelled.
-                    var buf: [JOB_FAILED_MESSAGE_MAX]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "processing job {s} failed: {s}; cancel it with `flo processing cancel {s}`", .{ job_id, job.failure_owned, job_id }) catch "processing job failed";
-                    shard.sendErrorResponse(conn, req.header.request_id, .bad_request, msg);
-                    return;
-                }
-                if (shard.metrics_registry) |m| m.processing.recordSubmitted();
-                shard.sendOkResponse(conn, req.header.request_id, job_id);
-            },
-            .processing_stop, .processing_cancel => {
-                if (shard.metrics_registry) |m| if (op == .processing_cancel) m.processing.recordCancelled() else m.processing.recordCompleted();
-                shard.sendOkResponse(conn, req.header.request_id, "");
-            },
-            else => shard.sendOkResponse(conn, req.header.request_id, ""),
-        }
+    /// The submit applied: answered with its job's id. Counted where the
+    /// client is answered.
+    fn answerSubmit(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        if (shard.metrics_registry) |m| m.processing.recordSubmitted();
+        var r = result.reader();
+        shard.sendOkResponse(conn, request_id, r.slice() orelse "");
+    }
+
+    fn answerStop(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        if (shard.metrics_registry) |m| m.processing.recordCompleted();
+        shard.sendOkResponse(conn, request_id, "");
+    }
+
+    fn answerCancel(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        if (shard.metrics_registry) |m| m.processing.recordCancelled();
+        shard.sendOkResponse(conn, request_id, "");
     }
 
     // ── Command Routing ─────────────────────────────────────────────────
@@ -569,7 +547,8 @@ pub const ProcessingHandler = struct {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "job not persisted"));
             return;
         };
-        shard.park(conn, req, proposed, respondProcessing);
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        shard.park(conn, req, proposed, answerSubmit);
     }
 
     fn refuseAtJobLimit(self: *const ProcessingHandler, shard: *Shard, conn: *Connection, request_id: u64) void {
@@ -601,7 +580,7 @@ pub const ProcessingHandler = struct {
                 shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "stop not persisted"));
                 return;
             };
-            shard.park(conn, req, proposed, respondProcessing);
+            shard.park(conn, req, proposed, answerStop);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -621,7 +600,7 @@ pub const ProcessingHandler = struct {
                 shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "cancel not persisted"));
                 return;
             };
-            shard.park(conn, req, proposed, respondProcessing);
+            shard.park(conn, req, proposed, answerCancel);
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
@@ -815,45 +794,39 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(entry);
+        return self.replayEntry(entry, out);
     }
 
-    /// Apply a processing entry (live commit and boot replay alike).
-    pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    /// Apply a processing entry (live commit and boot replay alike). A
+    /// submit is answered with its job's id.
+    pub fn replayEntry(self: *ProcessingHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const etype: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-        switch (etype) {
-            .processing_submit => {
-                self.last_submitted_job_id = null;
-                self.last_submit_at_limit = false;
-            },
-            else => {},
-        }
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
         const stamp_ms: i64 = @intCast(entry.header.timestamp_ns / std.time.ns_per_ms);
 
         return switch (etype) {
-            .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms),
+            .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms, out),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
-            else => .failed,
+            else => error.Halt,
         };
     }
 
     /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
     /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
+    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         const job_id = key;
         if (value.len == 0 or value[0] != SUBMIT_LAYOUT) {
             log.err("processing job {s} not started: its submit entry is from an older server, with a parallelism the server no longer takes; submit the job again", .{job_id});
-            return .failed;
+            return out.refuse(.bad_request, .unclassified, "job not started: its submit is from an older server; submit the job again");
         }
-        if (value.len < 8) return .failed; // 1+1+4+2 minimum
+        if (value.len < 8) return error.Halt; // 1+1+4+2 minimum
 
         var off: usize = 1;
-        const status = std.enums.fromInt(JobStatus, value[off]) orelse return .failed;
+        const status = std.enums.fromInt(JobStatus, value[off]) orelse return error.Halt;
         off += 1;
         const batch_size = std.mem.readInt(u32, value[off..][0..4], .little);
         off += 4;
@@ -861,7 +834,7 @@ pub const ProcessingHandler = struct {
         // Read embedded namespace
         const ns_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + ns_len > value.len) return .failed;
+        if (off + ns_len > value.len) return error.Halt;
         const ns_raw = value[off .. off + ns_len];
         off += ns_len;
 
@@ -871,8 +844,7 @@ pub const ProcessingHandler = struct {
         // same submits. A job already held is a replay of itself.
         if (!self.jobs.contains(job_id) and self.jobs.count() >= self.max_jobs) {
             log.warn("processing job {s} not created: this server holds at most {d} jobs", .{ job_id, self.max_jobs });
-            self.last_submit_at_limit = true;
-            return .applied;
+            return out.refuseFmt(.overloaded, .unclassified, "job not submitted: this server holds at most {d} processing jobs", .{self.max_jobs});
         }
 
         // Re-parse with the job's namespace as fallback, as the submit did, so
@@ -885,7 +857,7 @@ pub const ProcessingHandler = struct {
         var why_buf: [256]u8 = undefined;
         var failure: ?[]const u8 = null;
         var parsed: ?definition.JobDefinition = parser.parseJobDefinitionWithNamespace(self.allocator, yaml, ns_raw, &diag) catch |err| blk: {
-            if (err == error.OutOfMemory) return .failed;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             failure = diag.message();
             break :blk null;
         };
@@ -895,23 +867,23 @@ pub const ProcessingHandler = struct {
             failure = def.namespaceRefusal() orelse def.homeRefusal(ns_raw, &why_buf);
         }
 
-        const name = self.allocator.dupe(u8, if (parsed) |def| def.name else job_id) catch return .failed;
+        const name = self.allocator.dupe(u8, if (parsed) |def| def.name else job_id) catch return error.OutOfMemory;
         // Use the embedded namespace (authoritative from original submit)
         const namespace = self.allocator.dupe(u8, ns_raw) catch {
             self.allocator.free(name);
-            return .failed;
+            return error.OutOfMemory;
         };
 
         const owned_id = self.allocator.dupe(u8, job_id) catch {
             self.allocator.free(name);
             self.allocator.free(namespace);
-            return .failed;
+            return error.OutOfMemory;
         };
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
             self.allocator.free(namespace);
-            return .failed;
+            return error.OutOfMemory;
         };
 
         // Replace an existing record (idempotent replay), keeping its cursors.
@@ -940,15 +912,15 @@ pub const ProcessingHandler = struct {
             self.allocator.free(namespace);
             self.allocator.free(owned_yaml);
             cursors.deinit(self.allocator);
-            return .failed;
+            return error.OutOfMemory;
         };
         if (status == .failed) self.failed_jobs += 1;
-        self.last_submitted_job_id = owned_id;
         const job = self.jobs.getPtr(owned_id).?;
 
         if (failure) |why| {
             self.failJob(job, why);
-            return .applied;
+            // The job is stored, and takes a slot until cancelled.
+            return out.refuseFmt(.bad_request, .unclassified, "processing job {s} failed: {s}; cancel it with `flo processing cancel {s}`", .{ owned_id, job.failure_owned, owned_id });
         }
 
         // Rebuild the execution pipeline so a RUNNING job resumes consuming
@@ -959,24 +931,24 @@ pub const ProcessingHandler = struct {
         if (status == .running and self.pipelines.getPtr(owned_id) == null) {
             if (self.startPipelines(owned_id, &parsed.?, &why_buf)) |why| self.failJob(job, why);
         }
-        return .applied;
+        if (job.status == .failed)
+            return out.refuseFmt(.bad_request, .unclassified, "processing job {s} failed: {s}; cancel it with `flo processing cancel {s}`", .{ owned_id, job.failure_owned, owned_id });
+        out.putBytes(owned_id);
     }
 
     /// Replay a status change (stop/cancel).
-    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) persistence_mod.ApplyOutcome {
-        // Jobs are never removed, so a change for one this shard lacks has
-        // nothing to change.
-        const job = self.jobs.getPtr(key) orelse return .failed;
+    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) persistence_mod.ApplyError!void {
+        // Jobs are never removed: a change names one that was submitted.
+        const job = self.jobs.getPtr(key) orelse return error.Halt;
         self.setStatus(job, status);
-        return .applied;
     }
 
     /// Replay a processing_checkpoint entry: advance the pipeline's source
     /// cursor, if it has one, and the cursor its job keeps, so it resumes
     /// where it left off instead of from the start.
     /// Key = pipeline_key (job_id, or job_id\0idx); value = [a:u64 LE][b:u64 LE].
-    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyOutcome {
-        if (value.len < 16) return .failed;
+    fn replayCheckpoint(self: *ProcessingHandler, key: []const u8, value: []const u8) persistence_mod.ApplyError!void {
+        if (value.len < 16) return error.Halt;
         const a = std.mem.readInt(u64, value[0..8], .little);
         const b = std.mem.readInt(u64, value[8..16], .little);
         // A pipeline stopped since its checkpoint was proposed has no
@@ -988,18 +960,17 @@ pub const ProcessingHandler = struct {
         }
         // The job keeps it too, for a pipeline built later.
         const sep = std.mem.indexOfScalar(u8, key, 0);
-        const job = self.jobs.getPtr(key[0 .. sep orelse key.len]) orelse return .applied;
-        const source: u32 = if (sep) |i| std.fmt.parseInt(u32, key[i + 1 ..], 10) catch return .applied else 0;
+        const job = self.jobs.getPtr(key[0 .. sep orelse key.len]) orelse return;
+        const source: u32 = if (sep) |i| std.fmt.parseInt(u32, key[i + 1 ..], 10) catch return else 0;
         for (job.cursors.items) |*c| {
             if (c.source != source) continue;
             if (a > c.a or (a == c.a and b > c.b)) {
                 c.a = a;
                 c.b = b;
             }
-            return .applied;
+            return;
         }
-        job.cursors.append(self.allocator, .{ .source = source, .a = a, .b = b }) catch return .failed;
-        return .applied;
+        try job.cursors.append(self.allocator, .{ .source = source, .a = a, .b = b });
     }
 
     /// Move a pipeline's read cursor to `(a, b)`, forward only: this is also
@@ -1856,6 +1827,18 @@ pub const ProcessingHandler = struct {
 // Unit Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
+fn applySubmit(h: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyError!Result {
+    var out: Result = .{};
+    try h.replaySubmit(key, value, created_at_ms, &out);
+    return out;
+}
+
+fn applyLogged(h: *ProcessingHandler, e: *const entry_mod.Entry) persistence_mod.ApplyError!Result {
+    var out = Result.start(e);
+    try h.replayEntry(e, &out);
+    return out;
+}
+
 test "ProcessingHandler: all opcodes are registered" {
     const Dispatch = @import("../node/dispatcher.zig").Dispatcher;
     var d = Dispatch.init();
@@ -1892,7 +1875,7 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1700, .little);
     std.mem.writeInt(u64, val[8..16], 5, .little);
-    _ = handler.replayCheckpoint("job-cp", &val);
+    try handler.replayCheckpoint("job-cp", &val);
 
     const pipe = handler.pipelines.getPtr("job-cp").?;
     try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
@@ -1903,8 +1886,8 @@ test "ProcessingHandler: replayCheckpoint restores a pipeline's stream cursor" {
     try std.testing.expectEqual(@as(u64, 5), pipe.persisted_cursor_seq);
 
     // Unknown key is a no-op; short value is ignored (no crash, cursor unchanged).
-    _ = handler.replayCheckpoint("missing", &val);
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replayCheckpoint("job-cp", &[_]u8{0}));
+    try handler.replayCheckpoint("missing", &val);
+    try std.testing.expectError(error.Halt, handler.replayCheckpoint("job-cp", &[_]u8{0}));
     try std.testing.expectEqual(@as(u64, 1700), pipe.stream_cursor_ts);
 }
 
@@ -1925,7 +1908,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 1_700_000_000_123, .little);
     std.mem.writeInt(u64, val[8..16], 0, .little);
-    _ = handler.replayCheckpoint("job-ts", &val);
+    try handler.replayCheckpoint("job-ts", &val);
     const pipe = handler.pipelines.getPtr("job-ts").?;
     try std.testing.expectEqual(@as(u64, 1_700_000_000_123), pipe.ts_cursor_ns);
     try std.testing.expectEqual(@as(u64, 0), pipe.stream_cursor_ts);
@@ -1934,7 +1917,7 @@ test "processing: a TS source's checkpoint restores its cursor, and never moves 
     // A checkpoint that commits after the pipeline read further does not
     // move it back.
     pipe.ts_cursor_ns = 1_700_000_000_500;
-    _ = handler.replayCheckpoint("job-ts", &val);
+    try handler.replayCheckpoint("job-ts", &val);
     try std.testing.expectEqual(@as(u64, 1_700_000_000_500), pipe.ts_cursor_ns);
 }
 
@@ -1951,13 +1934,13 @@ test "processing: a stream source's checkpoint never moves its cursor back" {
     for ([_][2]u64{ .{ 1999, 9 }, .{ 2000, 2 } }) |older| {
         std.mem.writeInt(u64, val[0..8], older[0], .little);
         std.mem.writeInt(u64, val[8..16], older[1], .little);
-        _ = handler.replayCheckpoint("job-fw", &val);
+        try handler.replayCheckpoint("job-fw", &val);
         try std.testing.expectEqual(@as(u64, 2000), pipe.stream_cursor_ts);
         try std.testing.expectEqual(@as(u64, 3), pipe.stream_cursor_seq);
     }
     std.mem.writeInt(u64, val[0..8], 2000, .little);
     std.mem.writeInt(u64, val[8..16], 4, .little);
-    _ = handler.replayCheckpoint("job-fw", &val);
+    try handler.replayCheckpoint("job-fw", &val);
     try std.testing.expectEqual(@as(u64, 4), pipe.stream_cursor_seq);
 }
 
@@ -2042,7 +2025,7 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
         @memcpy(value[8..15], "default");
         @memcpy(value[15 .. 15 + yaml.len], yaml);
         var pbuf: [1024]u8 = undefined;
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 15 + yaml.len], &pbuf).?));
+        _ = try applyLogged(&handler, &entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 15 + yaml.len], &pbuf).?);
         try std.testing.expectEqual(stamp_ms, (handler.jobs.get("job-1") orelse return error.JobNotCreated).created_at_ms);
     }
 }
@@ -2056,7 +2039,7 @@ test "ProcessingHandler: a replayed submit with an unknown status is skipped" {
     var val = @as([8]u8, @splat(0));
     val[0] = SUBMIT_LAYOUT;
     val[1] = 0xee;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-bad", &val, 1));
+    try std.testing.expectError(error.Halt, applySubmit(&handler, "job-bad", &val, 1));
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }
 
@@ -2147,7 +2130,7 @@ test "ProcessingHandler: a stored definition that no longer parses is kept as fa
     var handler = ProcessingHandler.init(std.testing.allocator);
     defer handler.deinit();
     var buf: [512]u8 = undefined;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1));
+    _ = try applySubmit(&handler, "job-r", testSubmitValue(&buf, .running, yaml), 1);
     const job = handler.jobs.getPtr("job-r").?;
     try std.testing.expectEqual(ProcessingHandler.JobStatus.failed, job.status);
     try std.testing.expect(std.mem.indexOf(u8, job.failure_owned, "partitions") != null);
@@ -2156,10 +2139,10 @@ test "ProcessingHandler: a stored definition that no longer parses is kept as fa
     try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
 
     // The same submit again is still one failed job.
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1));
+    _ = try applySubmit(&handler, "job-r", testSubmitValue(&buf, .running, yaml), 1);
     try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
     // Cancelling it leaves none failed.
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayStatusChange("job-r", .cancelled));
+    try handler.replayStatusChange("job-r", .cancelled);
     try std.testing.expectEqual(@as(u64, 0), handler.failed_jobs);
 }
 
@@ -2179,23 +2162,23 @@ test "ProcessingHandler: a job without a pipeline keeps its cursor, forward only
     var handler = ProcessingHandler.init(std.testing.allocator);
     defer handler.deinit();
     var buf: [512]u8 = undefined;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-k", testSubmitValue(&buf, .stopped, yaml), 1));
+    _ = try applySubmit(&handler, "job-k", testSubmitValue(&buf, .stopped, yaml), 1);
     try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
 
     var val: [16]u8 = undefined;
     std.mem.writeInt(u64, val[0..8], 10, .little);
     std.mem.writeInt(u64, val[8..16], 5, .little);
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayCheckpoint("job-k", &val));
+    try handler.replayCheckpoint("job-k", &val);
     // A stale checkpoint doesn't move it back.
     std.mem.writeInt(u64, val[0..8], 9, .little);
     std.mem.writeInt(u64, val[8..16], 9, .little);
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayCheckpoint("job-k", &val));
+    try handler.replayCheckpoint("job-k", &val);
     const kept = handler.jobs.getPtr("job-k").?.cursors.items;
     try std.testing.expectEqual(@as(usize, 1), kept.len);
     try std.testing.expectEqual(ProcessingHandler.JobRecord.Cursor{ .source = 0, .a = 10, .b = 5 }, kept[0]);
 
     // The submit applied again as running builds the pipeline at the kept cursor.
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-k", testSubmitValue(&buf, .running, yaml), 1));
+    _ = try applySubmit(&handler, "job-k", testSubmitValue(&buf, .running, yaml), 1);
     const pipe = handler.pipelines.getPtr("job-k").?;
     try std.testing.expectEqual(@as(u64, 10), pipe.stream_cursor_ts);
     try std.testing.expectEqual(@as(u64, 5), pipe.stream_cursor_seq);
@@ -2241,8 +2224,9 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
     const value = testSubmitValue(&buf, .stopped, yaml);
     for ([_]struct { []const u8, bool }{ .{ "job-1", false }, .{ "job-2", true }, .{ "job-1", false } }) |c| {
         const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, 0, c[0], value, &pbuf).?;
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry));
-        try std.testing.expectEqual(c[1], handler.last_submit_at_limit);
+        var out = Result.start(&entry);
+        try handler.replayEntry(&entry, &out);
+        try std.testing.expectEqual(c[1], out.refused() != null);
         try std.testing.expectEqual(@as(usize, 1), handler.jobs.count());
     }
     try std.testing.expect(!handler.jobs.contains("job-2"));
@@ -2311,7 +2295,7 @@ test "ProcessingHandler: a stored job with a kv_lookup doesn't start on a server
         defer handler.deinit();
         handler.peer_shard_count = 2;
         var value: [512]u8 = undefined;
-        try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-1", testSubmitValue(&value, .running, yaml), 1));
+        _ = try applySubmit(&handler, "job-1", testSubmitValue(&value, .running, yaml), 1);
         try std.testing.expect(!handler.pipelines.contains("job-1"));
         const job = handler.jobs.getPtr("job-1").?;
         try std.testing.expectEqual(ProcessingHandler.JobStatus.failed, job.status);
@@ -2405,7 +2389,7 @@ test "ProcessingHandler: a submit applied twice keeps one pipeline, under a key 
     var handler = ProcessingHandler.init(std.testing.allocator);
     defer handler.deinit();
     var buf: [512]u8 = undefined;
-    for (0..2) |_| try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replaySubmit("job-twice", testSubmitValue(&buf, .running, yaml), 1));
+    for (0..2) |_| _ = try applySubmit(&handler, "job-twice", testSubmitValue(&buf, .running, yaml), 1);
     try std.testing.expectEqual(@as(usize, 1), handler.pipelines.count());
     try std.testing.expect(handler.pipelines.contains("job-twice"));
 }
@@ -2456,7 +2440,8 @@ test "ProcessingHandler: a submit entry from before the layout byte is refused, 
     @memcpy(val[11..18], "default");
     const yaml = "kind: Processing\nsources: [{stream: {name: in}}]\nsinks: [{stream: {name: out}}]\n";
     @memcpy(val[18 .. 18 + yaml.len], yaml);
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replaySubmit("job-old", val[0 .. 18 + yaml.len], 1));
+    const old = try applySubmit(&handler, "job-old", val[0 .. 18 + yaml.len], 1);
+    try std.testing.expectEqual(proto.StatusCode.bad_request, old.refused().?.status);
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
 }
 
@@ -2477,7 +2462,7 @@ test "ProcessingHandler: list shows a failed job's reason, through the walk ever
     var handler = ProcessingHandler.init(std.testing.allocator);
     defer handler.deinit();
     var buf: [512]u8 = undefined;
-    _ = handler.replaySubmit("job-r", testSubmitValue(&buf, .running, yaml), 1);
+    _ = try applySubmit(&handler, "job-r", testSubmitValue(&buf, .running, yaml), 1);
     const reason = handler.jobs.get("job-r").?.failure_owned;
     try std.testing.expect(reason.len > 0);
 

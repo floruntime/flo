@@ -32,6 +32,7 @@ const router_mod = @import("router.zig");
 const time_units = @import("../util/time_units.zig");
 
 const Entry = entry_mod.Entry;
+const Result = router_mod.Result;
 const EntryType = entry_mod.EntryType;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1026,7 +1027,11 @@ pub const TSProjection = struct {
 
     // ─── UAL Entry application ─────────────────────────────────────────────
 
-    pub fn applyEntry(self: *TSProjection, ual_entry: *const Entry) !void {
+    /// Apply a committed entry. A write is answered with its measurement
+    /// and the point's timestamp (the client's, or the entry's stamp), a
+    /// delete or retention with nothing. A payload that doesn't decode
+    /// halts.
+    pub fn applyEntry(self: *TSProjection, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const entry_type: EntryType = @fromBackingInt(@intCast(ual_entry.header.entry_type));
 
         switch (entry_type) {
@@ -1035,46 +1040,40 @@ pub const TSProjection = struct {
                 // reading plus the field name, client timestamp and tag hash
                 // (see TsWriteValue). Replaying all four is what makes a
                 // restored series identical to the written one.
-                if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    if (TsWriteValue.decode(cmd.value, ual_entry.header.timestamp_ns)) |rec| {
-                        try self.insert(
-                            cmd.namespace_hash,
-                            cmd.key,
-                            rec.field_name,
-                            rec.value,
-                            rec.timestamp_ns,
-                            ual_entry.header.index,
-                            rec.tags,
-                        );
-                    }
-                }
+                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
+                const rec = TsWriteValue.decode(cmd.value, ual_entry.header.timestamp_ns) orelse return error.Halt;
+                try self.insert(
+                    cmd.namespace_hash,
+                    cmd.key,
+                    rec.field_name,
+                    rec.value,
+                    rec.timestamp_ns,
+                    ual_entry.header.index,
+                    rec.tags,
+                );
+                out.putBytes(cmd.key);
+                out.putInt(u64, rec.timestamp_ns);
             },
             // The value is the canonical tag filter; empty deletes the
             // whole measurement.
             .ts_delete => {
-                if (entry_mod.CommandPayload.deserialize(ual_entry.payload)) |cmd| {
-                    var canon_buf: [MAX_TAG_STRING]u8 = undefined;
-                    var preds_buf: [MAX_TAGS]TagPredicate = undefined;
-                    switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
-                        .ok => |f| _ = self.deleteSeries(cmd.namespace_hash, cmd.key, f.preds),
-                        else => log.err("ts delete entry index={d} has a malformed tag filter; skipped, so nothing is deleted", .{ual_entry.header.index}),
-                    }
-                } else {
-                    log.err("ts delete entry index={d} is malformed; skipped, so the measurement stays", .{ual_entry.header.index});
+                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
+                var canon_buf: [MAX_TAG_STRING]u8 = undefined;
+                var preds_buf: [MAX_TAGS]TagPredicate = undefined;
+                switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
+                    .ok => |f| _ = self.deleteSeries(cmd.namespace_hash, cmd.key, f.preds),
+                    else => return error.Halt,
                 }
             },
             // The entry carries the duration; the cutoff is its stamp less
             // that, so every replica trims the same points.
             .ts_retention => {
-                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload);
-                if (cmd != null and cmd.?.value.len == 8) {
-                    const age_ms = std.mem.readInt(u64, cmd.?.value[0..8], .little);
-                    _ = self.applyRetention(cmd.?.namespace_hash, cmd.?.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
-                } else {
-                    log.err("ts retention entry index={d} is malformed; skipped, so nothing is trimmed", .{ual_entry.header.index});
-                }
+                const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
+                if (cmd.value.len != 8) return error.Halt;
+                const age_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
+                _ = self.applyRetention(cmd.namespace_hash, cmd.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
             },
-            else => {},
+            else => return error.Halt,
         }
 
         self.applied_index = ual_entry.header.index;
@@ -1091,9 +1090,9 @@ pub const TSProjection = struct {
         };
     }
 
-    fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry) router_mod.ApplyError!void {
+    fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *TSProjection = @ptrCast(@alignCast(ctx));
-        self.applyEntry(ual_entry) catch return error.OutOfMemory;
+        return self.applyEntry(ual_entry, out);
     }
 
     fn vtableMemory(ctx: *anyopaque) usize {
@@ -1420,6 +1419,11 @@ pub const TSProjection = struct {
 
 const testing = std.testing;
 
+fn applyTest(ts: *TSProjection, e: *const Entry) router_mod.ApplyError!void {
+    var out = Result.start(e);
+    return ts.applyEntry(e, &out);
+}
+
 test "ts: basic insert and query" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
@@ -1544,6 +1548,21 @@ test "ts: memory usage estimate" {
     try testing.expect(ts.memoryUsage() > 0);
 }
 
+test "ts: a write's answer carries the longest measurement name an entry can hold, whole" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer ts.deinit();
+    const name = @as([@import("../storage/persistence.zig").MAX_ENTRY_KEY]u8, @splat('m'));
+    const val_bytes: [8]u8 = @bitCast(@as(u64, @bitCast(@as(f64, 1.5))));
+    var payload_buf: [name.len + 128]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, 0, &name, &val_bytes, &payload_buf).?;
+    var out = Result.start(&e);
+    try ts.applyEntry(&e, &out);
+    try testing.expect(!out.overflowed);
+    var r = out.reader();
+    try testing.expectEqualSlices(u8, &name, r.slice().?);
+    try testing.expectEqual(@as(?u64, 1000), r.int(u64));
+}
+
 test "ts: apply entry for ts_write" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
@@ -1553,7 +1572,7 @@ test "ts: apply entry for ts_write" {
     const val_bytes: [8]u8 = @bitCast(@as(u64, @bitCast(val)));
     var payload_buf: [128]u8 = undefined;
     const ual_entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, 0, "cpu", &val_bytes, &payload_buf) orelse unreachable;
-    try ts.applyEntry(&ual_entry);
+    try applyTest(&ts, &ual_entry);
 
     try testing.expectEqual(@as(u64, 1), ts.stats.points_inserted);
 }
@@ -1901,7 +1920,7 @@ test "ts: replay reconstructs the tagged series exactly" {
 
     var payload_buf: [512]u8 = undefined;
     const entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 123, 1, "cpu", encoded, &payload_buf).?;
-    try ts.applyEntry(&entry);
+    try applyTest(&ts, &entry);
 
     // Field, timestamp and tags all survive — and the point is addressable by a
     // partial tag filter, which requires the dictionary to be repopulated.
@@ -1945,13 +1964,13 @@ test "ts: a retention entry cuts at its stamp less its duration, not at the host
         var pbuf: [64]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old points.
         std.mem.writeInt(u64, &age, 3_000, .little);
-        try ts.applyEntry(&entry_mod.buildCommandEntry(.ts_retention, 0, 1, 10, stamp, 1, "m", &age, &pbuf).?);
+        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 10, stamp, 1, "m", &age, &pbuf).?);
         var buf: [10]StoredPoint = undefined;
         try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
 
         // A duration past the stamp trims nothing, never everything.
         std.mem.writeInt(u64, &age, stamp / std.time.ns_per_ms + 1, .little);
-        try ts.applyEntry(&entry_mod.buildCommandEntry(.ts_retention, 0, 1, 11, stamp, 1, "m", &age, &pbuf).?);
+        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 11, stamp, 1, "m", &age, &pbuf).?);
         try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
     }
 }

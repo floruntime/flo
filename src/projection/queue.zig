@@ -24,6 +24,7 @@ const router_mod = @import("router.zig");
 const node_router = @import("../node/router.zig");
 
 const Entry = entry_mod.Entry;
+const Result = router_mod.Result;
 const EntryType = entry_mod.EntryType;
 const CommandPayload = entry_mod.CommandPayload;
 
@@ -152,11 +153,6 @@ pub const QueueProjection = struct {
 
     /// Next sequence number.
     next_seq: u64,
-    /// What the last applied purge removed, and the sequence the last
-    /// applied enqueue got (see `Shard.answering_index`).
-    last_purge_count: u64 = 0,
-    last_enqueued_seq: ?u64 = null,
-
     /// Last applied UAL index.
     applied_index: u64,
 
@@ -325,14 +321,14 @@ pub const QueueProjection = struct {
     /// count removed. The queue's ready heap goes with them; the lease heap
     /// self-cleans lazily (an expiring seq missing from `messages` is
     /// skipped). Dead letters are left intact.
-    pub fn purgeQueue(self: *QueueProjection, queue_name_hash: u64) u64 {
+    pub fn purgeQueue(self: *QueueProjection, queue_name_hash: u64) error{OutOfMemory}!u64 {
         // Collect matching seqs first; removing during iteration is unsafe.
         var seqs: std.ArrayList(u64) = .empty;
         defer seqs.deinit(self.allocator);
         var it = self.messages.iterator();
         while (it.next()) |kv| {
             if (kv.value_ptr.queue_name_hash == queue_name_hash) {
-                seqs.append(self.allocator, kv.key_ptr.*) catch return 0;
+                try seqs.append(self.allocator, kv.key_ptr.*);
             }
         }
         for (seqs.items) |seq| {
@@ -345,7 +341,6 @@ pub const QueueProjection = struct {
             l.ready = .empty;
             self.dropLaneIfEmpty(queue_name_hash);
         }
-        self.last_purge_count = seqs.items.len;
         return @intCast(seqs.items.len);
     }
 
@@ -602,66 +597,57 @@ pub const QueueProjection = struct {
 
     // ─── UAL Entry application ─────────────────────────────────────────────
 
-    pub fn applyEntry(self: *QueueProjection, entry: *const Entry) !void {
+    /// Apply a committed entry, recording its answer in `out`: an enqueue,
+    /// the message's sequence (u64); a purge, how many it removed (u64); an
+    /// ack or nack, nothing. A payload that doesn't decode halts. An ack or
+    /// nack of a message that's gone changes nothing: a worker may ack what
+    /// another node's lease already moved on.
+    pub fn applyEntry(self: *QueueProjection, entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
 
         switch (entry_type) {
             .queue_enqueue => {
-                self.last_enqueued_seq = null;
-                // Parse priority from command payload value (first 4 bytes) or default 0
+                const cmd = CommandPayload.deserialize(entry.payload) orelse return error.Halt;
+                // The value is a 4-byte priority, then the message.
                 var priority: u32 = 0;
-                var payload: []const u8 = &[_]u8{};
-                var q_name_hash: u64 = 0;
-                var q_name: []const u8 = "";
-                var q_ns_hash: u32 = 0;
-                if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    if (cmd.value.len >= 4) {
-                        priority = std.mem.readInt(u32, cmd.value[0..4], .little);
-                        // Rest of value after 4-byte priority is the actual payload
-                        if (cmd.value.len > 4) {
-                            payload = cmd.value[4..];
-                        }
-                    } else {
-                        payload = cmd.value;
-                    }
-                    q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
-                    q_name = cmd.key;
-                    q_ns_hash = cmd.namespace_hash;
+                var payload: []const u8 = cmd.value;
+                if (cmd.value.len >= 4) {
+                    priority = std.mem.readInt(u32, cmd.value[0..4], .little);
+                    payload = cmd.value[4..];
                 }
-                self.last_enqueued_seq = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
+                const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
+                const seq = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
                 // Register queue during recovery so list works after restart. The entry
                 // only has the namespace hash; resolve the real namespace string when a
                 // resolver is wired (live enqueues already register the correct namespace
                 // before apply, so this primarily fixes restart/replay labeling).
-                if (q_name.len > 0) {
-                    self.registerQueue(q_name_hash, q_name, self.resolveNamespace(q_ns_hash)) catch {};
+                if (cmd.key.len > 0) {
+                    self.registerQueue(q_name_hash, cmd.key, self.resolveNamespace(cmd.namespace_hash)) catch {};
                 }
+                out.putInt(u64, seq);
             },
             // Key: the message's seq. Value: the queue it must be in. Seqs
             // are numbered across the partition, so without the queue an
             // ack could take another queue's message, another namespace's.
             .queue_ack => {
-                if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    if (ackTarget(cmd)) |t| if (self.inQueue(t.seq, t.queue)) try self.ack(t.seq);
-                }
+                const cmd = CommandPayload.deserialize(entry.payload) orelse return error.Halt;
+                const t = ackTarget(cmd) orelse return error.Halt;
+                if (self.inQueue(t.seq, t.queue)) try self.ack(t.seq);
             },
             .queue_nack => {
-                if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    if (ackTarget(cmd)) |t| if (self.inQueue(t.seq, t.queue)) try self.nack(t.seq, entry.header.timestamp_ns);
-                }
+                const cmd = CommandPayload.deserialize(entry.payload) orelse return error.Halt;
+                const t = ackTarget(cmd) orelse return error.Halt;
+                if (self.inQueue(t.seq, t.queue)) try self.nack(t.seq, entry.header.timestamp_ns);
             },
             .queue_lease => {
                 // Lease extension — not yet implemented, treat as no-op
             },
             .queue_purge => {
-                self.last_purge_count = 0;
                 // Drop all ready+leased messages for one queue. Key = queue name.
-                if (CommandPayload.deserialize(entry.payload)) |cmd| {
-                    const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
-                    _ = self.purgeQueue(q_name_hash);
-                }
+                const cmd = CommandPayload.deserialize(entry.payload) orelse return error.Halt;
+                out.putInt(u64, try self.purgeQueue(node_router.nameHash(cmd.namespace_hash, cmd.key)));
             },
-            else => {},
+            else => return error.Halt,
         }
 
         self.applied_index = entry.header.index;
@@ -678,9 +664,9 @@ pub const QueueProjection = struct {
         };
     }
 
-    fn vtableApply(ctx: *anyopaque, entry: *const Entry) router_mod.ApplyError!void {
+    fn vtableApply(ctx: *anyopaque, entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *QueueProjection = @ptrCast(@alignCast(ctx));
-        self.applyEntry(entry) catch return error.OutOfMemory;
+        return self.applyEntry(entry, out);
     }
 
     fn vtableMemory(ctx: *anyopaque) usize {
@@ -989,6 +975,11 @@ pub const QueueProjection = struct {
 
 const testing = std.testing;
 
+fn applyTest(q: *QueueProjection, e: *const Entry) router_mod.ApplyError!void {
+    var out = Result.start(e);
+    return q.applyEntry(e, &out);
+}
+
 test "queue: basic enqueue and dequeue" {
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer q.deinit();
@@ -1225,7 +1216,7 @@ test "queue: a queue's ready heap is freed once it has nothing ready or dead" {
 
     for (0..3) |i| _ = try q.enqueue(100 + i, 0, 1000, 1, "a");
     _ = try q.enqueue(200, 0, 1000, 2, "b");
-    try testing.expectEqual(@as(u64, 3), q.purgeQueue(1));
+    try testing.expectEqual(@as(u64, 3), try q.purgeQueue(1));
     try testing.expect(q.lanes.get(1) == null);
 
     _ = (try q.dequeue(2000, 2)).?;
@@ -1274,8 +1265,10 @@ test "queue: projection handle with router" {
     router.registerQueue(q.projectionHandle());
 
     // Build a queue_enqueue entry
-    const entry = entry_mod.buildEntry(.queue_enqueue, 0, 1, 1, 1000, "test-payload");
-    const result = router.apply(&entry);
+    var payload_buf: [64]u8 = undefined;
+    const entry = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q", "test-payload", &payload_buf).?;
+    var out = Result.start(&entry);
+    const result = try router.apply(&entry, &out);
 
     try testing.expectEqual(router_mod.ApplyResult.applied, result);
     try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
@@ -1353,17 +1346,19 @@ test "queue: an ack or nack entry touches a message only in the queue it names" 
     std.mem.writeInt(u64, &key, theirs, .little);
     var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
     for ([_]EntryType{ .queue_ack, .queue_nack }) |kind| {
-        // Another queue's id, then no queue at all: nothing happens.
-        for ([_][]const u8{ &std.mem.toBytes(@as(u64, 7)), "" }) |queue| {
-            const entry = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, queue, &payload_buf).?;
-            try q.applyEntry(&entry);
-            try testing.expect(q.inQueue(theirs, 42));
-            try testing.expectEqual(@as(u64, 0), q.stats.acked + q.stats.nacked);
-        }
+        // Another queue's id: nothing happens.
+        const other = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, &std.mem.toBytes(@as(u64, 7)), &payload_buf).?;
+        try applyTest(&q, &other);
+        try testing.expect(q.inQueue(theirs, 42));
+        try testing.expectEqual(@as(u64, 0), q.stats.acked + q.stats.nacked);
+        // No queue at all: no proposer writes that, and it halts.
+        const none = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, "", &payload_buf).?;
+        try testing.expectError(error.Halt, applyTest(&q, &none));
+        try testing.expect(q.inQueue(theirs, 42));
     }
     // Its own queue's id: acked.
     const entry = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 3, 3000, 0, &key, &std.mem.toBytes(@as(u64, 42)), &payload_buf).?;
-    try q.applyEntry(&entry);
+    try applyTest(&q, &entry);
     try testing.expect(!q.inQueue(theirs, 42));
     try testing.expectEqual(@as(u64, 1), q.stats.acked);
 }

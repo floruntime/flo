@@ -48,6 +48,7 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const router = @import("../node/router.zig");
 
 const CommandResult = result_mod.CommandResult;
@@ -228,9 +229,6 @@ pub const NamespaceHandler = struct {
     /// they hold room and ids until they apply. Cleared when this node
     /// stops leading: an entry the log then drops is proposed again.
     pending_creates: std.StringHashMapUnmanaged(void) = .{},
-    /// What the last applied create did (see `Shard.answering_index`): two
-    /// creates can both pass the handler's checks before either applies.
-    last_create: CreateOutcome = .created,
     implicit_failed: u64 = 0,
     implicit_warn_ms: i64 = 0,
 
@@ -334,10 +332,12 @@ pub const NamespaceHandler = struct {
     /// Implicit creation (e.g. "default" on the first bare-namespace write):
     /// a namespace_create entry, applied like an explicit one so it
     /// survives restart and reaches followers. One in flight per name.
-    /// `counts_write`: the write that caused it has already applied and
-    /// its responder found no namespace to count against, so the create
-    /// counts it; a write that proposes the create ahead of its own entry
-    /// is counted by its responder.
+    /// `counts_write`: the write that caused it found no namespace to count
+    /// against where it was accepted, so the create counts it. A create
+    /// proposed ahead of its write counts nothing, and that write, counted
+    /// where it is accepted while the create is still pending, is not
+    /// counted either: `data_count` stays 0 until the namespace's next
+    /// write. Only tests read it.
     pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard, counts_write: bool) void {
         const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
         if (self.namespaces.contains(effective) or self.pending_creates.contains(effective)) return;
@@ -545,21 +545,13 @@ pub const NamespaceHandler = struct {
             return;
         };
         shard.namespace_handler.notePending(name);
-        shard.park(conn, req, proposed, respondCreate);
+        shard.park(conn, req, proposed, answerCreate);
     }
 
-    fn respondCreate(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        switch (shard.namespace_handler.last_create) {
-            .created => {},
-            .existed => return shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists"),
-            .invalid => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, nameRefusal(req.key) orelse "invalid namespace name"),
-            .collision => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, COLLISION_MESSAGE),
-            .full => return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, LIMIT_MESSAGE),
-            .failed => return shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "namespace not registered: out of memory"),
-        }
-        shard.sendOkResponse(conn, req.header.request_id, "");
+    /// Two creates can both pass the handler's checks before either
+    /// applies: the applier's result says which one made the name.
+    fn answerCreate(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        shard.sendOkResponse(conn, request_id, "");
     }
 
     /// A namespace's data can live on any shard, keyed by a name that a
@@ -597,39 +589,39 @@ pub const NamespaceHandler = struct {
         registry.register(.namespace_config, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const self: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(entry);
+        return self.replayEntry(entry, out);
     }
 
-    /// Replay a namespace UAL entry to rebuild in-memory state.
-    /// Called during segment replay on startup and after Raft commit. A
-    /// create refused for its name or the cap is applied: the proposer
-    /// answers its client with the refusal.
-    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
-        self.last_create = .created;
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+    /// Apply a namespace UAL entry, at boot or after Raft commit. A create
+    /// refused for its name, its id or the cap is refused the same way on
+    /// every replica; a delete of a name that's gone changes nothing.
+    pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
         const name = cmd.key;
-        if (name.len == 0) return .failed;
+        if (name.len == 0) return error.Halt;
 
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .namespace_create => {
-                self.last_create = self.applyCreateAt(name, entry.header.timestamp_ns);
+                if (self.pending_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
+                switch (self.applyCreateAt(name, entry.header.timestamp_ns)) {
+                    .created => {},
+                    .existed => out.refuse(.conflict, .unclassified, "namespace already exists"),
+                    .invalid => out.refuse(.bad_request, .unclassified, nameRefusal(name) orelse "invalid namespace name"),
+                    .collision => out.refuse(.bad_request, .unclassified, COLLISION_MESSAGE),
+                    .full => out.refuse(.bad_request, .unclassified, LIMIT_MESSAGE),
+                    .failed => return error.OutOfMemory,
+                }
                 if (std.mem.eql(u8, cmd.value, IMPLICIT_CREATE)) {
                     if (self.namespaces.getPtr(name)) |meta| meta.data_count = @max(meta.data_count, 1);
                 }
-                if (self.pending_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
-                if (self.last_create == .failed) return .failed;
             },
             .namespace_delete => self.applyDelete(name),
-            .namespace_config => {
-                log.warn("namespace: skipped a settings entry for namespace={s}: namespace settings aren't supported", .{name});
-                return .failed;
-            },
-            else => return .failed,
+            .namespace_config => out.refuse(.bad_request, .unclassified, SETTINGS_REFUSAL),
+            else => return error.Halt,
         }
-        return .applied;
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -1185,8 +1177,15 @@ test "namespace handler: a namespace created through the log was created at its 
     defer handler.deinit();
     var buf: [128]u8 = undefined;
     const e = entry_mod.buildCommandEntry(.namespace_create, 0, 1, 1, 1234 * std.time.ns_per_s, 0, "stamped", "", &buf) orelse unreachable;
-    try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&e));
+    var out = Result.start(&e);
+    try handler.replayEntry(&e, &out);
+    try testing.expect(out.refused() == null);
     try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), handler.namespaces.get("stamped").?.created_at_ns);
+    // A second create of the name is refused where it applies, not where
+    // it was proposed: two can pass the handler's checks before either applies.
+    var again = Result.start(&e);
+    try handler.replayEntry(&e, &again);
+    try testing.expectEqual(proto.StatusCode.conflict, again.refused().?.status);
 }
 
 test "namespace handler: applyCreate is idempotent" {

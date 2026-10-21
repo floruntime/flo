@@ -27,6 +27,7 @@ const router = @import("../node/router.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const ReplayRegistry = persistence_mod.ReplayRegistry;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
@@ -50,6 +51,9 @@ pub const QueueHandler = struct {
     queue: *QueueProjection,
     partition: *Partition,
     allocator: Allocator,
+    /// Without a shard (unit tests) an enqueue applies here: the id its
+    /// answer points into.
+    local_id_buf: [20]u8 = undefined,
 
     /// Opaque pointer to owning Shard (avoids circular import).
     /// Set after init by Shard.wireHandlerShardPtrs(). Required for Raft writes.
@@ -124,26 +128,42 @@ pub const QueueHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
-        if (result == .parked) return shard.park(conn, req, result.parked, respondQueue);
+        if (result == .parked) return parkQueue(shard, conn, req, result.parked);
         sendQueueResponse(shard, conn, req.header.request_id, result);
     }
 
-    /// A parked queue write applied: read the outcome back and answer.
-    fn respondQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+    /// Park a queue write on its entry, answered from what its applier
+    /// recorded. An enqueue counts against its namespace here, where it is
+    /// accepted.
+    fn parkQueue(shard: *Shard, conn: *Connection, req: Request, proposed: persistence_mod.ProposeResult) void {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        switch (op) {
-            .queue_enqueue => {
-                // Dequeue waiters are woken by the applier on every node; the
-                // write is counted against its namespace where the client is answered.
-                shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-                var id_buf: [20]u8 = undefined;
-                sendQueueResponse(shard, conn, req.header.request_id, shard.queue_handler.respondEnqueue(&id_buf));
-            },
-            .queue_purge => sendQueueResponse(shard, conn, req.header.request_id, .{ .queue_purged = .{ .count = @intCast(@min(shard.queue_handler.queue.last_purge_count, std.math.maxInt(u32))) } }),
-            else => sendQueueResponse(shard, conn, req.header.request_id, .ok),
-        }
+        if (op == .queue_enqueue) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        shard.park(conn, req, proposed, switch (op) {
+            .queue_enqueue => answerEnqueue,
+            .queue_purge => answerPurge,
+            else => answerOk,
+        });
+    }
+
+    fn answerEnqueue(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var id_buf: [20]u8 = undefined;
+        sendQueueResponse(shard, conn, request_id, enqueued(result, &id_buf));
+    }
+
+    fn answerPurge(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        sendQueueResponse(shard, conn, request_id, .{ .queue_purged = .{ .count = @intCast(@min(r.int(u64) orelse 0, std.math.maxInt(u32))) } });
+    }
+
+    fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        sendQueueResponse(shard, conn, request_id, .ok);
+    }
+
+    /// An enqueue's answer: the sequence its applier gave the message.
+    fn enqueued(result: *const Result, id_buf: *[20]u8) CommandResult {
+        var r = result.reader();
+        const id_str = std.fmt.bufPrint(id_buf, "{d}", .{r.int(u64) orelse 0}) catch "0";
+        return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
     /// Dedicated dispatch for queue_enqueue — notifies blocking dequeue waiters.
@@ -157,7 +177,7 @@ pub const QueueHandler = struct {
         shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
-        if (result == .parked) return shard.park(conn, req, result.parked, respondQueue);
+        if (result == .parked) return parkQueue(shard, conn, req, result.parked);
         switch (result) {
             .queue_enqueued => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
             else => {},
@@ -321,20 +341,13 @@ pub const QueueHandler = struct {
             ) orelse {
                 return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
             };
-            _ = self.partition.apply(&entry) catch {
+            var out = Result.start(&entry);
+            const applied = self.partition.applyRouted(&entry, &out) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
             };
+            if (applied.failed != null) return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
+            return enqueued(&out, &self.local_id_buf);
         }
-
-        var id_buf: [20]u8 = undefined;
-        return self.respondEnqueue(&id_buf);
-    }
-
-    /// The enqueue applied: answer with the sequence its applier recorded.
-    pub fn respondEnqueue(self: *QueueHandler, id_buf: *[20]u8) CommandResult {
-        const seq = self.queue.last_enqueued_seq orelse return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
-        const id_str = std.fmt.bufPrint(id_buf, "{d}", .{seq}) catch "0";
-        return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
     // ── DEQUEUE ─────────────────────────────────────────────────────────
@@ -566,7 +579,7 @@ pub const QueueHandler = struct {
         const q_name_hash = router.nameHash(ns_hash, req.key);
 
         // The applier purges the projection and records what it removed;
-        // the responder answers from that.
+        // the client is answered from that.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             const proposed = persistence_mod.proposeEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {

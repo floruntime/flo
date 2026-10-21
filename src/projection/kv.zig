@@ -33,6 +33,7 @@ comptime {
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
+pub const Result = router_mod.Result;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // KV Entry — stored in the hash map
@@ -568,73 +569,82 @@ pub const KVProjection = struct {
 
     // ─── UAL Entry application (ProjectionRouter interface) ────────────────
 
-    /// Apply a committed UAL entry to this projection. A payload that
-    /// doesn't decode whole is a bug in the proposer: nothing of it is
-    /// applied, and it is `InvalidPayload`, counted as an apply error. An
-    /// incr that overflows or meets a non-counter, and an expire of a key
-    /// that's gone, change nothing and are applied: every replica reaches
-    /// the same state.
-    pub fn applyEntry(self: *KVProjection, entry: *const Entry) !void {
+    /// Apply a committed UAL entry to this projection, recording what the
+    /// client is answered in `out`. A payload that doesn't decode whole is a
+    /// bug in the proposer: nothing of it is applied, and it halts. An incr
+    /// that overflows or meets a non-counter, and an expire of a key that's
+    /// gone, change nothing and are refused: every replica reaches the same
+    /// state and the same answer. Inside a batch they change nothing too,
+    /// and the rest of the batch applies.
+    ///
+    /// Answers: put, the key's version; delete, whether the key was there
+    /// (u8); incr, its version and value; expire, nothing; batch, its op
+    /// count (u16).
+    pub fn applyEntry(self: *KVProjection, entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         const h = entry.header;
         var diag: schema.Diagnostic = .{};
 
         switch (entry_type) {
             .kv_put => {
-                const p = kv_entries.Put.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                const p = kv_entries.Put.decodeAll(entry.payload, &diag) catch return error.Halt;
                 try self.put(p.key, p.value, h.index, h.term, h.timestamp_ns, time_units.expiryAfter(h.timestamp_ns, p.ttl_ms orelse 0));
+                out.putInt(u64, self.map.getPtr(p.key).?.version);
             },
             .kv_delete => {
-                const p = kv_entries.Delete.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                const p = kv_entries.Delete.decodeAll(entry.payload, &diag) catch return error.Halt;
+                const existed = if (self.map.getPtr(p.key)) |e| !e.tombstone and !expiredAt(e, h.timestamp_ns) else false;
                 try self.delete(p.key, h.index, h.term, h.timestamp_ns);
+                out.putInt(u8, @intFromBool(existed));
             },
             .kv_incr => {
-                const p = kv_entries.Incr.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
-                try self.applyIncrNoop(p.key, p.delta, h);
+                const p = kv_entries.Incr.decodeAll(entry.payload, &diag) catch return error.Halt;
+                const value = self.applyIncr(p.key, p.delta, h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+                    error.Overflow => return out.refuse(.bad_request, .out_of_range, INCR_OVERFLOW),
+                    error.NotACounter => return out.refuse(.bad_request, .wrong_type, NOT_A_COUNTER),
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                out.putInt(u64, self.map.getPtr(p.key).?.version);
+                out.putInt(i64, value);
             },
             .kv_expire => {
-                const p = kv_entries.Expire.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
-                self.applyExpireNoop(p.key, p.ttl_ms, h);
+                const p = kv_entries.Expire.decodeAll(entry.payload, &diag) catch return error.Halt;
+                self.applyTouch(p.key, time_units.expiryAfter(h.timestamp_ns, p.ttl_ms), h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+                    error.NotFound => return out.refuse(.not_found, .not_found, "not found"),
+                };
             },
             .kv_batch => {
                 // Decoded and checked whole before any op applies, so a bad
                 // batch changes nothing.
-                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return error.InvalidPayload;
+                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return error.Halt;
                 var check = batch.ops.iterator();
-                while (check.next() catch return error.InvalidPayload) |op| {
-                    if (kv_entries.batchOpRule(op) != null) return error.InvalidPayload;
+                var ops: u16 = 0;
+                while (check.next() catch return error.Halt) |op| {
+                    if (kv_entries.batchOpRule(op) != null) return error.Halt;
+                    ops += 1;
                 }
                 var it = batch.ops.iterator();
-                while (it.next() catch return error.InvalidPayload) |op| switch (op.kind) {
+                while (it.next() catch return error.Halt) |op| switch (op.kind) {
                     .put => try self.put(op.key, op.value.?, h.index, h.term, h.timestamp_ns, time_units.expiryAfter(h.timestamp_ns, op.ttl_ms orelse 0)),
                     .delete => try self.delete(op.key, h.index, h.term, h.timestamp_ns),
-                    .incr => try self.applyIncrNoop(op.key, op.delta.?, h),
-                    .expire => self.applyExpireNoop(op.key, op.ttl_ms.?, h),
+                    .incr => _ = self.applyIncr(op.key, op.delta.?, h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+                        error.Overflow, error.NotACounter => {},
+                        error.OutOfMemory => return error.OutOfMemory,
+                    },
+                    .expire => self.applyTouch(op.key, time_units.expiryAfter(h.timestamp_ns, op.ttl_ms.?), h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
+                        error.NotFound => {},
+                    },
                 };
+                out.putInt(u16, ops);
             },
-            else => {},
+            else => return error.Halt,
         }
 
         self.applied_index = entry.header.index;
     }
 
-    /// An incr as the log applies it: overflow and a non-counter change
-    /// nothing (the proposer checked both; a concurrent write can still
-    /// reach either first).
-    fn applyIncrNoop(self: *KVProjection, key: []const u8, delta: i64, h: entry_mod.Header) !void {
-        _ = self.applyIncr(key, delta, h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
-            error.Overflow, error.NotACounter => {},
-            else => return err,
-        };
-    }
-
-    /// An expire as the log applies it: a TTL of 0 clears it, and a key
-    /// that's gone changes nothing.
-    fn applyExpireNoop(self: *KVProjection, key: []const u8, ttl_ms: u64, h: entry_mod.Header) void {
-        self.applyTouch(key, time_units.expiryAfter(h.timestamp_ns, ttl_ms), h.index, h.term, h.timestamp_ns) catch |err| switch (err) {
-            error.NotFound => {},
-        };
-    }
+    pub const INCR_OVERFLOW = "bad request: delta would take the counter past an i64";
+    pub const NOT_A_COUNTER = "bad request: the key's value isn't an 8-byte counter";
 
     /// ProjectionVTable implementation for use with ProjectionRouter.
     pub fn projectionHandle(self: *KVProjection) router_mod.ProjectionHandle {
@@ -647,9 +657,9 @@ pub const KVProjection = struct {
         };
     }
 
-    fn vtableApply(ctx: *anyopaque, entry: *const Entry) router_mod.ApplyError!void {
+    fn vtableApply(ctx: *anyopaque, entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *KVProjection = @ptrCast(@alignCast(ctx));
-        self.applyEntry(entry) catch return error.InvalidPayload;
+        return self.applyEntry(entry, out);
     }
 
     fn vtableMemory(ctx: *anyopaque) usize {
@@ -832,6 +842,67 @@ pub const KVProjection = struct {
 
 const testing = std.testing;
 
+fn applyTest(kv: *KVProjection, e: *const Entry) router_mod.ApplyError!void {
+    var out = Result.start(e);
+    return kv.applyEntry(e, &out);
+}
+
+fn applyFor(kv: *KVProjection, e: *const Entry) router_mod.ApplyError!Result {
+    var out = Result.start(e);
+    try kv.applyEntry(e, &out);
+    return out;
+}
+
+test "kv: an apply answers from what it did: the version set, whether a delete found the key, a refused incr" {
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    var buf: [256]u8 = undefined;
+    const stamp: u64 = 1_000 * std.time.ns_per_s;
+
+    var r = try applyFor(&kv, &putEntry(&buf, "k", "v", 1, stamp, 0));
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u64, 1), rd.int(u64));
+    r = try applyFor(&kv, &putEntry(&buf, "k", "w", 2, stamp, 0));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u64, 2), rd.int(u64));
+
+    // A delete says whether the key was there when it applied.
+    r = try applyFor(&kv, &testEntry(&buf, .kv_delete, .{ .key = "k" }, 3, stamp));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u8, 1), rd.int(u8));
+    r = try applyFor(&kv, &testEntry(&buf, .kv_delete, .{ .key = "k" }, 4, stamp));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u8, 0), rd.int(u8));
+    // One whose TTL ran out by the delete's stamp wasn't there either.
+    _ = try applyFor(&kv, &putEntry(&buf, "t", "v", 5, stamp, 1_000));
+    r = try applyFor(&kv, &testEntry(&buf, .kv_delete, .{ .key = "t" }, 6, stamp + 2 * std.time.ns_per_s));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u8, 0), rd.int(u8));
+
+    // An incr that would overflow changes nothing and is refused.
+    var max: [8]u8 = undefined;
+    std.mem.writeInt(i64, &max, std.math.maxInt(i64), .little);
+    _ = try applyFor(&kv, &putEntry(&buf, "c", &max, 7, stamp, 0));
+    r = try applyFor(&kv, &testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 8, stamp));
+    try testing.expectEqual(proto_status.bad_request, r.refused().?.status);
+    try testing.expectEqualStrings(KVProjection.INCR_OVERFLOW, r.refused().?.refusal.message);
+    try testing.expectEqual(std.math.maxInt(i64), std.mem.readInt(i64, kv.get("c").?.value[0..8], .little));
+    // One on a value that isn't a counter is refused too.
+    _ = try applyFor(&kv, &putEntry(&buf, "s", "text", 9, stamp, 0));
+    r = try applyFor(&kv, &testEntry(&buf, .kv_incr, .{ .key = "s", .delta = 1 }, 10, stamp));
+    try testing.expectEqualStrings(KVProjection.NOT_A_COUNTER, r.refused().?.refusal.message);
+    // One that applies answers the key's version and value.
+    r = try applyFor(&kv, &testEntry(&buf, .kv_incr, .{ .key = "n", .delta = 5 }, 11, stamp));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u64, 1), rd.int(u64));
+    try testing.expectEqual(@as(?i64, 5), rd.int(i64));
+    // An expire of a key that's gone is refused as not found.
+    r = try applyFor(&kv, &testEntry(&buf, .kv_expire, .{ .key = "gone", .ttl_ms = 10 }, 12, stamp));
+    try testing.expectEqual(proto_status.not_found, r.refused().?.status);
+}
+
+const proto_status = @import("../protocol/proto.zig").StatusCode;
+
 test "kv: basic put and get" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
@@ -937,7 +1008,7 @@ test "kv: apply UAL entry for kv_put" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
     var buf: [256]u8 = undefined;
-    try kv.applyEntry(&putEntry(&buf, "mykey", "myval", 1, 1000, 0));
+    try applyTest(&kv, &putEntry(&buf, "mykey", "myval", 1, 1000, 0));
     const result = kv.get("mykey").?;
     try testing.expectEqualSlices(u8, "myval", result.value);
     try testing.expectEqual(@as(u64, 1), kv.applied_index);
@@ -947,8 +1018,8 @@ test "kv: apply UAL entry for kv_delete" {
     var kv = KVProjection.init(testing.allocator, 0);
     defer kv.deinit();
     var buf: [256]u8 = undefined;
-    try kv.applyEntry(&putEntry(&buf, "delme", "v", 1, 1000, 0));
-    try kv.applyEntry(&testEntry(&buf, .kv_delete, .{ .key = "delme" }, 2, 2000));
+    try applyTest(&kv, &putEntry(&buf, "delme", "v", 1, 1000, 0));
+    try applyTest(&kv, &testEntry(&buf, .kv_delete, .{ .key = "delme" }, 2, 2000));
     try testing.expect(kv.get("delme") == null);
     try testing.expectEqual(@as(u64, 2), kv.applied_index);
 }
@@ -963,7 +1034,8 @@ test "kv: projection handle integrates with router" {
     var pb: [256]u8 = undefined;
     const entry = putEntry(&pb, "rkey", "rval", 1, 1000, 0);
 
-    const result = router.apply(&entry);
+    var out = Result.start(&entry);
+    const result = try router.apply(&entry, &out);
     try testing.expectEqual(router_mod.ApplyResult.applied, result);
 
     // Verify it landed in the KV projection
@@ -1175,7 +1247,7 @@ test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on ever
     kv.read_clock = .{ .ctx = &clock, .now_ns = TestReadClock.read };
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var buf: [128]u8 = undefined;
-    try kv.applyEntry(&putEntry(&buf, "k", "v", 1, stamp, 5_000));
+    try applyTest(&kv, &putEntry(&buf, "k", "v", 1, stamp, 5_000));
     try testing.expectEqual(stamp + 5 * std.time.ns_per_s, kv.getRaw("k").?.expiry_ns);
 
     clock.ns = stamp + 5 * std.time.ns_per_s - 1;
@@ -1190,10 +1262,10 @@ test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on ever
     try testing.expectEqual(@as(usize, 0), kv.scanKeyNames("", &names));
 
     // An expire counts from its own entry's stamp; a TTL of 0 clears it.
-    try kv.applyEntry(&putEntry(&buf, "t", "v", 2, stamp, 1_000));
-    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 3, stamp + 500 * std.time.ns_per_ms));
+    try applyTest(&kv, &putEntry(&buf, "t", "v", 2, stamp, 1_000));
+    try applyTest(&kv, &testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 3, stamp + 500 * std.time.ns_per_ms));
     try testing.expectEqual(stamp + 60_500 * std.time.ns_per_ms, kv.getRaw("t").?.expiry_ns);
-    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 0 }, 4, stamp + std.time.ns_per_s));
+    try applyTest(&kv, &testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 0 }, 4, stamp + std.time.ns_per_s));
     try testing.expectEqual(@as(u64, 0), kv.getRaw("t").?.expiry_ns);
 }
 
@@ -1204,18 +1276,18 @@ test "kv: a key whose TTL ran out by an entry's stamp is gone to that entry: inc
     var buf: [128]u8 = undefined;
     var counter: [8]u8 = undefined;
     std.mem.writeInt(i64, &counter, 7, .little);
-    try kv.applyEntry(&putEntry(&buf, "c", &counter, 1, stamp, 1_000));
+    try applyTest(&kv, &putEntry(&buf, "c", &counter, 1, stamp, 1_000));
     // Before the TTL runs out it counts on; after, it starts again.
-    try kv.applyEntry(&testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 2, stamp + 999 * std.time.ns_per_ms));
+    try applyTest(&kv, &testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 2, stamp + 999 * std.time.ns_per_ms));
     try testing.expectEqual(@as(i64, 8), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
-    try kv.applyEntry(&putEntry(&buf, "c", &counter, 3, stamp + 2 * std.time.ns_per_s, 1_000));
-    try kv.applyEntry(&testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 4, stamp + 3 * std.time.ns_per_s));
+    try applyTest(&kv, &putEntry(&buf, "c", &counter, 3, stamp + 2 * std.time.ns_per_s, 1_000));
+    try applyTest(&kv, &testEntry(&buf, .kv_incr, .{ .key = "c", .delta = 1 }, 4, stamp + 3 * std.time.ns_per_s));
     try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, kv.getRaw("c").?.value[0..8], .little));
     try testing.expectEqual(@as(u64, 0), kv.getRaw("c").?.expiry_ns);
 
     // An expire after the TTL ran out does not bring the key back.
-    try kv.applyEntry(&putEntry(&buf, "t", "v", 5, stamp, 1_000));
-    try kv.applyEntry(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 6, stamp + std.time.ns_per_s));
+    try applyTest(&kv, &putEntry(&buf, "t", "v", 5, stamp, 1_000));
+    try applyTest(&kv, &testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 6, stamp + std.time.ns_per_s));
     try testing.expectEqual(stamp + std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
 }
 
@@ -1225,7 +1297,7 @@ test "kv: a transaction's TTLs count from its batch's stamp" {
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var eb: [64]u8 = undefined;
-    try kv.applyEntry(&putEntry(&eb, "t", "v", 1, stamp, 0));
+    try applyTest(&kv, &putEntry(&eb, "t", "v", 1, stamp, 0));
     const ops = [_]txn.TxnOp{
         .{ .kind = .put, .key = @constCast("p"), .value = @constCast("v"), .ttl_ms = 2_000 },
         .{ .kind = .expire, .key = @constCast("t"), .value = @constCast(""), .ttl_ms = 30_000 },
@@ -1233,7 +1305,7 @@ test "kv: a transaction's TTLs count from its batch's stamp" {
     const payload = try txn.encodeBatch(testing.allocator, &ops);
     defer testing.allocator.free(payload);
     const later = stamp + 10 * std.time.ns_per_s;
-    try kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 2, later, payload));
+    try applyTest(&kv, &entry_mod.buildEntry(.kv_batch, 0, 1, 2, later, payload));
     try testing.expectEqual(later + 2 * std.time.ns_per_s, kv.getRaw("p").?.expiry_ns);
     try testing.expectEqual(later + 30 * std.time.ns_per_s, kv.getRaw("t").?.expiry_ns);
 }
@@ -1250,7 +1322,7 @@ test "kv: a batch that doesn't decode whole, or breaks a kind's rule, applies no
     defer testing.allocator.free(payload);
     // Cut inside the second op: the first must not apply on its own.
     for (1..payload.len) |n| {
-        try testing.expectError(error.InvalidPayload, kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, payload[0..n])));
+        try testing.expectError(error.Halt, applyTest(&kv, &entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, payload[0..n])));
         try testing.expect(kv.get("a") == null);
     }
     // A delete carrying a value decodes, but breaks its kind's rule.
@@ -1260,7 +1332,7 @@ test "kv: a batch that doesn't decode whole, or breaks a kind's rule, applies no
         .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null },
         .{ .kind = .delete, .key = "b", .value = "x", .ttl_ms = null, .delta = null },
     });
-    try testing.expectError(error.InvalidPayload, kv.applyEntry(&entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, w.written())));
+    try testing.expectError(error.Halt, applyTest(&kv, &entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, w.written())));
     try testing.expect(kv.get("a") == null);
     try testing.expectEqual(@as(u64, 0), kv.applied_index);
 }

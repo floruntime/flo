@@ -6,6 +6,6 @@
 pub const ProposeResult = struct {
     index: u64,
     term: u64,
-    /// The entry's header timestamp, for a responder that answers from it.
+    /// The entry's header timestamp.
     timestamp_ns: u64,
 };

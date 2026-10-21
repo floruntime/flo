@@ -417,14 +417,7 @@ pub const Shard = struct {
     /// the table is twice that.
     pending: []Pending,
     pending_count: u32,
-    /// The entry a responder is answering for: its index and header
-    /// timestamp, set just before the responder runs. A responder otherwise
-    /// reads what that entry's applier recorded in its module's `last_*`
-    /// fields; each applier clears its field first, so an entry it refused
-    /// answers as a failure (or zero), never with the entry before's result.
-    answering_index: u64,
-    answering_timestamp_ns: u64,
-    /// The connection a responder answers on when the client's is not on
+    /// The connection a parked write is answered on when the client's is not on
     /// this thread or no longer known: carries (owner, fd, id) and collects
     /// the bytes, which go out through `deliverDeferred`.
     respond_proxy: *Connection,
@@ -526,9 +519,11 @@ pub const Shard = struct {
     /// True while `applyCommitted` is draining, so a waiter woken by an
     /// apply that proposes in turn cannot start a nested drain.
     applying: bool,
-    /// Whether the last entry the apply loop took applied; `park` answers
-    /// from it, not from the whole pass's result.
+    /// Whether the last entry the apply loop took applied, and what its
+    /// applier recorded: `park` answers from it, not from the whole pass's
+    /// result.
     last_entry_applied: bool,
+    last_result: persistence_mod.Result,
     /// An invoke applied on this leader in the current pass: its workers
     /// are woken once, after the pass.
     wake_workers: bool,
@@ -1004,8 +999,6 @@ pub const Shard = struct {
             .join_asked_ms = 0,
             .pending = pending,
             .pending_count = 0,
-            .answering_index = 0,
-            .answering_timestamp_ns = 0,
             .respond_proxy = respond_proxy,
             .forwards = forwards,
             .forward_count = 0,
@@ -1048,6 +1041,7 @@ pub const Shard = struct {
             .scratch = scratch,
             .applying = false,
             .last_entry_applied = true,
+            .last_result = .{},
             .wake_workers = false,
             .more_work = false,
             .run_id_gen = .{ .shard = @intCast(shard_id) },
@@ -1179,10 +1173,7 @@ pub const Shard = struct {
         for (self.pending) |*slot| {
             if (!slot.active or slot.index <= index) continue;
             self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
-            self.pendingFailed(slot.bytes);
-            self.allocator.free(slot.bytes);
-            slot.active = false;
-            self.pending_count -= 1;
+            self.endPending(slot);
         }
     }
 
@@ -1261,7 +1252,6 @@ pub const Shard = struct {
             if (f.reply) |r| self.allocator.free(r);
         };
         self.allocator.free(self.forwards);
-        for (self.pending) |*p| if (p.active) self.allocator.free(p.bytes);
         self.allocator.free(self.pending);
         self.respond_proxy.deinit();
         self.allocator.destroy(self.respond_proxy);
@@ -2450,30 +2440,43 @@ pub const Shard = struct {
 
     // ─── Writes waiting for commit ───────────────────────────────────────
 
+    /// Answers a parked write from what its entry's applier recorded. Runs
+    /// only for an entry that applied and was not refused; it reads nothing
+    /// but `result`.
+    pub const AnswerFn = *const fn (shard: *Shard, conn: *Connection, request_id: u64, result: *const persistence_mod.Result) void;
+
+    /// Frees what a parked write holds (`ctx`, as `parkHolding` was given
+    /// it), however its wait ends.
+    pub const ReleaseFn = *const fn (shard: *Shard, ctx: u64) void;
+
     /// What a write handler does once its entry is proposed: nothing more
-    /// now. `responder` runs once the entry is applied, on this thread,
-    /// with the request re-parsed and a connection standing for the
-    /// client's; it reads projection state and answers. When the entry is
-    /// already committed (a group of one) that is right away, on the
-    /// client's own connection.
-    pub fn park(self: *Shard, conn: *Connection, req: proto.Request, proposed: raft_node_mod.ProposeResult, responder: HandlerFn) void {
+    /// now. `answer` runs once the entry is applied, on this thread, with a
+    /// connection standing for the client's. When the entry is already
+    /// committed (a group of one) that is right away, on the client's own
+    /// connection.
+    pub fn park(self: *Shard, conn: *Connection, req: proto.Request, proposed: raft_node_mod.ProposeResult, answer: AnswerFn) void {
+        self.parkHolding(conn, req, proposed, answer, null, 0);
+    }
+
+    /// `park`, for a write that holds something until it is answered.
+    pub fn parkHolding(self: *Shard, conn: *Connection, req: proto.Request, proposed: raft_node_mod.ProposeResult, answer: AnswerFn, release: ?ReleaseFn, ctx: u64) void {
         // Inside the apply loop `applyCommitted` returns without draining:
-        // a single node's responder would run before its entry applied.
+        // a single node's write would be answered before its entry applied.
         std.debug.assert(!self.applying);
         if (self.raft_node.commit_index >= proposed.index) {
-            // Up to this write's entry and no further: its responder reads
-            // what that entry's applier recorded, which a later entry
-            // (another thread's proposal) would overwrite. The dispatch
+            // Up to this write's entry and no further: its answer is that
+            // entry's result, which the next entry's replaces. The dispatch
             // that parked this applies the rest.
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
+            defer if (release) |r| r(self, ctx);
             if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
                 self.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
                 return;
             }
-            self.answering_index = proposed.index;
-            self.answering_timestamp_ns = proposed.timestamp_ns;
-            responder(@ptrCast(self), @ptrCast(conn), req);
+            if (self.last_result.refused()) |r| return self.sendRefusal(conn, req.header.request_id, r.status, r.refusal);
+            if (self.last_result.overflowed) return self.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
+            answer(self, conn, req.header.request_id, &self.last_result);
             return;
         }
         const slot = &self.pending[proposed.index % PENDING_SLOTS];
@@ -2481,15 +2484,12 @@ pub const Shard = struct {
             // Cannot happen while the Raft node caps outstanding entries
             // below the table size; said out loud rather than trusted.
             log.err("shard {d}: pending slot for index {d} still holds index {d}", .{ self.id, proposed.index, slot.index });
+            if (release) |r| r(self, ctx);
             // Proposed already: it may still apply.
             self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .unclassified, .ran = .unknown, .message = persistence_mod.failureMessage(error.Overloaded, "") });
             return;
         }
-        const bytes = serializeRequest(self.allocator, req) catch {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "internal error: could not hold the request until commit — write may still apply");
-            return;
-        };
-        slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .responder = responder };
+        slot.* = .{ .active = true, .index = proposed.index, .term = proposed.term, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .answer = answer, .release = release, .ctx = ctx };
         self.pending_count += 1;
         conn.response_deferred = true;
         // A leader counts itself toward the quorum; when commits are
@@ -2498,55 +2498,41 @@ pub const Shard = struct {
         self.replica.pump(nowMs());
     }
 
-    /// The entry at `index` applied (or could not): answer whoever waits.
-    fn answerPending(self: *Shard, index: u64, term: u64, timestamp_ns: u64, applied: bool) void {
+    /// The entry at `index` applied (or could not): answer whoever waits,
+    /// from `result`.
+    fn answerPending(self: *Shard, index: u64, term: u64, applied: bool, result: *const persistence_mod.Result) void {
         const table_slot = &self.pending[index % PENDING_SLOTS];
         if (!table_slot.active or table_slot.index != index) return;
-        // Out of the table before the responder runs, so a sweep of the
-        // table (`resolvePending`) while it runs cannot answer and free
-        // this request a second time.
+        // Out of the table before it is answered, so a sweep of the table
+        // (`resolvePending`) meanwhile cannot answer it a second time.
         const slot = table_slot.*;
         table_slot.active = false;
         self.pending_count -= 1;
-        defer self.allocator.free(slot.bytes);
+        defer if (slot.release) |r| r(self, slot.ctx);
         // A different term at this index is a new leader's entry: this
         // write never committed, whatever became of that one.
-        if (term != 0 and slot.term != term) {
-            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .unavailable, proto.notRun("unavailable: leader changed, write not applied — retry"));
-            self.pendingFailed(slot.bytes);
-            return;
-        }
-        if (!applied) {
-            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-            self.pendingFailed(slot.bytes);
-            return;
-        }
-        const req = proto.Request.parse(slot.bytes) catch {
-            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
-            return;
-        };
+        if (term != 0 and slot.term != term)
+            return self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .unavailable, proto.notRun("unavailable: leader changed, write not applied — retry"));
+        if (!applied) return self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
+        if (result.refused()) |r| return self.deliverDeferredRefusal(slot.reply_to, slot.request_id, r.status, r.refusal);
+        if (result.overflowed) return self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
         const proxy = self.respond_proxy;
         loadProxy(proxy, slot.reply_to);
-        self.answering_index = index;
-        self.answering_timestamp_ns = timestamp_ns;
-        slot.responder(@ptrCast(self), @ptrCast(proxy), req);
+        slot.answer(self, proxy, slot.request_id, result);
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, slot.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
             self.deliverDeferred(slot.reply_to, answer.bytes());
-        } else if (!proxy.response_deferred) {
+        } else {
             self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
         }
     }
 
-    /// A parked request answered with a failure instead of its responder.
-    /// A KV commit's transaction was closed when its batch was proposed and
-    /// waits on that responder to drop it; without this it would hold its
-    /// slot forever.
-    fn pendingFailed(self: *Shard, bytes: []const u8) void {
-        const req = proto.Request.parse(bytes) catch return;
-        if (req.header.op_code != @backingInt(proto.OpCode.kv_commit_txn)) return;
-        self.kv_handler.commitFailed(req);
+    /// Take a slot out of the table, answered already, and release what it held.
+    fn endPending(self: *Shard, slot: *Pending) void {
+        slot.active = false;
+        self.pending_count -= 1;
+        if (slot.release) |r| r(self, slot.ctx);
     }
 
     fn resolvePending(self: *Shard, message: []const u8) void {
@@ -2555,10 +2541,7 @@ pub const Shard = struct {
         for (self.pending) |*slot| {
             if (!slot.active) continue;
             self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
-            self.pendingFailed(slot.bytes);
-            self.allocator.free(slot.bytes);
-            slot.active = false;
-            self.pending_count -= 1;
+            self.endPending(slot);
         }
     }
 
@@ -3327,11 +3310,11 @@ pub const Shard = struct {
     /// Apply one committed entry and tell its waiters. False, counted and
     /// logged, when the projections are missing it; its client, if any, is
     /// told the write committed but did not apply.
-    pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry) bool {
-        const result = applyEntryCore(self.defaultPartition(), &self.replay_registry, entry);
+    pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry, out: *persistence_mod.Result) bool {
+        const result = applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out);
         noteApply(&self.losses, self.id, nowMs(), entry, result);
         if (result != .applied) return false;
-        self.notifyApplied(entry);
+        self.afterApply(entry, out);
         return true;
     }
 
@@ -3340,7 +3323,7 @@ pub const Shard = struct {
     /// after each client request (its own client's or one forwarded from
     /// another shard), and in the tick; `park` applies up to its own entry through
     /// `applyThrough`. Module code never does: applying in the middle of its own
-    /// work would run other writers' appliers and responders under its
+    /// work would run other writers' appliers and answers under its
     /// locks and over its pointers into the maps they change. False when an
     /// entry could not be applied.
     ///
@@ -3378,13 +3361,18 @@ pub const Shard = struct {
                 raft.last_applied = next_idx;
                 if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
                     raft.noteApplied(e.header.timestamp_ns);
-                    const applied = self.applyEntry(&e);
+                    self.last_result.reset(&e);
+                    const applied = self.applyEntry(&e, &self.last_result);
+                    // A bug in an applier, never a valid request's doing:
+                    // every answer is sized for the longest key.
+                    if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
                     if (!applied) all_applied = false;
                     self.last_entry_applied = applied;
-                    self.answerPending(next_idx, e.header.term, e.header.timestamp_ns, applied);
+                    self.answerPending(next_idx, e.header.term, applied, &self.last_result);
                 } else {
                     self.last_entry_applied = false;
-                    self.answerPending(next_idx, 0, 0, false);
+                    self.last_result.index = next_idx;
+                    self.answerPending(next_idx, 0, false, &self.last_result);
                     // A committed index is always within the log, in the ring
                     // or below it in the durable log, and the buffer fits every
                     // entry; an unreadable one is a bug or a damaged segment,
@@ -3423,6 +3411,16 @@ pub const Shard = struct {
     fn kvNamespace(qkey: []const u8) []const u8 {
         const sep = std.mem.indexOfScalar(u8, qkey, 0) orelse return "default";
         return qkey[0..sep];
+    }
+
+    /// What follows an entry's apply on the live paths, from the entry and
+    /// its result alone: the waiters, triggers and metrics, and the first
+    /// step of a run its start created. Not at boot: nothing waits on a
+    /// replayed entry, and a run started before the restart stays at its
+    /// start, as it does when leadership moves (`dropStartedRuns`).
+    fn afterApply(self: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) void {
+        self.notifyApplied(entry);
+        self.workflow_handler.startApplied(self, entry, result);
     }
 
     /// Waiters, triggers and per-namespace metrics for an entry that just
@@ -4788,10 +4786,8 @@ pub const Shard = struct {
         }
     }
 
-    fn respondChangeCommitted(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        shard.sendOkResponse(conn, req.header.request_id, "");
+    fn respondChangeCommitted(shard: *Shard, conn: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
+        shard.sendOkResponse(conn, request_id, "");
     }
 
     /// Answers a client built from another protocol version or table in its
@@ -5598,8 +5594,9 @@ pub const Pending = struct {
     term: u64 = 0,
     reply_to: ReplyTo = undefined,
     request_id: u64 = 0,
-    bytes: []u8 = &.{},
-    responder: HandlerFn = undefined,
+    answer: Shard.AnswerFn = undefined,
+    release: ?Shard.ReleaseFn = null,
+    ctx: u64 = 0,
 };
 pub const PENDING_SLOTS: usize = 2 * raft_node_mod.MAX_OUTSTANDING;
 
@@ -5796,9 +5793,9 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
 
 /// The config entry committed: what it names is the membership a
 /// truncation falls back to.
-fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {
     const raft: *RaftNode = @ptrCast(@alignCast(ctx));
-    const cfg = membership.decode(entry.payload) orelse return .failed;
+    const cfg = membership.decode(entry.payload) orelse return error.Halt;
     raft.commitMembership(&cfg, entry.header.index);
     // At boot, replay applies the committed configs before the group comes
     // up: a node that lost its hard state checks the committed set even
@@ -5807,7 +5804,6 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_m
     var ids: [membership.MAX_MEMBERS]u32 = undefined;
     var voters: [membership.MAX_MEMBERS]u32 = undefined;
     log.info("Raft: membership committed: {any}, voters {any} (config index {d})", .{ cfg.ids(&ids), cfg.voterIds(&voters), entry.header.index });
-    return .applied;
 }
 
 pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
@@ -5820,10 +5816,10 @@ pub const ApplyResult = union(enum) {
     applied,
     /// The partition refused it; nothing else saw it.
     partition_reject: anyerror,
-    /// The projection the router owns failed to apply it.
-    router_error,
-    /// Its registry applier could not apply it.
-    applier_failed,
+    /// The projection the router owns could not apply it, and why.
+    router_error: persistence_mod.ApplyError,
+    /// Its registry applier could not apply it, and why.
+    applier_failed: persistence_mod.ApplyError,
     /// No applier owns its type.
     no_applier,
 };
@@ -5848,12 +5844,13 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 /// The one apply path: the partition (hot ring plus the projections the
 /// router owns — KV, queue, TS) and then the registry appliers for every
 /// other entry type.
-pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry) ApplyResult {
+pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-    const applied = partition.applyRouted(entry) catch |err| return .{ .partition_reject = err };
-    if (routedToProjection(etype)) return if (applied.route == .apply_error) .router_error else .applied;
-    const outcome = registry.dispatch(entry) orelse return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
-    return if (outcome == .failed) .applier_failed else .applied;
+    const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
+    if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
+    const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
+    if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
+    return .applied;
 }
 
 /// Count and say why an entry did not apply. Its applier, where it had one,
@@ -5867,10 +5864,18 @@ fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *co
             counts.noteDuplicate(now_ms, shard_id, index, type_name)
         else
             counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
-        .router_error => counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection; the projection is missing it", .{ index, type_name }),
-        .applier_failed => counts.note(.applier_failed, now_ms, shard_id, "entry index={d} type={s} could not be applied; its state is missing it", .{ index, type_name }),
+        .router_error => |err| counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection ({s}); the projection is missing it", .{ index, type_name, applyErrorName(err) }),
+        .applier_failed => |err| counts.note(.applier_failed, now_ms, shard_id, "entry index={d} type={s} could not be applied ({s}); its state is missing it", .{ index, type_name, applyErrorName(err) }),
         .no_applier => counts.note(.no_applier, now_ms, shard_id, "entry index={d} type={s} has no applier on this build", .{ index, type_name }),
     }
+}
+
+fn applyErrorName(err: persistence_mod.ApplyError) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.Io => "a disk write failed",
+        error.Halt => "it breaks what the log holds true",
+    };
 }
 
 /// Every entry type has exactly one applier, the projection router or one
@@ -6019,6 +6024,8 @@ fn replaySegmentFile(
     out: *ReplayOutcome,
 ) void {
     const name = std.fs.path.basename(full_path);
+    // One result for the segment's entries, reset for each.
+    var replay_result: persistence_mod.Result = .{};
     // Sealed segments are written whole and renamed into place, so one
     // that will not open, or fails its checksum, is damage, never a crash.
     const opened = SegmentReader.initFromFile(allocator, full_path) catch |err| {
@@ -6069,7 +6076,9 @@ fn replaySegmentFile(
         // Above the watermark: in the log, not yet in the projections.
         if (seg_entry.header.index > watermark) continue;
 
-        noteApply(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry));
+        // Nobody waits on a replayed entry's answer.
+        replay_result.reset(&seg_entry);
+        noteApply(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
         out.applied_through = seg_entry.header.index;
     }
 }
@@ -6077,6 +6086,12 @@ fn replaySegmentFile(
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/// Apply an entry through a handler's applier, as the log does.
+fn applyLoggedTo(handler: anytype, e: *const entry_mod.Entry) !void {
+    var out = persistence_mod.Result.start(e);
+    try handler.replayEntry(e, &out);
+}
 
 test "Shard: init and deinit" {
     const pipe_fds = try @import("stdx").io.pipe();
@@ -8862,6 +8877,54 @@ const FollowerTest = struct {
     }
 };
 
+test "Shard: a start that applies on a follower, or on a later leader, queues no first step; on the leader that proposed it the run it created does" {
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    var pbuf: [128]u8 = undefined;
+    const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, 0, "default:r1", &start, &pbuf).?;
+
+    // A follower: a step proposes, and only the leader does.
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try std.testing.expect(t.shard.raft_node.role != .leader);
+    var out = persistence_mod.Result.start(&e);
+    try std.testing.expect(t.shard.applyEntry(&e, &out));
+    try std.testing.expect(t.shard.workflow_handler.runs.contains("default:r1"));
+    try std.testing.expectEqual(@as(usize, 0), t.shard.workflow_handler.started_to_advance.items.len);
+
+    // The leader of a group of one.
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(raft_node_mod.Role.leader, shard.raft_node.role);
+    // Past the entries the group's start applied.
+    const next = shard.raft_node.last_applied + 1;
+    const led = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next, 0, 0, "default:r1", &start, &pbuf).?;
+    out = persistence_mod.Result.start(&led);
+    try std.testing.expect(shard.applyEntry(&led, &out));
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    // A start from an earlier term, applied by this later leader, stays at
+    // its start: its own leader may have stepped it already.
+    try std.testing.expect(shard.raft_node.current_term > 0);
+    var earlier_buf: [128]u8 = undefined;
+    const earlier = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term - 1, next + 1, 0, 0, "default:r0", &start, &earlier_buf).?;
+    out = persistence_mod.Result.start(&earlier);
+    try std.testing.expect(shard.applyEntry(&earlier, &out));
+    try std.testing.expect(shard.workflow_handler.runs.contains("default:r0"));
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    // A second start of the run is refused, and queues nothing more.
+    var again_buf: [128]u8 = undefined;
+    const again = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next + 2, 0, 0, "default:r1", &start, &again_buf).?;
+    out = persistence_mod.Result.start(&again);
+    try std.testing.expect(shard.applyEntry(&again, &out));
+    try std.testing.expect(out.refused() != null);
+    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+}
+
 test "Shard: a node that stops leading forgets the action timeouts it proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -8877,10 +8940,10 @@ test "Shard: a node that stops leading forgets the action timeouts it proposed" 
 
     var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
     var pbuf: [1024]u8 = undefined;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?));
+    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?);
     var inv_buf: [256]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?));
+    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?);
     const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
     std.testing.allocator.free(task.body);
 
@@ -8898,10 +8961,10 @@ test "Shard: an action timeout this node can't propose is proposed again by a la
 
     var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
     var pbuf: [1024]u8 = undefined;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?));
+    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?);
     var inv_buf: [256]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, actions.replayEntry(&entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?));
+    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?);
     const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
     std.testing.allocator.free(task.body);
     actions.runs.getPtr("act-1").?.lease_from_ms = 0;
@@ -9328,6 +9391,104 @@ const ParkTest = struct {
     }
 };
 
+/// A shard leading member 2, with a client whose two writes both pass the
+/// leader's checks before either applies.
+const RaceTest = struct {
+    rn: RaftNetwork,
+    shard: Shard,
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+    pipe_fds: [2]std.posix.fd_t,
+
+    fn init(t: *RaceTest) !void {
+        t.pipe_fds = try @import("stdx").io.pipe();
+        t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+        t.shard.raft_network = &t.rn;
+        t.shard.wireHandlerShardPtrs();
+        try ParkTest.joinPeer(&t.shard);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &t.pair));
+        t.conn = try t.shard.addConnection(t.pair[0]);
+    }
+
+    fn deinit(t: *RaceTest) void {
+        for (t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        t.rn.outbound.clearRetainingCapacity();
+        _ = std.c.close(t.pair[1]);
+        t.shard.deinit();
+        t.rn.deinit();
+        _ = std.c.close(t.pipe_fds[0]);
+        _ = std.c.close(t.pipe_fds[1]);
+    }
+
+    /// Body already schema-coded, sent as it is.
+    fn send(t: *RaceTest, op: proto.OpCode, id: u64, key: []const u8, body: []const u8) void {
+        t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(op, id), .namespace = "", .key = key, .value = body }, .client);
+    }
+};
+
+test "Shard: of two incrs that both pass the leader's check, the one that would overflow is refused, not answered with the old value" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var two: [2]proto.Response = undefined;
+    var one: [1]proto.Response = undefined;
+    var diag: schema.Diagnostic = .{};
+
+    const set = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(i64, &counter, std.math.maxInt(i64) - 1, .little);
+    _ = &counter;
+    t.send(.kv_put, 1, "c", try set.request.encodeInto(&set_buf, .{ .value = &counter, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+
+    const incr = table_run.op("kv.incr");
+    var incr_buf: [32]u8 = undefined;
+    const by_one = try incr.request.encodeInto(&incr_buf, .{ .delta = 1, .routing_key = null, .txn = null });
+    t.send(.kv_incr, 2, "c", by_one);
+    t.send(.kv_incr, 3, "c", by_one);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), (try incr.response.decodeAll(two[0].data, &diag)).value.?);
+    // On dev the second was answered ok with the value it didn't change.
+    try std.testing.expectEqual(@as(u64, 3), two[1].header.request_id);
+    const r = try two[1].refused();
+    try std.testing.expectEqual(proto.Reason.out_of_range, r.reason);
+    try std.testing.expectEqual(proto.Ran.no, r.ran);
+}
+
+test "Shard: of two deletes of one key that both pass the leader's check, only the first says the key existed" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var two: [2]proto.Response = undefined;
+    var one: [1]proto.Response = undefined;
+    var diag: schema.Diagnostic = .{};
+
+    const set = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+
+    const delete = table_run.op("kv.delete");
+    var del_buf: [32]u8 = undefined;
+    const body = try delete.request.encodeInto(&del_buf, .{ .cas_version = null, .routing_key = null, .txn = null });
+    t.send(.kv_delete, 2, "k", body);
+    t.send(.kv_delete, 3, "k", body);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    try std.testing.expectEqual(@as(?bool, true), (try delete.response.decodeAll(two[0].data, &diag)).existed);
+    // On dev both said it existed.
+    try std.testing.expectEqual(@as(?bool, false), (try delete.response.decodeAll(two[1].data, &diag)).existed);
+}
+
 test "Shard: a parked write that committed but didn't apply says so, with ran = yes, so it isn't resent" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -9354,7 +9515,7 @@ test "Shard: a parked write that committed but didn't apply says so, with ran = 
         if (p.active) break p;
     } else unreachable;
 
-    shard.answerPending(slot.index, slot.term, 0, false);
+    shard.answerPending(slot.index, slot.term, false, &persistence_mod.Result{});
     var one: [1]proto.Response = undefined;
     var buf: [512]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -9417,7 +9578,7 @@ test "Shard: ran is no for a parked write whose index another term took, and unk
         try ParkTest.send(&t.shard, t.conn, .kv_put, 7, "k", "v");
         const slot = t.parked();
         // Another leader's entry committed at this index: this write didn't.
-        t.shard.answerPending(slot.index, slot.term + 1, 0, true);
+        t.shard.answerPending(slot.index, slot.term + 1, true, &persistence_mod.Result{});
         const got = try t.refusal(&buf);
         try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), got.status);
         try std.testing.expectEqual(proto.Ran.no, got.r.ran);
@@ -9676,10 +9837,8 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     var f64_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &f64_bytes, @bitCast(@as(f64, 1.5)), .little);
     // Two appends and two enqueues, interleaved with a time-series write:
-    // each responder must run right after its own entry applies, before
-    // the next entry's applier overwrites what it reads. Answering after
-    // the whole batch applied would give the first of each pair the
-    // second's id.
+    // each is answered from its own entry's result, not from what the
+    // pair's second entry left behind.
     // An append's value is a batch: [count:u32]([len:u32][payload][header_count:u16])*
     try ParkTest.send(&shard, conn, .stream_append, 10, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
     try ParkTest.send(&shard, conn, .queue_enqueue, 11, "q", "m1");
@@ -9715,6 +9874,33 @@ test "Shard: appends, enqueues and a time-series write parked behind a peer's ac
     const hdr_ms = raft.log.getEntry(ts_index).?.header.timestamp_ns / 1_000_000;
     try std.testing.expectEqual(hdr_ms, std.mem.readInt(u64, rs[2].data[8..16], .little));
     try std.testing.expectEqual(ts_index, std.mem.readInt(u64, rs[2].data[16..24], .little));
+}
+
+test "Shard: two action invokes parked behind a peer's ack each answer with the run their own entry created" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    var buf: [2048]u8 = undefined;
+
+    _ = try persistence_mod.proposeEntry(&t.shard, .action_register, entry_mod.Flags.NONE, "", "act", "");
+    try ParkTest.ack(&t.shard);
+    // An invoke's value starts with its has_labels byte.
+    try ParkTest.send(&t.shard, t.conn, .action_invoke, 1, "act", "\x00");
+    const first = raft.log.lastIndex();
+    try ParkTest.send(&t.shard, t.conn, .action_invoke, 2, "act", "\x00");
+    const second = raft.log.lastIndex();
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
+    try ParkTest.ack(&t.shard);
+
+    var rs: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &rs);
+    for (rs, [_]u64{ first, second }) |resp, index| {
+        // [run_id_len:u16][run_id]...: the run id is its entry's key.
+        const n = std.mem.readInt(u16, resp.data[0..2], .little);
+        const cmd = entry_mod.CommandPayload.deserialize(raft.log.getEntry(index).?.payload).?;
+        try std.testing.expectEqualStrings(cmd.key, resp.data[2..][0..n]);
+    }
 }
 
 test "Shard: on a cluster leader a workflow's first step invokes its action without waiting for the commit, and the run resumes once the action's completion applies" {
@@ -9784,7 +9970,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try std.testing.expect(shard.actions_handler.runs.get(action_run) == null);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
-    // One ack commits both: the second start is answered (its responder
+    // One ack commits both: the second start is answered (its applier
     // takes the workflow's lock, which nothing holds), and the invoke
     // applies, so workers can take the action run.
     try ParkTest.ack(&shard);
@@ -10105,14 +10291,14 @@ test "Shard: park answers from its own entry when a later one has already commit
 
     // On a single node both appends commit as they are proposed; the second
     // stands for another thread's proposal landing before this write parks.
-    // The first write's responder must read the first's record.
+    // The first write is answered from the first's result.
     const Seen = struct {
         var index: u64 = 0;
-        var id: ?StreamID = null;
-        fn respond(shard_ptr: *anyopaque, _: *anyopaque, _: proto.Request) void {
-            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
-            index = sh.raft_node.last_applied;
-            id = sh.stream_handler.last_append;
+        var seq: ?u64 = null;
+        fn respond(_: *Shard, _: *Connection, _: u64, result: *const persistence_mod.Result) void {
+            index = result.index;
+            var r = result.reader();
+            seq = r.int(u64);
         }
     };
     const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
@@ -10125,8 +10311,8 @@ test "Shard: park answers from its own entry when a later one has already commit
     // the one the first write was answered with.
     try std.testing.expect(shard.applyCommitted());
     const hash = node_router.nameHash(node_router.namespaceHash(""), "s");
-    try std.testing.expect(Seen.id.?.eql(shard.stream_handler.stream.streamFirstId(hash)));
-    try std.testing.expect(!Seen.id.?.eql(shard.stream_handler.stream.streamLastId(hash)));
+    try std.testing.expectEqual(shard.stream_handler.stream.streamFirstId(hash).sequence, Seen.seq.?);
+    try std.testing.expect(Seen.seq.? != shard.stream_handler.stream.streamLastId(hash).sequence);
 }
 
 test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
@@ -10430,7 +10616,7 @@ test "Shard: a deferred answer too large to frame reaches its client as an error
     try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
 }
 
-test "Shard: a parked request leaves the pending table before its responder runs, so a sweep during it answers the client once" {
+test "Shard: a parked request leaves the pending table before it is answered, so a sweep during its answer answers the client once" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -10447,23 +10633,22 @@ test "Shard: a parked request leaves the pending table before its responder runs
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
 
-    // A responder that sweeps the pending table: the request it answers
+    // An answer that sweeps the pending table: the request it answers
     // must not be in it.
     const Sweep = struct {
-        fn respond(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
-            const sh: *Shard = @ptrCast(@alignCast(shard_ptr));
+        fn respond(sh: *Shard, conn_: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
             sh.resolvePending("swept");
-            sh.sendOkResponse(@ptrCast(@alignCast(conn_ptr)), req.header.request_id, "answered");
+            sh.sendOkResponse(conn_, request_id, "answered");
         }
     };
-    // Any entry will do: the responder under test never reads it.
+    // Any entry will do: the answer under test never reads it.
     const proposed = try persistence_mod.proposeEntry(&shard, .namespace_create, entry_mod.Flags.NONE, "", "k", "");
     shard.park(conn, try ParkTest.request(.kv_put, 30, "", "k", "v", ""), proposed, Sweep.respond);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
     try ParkTest.ack(&shard);
     try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
-    // One answer, the responder's.
+    // One answer, the answer function's.
     var buf: [256]u8 = undefined;
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
@@ -10588,9 +10773,7 @@ test "the Raft ring floor holds the largest transaction batch" {
 
 test "every entry type has exactly one applier, or is listed as needing none, or the shard refuses to start" {
     const Noop = struct {
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
-            return .applied;
-        }
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {}
     };
     var ctx: u8 = 0;
     // Every type the router does not own and no list excuses.
@@ -10633,14 +10816,13 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
         var last_applied_seen: u64 = 0;
         var nested_saw_kv: bool = false;
         var calls: u32 = 0;
-        fn apply(_: *anyopaque, _: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+        fn apply(_: *anyopaque, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {
             calls += 1;
             const shard_inner = shard_ptr;
             last_applied_seen = shard_inner.raft_node.last_applied;
             _ = kv_handler_mod.KVHandler.testProposePut(shard_inner, "nested", "v") catch unreachable;
             _ = shard_inner.applyCommitted();
             nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
-            return .applied;
         }
     };
     Probe.shard_ptr = &shard;
@@ -12249,7 +12431,7 @@ test "a committed entry this node cannot read back takes its shard offline, and 
 }
 
 /// A client write whose entry nothing applies, parked as a handler parks
-/// one; its responder would answer ok.
+/// one; its answer function would answer ok.
 const UnappliedWrite = struct {
     fn handle(sh: *anyopaque, c: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(sh));
@@ -12257,9 +12439,8 @@ const UnappliedWrite = struct {
         shard.park(@ptrCast(@alignCast(c)), req, proposed, answerOk);
     }
 
-    fn answerOk(sh: *anyopaque, c: *anyopaque, req: proto.Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(sh));
-        shard.sendOkResponse(@ptrCast(@alignCast(c)), req.header.request_id, "applied");
+    fn answerOk(shard: *Shard, c: *Connection, request_id: u64, _: *const persistence_mod.Result) void {
+        shard.sendOkResponse(c, request_id, "applied");
     }
 
     /// The one answer `conn` got: committed, not applied.
@@ -13063,9 +13244,10 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
 
     var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     e.header.crc32c = e.computeCrc();
-    const first = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e);
+    var out = persistence_mod.Result.start(&e);
+    const first = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out);
     try std.testing.expect(first == .applied);
-    const again = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e);
+    const again = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out);
     try std.testing.expect(again == .partition_reject);
     noteApply(&shard.losses, shard.id, Shard.nowMs(), &e, again);
 
@@ -13095,10 +13277,12 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
         if (a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("", id))) == 0) break id;
     } else return error.TestUnexpectedResult;
     const b = two.shards[1].actions_handler;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, b.replayRegister("echo", "", 1));
+    var reg_out: persistence_mod.Result = .{};
+    try b.replayRegister("echo", "", 1, &reg_out);
     var inv_buf: [512]u8 = undefined;
     const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
-    try std.testing.expectEqual(persistence_mod.ApplyOutcome.applied, b.replayInvoke(run_id, inv, 1000 * std.time.ns_per_ms));
+    var inv_out: persistence_mod.Result = .{};
+    try b.replayInvoke(run_id, inv, 1000 * std.time.ns_per_ms, &inv_out);
 
     // Asked on shard 0, it's sent to shard 1 before anything runs; before,
     // the id was hashed as a key and could land on a shard without the run.

@@ -28,6 +28,7 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const entry_mod = @import("../storage/ual/entry.zig");
 
 // FloQL pipeline
@@ -120,7 +121,9 @@ pub const TSHandler = struct {
         defer shard.ts_handler.freeResult(result);
         if (result == .parked) {
             const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-            return shard.park(conn, req, result.parked, if (op == .ts_write) respondTS else respondApplied);
+            // A write counts against its namespace here, where it is accepted.
+            if (op == .ts_write) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+            return shard.park(conn, req, result.parked, if (op == .ts_write) answerWrite else answerOk);
         }
         switch (result) {
             .ts_write_ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
@@ -130,21 +133,16 @@ pub const TSHandler = struct {
     }
 
     /// A parked delete or retention applied: nothing to report but that.
-    fn respondApplied(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        sendTSResponse(shard, conn, req.header.request_id, .ok);
+    fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        sendTSResponse(shard, conn, request_id, .ok);
     }
 
-    /// A parked write applied: the point's timestamp is the client's or,
-    /// server-stamped, the entry's; its sequence the entry's index.
-    fn respondTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        // Checked by the write handler before the entry was proposed.
-        const client_ts = clientTimestampNs(req) catch null;
-        sendTSResponse(shard, conn, req.header.request_id, writeOk(req.key, client_ts orelse shard.answering_timestamp_ns, shard.answering_index));
+    /// A parked write applied: the point's timestamp, as its applier
+    /// recorded it; its sequence the entry's index.
+    fn answerWrite(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        const key = r.slice() orelse "";
+        sendTSResponse(shard, conn, request_id, writeOk(key, r.int(u64) orelse result.timestamp_ns, result.index));
     }
 
     /// The timestamp the client gave its point, in ns; null when it left

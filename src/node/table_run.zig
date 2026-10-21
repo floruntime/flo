@@ -22,14 +22,16 @@ pub fn Outcome(comptime Response: type) type {
     return union(enum) {
         /// Answer now, with this.
         answer: Response.Value,
-        /// The write was proposed: `responder` answers once it applies.
+        /// The write was proposed: `answer` answers from its result once it
+        /// applies.
         park: Park,
         /// A waiter holds the request, and answers it.
         wait,
     };
 }
 
-pub const Park = struct { proposed: ProposeResult, responder: dispatcher_mod.HandlerFn };
+/// `release`, given `ctx`, frees what the write holds however its wait ends.
+pub const Park = struct { proposed: ProposeResult, answer: Shard.AnswerFn, release: ?Shard.ReleaseFn = null, ctx: u64 = 0 };
 
 /// A refusal and the status it goes with: what a family's `refusal` gives.
 pub const Refused = struct { status: proto.StatusCode, refusal: proto.Refusal };
@@ -73,7 +75,7 @@ pub fn handler(comptime name: []const u8, comptime Family: type, comptime functi
             };
             switch (outcome) {
                 .answer => |v| answer(the_op.response, shard, conn, req.header.request_id, v),
-                .park => |p| shard.park(conn, req, p.proposed, p.responder),
+                .park => |p| shard.parkHolding(conn, req, p.proposed, p.answer, p.release, p.ctx),
                 .wait => conn.response_deferred = true,
             }
         }

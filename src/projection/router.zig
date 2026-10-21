@@ -23,8 +23,12 @@
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
 
+const persistence = @import("../storage/persistence.zig");
+
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
+pub const Result = persistence.Result;
+pub const ApplyError = persistence.ApplyError;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Projection Interface
@@ -33,17 +37,11 @@ const EntryType = entry_mod.EntryType;
 /// Common interface for all projection engines.
 /// Each projection must implement these operations.
 pub const ProjectionVTable = struct {
-    /// Apply a committed UAL entry to this projection.
-    applyFn: *const fn (ctx: *anyopaque, entry: *const Entry) ApplyError!void,
+    /// Apply a committed UAL entry to this projection, recording its answer.
+    applyFn: *const fn (ctx: *anyopaque, entry: *const Entry, result: *Result) ApplyError!void,
 
     /// Return current memory usage in bytes.
     memoryUsageFn: *const fn (ctx: *anyopaque) usize,
-};
-
-pub const ApplyError = error{
-    InvalidPayload,
-    OutOfMemory,
-    CapacityExceeded,
 };
 
 /// Type-erased projection handle.
@@ -51,8 +49,8 @@ pub const ProjectionHandle = struct {
     ctx: *anyopaque,
     vtable: ProjectionVTable,
 
-    pub fn apply(self: ProjectionHandle, entry: *const Entry) ApplyError!void {
-        return self.vtable.applyFn(self.ctx, entry);
+    pub fn apply(self: ProjectionHandle, entry: *const Entry, result: *Result) ApplyError!void {
+        return self.vtable.applyFn(self.ctx, entry, result);
     }
 
     pub fn memoryUsage(self: ProjectionHandle) usize {
@@ -73,8 +71,6 @@ pub const ApplyResult = enum(u8) {
     skipped_no_projection,
     /// Snapshot installation triggered.
     snapshot_triggered,
-    /// Error applying to projection.
-    apply_error,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -133,9 +129,9 @@ pub const ProjectionRouter = struct {
         self.ts = handle;
     }
 
-    /// Apply a single committed entry. Routes by EntryType.
-    /// Returns what happened.
-    pub fn apply(self: *ProjectionRouter, entry: *const Entry) ApplyResult {
+    /// Apply a single committed entry. Routes by EntryType, and returns
+    /// what happened or why its projection could not apply it.
+    pub fn apply(self: *ProjectionRouter, entry: *const Entry, out: *Result) ApplyError!ApplyResult {
         // Idempotency: skip already-applied entries
         if (entry.header.index <= self.applied_index) {
             self.stats.entries_skipped += 1;
@@ -145,10 +141,15 @@ pub const ProjectionRouter = struct {
         const entry_type: EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         const target = routeTarget(entry_type);
 
-        const result = switch (target) {
-            .kv => self.applyTo(self.kv, entry, &self.stats.kv_entries),
-            .queue => self.applyTo(self.queue, entry, &self.stats.queue_entries),
-            .ts => self.applyTo(self.ts, entry, &self.stats.ts_entries),
+        // Advanced whatever the outcome: an entry is never applied twice.
+        defer {
+            self.applied_index = @max(self.applied_index, entry.header.index);
+            self.applied_stamp = @max(self.applied_stamp, entry.header.timestamp_ns);
+        }
+        return switch (target) {
+            .kv => self.applyTo(self.kv, entry, out, &self.stats.kv_entries),
+            .queue => self.applyTo(self.queue, entry, out, &self.stats.queue_entries),
+            .ts => self.applyTo(self.ts, entry, out, &self.stats.ts_entries),
             .none => blk: {
                 self.stats.entries_no_projection += 1;
                 break :blk .skipped_no_projection;
@@ -158,24 +159,22 @@ pub const ProjectionRouter = struct {
                 break :blk .snapshot_triggered;
             },
         };
-
-        // Advance applied_index regardless of routing outcome
-        self.applied_index = @max(self.applied_index, entry.header.index);
-        self.applied_stamp = @max(self.applied_stamp, entry.header.timestamp_ns);
-        return result;
     }
 
     /// Apply a batch of committed entries (e.g., after Raft commit advances).
     pub fn applyBatch(self: *ProjectionRouter, entries: []const Entry) BatchResult {
         var result = BatchResult{};
         for (entries) |*entry| {
-            const r = self.apply(entry);
+            var out = Result.start(entry);
+            const r = self.apply(entry, &out) catch {
+                result.errors += 1;
+                continue;
+            };
             switch (r) {
                 .applied => result.applied += 1,
                 .skipped_already_applied => result.skipped += 1,
                 .skipped_no_projection => result.no_projection += 1,
                 .snapshot_triggered => result.snapshots += 1,
-                .apply_error => result.errors += 1,
             }
         }
         return result;
@@ -209,12 +208,13 @@ pub const ProjectionRouter = struct {
         self: *ProjectionRouter,
         handle: ?ProjectionHandle,
         entry: *const Entry,
+        out: *Result,
         counter: *u64,
-    ) ApplyResult {
+    ) ApplyError!ApplyResult {
         if (handle) |h| {
-            h.apply(entry) catch {
+            h.apply(entry, out) catch |err| {
                 self.stats.entries_error += 1;
-                return .apply_error;
+                return err;
             };
             counter.* += 1;
             self.stats.entries_applied += 1;
@@ -289,7 +289,7 @@ const TestProjection = struct {
     last_index: u64 = 0,
     memory: usize = 1024,
 
-    fn applyFn(ctx: *anyopaque, entry: *const Entry) ApplyError!void {
+    fn applyFn(ctx: *anyopaque, entry: *const Entry, _: *Result) ApplyError!void {
         const self: *TestProjection = @ptrCast(@alignCast(ctx));
         self.apply_count += 1;
         self.last_index = entry.header.index;
@@ -313,8 +313,8 @@ const TestProjection = struct {
 
 /// Test projection that always returns an error.
 const ErrorProjection = struct {
-    fn applyFn(_: *anyopaque, _: *const Entry) ApplyError!void {
-        return error.InvalidPayload;
+    fn applyFn(_: *anyopaque, _: *const Entry, _: *Result) ApplyError!void {
+        return error.Halt;
     }
 
     fn memoryUsageFn(_: *anyopaque) usize {
@@ -331,6 +331,11 @@ const ErrorProjection = struct {
         };
     }
 };
+
+fn applyOne(router: *ProjectionRouter, entry: *const Entry) ApplyError!ApplyResult {
+    var out = Result.start(entry);
+    return router.apply(entry, &out);
+}
 
 fn makeEntry(entry_type: EntryType, index: u64) Entry {
     return entry_mod.buildEntry(entry_type, entry_mod.Flags.NONE, 1, index, 0, "test");
@@ -375,7 +380,7 @@ test "router: kv entry routed to kv projection" {
     router.registerKV(kv_proj.handle());
 
     const entry = makeEntry(.kv_put, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.applied, result);
     try testing.expectEqual(@as(u32, 1), kv_proj.apply_count);
@@ -390,7 +395,7 @@ test "router: queue entry routed to queue projection" {
     router.registerQueue(queue_proj.handle());
 
     const entry = makeEntry(.queue_enqueue, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.applied, result);
     try testing.expectEqual(@as(u32, 1), queue_proj.apply_count);
@@ -403,7 +408,7 @@ test "router: ts entry routed to ts projection" {
     router.registerTS(ts_proj.handle());
 
     const entry = makeEntry(.ts_write, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.applied, result);
     try testing.expectEqual(@as(u32, 1), ts_proj.apply_count);
@@ -419,7 +424,7 @@ test "router: consumer group entry not routed to a projection" {
     router.registerKV(kv_proj.handle());
 
     const entry = makeEntry(.cg_commit, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
     try testing.expectEqual(@as(u32, 0), kv_proj.apply_count);
@@ -429,7 +434,7 @@ test "router: consumer group entry not routed to a projection" {
 test "router: stream entry has no projection" {
     var router = ProjectionRouter.init();
     const entry = makeEntry(.stream_append, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
     try testing.expectEqual(@as(u64, 1), router.stats.entries_no_projection);
@@ -438,7 +443,7 @@ test "router: stream entry has no projection" {
 test "router: raft noop has no projection" {
     var router = ProjectionRouter.init();
     const entry = makeEntry(.raft_noop, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
 }
@@ -446,7 +451,7 @@ test "router: raft noop has no projection" {
 test "router: raft snapshot triggers installation" {
     var router = ProjectionRouter.init();
     const entry = makeEntry(.raft_snapshot, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.snapshot_triggered, result);
     try testing.expectEqual(@as(u64, 1), router.stats.snapshots_triggered);
@@ -460,11 +465,11 @@ test "router: idempotency — duplicate entries skipped" {
     const entry = makeEntry(.kv_put, 1);
 
     // Apply once
-    _ = router.apply(&entry);
+    _ = try applyOne(&router, &entry);
     try testing.expectEqual(@as(u32, 1), kv_proj.apply_count);
 
     // Apply same index again — should be skipped
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
     try testing.expectEqual(ApplyResult.skipped_already_applied, result);
     try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // unchanged
     try testing.expectEqual(@as(u64, 1), router.stats.entries_skipped);
@@ -476,15 +481,15 @@ test "router: entries must be applied in order" {
     router.registerKV(kv_proj.handle());
 
     // Apply index 1, 2, 3 in order
-    _ = router.apply(&makeEntry(.kv_put, 1));
-    _ = router.apply(&makeEntry(.kv_delete, 2));
-    _ = router.apply(&makeEntry(.kv_put, 3));
+    _ = try applyOne(&router, &makeEntry(.kv_put, 1));
+    _ = try applyOne(&router, &makeEntry(.kv_delete, 2));
+    _ = try applyOne(&router, &makeEntry(.kv_put, 3));
 
     try testing.expectEqual(@as(u32, 3), kv_proj.apply_count);
     try testing.expectEqual(@as(u64, 3), router.applied_index);
 
     // Index 2 again — skipped
-    const r = router.apply(&makeEntry(.kv_put, 2));
+    const r = try applyOne(&router, &makeEntry(.kv_put, 2));
     try testing.expectEqual(ApplyResult.skipped_already_applied, r);
     try testing.expectEqual(@as(u32, 3), kv_proj.apply_count);
 }
@@ -495,9 +500,7 @@ test "router: apply error counted but index advances" {
     router.registerKV(err_proj.handle());
 
     const entry = makeEntry(.kv_put, 1);
-    const result = router.apply(&entry);
-
-    try testing.expectEqual(ApplyResult.apply_error, result);
+    try testing.expectError(error.Halt, applyOne(&router, &entry));
     try testing.expectEqual(@as(u64, 1), router.stats.entries_error);
     // Index still advances — we don't retry
     try testing.expectEqual(@as(u64, 1), router.applied_index);
@@ -508,7 +511,7 @@ test "router: unregistered projection acts as no_projection" {
     // No projections registered
 
     const entry = makeEntry(.kv_put, 1);
-    const result = router.apply(&entry);
+    const result = try applyOne(&router, &entry);
 
     // KV projection not registered — treated as no projection
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
@@ -559,12 +562,12 @@ test "router: mixed entry types across all projections" {
     router.registerQueue(queue_proj.handle());
     router.registerTS(ts_proj.handle());
 
-    _ = router.apply(&makeEntry(.kv_put, 1));
-    _ = router.apply(&makeEntry(.queue_enqueue, 2));
-    _ = router.apply(&makeEntry(.ts_write, 3));
-    _ = router.apply(&makeEntry(.cg_commit, 4)); // → none (stream replay registry)
-    _ = router.apply(&makeEntry(.queue_ack, 5));
-    _ = router.apply(&makeEntry(.ts_write_batch, 6));
+    _ = try applyOne(&router, &makeEntry(.kv_put, 1));
+    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 2));
+    _ = try applyOne(&router, &makeEntry(.ts_write, 3));
+    _ = try applyOne(&router, &makeEntry(.cg_commit, 4)); // → none (stream replay registry)
+    _ = try applyOne(&router, &makeEntry(.queue_ack, 5));
+    _ = try applyOne(&router, &makeEntry(.ts_write_batch, 6));
 
     try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // kv_put only
     try testing.expectEqual(@as(u32, 2), queue_proj.apply_count); // enqueue + ack

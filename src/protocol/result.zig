@@ -19,8 +19,8 @@ pub const CommandResult = union(enum) {
     /// Request is pending (blocked) - no response sent yet
     pending: void,
 
-    /// The write is in the log and waits for commit; the module's
-    /// responder answers once it has applied. Carries what `propose`
+    /// The write is in the log and waits for commit; it is answered from
+    /// its entry's result once it has applied. Carries what `propose`
     /// returned.
     parked: @import("../raft/types.zig").ProposeResult,
 

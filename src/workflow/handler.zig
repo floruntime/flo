@@ -47,6 +47,7 @@ const connection_mod = @import("../node/connection.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
 const entry_mod = @import("../storage/ual/entry.zig");
 const persistence_mod = @import("../storage/persistence.zig");
+const Result = persistence_mod.Result;
 const Partition = @import("../storage/partition.zig").Partition;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
@@ -78,18 +79,8 @@ pub const WorkflowHandler = struct {
     /// Mutex for cross-shard thread safety. Acquired when this handler is
     /// accessed from a different shard's thread via forwardToShard dispatch.
     mu: @import("stdx").Mutex,
-    /// The run the last applied start created; a key of `runs` (see
-    /// `Shard.answering_index`).
-    last_started_key: ?[]const u8 = null,
-    /// The last applied start named a run that already existed under its
-    /// idempotency key; `last_started_key` is that run.
-    last_start_existed: bool = false,
-    /// The last applied start named a run id that already existed.
-    last_start_collided: bool = false,
-    /// Runs started on this leader, in the order they were queued (not log
-    /// order: a client's start is queued once it applies, a producer's when
-    /// it is proposed), for the tick to take
-    /// their first step once the start has applied (`advanceStartedRuns`).
+    /// Runs whose start this leader applied, in log order, for the tick to
+    /// take their first step (`advanceStartedRuns`).
     /// No start takes its first step where it is proposed or answered: a
     /// step proposes, and the shard applies nothing in the middle of a
     /// module's work.
@@ -500,25 +491,54 @@ pub const WorkflowHandler = struct {
     fn dispatchWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        // Parked outside the handler's lock: on a single node the responder
-        // runs straight away and takes the lock itself.
-        if (shard.workflow_handler.handleCommand(shard, conn, req)) |proposed| shard.park(conn, req, proposed, respondWorkflow);
+        // Parked outside the handler's lock: on a single node the entry
+        // applies straight away, and its applier takes the lock itself.
+        const proposed = shard.workflow_handler.handleCommand(shard, conn, req) orelse return;
+        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
+        shard.park(conn, req, proposed, switch (op) {
+            .workflow_create => answerCreate,
+            .workflow_start => answerStart,
+            else => answerOk,
+        });
     }
 
-    /// A parked create or start applied: answer, and for a start, begin.
-    fn respondWorkflow(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const h = shard.workflow_handler;
-        shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
-        h.mu.lock();
-        defer h.mu.unlock();
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        switch (op) {
-            .workflow_create => h.respondCreate(shard, conn, req),
-            .workflow_start => h.respondStart(shard, conn, req),
-            else => shard.sendOkResponse(conn, req.header.request_id, ""),
-        }
+    fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        shard.sendOkResponse(conn, request_id, "");
+    }
+
+    /// The create applied: answered with the definition's name.
+    fn answerCreate(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        shard.sendOkResponse(conn, request_id, r.slice() orelse "");
+    }
+
+    /// The start applied: answered with its run's id, the one it created or
+    /// the earlier run its idempotency key names. The first step is the
+    /// tick's (`startApplied`).
+    fn answerStart(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        _ = r.int(u8);
+        shard.sendOkResponse(conn, request_id, r.slice() orelse "");
+    }
+
+    /// After a start applies on the leader that proposed it: a run it
+    /// created is queued for its first step. Never on a follower (a step
+    /// proposes, and only the leader does), and never on a later leader
+    /// applying an earlier term's start: that start's own leader may have
+    /// stepped it already, so it stays at its start (`dropStartedRuns`).
+    pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
+        if (entry.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start)) return;
+        if (result.refused() != null or shard.raft_node.role != .leader) return;
+        if (entry.header.term != shard.raft_node.current_term) return;
+        var r = result.reader();
+        if ((r.int(u8) orelse 0) != 1) return;
+        // The run's key is the entry's: "namespace:run_id".
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        if (shard.metrics_registry) |m| m.workflow.recordStarted();
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.queueFirstStep(cmd.key, result.index);
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -621,22 +641,6 @@ pub const WorkflowHandler = struct {
             return null;
         };
         return proposed;
-    }
-
-    /// The create applied: the definition is stored under its key.
-    fn respondCreate(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const name = req.key;
-        const ns_key = self.makeNsKey(req.namespace, name) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-        defer self.allocator.free(ns_key);
-        if (!self.definitions.contains(ns_key)) {
-            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-            return;
-        }
-
-        shard.sendOkResponse(conn, req.header.request_id, name);
     }
 
     // ── START ───────────────────────────────────────────────────────────
@@ -800,30 +804,6 @@ pub const WorkflowHandler = struct {
             return null;
         };
         return proposed;
-    }
-
-    /// The start applied: answer with the id of the run it created, and
-    /// leave its first step to the tick.
-    fn respondStart(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const stored_key = self.last_started_key orelse {
-            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-            return;
-        };
-        const run = self.runs.get(stored_key) orelse {
-            shard.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
-            return;
-        };
-        if (self.last_start_collided) {
-            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "conflict: a run with this id already exists");
-            return;
-        }
-        if (self.last_start_existed) {
-            shard.sendOkResponse(conn, req.header.request_id, run.run_id_owned);
-            return;
-        }
-        if (shard.metrics_registry) |m| m.workflow.recordStarted();
-        shard.sendOkResponse(conn, req.header.request_id, run.run_id_owned);
-        self.queueFirstStep(stored_key, shard.answering_index);
     }
 
     /// The index key for an idempotency key, any length the wire allows:
@@ -2763,7 +2743,7 @@ pub const WorkflowHandler = struct {
         // The applier applies the same record again at commit, at the same
         // stamp; it replaces the terminal state wholesale, so a second
         // apply is a no-op.
-        _ = self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms));
+        self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms)) catch {};
 
         // Every terminal transition passes through here, so this is the one
         // place the outcome counters need to be recorded.
@@ -3473,7 +3453,7 @@ pub const WorkflowHandler = struct {
 
     /// Start a run for a producer (a schedule, a trigger, a parent run):
     /// the start is proposed and the tick takes its first step once it
-    /// applies. Returns the start's log index. The caller holds `mu`.
+    /// applies, as for a client's. Returns the start's log index. The caller holds `mu`.
     fn proposeRun(
         self: *WorkflowHandler,
         shard: *Shard,
@@ -3489,9 +3469,6 @@ pub const WorkflowHandler = struct {
             log.err("workflow {s}: run {s} not started: {s}", .{ wf_name, run_id, @errorName(err) });
             return null;
         };
-        var key_buf: [600]u8 = undefined;
-        const ns_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ namespace, run_id }) catch return null;
-        self.queueFirstStep(ns_key, proposed.index);
         return proposed.index;
     }
 
@@ -3695,9 +3672,9 @@ pub const WorkflowHandler = struct {
     /// `completed_at_ms`; the producer and replay both apply it here. A
     /// value cut short, or an allocation that fails, leaves the run as it
     /// was.
-    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyOutcome {
-        const entry = CompleteEntry.parse(value) orelse return .failed;
-        const built = self.buildComplete(&entry) catch return .failed;
+    fn applyComplete(self: *WorkflowHandler, run: *RunRecord, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyError!void {
+        const entry = CompleteEntry.parse(value) orelse return error.Halt;
+        const built = try self.buildComplete(&entry);
 
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
@@ -3720,7 +3697,6 @@ pub const WorkflowHandler = struct {
             if (run.search_tags_owned) |old| self.allocator.free(old);
             run.search_tags_owned = t;
         }
-        return .applied;
     }
 
     /// Register this handler's entry types with the shared ReplayRegistry.
@@ -3730,41 +3706,39 @@ pub const WorkflowHandler = struct {
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
     }
 
-    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const self: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-        return self.replayEntry(entry);
+        return self.replayEntry(entry, out);
     }
 
-    /// Apply a workflow entry: live commit, replicated entry or boot replay alike.
-    pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry) persistence_mod.ApplyOutcome {
+    /// Apply a workflow entry: live commit, replicated entry or boot replay
+    /// alike. A create is answered with the definition's name; a start with
+    /// whether it created its run (u8) and the run's id.
+    pub fn replayEntry(self: *WorkflowHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         // Other shard threads walk these maps under this lock. Nothing
         // holds it across an apply, so taking it here cannot nest.
         self.mu.lock();
         defer self.mu.unlock();
-        if (etype == .workflow_start) {
-            self.last_started_key = null;
-            self.last_start_existed = false;
-            self.last_start_collided = false;
-        }
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return .failed;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
 
         return switch (etype) {
-            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000)),
-            .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
+            .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
+            .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
-            else => .failed,
+            else => error.Halt,
         };
     }
 
     /// Apply a workflow_create entry. The key is "namespace:name" (ns-qualified).
-    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
+    fn replayCreate(self: *WorkflowHandler, ns_key_raw: []const u8, yaml: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         // "namespace:name"
         const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
         const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
         const raw_name = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
+        out.putBytes(raw_name);
 
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return .failed;
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
         // Remove old definition if exists
         if (self.definitions.fetchRemove(ns_key)) |old| {
             self.allocator.free(old.key); // old ns-qualified key
@@ -3773,26 +3747,26 @@ pub const WorkflowHandler = struct {
             self.allocator.free(old.value.yaml_owned);
         }
 
-        var def = self.parseStored(yaml, ns_key_raw) catch {
+        var def = self.parseStored(yaml, ns_key_raw) catch |err| {
             self.allocator.free(ns_key);
-            return .failed;
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
         };
         defer def.deinit(self.allocator);
 
         const version = self.allocator.dupe(u8, def.version) catch {
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         const owned_name = self.allocator.dupe(u8, raw_name) catch {
             self.allocator.free(ns_key);
             self.allocator.free(version);
-            return .failed;
+            return error.OutOfMemory;
         };
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
             self.allocator.free(ns_key);
             self.allocator.free(owned_name);
             self.allocator.free(version);
-            return .failed;
+            return error.OutOfMemory;
         };
         self.definitions.put(ns_key, .{
             .name_owned = owned_name,
@@ -3805,13 +3779,13 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned_name);
             self.allocator.free(version);
             self.allocator.free(owned_yaml);
-            return .failed;
+            return error.OutOfMemory;
         };
 
         // A definition's trigger and schedule are part of it: (re)register
         // them here so a restart keeps them and a redefinition without one
         // drops it.
-        if (!self.install_producers) return .applied;
+        if (!self.install_producers) return;
         if (def.trigger) |trigger| {
             self.registerStreamTrigger(namespace, raw_name, trigger);
         } else {
@@ -3822,46 +3796,45 @@ pub const WorkflowHandler = struct {
         } else {
             self.unregisterSchedule(namespace, raw_name);
         }
-        return .applied;
     }
 
     /// Apply a workflow_start entry. The key is "namespace:run_id" (ns-qualified).
-    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyOutcome {
+    fn replayStart(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         // "namespace:run_id"
         const sep = std.mem.indexOfScalar(u8, ns_key_raw, ':');
         const namespace = if (sep) |i| ns_key_raw[0..i] else "default";
         const raw_run_id = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
 
         var off: usize = 0;
-        if (off + 2 > value.len) return .failed;
+        if (off + 2 > value.len) return error.Halt;
         const wf_name_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + wf_name_len > value.len) return .failed;
+        if (off + wf_name_len > value.len) return error.Halt;
         const wf_name = value[off .. off + wf_name_len];
         off += wf_name_len;
 
-        if (off + 2 > value.len) return .failed;
+        if (off + 2 > value.len) return error.Halt;
         const ver_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + ver_len > value.len) return .failed;
+        if (off + ver_len > value.len) return error.Halt;
         const version = value[off .. off + ver_len];
         off += ver_len;
 
-        if (off + 1 > value.len) return .failed;
-        const status = std.enums.fromInt(RunStatus, value[off]) orelse return .failed;
+        if (off + 1 > value.len) return error.Halt;
+        const status = std.enums.fromInt(RunStatus, value[off]) orelse return error.Halt;
         off += 1;
 
-        if (off + 2 > value.len) return .failed;
+        if (off + 2 > value.len) return error.Halt;
         const evt_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + evt_len > value.len) return .failed;
+        if (off + evt_len > value.len) return error.Halt;
         const event_type = value[off .. off + evt_len];
         off += evt_len;
 
-        if (off + 2 > value.len) return .failed;
+        if (off + 2 > value.len) return error.Halt;
         const idem_len = std.mem.readInt(u16, value[off..][0..2], .little);
         off += 2;
-        if (off + idem_len > value.len) return .failed;
+        if (off + idem_len > value.len) return error.Halt;
         const idem: ?[]const u8 = if (idem_len > 0) value[off .. off + idem_len] else null;
         off += idem_len;
 
@@ -3874,26 +3847,23 @@ pub const WorkflowHandler = struct {
         // carrying both its key and its own run id is the same start.
         if (idem) |k| {
             if (self.runKeyForIdempotencyKey(namespace, wf_name, k)) |run_key| {
-                self.last_started_key = run_key;
-                self.last_start_existed = true;
-                return .applied;
+                const earlier = self.runs.get(run_key) orelse return error.Halt;
+                out.putInt(u8, 0);
+                out.putBytes(earlier.run_id_owned);
+                return;
             }
         }
 
         // Already present: a re-apply, or a second start with a run id
         // the client chose, which the handler let through while the first
         // was uncommitted. The log's order decides; the later is refused.
-        if (self.runs.getEntry(ns_key_raw)) |e| {
-            self.last_started_key = e.key_ptr.*;
-            self.last_start_collided = true;
-            return .applied;
-        }
+        if (self.runs.contains(ns_key_raw)) return out.refuse(.conflict, .unclassified, "conflict: a run with this id already exists");
 
-        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return .failed;
+        const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
         var run = RunRecord{
             .run_id_owned = self.allocator.dupe(u8, raw_run_id) catch {
                 self.allocator.free(ns_key);
-                return .failed;
+                return error.OutOfMemory;
             },
             .workflow_name_owned = "",
             .workflow_version_owned = "",
@@ -3909,20 +3879,20 @@ pub const WorkflowHandler = struct {
         run.workflow_name_owned = self.allocator.dupe(u8, wf_name) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         run.workflow_version_owned = self.allocator.dupe(u8, version) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(run.workflow_name_owned);
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         run.input_owned = self.allocator.dupe(u8, input) catch {
             self.allocator.free(run.run_id_owned);
             self.allocator.free(run.workflow_name_owned);
             self.allocator.free(run.workflow_version_owned);
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         };
         run.idempotency_key_owned = if (idem) |k| self.allocator.dupe(u8, k) catch {
             self.allocator.free(run.run_id_owned);
@@ -3930,7 +3900,7 @@ pub const WorkflowHandler = struct {
             self.allocator.free(run.workflow_version_owned);
             self.allocator.free(run.input_owned);
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         } else null;
         // The run's first history event, as the start path recorded it.
         if (event_type.len > 0) self.addHistoryEvent(&run, event_type, input, created_at_ms);
@@ -3943,9 +3913,10 @@ pub const WorkflowHandler = struct {
         self.runs.put(ns_key, run) catch {
             self.freeRunRecord(&run);
             self.allocator.free(ns_key);
-            return .failed;
+            return error.OutOfMemory;
         };
-        self.last_started_key = ns_key;
+        out.putInt(u8, 1);
+        out.putBytes(raw_run_id);
         if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
         // Search tags come from the definition and the input; derived here so
         // every node computes the same ones.
@@ -3955,7 +3926,6 @@ pub const WorkflowHandler = struct {
                 stored.search_tags_owned = self.buildSearchTags(def_ns_key, stored);
             }
         }
-        return .applied;
     }
 
     /// Apply a workflow_complete entry. Updates the run's terminal status,
@@ -3964,8 +3934,9 @@ pub const WorkflowHandler = struct {
     ///   [has_output:u8][output_len:u32][output]?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyOutcome {
-        const run = self.runs.getPtr(ns_key_raw) orelse return .failed;
+    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyError!void {
+        // Runs are never removed: a completion names one that started.
+        const run = self.runs.getPtr(ns_key_raw) orelse return error.Halt;
         return self.applyComplete(run, value, completed_at_ms);
     }
 
@@ -4485,7 +4456,7 @@ fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8
     };
 }
 
-test "a producer's start waits in the first-step queue until it applies, then takes its step; one whose index applied without creating a run is dropped" {
+test "a producer's start joins the first-step queue when it applies, then takes its step; one whose index applied without creating a run is dropped" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -4496,15 +4467,18 @@ test "a producer's start waits in the first-step queue until it applies, then ta
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
     handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
-    // Proposed, not yet applied: there is no run to step, so it waits.
+    // Proposed, not yet applied: there is no run to step, and nothing waits.
     try testing.expect(handler.proposeRun(&shard, "default", "run-p", "test-wf", "latest", "{}", null, "schedule_started") != null);
     handler.advanceStartedRuns(&shard);
-    try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
+    try testing.expectEqual(@as(usize, 0), handler.started_to_advance.items.len);
     try testing.expect(handler.runs.get("default:run-p") == null);
 
+    // Applied on the leader: the run it created waits for its first step.
     _ = shard.applyCommitted();
+    try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
     // A start whose index applied without creating a run (dropped with the
     // log's tail) is dropped from the queue, not kept for ever.
     handler.queueFirstStep("default:ghost", shard.raft_node.last_applied);
@@ -5147,19 +5121,33 @@ test "workflow replay: a start that runs out of memory fails and creates nothing
         // the map's insert failing after it.
         try handler.runs.ensureTotalCapacity(1);
         fa.fail_index = fa.alloc_index + fail_at;
-        const outcome = handler.replayStart("default:r1", &start, 1);
-        if (outcome == .failed) {
+        var out: Result = .{};
+        handler.replayStart("default:r1", &start, 1, &out) catch {
             try testing.expect(fa.has_induced_failure);
             try testing.expectEqual(@as(usize, 0), handler.runCount());
             continue;
-        }
+        };
         const run = handler.runs.get("default:r1") orelse return error.RunMissing;
         try testing.expectEqualStrings("key", run.idempotency_key_owned orelse return error.IdempotencyKeyLost);
         if (!fa.has_induced_failure) break;
     }
 }
 
-test "workflow replay: an unknown status, or a complete entry without its output flag, is skipped" {
+test "workflow replay: a start answers with its run id whole, at the longest key an entry carries" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    var key: [persistence_mod.MAX_ENTRY_KEY]u8 = @splat('r');
+    @memcpy(key[0..8], "default:");
+    var out: Result = .{};
+    try handler.replayStart(&key, &start, 1, &out);
+    try testing.expect(!out.overflowed);
+    var r = out.reader();
+    try testing.expectEqual(@as(?u8, 1), r.int(u8));
+    try testing.expectEqualSlices(u8, key[8..], r.slice().?);
+}
+
+test "workflow replay: an unknown status, or a complete entry without its output flag, halts and changes nothing" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -5168,15 +5156,16 @@ test "workflow replay: an unknown status, or a complete entry without its output
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var bad_status = start;
     bad_status[7] = 0xee;
-    try testing.expectEqual(persistence_mod.ApplyOutcome.failed, handler.replayStart("default:r0", &bad_status, 1));
+    var out: Result = .{};
+    try testing.expectError(error.Halt, handler.replayStart("default:r0", &bad_status, 1, &out));
     try testing.expectEqual(@as(usize, 0), handler.runCount());
 
-    _ = handler.replayStart("default:r1", &start, 1);
+    try handler.replayStart("default:r1", &start, 1, &out);
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 
     // Missing has_output byte; then an unknown status. Neither may change the run.
-    _ = handler.replayComplete("default:r1", &[_]u8{3}, 2);
-    _ = handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2);
+    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{3}, 2));
+    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2));
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
 }
 
@@ -5191,10 +5180,11 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         const stamp_ns: u64 = @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms;
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
-        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?));
+        var out: Result = .{};
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, handler.runs.get("default:r1").?.created_at_ms);
         // completed, no output, no steps, no history, no tags
-        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?));
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);
@@ -5207,7 +5197,8 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     defer handler.deinit();
 
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
-    _ = handler.replayStart("default:r1", &start, 1);
+    var start_out: Result = .{};
+    try handler.replayStart("default:r1", &start, 1, &start_out);
 
     // completed, output "ok", one step "s"/"done"/"x", one history event "e"/"d"@7, tags "t"
     const whole = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++
@@ -5225,14 +5216,14 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     const history_before = handler.runs.get("default:r1").?.history.items.len;
     try testing.expectEqual(@as(usize, 1), history_before);
     for (1..whole.len - 3) |n| {
-        _ = handler.replayComplete("default:r1", whole[0..n], 2);
+        try testing.expectError(error.Halt, handler.replayComplete("default:r1", whole[0..n], 2));
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
         try testing.expectEqual(history_before, run.history.items.len);
     }
 
-    _ = handler.replayComplete("default:r1", &whole, 2);
+    try handler.replayComplete("default:r1", &whole, 2);
     const run = handler.runs.get("default:r1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
@@ -5294,7 +5285,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
     var follower = WorkflowHandler.init(allocator);
     defer follower.deinit();
     createTestRun(&follower, "default:big", "big", "test-wf");
-    _ = follower.replayComplete("default:big", record, 2);
+    try follower.replayComplete("default:big", record, 2);
     const f = follower.runs.get("default:big").?;
     try testing.expectEqual(done.status, f.status);
     try testing.expectEqual(done.history.items.len, f.history.items.len);
@@ -5344,7 +5335,7 @@ test "a completion record that fits round-trips through replay" {
     };
     const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit("default:r"));
     defer allocator.free(record);
-    _ = handler.applyComplete(run, record, 7);
+    try handler.applyComplete(run, record, 7);
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     try testing.expectEqualStrings("out", run.output_owned.?);
     try testing.expectEqualStrings("{\"a\":1}", run.search_tags_owned.?);
@@ -5740,7 +5731,8 @@ test "workflow replay: a start whose input nests past 128 levels applies; a sear
         var key_buf: [32]u8 = undefined;
         const ns_key = try std.fmt.bufPrint(&key_buf, "default:r{d}", .{n});
 
-        try testing.expectEqual(persistence_mod.ApplyOutcome.applied, handler.replayStart(ns_key, value, 1));
+        var out: Result = .{};
+        try handler.replayStart(ns_key, value, 1, &out);
         const tags = handler.runs.get(ns_key).?.search_tags_owned.?;
         if (n <= json_depth.MAX_DEPTH) {
             try testing.expect(std.mem.indexOf(u8, tags, arrays) != null);

@@ -4,8 +4,8 @@
 //! mutates a subsystem's state from a committed entry, whether that entry was
 //! written here, replicated from a peer, or read back from a segment at boot.
 //! `proposeEntry` builds a command entry and proposes it; the caller parks
-//! the client on the result and answers from a responder once the entry
-//! has applied. Nothing waits for a commit: a producer that needs the
+//! the client on it, and the client is answered from what the applier
+//! recorded in its `Result` once the entry has applied. Nothing waits for a commit: a producer that needs the
 //! applied state picks it up once the entry applies.
 //!
 //! ## Usage
@@ -13,9 +13,10 @@
 //! Handler registration (in Shard.init, before segment replay):
 //!   handler.registerReplay(&replay_registry);
 //!
-//! Client write: propose, park, read the result back in the responder:
+//! Client write: propose, then park with the op's answer function, which
+//! reads only the entry's `Result`:
 //!   const p = try persistence.proposeEntry(shard, .action_register, Flags.NONE, namespace, key, value);
-//!   return .{ .parked = p };   // the dispatcher parks with the module's responder
+//!   shard.park(conn, req, p, answerRegister);
 //!
 
 const std = @import("std");
@@ -41,14 +42,133 @@ pub const MAX_ENTRY_KEY: usize = ns_keys.MAX_QUALIFIED_KEY;
 // ReplayRegistry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// What an applier made of an entry. `failed` means the entry changed
-/// nothing it should have (a payload that would not decode, a write the
-/// state could not take); the applier has logged why, and the shard
-/// counts it.
-pub const ApplyOutcome = enum { applied, failed };
+/// Why an applier could not apply an entry. Not a refusal: a refused
+/// entry applied (it changed nothing, the same way on every node) and its
+/// `Result` says why.
+pub const ApplyError = error{
+    /// This node could not hold what the entry adds; another node may.
+    OutOfMemory,
+    /// This node could not write what the entry needs to disk.
+    Io,
+    /// The entry breaks what every node holds true of the log: a payload
+    /// that will not decode, a step no prepared write can ask for. Every
+    /// node that applies it fails the same way.
+    Halt,
+};
 
-/// An applier: called for every committed entry of a registered type.
-pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry) ApplyOutcome;
+/// What applying one entry came to, for the client waiting on its index:
+/// an answer body, or a refusal. The applier writes it; nothing reads the
+/// applier's state afterwards to rebuild it.
+pub const Result = struct {
+    index: u64 = 0,
+    timestamp_ns: u64 = 0,
+    len: u16 = 0,
+    /// A write didn't fit. The answer is lost rather than cut: a cut key
+    /// would name something else.
+    overflowed: bool = false,
+    bytes: [RESULT_MAX]u8 = undefined,
+    refused_status: ?proto.StatusCode = null,
+    refused_reason: proto.Reason = .unclassified,
+    message_len: u16 = 0,
+    message: [MESSAGE_MAX]u8 = undefined,
+
+    /// The longest answer an applier records: one key, at most the longest
+    /// an entry carries, and a few numbers.
+    pub const RESULT_MAX = MAX_ENTRY_KEY + 64;
+    /// The longest refusal message kept; a longer one is cut.
+    pub const MESSAGE_MAX = 256;
+
+    pub fn start(entry: *const Entry) Result {
+        return .{ .index = entry.header.index, .timestamp_ns = entry.header.timestamp_ns };
+    }
+
+    /// Ready for `entry`'s apply, in place: the buffers aren't touched.
+    pub fn reset(self: *Result, entry: *const Entry) void {
+        self.index = entry.header.index;
+        self.timestamp_ns = entry.header.timestamp_ns;
+        self.len = 0;
+        self.overflowed = false;
+        self.refused_status = null;
+        self.message_len = 0;
+    }
+
+    /// The entry applied and changed nothing: what the client is told.
+    pub fn refuse(self: *Result, status: proto.StatusCode, reason: proto.Reason, message: []const u8) void {
+        const n = @min(message.len, MESSAGE_MAX);
+        @memcpy(self.message[0..n], message[0..n]);
+        self.message_len = @intCast(n);
+        self.refused_status = status;
+        self.refused_reason = reason;
+    }
+
+    /// `refuse`, with the message formatted.
+    pub fn refuseFmt(self: *Result, status: proto.StatusCode, reason: proto.Reason, comptime fmt: []const u8, args: anytype) void {
+        var buf: [MESSAGE_MAX]u8 = undefined;
+        self.refuse(status, reason, std.fmt.bufPrint(&buf, fmt, args) catch buf[0..]);
+    }
+
+    /// The refusal, if the entry was refused; it points into this result.
+    pub fn refused(self: *const Result) ?Refused {
+        const status = self.refused_status orelse return null;
+        return .{ .status = status, .refusal = .{ .reason = self.refused_reason, .ran = .no, .message = self.message[0..self.message_len] } };
+    }
+
+    pub fn putInt(self: *Result, comptime T: type, v: T) void {
+        if (!self.room(@sizeOf(T))) return;
+        std.mem.writeInt(T, self.bytes[self.len..][0..@sizeOf(T)], v, .little);
+        self.len += @sizeOf(T);
+    }
+
+    /// `b`, length-prefixed, whole or not at all.
+    pub fn putBytes(self: *Result, b: []const u8) void {
+        if (!self.room(2 + b.len)) return;
+        self.putInt(u16, @intCast(b.len));
+        @memcpy(self.bytes[self.len..][0..b.len], b);
+        self.len += @intCast(b.len);
+    }
+
+    fn room(self: *Result, n: usize) bool {
+        if (self.overflowed or RESULT_MAX - self.len < n) {
+            self.overflowed = true;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn body(self: *const Result) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    /// Reads back what `putInt`/`putBytes` wrote, in order.
+    pub const Reader = struct {
+        bytes: []const u8,
+        at: usize = 0,
+
+        pub fn int(self: *Reader, comptime T: type) ?T {
+            if (self.bytes.len - self.at < @sizeOf(T)) return null;
+            defer self.at += @sizeOf(T);
+            return std.mem.readInt(T, self.bytes[self.at..][0..@sizeOf(T)], .little);
+        }
+
+        pub fn slice(self: *Reader) ?[]const u8 {
+            const n = self.int(u16) orelse return null;
+            if (self.bytes.len - self.at < n) return null;
+            defer self.at += n;
+            return self.bytes[self.at..][0..n];
+        }
+    };
+
+    pub fn reader(self: *const Result) Reader {
+        return .{ .bytes = self.body() };
+    }
+};
+
+/// A refusal and the status it goes with.
+pub const Refused = struct { status: proto.StatusCode, refusal: proto.Refusal };
+
+/// An applier: called for every committed entry of a registered type, on
+/// every node, live or at boot. It records the entry's answer in `result`.
+pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry, result: *Result) ApplyError!void;
 
 /// Maps EntryType → applier. Handlers register their owned entry types
 /// during init; every committed entry of such a type is dispatched here.
@@ -77,11 +197,12 @@ pub const ReplayRegistry = struct {
         return self.callbacks[@backingInt(etype)] != null;
     }
 
-    /// Dispatch an entry to its registered handler. Null when its type has
-    /// none.
-    pub fn dispatch(self: *const ReplayRegistry, entry: *const Entry) ?ApplyOutcome {
-        if (self.callbacks[entry.header.entry_type]) |cb| return cb.func(cb.ctx, entry);
-        return null;
+    /// Dispatch an entry to its registered handler. False when its type
+    /// has none.
+    pub fn dispatch(self: *const ReplayRegistry, entry: *const Entry, result: *Result) ApplyError!bool {
+        const cb = self.callbacks[entry.header.entry_type] orelse return false;
+        try cb.func(cb.ctx, entry, result);
+        return true;
     }
 };
 
@@ -205,4 +326,20 @@ test "persistence: a write that couldn't be proposed never ran, whatever stopped
     try std.testing.expectEqual(proto.Ran.yes, COMMITTED_REFUSAL.ran);
     try std.testing.expectEqual(proto.Reason.committed_not_applied, COMMITTED_REFUSAL.reason);
     try std.testing.expectEqual(proto.Ran.yes, ANSWER_LOST_REFUSAL.ran);
+}
+
+test "persistence: a result takes the longest key an entry carries whole, and a write that doesn't fit is lost, never cut" {
+    var r: Result = .{};
+    const longest = @as([MAX_ENTRY_KEY]u8, @splat('k'));
+    r.putBytes(&longest);
+    r.putInt(u64, 7);
+    try std.testing.expect(!r.overflowed);
+    var rd = r.reader();
+    try std.testing.expectEqual(MAX_ENTRY_KEY, rd.slice().?.len);
+    try std.testing.expectEqual(@as(?u64, 7), rd.int(u64));
+    // Past the room left: nothing of it is written, and the result says so.
+    const len = r.len;
+    r.putBytes(&longest);
+    try std.testing.expect(r.overflowed);
+    try std.testing.expectEqual(len, r.len);
 }
