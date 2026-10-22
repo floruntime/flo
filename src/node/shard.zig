@@ -11707,9 +11707,11 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
             try std.testing.expectEqual(@as(u64, 4), (try nextAnswer(cb, other, &out)).header.request_id);
         },
         .silent => {
-            const now = @import("stdx").time.monotonicMs();
-            other.worker_handler.find("default", worker).?.last_seen_ms = now -| (other.worker_handler.heartbeat_timeout_ms + 1);
-            try std.testing.expectEqual(@as(usize, 1), other.worker_handler.checkHealth(now));
+            // The sweep's clock moves past the timeout; moving the worker's
+            // last sight back instead would stop at 0 on a machine up for
+            // less than the timeout.
+            const seen = other.worker_handler.find("default", worker).?.last_seen_ms;
+            try std.testing.expectEqual(@as(usize, 1), other.worker_handler.checkHealth(seen + other.worker_handler.heartbeat_timeout_ms + 1));
         },
     }
 
