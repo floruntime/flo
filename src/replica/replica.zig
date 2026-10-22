@@ -302,7 +302,7 @@ pub fn Replica(comptime Io: type) type {
                     const was = raft.lost_log;
                     self.takeVouch(resp);
                     raft.handleTermCheckResponse(resp);
-                    if (was != .none and raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term + 1 });
+                    if (was != .none and raft.lost_log == .none) log.info("shard {d}: lost-log guard done; term {d} confirmed, voting from term {d} on", .{ self.id, raft.current_term, raft.current_term +| 1 });
                 },
                 .join_request => self.handleJoinRequest(frame.source_node),
                 .removed_notice => self.takeRemovedNotice(frame),
