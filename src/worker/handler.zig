@@ -18,7 +18,9 @@
 //!
 //! Workers self-register on connect and send periodic heartbeats.
 //! The registry tracks health state and exposes it for dashboards.
-//! Worker deregistration happens explicitly or via heartbeat timeout.
+//! A worker that misses its heartbeats is marked unhealthy and takes no
+//! work; one silent past the removal grace is removed. Deregistration is
+//! otherwise explicit.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -81,10 +83,17 @@ pub const WorkerRecord = struct {
     processes: std.ArrayList(ProcessInfo),
     tasks_completed: u64 = 0,
     tasks_failed: u64 = 0,
+    /// Tasks in hand, as the worker reported in its last heartbeat, and 0
+    /// once it is unhealthy. Worker-reported, not counted here: its runs
+    /// complete and expire on other shards, which this one can't see.
     current_load: u32 = 0,
     max_concurrency: u32 = 10,
     registered_at_ms: i64,
+    /// Wall clock, for display.
     last_heartbeat_ms: i64,
+    /// Monotonic clock, for expiry: a wall-clock step must not mark every
+    /// worker unhealthy, nor keep a dead one alive.
+    last_seen_ms: u64,
 };
 
 comptime {
@@ -109,8 +118,16 @@ pub const WorkerHandler = struct {
     /// worker.list builds its page here; allocated on first use.
     list_buf: ?[]u8 = null,
 
+    /// A worker silent this long is unhealthy and takes no work: three
+    /// missed beats at the SDKs' 30 s.
+    heartbeat_timeout_ms: u64 = DEFAULT_HEARTBEAT_TIMEOUT_MS,
+    /// A worker silent this long is removed, so ones that died without
+    /// deregistering don't pile up.
+    remove_after_ms: u64 = DEFAULT_REMOVE_AFTER_MS,
+
     const MAX_WORKERS: usize = 10_000;
-    const HEARTBEAT_TIMEOUT_MS: i64 = 90_000; // 90s — unhealthy if no heartbeat
+    pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 90_000;
+    pub const DEFAULT_REMOVE_AFTER_MS: u64 = 600_000;
 
     pub fn init(allocator: Allocator) WorkerHandler {
         return .{
@@ -375,6 +392,7 @@ pub const WorkerHandler = struct {
             .max_concurrency = max_concurrency,
             .registered_at_ms = now_ms,
             .last_heartbeat_ms = now_ms,
+            .last_seen_ms = @import("stdx").time.monotonicMs(),
         }) catch {
             for (processes.items) |p| self.allocator.free(p.name_owned);
             processes.deinit(self.allocator);
@@ -394,6 +412,7 @@ pub const WorkerHandler = struct {
     fn handleHeartbeat(self: *WorkerHandler, req: Request) ?WorkerStatus {
         const worker = self.find(req.namespace, req.key) orelse return null;
         worker.last_heartbeat_ms = @import("stdx").time.milliTimestamp();
+        worker.last_seen_ms = @import("stdx").time.monotonicMs();
 
         // Don't reset draining→active — drain is sticky until deregister
         if (worker.status != .draining) {
@@ -425,23 +444,41 @@ pub const WorkerHandler = struct {
         }
     }
 
-    /// Update status of stale workers (called periodically from shard tick).
-    pub fn checkHealth(self: *WorkerHandler) void {
-        const now_ms = @import("stdx").time.milliTimestamp();
+    /// Mark workers silent past the heartbeat timeout unhealthy, and remove
+    /// those silent past the removal grace, by the monotonic clock `now_ms`.
+    /// Returns how many changed.
+    pub fn checkHealth(self: *WorkerHandler, now_ms: u64) usize {
+        var changed: usize = 0;
+        // Removed after the pass, which a removal would invalidate; any past
+        // this many go on the next sweep.
+        var gone: [256][]const u8 = undefined;
+        var gone_count: usize = 0;
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr;
-            if (w.status != .unhealthy and (now_ms - w.last_heartbeat_ms) > HEARTBEAT_TIMEOUT_MS) {
+            const silent = now_ms -| w.last_seen_ms;
+            if (silent > self.remove_after_ms) {
+                if (gone_count == gone.len) continue;
+                gone[gone_count] = entry.key_ptr.*;
+                gone_count += 1;
+            } else if (silent > self.heartbeat_timeout_ms and (w.status == .active or w.status == .idle)) {
                 w.status = .unhealthy;
+                // Its last report is stale, and it takes no work now.
+                w.current_load = 0;
+                changed += 1;
             }
         }
+        for (gone[0..gone_count]) |key| {
+            var record = self.workers.fetchRemove(key).?.value;
+            self.freeWorkerRecord(&record);
+        }
+        return changed + gone_count;
     }
 
     /// Increment completed count for a worker + specific process (called by actions handler).
     pub fn recordCompletion(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
         if (self.find(namespace, worker_id)) |w| {
             w.tasks_completed += 1;
-            if (w.current_load > 0) w.current_load -= 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, false);
         }
     }
@@ -450,24 +487,19 @@ pub const WorkerHandler = struct {
     pub fn recordFailure(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
         if (self.find(namespace, worker_id)) |w| {
             w.tasks_failed += 1;
-            if (w.current_load > 0) w.current_load -= 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, true);
         }
     }
 
-    /// Increment current load for a worker (when task assigned).
-    pub fn recordTaskAssigned(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) void {
-        if (self.find(namespace, worker_id)) |w| {
-            w.current_load += 1;
-        }
-    }
-
-    /// Check if a worker is draining (used by action_await to reject new tasks).
-    pub fn isDraining(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) bool {
-        if (self.find(namespace, worker_id)) |w| {
-            return w.status == .draining;
-        }
-        return false;
+    /// Why worker `worker_id` takes no new task, or null if it takes one.
+    /// An unregistered worker takes tasks: registering is optional.
+    pub fn refusesWork(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) ?proto.Refusal {
+        const w = self.find(namespace, worker_id) orelse return null;
+        return switch (w.status) {
+            .draining => .{ .reason = .worker_draining, .ran = .no, .message = "worker is draining" },
+            .unhealthy => .{ .reason = .worker_unhealthy, .ran = .no, .message = "worker missed its heartbeats; send one, or register again" },
+            .active, .idle => null,
+        };
     }
 
     /// Update per-process stats after a run.
@@ -950,3 +982,62 @@ test "worker.list: a page that doesn't decode is refused before anything is answ
 // A worker id is a qualified registry key at most; the id alone is shorter
 // by its namespace and separator.
 const ops_max_key = @import("../protocol/ops.zig").MAX_KEY - 8;
+
+test "workers: a silent worker is marked unhealthy and refused work, then removed; a heartbeat brings it back" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    h.heartbeat_timeout_ms = 100;
+    h.remove_after_ms = 1000;
+    for ([_][]const u8{ "a", "b", "c" }) |id| try std.testing.expect(h.handleRegister(testRequest("", id)) == null);
+    const t0: u64 = 1_000_000;
+    for ([_][]const u8{ "a", "b", "c" }) |id| h.find("", id).?.last_seen_ms = t0;
+    h.find("", "a").?.current_load = 4;
+    h.find("", "c").?.status = .draining;
+
+    try std.testing.expectEqual(@as(usize, 0), h.checkHealth(t0 + 100));
+    try std.testing.expect(h.refusesWork("", "a") == null);
+
+    // Silent past the timeout: a and b unhealthy; c stays draining.
+    try std.testing.expectEqual(@as(usize, 2), h.checkHealth(t0 + 101));
+    try std.testing.expectEqual(WorkerStatus.unhealthy, h.find("", "a").?.status);
+    try std.testing.expectEqual(@as(u32, 0), h.find("", "a").?.current_load);
+    try std.testing.expectEqual(WorkerStatus.draining, h.find("", "c").?.status);
+    try std.testing.expectEqual(proto.Reason.worker_unhealthy, h.refusesWork("", "a").?.reason);
+    try std.testing.expectEqual(proto.Reason.worker_draining, h.refusesWork("", "c").?.reason);
+    // An unregistered worker takes work.
+    try std.testing.expect(h.refusesWork("", "nobody") == null);
+
+    // A heartbeat makes a healthy again, from then on.
+    try std.testing.expectEqual(WorkerStatus.active, h.handleHeartbeat(testRequest("", "a")).?);
+    h.find("", "a").?.last_seen_ms = t0 + 950;
+    try std.testing.expect(h.refusesWork("", "a") == null);
+
+    // Silent past the grace, b and c are removed, draining or not; a isn't.
+    try std.testing.expectEqual(@as(usize, 2), h.checkHealth(t0 + 1001));
+    try std.testing.expectEqual(@as(usize, 1), h.workers.count());
+    try std.testing.expect(h.find("", "a") != null);
+}
+
+test "workers: current_load is what the worker last reported" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try std.testing.expect(h.handleRegister(testRequest("", "w")) == null);
+    var beat = testRequest("", "w");
+    beat.value = &.{ 3, 0, 0, 0 };
+    _ = h.handleHeartbeat(beat);
+    h.recordCompletion("", "w", null);
+    h.recordFailure("", "w", null);
+    try std.testing.expectEqual(@as(u32, 3), h.find("", "w").?.current_load);
+    try std.testing.expectEqual(@as(u64, 1), h.find("", "w").?.tasks_completed);
+}
+
+test "workers: expiry reads the monotonic clock, so a wall-clock step expires no one" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    try std.testing.expect(h.handleRegister(testRequest("", "w")) == null);
+    const w = h.find("", "w").?;
+    // The wall clock stepped: the last heartbeat now reads a day ago.
+    w.last_heartbeat_ms -= std.time.ms_per_day;
+    try std.testing.expectEqual(@as(usize, 0), h.checkHealth(w.last_seen_ms + 1000));
+    try std.testing.expectEqual(WorkerStatus.active, w.status);
+}

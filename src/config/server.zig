@@ -43,6 +43,14 @@ pub const MAX_SHARDS: u16 = 256;
 /// past that would route its status and signals to another partition.
 pub const MAX_PARTITIONS: u32 = @import("../node/run_id.zig").MAX_PARTITION + 1;
 
+/// How long a worker may go without a heartbeat.
+pub const WorkersConfig = struct {
+    /// Silent this long, a worker is unhealthy and takes no work.
+    heartbeat_timeout_ms: u64 = 90_000,
+    /// Silent this long, a worker is removed.
+    remove_after_ms: u64 = 600_000,
+};
+
 /// Server configuration loaded from flo.toml
 pub const ServerConfig = struct {
     // [server] section
@@ -67,6 +75,9 @@ pub const ServerConfig = struct {
 
     // [cluster] section
     cluster: ClusterConfig = .{},
+
+    // [workers] section
+    workers: WorkersConfig = .{},
 
     // [logging] section
     log_level: LogLevel = .info,
@@ -139,6 +150,8 @@ pub const ServerConfig = struct {
             .cluster_seeds = self.cluster.seeds,
             .cluster_secret = self.cluster.secret,
             .cluster_failover_timeout_ms = self.cluster.failover_timeout_ms,
+            .worker_heartbeat_timeout_ms = self.workers.heartbeat_timeout_ms,
+            .worker_remove_after_ms = self.workers.remove_after_ms,
         };
     }
 
@@ -207,6 +220,10 @@ const sections = [_]Section{
         .{ .name = "raft_port", .kind = .integer, .max = PORT_MAX },
         .{ .name = "seeds", .kind = .string_or_array },
         .{ .name = "failover_timeout_ms", .kind = .integer },
+    } },
+    .{ .name = "workers", .keys = &.{
+        .{ .name = "heartbeat_timeout_ms", .kind = .integer, .min = 1000 },
+        .{ .name = "remove_after_ms", .kind = .integer, .min = 1000 },
     } },
 };
 
@@ -405,6 +422,16 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
                 log.err("[logging] format = \"{s}\": use text or json", .{format});
                 return error.InvalidSetting;
             };
+        }
+    }
+
+    // Parse [workers] section
+    if (table.getTable("workers")) |w| {
+        if (w.getInt("heartbeat_timeout_ms")) |t| config.workers.heartbeat_timeout_ms = @intCast(t);
+        if (w.getInt("remove_after_ms")) |t| config.workers.remove_after_ms = @intCast(t);
+        if (config.workers.remove_after_ms < config.workers.heartbeat_timeout_ms) {
+            log.err("[workers] remove_after_ms = {d} is below heartbeat_timeout_ms = {d}: a worker would be removed before it is marked unhealthy", .{ config.workers.remove_after_ms, config.workers.heartbeat_timeout_ms });
+            return error.InvalidSetting;
         }
     }
 
@@ -641,6 +668,13 @@ pub fn generateDefaultConfig() []const u8 {
     \\# is certain by all of it; heartbeats are a sixth of it. Minimum 100.
     \\# failover_timeout_ms = 1500
     \\
+    \\[workers]
+    \\# A worker silent this long is unhealthy and takes no work; the SDKs
+    \\# heartbeat every 30 s. Minimum 1000.
+    \\# heartbeat_timeout_ms = 90000
+    \\# A worker silent this long is removed. At least heartbeat_timeout_ms.
+    \\# remove_after_ms = 600000
+    \\
     ;
 }
 
@@ -767,6 +801,8 @@ test "config: what flo.toml can't hold is refused, not ignored" {
         .{ .body = "[logging]\nformat = \"xml\"\n", .err = error.InvalidSetting },
         .{ .body = "[dashboard]\nenabled = \"yes\"\n", .err = error.InvalidSetting },
         .{ .body = "[cluster]\nseeds = [9500]\n", .err = error.InvalidSetting },
+        .{ .body = "[workers]\nheartbeat_timeout_ms = 10\n", .err = error.InvalidSetting },
+        .{ .body = "[workers]\nheartbeat_timeout_ms = 5000\nremove_after_ms = 2000\n", .err = error.InvalidSetting },
     }) |c| {
         const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
         try @import("stdx").fs.writeAll(f, c.body);
@@ -798,4 +834,28 @@ test "config: the file config init writes loads, and a named file that is missin
     @import("stdx").fs.closeFile(f);
     var config = try load(allocator, path);
     defer config.deinit();
+}
+
+test "config: [workers] timeouts reach the runtime config, and default when absent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, "[workers]\nheartbeat_timeout_ms = 5000\nremove_after_ms = 60000\n");
+    @import("stdx").fs.closeFile(f);
+    var set = try load(allocator, path);
+    defer set.deinit();
+    const rt = set.toRuntimeConfig();
+    try std.testing.expectEqual(@as(u64, 5000), rt.worker_heartbeat_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 60000), rt.worker_remove_after_ms);
+
+    var defaults = ServerConfig.init(allocator);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u64, 90_000), defaults.toRuntimeConfig().worker_heartbeat_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 600_000), defaults.toRuntimeConfig().worker_remove_after_ms);
 }

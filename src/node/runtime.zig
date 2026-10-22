@@ -110,6 +110,9 @@ pub const RuntimeConfig = struct {
     /// The one timing knob: a leader unheard for this long is replaced.
     /// Election timeouts are [½, 1] × this, heartbeats a sixth of it.
     cluster_failover_timeout_ms: u32 = 1500,
+    /// A worker silent this long is unhealthy; this long, removed.
+    worker_heartbeat_timeout_ms: u64 = 90_000,
+    worker_remove_after_ms: u64 = 600_000,
 
     // =========================================================================
     // Port Derivation Methods
@@ -653,6 +656,8 @@ pub const Runtime = struct {
         // Must happen after shards are at final heap addresses.
         // Also wire shard back-pointers for handlers that need Raft access.
         for (0..self.shard_count) |i| {
+            shards[i].worker_handler.heartbeat_timeout_ms = self.config.worker_heartbeat_timeout_ms;
+            shards[i].worker_handler.remove_after_ms = self.config.worker_remove_after_ms;
             shards[i].registerBackgroundTasks();
             shards[i].wireHandlerShardPtrs();
             shards[i].applyDeferredTail();

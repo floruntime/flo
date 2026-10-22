@@ -3832,6 +3832,15 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        // Workers that stopped heartbeating: unhealthy, then removed. The
+        // registry is this shard's alone, so every shard sweeps its own.
+        self.task_scheduler.register(
+            "worker_health",
+            1_000,
+            workerHealthTask,
+            @ptrCast(self),
+        ) catch {};
+
         self.task_scheduler.register(
             "kv_txn_reap",
             1_000,
@@ -3848,6 +3857,12 @@ pub const Shard = struct {
                 @ptrCast(self),
             ) catch {};
         }
+    }
+
+    /// TaskScheduler callback: mark silent workers unhealthy, remove long-silent ones.
+    fn workerHealthTask(ctx: *anyopaque) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        return self.worker_handler.checkHealth(@import("stdx").time.monotonicMs());
     }
 
     /// TaskScheduler callback: drop the KV transactions left idle.
@@ -11616,9 +11631,22 @@ test "Shard: a worker's await runs where the worker is registered, so a labelled
     try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
+    // Handing it a task doesn't count toward its load: that is what the
+    // worker reports.
+    try std.testing.expectEqual(@as(u32, 0), other.worker_handler.find("default", worker).?.current_load);
 }
 
 test "Shard: an await parked before its worker was drained is refused when work arrives" {
+    try expectParkedAwaitRefused(.drained);
+}
+
+test "Shard: an await parked before its worker went silent is refused when work arrives" {
+    try expectParkedAwaitRefused(.silent);
+}
+
+/// A worker parks an await with nothing to take, then is drained or misses
+/// its heartbeats; when a run arrives the await is refused, by reason.
+fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -11671,10 +11699,19 @@ test "Shard: an await parked before its worker was drained is refused when work 
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
     other.flushToClient(cb.conn.fd);
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
-    const drain = try testRequest(.worker_drain, 4, worker, "");
-    defer std.testing.allocator.free(drain);
-    _ = feedClient(cb.pair[1], other, cb.conn.fd, drain);
-    try std.testing.expectEqual(@as(u64, 4), (try nextAnswer(cb, other, &out)).header.request_id);
+    switch (how) {
+        .drained => {
+            const drain = try testRequest(.worker_drain, 4, worker, "");
+            defer std.testing.allocator.free(drain);
+            _ = feedClient(cb.pair[1], other, cb.conn.fd, drain);
+            try std.testing.expectEqual(@as(u64, 4), (try nextAnswer(cb, other, &out)).header.request_id);
+        },
+        .silent => {
+            const now = @import("stdx").time.monotonicMs();
+            other.worker_handler.find("default", worker).?.last_seen_ms = now -| (other.worker_handler.heartbeat_timeout_ms + 1);
+            try std.testing.expectEqual(@as(usize, 1), other.worker_handler.checkHealth(now));
+        },
+    }
 
     // A run arrives: the drained worker's await is refused, and the run waits.
     const invoke = try testRequest(.action_invoke, 5, name, "\x00job");
@@ -11686,6 +11723,10 @@ test "Shard: an await parked before its worker was drained is refused when work 
     const resp = try nextAnswer(cb, other, &out);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(switch (how) {
+        .drained => proto.Reason.worker_draining,
+        .silent => proto.Reason.worker_unhealthy,
+    }, (try resp.refused()).reason);
     var runs = owner.actions_handler.runs.valueIterator();
     try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, runs.next().?.status);
 }

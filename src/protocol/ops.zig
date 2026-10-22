@@ -399,13 +399,29 @@ pub fn tableHash(comptime ops: []const Op, comptime entries: anytype) u64 {
             hashSchema(&h, op.request);
             hashSchema(&h, op.response);
         }
-        hashNum(&h, entries.len);
-        for (entries) |e| {
-            hashStr(&h, e.name);
-            hashNum(&h, e.type_code);
-            hashSchema(&h, e.payload);
-        }
+        hashEntries(&h, entries);
         return h.final();
+    }
+}
+
+/// A hash of the entry payload layouts alone: what a segment stores. The
+/// refusal reasons and ops in `tableHash` are never stored, so a change to
+/// them must not move this.
+pub fn entryTableHash(comptime entries: anytype) u64 {
+    comptime {
+        @setEvalBranchQuota(10_000_000);
+        var h = std.hash.Wyhash.init(0x666c6f2d656e7421); // "flo-ent!"
+        hashEntries(&h, entries);
+        return h.final();
+    }
+}
+
+fn hashEntries(comptime h: *std.hash.Wyhash, comptime entries: anytype) void {
+    hashNum(h, entries.len);
+    for (entries) |e| {
+        hashStr(h, e.name);
+        hashNum(h, e.type_code);
+        hashSchema(h, e.payload);
     }
 }
 
@@ -639,7 +655,7 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0xe550a39747bc7c2c), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0xf907165f6f97bbbd), comptime tableHash(&test_table, NoEntries));
 }
 
 test "ops: the hash covers which field a route names and a wait's default" {
