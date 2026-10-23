@@ -11636,7 +11636,7 @@ test "Shard: a worker's await runs where the worker is registered, so a labelled
     try std.testing.expectEqual(@as(u32, 0), other.worker_handler.find("default", worker).?.current_load);
 }
 
-test "Shard: an await parked before its worker was drained is refused when work arrives" {
+test "Shard: an await parked before its worker was drained is refused as it drains, and a run that arrives later waits" {
     try expectParkedAwaitRefused(.drained);
 }
 
@@ -11645,7 +11645,8 @@ test "Shard: an await parked before its worker went silent is refused when work 
 }
 
 /// A worker parks an await with nothing to take, then is drained or misses
-/// its heartbeats; when a run arrives the await is refused, by reason.
+/// its heartbeats. A drain answers the await at once; a silent worker's is
+/// refused when a run arrives. Either way the run waits for another worker.
 fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
     var two: TwoShards = undefined;
     try two.init();
@@ -11704,7 +11705,16 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
             const drain = try testRequest(.worker_drain, 4, worker, "");
             defer std.testing.allocator.free(drain);
             _ = feedClient(cb.pair[1], other, cb.conn.fd, drain);
-            try std.testing.expectEqual(@as(u64, 4), (try nextAnswer(cb, other, &out)).header.request_id);
+            // The parked await first: the drain frees it, rather than its
+            // block running out. Both answers come in one read.
+            const got = try readAnswer(cb.pair[1], other, cb.conn.fd, &out, 2 * @sizeOf(proto.ResponseHeader));
+            const refused = try proto.Response.parse(out[0..got]);
+            try std.testing.expectEqual(@as(u64, 3), refused.header.request_id);
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), refused.header.status);
+            try std.testing.expectEqual(proto.Reason.worker_draining, (try refused.refused()).reason);
+            const drained = try proto.Response.parse(out[@sizeOf(proto.ResponseHeader) + refused.header.data_len .. got]);
+            try std.testing.expectEqual(@as(u64, 4), drained.header.request_id);
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), drained.header.status);
         },
         .silent => {
             // The sweep's clock moves past the timeout; moving the worker's
@@ -11715,20 +11725,26 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
         },
     }
 
-    // A run arrives: the drained worker's await is refused, and the run waits.
+    // A run arrives. A silent worker's await is refused now; a drained
+    // worker's was answered already, and nothing more comes.
     const invoke = try testRequest(.action_invoke, 5, name, "\x00job");
     defer std.testing.allocator.free(invoke);
     _ = feedClient(ca.pair[1], owner, ca.conn.fd, invoke);
     _ = owner.applyCommitted();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
     _ = other.drainInbox();
-    const resp = try nextAnswer(cb, other, &out);
-    try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
-    try std.testing.expectEqual(switch (how) {
-        .drained => proto.Reason.worker_draining,
-        .silent => proto.Reason.worker_unhealthy,
-    }, (try resp.refused()).reason);
+    switch (how) {
+        .drained => {
+            other.flushToClient(cb.conn.fd);
+            try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
+        },
+        .silent => {
+            const resp = try nextAnswer(cb, other, &out);
+            try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+            try std.testing.expectEqual(proto.Reason.worker_unhealthy, (try resp.refused()).reason);
+        },
+    }
     var runs = owner.actions_handler.runs.valueIterator();
     try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, runs.next().?.status);
 }

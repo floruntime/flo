@@ -30,6 +30,7 @@ const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const ns_keys = @import("../namespace/handler.zig");
+const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const table_run = @import("../node/table_run.zig");
 const gather_mod = @import("../node/gather.zig");
 const schema = @import("../protocol/schema.zig");
@@ -225,6 +226,9 @@ pub const WorkerHandler = struct {
             },
             .worker_drain => {
                 if (shard.worker_handler.handleDrain(req)) {
+                    // Its parked awaits are answered now, not when they time
+                    // out: they park here, where its registration is.
+                    shard.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(shard));
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 } else {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
