@@ -427,7 +427,7 @@ const Converter = struct {
                 }
                 first = false;
 
-                if (mem.indexOf(u8, rest, ",")) |comma_pos| {
+                if (findTopLevel(rest, ',')) |comma_pos| {
                     const item = mem.trim(u8, rest[0..comma_pos], " \t");
                     try self.writeValue(item);
                     rest = if (comma_pos + 1 < rest.len) rest[comma_pos + 1 ..] else "";
@@ -966,4 +966,10 @@ test "yaml_to_json: block sequences nest at most MAX_DEPTH levels" {
             }
         }
     }
+}
+
+test "a flow sequence of flow maps splits between the maps, not inside them" {
+    const json = try convert(std.testing.allocator, "ops: [{type: map, name: m}, {type: keyby, name: k}]\n");
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"ops\":[{\"type\":\"map\",\"name\":\"m\"},{\"type\":\"keyby\",\"name\":\"k\"}]}", json);
 }

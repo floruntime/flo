@@ -335,7 +335,7 @@ pub const ProcessingHandler = struct {
         self.allocator.free(job.namespace_owned);
         self.allocator.free(job.yaml_owned);
         if (job.failure_owned.len > 0) self.allocator.free(job.failure_owned);
-        if (job.held_owned.len > 0) self.allocator.free(job.held_owned);
+        self.freeHeldReason(job);
         job.cursors.deinit(self.allocator);
     }
 
@@ -357,16 +357,23 @@ pub const ProcessingHandler = struct {
             self.held_jobs += 1;
             log.warn("processing job {s} held on this node: {s}", .{ job.job_id_owned, reason });
         }
-        if (job.held_owned.len > 0) self.allocator.free(job.held_owned);
-        job.held_owned = boundedReason(self.allocator, reason) catch "";
+        self.freeHeldReason(job);
+        job.held_owned = boundedReason(self.allocator, reason) catch HELD_NO_MEMORY;
+    }
+
+    /// Why a job is held when copying its reason ran out of memory.
+    const HELD_NO_MEMORY = "out of memory";
+
+    fn freeHeldReason(self: *ProcessingHandler, job: *JobRecord) void {
+        if (job.held_owned.len > 0 and job.held_owned.ptr != HELD_NO_MEMORY.ptr) self.allocator.free(job.held_owned);
+        job.held_owned = "";
     }
 
     fn clearHeld(self: *ProcessingHandler, job: *JobRecord) void {
         if (!job.held) return;
         job.held = false;
         self.held_jobs -= 1;
-        if (job.held_owned.len > 0) self.allocator.free(job.held_owned);
-        job.held_owned = "";
+        self.freeHeldReason(job);
     }
 
     /// Mark a job failed with `reason`, cut to MAX_FAILURE_REASON and marked.
@@ -1002,7 +1009,7 @@ pub const ProcessingHandler = struct {
 
         if (failure) |why| {
             self.failJob(job, why);
-            // The job is stored, and takes a slot until cancelled.
+            // The job is stored, and keeps its slot: jobs are never removed.
             return refuseStoredFailure(out, owned_id, job.failure_owned);
         }
 
@@ -1022,7 +1029,7 @@ pub const ProcessingHandler = struct {
     }
 
     /// A submit whose job applied as failed: refused, but the job is stored
-    /// and holds a slot until cancelled, so it ran.
+    /// and keeps its slot, so it ran.
     fn refuseStoredFailure(out: *persistence_mod.Result, job_id: []const u8, why: []const u8) void {
         var buf: [persistence_mod.Result.MESSAGE_MAX]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "processing job {s} failed: {s}; cancel it with `flo processing cancel {s}`", .{ job_id, why, job_id }) catch buf[0..];
@@ -1128,7 +1135,7 @@ pub const ProcessingHandler = struct {
         // can't be built takes the rest down with it.
         for (def.sources.items, 0..) |*src, idx| {
             const owned_key = (if (idx == 0) self.allocator.dupe(u8, job_id) else std.fmt.allocPrint(self.allocator, "{s}\x00{d}", .{ job_id, idx })) catch {
-                self.dropPipelines(job_id, def.sources.items.len);
+                self.dropPipelines(job_id);
                 return .{ .held = "a pipeline couldn't be built: out of memory" };
             };
             if (self.pipelines.contains(owned_key)) {
@@ -1136,20 +1143,21 @@ pub const ProcessingHandler = struct {
                 continue;
             }
             if (!self.createPipeline(owned_key, src, def.sinks.items, def, tag_registry)) {
-                self.dropPipelines(job_id, def.sources.items.len);
+                self.dropPipelines(job_id);
                 return .{ .held = "a pipeline couldn't be built: out of memory" };
             }
         }
 
         // Pick up where the job's kept cursors say.
         const job = self.jobs.getPtr(job_id) orelse return null;
-        for (job.cursors.items) |c| {
-            var key_buf: [256]u8 = undefined;
-            const key = (if (c.source == 0) job_id else std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, c.source }) catch continue);
-            const pipe = self.pipelines.getPtr(key) orelse continue;
-            applyCursor(pipe, c.a, c.b);
-            pipe.persisted_cursor_ts = c.a;
-            pipe.persisted_cursor_seq = c.b;
+        var it = self.pipelines.iterator();
+        while (it.next()) |e| {
+            const source = pipelineSource(e.key_ptr.*, job_id) orelse continue;
+            for (job.cursors.items) |c| if (c.source == source) {
+                applyCursor(e.value_ptr, c.a, c.b);
+                e.value_ptr.persisted_cursor_ts = c.a;
+                e.value_ptr.persisted_cursor_seq = c.b;
+            };
         }
         return null;
     }
@@ -1157,16 +1165,29 @@ pub const ProcessingHandler = struct {
     const StartRefusal = union(enum) { failed: []const u8, held: []const u8 };
 
     /// Remove whatever pipelines job `job_id`'s `sources` have here.
-    fn dropPipelines(self: *ProcessingHandler, job_id: []const u8, sources: usize) void {
-        var key_buf: [256]u8 = undefined;
-        for (0..sources) |idx| {
-            const key = if (idx == 0) job_id else std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ job_id, idx }) catch continue;
-            if (self.pipelines.fetchRemove(key)) |kv| {
-                var pipe = kv.value;
-                self.freePipelineState(&pipe);
-                self.allocator.free(kv.key);
+    fn dropPipelines(self: *ProcessingHandler, job_id: []const u8) void {
+        // Removing invalidates the iterator: look again after each one.
+        outer: while (true) {
+            var it = self.pipelines.iterator();
+            while (it.next()) |e| {
+                if (pipelineSource(e.key_ptr.*, job_id) == null) continue;
+                const key = e.key_ptr.*;
+                self.freePipelineState(e.value_ptr);
+                self.pipelines.removeByPtr(e.key_ptr);
+                self.allocator.free(key);
+                continue :outer;
             }
+            return;
         }
+    }
+
+    /// The source a pipeline key names, if the key is one of `job_id`'s:
+    /// the job id for source 0, else the id, a NUL and the source's index.
+    fn pipelineSource(key: []const u8, job_id: []const u8) ?u32 {
+        if (!std.mem.startsWith(u8, key, job_id)) return null;
+        if (key.len == job_id.len) return 0;
+        if (key[job_id.len] != 0) return null;
+        return std.fmt.parseInt(u32, key[job_id.len + 1 ..], 10) catch null;
     }
 
     /// The first operator that can't be built, by name: checked at submit,
@@ -2431,6 +2452,11 @@ test "ProcessingHandler: replicas of different shard counts store the same statu
     try std.testing.expectEqualStrings("kv_lookup needs a one-shard server (--shards 1) until lookups can read other shards", held.held_owned);
     try std.testing.expectEqual(@as(u64, 1), two.held_jobs);
 
+    // Applied again, it is still one held job.
+    _ = try applySubmit(&two, "job-1", testSubmitValue(&value, .running, lookup_yaml), 2);
+    try std.testing.expect(two.jobs.get("job-1").?.held);
+    try std.testing.expectEqual(@as(u64, 1), two.held_jobs);
+
     // The list says so, beside the status.
     const ctxs = [_]*anyopaque{@ptrCast(&two)};
     const answer = try ProcessingHandler.serializeWalkJobs(std.testing.allocator, &.{"lookup"}, null, &ctxs, "");
@@ -2458,24 +2484,39 @@ test "ProcessingHandler: a submit stored as failed is refused, but says it ran" 
 }
 
 test "ProcessingHandler: memory running out while a submit applies never stores it as failed" {
-    var value: [512]u8 = undefined;
-    const submit = testSubmitValue(&value, .running, lookup_yaml);
-    // Each allocation in turn fails; past the last, the apply runs clean.
-    var fail_index: usize = 0;
-    while (true) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var h = ProcessingHandler.init(failing.allocator());
-        defer h.deinit();
-        if (applySubmit(&h, "job-m", submit, 1)) |_| {
-            // Applied: running, held here or not, never failed.
-            const job = h.jobs.get("job-m").?;
-            try std.testing.expectEqual(ProcessingHandler.JobStatus.running, job.status);
-            try std.testing.expectEqual(@as(u64, 0), h.failed_jobs);
-            try std.testing.expectEqual(job.held, !h.pipelines.contains("job-m"));
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        if (!failing.has_induced_failure) break;
+    // One job per operator type, each reading two streams under an id long
+    // enough that its pipeline keys outgrow a small buffer.
+    const operators = [_][]const u8{
+        "{type: kv_lookup, name: o, lookup_key: k}",
+        "{type: keyby, name: o, key_expression: \"$.user.id\"}",
+        "{type: aggregate, name: o, function: sum, field: \"$.amount\"}",
+        "{type: map, name: o, user: \"$.user.name\", source: signup}",
+        "{type: flatmap, name: o, array_field: \"$.order.items\", element_key: \"$.sku\"}",
+    };
+    const job_id = comptime @import("stdx").repeat("j", 300);
+    for (operators) |op| {
+        var yaml_buf: [512]u8 = undefined;
+        const yaml = try std.fmt.bufPrint(&yaml_buf, "kind: Processing\nname: oom\nsources: [{{stream: {{name: a}}}}, {{stream: {{name: b}}}}]\noperators: [{s}]\nsinks: [{{stream: {{name: out}}}}]\n", .{op});
+        var value: [1024]u8 = undefined;
+        const submit = testSubmitValue(&value, .running, yaml);
+        // Each allocation in turn fails; past the last, the apply runs clean.
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+            var h = ProcessingHandler.init(failing.allocator());
+            defer h.deinit();
+            if (applySubmit(&h, job_id, submit, 1)) |_| {
+                // Applied: running, held here or not, never failed; held
+                // with no pipeline left, or running both.
+                const job = h.jobs.get(job_id).?;
+                try std.testing.expectEqual(ProcessingHandler.JobStatus.running, job.status);
+                try std.testing.expectEqual(@as(u64, 0), h.failed_jobs);
+                try std.testing.expectEqual(@as(u32, if (job.held) 0 else 2), h.pipelines.count());
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            if (!failing.has_induced_failure) break;
+        }
+        try std.testing.expect(fail_index > 3);
     }
-    try std.testing.expect(fail_index > 3);
 }
 
 test "ProcessingHandler: a pipeline's copied config is freed once, and a build out of memory frees what it copied" {

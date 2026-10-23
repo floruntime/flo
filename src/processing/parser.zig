@@ -164,6 +164,7 @@ pub fn parseJobDefinitionWithNamespace(allocator: Allocator, content: []const u8
 
     // Not JSON: YAML, converted to JSON.
     const json_content = yaml_to_json.convert(allocator, content) catch |err| return switch (err) {
+        error.OutOfMemory => ParseError.OutOfMemory,
         error.NestingTooDeep => d.fail(ParseError.InvalidFormat, "YAML nesting is limited to {d} levels", .{yaml_to_json.MAX_DEPTH}),
         else => d.fail(ParseError.InvalidFormat, "the definition is neither JSON nor YAML", .{}),
     };
@@ -497,13 +498,6 @@ fn freeSource(allocator: Allocator, src: SourceSpec) void {
     allocator.free(src.ts_tags);
 }
 
-fn appendSource(allocator: Allocator, sources: *std.ArrayList(SourceSpec), src: SourceSpec) ParseError!void {
-    sources.append(allocator, src) catch {
-        freeSource(allocator, src);
-        return ParseError.OutOfMemory;
-    };
-}
-
 /// One source object: exactly one of `stream:` or `ts:`.
 ///
 /// Stream source:
@@ -604,7 +598,7 @@ fn appendTsSource(
     src.ts_measurement = try dupe(allocator, measurement);
     src.ts_field = try dupe(allocator, field);
     src.ts_tags = try parseStringPairs(allocator, d, ts_obj, "tags");
-    try appendSource(allocator, sources, src);
+    try sources.append(allocator, src);
 }
 
 fn appendStreamSource(
@@ -633,7 +627,7 @@ fn appendStreamSource(
     src.name = try dupe(allocator, source_name);
     src.stream = try dupe(allocator, stream_name);
     src.namespace = try dupe(allocator, ns);
-    try appendSource(allocator, sources, src);
+    try sources.append(allocator, src);
 }
 
 // =============================================================================

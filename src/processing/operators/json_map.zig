@@ -37,6 +37,7 @@
 const std = @import("std");
 const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
+const path_segments = @import("path_segments.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -91,25 +92,23 @@ pub const JsonMapOperator = struct {
         }
 
         for (config_entries) |entry| {
-            const source: Mapping.Source = if (std.mem.startsWith(u8, entry.value, "$.")) blk: {
-                // JSONPath extraction — split into segments (owned copies)
-                const field_path = entry.value[2..];
-                var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
-                var iter = std.mem.splitScalar(u8, field_path, '.');
-                while (iter.next()) |seg| {
-                    try seg_list.append(allocator, try allocator.dupe(u8, seg));
-                }
-                break :blk .{ .json_path = try seg_list.toOwnedSlice(allocator) };
-            } else .{ .constant = try allocator.dupe(u8, entry.value) };
-
-            try mappings_list.append(allocator, .{
-                .output_field = try allocator.dupe(u8, entry.key),
-                .source = source,
-            });
+            const source: Mapping.Source = if (std.mem.startsWith(u8, entry.value, "$."))
+                .{ .json_path = try path_segments.splitOwned(allocator, entry.value, .keep) }
+            else
+                .{ .constant = try allocator.dupe(u8, entry.value) };
+            errdefer switch (source) {
+                .json_path => |segs| path_segments.free(allocator, segs),
+                .constant => |c| allocator.free(c),
+            };
+            const output_field = try allocator.dupe(u8, entry.key);
+            errdefer allocator.free(output_field);
+            try mappings_list.append(allocator, .{ .output_field = output_field, .source = source });
         }
 
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
         return .{
-            .name = try allocator.dupe(u8, name),
+            .name = owned_name,
             .allocator = allocator,
             .mappings = try mappings_list.toOwnedSlice(allocator),
         };

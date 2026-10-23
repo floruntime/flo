@@ -33,6 +33,7 @@
 const std = @import("std");
 const json_out = @import("json_out.zig");
 const Allocator = std.mem.Allocator;
+const path_segments = @import("path_segments.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -61,16 +62,13 @@ pub const JsonFlatMapOperator = struct {
         array_field: []const u8,
         element_key: ?[]const u8,
     ) !Self {
-        const array_segs = try splitJsonPathOwned(allocator, array_field);
-        errdefer {
-            for (array_segs) |seg| allocator.free(seg);
-            allocator.free(array_segs);
-        }
-
+        const array_segs = try path_segments.splitOwned(allocator, array_field, .keep);
+        errdefer path_segments.free(allocator, array_segs);
         const key_segs: ?[]const []const u8 = if (element_key) |k|
-            try splitJsonPathOwned(allocator, k)
+            try path_segments.splitOwned(allocator, k, .keep)
         else
             null;
+        errdefer if (key_segs) |segs| path_segments.free(allocator, segs);
 
         return .{
             .name = try allocator.dupe(u8, name),
@@ -180,20 +178,6 @@ pub const JsonFlatMapOperator = struct {
     }
 
     /// Like splitJsonPath but dupes each segment (owned copies).
-    fn splitJsonPathOwned(allocator: Allocator, expr: []const u8) ![]const []const u8 {
-        const path = if (std.mem.startsWith(u8, expr, "$."))
-            expr[2..]
-        else
-            expr;
-
-        var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        var iter = std.mem.splitScalar(u8, path, '.');
-        while (iter.next()) |seg| {
-            try seg_list.append(allocator, try allocator.dupe(u8, seg));
-        }
-        return try seg_list.toOwnedSlice(allocator);
-    }
-
     fn navigateJson(root: std.json.Value, segments: []const []const u8) std.json.Value {
         var current = root;
         for (segments) |seg| {

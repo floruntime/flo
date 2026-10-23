@@ -214,7 +214,6 @@ fn createJsonKeyBy(allocator: Allocator, spec: *const OperatorSpec) CreateError!
     };
 
     const ptr = allocator.create(JsonKeyByOperator) catch return CreateError.OutOfMemory;
-
     errdefer allocator.destroy(ptr);
     ptr.* = JsonKeyByOperator.init(allocator, spec.name, key_expression) catch return CreateError.OutOfMemory;
 
@@ -267,7 +266,6 @@ fn createJsonAggregate(allocator: Allocator, spec: *const OperatorSpec) CreateEr
     };
 
     const ptr = allocator.create(JsonAggregateOperator) catch return CreateError.OutOfMemory;
-
     errdefer allocator.destroy(ptr);
     ptr.* = JsonAggregateOperator.init(allocator, spec.name, function, field_expr, window) catch return CreateError.OutOfMemory;
 
@@ -290,7 +288,6 @@ fn createJsonMap(allocator: Allocator, spec: *const OperatorSpec) CreateError!Cr
     };
 
     const ptr = allocator.create(JsonMapOperator) catch return CreateError.OutOfMemory;
-
     errdefer allocator.destroy(ptr);
     ptr.* = JsonMapOperator.init(allocator, spec.name, config) catch return CreateError.OutOfMemory;
 
@@ -309,7 +306,6 @@ fn createJsonFlatMap(allocator: Allocator, spec: *const OperatorSpec) CreateErro
     const element_key = spec.getConfig("element_key");
 
     const ptr = allocator.create(JsonFlatMapOperator) catch return CreateError.OutOfMemory;
-
     errdefer allocator.destroy(ptr);
     ptr.* = JsonFlatMapOperator.init(allocator, spec.name, array_field, element_key) catch return CreateError.OutOfMemory;
 
@@ -334,7 +330,6 @@ fn createKvLookup(allocator: Allocator, spec: *const OperatorSpec) CreateError!C
     const enrich_field = spec.getConfig("enrich_field") orelse "_kv";
 
     const ptr = allocator.create(KvLookupOperator) catch return CreateError.OutOfMemory;
-
     errdefer allocator.destroy(ptr);
     ptr.* = KvLookupOperator.init(allocator, spec.name, lookup_key, namespace, mode, enrich_field) catch return CreateError.OutOfMemory;
 
