@@ -43,6 +43,7 @@ const TSHandler = @import("../ts/handler.zig").TSHandler;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
+const data_format = @import("data_format.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
@@ -490,7 +491,9 @@ pub const Runtime = struct {
             data_dir,
         });
 
-        // 0. Topology safety — validate shard/partition count against SYSTEM manifest
+        // 0. The data directory's format, then its topology: a newer format
+        // is refused before anything in it is read.
+        try data_format.check(self.allocator, data_dir);
         try manifest.ensureTopology(
             self.allocator,
             data_dir,
