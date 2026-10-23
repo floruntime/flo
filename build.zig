@@ -7,14 +7,6 @@ comptime {
         @compileError(std.fmt.comptimePrint("flo needs Zig 0.17.x, found {d}.{d}.{d}", .{ v.major, v.minor, v.patch }));
 }
 
-/// A single-threaded `std.Io` instance used at build configure time for
-/// `std.process.run`, `std.Io.Dir`, etc. Constructed once per build.zig run.
-var build_threaded_io: std.Io.Threaded = .init_single_threaded;
-
-fn buildIo() std.Io {
-    return build_threaded_io.io();
-}
-
 pub fn build(b: *std.Build) void {
     // Configure does I/O the build system can't see (git describe, the test
     // root and dashboard asset walks), so a cached configuration would miss
@@ -206,27 +198,10 @@ pub fn build(b: *std.Build) void {
 
     // ── Test Steps ──
 
-    const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_unit_tests.step);
-    test_step.dependOn(&run_stdx_tests.step);
-    failIfNoTestMatched(b, test_step, "test", test_filters, &.{ unit_root, stdx_root });
-    failIfMissing(b, test_step, "test", &.{ unit_root, stdx_root });
-
-    const unit_test_step = b.step("test-unit", "Run unit tests only");
-    unit_test_step.dependOn(&run_unit_tests.step);
-    unit_test_step.dependOn(&run_stdx_tests.step);
-    failIfNoTestMatched(b, unit_test_step, "test-unit", test_filters, &.{ unit_root, stdx_root });
-    failIfMissing(b, unit_test_step, "test-unit", &.{ unit_root, stdx_root });
-
-    const e2e_test_step = b.step("test-e2e", "Run end-to-end tests");
-    e2e_test_step.dependOn(&run_e2e_tests.step);
-    failIfNoTestMatched(b, e2e_test_step, "test-e2e", test_filters, &.{e2e_root});
-    failIfMissing(b, e2e_test_step, "test-e2e", &.{e2e_root});
-
-    const integration_test_step = b.step("test-integration", "Run integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
-    failIfNoTestMatched(b, integration_test_step, "test-integration", test_filters, &.{integration_root});
-    failIfMissing(b, integration_test_step, "test-integration", &.{integration_root});
+    addTestStep(b, "test", "Run all tests", &.{ &run_unit_tests.step, &run_stdx_tests.step }, &.{ unit_root, stdx_root }, test_filters);
+    addTestStep(b, "test-unit", "Run unit tests only", &.{ &run_unit_tests.step, &run_stdx_tests.step }, &.{ unit_root, stdx_root }, test_filters);
+    addTestStep(b, "test-e2e", "Run end-to-end tests", &.{&run_e2e_tests.step}, &.{e2e_root}, test_filters);
+    addTestStep(b, "test-integration", "Run integration tests", &.{&run_integration_tests.step}, &.{integration_root}, test_filters);
 
     // ── VOPR simulator ──
 
@@ -315,10 +290,16 @@ const TestRoot = struct {
 };
 
 /// A checkout without a test directory (a source tarball, an image build)
-/// still builds the binary; a step that would run those tests fails instead.
-fn failIfMissing(b: *std.Build, step: *std.Build.Step, name: []const u8, roots: []const TestRoot) void {
-    for (roots) |root| if (root.missing) |dir|
+/// still builds the binary; a step that would run those tests fails instead,
+/// without building anything first.
+fn addTestStep(b: *std.Build, name: []const u8, description: []const u8, runs: []const *std.Build.Step, roots: []const TestRoot, filters: []const []const u8) void {
+    const step = b.step(name, description);
+    for (roots) |root| if (root.missing) |dir| {
         step.dependOn(&b.addFail(b.fmt("{s} needs {s}, which this checkout doesn't have", .{ name, dir })).step);
+        return;
+    };
+    for (runs) |run| step.dependOn(run);
+    failIfNoTestMatched(b, step, name, filters, roots);
 }
 
 /// A filtered test step whose roots hold no test matching any filter would
@@ -326,7 +307,7 @@ fn failIfMissing(b: *std.Build, step: *std.Build.Step, name: []const u8, roots: 
 /// filters.
 fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, filters: []const []const u8, roots: []const TestRoot) void {
     if (filters.len == 0) return;
-    for (roots) |root| if (root.matched > 0 or root.missing != null) return;
+    for (roots) |root| if (root.matched > 0) return;
     var msg: std.Io.Writer.Allocating = .init(b.allocator);
     msg.writer.print("no test in {s} matched", .{name}) catch @panic("out of memory");
     for (filters) |f| msg.writer.print(" -Dtest-filter={s}", .{f}) catch @panic("out of memory");
@@ -344,16 +325,12 @@ fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, f
 /// Called at configure time, like the dashboard assets; the file is
 /// gitignored. A missing `dir` gives an empty root marked `missing`.
 fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filters: []const []const u8) TestRoot {
-    const io = buildIo();
+    const io = b.graph.io;
     const out_name = "all_tests.zig";
     var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
-            const options = b.addOptions();
-            options.addOption(usize, "declared", 0);
-            options.addOption([]const []const u8, "filters", filters);
-            options.addOption(usize, "matched", 0);
             const stub = b.addWriteFiles().add(out_name, "test {}\n");
-            return .{ .source = stub, .options = options, .matched = 0, .missing = dir };
+            return .{ .source = stub, .options = b.addOptions(), .matched = 0, .missing = dir };
         },
         else => std.debug.panic("cannot open {s} to find its tests: {t}", .{ dir, err }),
     };
@@ -559,9 +536,10 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
 
     var entries: std.ArrayListUnmanaged([]const u8) = .empty;
     var asset_idx: usize = 0;
+    var precompressed: usize = 0;
 
     const dist_path = "src/node/dashboard/dist";
-    const io = buildIo();
+    const io = b.graph.io;
     var dist_dir = b.root.root_dir.handle.openDir(io, dist_path, .{ .iterate = true }) catch |err| {
         std.debug.print("Warning: Cannot open {s}: {}. Run 'zake build.dashboard' first.\n", .{ dist_path, err });
         // Return a minimal stub so compilation succeeds without assets.
@@ -593,13 +571,15 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         var is_precompressed: u8 = 0;
         if (compressible) {
             // Gzip the file at configure time and embed the compressed version.
-            // Fall back to raw embed if gzip is not available.
+            // Fall back to raw embed if gzip fails; release.yml refuses a
+            // binary whose assets aren't compressed.
             const gz_path = b.fmt("{s}.gz", .{file_path});
-            if (gzipFile(b.allocator, dist_dir, file_path, gz_path)) {
+            if (gzipFile(b, dist_dir, file_path, gz_path)) {
                 writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
                     var_name, gz_path,
                 }) catch unreachable;
                 is_precompressed = 1;
+                precompressed += 1;
             } else {
                 writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
                     var_name, file_path,
@@ -682,14 +662,14 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     }
 
     writeAssetsFile(b, aw.written());
-    std.debug.print("Dashboard: Embedded {d} assets from {s}\n", .{ asset_idx, dist_path });
+    std.debug.print("Dashboard: Embedded {d} assets from {s}, {d} precompressed\n", .{ asset_idx, dist_path, precompressed });
 
     return b.createModule(.{ .root_source_file = b.path("src/node/dashboard/assets.zig") });
 }
 
 fn writeAssetsFile(b: *std.Build, content: []const u8) void {
     const assets_path = "src/node/dashboard/assets.zig";
-    const io = buildIo();
+    const io = b.graph.io;
     var file = b.root.root_dir.handle.createFile(io, assets_path, .{}) catch unreachable;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
@@ -721,38 +701,50 @@ fn isCompressible(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".json");
 }
 
-fn gzipFile(_: std.mem.Allocator, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) bool {
-    const io = buildIo();
+fn gzipFile(b: *std.Build, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) bool {
+    const io = b.graph.io;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = dir.realPath(io, &path_buf) catch return false;
+    const dir_path_len = dir.realPath(io, &path_buf) catch |err| {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: {t}\n", .{ src_path, err });
+        return false;
+    };
     const dir_path = path_buf[0..dir_path_len];
+    const src = b.fmt("{s}/{s}", .{ dir_path, src_path });
+    const dest = b.fmt("{s}/{s}", .{ dir_path, dest_path });
 
-    const abs_src = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, src_path }) catch return false;
-    defer std.heap.page_allocator.free(abs_src);
-
-    const abs_dest = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ dir_path, dest_path }) catch return false;
-    defer std.heap.page_allocator.free(abs_dest);
-
-    const cmd = std.fmt.allocPrint(std.heap.page_allocator, "gzip -9 -c \"{s}\" > \"{s}\"", .{ abs_src, abs_dest }) catch return false;
-    defer std.heap.page_allocator.free(cmd);
-
-    _ = std.process.run(std.heap.page_allocator, buildIo(), .{
-        .argv = &.{ "sh", "-c", cmd },
-    }) catch return false;
+    const result = std.process.run(b.allocator, io, .{
+        // -n leaves the name and mtime out of the header, so a commit
+        // always gives the same binary. The paths go in as arguments, never
+        // into the command text.
+        .argv = &.{ "sh", "-c", "gzip -9 -n -c \"$1\" > \"$2\" || { rm -f \"$2\"; exit 1; }", "sh", src, dest },
+    }) catch |err| {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {t}\n", .{ src_path, err });
+        return false;
+    };
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {s}\n", .{ src_path, std.mem.trim(u8, result.stderr, &std.ascii.whitespace) });
+        return false;
+    }
     return true;
 }
 
+/// `-Dversion`, or else `git describe` without the leading `v`. A build
+/// where git can't say (no git, not a checkout) warns and is "dev";
+/// release.yml checks that a release binary reports its tag.
 fn getGitVersion(b: *std.Build) []const u8 {
     const version_override = b.option([]const u8, "version", "Override version string");
     if (version_override) |v| return v;
 
-    const result = std.process.run(b.allocator, buildIo(), .{
+    const result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ "git", "describe", "--tags", "--always", "--dirty" },
-    }) catch return "dev";
-
+    }) catch |err| {
+        std.debug.print("Warning: version is \"dev\": can't run git describe: {t}\n", .{err});
+        return "dev";
+    };
     const out = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-    if (out.len == 0) return "dev";
-
-    // Strip leading 'v' prefix (e.g. "v0.1.0-dev.3" → "0.1.0-dev.3")
+    if (result.term != .exited or result.term.exited != 0 or out.len == 0) {
+        std.debug.print("Warning: version is \"dev\": git describe: {s}\n", .{std.mem.trim(u8, result.stderr, &std.ascii.whitespace)});
+        return "dev";
+    }
     return if (out[0] == 'v') out[1..] else out;
 }

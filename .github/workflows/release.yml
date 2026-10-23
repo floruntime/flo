@@ -80,7 +80,24 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ steps.version.outputs.VERSION }}
-        run: zig build --release=safe -Dtarget="$TARGET" -Dversion="$VERSION"
+        run: |
+          set -o pipefail
+          zig build --release=safe -Dtarget="$TARGET" -Dversion="$VERSION" 2>&1 | tee build.log
+          # The build falls back to uncompressed dashboard assets with only a
+          # warning; a release must not.
+          if grep -q '^Warning: dashboard asset' build.log ||
+            ! grep -Eq '^Dashboard: Embedded [0-9]+ assets from .*, [1-9][0-9]* precompressed$' build.log; then
+            echo "::error::dashboard assets weren't all precompressed"; exit 1
+          fi
+
+      - name: Check the binary's version
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          GOT=$(zig-out/bin/flo -V)
+          if [ "$GOT" != "flo $VERSION" ]; then
+            echo "::error::flo -V printed '$GOT', expected 'flo $VERSION'"; exit 1
+          fi
 
       - name: Package
         env:
