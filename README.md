@@ -60,7 +60,8 @@ curl -fsSL https://raw.githubusercontent.com/floruntime/flo/dev/scripts/install.
 Or download a tarball for your platform from
 [Releases](https://github.com/floruntime/flo/releases); each has a `.sha256` beside it.
 
-The macOS binaries need macOS 15 or later.
+The macOS binaries need macOS 15 or later. The release binaries need an x86-64-v2
+CPU (any x86-64 since about 2009) or ARMv8 with the CRC extension.
 
 ### Start the Server
 

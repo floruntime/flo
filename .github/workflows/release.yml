@@ -25,22 +25,28 @@ jobs:
     strategy:
       matrix:
         include:
+          # The CPU floor: hardware CRC32C. aarch64-macos's baseline (Apple
+          # M1) already has it.
           - os: ubuntu-latest
             arch: x86_64
             platform: linux
             target: x86_64-linux
+            cpu: x86_64_v2
           - os: ubuntu-24.04-arm
             arch: aarch64
             platform: linux
             target: aarch64-linux
+            cpu: generic+crc
           - os: macos-15
             arch: x86_64
             platform: macos
             target: x86_64-macos
+            cpu: x86_64_v2
           - os: macos-15
             arch: aarch64
             platform: macos
             target: aarch64-macos
+            cpu: baseline
 
     runs-on: ${{ matrix.os }}
 
@@ -79,10 +85,11 @@ jobs:
       - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}
+          CPU: ${{ matrix.cpu }}
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           set -o pipefail
-          zig build --release=safe -Dtarget="$TARGET" -Dversion="$VERSION" 2>&1 | tee build.log
+          zig build --release=safe -Dtarget="$TARGET" -Dcpu="$CPU" -Drequire-hw-crc -Dversion="$VERSION" 2>&1 | tee build.log
           # The build falls back to uncompressed dashboard assets with only a
           # warning; a release must not.
           if grep -q '^Warning: dashboard asset' build.log ||
