@@ -88,13 +88,11 @@ export interface KVKeyValue {
   /** MVCC version. */
   version?: number
   size?: number
-  updated_at?: number
   /** Absolute expiry, epoch ms, or null for no expiry. */
   expires_at_ms?: number | null
 }
 export interface KVHistoryEntry {
   version: number
-  term: number
   timestamp_ms: number
   size: number
   tombstone: boolean

@@ -310,6 +310,8 @@ fn routeKV(allocator: Allocator, method: Method, rest: []const u8, query_string:
         // Percent-decode the key (frontend sends encodeURIComponent)
         var decode_buf: [4096]u8 = undefined;
         const key_rest = helpers.percentDecode(&decode_buf, key_rest_raw) orelse return error.NotFound;
+        // A NUL would spell another namespace's key, so it names none.
+        if (std.mem.indexOfScalar(u8, key_rest, 0) != null) return error.NotFound;
         // Check for /history suffix
         if (std.mem.endsWith(u8, key_rest, "/history")) {
             try only(method, &.{.GET});
@@ -322,7 +324,7 @@ fn routeKV(allocator: Allocator, method: Method, rest: []const u8, query_string:
         if (method == .DELETE) return kv.deleteKVKey(allocator, ns, key_rest, ctx);
 
         // GET key value
-        return kv.getKVKeyValue(allocator, ns, key_rest, query_string, ctx);
+        return kv.getKVKeyValue(allocator, ns, key_rest, ctx);
     }
 
     return helpers.jsonError(allocator, "Not found");

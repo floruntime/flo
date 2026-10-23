@@ -12,25 +12,10 @@ const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
-const Shard = @import("../../shard.zig").Shard;
-const kv_mod = @import("../../../projection/kv.zig");
-const KVProjection = kv_mod.KVProjection;
-const ns_keys = @import("../../../namespace/handler.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
 const schema = @import("../../../protocol/schema.zig");
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-fn getKVProjection(ctx: *DashboardContext, idx: usize) ?*KVProjection {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    const shard: *Shard = @ptrCast(@alignCast(ptrs[idx]));
-    return &shard.defaultPartition().kv;
-}
-
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
+const kv_ops = @import("../../../protocol/kv_ops.zig");
+const reply_pool = @import("../../reply_pool.zig");
 
 /// GET /kv/namespaces - List all KV namespaces with stats
 pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
@@ -85,17 +70,37 @@ pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /kv/namespaces/:ns/keys - Scan/list keys in a namespace
-/// Query params: ?prefix=&limit=&cursor=
+/// The most keys a listing page holds: one mget answers their sizes.
+const MAX_PAGE: u32 = kv_ops.MAX_MGET;
+
+/// GET /kv/namespaces/:ns/keys - List keys in a namespace, a page at a time
+/// Query params: ?prefix=&limit=&cursor= (the hex cursor the last page gave)
+/// Read as a client over loopback (`kv.scan`, then `kv.mget` for sizes and
+/// versions): the projections are their shards' alone to read.
 pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const prefix = h.parseQueryParam([]const u8, query_string, "prefix") orelse "";
-    const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
-    const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
+    const limit: u32 = @min(h.parseQueryParam(u32, query_string, "limit") orelse 100, MAX_PAGE);
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    const cursor: []const u8 = if (h.parseQueryParam([]const u8, query_string, "cursor")) |hex|
+        std.fmt.hexToBytes(&cursor_buf, hex) catch return try h.jsonError(allocator, "cursor must be the hex cursor a page gave")
+    else
+        "";
+
+    var client = loopbackRead(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+
+    var scanned = client.call(kv_ops.op("kv.scan"), namespace, prefix, .{ .limit = @max(limit, 1), .cursor = cursor }) catch
+        return try h.jsonError(allocator, "KV scan failed");
+    defer scanned.deinit();
+    if (scanned.isError()) return try h.jsonError(allocator, scanned.errorMessage());
+    var diag: schema.Diagnostic = .{};
+    const page = kv_ops.op("kv.scan").response.decodeAll(scanned.data, &diag) catch
+        return try h.jsonError(allocator, "KV scan: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var outer = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try outer.begin();
 
@@ -103,157 +108,152 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
     {
         var keys_arr = try outer.arrayField("keys");
         try keys_arr.begin();
-
-        // Build namespace prefix for filtering (same logic as KV handler)
-        var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_prefix = try ns_keys.namespacePrefix(&ns_prefix_buf, namespace);
-
-        // Scan keys from shard projections
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getKVProjection(ctx, i)) |kv| {
-                var it = kv.map.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.tombstone) continue;
-                    const key = entry.key_ptr.*;
-
-                    // Filter by namespace and strip prefix
-                    const display_key = blk: {
-                        if (ns_prefix.len == 0) {
-                            // Default namespace — only bare keys (no NUL separator)
-                            if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
-                            break :blk key;
-                        } else {
-                            if (!std.mem.startsWith(u8, key, ns_prefix)) continue;
-                            break :blk key[ns_prefix.len..];
-                        }
-                    };
-
-                    if (prefix.len > 0 and !std.mem.startsWith(u8, display_key, prefix)) continue;
-                    if (total >= limit) break;
-                    try keys_arr.next();
-                    var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try kobj.begin();
-                    try kobj.stringField("key", display_key);
-                    try kobj.intField("size", @as(i64, @intCast(entry.value_ptr.value.len)));
-                    try kobj.intField("version", entry.value_ptr.lsn);
-                    try kobj.end();
-                    total += 1;
-                }
+        // The page's names, then their sizes and versions in as many mgets
+        // as the answers need. A key deleted in between is left out.
+        const Keys = kv_ops.op("kv.mget").request.field_list[0].T;
+        const keys_buf = try allocator.alloc(u8, Keys.max_size);
+        defer allocator.free(keys_buf);
+        var names: [MAX_PAGE][]const u8 = undefined;
+        var n: usize = 0;
+        var it = page.names.iterator();
+        while (it.next() catch return try h.jsonError(allocator, "KV scan: malformed answer")) |name| : (n += 1) names[n] = name;
+        var from: usize = 0;
+        while (from < n) {
+            var list = Keys.Builder.init(keys_buf);
+            for (names[from..n]) |name| if (!(try list.add(name))) break;
+            var got = client.call(kv_ops.op("kv.mget"), namespace, "", .{ .keys = list.value(), .routing_key = null }) catch
+                return try h.jsonError(allocator, "KV mget failed");
+            defer got.deinit();
+            if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+            const answer = kv_ops.op("kv.mget").response.decodeAll(got.data, &diag) catch
+                return try h.jsonError(allocator, "KV mget: malformed answer");
+            var entries = answer.entries.iterator();
+            var i = from;
+            while (entries.next() catch return try h.jsonError(allocator, "KV mget: malformed answer")) |e| : (i += 1) {
+                if (i >= n) return try h.jsonError(allocator, "KV mget: malformed answer");
+                if (!e.found) continue;
+                try keys_arr.next();
+                var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try kobj.begin();
+                try kobj.stringField("key", names[i]);
+                try kobj.intField("size", @as(i64, @intCast(e.value.len)));
+                try kobj.intField("version", e.version);
+                try kobj.end();
+                total += 1;
             }
+            const answered = answer.next orelse list.count;
+            if (answered == 0) return try h.jsonError(allocator, "KV mget: no progress");
+            from += answered;
         }
-
         try keys_arr.end();
     }
 
-    try outer.boolField("has_more", false);
-    try outer.nullField("cursor");
+    try outer.boolField("has_more", page.cursor != null);
+    if (page.cursor) |next| {
+        // Hex, as the CLI prints it; at most MAX_CURSOR bytes by the schema.
+        var hex: [2 * kv_ops.MAX_CURSOR]u8 = undefined;
+        const digits = "0123456789abcdef";
+        for (next, 0..) |b, i| {
+            hex[2 * i] = digits[b >> 4];
+            hex[2 * i + 1] = digits[b & 0xf];
+        }
+        try outer.stringField("cursor", hex[0 .. 2 * next.len]);
+    } else try outer.nullField("cursor");
     try outer.intField("count", total);
     try outer.stringField("namespace", namespace);
     try outer.end();
-
     return try json_aw.toOwnedSlice();
 }
 
 /// GET /kv/namespaces/:ns/keys/:key - Get a specific key's value
-/// Query params: ?version=N (optional, for time-travel)
-pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam(u64, query_string, "version");
+pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u8, ctx: *DashboardContext) ![]const u8 {
+    var client = loopbackRead(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var got = client.call(kv_ops.op("kv.get"), namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch
+        return try h.jsonError(allocator, "KV get failed");
+    defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
-
-    // Namespace-qualify the key for projection lookup
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch return error.NotFound;
-
-    // Search across shard projections for the key
-    var found = false;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getKVProjection(ctx, i)) |kv| {
-            if (kv.get(qkey)) |entry| {
-                found = true;
-                try obj.boolField("found", true);
-                try obj.stringField("value", entry.value);
-                try obj.intField("version", entry.version);
-                try obj.intField("size", @as(i64, @intCast(entry.value.len)));
-                const ts_ms = @as(i64, @intCast(entry.timestamp_ns / std.time.ns_per_ms));
-                try obj.intField("updated_at", ts_ms);
-                if (entry.expiry_ns > 0) {
-                    try obj.intField("expires_at_ms", @as(i64, @intCast(entry.expiry_ns / std.time.ns_per_ms)));
-                } else {
-                    try obj.nullField("expires_at_ms");
-                }
-                break;
-            }
-        }
-    }
-
-    if (!found) {
+    if (got.isNotFound()) {
         try obj.boolField("found", false);
+    } else {
+        if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+        var diag: schema.Diagnostic = .{};
+        const answer = kv_ops.op("kv.get").response.decodeAll(got.data, &diag) catch
+            return try h.jsonError(allocator, "KV get: malformed answer");
+        try obj.boolField("found", true);
+        try obj.stringField("value", answer.value);
+        try obj.intField("version", answer.version);
+        try obj.intField("size", @as(i64, @intCast(answer.value.len)));
+        if (answer.expires_at_ms) |at| try obj.intField("expires_at_ms", at) else try obj.nullField("expires_at_ms");
     }
-
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /kv/namespaces/:ns/keys/:key/history - Version history
-/// Query params: ?limit=N (default: 10)
-/// Returns current version plus previous versions from MVCC chain.
+/// GET /kv/namespaces/:ns/keys/:key/history - Version history, newest first
+/// Query params: ?limit=N (default 10, at most kv_ops.MAX_HISTORY)
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam(u32, query_string, "limit");
+    const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 10, 1, kv_ops.MAX_HISTORY);
+
+    var client = loopbackRead(allocator, ctx) catch
+        return try h.jsonError(allocator, "Loopback connect failed");
+    defer client.deinit();
+    var got = client.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .routing_key = null }) catch
+        return try h.jsonError(allocator, "KV history failed");
+    defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("key", key);
     try obj.stringField("namespace", namespace);
 
+    var version_count: i64 = 0;
     var arr = try obj.arrayField("versions");
     try arr.begin();
-
-    var version_count: i64 = 0;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getKVProjection(ctx, i)) |kv| {
-            // Namespace-qualify the key for projection lookup
-            var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-            const qkey = ns_keys.qualifyKey(&qbuf, namespace, key) catch return error.NotFound;
-            var hist_buf: [kv_mod.DEFAULT_VERSION_CHAIN_LEN + 1]kv_mod.VersionEntry = undefined;
-            const hist_n = kv.getHistory(qkey, &hist_buf);
-            if (hist_n > 0) {
-                for (hist_buf[0..hist_n]) |ver| {
-                    try arr.next();
-                    var vobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try vobj.begin();
-                    try vobj.intField("version", ver.version);
-                    try vobj.intField("term", ver.term);
-                    const ts_ms = @as(i64, @intCast(ver.timestamp_ns / std.time.ns_per_ms));
-                    try vobj.intField("timestamp_ms", ts_ms);
-                    try vobj.intField("size", @as(i64, @intCast(ver.value.len)));
-                    try vobj.boolField("tombstone", ver.tombstone);
-                    try vobj.end();
-                }
-                version_count = @intCast(hist_n);
-                break;
-            }
+    if (!got.isNotFound()) {
+        if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+        var diag: schema.Diagnostic = .{};
+        const answer = kv_ops.op("kv.history").response.decodeAll(got.data, &diag) catch
+            return try h.jsonError(allocator, "KV history: malformed answer");
+        var it = answer.versions.iterator();
+        while (it.next() catch return try h.jsonError(allocator, "KV history: malformed answer")) |ver| {
+            try arr.next();
+            var vobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try vobj.begin();
+            try vobj.intField("version", ver.version);
+            try vobj.intField("timestamp_ms", ver.at_ms);
+            try vobj.intField("size", @as(i64, @intCast(ver.value.len)));
+            try vobj.boolField("tombstone", ver.deleted);
+            try vobj.end();
+            version_count += 1;
         }
     }
-
     try arr.end();
     try obj.intField("version_count", version_count);
     try obj.end();
     return try json_aw.toOwnedSlice();
+}
+
+/// The longest a dashboard read waits for its answer over loopback: the
+/// node's own read deadline, and a second to spare.
+const LOOPBACK_READ_TIMEOUT_SEC: u32 = @intCast(reply_pool.DEADLINE_MS / std.time.ms_per_s + 1);
+
+/// A loopback client for a read, with its read timeout.
+pub fn loopbackRead(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
+    var client = try loopbackConnect(allocator, ctx);
+    client.setReadTimeoutSec(LOOPBACK_READ_TIMEOUT_SEC);
+    return client;
 }
 
 /// Connect a short-lived loopback client to the node's own protocol port.
@@ -372,29 +372,29 @@ test "getKVNamespaces returns default namespace" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"key_count\":0") != null);
 }
 
-test "getKVKeys returns empty keys structure" {
+test "getKVKeys refuses a cursor that isn't hex before connecting" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here → connect refused
 
-    const result = try getKVKeys(allocator, "default", null, &ctx);
+    const result = try getKVKeys(allocator, "default", "cursor=zz", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"keys\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"has_more\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cursor must be the hex cursor a page gave") != null);
 }
 
-test "getKVKeyValue returns not found" {
+test "getKVKeyValue surfaces loopback connect failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
 
-    const result = try getKVKeyValue(allocator, "default", "mykey", null, &ctx);
+    ctx.listen_port = 1; // nothing listens here → connect refused
+
+    const result = try getKVKeyValue(allocator, "default", "mykey", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"found\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\":\"mykey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
 }
 
 test "putKVKey rejects empty body" {
