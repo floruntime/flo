@@ -220,7 +220,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
         "kv table: a request in a transaction goes to the leader, and to the shard its id names",
     } },
     .{ .op = "kv.set", .field = "value", .tests = &.{"kv table: a set answers its version, and a get answers the value and that version"} },
-    .{ .op = "kv.set", .field = "ttl_ms", .tests = &.{"kv table: ttl_ms is written with the value, and none means no expiry"} },
+    .{ .op = "kv.set", .field = "ttl_ms", .tests = &.{"kv table: ttl_ms is written with the value, get answers when it runs out, and none means no expiry"} },
     .{ .op = "kv.set", .field = "condition", .tests = &.{"kv table: condition if_absent and if_present refuse, unrun, when they don't hold"} },
     .{ .op = "kv.set", .field = "cas_version", .tests = &.{"kv table: cas_version must be the key's version, and 0 means absent"} },
     .{ .op = "kv.set", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },

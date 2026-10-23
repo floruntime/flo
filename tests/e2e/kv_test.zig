@@ -509,6 +509,27 @@ test "e2e/kv: a TTL in milliseconds expires the key; --ttl-ms refuses a unit it 
     try testing.expect(kept.stdoutContains("kept"));
 }
 
+test "e2e/kv: get answers when a key's TTL runs out, in ms since the epoch, and none without one" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const Get = struct { version: u64, value: []const u8, expires_at_ms: ?i64 = null };
+    const before = stdx.time.milliTimestamp();
+    try ctx.exec(&.{ "kv", "set", "ttl_at", "v", "--ttl-ms", "1h" });
+    const after = stdx.time.milliTimestamp();
+    const timed = try ctx.execCapture(&.{ "kv", "get", "ttl_at", "-o", "json" });
+    const t = try std.json.parseFromSlice(Get, testing.allocator, timed, .{});
+    defer t.deinit();
+    const at = t.value.expires_at_ms orelse return error.NoExpiry;
+    try testing.expect(at >= before + 3_600_000 and at <= after + 3_600_000);
+
+    try ctx.exec(&.{ "kv", "set", "no_ttl_at", "v" });
+    const plain = try ctx.execCapture(&.{ "kv", "get", "no_ttl_at", "-o", "json" });
+    const p = try std.json.parseFromSlice(Get, testing.allocator, plain, .{});
+    defer p.deinit();
+    try testing.expectEqual(@as(?i64, null), p.value.expires_at_ms);
+}
+
 test "e2e/kv: set with TTL 0 means no expiration" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -1400,7 +1421,7 @@ test "e2e/kv: history shows multiple versions after overwrites" {
     try ctx.exec(&.{ "kv", "set", "hist_key", "version_two" });
     try ctx.exec(&.{ "kv", "set", "hist_key", "version_three" });
 
-    // Newest first: version, when (ms), value.
+    // Newest first: version, when (ms), deleted, value.
     const output = try ctx.execCapture(&.{ "kv", "history", "hist_key", "-o", "raw" });
     var lines = std.mem.tokenizeScalar(u8, output, '\n');
     for ([_][]const u8{ "3\t", "2\t", "1\t" }, [_][]const u8{ "version_three", "version_two", "version_one" }) |version, value| {
@@ -1470,9 +1491,15 @@ test "e2e/kv: history after delete preserves prior versions" {
     var result = try ctx.cli.run(&.{ "kv", "history", "del_hist", "-o", "raw" });
     defer result.deinit();
     try testing.expectEqual(@as(u8, 0), result.exit_code);
-    const output = result.stdout;
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "\n"));
-    try testing.expect(std.mem.indexOf(u8, output, "alive_value") != null);
+    // Newest first: version, when (ms), deleted, value.
+    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    const deleted = lines.next() orelse return error.TooFewVersions;
+    try testing.expect(std.mem.startsWith(u8, deleted, "2\t"));
+    try testing.expect(std.mem.endsWith(u8, deleted, "\ttrue\t"));
+    const alive = lines.next() orelse return error.TooFewVersions;
+    try testing.expect(std.mem.startsWith(u8, alive, "1\t"));
+    try testing.expect(std.mem.endsWith(u8, alive, "\tfalse\talive_value"));
+    try testing.expect(lines.next() == null);
 }
 
 // =============================================================================

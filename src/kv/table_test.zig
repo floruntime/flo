@@ -279,7 +279,7 @@ test "kv table: wait_for change waits for the version after the one there" {
     try h.setWaking("k", setBody("v2", .{}), h.next_id - 1, 2);
 }
 
-test "kv table: ttl_ms is written with the value, and none means no expiry" {
+test "kv table: ttl_ms is written with the value, get answers when it runs out, and none means no expiry" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
@@ -287,8 +287,25 @@ test "kv table: ttl_ms is written with the value, and none means no expiry" {
     try expectSet(try h.set("t", setBody("v", .{ .ttl_ms = 60_000 })), 1);
     const e = h.shard.defaultPartition().kv.get(qualified(&qbuf, "t")).?;
     try testing.expectEqual(e.timestamp_ns + 60_000 * std.time.ns_per_ms, e.expiry_ns);
+    try testing.expectEqual(@as(?i64, @intCast(e.expiry_ns / std.time.ns_per_ms)), (try h.ok("kv.get", "t", getBody(.{}))).expires_at_ms);
     try expectSet(try h.set("n", setBody("v", .{})), 1);
     try testing.expectEqual(@as(u64, 0), h.shard.defaultPartition().kv.get(qualified(&qbuf, "n")).?.expiry_ns);
+    try testing.expectEqual(@as(?i64, null), (try h.ok("kv.get", "n", getBody(.{}))).expires_at_ms);
+}
+
+test "kv table: a waiting get answers the key's expiry too" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    try testing.expect((try h.get("t", getBody(.{ .wait_ms = 5000 }))) == null);
+    var buf: [1024]u8 = undefined;
+    _ = h.send(set_op.code, "t", try set_op.request.encodeInto(&buf, setBody("v", .{ .ttl_ms = 60_000 })));
+    const woken = (try h.answer()).?;
+    var diag: schema.Diagnostic = .{};
+    const got = try get_op.response.decodeAll(woken.data, &diag);
+    const e = h.shard.defaultPartition().kv.get(qualified(&qbuf, "t")).?;
+    try testing.expectEqual(@as(?i64, @intCast(e.expiry_ns / std.time.ns_per_ms)), got.expires_at_ms);
 }
 
 test "kv table: condition if_absent and if_present refuse, unrun, when they don't hold" {
@@ -598,6 +615,22 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
     }
     try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .routing_key = null })).versions.count);
     try h.no("kv.history", "absent", .{ .limit = 10, .routing_key = null }, .not_found, .not_found);
+}
+
+test "kv ops: history marks a delete's version deleted" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    _ = try h.set("k", setBody("v1", .{}));
+    _ = try h.ok("kv.delete", "k", .{ .cas_version = null, .routing_key = null, .txn = null });
+    _ = try h.set("k", setBody("v3", .{}));
+    var it = (try h.ok("kv.history", "k", .{ .limit = 10, .routing_key = null })).versions.iterator();
+    for ([_]struct { version: u64, deleted: bool }{ .{ .version = 3, .deleted = false }, .{ .version = 2, .deleted = true }, .{ .version = 1, .deleted = false } }) |want| {
+        const v = (try it.next()).?;
+        try testing.expectEqual(want.version, v.version);
+        try testing.expectEqual(want.deleted, v.deleted);
+    }
+    try testing.expect((try it.next()) == null);
 }
 
 test "kv ops: mget answers each key in order, found or not, and next when they don't all fit" {

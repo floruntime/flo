@@ -240,7 +240,7 @@ pub const KVHandler = struct {
         std.debug.assert(kv_ops.MAX_WAIT_MS == waiter_pool_mod.MAX_BLOCK_MS);
     }
 
-    const GetResponse = table_run.op("kv.get").response;
+    pub const GetResponse = table_run.op("kv.get").response;
     const SetResponse = table_run.op("kv.set").response;
 
     /// Read a key: at once, or once it exists or changes (`wait_ms`,
@@ -262,15 +262,15 @@ pub const KVHandler = struct {
             if (wait_ms > 0) return error.WaitInTxn;
             if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
                 .delete => return error.NotFound,
-                // Not committed, so no version yet.
-                .put => return .{ .answer = .{ .version = 0, .value = last.value } },
+                // Not committed, so no version or expiry yet.
+                .put => return .{ .answer = .{ .version = 0, .value = last.value, .expires_at_ms = null } },
                 // Their value isn't the key's: read what's committed.
                 .expire, .incr => {},
             };
         }
         const current = kv.get(qkey);
         if (wait_ms > 0) {
-            if (wait_for == .exists) if (current) |e| return .{ .answer = .{ .version = e.version, .value = e.value } };
+            if (wait_for == .exists) if (current) |e| return .{ .answer = getAnswer(e) };
             const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .reply_to = conn.replyTo(),
@@ -291,7 +291,16 @@ pub const KVHandler = struct {
             if (mr.registerKVNamespace(req.namespace)) |km| km.recordGet() else |_| {}
         }
         const e = current orelse return error.NotFound;
-        return .{ .answer = .{ .version = e.version, .value = e.value } };
+        return .{ .answer = getAnswer(e) };
+    }
+
+    /// A committed key as kv.get answers it, here and from a waiting get.
+    pub fn getAnswer(e: *const kv_mod.KVEntry) GetResponse.Value {
+        return .{
+            .version = e.version,
+            .value = e.value,
+            .expires_at_ms = if (e.expiry_ns > 0) @intCast(e.expiry_ns / std.time.ns_per_ms) else null,
+        };
     }
 
     /// Write a key, if its `condition` and `cas_version` hold; inside a
@@ -475,7 +484,7 @@ pub const KVHandler = struct {
         var versions = Versions.Builder.init(&self.answer_buf);
         for (chain[0..@min(n, limit)]) |v| {
             const at_ms: i64 = @intCast(v.timestamp_ns / std.time.ns_per_ms);
-            if (!(versions.add(.{ .version = v.version, .at_ms = at_ms, .value = v.value }) catch return error.Internal)) break;
+            if (!(versions.add(.{ .version = v.version, .at_ms = at_ms, .deleted = v.tombstone, .value = v.value }) catch return error.Internal)) break;
         }
         return .{ .answer = .{ .versions = versions.value() } };
     }

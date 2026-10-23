@@ -80,6 +80,7 @@ pub const Condition = enum(u8) {
 pub const HistoryEntry = Record(&.{
     .{ .name = "version", .T = Version },
     .{ .name = "at_ms", .T = Int(i64) },
+    .{ .name = "deleted", .T = Bool },
     .{ .name = "value", .T = Bytes(MAX_VALUE) },
 });
 
@@ -133,6 +134,7 @@ pub const table = [_]ops.Op{
         .response = Record(&.{
             .{ .name = "version", .T = Version, .doc = "The key's version" },
             .{ .name = "value", .T = Bytes(MAX_VALUE), .doc = "The key's value" },
+            .{ .name = "expires_at_ms", .T = Optional(Int(i64)), .doc = "When the key's TTL runs out, in milliseconds since the epoch; absent with no TTL" },
         }),
         .cli = .{
             .render = .raw,
