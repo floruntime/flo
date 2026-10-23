@@ -119,7 +119,7 @@ fn tableMismatch(ctx: *Context) Error {
     if (server.version == proto.VERSION) {
         ctx.printErr("Error: server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client\n", .{ server.table_hash, proto.TABLE_HASH });
     } else {
-        ctx.printErr("Error: server protocol {d}, client protocol {d}: upgrade the client\n", .{ server.version, proto.VERSION });
+        ctx.printErr("Error: server protocol {d}, client protocol {d}: upgrade the {s}\n", .{ server.version, proto.VERSION, if (server.version < proto.VERSION) "server" else "client" });
     }
     return error.Transport;
 }
