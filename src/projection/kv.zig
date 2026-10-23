@@ -115,6 +115,22 @@ pub const KVProjection = struct {
     stats: Stats,
     /// What "now" is when a read judges expiry.
     read_clock: ReadClock = .{},
+    /// Live (non-tombstone) keys per namespace, changed only where apply
+    /// makes a key live or a tombstone, so every replica and every restart
+    /// counts the same. A key past its TTL counts until it is deleted or
+    /// overwritten: nothing removes it before then.
+    live_keys: std.StringHashMapUnmanaged(LiveKeys) = .empty,
+    /// Some namespace's count changed since the shard last published.
+    live_keys_changed: bool = false,
+
+    pub const LiveKeys = struct {
+        count: u64 = 0,
+        /// What the shard last published for this namespace.
+        published: u64 = 0,
+        /// Where the shard publishes it, once it has looked it up; the
+        /// projection never reads it.
+        publish_to: ?*anyopaque = null,
+    };
 
     /// The shard points this at its Raft node, so a read judges expiry by
     /// the same time line the entry stamps follow: a key a replica has
@@ -176,6 +192,51 @@ pub const KVProjection = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.version_chains.deinit();
+
+        var ns_it = self.live_keys.keyIterator();
+        while (ns_it.next()) |ns| self.allocator.free(ns.*);
+        self.live_keys.deinit(self.allocator);
+    }
+
+    /// The namespace a stored key belongs to: what precedes its separator,
+    /// or "default" when it has none. Read off the key, so "" and
+    /// "default" can't count apart.
+    pub fn namespaceOf(key: []const u8) []const u8 {
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return "default";
+        return key[0..sep];
+    }
+
+    /// `key`'s namespace count, made if it is the first. Taken before the
+    /// key changes, so a failed allocation leaves the count and the key
+    /// agreeing.
+    fn liveCounter(self: *KVProjection, key: []const u8) !*LiveKeys {
+        const ns = namespaceOf(key);
+        const gop = try self.live_keys.getOrPut(self.allocator, ns);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, ns) catch |err| {
+                self.live_keys.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    fn noteLive(self: *KVProjection, counter: *LiveKeys) void {
+        counter.count += 1;
+        self.live_keys_changed = true;
+    }
+
+    /// A live key in `key`'s namespace became a tombstone or went.
+    fn noteGone(self: *KVProjection, key: []const u8) void {
+        const counter = self.live_keys.getPtr(namespaceOf(key)) orelse return;
+        counter.count -|= 1;
+        self.live_keys_changed = true;
+    }
+
+    /// Live keys in `namespace` on this projection.
+    pub fn liveKeys(self: *const KVProjection, namespace: []const u8) u64 {
+        return if (self.live_keys.get(namespace)) |c| c.count else 0;
     }
 
     /// Number of live (non-tombstone) entries.
@@ -206,8 +267,10 @@ pub const KVProjection = struct {
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
+        const counter = try self.liveCounter(key);
 
         if (self.map.getPtr(key)) |existing| {
+            if (existing.tombstone) self.noteLive(counter);
             // Save current version to history before overwriting
             self.pushVersionChain(existing) catch {};
 
@@ -236,6 +299,7 @@ pub const KVProjection = struct {
                 .tombstone = false,
                 .value_type = value_type,
             });
+            self.noteLive(counter);
             self.memory_used += owned_key.len + owned_value.len;
         }
         self.stats.puts += 1;
@@ -266,6 +330,7 @@ pub const KVProjection = struct {
             self.pushVersionChain(existing) catch {};
 
             // Old value was moved to version chain (or freed if chain full)
+            if (!existing.tombstone) self.noteGone(key);
             existing.value = "";
             existing.lsn = lsn;
             existing.version += 1;
@@ -430,6 +495,7 @@ pub const KVProjection = struct {
 
             for (to_remove_buf[0..remove_count]) |key| {
                 if (self.map.fetchRemove(key)) |removed| {
+                    if (!removed.value.tombstone) self.noteGone(removed.value.key);
                     self.memory_used -|= removed.value.key.len + removed.value.value.len;
                     self.allocator.free(@constCast(removed.value.key));
                     if (removed.value.value.len > 0) {
@@ -465,6 +531,12 @@ pub const KVProjection = struct {
 
         // Update memory accounting: value moved from current to chain
         // (no net change yet — will be freed if evicted below)
+        // A chain that can't take it drops it: the caller overwrites the
+        // value either way.
+        errdefer if (hist_value.len > 0) {
+            self.memory_used -|= hist_value.len;
+            self.allocator.free(@constCast(hist_value));
+        };
 
         const gop = try self.version_chains.getOrPut(existing.key);
         if (!gop.found_existing) {
@@ -1140,4 +1212,84 @@ test "kv: a batch that doesn't decode whole, or breaks a kind's rule, applies no
     try testing.expectError(error.Halt, applyTest(&kv, &entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, w.written())));
     try testing.expect(kv.get("a") == null);
     try testing.expectEqual(@as(u64, 0), kv.applied_index);
+}
+
+/// Live keys counted from scratch, per namespace, to check the kept count by.
+fn recountLive(kv: *const KVProjection, namespace: []const u8) u64 {
+    var n: u64 = 0;
+    var it = kv.map.iterator();
+    while (it.next()) |e| {
+        if (!e.value_ptr.tombstone and std.mem.eql(u8, KVProjection.namespaceOf(e.key_ptr.*), namespace)) n += 1;
+    }
+    return n;
+}
+
+test "kv: live keys are counted per namespace as apply makes and removes them, and a replay counts the same" {
+    const txn = @import("../kv/txn.zig");
+    var kv = KVProjection.init(testing.allocator, 0);
+    defer kv.deinit();
+    const stamp: u64 = 1_000 * std.time.ns_per_s;
+    var bufs: [12][96]u8 = undefined;
+    const batch_ops = [_]txn.TxnOp{
+        .{ .kind = .put, .key = @constCast("orders\x00b1"), .value = @constCast("v"), .ttl_ms = 0 },
+        .{ .kind = .put, .key = @constCast("orders\x00b2"), .value = @constCast("v"), .ttl_ms = 0 },
+        .{ .kind = .delete, .key = @constCast("orders\x00b1"), .value = @constCast(""), .ttl_ms = 0 },
+    };
+    const batch = try txn.encodeBatch(testing.allocator, &batch_ops);
+    defer testing.allocator.free(batch);
+    // Each entry, with the counts after it: "orders", then the default namespace.
+    const Step = struct { entry: Entry, orders: u64, default: u64 };
+    const steps = [_]Step{
+        .{ .entry = putEntry(&bufs[0], "orders\x00a", "1", 1, stamp, 0), .orders = 1, .default = 0 },
+        .{ .entry = putEntry(&bufs[1], "orders\x00a", "2", 2, stamp, 0), .orders = 1, .default = 0 }, // overwrite
+        .{ .entry = putEntry(&bufs[2], "plain", "1", 3, stamp, 0), .orders = 1, .default = 1 },
+        .{ .entry = testEntry(&bufs[3], .kv_delete, .{ .key = "orders\x00missing" }, 4, stamp), .orders = 1, .default = 1 },
+        .{ .entry = testEntry(&bufs[4], .kv_delete, .{ .key = "orders\x00a" }, 5, stamp), .orders = 0, .default = 1 },
+        .{ .entry = testEntry(&bufs[5], .kv_delete, .{ .key = "orders\x00a" }, 6, stamp), .orders = 0, .default = 1 }, // again
+        .{ .entry = putEntry(&bufs[6], "orders\x00a", "3", 7, stamp, 0), .orders = 1, .default = 1 }, // back from a tombstone
+        .{ .entry = testEntry(&bufs[7], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 8, stamp), .orders = 2, .default = 1 },
+        .{ .entry = testEntry(&bufs[8], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 9, stamp), .orders = 2, .default = 1 },
+        .{ .entry = entry_mod.buildEntry(.kv_batch, 0, 1, 10, stamp, batch), .orders = 3, .default = 1 },
+        // A TTL that runs out removes nothing: the key counts until deleted.
+        .{ .entry = putEntry(&bufs[9], "plain", "t", 11, stamp, 1), .orders = 3, .default = 1 },
+        .{ .entry = testEntry(&bufs[10], .kv_expire, .{ .key = "orders\x00a", .ttl_ms = 1 }, 12, stamp + std.time.ns_per_s), .orders = 3, .default = 1 },
+    };
+    for (steps) |step| {
+        try applyTest(&kv, &step.entry);
+        try testing.expectEqual(step.orders, kv.liveKeys("orders"));
+        try testing.expectEqual(step.default, kv.liveKeys("default"));
+        try testing.expectEqual(recountLive(&kv, "orders"), kv.liveKeys("orders"));
+        try testing.expectEqual(recountLive(&kv, "default"), kv.liveKeys("default"));
+    }
+    try testing.expect(kv.live_keys_changed);
+
+    // The same log applied again, as at boot or on a follower, counts the same.
+    var replay = KVProjection.init(testing.allocator, 0);
+    defer replay.deinit();
+    for (steps) |step| try applyTest(&replay, &step.entry);
+    try testing.expectEqual(kv.liveKeys("orders"), replay.liveKeys("orders"));
+    try testing.expectEqual(kv.liveKeys("default"), replay.liveKeys("default"));
+
+    // Clearing a namespace takes its live keys out.
+    _ = kv.clearByPrefix("orders\x00");
+    try testing.expectEqual(@as(u64, 0), kv.liveKeys("orders"));
+    try testing.expectEqual(@as(u64, 1), kv.liveKeys("default"));
+}
+
+test "kv: a put short of memory at any point leaves the count agreeing with the keys" {
+    const run = struct {
+        fn f(allocator: Allocator) !void {
+            var kv = KVProjection.init(allocator, 0);
+            defer kv.deinit();
+            const stamp: u64 = 1_000 * std.time.ns_per_s;
+            defer {
+                std.testing.expectEqual(recountLive(&kv, "ns"), kv.liveKeys("ns")) catch @panic("count disagrees with the keys");
+            }
+            try kv.put("ns\x00a", "1", 1, 1, stamp, 0);
+            try kv.delete("ns\x00a", 2, 1, stamp);
+            try kv.put("ns\x00a", "2", 3, 1, stamp, 0);
+            try kv.put("ns\x00b", "1", 4, 1, stamp, 0);
+        }
+    }.f;
+    try std.testing.checkAllAllocationFailures(testing.allocator, run, .{});
 }

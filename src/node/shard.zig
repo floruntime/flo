@@ -64,6 +64,7 @@ const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const KVProjection = @import("../projection/kv.zig").KVProjection;
+const KVMetrics = @import("../metrics/registry.zig").KVMetrics;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
@@ -3059,9 +3060,34 @@ pub const Shard = struct {
         return .ok;
     }
 
+    /// Publish each namespace's live key count that changed since the last
+    /// time, for /metrics and the dashboard: they read it from another
+    /// thread, never the projection. A namespace whose metrics can't be
+    /// registered is tried again next time.
+    fn publishLiveKeys(self: *Shard) void {
+        const kv = self.kv_handler.kv;
+        if (!kv.live_keys_changed) return;
+        const registry = self.metrics_registry orelse return;
+        var all = true;
+        var it = kv.live_keys.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.count == e.value_ptr.published) continue;
+            // Looked up once: a namespace's metrics never move.
+            const km: *KVMetrics = if (e.value_ptr.publish_to) |p| @ptrCast(@alignCast(p)) else registry.registerKVNamespace(e.key_ptr.*) catch {
+                all = false;
+                continue;
+            };
+            e.value_ptr.publish_to = km;
+            km.publishLiveKeys(self.id, e.value_ptr.count);
+            e.value_ptr.published = e.value_ptr.count;
+        }
+        if (all) kv.live_keys_changed = false;
+    }
+
     /// Publish this shard's state and losses. The runtime calls it once
     /// before the client port opens, so the first answers are already right.
     pub fn publishHealth(self: *Shard) void {
+        self.publishLiveKeys();
         if (self.shard_metrics) |sm| {
             sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
             sm.processing_failed_jobs.store(self.processing_handler.failed_jobs, .monotonic);
@@ -3358,14 +3384,6 @@ pub const Shard = struct {
         return self.namespace_handler.nameForHash(ns_hash);
     }
 
-    /// The namespace a qualified KV key names: the part before the
-    /// separator, or "default" for a bare key. Read off the key, so ""
-    /// and "default" can't meter apart.
-    fn kvNamespace(qkey: []const u8) []const u8 {
-        const sep = std.mem.indexOfScalar(u8, qkey, 0) orelse return "default";
-        return qkey[0..sep];
-    }
-
     /// What follows an entry's apply on the live paths, from the entry and
     /// its result alone: the waiters, triggers and metrics, and the first
     /// step of a run its start created. Not at boot: nothing waits on a
@@ -3389,16 +3407,12 @@ pub const Shard = struct {
                 const key = kv_entries.Key.decode(&r, "key") catch return;
                 self.waiter_pool.notify(.kv_get, key, resolveKVWaiter, @ptrCast(self));
                 if (self.metrics_registry) |mr| {
-                    if (mr.registerKVNamespace(kvNamespace(key))) |km| switch (etype) {
-                        // A per-key version of 1 is the key's first write.
+                    if (mr.registerKVNamespace(KVProjection.namespaceOf(key))) |km| switch (etype) {
                         .kv_put => {
                             const put = kv_entries.Put.decodeAll(entry.payload, &diag) catch return;
-                            km.recordSet(put.value.len, if (self.kv_handler.kv.get(key)) |e| e.version == 1 else false);
+                            km.recordSet(put.value.len);
                         },
-                        .kv_delete => {
-                            km.recordDelete();
-                            km.decrementKeyCount();
-                        },
+                        .kv_delete => km.recordDelete(),
                         else => {},
                     } else |_| {}
                 }
@@ -13219,4 +13233,61 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     var diag: schema.Diagnostic = .{};
     const s = try table_run.op("action.status").response.decodeAll(resp.data, &diag);
     try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, s.status);
+}
+
+test "Shard: a follower and the leader publish the same live key count for the same KV entries, down to 0" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var leader = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer leader.deinit();
+    leader.wireHandlerShardPtrs();
+    try std.testing.expect(leader.applyCommitted());
+
+    var follower_metrics = MetricsRegistry.init(std.testing.allocator);
+    defer follower_metrics.deinit();
+    var leader_metrics = MetricsRegistry.init(std.testing.allocator);
+    defer leader_metrics.deinit();
+    t.shard.setMetricsRegistry(&follower_metrics);
+    leader.setMetricsRegistry(&leader_metrics);
+
+    const txn = @import("../kv/txn.zig");
+    const batch = try txn.encodeBatch(std.testing.allocator, &.{
+        .{ .kind = .put, .key = @constCast("orders\x00c"), .value = @constCast("v"), .ttl_ms = 0 },
+        .{ .kind = .delete, .key = @constCast("orders\x00a"), .value = @constCast(""), .ttl_ms = 0 },
+    });
+    defer std.testing.allocator.free(batch);
+    const Op = union(enum) { put: []const u8, delete: []const u8, batch };
+    // Each run of entries, then the count published after it.
+    const runs = [_]struct { ops: []const Op, keys: u64 }{
+        // Put a, put b, delete a missing key, delete a, put a again.
+        .{ .ops = &.{ .{ .put = "orders\x00a" }, .{ .put = "orders\x00b" }, .{ .delete = "orders\x00missing" }, .{ .delete = "orders\x00a" }, .{ .put = "orders\x00a" } }, .keys = 2 },
+        // A batch: put c, delete a.
+        .{ .ops = &.{.batch}, .keys = 2 },
+        // Every key gone: the published count goes to 0, not left where it was.
+        .{ .ops = &.{ .{ .delete = "orders\x00b" }, .{ .delete = "orders\x00c" } }, .keys = 0 },
+    };
+    var indices = [2]u64{ t.shard.raft_node.last_applied, leader.raft_node.last_applied };
+    for (runs) |run| {
+        for ([_]*Shard{ &t.shard, &leader }, &indices) |shard, *index| {
+            for (run.ops) |op| {
+                index.* += 1;
+                var buf: [64]u8 = undefined;
+                const term = shard.raft_node.current_term;
+                const e = switch (op) {
+                    .put => |key| entry_mod.buildEntry(.kv_put, 0, term, index.*, 1, try kv_entries.Put.encodeInto(&buf, .{ .key = key, .value = "v", .ttl_ms = null })),
+                    .delete => |key| entry_mod.buildEntry(.kv_delete, 0, term, index.*, 1, try kv_entries.Delete.encodeInto(&buf, .{ .key = key })),
+                    .batch => entry_mod.buildEntry(.kv_batch, 0, term, index.*, 1, batch),
+                };
+                var out = persistence_mod.Result.start(&e);
+                try std.testing.expect(shard.applyEntry(&e, &out));
+            }
+            shard.publishHealth();
+        }
+        try std.testing.expectEqual(run.keys, follower_metrics.kvLiveKeys("orders"));
+        try std.testing.expectEqual(run.keys, leader_metrics.kvLiveKeys("orders"));
+    }
 }

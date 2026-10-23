@@ -88,7 +88,7 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
         // From KV namespaces
         var kv_it = ctx.metrics.kv_namespaces.iterator();
         while (kv_it.next()) |entry| {
-            try ns_set.put(entry.value_ptr.namespace, {});
+            try ns_set.put(entry.value_ptr.*.namespace, {});
         }
 
         // From queues
@@ -373,8 +373,8 @@ pub fn getNamespaceKV(allocator: Allocator, namespace: []const u8, ctx: *Dashboa
         var found = false;
         var it = ctx.metrics.kv_namespaces.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.namespace, namespace)) {
-                const snap = entry.value_ptr.metrics.snapshot();
+            if (std.mem.eql(u8, entry.value_ptr.*.namespace, namespace)) {
+                const snap = entry.value_ptr.*.metrics.snapshot();
                 try obj.intField("key_count", snap.key_count);
                 try obj.intField("bytes_stored", snap.bytes_stored);
                 try obj.intField("get_ops", snap.get_ops_total);
@@ -427,29 +427,8 @@ fn countQueuesInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
 }
 
 fn countKVInNamespace(ctx: *DashboardContext, namespace: []const u8) u64 {
-    // Scan the KV projection per namespace (the metrics key_count counter is not
-    // updated on write, so it under-reports). Mirrors api/kv.zig getKVKeys filtering.
-    var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const ns_prefix = ns_keys.namespacePrefix(&ns_prefix_buf, namespace) catch return 0;
-
-    var count: u64 = 0;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getKVProjection(ctx, i)) |kv| {
-            var it = kv.map.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.tombstone) continue;
-                const key = entry.key_ptr.*;
-                if (ns_prefix.len == 0) {
-                    if (std.mem.indexOfScalar(u8, key, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
-                } else {
-                    if (!std.mem.startsWith(u8, key, ns_prefix)) continue;
-                }
-                count += 1;
-            }
-        }
-    }
-    return count;
+    // As the shards published it: their projections are theirs alone to read.
+    return ctx.metrics.kvLiveKeys(namespace);
 }
 
 fn countWorkflowsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
