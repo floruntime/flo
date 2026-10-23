@@ -74,6 +74,8 @@ fi
 # Below that they stop with an illegal instruction, so say why first.
 # Only this arch's line is read: under emulation (an amd64 container on an
 # arm64 host) cpuinfo describes the host, and then there's nothing to judge.
+# The same check, with the same flag lists, is in
+# packaging/scripts/preinstall.sh (CI compares them).
 if [ "$OS" = "linux" ]; then
   case "$ARCH" in
     x86_64)  CPU_KEY="flags";    NEEDED="cx16 lahf_lm pni popcnt sse4_1 sse4_2 ssse3" ;;

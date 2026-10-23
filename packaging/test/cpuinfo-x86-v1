@@ -1,0 +1,5 @@
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: x86-64 v1 test CPU
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc pni cx16 lahf_lm
+

@@ -62,6 +62,24 @@ jobs:
       - name: .deb on Ubuntu, with systemd
         run: sudo packaging/smoke.sh "$(ls dist/flo_*.deb)"
 
+      # preinst / %pre refuse a CPU below the floor before anything is
+      # unpacked. A v1 cpuinfo is mounted over the container's.
+      - name: Both packages refuse a CPU below the floor
+        run: |
+          want='Error: flo needs an x86-64-v2 CPU or ARMv8 with CRC; this CPU lacks: popcnt sse4_1 sse4_2 ssse3.'
+          check() {
+            out=$(docker run --rm -v "$PWD/dist:/dist:ro" \
+              -v "$PWD/packaging/test/cpuinfo-x86-v1:/proc/cpuinfo:ro" "$1" \
+              sh -c "$2; echo \"install exit \$?\"; if [ -e /usr/bin/flo ]; then echo flo present; else echo flo absent; fi" 2>&1)
+            printf '== %s\n%s\n' "$1" "$out"
+            printf '%s\n' "$out" | grep -qF "$want" || { echo "::error::$1: no refusal message"; exit 1; }
+            printf '%s\n' "$out" | grep -qx 'install exit 0' && { echo "::error::$1: the install succeeded"; exit 1; }
+            printf '%s\n' "$out" | grep -qx 'flo absent' || { echo "::error::$1: /usr/bin/flo was installed"; exit 1; }
+          }
+          check ubuntu:24.04 'dpkg -i /dist/flo_*.deb'
+          # --nodeps: reach %pre without installing shadow-utils first.
+          check rockylinux:9 'rpm -i --nodeps /dist/flo-*.rpm'
+
       - name: .rpm on Rocky Linux 9
         # io_uring, which flo needs, is blocked by Docker's default seccomp profile.
         run: |
