@@ -528,7 +528,8 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         \\pub const Asset = struct {
         \\    content: []const u8,
         \\    mime_type: []const u8,
-        \\    is_precompressed: bool = false,
+        \\    /// The same bytes gzipped, served to a client that accepts gzip.
+        \\    gzip: ?[]const u8 = null,
         \\};
         \\
         \\
@@ -568,27 +569,18 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         const var_name = b.fmt("asset_{d}", .{asset_idx});
         const compressible = isCompressible(file_path);
 
+        writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{ var_name, file_path }) catch unreachable;
         var is_precompressed: u8 = 0;
         if (compressible) {
-            // Gzip the file at configure time and embed the compressed version.
-            // Fall back to raw embed if gzip fails; release.yml refuses a
-            // binary whose assets aren't compressed.
+            // Embed a gzipped copy too, for clients that accept gzip. Without
+            // gzip only the raw bytes go in; release.yml refuses a binary whose
+            // assets have no compressed copy.
             const gz_path = b.fmt("{s}.gz", .{file_path});
             if (gzipFile(b, dist_dir, file_path, gz_path)) {
-                writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
-                    var_name, gz_path,
-                }) catch unreachable;
+                writer.print("const {s}_gz = @embedFile(\"dist/{s}\");\n", .{ var_name, gz_path }) catch unreachable;
                 is_precompressed = 1;
                 precompressed += 1;
-            } else {
-                writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
-                    var_name, file_path,
-                }) catch unreachable;
             }
-        } else {
-            writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{
-                var_name, file_path,
-            }) catch unreachable;
         }
 
         const entry_line = b.fmt("{s}\x00{s}\x00{s}\x00{d}", .{ file_path, var_name, mime, is_precompressed });
@@ -622,7 +614,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         } else {
             writer.print("    }} else if (mem.eql(u8, lookup, \"{s}\")) {{\n", .{epath}) catch unreachable;
         }
-        writer.print("        return .{{ .content = {s}, .mime_type = \"{s}\", .is_precompressed = {s} }};\n", .{ vname, emime, if (is_gz) "true" else "false" }) catch unreachable;
+        writer.print("        return {s};\n", .{assetLiteral(b, vname, emime, is_gz)}) catch unreachable;
     }
 
     // SPA fallback — serve index.html for non-API paths
@@ -641,7 +633,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
             const compressed = it.next().?;
             const is_gz = std.mem.eql(u8, compressed, "1");
             if (std.mem.eql(u8, epath, "index.html")) {
-                writer.print("            return .{{ .content = {s}, .mime_type = \"{s}\", .is_precompressed = {s} }};\n", .{ vname, emime, if (is_gz) "true" else "false" }) catch unreachable;
+                writer.print("            return {s};\n", .{assetLiteral(b, vname, emime, is_gz)}) catch unreachable;
                 break;
             }
         }
@@ -665,6 +657,11 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     std.debug.print("Dashboard: Embedded {d} assets from {s}, {d} precompressed\n", .{ asset_idx, dist_path, precompressed });
 
     return b.createModule(.{ .root_source_file = b.path("src/node/dashboard/assets.zig") });
+}
+
+fn assetLiteral(b: *std.Build, var_name: []const u8, mime: []const u8, gzipped: bool) []const u8 {
+    if (gzipped) return b.fmt(".{{ .content = {s}, .mime_type = \"{s}\", .gzip = {s}_gz }}", .{ var_name, mime, var_name });
+    return b.fmt(".{{ .content = {s}, .mime_type = \"{s}\" }}", .{ var_name, mime });
 }
 
 fn writeAssetsFile(b: *std.Build, content: []const u8) void {
