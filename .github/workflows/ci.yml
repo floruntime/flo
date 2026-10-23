@@ -74,6 +74,17 @@ jobs:
       - name: Build the benches
         run: zig build bench
 
+      # install.sh and the packages' preinstall each check the CPU floor;
+      # their flag lists must not drift apart.
+      - name: The CPU floor lists match
+        run: |
+          lists() { grep -oE '(x86_64|aarch64)\) +CPU_KEY="[A-Za-z]+"; +NEEDED="[^"]*"' "$1" | tr -s ' '; }
+          a=$(lists scripts/install.sh); b=$(lists packaging/scripts/preinstall.sh)
+          if [ -z "$a" ] || [ "$(printf '%s\n' "$a" | wc -l)" -ne 2 ] || [ "$a" != "$b" ]; then
+            printf 'install.sh:\n%s\npreinstall.sh:\n%s\n' "$a" "$b"
+            echo "::error::the CPU floor flag lists in scripts/install.sh and packaging/scripts/preinstall.sh differ"; exit 1
+          fi
+
       # CI otherwise runs only unfiltered, which never exercises the filter
       # checks: a filtered step must compile exactly what the build predicted,
       # and a filter that matches nothing must fail the step.
