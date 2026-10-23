@@ -21,6 +21,9 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const time = @import("../../time.zig");
 const Mutex = @import("../../sync.zig").Mutex;
+const Watchdog = @import("watchdog.zig").Watchdog;
+const Process = @import("../../process.zig");
+const awaitExit = @import("watchdog.zig").awaitExit;
 
 /// Result of a CLI command execution
 pub const CommandResult = struct {
@@ -172,6 +175,31 @@ pub const AsyncCommand = struct {
         return self.child_pid;
     }
 
+    /// Polls for the exit, reaping under `pid_lock`, so the pid stays
+    /// signalable until the moment it is reaped and never after.
+    fn reapSignalable(self: *Self, child: *Process.Child) !Process.Term {
+        while (true) {
+            var status: c_int = 0;
+            self.pid_lock.lock();
+            const r = std.c.waitpid(child.id, &status, std.posix.W.NOHANG);
+            if (r == child.id) self.child_pid = 0;
+            self.pid_lock.unlock();
+            if (r == child.id) {
+                // What child.wait() would have closed.
+                if (child.stdout) |f| _ = std.c.close(f.handle);
+                if (child.stderr) |f| _ = std.c.close(f.handle);
+                child.stdout = null;
+                child.stderr = null;
+                const st: u32 = @bitCast(status);
+                if (std.c.W.IFEXITED(st)) return .{ .Exited = std.c.W.EXITSTATUS(st) };
+                if (std.c.W.IFSIGNALED(st)) return .{ .Signal = @backingInt(std.c.W.TERMSIG(st)) };
+                return .{ .Unknown = st };
+            }
+            if (r < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.WaitFailed;
+            time.sleep(50 * std.time.ns_per_ms);
+        }
+    }
+
     fn setPid(self: *Self, pid: i32) void {
         self.pid_lock.lock();
         defer self.pid_lock.unlock();
@@ -279,8 +307,16 @@ pub const CliRunner = struct {
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
+        // Its own group, for the watchdog to kill without the test's.
+        child.pgid = 0;
 
         child.spawn() catch |e| {
+            async_cmd.err = e;
+            return;
+        };
+        const watchdog = Watchdog.start(allocator, child.id) catch |e| {
+            _ = std.c.kill(child.id, .KILL);
+            _ = child.wait() catch {};
             async_cmd.err = e;
             return;
         };
@@ -297,9 +333,20 @@ pub const CliRunner = struct {
             stderr_list.deinit(allocator);
         }
 
-        // No signal may reach this pid once the wait has reaped it.
-        async_cmd.setPid(0);
-        const result = child.wait() catch |e| {
+        // A child can close its pipes and keep running, so it stays
+        // signalable until it has exited. Then, while it is still unreaped,
+        // the pid stops being signalled and the watchdog stands down: once
+        // reaped, the id may name another process. If the exit can't be
+        // checked, it is reaped by polling under the pid lock instead.
+        const exited = awaitExit(child.id, true) catch false;
+        if (exited) async_cmd.setPid(0);
+        watchdog.release();
+        const waited = if (exited) child.wait() else async_cmd.reapSignalable(&child);
+        const result = waited catch |e| {
+            if (collected) |_| {
+                stdout_list.deinit(allocator);
+                stderr_list.deinit(allocator);
+            } else |_| {}
             async_cmd.err = e;
             return;
         };

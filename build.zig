@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
     // with tests can't be left out of a hand-kept list and never run.
     const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filters);
     const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filters);
-    const e2e_root = generateTestRoot(b, "tests/e2e", &.{}, test_filters);
+    const e2e_root = generateTestRoot(b, "tests/e2e", &.{"helpers"}, test_filters);
     const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filters);
 
     const unit_tests = b.addTest(.{
@@ -174,6 +174,21 @@ pub fn build(b: *std.Build) void {
 
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
     run_e2e_tests.step.dependOn(b.getInstallStep());
+    // harness_test.zig runs it: a process that starts servers, then dies
+    // without cleanup.
+    if (e2e_root.missing == null) {
+        const orphan = b.addTest(.{
+            .name = "e2e-orphan",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/e2e/helpers/orphan_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        orphan.root_module.addImport("stdx", stdx_module);
+        run_e2e_tests.step.dependOn(&b.addInstallArtifact(orphan, .{}).step);
+    }
     // The tests spawn the installed flo. Its bytes are part of the run's
     // cache key, or a change to flo alone would replay the last result
     // without running anything.

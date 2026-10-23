@@ -21,6 +21,8 @@
 const std = @import("std");
 const stdx = @import("../../mod.zig");
 const builtin = @import("builtin");
+const Watchdog = @import("watchdog.zig").Watchdog;
+const awaitExit = @import("watchdog.zig").awaitExit;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -107,6 +109,15 @@ fn claimCheckout() !void {
     if (r.term == .exited and r.term.exited == 0) stdx.time.sleep(500 * std.time.ns_per_ms);
 }
 
+/// For a helper process an e2e test starts: the test holds the checkout's
+/// claim, so the helper neither takes the lock nor clears the checkout's
+/// servers, which would include the test's own.
+pub fn claimHeldByParent() void {
+    claim_mutex.lock();
+    defer claim_mutex.unlock();
+    claim = .held;
+}
+
 /// Server process manager for e2e tests
 pub const ServerProcess = struct {
     const Self = @This();
@@ -138,6 +149,8 @@ pub const ServerProcess = struct {
     started: bool,
     config: ServerConfig,
     log_thread: ?std.Thread = null,
+    /// Kills the server's group if this test process dies first.
+    watchdog: ?*Watchdog = null,
     /// Set once the server is reaped; the log thread exits at the next quiet
     /// poll, so joining it never waits on a pipe something else still holds.
     log_stop: std.atomic.Value(bool) = .init(false),
@@ -457,6 +470,11 @@ pub const ServerProcess = struct {
         child.pgid = 0; // 0 means use child's PID as process group ID
 
         try child.spawn();
+        self.watchdog = Watchdog.start(self.allocator, child.id) catch |err| {
+            _ = std.c.kill(-child.id, .KILL);
+            _ = child.wait() catch {};
+            return err;
+        };
 
         // Redirect stdout/stderr to log file in background
         // Store process immediately so we can kill it if readiness check fails
@@ -531,15 +549,28 @@ pub const ServerProcess = struct {
 
             self.joinLogThread();
             self.checkExit();
+            // Still armed only if the server couldn't be reaped; it then
+            // stays a zombie, so its group id isn't reused.
+            self.releaseWatchdog();
             self.process = null;
         }
 
         self.started = false;
     }
 
+    fn releaseWatchdog(self: *Self) void {
+        if (self.watchdog) |w| w.release();
+        self.watchdog = null;
+    }
+
     /// Collect the child if it has exited, keeping its status.
     fn tryReap(self: *Self, pid: std.c.pid_t) bool {
         if (self.reaped) return true;
+        // Stand the watchdog down while the exited server is still unreaped.
+        if (self.watchdog != null) {
+            if (!(awaitExit(pid, false) catch true)) return false;
+            self.releaseWatchdog();
+        }
         var status: c_int = 0;
         if (std.c.waitpid(pid, &status, std.posix.W.NOHANG) != pid) return false;
         self.reaped = true;
@@ -703,6 +734,7 @@ pub const ServerProcess = struct {
             }
             stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
             self.joinLogThread();
+            self.releaseWatchdog();
             self.process = null;
         }
         self.started = false;
