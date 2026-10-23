@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const raft_log = @import("log.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const membership = @import("membership.zig");
+const limits = @import("../protocol/limits.zig");
 
 const RaftLog = raft_log.RaftLog;
 const Entry = entry_mod.Entry;
@@ -420,6 +421,9 @@ pub const RaftNode = struct {
     /// The config entry `committed_config` came from: a removal notice names
     /// it, so a receiver can tell it from a config it already holds.
     committed_config_index: u64 = 0,
+    /// The highest index `raiseCommit` has read the log through for a
+    /// config the records evicted.
+    config_scanned_to: u64 = 0,
     /// A leader whose committed config no longer makes it a voter stepped
     /// down; the owner says why.
     left_group: bool = false,
@@ -597,10 +601,52 @@ pub const RaftNode = struct {
 
     /// The config entry at `index` committed: it is now the membership a
     /// truncation falls back to. (A leader it drops has already stepped
-    /// down, at commit: `advanceCommitIndex`.)
+    /// down, at commit: `advanceCommitIndex`.) Never moves back: applying
+    /// an older committed config, at boot or behind a lagging apply, keeps
+    /// the newer one commit already took.
     pub fn commitMembership(self: *RaftNode, cfg: *const membership.Config, index: u64) void {
+        if (index < self.committed_config_index) return;
         self.committed_config = cfg.*;
         self.committed_config_index = index;
+    }
+
+    /// Commit reaches `idx`. The committed config is the newest config in
+    /// the log at or below it, taken here rather than when the owner
+    /// applies the entry: a node whose apply lags, or has stopped, still
+    /// knows the group's committed membership.
+    fn raiseCommit(self: *RaftNode, idx: u64) void {
+        self.commit_index = @max(self.commit_index, idx);
+        var i = self.config_record_count;
+        while (i > 0) {
+            i -= 1;
+            const rec = &self.config_records[i];
+            if (rec.index > self.commit_index) continue;
+            self.commitMembership(&rec.config, rec.index);
+            return;
+        }
+        // Every record is above commit: configs the records evicted (more
+        // were above the applied index at boot than they hold) lie between
+        // the committed config and the oldest record. Read them from the
+        // log, each index once.
+        if (self.config_record_count == 0) return;
+        const upper = @min(self.commit_index, self.config_records[0].index - 1);
+        const lower = @max(self.committed_config_index, self.config_scanned_to) + 1;
+        if (upper < lower) return;
+        self.config_scanned_to = upper;
+        const buf = self.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD) catch {
+            log.err("Raft: no memory to read the log for its committed config; it stays at index {d} until a newer one commits", .{self.committed_config_index});
+            self.config_scanned_to = lower - 1;
+            return;
+        };
+        defer self.allocator.free(buf);
+        var at = upper;
+        while (at >= lower) : (at -= 1) {
+            const e = self.log.getEntryCopy(at, buf) orelse continue;
+            if (e.header.entry_type != @backingInt(EntryType.raft_config)) continue;
+            const cfg = membership.decode(e.payload) orelse continue;
+            self.commitMembership(&cfg, at);
+            return;
+        }
     }
 
     /// A voter campaigns. So does a voter of the committed config that a
@@ -681,12 +727,34 @@ pub const RaftNode = struct {
         self.config_record_count += 1;
     }
 
+    /// At boot, every config in the log above `applied`, in index order.
+    /// Replay recorded the ones at or below it as it applied them; commit
+    /// takes the newest at or below it from these records (`raiseCommit`),
+    /// so one recorded out of order, or not at all, would be skipped.
+    pub fn recordConfigsAbove(self: *RaftNode, applied: u64, buf: []u8) error{MembershipUnreadable}!void {
+        var i = applied + 1;
+        while (i <= self.log.lastIndex()) : (i += 1) {
+            const e = self.log.getEntryCopy(i, buf) orelse {
+                log.err("Raft: the entry at index {d} could not be read back; refusing to guess the membership", .{i});
+                return error.MembershipUnreadable;
+            };
+            if (e.header.entry_type != @backingInt(EntryType.raft_config)) continue;
+            const cfg = membership.decode(e.payload) orelse {
+                log.err("Raft: the config entry at index {d} is not a membership", .{i});
+                return error.MembershipUnreadable;
+            };
+            self.recordConfig(i, e.header.term, &cfg);
+        }
+    }
+
     /// A truncation cut the config entry the membership came from: the
     /// membership is the newest config the log still holds, or, with none
     /// recorded, the committed one. Falling back to the committed set alone
     /// would leave a node whose owner has not yet applied a committed
     /// config with no members at all, never campaigning.
     fn truncatedBelowMembership(self: *RaftNode, after_index: u64) void {
+        // A cut log's tail is read again for evicted configs.
+        self.config_scanned_to = @min(self.config_scanned_to, after_index);
         while (self.config_record_count > 0 and self.config_records[self.config_record_count - 1].index > after_index) {
             self.config_record_count -= 1;
         }
@@ -743,7 +811,7 @@ pub const RaftNode = struct {
         const idx = try self.log.append(&noop);
         // `last_applied` stays where replay left it; the owner drains what
         // this bootstrap just committed.
-        self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
+        self.raiseCommit(self.selfCountedThrough(idx));
         log.debug("Raft: bootstrap complete, leader at term={d}, commit_index={d}", .{ self.current_term, idx });
     }
 
@@ -1215,7 +1283,7 @@ pub const RaftNode = struct {
         // Never move commit backwards — an older heartbeat, delayed or
         // duplicated in flight, verifies less than we may already hold.
         const last_new = req.prev_log_index + req.entries.len;
-        self.commit_index = @max(self.commit_index, @min(req.leader_commit, last_new));
+        self.raiseCommit(@min(req.leader_commit, last_new));
 
         // Caught up: this node holds everything the leader had committed
         // when it sent this batch, so it refuses any candidate missing a
@@ -1359,7 +1427,7 @@ pub const RaftNode = struct {
         // The lone voter is the majority: its copy commits the entry, at
         // once unless it must be on disk first.
         if (self.voterPeers() == 0) {
-            self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
+            self.raiseCommit(self.selfCountedThrough(idx));
         }
 
         log.debug("Raft: proposed entry, index={d}, term={d}, type={d}, payload_len={d}", .{ idx, self.current_term, @backingInt(entry_type), payload.len });
@@ -1728,7 +1796,7 @@ pub const RaftNode = struct {
         var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, self.current_term, next, self.nextStamp(), "");
         noop.header.crc32c = noop.computeCrc();
         if (self.log.append(&noop)) |idx| {
-            if (self.voterPeers() == 0) self.commit_index = @max(self.commit_index, self.selfCountedThrough(idx));
+            if (self.voterPeers() == 0) self.raiseCommit(self.selfCountedThrough(idx));
         } else |err| {
             log.err("Raft: cannot append the leadership noop at index {d}: {s}; earlier terms' entries commit only after the next client write", .{ next, @errorName(err) });
         }
@@ -1870,7 +1938,7 @@ pub const RaftNode = struct {
         if (self.voterPeers() == 0) {
             // A lone voter's disk is the whole quorum, whatever term the
             // entries are from.
-            self.commit_index = @max(self.commit_index, self.durable_index);
+            self.raiseCommit(self.durable_index);
         } else {
             self.advanceCommitIndex();
         }
@@ -1900,7 +1968,7 @@ pub const RaftNode = struct {
             }
         }
 
-        self.commit_index = new_commit;
+        self.raiseCommit(new_commit);
         // A leader whose own removal (or demotion) just committed leaves
         // office now, not when its owner applies the entry: until then every
         // gate would be open to it, and anything it proposed would be counted
@@ -3873,6 +3941,129 @@ test "raft node: an empty-log node checks the committed config it caught up to, 
     try testing.expectEqual(LostLog.confirming, node.lost_log);
     node.handleTermCheckResponse(checkAnswer(3, 3, 3, 3, &.{ 1, 2, 3, 4 }));
     try testing.expectEqual(LostLog.none, node.lost_log);
+}
+
+test "raft node: a config is committed once commit reaches it, whether or not the owner has applied it, and never moves back" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    node.timer_enabled = false;
+    var a: [membership.MAX_SIZE]u8 = undefined;
+    var b: [membership.MAX_SIZE]u8 = undefined;
+    const three = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    const four = membership.Config.ofVoters(&.{ 1, 2, 3, 4 });
+    var es = [_]Entry{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&three, &a)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 3, 0, membership.encode(&four, &b)),
+    };
+    // Commit reaches 2: {1,2,3} is committed, though nothing applied it.
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &es, .leader_commit = 2 });
+    try testing.expectEqual(@as(u64, 0), node.last_applied);
+    try testing.expectEqual(@as(u64, 2), node.committed_config_index);
+    try testing.expectEqual(@as(u64, 1), node.committedConfigTerm());
+    try testing.expect(node.committed_config.isVoter(3) and !node.committed_config.isVoter(4));
+    // Commit reaches 3: {1,2,3,4}.
+    _ = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 1, .entries = &.{}, .leader_commit = 3 });
+    try testing.expectEqual(@as(u64, 3), node.committed_config_index);
+    try testing.expect(node.committed_config.isVoter(4));
+    // The owner's apply catching up with the older one changes nothing.
+    node.commitMembership(&three, 2);
+    try testing.expectEqual(@as(u64, 3), node.committed_config_index);
+    try testing.expect(node.committed_config.isVoter(4));
+}
+
+test "raft node: a leader takes a config as committed once a quorum acks it, with nothing applied" {
+    var leader = try leading(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer leader.deinit();
+    const p = (try leader.proposeConfig(&leader.latest_config.withJoiner(4, true))).proposed;
+    try testing.expect(leader.committed_config_index < p.index);
+    ackAll(&leader, 2);
+    try testing.expectEqual(p.index, leader.commit_index);
+    try testing.expectEqual(@as(u64, 0), leader.last_applied);
+    try testing.expectEqual(p.index, leader.committed_config_index);
+    try testing.expect(leader.committed_config.names(4));
+}
+
+test "raft node: a lone voter takes its own config as committed once it is on disk" {
+    var leader = try leading(membership.Config.ofVoters(&.{1}));
+    defer leader.deinit();
+    const p = (try leader.proposeConfig(&leader.latest_config.withJoiner(2, true))).proposed;
+    try testing.expectEqual(p.index, leader.commit_index);
+    try testing.expectEqual(@as(u64, 0), leader.last_applied);
+    try testing.expectEqual(p.index, leader.committed_config_index);
+    try testing.expect(leader.committed_config.names(2));
+}
+
+test "raft node: with more configs above the applied index than the records hold, commit still takes the newest at or below it" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 16384, .{ .rng_seed = 9 });
+    defer node.deinit();
+    // c0 at 1, applied; c1..c6 at 3..8, above it.
+    var bufs: [7][membership.MAX_SIZE]u8 = undefined;
+    var cfgs: [7]membership.Config = undefined;
+    for (&cfgs, 0..) |*c, k| c.* = membership.Config.ofVoters(&.{ 1, 2, @as(NodeId, @intCast(10 + k)) });
+    for (1..9) |i| {
+        const idx: u64 = @intCast(i);
+        var e = if (idx == 2)
+            entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, idx, 0, "")
+        else blk: {
+            const k: usize = if (idx == 1) 0 else idx - 2;
+            break :blk entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, idx, 0, membership.encode(&cfgs[k], &bufs[k]));
+        };
+        e.header.crc32c = e.computeCrc();
+        _ = try node.log.append(&e);
+    }
+    node.recordConfig(1, 1, &cfgs[0]);
+    node.commitMembership(&cfgs[0], 1);
+    var buf: [membership.MAX_SIZE + 64]u8 = undefined;
+    try node.recordConfigsAbove(2, &buf);
+    // The records keep the newest four, 5..8; the config at 4 is only in
+    // the log.
+    try testing.expectEqual(@as(u64, 5), node.config_records[0].index);
+    node.raiseCommit(4);
+    try testing.expectEqual(@as(u64, 4), node.committed_config_index);
+    try testing.expect(node.committed_config.names(12));
+    node.raiseCommit(6);
+    try testing.expectEqual(@as(u64, 6), node.committed_config_index);
+}
+
+test "raft node: at boot a config above the applied index that won't decode is refused, not skipped" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 16384, .{ .rng_seed = 9 });
+    defer node.deinit();
+    var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 1, 0, "not a membership");
+    e.header.crc32c = e.computeCrc();
+    _ = try node.log.append(&e);
+    var buf: [membership.MAX_SIZE + 64]u8 = undefined;
+    try testing.expectError(error.MembershipUnreadable, node.recordConfigsAbove(0, &buf));
+}
+
+test "raft node: at boot the configs above the applied index are recorded in order, so commit takes the newest at or below it" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 16384, .{ .rng_seed = 9 });
+    defer node.deinit();
+    var bufs: [3][membership.MAX_SIZE]u8 = undefined;
+    const cfgs = [_]membership.Config{
+        membership.Config.ofVoters(&.{ 1, 2 }),
+        membership.Config.ofVoters(&.{ 1, 2, 3 }),
+        membership.Config.ofVoters(&.{ 1, 2, 3, 4 }),
+    };
+    // As boot restores it: straight into the log, configs at 5, 8 and 11.
+    var c: usize = 0;
+    for (1..12) |i| {
+        const idx: u64 = @intCast(i);
+        var e = if (idx == 5 or idx == 8 or idx == 11) blk: {
+            defer c += 1;
+            break :blk entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, idx, 0, membership.encode(&cfgs[c], &bufs[c]));
+        } else entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, idx, 0, "");
+        e.header.crc32c = e.computeCrc();
+        _ = try node.log.append(&e);
+    }
+    // Replay applied through 6, recording the config at 5; bring-up then
+    // records the rest.
+    node.recordConfig(5, 1, &cfgs[0]);
+    var buf: [membership.MAX_SIZE + 64]u8 = undefined;
+    try node.recordConfigsAbove(6, &buf);
+    node.raiseCommit(9);
+    try testing.expectEqual(@as(u64, 8), node.committed_config_index);
+    try testing.expect(node.committed_config.names(3) and !node.committed_config.names(4));
 }
 
 test "raft node: a truncated config falls back to the newest one the log still holds, applied or not" {

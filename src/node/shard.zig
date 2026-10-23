@@ -5737,6 +5737,7 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         };
         raft.setMembership(&cfg, cfg_index);
         raft.membership_term = e.header.term;
+        try raft.recordConfigsAbove(raft.last_applied, buf);
         raft.recordConfig(cfg_index, e.header.term, &cfg);
         if (cfg_index <= raft.last_applied) raft.commitMembership(&cfg, cfg_index);
         // What the segments flushed under a commit watermark is committed;
@@ -10841,6 +10842,45 @@ test "a shard whose saved term or log runs past the term ceiling refuses to star
         var buf: [1024]u8 = undefined;
         try std.testing.expectError(error.TermSpaceExhausted, bringUpGroup(&raft, .join, &buf, 0, 1, true));
     }
+}
+
+test "a shard brought up with configs above its applied index records each of them, in order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    // A config at 1, applied (sealed under watermark 1); two more after it.
+    var bufs: [3][membership.MAX_SIZE]u8 = undefined;
+    const cfgs = [_]membership.Config{
+        membership.Config.ofVoters(&.{ 1, 8 }),
+        membership.Config.ofVoters(&.{ 1, 8, 9 }),
+        membership.Config.ofVoters(&.{ 1, 8, 9, 10 }),
+    };
+    {
+        var w = SegmentWriter.init(std.testing.allocator, 0);
+        defer w.deinit();
+        for (&cfgs, 0..) |*c, k| {
+            var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, k + 1, k + 1, membership.encode(c, &bufs[k]));
+            e.header.crc32c = e.computeCrc();
+            try w.addEntry(&e);
+        }
+        w.commit_index_at_seal = 1;
+        try w.writeToFile(segs);
+    }
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    const r = shard.raft_node;
+    try std.testing.expectEqual(@as(u64, 1), r.last_applied);
+    // Every config the log holds is recorded, not only its newest.
+    try std.testing.expectEqual(@as(u8, 3), r.config_record_count);
+    for (r.config_records[0..3], 1..) |rec, want| try std.testing.expectEqual(@as(u64, want), rec.index);
+    try std.testing.expectEqual(@as(u64, 1), r.committed_config_index);
 }
 
 fn testDataDir(tmp: *std.testing.TmpDir) ![]const u8 {
