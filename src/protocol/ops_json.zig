@@ -1,7 +1,8 @@
-//! `ops.json`: every client op, field, type, bound, refusal reason and group,
-//! read from the op table. SDK codecs and the reference docs are generated
-//! from it, so it describes the wire, not the server: internal ops are left
-//! out. `zig build gen` writes it; a release publishes it.
+//! `ops.json`: every client op, field, type, bound, answer status, refusal
+//! reason and group, read from the op table and the protocol. SDK codecs and
+//! the reference docs are generated from it, so it describes the wire, not
+//! the server: internal ops are left out. `zig build gen` writes it; a
+//! release publishes it.
 //!
 //! Integers past 2^53 (u64 bounds, an i64 minimum) are written as decimal
 //! strings, so a JSON reader that parses numbers as doubles can't round
@@ -30,6 +31,20 @@ pub fn write(w: *std.Io.Writer) Stringify.Error!void {
     try jw.write(proto.VERSION);
     try jw.objectField("table_hash");
     try jw.print("\"0x{x:0>16}\"", .{table.HASH});
+
+    // The status every answer carries in its header.
+    try jw.objectField("statuses");
+    try jw.beginArray();
+    const statuses = @typeInfo(proto.StatusCode).@"enum";
+    inline for (statuses.field_names, statuses.field_values) |name, value| {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(value);
+        try jw.objectField("name");
+        try jw.write(name);
+        try jw.endObject();
+    }
+    try jw.endArray();
 
     try jw.objectField("reasons");
     try jw.beginArray();
@@ -235,6 +250,23 @@ test "ops.json: it parses, lists every client op with its fields, and leaves int
     }
     try testing.expectEqual(client_ops, listed.len);
     try testing.expectEqual(@typeInfo(reason_mod.Reason).@"enum".field_names.len, root.get("reasons").?.array.items.len);
+}
+
+test "ops.json: it lists every answer status by code and name" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(&out.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const listed = parsed.value.object.get("statuses").?.array.items;
+    const statuses = @typeInfo(proto.StatusCode).@"enum";
+    try testing.expectEqual(statuses.field_names.len, listed.len);
+    inline for (statuses.field_names, statuses.field_values, 0..) |name, value, i| {
+        try testing.expectEqual(@as(i64, value), listed[i].object.get("code").?.integer);
+        try testing.expectEqualStrings(name, listed[i].object.get("name").?.string);
+    }
+    const unavailable = listed[@backingInt(proto.StatusCode.unavailable)].object;
+    try testing.expectEqualStrings("unavailable", unavailable.get("name").?.string);
 }
 
 test "ops.json: a field's bound is its schema's, and a wide integer is a string" {
