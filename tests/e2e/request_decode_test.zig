@@ -41,7 +41,8 @@ fn alive(ctx: *stdx.testing.TestContext) !void {
     _ = try rawCall(ctx, .kv_put, "", "alive", try kv_ops.plainSetBody(&set_buf, "yes"), &out);
     const r = try rawCall(ctx, .kv_get, "", "alive", try kv_ops.plainGetBody(&get_buf), &out);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
-    try testing.expect(std.mem.endsWith(u8, r.data, "yes"));
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    try testing.expectEqualStrings("yes", (try kv_ops.op("kv.get").response.decodeAll(r.data, &diag)).value);
 }
 
 const Case = struct { name: []const u8, op: proto.OpCode, ns: []const u8 = "", key: []const u8, value: []const u8, status: proto.StatusCode };

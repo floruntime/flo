@@ -49,7 +49,9 @@ fn kvAlive(ctx: *stdx.testing.TestContext) !bool {
     var out: [4096]u8 = undefined;
     if ((try send(ctx, put, &out)).status != @backingInt(proto.StatusCode.ok)) return false;
     const r = try send(ctx, get, &out);
-    return r.status == @backingInt(proto.StatusCode.ok) and std.mem.endsWith(u8, r.data, "yes");
+    if (r.status != @backingInt(proto.StatusCode.ok)) return false;
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    return std.mem.eql(u8, (try kv_ops.op("kv.get").response.decodeAll(r.data, &diag)).value, "yes");
 }
 
 test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and the log still replays" {

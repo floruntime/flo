@@ -47,7 +47,8 @@ fn kvValue(ctx: *stdx.testing.TestContext, key: []const u8, out: []u8) ![]const 
     var body: [16]u8 = undefined;
     const r = try rawCall(ctx, .kv_get, key, try kv_ops.plainGetBody(&body), "", out);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.status);
-    return r.data[12..];
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    return (try kv_ops.op("kv.get").response.decodeAll(r.data, &diag)).value;
 }
 
 /// The point or series count leading a ts read or query answer.
