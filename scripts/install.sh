@@ -48,6 +48,24 @@ case "$ARCH" in
   *)              echo "Error: Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
+# The macOS binaries are built for macOS 15 and won't start on older systems.
+if [ "$OS" = "macos" ]; then
+  MACOS_VERSION=$(sw_vers -productVersion 2>/dev/null || true)
+  MACOS_MAJOR=${MACOS_VERSION%%.*}
+  case "$MACOS_MAJOR" in
+    ''|*[!0-9]*)
+      echo "Warning: could not read the macOS version; flo needs macOS 15 or later." >&2
+      ;;
+    *)
+      if [ "$MACOS_MAJOR" -lt 15 ]; then
+        echo "Error: flo needs macOS 15 or later (this is macOS $MACOS_VERSION)."
+        echo "Upgrade macOS, or build from source: https://github.com/$REPO#building-from-source"
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
 # --- Default install directory ---
 if [ -z "$INSTALL_DIR" ]; then
   if [ "$OS" = "macos" ]; then
