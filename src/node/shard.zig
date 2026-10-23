@@ -64,6 +64,7 @@ const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const KVProjection = @import("../projection/kv.zig").KVProjection;
+const KVEntry = @import("../projection/kv.zig").KVEntry;
 const KVMetrics = @import("../metrics/registry.zig").KVMetrics;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
@@ -5337,7 +5338,7 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             // A watch on a key that exists but did not change answers what is
             // there now, so the asker can tell "unchanged" from "gone".
             if (shard.defaultPartition().kv.get(waiter.key())) |entry| {
-                sendKVWaiterValue(shard, waiter, entry.value, entry.version);
+                sendKVWaiterValue(shard, waiter, entry);
             } else {
                 const r = KVHandler.refusal(error.NotFound);
                 shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, r.status, r.refusal);
@@ -5362,14 +5363,14 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     const entry = shard.defaultPartition().kv.get(waiter.key()) orelse return false;
     if (entry.version <= waiter.min_version) return false;
-    sendKVWaiterValue(shard, waiter, entry.value, entry.version);
+    sendKVWaiterValue(shard, waiter, entry);
     return true;
 }
 
 /// Answers a waiting `kv.get`.
-fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, value: []const u8, version: u64) void {
-    const Response = table_run.op("kv.get").response;
-    const answer: Response.Value = .{ .version = version, .value = value };
+fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, entry: *const KVEntry) void {
+    const Response = KVHandler.GetResponse;
+    const answer = KVHandler.getAnswer(entry);
     // This shard's own client: written in place.
     if (shard.localConnection(waiter.reply_to)) |conn| {
         shard.noteDeferred(waiter.reply_to, waiter.request_id);
@@ -6422,8 +6423,10 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expectEqual(@as(u64, 7), resp.header.request_id);
-    try std.testing.expect(std.mem.endsWith(u8, resp.data, "v1"));
-    try std.testing.expectEqual(version, std.mem.readInt(u64, resp.data[0..8], .little));
+    var diag: schema.Diagnostic = .{};
+    const got = try KVHandler.GetResponse.decodeAll(resp.data, &diag);
+    try std.testing.expectEqualStrings("v1", got.value);
+    try std.testing.expectEqual(version, got.version);
 
     var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
@@ -6620,8 +6623,8 @@ test "Shard: a client that sends without reading is paced: its requests wait unt
     try std.testing.expectEqual(gets[1].len + gets[2].len, c.conn.read_buf.readable());
 
     // Read on the client side: each drained answer lets the next request run.
-    // kv.get answers [version:u64][value_len:u32][value].
-    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len;
+    // kv.get answers [version:u64][value_len:u32][value][expires_at_ms: absent].
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len + 1;
     const out = try std.testing.allocator.alloc(u8, 3 * answer_len);
     defer std.testing.allocator.free(out);
     var got: usize = 0;
@@ -6691,8 +6694,8 @@ test "Shard: a client that sends its whole pipeline before reading is unpaced on
     try std.testing.expect(!c.conn.reads_paused);
     try std.testing.expect(c.conn.write_buf.readable() > Shard.PAUSE_READS_AT);
 
-    // kv.get answers [version:u64][value_len:u32][value].
-    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len;
+    // kv.get answers [version:u64][value_len:u32][value][expires_at_ms: absent].
+    const answer_len = @sizeOf(proto.ResponseHeader) + 8 + 4 + value.len + 1;
     const out = try std.testing.allocator.alloc(u8, count * answer_len);
     defer std.testing.allocator.free(out);
     var got: usize = 0;

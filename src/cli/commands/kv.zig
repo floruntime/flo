@@ -224,13 +224,13 @@ fn answer(comptime name: []const u8, v: kv_ops.op(name).response.Value, buf: []u
 test "kv: an answer prints by its op: raw, record, a table, hex, JSON" {
     var b: [256]u8 = undefined;
     var o: [512]u8 = undefined;
-    var r = try printed(answer("kv.get", .{ .version = 3, .value = "hello" }, &b), &.{ "flo", "kv", "get", "k" }, &o);
+    var r = try printed(answer("kv.get", .{ .version = 3, .value = "hello", .expires_at_ms = null }, &b), &.{ "flo", "kv", "get", "k" }, &o);
     try r.result;
     try std.testing.expectEqualStrings("hello\n", r.text);
 
-    r = try printed(answer("kv.get", .{ .version = 3, .value = "hello" }, &b), &.{ "flo", "kv", "get", "k", "-o", "json" }, &o);
+    r = try printed(answer("kv.get", .{ .version = 3, .value = "hello", .expires_at_ms = 1700000000000 }, &b), &.{ "flo", "kv", "get", "k", "-o", "json" }, &o);
     try r.result;
-    try std.testing.expectEqualStrings("{\"version\":3,\"value\":\"hello\"}\n", r.text);
+    try std.testing.expectEqualStrings("{\"version\":3,\"value\":\"hello\",\"expires_at_ms\":1700000000000}\n", r.text);
 
     r = try printed(answer("kv.txn.commit", .{ .commit_index = 9, .ops = 2 }, &b), &.{ "flo", "kv", "txn", "commit", "5" }, &o);
     try r.result;
@@ -272,7 +272,7 @@ test "kv: exists exits 1 when the key isn't there, and a cut answer is a transpo
     r = try printed(answer("kv.exists", .{ .exists = true, .version = 4 }, &b), &.{ "flo", "kv", "exists", "k" }, &o);
     try r.result;
 
-    const cut = answer("kv.get", .{ .version = 3, .value = "hello" }, &b);
+    const cut = answer("kv.get", .{ .version = 3, .value = "hello", .expires_at_ms = null }, &b);
     r = try printed(cut[0 .. cut.len - 1], &.{ "flo", "kv", "get", "k" }, &o);
     try std.testing.expectError(error.Transport, r.result);
 }
