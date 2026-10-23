@@ -13,18 +13,22 @@ REPO="floruntime/flo"
 BINARY="flo"
 VERSION=""
 INSTALL_DIR=""
+SKIP_CHECKSUM=0
 
 # --- Parse arguments ---
 while [ $# -gt 0 ]; do
   case "$1" in
     --version|-v) VERSION="$2"; shift 2 ;;
     --dir|-d)     INSTALL_DIR="$2"; shift 2 ;;
+    --insecure-skip-checksum) SKIP_CHECKSUM=1; shift ;;
     --help|-h)
       echo "Usage: install.sh [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  --version, -v VERSION   Install a specific version (e.g. v0.1.0)"
       echo "  --dir, -d DIR           Install to a custom directory"
+      echo "  --insecure-skip-checksum"
+      echo "                          Install even if the download can't be verified"
       echo "  --help, -h              Show this help"
       exit 0
       ;;
@@ -75,16 +79,28 @@ if [ -z "$INSTALL_DIR" ]; then
   fi
 fi
 
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 # --- Resolve version ---
 if [ -z "$VERSION" ]; then
   echo "Fetching latest release..."
   # The newest release, prereleases included: releases/latest skips those,
   # and every flo release so far is one.
-  VERSION=$(curl -sfL "https://api.github.com/repos/$REPO/releases?per_page=1" \
-    | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+  API_CODE=$(curl -sL -D "$TMP_DIR/api-headers" -o "$TMP_DIR/api-body" -w '%{http_code}' \
+    "https://api.github.com/repos/$REPO/releases?per_page=1" || true)
+  if [ "$API_CODE" = "200" ]; then
+    VERSION=$(grep '"tag_name"' "$TMP_DIR/api-body" | head -1 | cut -d'"' -f4)
+  fi
   if [ -z "$VERSION" ]; then
-    echo "Error: Could not determine latest version."
-    echo "Check https://github.com/$REPO/releases or specify --version"
+    if { [ "$API_CODE" = "403" ] || [ "$API_CODE" = "429" ]; } &&
+      grep -qi '^x-ratelimit-remaining: *0[^0-9]*$' "$TMP_DIR/api-headers" 2>/dev/null; then
+      echo "Error: GitHub API rate limit reached. Retry later, or pass --version vX.Y.Z"
+      echo "(releases: https://github.com/$REPO/releases)."
+    else
+      echo "Error: Could not determine latest version (GitHub API HTTP ${API_CODE:-000})."
+      echo "Check https://github.com/$REPO/releases or specify --version"
+    fi
     exit 1
   fi
 fi
@@ -96,9 +112,6 @@ CHECKSUM_URL="${URL}.sha256"
 echo "Installing flo $VERSION ($ARCH-$OS) to $INSTALL_DIR..."
 
 # --- Download ---
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-
 TARBALL="${ARTIFACT}.tar.gz"
 
 echo "Downloading $URL..."
@@ -110,21 +123,42 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 
 # --- Verify checksum ---
-echo "Verifying checksum..."
-if curl -sfL -o "$TMP_DIR/${TARBALL}.sha256" "$CHECKSUM_URL" 2>/dev/null; then
-  (
-    cd "$TMP_DIR"
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c "${TARBALL}.sha256" >/dev/null
-    elif command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 -c "${TARBALL}.sha256" >/dev/null
-    else
-      echo "Warning: No SHA256 tool found, skipping verification"
-    fi
-  )
-  echo "Checksum OK"
+if [ "$SKIP_CHECKSUM" = 1 ]; then
+  echo "Warning: installing without verifying the checksum (--insecure-skip-checksum)." >&2
 else
-  echo "Warning: No checksum file available, skipping verification"
+  echo "Verifying checksum..."
+  SKIP_HINT="Re-run with --insecure-skip-checksum to install anyway."
+  SUM_CODE=$(curl -sL -w '%{http_code}' -o "$TMP_DIR/${TARBALL}.sha256" "$CHECKSUM_URL" || true)
+  if [ "$SUM_CODE" != "200" ]; then
+    echo "Error: could not download the checksum (HTTP ${SUM_CODE:-000}) from $CHECKSUM_URL."
+    echo "Not installing an unverified binary. $SKIP_HINT"
+    exit 1
+  fi
+  EXPECTED=$(awk '{ print tolower($1); exit }' "$TMP_DIR/${TARBALL}.sha256")
+  case "$EXPECTED" in
+    *[!0-9a-f]*) EXPECTED="" ;;
+  esac
+  if [ ${#EXPECTED} -ne 64 ]; then
+    echo "Error: $CHECKSUM_URL doesn't hold a SHA-256 hash."
+    echo "Not installing an unverified binary. $SKIP_HINT"
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMP_DIR/$TARBALL" | awk '{ print $1 }')
+  elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL=$(shasum -a 256 "$TMP_DIR/$TARBALL" | awk '{ print $1 }')
+  else
+    echo "Error: no SHA-256 tool found (looked for sha256sum and shasum)."
+    echo "Not installing an unverified binary. $SKIP_HINT"
+    exit 1
+  fi
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "Error: checksum mismatch for $TARBALL."
+    echo "  expected $EXPECTED"
+    echo "  got      $ACTUAL"
+    exit 1
+  fi
+  echo "Checksum OK ($EXPECTED)"
 fi
 
 # --- Extract ---
