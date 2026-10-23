@@ -46,6 +46,10 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     // Collect namespace names from multiple sources
     var ns_set = std.StringHashMap(void).init(allocator);
     defer ns_set.deinit();
+    // The registry's names are copied out under its lock: an unregister
+    // frees them.
+    var names = std.heap.ArenaAllocator.init(allocator);
+    defer names.deinit();
 
     // 1. From ALL shards' namespace handlers, workflow handlers, and processing handlers
     if (ctx.shard_ptrs) |ptrs| {
@@ -88,19 +92,19 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
         // From KV namespaces
         var kv_it = ctx.metrics.kv_namespaces.iterator();
         while (kv_it.next()) |entry| {
-            try ns_set.put(entry.value_ptr.*.namespace, {});
+            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
         }
 
         // From queues
         var q_it = ctx.metrics.queues.iterator();
         while (q_it.next()) |entry| {
-            try ns_set.put(entry.value_ptr.namespace, {});
+            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
         }
 
         // From streams
         var s_it = ctx.metrics.streams.iterator();
         while (s_it.next()) |entry| {
-            try ns_set.put(entry.value_ptr.namespace, {});
+            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
         }
     }
 
@@ -409,7 +413,7 @@ fn countStreamsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
     var count: u32 = 0;
     var it = ctx.metrics.streams.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.namespace, namespace)) count += 1;
+        if (std.mem.eql(u8, entry.value_ptr.*.namespace, namespace)) count += 1;
     }
     return count;
 }
@@ -421,7 +425,7 @@ fn countQueuesInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
     var count: u32 = 0;
     var it = ctx.metrics.queues.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.namespace, namespace)) count += 1;
+        if (std.mem.eql(u8, entry.value_ptr.*.namespace, namespace)) count += 1;
     }
     return count;
 }
