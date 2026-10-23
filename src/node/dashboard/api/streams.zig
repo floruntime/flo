@@ -308,7 +308,9 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     try obj.begin();
     try obj.stringField("name", stream_name);
 
-    // Namespace + stats from MetricsRegistry (thread-safe)
+    // Namespace + stats from MetricsRegistry (thread-safe). The namespace
+    // is copied out under the lock: an unregister frees the registry's.
+    var ns_buf: [ns_keys.MAX_NAMESPACE_LEN]u8 = undefined;
     var ns: []const u8 = "default";
     var total_appends: u64 = 0;
     var total_bytes: u64 = 0;
@@ -317,9 +319,12 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
         defer ctx.metrics.mutex.unlock();
         var it = ctx.metrics.streams.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.topic, stream_name)) {
-                ns = entry.value_ptr.namespace;
-                const snap = entry.value_ptr.metrics.snapshot();
+            if (std.mem.eql(u8, entry.value_ptr.*.topic, stream_name)) {
+                const name = entry.value_ptr.*.namespace;
+                const n = @min(name.len, ns_buf.len);
+                @memcpy(ns_buf[0..n], name[0..n]);
+                ns = ns_buf[0..n];
+                const snap = entry.value_ptr.*.metrics.snapshot();
                 total_appends += snap.append_records_total;
                 total_bytes += snap.append_bytes_total;
             }

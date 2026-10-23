@@ -842,11 +842,14 @@ pub const MetricsRegistry = struct {
 
     /// Registered stream metrics
     /// Key format: "{namespace}:{topic}:{partition}"
-    streams: std.StringHashMap(StreamEntry),
+    // Entries live on the heap: a register returns its metrics' address,
+    // which a shard keeps or uses while another thread's register grows
+    // the map, and a map's own slots move when it grows.
+    streams: std.StringHashMap(*StreamEntry),
 
     /// Registered queue metrics
     /// Key format: "{namespace}:{queue}"
-    queues: std.StringHashMap(QueueEntry),
+    queues: std.StringHashMap(*QueueEntry),
 
     /// Registered KV namespace metrics
     /// Key format: "{namespace}"
@@ -856,7 +859,7 @@ pub const MetricsRegistry = struct {
 
     /// Registered tiered log metrics
     /// Key: group_id (Raft group)
-    tiered_logs: std.AutoHashMap(u32, TieredLogEntry),
+    tiered_logs: std.AutoHashMap(u32, *TieredLogEntry),
 
     /// Workflow engine metrics (singleton - one per node)
     workflow: WorkflowMetrics,
@@ -903,10 +906,10 @@ pub const MetricsRegistry = struct {
         return MetricsRegistry{
             .allocator = allocator,
             .server = ServerMetrics.init(),
-            .streams = std.StringHashMap(StreamEntry).init(allocator),
-            .queues = std.StringHashMap(QueueEntry).init(allocator),
+            .streams = std.StringHashMap(*StreamEntry).init(allocator),
+            .queues = std.StringHashMap(*QueueEntry).init(allocator),
             .kv_namespaces = std.StringHashMap(*KVEntry).init(allocator),
-            .tiered_logs = std.AutoHashMap(u32, TieredLogEntry).init(allocator),
+            .tiered_logs = std.AutoHashMap(u32, *TieredLogEntry).init(allocator),
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
             .replication = ReplicationMetrics.init(),
@@ -933,8 +936,9 @@ pub const MetricsRegistry = struct {
         }
         var stream_value_iter = self.streams.valueIterator();
         while (stream_value_iter.next()) |entry| {
-            self.allocator.free(entry.namespace);
-            self.allocator.free(entry.topic);
+            self.allocator.free(entry.*.namespace);
+            self.allocator.free(entry.*.topic);
+            self.allocator.destroy(entry.*);
         }
         self.streams.deinit();
 
@@ -945,8 +949,9 @@ pub const MetricsRegistry = struct {
         }
         var queue_value_iter = self.queues.valueIterator();
         while (queue_value_iter.next()) |entry| {
-            self.allocator.free(entry.namespace);
-            self.allocator.free(entry.queue);
+            self.allocator.free(entry.*.namespace);
+            self.allocator.free(entry.*.queue);
+            self.allocator.destroy(entry.*);
         }
         self.queues.deinit();
 
@@ -963,12 +968,15 @@ pub const MetricsRegistry = struct {
         self.kv_namespaces.deinit();
 
         // Free tiered log entries (no string keys)
+        var tiered_value_iter = self.tiered_logs.valueIterator();
+        while (tiered_value_iter.next()) |entry| self.allocator.destroy(entry.*);
         self.tiered_logs.deinit();
     }
 
     /// Register a stream and return a pointer to its metrics
     ///
-    /// Returns: Pointer to StreamMetrics (owned by registry, valid until deinit)
+    /// Returns: Pointer to StreamMetrics (owned by registry, valid until
+    /// unregisterStream)
     ///
     /// Thread-safe: Multiple threads can register different streams concurrently
     pub fn registerStream(
@@ -989,24 +997,21 @@ pub const MetricsRegistry = struct {
         errdefer self.allocator.free(key);
 
         // Check if already registered
-        if (self.streams.getPtr(key)) |existing| {
+        if (self.streams.get(key)) |existing| {
             // Already exists - free key and return existing metrics
             self.allocator.free(key);
             return &existing.metrics;
         }
 
-        // Create new entry
-        const entry = StreamEntry{
-            .namespace = try self.allocator.dupe(u8, namespace),
-            .topic = try self.allocator.dupe(u8, topic),
-            .partition = partition,
-            .metrics = StreamMetrics.init(),
-        };
-
+        const entry = try self.allocator.create(StreamEntry);
+        errdefer self.allocator.destroy(entry);
+        const owned_namespace = try self.allocator.dupe(u8, namespace);
+        errdefer self.allocator.free(owned_namespace);
+        const owned_topic = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned_topic);
+        entry.* = .{ .namespace = owned_namespace, .topic = owned_topic, .partition = partition, .metrics = StreamMetrics.init() };
         try self.streams.put(key, entry);
-
-        // Return pointer to metrics (safe because HashMap owns the entry)
-        return &self.streams.getPtr(key).?.metrics;
+        return &entry.metrics;
     }
 
     /// Remove a stream's metrics entry (mirror of `registerStream`). No-op if
@@ -1031,6 +1036,7 @@ pub const MetricsRegistry = struct {
             self.allocator.free(@constCast(kv.key));
             self.allocator.free(kv.value.namespace);
             self.allocator.free(kv.value.topic);
+            self.allocator.destroy(kv.value);
         }
     }
 
@@ -1056,20 +1062,20 @@ pub const MetricsRegistry = struct {
         errdefer self.allocator.free(key);
 
         // Check if already registered
-        if (self.queues.getPtr(key)) |existing| {
+        if (self.queues.get(key)) |existing| {
             self.allocator.free(key);
             return &existing.metrics;
         }
 
-        // Create new entry
-        const entry = QueueEntry{
-            .namespace = try self.allocator.dupe(u8, namespace),
-            .queue = try self.allocator.dupe(u8, queue),
-            .metrics = QueueMetrics.init(),
-        };
-
+        const entry = try self.allocator.create(QueueEntry);
+        errdefer self.allocator.destroy(entry);
+        const owned_namespace = try self.allocator.dupe(u8, namespace);
+        errdefer self.allocator.free(owned_namespace);
+        const owned_queue = try self.allocator.dupe(u8, queue);
+        errdefer self.allocator.free(owned_queue);
+        entry.* = .{ .namespace = owned_namespace, .queue = owned_queue, .metrics = QueueMetrics.init() };
         try self.queues.put(key, entry);
-        return &self.queues.getPtr(key).?.metrics;
+        return &entry.metrics;
     }
 
     /// Register a KV namespace and return a pointer to its metrics
@@ -1120,18 +1126,15 @@ pub const MetricsRegistry = struct {
         defer self.mutex.unlock();
 
         // Check if already registered
-        if (self.tiered_logs.getPtr(group_id)) |existing| {
+        if (self.tiered_logs.get(group_id)) |existing| {
             return &existing.metrics;
         }
 
-        // Create new entry
-        const entry = TieredLogEntry{
-            .group_id = group_id,
-            .metrics = TieredLogMetrics.init(),
-        };
-
+        const entry = try self.allocator.create(TieredLogEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{ .group_id = group_id, .metrics = TieredLogMetrics.init() };
         try self.tiered_logs.put(group_id, entry);
-        return &self.tiered_logs.getPtr(group_id).?.metrics;
+        return &entry.metrics;
     }
 
     /// Initialize per-shard metrics counters.
@@ -1194,7 +1197,8 @@ pub const MetricsRegistry = struct {
 
         // Export stream metrics
         var iter = self.streams.valueIterator();
-        while (iter.next()) |entry| {
+        while (iter.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             const snapshot = entry.metrics.snapshot();
 
             // Format labels
@@ -1224,14 +1228,16 @@ pub const MetricsRegistry = struct {
 
         // Export tiered log metrics
         var tiered_iter = self.tiered_logs.valueIterator();
-        while (tiered_iter.next()) |entry| {
+        while (tiered_iter.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             const snapshot = entry.metrics.snapshot();
             try writeTieredLogMetrics(writer, snapshot, entry.group_id);
         }
 
         // Export queue metrics
         var queue_iter = self.queues.valueIterator();
-        while (queue_iter.next()) |entry| {
+        while (queue_iter.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
             const q_snapshot = entry.metrics.snapshot();
 
             const q_labels = try std.fmt.allocPrint(
@@ -1802,4 +1808,47 @@ test "registry: queue and stream series are exactly the ones something records" 
         if (!s) std.debug.print("missing series {s}\n", .{w});
         try testing.expect(s);
     }
+}
+
+test "MetricsRegistry: a registered entry stays where it is while later registrations grow the maps" {
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    const stream = try registry.registerStream("ns", "first", 0);
+    const queue = try registry.registerQueue("ns", "first");
+    const log = try registry.registerTieredLog(0);
+    var name: [32]u8 = undefined;
+    for (1..200) |i| {
+        const n = try std.fmt.bufPrint(&name, "s{d}", .{i});
+        _ = try registry.registerStream("ns", n, 0);
+        _ = try registry.registerQueue("ns", n);
+        _ = try registry.registerTieredLog(@intCast(i));
+    }
+    // What a shard kept is still the registry's entry.
+    try std.testing.expectEqual(stream, try registry.registerStream("ns", "first", 0));
+    try std.testing.expectEqual(queue, try registry.registerQueue("ns", "first"));
+    try std.testing.expectEqual(log, try registry.registerTieredLog(0));
+    // And an unregistered stream's entry goes with it.
+    registry.unregisterStream("ns", "s1", 0);
+    try std.testing.expectEqual(@as(usize, 199), registry.streams.count());
+}
+
+test "MetricsRegistry: a shard writing through its metrics while another thread registers loses nothing" {
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    const queue = try registry.registerQueue("ns", "held");
+    const Registrar = struct {
+        fn run(r: *MetricsRegistry) void {
+            var name: [32]u8 = undefined;
+            for (0..2000) |i| {
+                const n = std.fmt.bufPrint(&name, "q{d}", .{i}) catch unreachable;
+                _ = r.registerQueue("ns", n) catch unreachable;
+                _ = r.registerTieredLog(@intCast(i)) catch unreachable;
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Registrar.run, .{&registry});
+    const writes = 200_000;
+    for (0..writes) |_| queue.recordEnqueue(1, 1);
+    thread.join();
+    try std.testing.expectEqual(@as(u64, writes), (try registry.registerQueue("ns", "held")).snapshot().enqueue_ops_total);
 }
