@@ -42,6 +42,10 @@ pub const Role = enum(u8) {
 
 pub const NodeId = u32;
 pub const NO_VOTE: NodeId = 0;
+/// The highest term a node takes or reaches. Far past any real cluster's
+/// elections; what it bounds is a peer pushing the term up, up to 2^32 a
+/// frame (`termPlausible`), until an increment would overflow.
+pub const MAX_TERM: u64 = std.math.maxInt(u64) >> 1;
 
 /// Per-peer replication tracking (leader-only state).
 pub const PeerState = struct {
@@ -718,7 +722,7 @@ pub const RaftNode = struct {
     /// node ends up voting twice in it.
     pub fn bootstrap(self: *RaftNode) !void {
         log.debug("Raft: bootstrapping single-node, node_id={d}, group_id={d}, prior_term={d}, last_index={d}", .{ self.id, self.group_id, self.current_term, self.log.lastIndex() });
-        self.current_term += 1;
+        self.current_term = self.nextTerm() orelse return error.TermSpaceExhausted;
         self.voted_for = self.id;
         if (!self.persistHardState()) return error.HardStateNotDurable;
         self.role = .leader;
@@ -859,13 +863,17 @@ pub const RaftNode = struct {
         // reconnect. A poll that gets no majority before the timer fires
         // again is simply asked again; only a passed poll spends the term.
         if (self.config.enable_pre_vote and self.voterPeers() > 0) {
-            self.pre_vote_term = self.current_term + 1;
+            const next = self.nextTerm() orelse {
+                self.rearmElectionTimer();
+                return null;
+            };
+            self.pre_vote_term = next;
             self.votes_received = @intFromBool(self.timer_enabled);
             self.votes_needed = self.quorum();
             self.vote_granted_by = std.mem.zeroes([MAX_PEERS]bool);
             self.rearmElectionTimer();
             return .{
-                .term = self.current_term + 1,
+                .term = next,
                 .candidate_id = self.id,
                 .last_log_index = self.log.lastIndex(),
                 .last_log_term = self.log.lastTerm(),
@@ -877,16 +885,20 @@ pub const RaftNode = struct {
 
     /// A poll is still asking about the term after ours.
     fn pollOpen(self: *const RaftNode) bool {
-        return self.pre_vote_term != 0 and self.pre_vote_term == self.current_term + 1;
+        return self.pre_vote_term != 0 and self.pre_vote_term == self.current_term +| 1;
     }
 
     /// Spend the term: what a passed poll leads to, and what a node with no
     /// peers or no pre-vote does at once.
     pub fn startElectionNow(self: *RaftNode) ?VoteRequest {
         self.pre_vote_term = 0;
+        const next = self.nextTerm() orelse {
+            self.rearmElectionTimer();
+            return null;
+        };
         const prior_term = self.current_term;
         const prior_vote = self.voted_for;
-        self.current_term += 1;
+        self.current_term = next;
         self.voted_for = self.id;
         if (!self.persistHardState()) {
             self.current_term = prior_term;
@@ -919,7 +931,22 @@ pub const RaftNode = struct {
     /// it is corruption or a hostile peer, and adopting it would strand
     /// this node in a term nobody else will ever reach.
     pub fn termPlausible(self: *const RaftNode, term: u64) bool {
-        return term <= self.current_term +| (1 << 32);
+        return term <= MAX_TERM and term <= self.current_term +| (1 << 32);
+    }
+
+    /// Why `termPlausible` refused `term`.
+    fn implausibleWhy(term: u64) []const u8 {
+        return if (term > MAX_TERM) "it is past the highest term a node takes" else "it is more than 2^32 ahead of ours";
+    }
+
+    /// The term after this one, or null at `MAX_TERM`: no increment wraps
+    /// or panics, at boot or in an election.
+    fn nextTerm(self: *const RaftNode) ?u64 {
+        if (self.current_term >= MAX_TERM) {
+            log.err("Raft: node {d} is at term {d}, the highest it takes; it starts no election. Peers that pushed the term this far are not voters, or are faulty", .{ self.id, self.current_term });
+            return null;
+        }
+        return self.current_term + 1;
     }
 
     /// Handle an incoming VoteRequest. Returns the VoteResponse.
@@ -931,7 +958,7 @@ pub const RaftNode = struct {
 
     fn voteRequest(self: *RaftNode, req: VoteRequest) VoteResponse {
         if (!self.termPlausible(req.term)) {
-            log.warn("Raft: vote request for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
+            log.warn("Raft: vote request for term {d} rejected: {s} (our term {d})", .{ req.term, implausibleWhy(req.term), self.current_term });
             return .{ .term = self.current_term, .vote_granted = false, .from = self.id, .is_pre_vote = req.is_pre_vote };
         }
         // What this node voted for before it lost its log or hard state is
@@ -1063,7 +1090,7 @@ pub const RaftNode = struct {
 
     fn appendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
         if (!self.termPlausible(req.term)) {
-            log.warn("Raft: AppendEntries for term {d} rejected; {d} is more than 2^32 ahead of our term {d}", .{ req.term, req.term - self.current_term, self.current_term });
+            log.warn("Raft: AppendEntries for term {d} rejected: {s} (our term {d})", .{ req.term, implausibleWhy(req.term), self.current_term });
             return .{ .term = self.current_term, .success = false, .match_index = self.log.lastIndex(), .from = self.id };
         }
         // If request term > current, step down
@@ -1127,6 +1154,9 @@ pub const RaftNode = struct {
         // not a leader's and must not touch the log.
         for (req.entries, 0..) |*e, k| {
             if (e.header.index != req.prev_log_index + 1 + k) return error.MalformedBatch;
+            // No leader sends an entry from a term after its own: one would
+            // set the log's last term, and the term boot takes from it.
+            if (e.header.term > req.term) return error.MalformedBatch;
         }
 
         // Append new entries (truncate conflicts). A config entry becomes
@@ -1639,7 +1669,7 @@ pub const RaftNode = struct {
             return false;
         }
         self.rearmElectionTimer();
-        log.info("Raft: guarded node {d} confirmed term {d} with {d} answer(s); it votes from term {d} on", .{ self.id, self.current_term, self.check.answered_count, self.current_term + 1 });
+        log.info("Raft: guarded node {d} confirmed term {d} with {d} answer(s); it votes from term {d} on", .{ self.id, self.current_term, self.check.answered_count, self.current_term +| 1 });
         return true;
     }
 
@@ -4401,4 +4431,55 @@ test "raft node: a replica's clock has no say in the voters' clock" {
     const p = try leader.propose(.kv_put, 0, "x");
     try testing.expectEqual(t + s_ns, p.timestamp_ns);
     try testing.expectEqual(@as(NodeId, 2), leader.stamp_held_by);
+}
+
+test "raft node: a peer can push the term to MAX_TERM and no further, and a node there starts no election instead of overflowing" {
+    var leader = try leading(membership.Config.ofVoters(&.{ 1, 2, 3 }));
+    defer leader.deinit();
+    // A peer answers with a term 2^32 ahead, over and over, from a few
+    // jumps short of the ceiling.
+    leader.current_term = MAX_TERM - 3 * (1 << 32) + 5;
+    for (0..8) |_| leader.handleAppendResponse(.{ .term = leader.current_term +| (1 << 32), .success = false, .match_index = 0, .from = 2 });
+    try testing.expect(leader.current_term <= MAX_TERM);
+    try testing.expect(leader.current_term > MAX_TERM - (1 << 32));
+    // Past MAX_TERM nothing is taken, however close the jump.
+    leader.current_term = MAX_TERM;
+    leader.handleAppendResponse(.{ .term = MAX_TERM + 1, .success = false, .match_index = 0, .from = 2 });
+    try testing.expectEqual(MAX_TERM, leader.current_term);
+    try testing.expect(!leader.termPlausible(MAX_TERM + 1));
+    // At MAX_TERM an election, polled or not, is not started.
+    try testing.expect(leader.startElection() == null);
+    try testing.expect(leader.startElectionNow() == null);
+    try testing.expectEqual(MAX_TERM, leader.current_term);
+}
+
+test "raft node: bootstrap at MAX_TERM refuses to start rather than overflow" {
+    var node = try RaftNode.init(testing.allocator, 1, 0, 4096, .{});
+    defer node.deinit();
+    node.current_term = MAX_TERM;
+    try testing.expectError(error.TermSpaceExhausted, node.bootstrap());
+    try testing.expectEqual(MAX_TERM, node.current_term);
+}
+
+test "raft node: an entry from a term after its request's is refused before it reaches the log" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, std.math.maxInt(u64), 1, 0, "");
+    e.header.crc32c = e.computeCrc();
+    try testing.expectError(error.MalformedBatch, node.handleAppendEntries(.{ .term = 3, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = (&e)[0..1], .leader_commit = 0 }));
+    try testing.expectEqual(@as(u64, 0), node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 0), node.log.lastTerm());
+}
+
+test "raft node: a request past the ceiling is refused without overflow, whatever this node's term" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    // A term above the request's, as no honest node holds: the refusal's
+    // line must not subtract its way into a panic.
+    node.current_term = MAX_TERM + 10;
+    const vote = node.handleVoteRequest(.{ .term = MAX_TERM + 5, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 });
+    try testing.expect(!vote.vote_granted);
+    const append = try node.handleAppendEntries(.{ .term = MAX_TERM + 5, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!append.success);
+    try testing.expectEqual(MAX_TERM + 10, node.current_term);
 }

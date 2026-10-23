@@ -815,6 +815,12 @@ pub const Shard = struct {
                     log.err("shard {d}: {s}/HARDSTATE belongs to node {d}, this node is {d}; the shard directories come from different nodes", .{ shard_id, shard_dir, hs.node_id, node_id });
                     return error.NodeIdMismatch;
                 }
+                // Only corruption gets one past the ceiling (the file is
+                // checksummed); a node there could never campaign again.
+                if (hs.term > raft_node_mod.MAX_TERM) {
+                    log.err("shard {d}: {s}/HARDSTATE holds term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, shard_dir, hs.term, raft_node_mod.MAX_TERM });
+                    return error.TermSpaceExhausted;
+                }
                 raft_node.current_term = hs.term;
                 raft_node.voted_for = hs.voted_for;
                 if (hs.lost_log) raft_node.resumeLostLog();
@@ -5714,6 +5720,10 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
     const empty = raft.log.lastIndex() == 0;
     // The log is evidence of the term too: a hard state that is missing,
     // or behind it, never lets the node act in a term it already left.
+    if (raft.log.lastTerm() > raft_node_mod.MAX_TERM) {
+        log.err("shard {d}: the log's last entry is from term {d}, past the highest term a node takes ({d}); refusing to start on it", .{ shard_id, raft.log.lastTerm(), raft_node_mod.MAX_TERM });
+        return error.TermSpaceExhausted;
+    }
     raft.current_term = @max(raft.current_term, raft.log.lastTerm());
     if (cfg_index > 0) {
         const e = raft.log.getEntryCopy(cfg_index, buf) orelse {
@@ -10801,6 +10811,35 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     try std.testing.expect(shard.kv_handler.kv.get("nested") != null);
     try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
     try std.testing.expectEqual(@as(u32, 1), Probe.calls);
+}
+
+test "a shard whose saved term or log runs past the term ceiling refuses to start, rather than take it" {
+    // HARDSTATE past the ceiling: only corruption writes one.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const data_dir = try testDataDir(&tmp);
+        defer std.testing.allocator.free(data_dir);
+        const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+        defer std.testing.allocator.free(shard_dir);
+        try @import("stdx").fs.makePath(shard_dir);
+        try hard_state_mod.save(shard_dir, .{ .node_id = 8, .term = raft_node_mod.MAX_TERM + 1, .voted_for = 0 });
+        const pipe_fds = try @import("stdx").io.pipe();
+        defer _ = std.c.close(pipe_fds[0]);
+        defer _ = std.c.close(pipe_fds[1]);
+        // A joining node: it would take the term and wait, never campaign.
+        try std.testing.expectError(error.TermSpaceExhausted, Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{}));
+    }
+    // A log whose last entry is from past the ceiling.
+    {
+        var raft = try RaftNode.init(std.testing.allocator, 1, 0, 4096, .{});
+        defer raft.deinit();
+        var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, raft_node_mod.MAX_TERM + 1, 1, 0, "");
+        e.header.crc32c = e.computeCrc();
+        _ = try raft.log.append(&e);
+        var buf: [1024]u8 = undefined;
+        try std.testing.expectError(error.TermSpaceExhausted, bringUpGroup(&raft, .join, &buf, 0, 1, true));
+    }
 }
 
 fn testDataDir(tmp: *std.testing.TmpDir) ![]const u8 {
