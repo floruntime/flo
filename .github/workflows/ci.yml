@@ -70,6 +70,10 @@ jobs:
       - name: Build
         run: zig build
 
+      # Nothing else compiles the benches; this keeps them building.
+      - name: Build the benches
+        run: zig build bench
+
       # CI otherwise runs only unfiltered, which never exercises the filter
       # checks: a filtered step must compile exactly what the build predicted,
       # and a filter that matches nothing must fail the step.
