@@ -131,3 +131,31 @@ test "harness: a second e2e run in the same checkout is refused" {
     const checkout = stdx.testing.checkoutOf(server.flo_binary).?;
     try testing.expectError(error.E2eRunInProgress, stdx.testing.takeRunLock(checkout));
 }
+
+test "harness: an async command freed before it is awaited is stopped, and its thread joined" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // As in a test whose `try` fails between the start and the wait: the
+    // command would block for 300 s.
+    const cmd = try ctx.cli.runAsync(&.{ "kv", "get", "harness_never_set", "--wait-ms", "300000" });
+    var pid: i32 = 0;
+    for (0..200) |_| {
+        pid = cmd.childPid();
+        if (pid > 0) break;
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(pid > 0);
+    stdx.time.sleep(200 * std.time.ns_per_ms);
+
+    const t0 = stdx.time.monotonicMs();
+    cmd.deinit();
+    try testing.expect(stdx.time.monotonicMs() - t0 < 3_000);
+    // Reaped by the joined thread, so nothing of it is left.
+    try testing.expect(processGone(pid));
+
+    // Freed straight away, before its thread may have spawned the child.
+    const t1 = stdx.time.monotonicMs();
+    (try ctx.cli.runAsync(&.{ "kv", "get", "harness_never_set", "--wait-ms", "300000" })).deinit();
+    try testing.expect(stdx.time.monotonicMs() - t1 < 3_000);
+}

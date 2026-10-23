@@ -19,6 +19,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const time = @import("../../time.zig");
+const Mutex = @import("../../sync.zig").Mutex;
 
 /// Result of a CLI command execution
 pub const CommandResult = struct {
@@ -80,15 +82,25 @@ pub const CommandResult = struct {
     }
 };
 
-/// Handle for an async command execution
+/// Handle for an async command execution. `deinit` stops the command if
+/// it is still running and joins its thread, so a test that returns early
+/// (a failed `try` before the wait) doesn't leave the thread writing into
+/// freed memory, or the command running past its test.
 pub const AsyncCommand = struct {
     const Self = @This();
 
     thread: std.Thread,
+    joined: bool = false,
     result: ?CommandResult = null,
+    /// A wait handed `result` to the caller, who frees it.
+    result_taken: bool = false,
     err: ?anyerror = null,
     completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    child_pid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    /// The child's pid while it may be signalled: set after spawn, cleared
+    /// before the thread reaps it (after which the pid can name another
+    /// process). Read and written only under `pid_lock`.
+    child_pid: i32 = 0,
+    pid_lock: Mutex = .{},
 
     // Stored context for thread execution
     allocator: Allocator,
@@ -97,35 +109,23 @@ pub const AsyncCommand = struct {
 
     /// Wait for command to complete and return result
     pub fn wait(self: *Self) !CommandResult {
-        self.thread.join();
-        if (self.err) |e| return e;
-        return self.result orelse error.NoResult;
+        self.join();
+        return self.take();
     }
 
     /// Wait for command to complete with a timeout. Kills the process if it exceeds the timeout.
     /// Useful for tests involving --follow mode or infinite blocking reads.
     pub fn waitWithTimeout(self: *Self, timeout_ms: u64) !CommandResult {
-        const start = @import("../../time.zig").milliTimestamp();
+        const start = time.monotonicMs();
         while (!self.completed.load(.acquire)) {
-            const elapsed = @as(u64, @intCast(@import("../../time.zig").milliTimestamp() - start));
-            if (elapsed >= timeout_ms) {
-                // Kill the child process to unblock the thread
-                const pid = self.child_pid.load(.acquire);
-                if (pid > 0) {
-                    _ = std.c.kill(@intCast(pid), .TERM);
-                    // Give it 500ms to die, then SIGKILL
-                    @import("../../time.zig").sleep(500 * std.time.ns_per_ms);
-                    if (!self.completed.load(.acquire)) {
-                        _ = std.c.kill(@intCast(pid), .KILL);
-                    }
-                }
+            if (time.monotonicMs() - start >= timeout_ms) {
+                self.stop();
                 break;
             }
-            @import("../../time.zig").sleep(50 * std.time.ns_per_ms);
+            time.sleep(50 * std.time.ns_per_ms);
         }
-        self.thread.join();
-        if (self.err) |e| return e;
-        return self.result orelse error.NoResult;
+        self.join();
+        return self.take();
     }
 
     /// Check if command has completed (non-blocking)
@@ -133,16 +133,62 @@ pub const AsyncCommand = struct {
         return self.completed.load(.acquire);
     }
 
-    /// Free resources (call after wait())
+    /// Stop the command if it's still running, join its thread, and free
+    /// everything, including a result no wait handed out.
     pub fn deinit(self: *Self) void {
-        // Free the duplicated argument strings
+        if (!self.joined) {
+            self.stop();
+            self.join();
+        }
+        if (self.result) |*r| if (!self.result_taken) r.deinit();
         for (self.owned_argv) |arg| {
             self.allocator.free(arg);
         }
         self.allocator.free(self.owned_argv);
         self.allocator.free(self.argv);
-        // Free the AsyncCommand struct itself
         self.allocator.destroy(self);
+    }
+
+    /// TERM until the command completes, KILL after a second. The pid is
+    /// re-read each time, so a child spawned after this starts is caught.
+    fn stop(self: *Self) void {
+        const start = time.monotonicMs();
+        while (!self.completed.load(.acquire)) {
+            self.signal(if (time.monotonicMs() - start < 1_000) .TERM else .KILL);
+            time.sleep(50 * std.time.ns_per_ms);
+        }
+    }
+
+    fn signal(self: *Self, sig: std.c.SIG) void {
+        self.pid_lock.lock();
+        defer self.pid_lock.unlock();
+        if (self.child_pid > 0) _ = std.c.kill(self.child_pid, sig);
+    }
+
+    /// The running child's pid, or 0 before spawn and once it's reaped.
+    pub fn childPid(self: *Self) i32 {
+        self.pid_lock.lock();
+        defer self.pid_lock.unlock();
+        return self.child_pid;
+    }
+
+    fn setPid(self: *Self, pid: i32) void {
+        self.pid_lock.lock();
+        defer self.pid_lock.unlock();
+        self.child_pid = pid;
+    }
+
+    fn join(self: *Self) void {
+        if (self.joined) return;
+        self.thread.join();
+        self.joined = true;
+    }
+
+    fn take(self: *Self) !CommandResult {
+        if (self.err) |e| return e;
+        const r = self.result orelse return error.NoResult;
+        self.result_taken = true;
+        return r;
     }
 };
 
@@ -229,32 +275,36 @@ pub const CliRunner = struct {
     /// Thread function to execute command
     fn runCommandThread(async_cmd: *AsyncCommand, allocator: Allocator) void {
         var child = @import("../../process.zig").Child.init(async_cmd.argv, allocator);
+        defer async_cmd.completed.store(true, .release);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
         child.spawn() catch |e| {
             async_cmd.err = e;
-            async_cmd.completed.store(true, .release);
             return;
         };
-
-        // Store PID so waitWithTimeout() can kill the process if needed
-        async_cmd.child_pid.store(@intCast(child.id), .release);
+        async_cmd.setPid(@intCast(child.id));
 
         // Read stdout and stderr
         var stdout_list: std.ArrayList(u8) = .empty;
         var stderr_list: std.ArrayList(u8) = .empty;
-        child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024) catch |e| {
-            async_cmd.err = e;
-            async_cmd.completed.store(true, .release);
-            return;
-        };
+        const collected = child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024);
+        if (collected) |_| {} else |_| {
+            // Still ours to signal: it isn't reaped until the wait below.
+            async_cmd.signal(.KILL);
+            stdout_list.deinit(allocator);
+            stderr_list.deinit(allocator);
+        }
 
-        // Wait for process to complete
+        // No signal may reach this pid once the wait has reaped it.
+        async_cmd.setPid(0);
         const result = child.wait() catch |e| {
             async_cmd.err = e;
-            async_cmd.completed.store(true, .release);
+            return;
+        };
+        collected catch |e| {
+            async_cmd.err = e;
             return;
         };
 
@@ -271,7 +321,6 @@ pub const CliRunner = struct {
             .stdout = stdout_list.toOwnedSlice(allocator) catch "",
             .stderr = stderr_list.toOwnedSlice(allocator) catch "",
         };
-        async_cmd.completed.store(true, .release);
     }
 
     /// Run a CLI command (automatically inserts --endpoint and --api-key before any `--` separator)
