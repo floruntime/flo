@@ -195,7 +195,9 @@ pub const KvLookupOperator = struct {
         }
 
         const segment_storage = try all_segments.toOwnedSlice(allocator);
+        errdefer allocator.free(segment_storage);
         const parts = try parts_list.toOwnedSlice(allocator);
+        errdefer allocator.free(parts);
         const ranges = try ranges_list.toOwnedSlice(allocator);
         defer allocator.free(ranges);
 

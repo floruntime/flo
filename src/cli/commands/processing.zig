@@ -219,7 +219,12 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     ctx.print("Job:        {s}\n", .{job_id});
     ctx.print("Name:       {s}\n", .{name});
     if (reason.len > 0) {
-        ctx.print("Status:     {s}: {s}\n", .{ status_str, reason });
+        // A failed job's reason follows it; anything else (a node holding a
+        // running job) is a note beside it.
+        if (std.mem.eql(u8, status_str, "FAILED"))
+            ctx.print("Status:     {s}: {s}\n", .{ status_str, reason })
+        else
+            ctx.print("Status:     {s} ({s})\n", .{ status_str, reason });
     } else {
         ctx.print("Status:     {s}\n", .{status_str});
     }
