@@ -225,7 +225,7 @@ pub const DashboardServer = struct {
             self.handleApiRequest(client, parsed, body, cors_headers);
         } else if (parsed.method == .GET) {
             // Serve embedded static assets
-            self.handleStaticRequest(client, parsed.path, cors_headers);
+            self.handleStaticRequest(client, parsed.path, request, cors_headers);
         } else {
             self.sendError(client, .method_not_allowed, "Method not allowed");
         }
@@ -259,7 +259,7 @@ pub const DashboardServer = struct {
         self.sendResponse(client, .ok, .json, response, cors_headers);
     }
 
-    fn handleStaticRequest(self: *Self, client: std.posix.socket_t, path: []const u8, cors_headers: ?[]const u8) void {
+    fn handleStaticRequest(self: *Self, client: std.posix.socket_t, path: []const u8, request: []const u8, cors_headers: ?[]const u8) void {
         // Security: prevent path traversal
         if (std.mem.indexOf(u8, path, "..") != null) {
             self.sendError(client, .bad_request, "Invalid path");
@@ -268,7 +268,7 @@ pub const DashboardServer = struct {
 
         // Try to get embedded asset (handles SPA routing internally)
         if (assets.get(path)) |asset| {
-            self.sendResponseRaw(client, .ok, asset.mime_type, asset.content, cors_headers, asset.is_precompressed);
+            self.sendAsset(client, asset, request, cors_headers);
             return;
         }
 
@@ -276,9 +276,26 @@ pub const DashboardServer = struct {
         self.sendError(client, .not_found, "Dashboard not available");
     }
 
-    fn sendResponse(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: http.ContentType, body_data: []const u8, cors_headers: ?[]const u8) void {
-        self.sendResponseRaw(client, status, content_type.toString(), body_data, cors_headers, false);
+    /// The gzipped copy only to a client that accepts gzip. Either answer
+    /// says it depends on Accept-Encoding, so a cache keeps them apart.
+    fn sendAsset(self: *Self, client: std.posix.socket_t, asset: assets.Asset, request: []const u8, cors_headers: ?[]const u8) void {
+        const gz = if (asset.gzip) |g| (if (acceptsGzip(headerValue(request, "accept-encoding"))) g else null) else null;
+        self.sendResponseRaw(client, .ok, asset.mime_type, gz orelse asset.content, cors_headers, .{
+            .gzip = gz != null,
+            .vary_encoding = asset.gzip != null,
+        });
     }
+
+    fn sendResponse(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: http.ContentType, body_data: []const u8, cors_headers: ?[]const u8) void {
+        self.sendResponseRaw(client, status, content_type.toString(), body_data, cors_headers, .{});
+    }
+
+    const Encoding = struct {
+        /// The body is gzipped.
+        gzip: bool = false,
+        /// Another Accept-Encoding would have got a different body.
+        vary_encoding: bool = false,
+    };
 
     /// On every response the dashboard writes: no framing by another site,
     /// no MIME sniffing.
@@ -286,7 +303,7 @@ pub const DashboardServer = struct {
         "Content-Security-Policy: frame-ancestors 'none'\r\n" ++
         "X-Content-Type-Options: nosniff\r\n";
 
-    fn sendResponseRaw(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body_data: []const u8, cors_headers: ?[]const u8, gzip: bool) void {
+    fn sendResponseRaw(self: *Self, client: std.posix.socket_t, status: http.StatusCode, content_type: []const u8, body_data: []const u8, cors_headers: ?[]const u8, encoding: Encoding) void {
         var hdr_buf: [1024]u8 = undefined;
         const response = std.fmt.bufPrint(
             &hdr_buf,
@@ -295,10 +312,18 @@ pub const DashboardServer = struct {
                 "{s}" ++
                 "Content-Length: {d}\r\n" ++
                 security_headers ++
-                "{s}{s}" ++
+                "{s}{s}{s}" ++
                 "Connection: close\r\n" ++
                 "\r\n",
-            .{ status.statusLine(), content_type, if (gzip) "Content-Encoding: gzip\r\n" else "", body_data.len, cors_headers orelse "", self.varyOnly(cors_headers) },
+            .{
+                status.statusLine(),
+                content_type,
+                if (encoding.gzip) "Content-Encoding: gzip\r\n" else "",
+                body_data.len,
+                cors_headers orelse "",
+                self.varyOnly(cors_headers),
+                if (encoding.vary_encoding) "Vary: Accept-Encoding\r\n" else "",
+            },
         ) catch return;
 
         http.serve.writeAll(client, response) catch return;
@@ -503,6 +528,36 @@ fn headerValue(request: []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Whether an Accept-Encoding value accepts gzip: `gzip` or `*` with a
+/// nonzero q, where an explicit `gzip` outranks `*`. No header accepts only
+/// the raw bytes.
+fn acceptsGzip(accept_encoding: ?[]const u8) bool {
+    const value = accept_encoding orelse return false;
+    var star: ?bool = null;
+    var codings = std.mem.splitScalar(u8, value, ',');
+    while (codings.next()) |raw| {
+        var params = std.mem.splitScalar(u8, raw, ';');
+        const coding = std.mem.trim(u8, params.first(), " \t");
+        var accepted = true;
+        while (params.next()) |param| {
+            const p = std.mem.trim(u8, param, " \t");
+            if (p.len >= 2 and std.ascii.toLower(p[0]) == 'q' and p[1] == '=') accepted = !qIsZero(p[2..]);
+        }
+        if (std.ascii.eqlIgnoreCase(coding, "gzip")) return accepted;
+        if (std.mem.eql(u8, coding, "*")) star = accepted;
+    }
+    return star orelse false;
+}
+
+/// A qvalue of zero: `0`, `0.`, `0.0`, up to three zero decimals.
+fn qIsZero(q: []const u8) bool {
+    if (q.len == 0 or q[0] != '0') return false;
+    if (q.len == 1) return true;
+    if (q[1] != '.') return false;
+    for (q[2..]) |c| if (c != '0') return false;
+    return true;
 }
 
 /// `host[:port]` without the port; `[::1]:9002` keeps its brackets.
@@ -746,6 +801,66 @@ fn answerFor(srv: *DashboardServer, request: []const u8, buf: []u8) ![]const u8 
         len += @intCast(n);
     }
     return buf[0..len];
+}
+
+test "dashboard: gzip is accepted only when Accept-Encoding names it, or *, with a nonzero q" {
+    const yes = [_][]const u8{ "gzip", "GZIP", "deflate, gzip;q=0.5", "gzip;q=1", " br , gzip ", "*", "br, *;q=0.1", "gzip;q=0.001" };
+    const no = [_][]const u8{ "", "gzip;q=0", "gzip; q=0.000", "gzip;Q=0.", "*;q=0", "gzip;q=0, *", "br", "identity", "x-gzip", "deflate;q=0.5" };
+    try std.testing.expect(!acceptsGzip(null));
+    for (yes) |v| std.testing.expect(acceptsGzip(v)) catch |err| {
+        std.debug.print("expected gzip accepted for \"{s}\"\n", .{v});
+        return err;
+    };
+    for (no) |v| std.testing.expect(!acceptsGzip(v)) catch |err| {
+        std.debug.print("expected gzip refused for \"{s}\"\n", .{v});
+        return err;
+    };
+}
+
+/// What the dashboard sends for `asset` asked for with `request`.
+fn assetAnswer(srv: *DashboardServer, asset: assets.Asset, request: []const u8, buf: []u8) ![]const u8 {
+    var pair: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    defer _ = std.c.close(pair[1]);
+    srv.sendAsset(pair[0], asset, request, null);
+    _ = std.c.close(pair[0]);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = std.c.read(pair[1], buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    return buf[0..len];
+}
+
+test "dashboard: an asset's gzipped copy goes only to a client that accepts gzip, and both answers vary on Accept-Encoding" {
+    var srv = testServer(.{});
+    var buf: [1024]u8 = undefined;
+    const both: assets.Asset = .{ .content = "RAW-BYTES", .mime_type = "text/css", .gzip = "GZ" };
+
+    var a = try assetAnswer(&srv, both, "GET /x.css HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Content-Encoding: gzip\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Vary: Accept-Encoding\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Content-Length: 2\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, a, "\r\n\r\nGZ"));
+
+    for ([_][]const u8{
+        "GET /x.css HTTP/1.1\r\n\r\n",
+        "GET /x.css HTTP/1.1\r\nAccept-Encoding: gzip;q=0\r\n\r\n",
+        "GET /x.css HTTP/1.1\r\nAccept-Encoding: br\r\n\r\n",
+    }) |req| {
+        a = try assetAnswer(&srv, both, req, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, a, "Content-Encoding") == null);
+        try std.testing.expect(std.mem.indexOf(u8, a, "Vary: Accept-Encoding\r\n") != null);
+        try std.testing.expect(std.mem.endsWith(u8, a, "\r\n\r\nRAW-BYTES"));
+    }
+
+    // An asset with no gzipped copy (an image) is the same for everyone.
+    const raw_only: assets.Asset = .{ .content = "PNG", .mime_type = "image/png" };
+    a = try assetAnswer(&srv, raw_only, "GET /x.png HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Content-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Accept-Encoding") == null);
+    try std.testing.expect(std.mem.endsWith(u8, a, "\r\n\r\nPNG"));
 }
 
 test "dashboard: until the shards are wired the data APIs answer replaying, while health, ready and cluster stats answer" {
