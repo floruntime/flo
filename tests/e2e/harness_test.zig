@@ -159,3 +159,50 @@ test "harness: an async command freed before it is awaited is stopped, and its t
     (try ctx.cli.runAsync(&.{ "kv", "get", "harness_never_set", "--wait-ms", "300000" })).deinit();
     try testing.expect(stdx.time.monotonicMs() - t1 < 3_000);
 }
+
+test "harness: a test process that dies without cleanup takes its servers with it" {
+    // e2e-orphan, installed beside flo, starts a server and an async
+    // `server start`, prints both pids and SIGKILLs itself: no deinit, no
+    // stop, as when the runner kills a test at its time limit.
+    const flo = try stdx.testing.findFloBinary(testing.allocator);
+    defer testing.allocator.free(flo);
+    const helper = try std.fmt.allocPrint(testing.allocator, "{s}/e2e-orphan", .{std.fs.path.dirname(flo).?});
+    defer testing.allocator.free(helper);
+
+    var child = stdx.process.Child.init(&.{helper}, testing.allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var err_out: std.ArrayList(u8) = .empty;
+    defer err_out.deinit(testing.allocator);
+    try child.collectOutput(testing.allocator, &out, &err_out, 64 * 1024);
+    const term = try child.wait();
+    if (term != .Signal or term.Signal != 9) std.debug.print("e2e-orphan: {any}\n{s}\n", .{ term, err_out.items });
+    try testing.expect(term == .Signal and term.Signal == 9);
+
+    var fields = std.mem.tokenizeAny(u8, out.items, " \n");
+    var n: usize = 0;
+    var left: usize = 0;
+    while (n < 2) : (n += 1) {
+        const pid = try std.fmt.parseInt(std.c.pid_t, fields.next() orelse break, 10);
+        var gone = false;
+        for (0..200) |_| {
+            if (processGone(pid)) {
+                gone = true;
+                break;
+            }
+            stdx.time.sleep(10 * std.time.ns_per_ms);
+        }
+        // Killed here so a failing run leaves nothing behind either.
+        if (!gone) {
+            left += 1;
+            _ = std.c.kill(pid, .KILL);
+        }
+    }
+    // Both servers' data, left behind by the helper's death.
+    if (fields.next()) |data_dir| try stdx.fs.deleteTree(data_dir);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 0), left);
+}
