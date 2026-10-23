@@ -3,6 +3,7 @@ const silent_loss = @import("../node/silent_loss.zig");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 const StreamMetrics = @import("../stream/metrics.zig").Metrics;
+const MAX_SHARDS = @import("../config/server.zig").MAX_SHARDS;
 
 // =============================================================================
 // Queue Metrics — imported from src/queue/metrics.zig
@@ -15,8 +16,9 @@ pub const QueueMetrics = @import("../queue/metrics.zig").Metrics;
 
 /// KV namespace-level metrics for observability
 pub const KVMetrics = struct {
-    /// Total keys (approximate, updated on set/delete)
-    key_count: Atomic(u64) = Atomic(u64).init(0),
+    /// Live keys in this namespace, as each shard last published from its
+    /// projection; indexed by shard id. The gauge is their sum.
+    live_keys: [MAX_SHARDS]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Total GET operations
     get_ops_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total SET operations
@@ -34,29 +36,18 @@ pub const KVMetrics = struct {
         _ = self.get_ops_total.fetchAdd(1, .monotonic);
     }
 
-    pub fn recordSet(self: *KVMetrics, bytes: u64, is_new: bool) void {
+    pub fn recordSet(self: *KVMetrics, bytes: u64) void {
         _ = self.set_ops_total.fetchAdd(1, .monotonic);
         _ = self.bytes_stored.fetchAdd(bytes, .monotonic);
-        if (is_new) {
-            _ = self.key_count.fetchAdd(1, .monotonic);
-        }
     }
 
     pub fn recordDelete(self: *KVMetrics) void {
         _ = self.delete_ops_total.fetchAdd(1, .monotonic);
-        // key_count decremented if key existed (caller should check)
     }
 
-    pub fn decrementKeyCount(self: *KVMetrics) void {
-        // Saturate at zero. Recovery rebuilds keys without going through
-        // recordSet, so key_count can be 0 while keys exist on disk — an
-        // unguarded fetchSub would wrap to u64 max and export a nonsense gauge.
-        var cur = self.key_count.load(.monotonic);
-        while (cur > 0) {
-            if (self.key_count.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
-                cur = actual;
-            } else return;
-        }
+    /// Shard `shard_id`'s live key count for this namespace.
+    pub fn publishLiveKeys(self: *KVMetrics, shard_id: u16, count: u64) void {
+        self.live_keys[shard_id].store(count, .monotonic);
     }
 
     pub const Snapshot = struct {
@@ -69,7 +60,11 @@ pub const KVMetrics = struct {
 
     pub fn snapshot(self: *const KVMetrics) Snapshot {
         return .{
-            .key_count = self.key_count.load(.monotonic),
+            .key_count = blk: {
+                var sum: u64 = 0;
+                for (&self.live_keys) |*n| sum += n.load(.monotonic);
+                break :blk sum;
+            },
             .get_ops_total = self.get_ops_total.load(.monotonic),
             .set_ops_total = self.set_ops_total.load(.monotonic),
             .delete_ops_total = self.delete_ops_total.load(.monotonic),
@@ -855,7 +850,9 @@ pub const MetricsRegistry = struct {
 
     /// Registered KV namespace metrics
     /// Key format: "{namespace}"
-    kv_namespaces: std.StringHashMap(KVEntry),
+    /// Entries on the heap: shards hold their metrics' address while
+    /// another shard's registration grows the map.
+    kv_namespaces: std.StringHashMap(*KVEntry),
 
     /// Registered tiered log metrics
     /// Key: group_id (Raft group)
@@ -908,7 +905,7 @@ pub const MetricsRegistry = struct {
             .server = ServerMetrics.init(),
             .streams = std.StringHashMap(StreamEntry).init(allocator),
             .queues = std.StringHashMap(QueueEntry).init(allocator),
-            .kv_namespaces = std.StringHashMap(KVEntry).init(allocator),
+            .kv_namespaces = std.StringHashMap(*KVEntry).init(allocator),
             .tiered_logs = std.AutoHashMap(u32, TieredLogEntry).init(allocator),
             .workflow = WorkflowMetrics.init(),
             .processing = ProcessingMetrics.init(),
@@ -960,7 +957,8 @@ pub const MetricsRegistry = struct {
         }
         var kv_value_iter = self.kv_namespaces.valueIterator();
         while (kv_value_iter.next()) |entry| {
-            self.allocator.free(entry.namespace);
+            self.allocator.free(entry.*.namespace);
+            self.allocator.destroy(entry.*);
         }
         self.kv_namespaces.deinit();
 
@@ -1091,19 +1089,25 @@ pub const MetricsRegistry = struct {
         errdefer self.allocator.free(key);
 
         // Check if already registered
-        if (self.kv_namespaces.getPtr(key)) |existing| {
+        if (self.kv_namespaces.get(key)) |existing| {
             self.allocator.free(key);
             return &existing.metrics;
         }
 
-        // Create new entry
-        const entry = KVEntry{
-            .namespace = try self.allocator.dupe(u8, namespace),
-            .metrics = KVMetrics.init(),
-        };
-
+        const entry = try self.allocator.create(KVEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{ .namespace = try self.allocator.dupe(u8, namespace), .metrics = KVMetrics.init() };
+        errdefer self.allocator.free(entry.namespace);
         try self.kv_namespaces.put(key, entry);
-        return &self.kv_namespaces.getPtr(key).?.metrics;
+        return &entry.metrics;
+    }
+
+    /// Live keys in `namespace`, summed across the shards that published.
+    pub fn kvLiveKeys(self: *MetricsRegistry, namespace: []const u8) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.kv_namespaces.get(namespace) orelse return 0;
+        return entry.metrics.snapshot().key_count;
     }
 
     /// Register a tiered log (Raft group) and return a pointer to its metrics
@@ -1208,11 +1212,11 @@ pub const MetricsRegistry = struct {
         // Export KV metrics, one series set per namespace.
         var kv_iter = self.kv_namespaces.valueIterator();
         while (kv_iter.next()) |entry| {
-            const kv_snapshot = entry.metrics.snapshot();
+            const kv_snapshot = entry.*.metrics.snapshot();
             const kv_labels = try std.fmt.allocPrint(
                 allocator,
                 "namespace=\"{s}\"",
-                .{entry.namespace},
+                .{entry.*.namespace},
             );
             defer allocator.free(kv_labels);
             try writeKVMetrics(writer, kv_snapshot, kv_labels);
@@ -1353,7 +1357,7 @@ fn writeKVMetrics(
     snapshot: KVMetrics.Snapshot,
     labels: []const u8,
 ) !void {
-    try writer.print("# HELP flo_kv_keys Current keys stored in this namespace\n", .{});
+    try writer.print("# HELP flo_kv_keys Keys stored in this namespace: those written and not deleted, a key past its TTL included until it is deleted or overwritten\n", .{});
     try writer.print("# TYPE flo_kv_keys gauge\n", .{});
     try writer.print("flo_kv_keys{{{s}}} {d}\n", .{ labels, snapshot.key_count });
 

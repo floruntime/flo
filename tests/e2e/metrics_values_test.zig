@@ -243,3 +243,47 @@ test "e2e/metrics: kv key count does not wrap when deleting a recovered key" {
     const keys = seriesValue(resp.body, "flo_kv_keys", "default") orelse 0;
     try testing.expect(keys < 1_000_000);
 }
+
+/// `flo_kv_keys` for `namespace`, once the shards have published `want`.
+fn awaitKvKeys(ctx: *stdx.testing.TestContext, namespace: []const u8, want: u64) !?u64 {
+    var label_buf: [64]u8 = undefined;
+    const label = try std.fmt.bufPrint(&label_buf, "namespace=\"{s}\"", .{namespace});
+    var got: ?u64 = null;
+    for (0..50) |_| {
+        var http = try ctx.createMetricsHttp();
+        defer http.deinit();
+        var resp = try http.get("/metrics");
+        defer resp.deinit();
+        got = seriesValue(resp.body, "flo_kv_keys", label);
+        if (got == want) return got;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return got;
+}
+
+test "e2e/metrics: flo_kv_keys counts the live keys, across shards and a restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true, .shards = 2, .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    const Step = struct { args: []const []const u8, keys: u64 };
+    for ([_]Step{
+        .{ .args = &.{ "kv", "set", "a", "1" }, .keys = 1 },
+        .{ .args = &.{ "kv", "set", "b", "1" }, .keys = 2 },
+        .{ .args = &.{ "kv", "set", "a", "2" }, .keys = 2 },
+        .{ .args = &.{ "kv", "delete", "missing" }, .keys = 2 },
+        .{ .args = &.{ "kv", "delete", "a" }, .keys = 1 },
+        .{ .args = &.{ "kv", "set", "a", "3" }, .keys = 2 },
+        .{ .args = &.{ "kv", "incr", "n" }, .keys = 3 },
+    }) |step| {
+        var r = try ctx.cli.run(step.args);
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        try testing.expectEqual(@as(?u64, step.keys), try awaitKvKeys(ctx, "default", step.keys));
+    }
+
+    // A restart rebuilds the count from the log.
+    try ctx.restartServer();
+    try testing.expectEqual(@as(?u64, 3), try awaitKvKeys(ctx, "default", 3));
+}
