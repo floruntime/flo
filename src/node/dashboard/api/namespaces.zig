@@ -246,16 +246,16 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
 
     // The first page of the namespace's key names, read as a client over
     // loopback: the projections are their shards' alone to read. A read
-    // that fails leaves the list empty and says why.
+    // that fails says why, beside the names it got.
     {
         var kv_arr = try obj.arrayField("kv_keys");
         try kv_arr.begin();
         var more = false;
         var failed: ?[]const u8 = null;
-        if (kv_api.loopbackRead(allocator, ctx)) |client_| {
-            var client = client_;
-            defer client.deinit();
-            if (client.call(kv_ops.op("kv.scan"), name, "", .{ .limit = KV_KEYS_SHOWN, .cursor = "" })) |resp_| {
+        if (kv_api.Reader.open(allocator, ctx)) |reader_| {
+            var reader = reader_;
+            defer reader.deinit();
+            if (reader.call(kv_ops.op("kv.scan"), name, "", .{ .limit = KV_KEYS_SHOWN, .cursor = "" })) |resp_| {
                 var resp = resp_;
                 defer resp.deinit();
                 if (resp.isError()) {
@@ -264,7 +264,11 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
                     var diag: schema.Diagnostic = .{};
                     if (kv_ops.op("kv.scan").response.decodeAll(resp.data, &diag)) |page| {
                         var it = page.names.iterator();
-                        while (it.next() catch null) |key| {
+                        while (true) {
+                            const key = it.next() catch {
+                                failed = "KV scan: malformed answer";
+                                break;
+                            } orelse break;
                             try kv_arr.next();
                             var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                             try kobj.begin();
@@ -274,8 +278,8 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
                         more = page.cursor != null;
                     } else |_| failed = "KV scan: malformed answer";
                 }
-            } else |_| failed = "KV scan failed";
-        } else |_| failed = "Loopback connect failed";
+            } else |err| failed = timedOutOr(err, "KV scan failed");
+        } else |err| failed = timedOutOr(err, "Loopback connect failed");
         try kv_arr.end();
         try obj.boolField("kv_keys_more", more);
         if (failed) |why| try obj.stringField("kv_keys_error", why);
@@ -283,6 +287,13 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
 
     try obj.end();
     return try json_aw.toOwnedSlice();
+}
+
+fn timedOutOr(err: anyerror, otherwise: []const u8) []const u8 {
+    return switch (err) {
+        error.OutOfTime, error.ConnectionTimedOut => "KV scan: the node didn't answer in time",
+        else => otherwise,
+    };
 }
 
 /// GET /namespaces/:ns/streams - Streams in namespace

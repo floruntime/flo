@@ -174,6 +174,13 @@ fn refuse(allocator: std.mem.Allocator, c: *Conn, status: []const u8) void {
 /// response, however many writes it takes.
 threadlocal var write_deadline_ms: i64 = 0;
 
+/// Milliseconds left before the response being handled must be written,
+/// for a handler that waits on others to keep inside it; null outside one.
+pub fn responseMsLeft() ?i64 {
+    if (write_deadline_ms == 0) return null;
+    return write_deadline_ms - nowMs();
+}
+
 fn dispatch(allocator: std.mem.Allocator, c: *Conn, handler: anytype, bytes: []const u8) void {
     write_deadline_ms = nowMs() + WRITE_TIMEOUT_MS;
     defer write_deadline_ms = 0;
@@ -234,8 +241,11 @@ const Echo = struct {
     chunk_delay_ms: u64 = 0,
     /// When the last answer was given up or finished.
     done_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// What `responseMsLeft` said as the last answer began.
+    left_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
     fn handle(self: *Echo, fd: posix.socket_t, bytes: []const u8) void {
         _ = self.served.fetchAdd(1, .monotonic);
+        self.left_ms.store(responseMsLeft() orelse -1, .release);
         defer self.done_ms.store(nowMs(), .release);
         const tail = bytes[bytes.len - @min(bytes.len, self.last.len) ..];
         @memcpy(self.last[0..tail.len], tail);
@@ -302,6 +312,22 @@ test "serve: clients that connect and send nothing hold up no one, even past the
     try testing.expectEqualStrings("200", try get(l.port));
     try testing.expect(nowMs() - start < READ_TIMEOUT_MS);
     try testing.expectEqual(@as(u32, 1), echo.served.load(.monotonic));
+}
+
+test "serve: a handler sees what is left of its response's deadline, and none outside one" {
+    try testing.expectEqual(@as(?i64, null), responseMsLeft());
+    const l = try listenLocal();
+    var running = std.atomic.Value(bool).init(true);
+    var echo = Echo{};
+    const t = try std.Thread.spawn(.{}, serve, .{ testing.allocator, l.fd, &running, &echo, MAX_REQUEST });
+    defer {
+        running.store(false, .release);
+        t.join();
+        _ = std.c.close(l.fd);
+    }
+    try testing.expectEqualStrings("200", try get(l.port));
+    const left = echo.left_ms.load(.acquire);
+    try testing.expect(left > 0 and left <= WRITE_TIMEOUT_MS);
 }
 
 test "serve: a connection that has not sent its whole request in time is closed" {

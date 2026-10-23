@@ -16,6 +16,8 @@ const client_mod = @import("../../../cli/client/mod.zig");
 const schema = @import("../../../protocol/schema.zig");
 const kv_ops = @import("../../../protocol/kv_ops.zig");
 const reply_pool = @import("../../reply_pool.zig");
+const serve = @import("../../../util/http/serve.zig");
+const stdx = @import("stdx");
 
 /// GET /kv/namespaces - List all KV namespaces with stats
 pub fn getKVNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
@@ -86,12 +88,11 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
     else
         "";
 
-    var client = loopbackRead(allocator, ctx) catch
-        return try h.jsonError(allocator, "Loopback connect failed");
-    defer client.deinit();
+    var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV scan", err);
+    defer reader.deinit();
 
-    var scanned = client.call(kv_ops.op("kv.scan"), namespace, prefix, .{ .limit = @max(limit, 1), .cursor = cursor }) catch
-        return try h.jsonError(allocator, "KV scan failed");
+    var scanned = reader.call(kv_ops.op("kv.scan"), namespace, prefix, .{ .limit = @max(limit, 1), .cursor = cursor }) catch |err|
+        return try readFailed(allocator, "KV scan", err);
     defer scanned.deinit();
     if (scanned.isError()) return try h.jsonError(allocator, scanned.errorMessage());
     var diag: schema.Diagnostic = .{};
@@ -116,13 +117,16 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
         var names: [MAX_PAGE][]const u8 = undefined;
         var n: usize = 0;
         var it = page.names.iterator();
-        while (it.next() catch return try h.jsonError(allocator, "KV scan: malformed answer")) |name| : (n += 1) names[n] = name;
+        while (it.next() catch return try h.jsonError(allocator, "KV scan: malformed answer")) |name| : (n += 1) {
+            if (n == names.len) return try h.jsonError(allocator, "KV scan: more names than asked for");
+            names[n] = name;
+        }
         var from: usize = 0;
         while (from < n) {
             var list = Keys.Builder.init(keys_buf);
             for (names[from..n]) |name| if (!(try list.add(name))) break;
-            var got = client.call(kv_ops.op("kv.mget"), namespace, "", .{ .keys = list.value(), .routing_key = null }) catch
-                return try h.jsonError(allocator, "KV mget failed");
+            var got = reader.call(kv_ops.op("kv.mget"), namespace, "", .{ .keys = list.value(), .routing_key = null }) catch |err|
+                return try readFailed(allocator, "KV mget", err);
             defer got.deinit();
             if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
             const answer = kv_ops.op("kv.mget").response.decodeAll(got.data, &diag) catch
@@ -167,11 +171,10 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
 
 /// GET /kv/namespaces/:ns/keys/:key - Get a specific key's value
 pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u8, ctx: *DashboardContext) ![]const u8 {
-    var client = loopbackRead(allocator, ctx) catch
-        return try h.jsonError(allocator, "Loopback connect failed");
-    defer client.deinit();
-    var got = client.call(kv_ops.op("kv.get"), namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch
-        return try h.jsonError(allocator, "KV get failed");
+    var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV get", err);
+    defer reader.deinit();
+    var got = reader.call(kv_ops.op("kv.get"), namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch |err|
+        return try readFailed(allocator, "KV get", err);
     defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -203,11 +206,10 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 10, 1, kv_ops.MAX_HISTORY);
 
-    var client = loopbackRead(allocator, ctx) catch
-        return try h.jsonError(allocator, "Loopback connect failed");
-    defer client.deinit();
-    var got = client.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .routing_key = null }) catch
-        return try h.jsonError(allocator, "KV history failed");
+    var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV history", err);
+    defer reader.deinit();
+    var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .routing_key = null }) catch |err|
+        return try readFailed(allocator, "KV history", err);
     defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -245,15 +247,55 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     return try json_aw.toOwnedSlice();
 }
 
-/// The longest a dashboard read waits for its answer over loopback: the
-/// node's own read deadline, and a second to spare.
-const LOOPBACK_READ_TIMEOUT_SEC: u32 = @intCast(reply_pool.DEADLINE_MS / std.time.ms_per_s + 1);
+/// The longest one loopback read waits for its answer: the node's own read
+/// deadline, and a second to spare.
+const LOOPBACK_READ_TIMEOUT_MS: i64 = reply_pool.DEADLINE_MS + std.time.ms_per_s;
+/// Kept back from a request's time to write its answer.
+const WRITE_ROOM_MS: i64 = 500;
 
-/// A loopback client for a read, with its read timeout.
-pub fn loopbackRead(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
-    var client = try loopbackConnect(allocator, ctx);
-    client.setReadTimeoutSec(LOOPBACK_READ_TIMEOUT_SEC);
-    return client;
+/// A loopback client for one request's reads. The request has one budget,
+/// its response's deadline less room to write: every read waits only for
+/// what is left of it, so a request of many reads still answers in time,
+/// and the dashboard thread is never held past it.
+pub const Reader = struct {
+    client: client_mod.Client,
+    deadline_ms: i64,
+
+    pub fn open(allocator: Allocator, ctx: *DashboardContext) !Reader {
+        const left = serve.responseMsLeft() orelse LOOPBACK_READ_TIMEOUT_MS + WRITE_ROOM_MS;
+        return openUntil(allocator, ctx, nowMs() + left - WRITE_ROOM_MS);
+    }
+
+    fn openUntil(allocator: Allocator, ctx: *DashboardContext, deadline_ms: i64) !Reader {
+        if (deadline_ms <= nowMs()) return error.OutOfTime;
+        return .{ .client = try loopbackConnect(allocator, ctx), .deadline_ms = deadline_ms };
+    }
+
+    pub fn deinit(self: *Reader) void {
+        self.client.deinit();
+    }
+
+    pub fn call(self: *Reader, comptime op: @import("../../../protocol/ops.zig").Op, namespace: []const u8, key: []const u8, body: op.request.Value) !client_mod.Response {
+        const left = self.deadline_ms - nowMs();
+        if (left <= 0) return error.OutOfTime;
+        self.client.setReadTimeoutMs(@intCast(@min(left, LOOPBACK_READ_TIMEOUT_MS)));
+        return self.client.call(op, namespace, key, body);
+    }
+
+    fn nowMs() i64 {
+        return @intCast(stdx.time.monotonicMs());
+    }
+};
+
+/// The answer to a read that didn't come back; the console keeps what it
+/// last showed, marked stale.
+pub fn readFailed(allocator: Allocator, what: []const u8, err: anyerror) ![]const u8 {
+    const msg = switch (err) {
+        error.OutOfTime, error.ConnectionTimedOut => try std.fmt.allocPrint(allocator, "{s}: the node didn't answer in time", .{what}),
+        else => try std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ what, @errorName(err) }),
+    };
+    defer allocator.free(msg);
+    return h.jsonError(allocator, msg);
 }
 
 /// Connect a short-lived loopback client to the node's own protocol port.
@@ -429,4 +471,17 @@ test "deleteKVKey surfaces loopback connect failure (no node in unit test)" {
     const result = try deleteKVKey(allocator, "default", "k", &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+}
+
+test "Reader: a request whose time is spent reads nothing, and says it timed out" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: a connect would be refused
+
+    try std.testing.expectError(error.OutOfTime, Reader.openUntil(allocator, &ctx, Reader.nowMs()));
+    const answer = try readFailed(allocator, "KV scan", error.OutOfTime);
+    defer allocator.free(answer);
+    try std.testing.expectEqualStrings("{\"error\":\"KV scan: the node didn't answer in time\"}", answer);
 }

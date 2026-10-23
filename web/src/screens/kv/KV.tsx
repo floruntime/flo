@@ -36,7 +36,9 @@ export function KV() {
   const [delOpen, setDelOpen] = useState(false)
 
   const keysQ = useKVKeys(ns, search)
-  const keys = keysQ.data?.keys ?? []
+  const keys = keysQ.data?.pages.flatMap((p) => p.keys) ?? []
+  // A refresh that fails keeps the keys last loaded, marked stale.
+  const stale = keysQ.isError && keysQ.data !== undefined
   const detailQ = useKVKey(ns, sel)
   const historyQ = useKVHistory(ns, sel)
   const put = usePutKVKey(ns)
@@ -50,7 +52,6 @@ export function KV() {
 
   const detail = detailQ.data
   const versions = historyQ.data?.versions ?? []
-  const maxLsn = keys.reduce((m, k) => Math.max(m, k.version), 0)
   const totalBytes = keys.reduce((a, k) => a + k.size, 0)
   const value = detail?.found ? detail.value ?? '' : ''
   const counter = detail?.found && isCounter(value)
@@ -78,7 +79,7 @@ export function KV() {
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <Field
               wrapStyle={{ width: 220 }}
-              placeholder="Search keys…"
+              placeholder="Key prefix…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               trailing={
@@ -97,26 +98,34 @@ export function KV() {
       </div>
 
       <Stats>
-        <Stat label="Keys" value={keysQ.isLoading ? '…' : (keysQ.data?.count ?? 0).toLocaleString()} sub={`${ns} namespace`} />
+        <Stat
+          label="Keys"
+          value={keysQ.isLoading ? '…' : keys.length.toLocaleString() + (keysQ.hasNextPage ? '+' : '')}
+          sub={keysQ.hasNextPage ? 'loaded so far' : `${ns} namespace`}
+        />
         <Stat label="Stored" value={(totalBytes / 1024).toFixed(1)} unit="KB" sub="across listed keys" />
-        <Stat label="Max LSN" value={maxLsn.toLocaleString()} sub="latest write" />
         <Stat label="Namespace" value={<span className="mono" style={{ fontSize: 18 }}>{ns}</span>} />
       </Stats>
 
       <div className="sec" style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 20, alignItems: 'start' }}>
-        {keysQ.isError ? (
+        {keysQ.isError && !stale ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--crit)', padding: '44px 20px' }}>
-            Failed to load keys. Is the server running?
+            Failed to load keys: {keysQ.error.message}
           </div>
         ) : keys.length === 0 ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '44px 20px' }}>
-            {keysQ.isLoading ? 'Loading…' : <>No keys{search ? <> match “{search}”</> : <> in <span className="mono">{ns}</span></>}</>}
+            {keysQ.isLoading ? 'Loading…' : <>No keys{search ? <> start with “{search}”</> : <> in <span className="mono">{ns}</span></>}</>}
           </div>
         ) : (
           <div className="list" style={{ minWidth: 0 }}>
+            {stale && (
+              <div className="li" style={{ color: 'var(--crit)', fontSize: 12 }}>
+                Stale: couldn’t refresh ({keysQ.error?.message}). Showing the keys last loaded.
+              </div>
+            )}
             <div className="li head" style={{ gridTemplateColumns: '1fr 72px 60px 30px' }}>
               <div className="c">Key</div>
-              <div className="c r">LSN</div>
+              <div className="c r">Version</div>
               <div className="c r">Size</div>
               <div />
             </div>
@@ -137,6 +146,13 @@ export function KV() {
                 </button>
               </div>
             ))}
+            {keysQ.hasNextPage && (
+              <div className="li" style={{ justifyContent: 'center' }}>
+                <Button style={{ padding: '5px 11px', fontSize: 12 }} onClick={() => keysQ.fetchNextPage()} disabled={keysQ.isFetchingNextPage}>
+                  {keysQ.isFetchingNextPage ? 'Loading…' : 'Load more'}
+                </Button>
+              </div>
+            )}
           </div>
         )}
 

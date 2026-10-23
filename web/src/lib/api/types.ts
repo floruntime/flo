@@ -70,7 +70,7 @@ export interface MetricsInfo {
 export interface KVKeyListItem {
   key: string
   size: number
-  /** Entry LSN (not the MVCC version count). */
+  /** The key's MVCC version. */
   version: number
 }
 export interface KVKeysResponse {

@@ -178,6 +178,15 @@ pub const Client = struct {
         }
     }
 
+    /// Set the socket read timeout in milliseconds; at least one. Must be
+    /// called after connect().
+    pub fn setReadTimeoutMs(self: *Self, ms: u32) void {
+        const stream = self.stream orelse return;
+        const at_least = @max(ms, 1);
+        const tv = posix.timeval{ .sec = @intCast(at_least / 1000), .usec = @intCast((at_least % 1000) * 1000) };
+        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    }
+
     /// Send a request and receive response (low-level)
     pub fn sendRequest(
         self: *Self,
