@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const path_segments = @import("path_segments.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -45,22 +46,14 @@ pub const JsonKeyByOperator = struct {
     /// Also accepts plain field names without "$." prefix for convenience.
     /// Dupes all borrowed strings — safe to free the source after init.
     pub fn init(allocator: Allocator, name: []const u8, key_expression: []const u8) !Self {
-        // Strip "$." prefix if present
-        const field_path = if (std.mem.startsWith(u8, key_expression, "$."))
-            key_expression[2..]
-        else
-            key_expression;
-
-        // Pre-split dotted path for efficient evaluation (owned copies)
-        var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        var iter = std.mem.splitScalar(u8, field_path, '.');
-        while (iter.next()) |seg| {
-            if (seg.len > 0) try seg_list.append(allocator, try allocator.dupe(u8, seg));
-        }
+        const segments = try path_segments.splitOwned(allocator, key_expression, .skip);
+        errdefer path_segments.free(allocator, segments);
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
         return .{
-            .name = try allocator.dupe(u8, name),
+            .name = owned_name,
             .key_expression = try allocator.dupe(u8, key_expression),
-            .segments = try seg_list.toOwnedSlice(allocator),
+            .segments = segments,
         };
     }
 

@@ -3098,6 +3098,7 @@ pub const Shard = struct {
         if (self.shard_metrics) |sm| {
             sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
             sm.processing_failed_jobs.store(self.processing_handler.failed_jobs, .monotonic);
+            sm.processing_held_jobs.store(self.processing_handler.held_jobs, .monotonic);
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
         }
         const slot = self.health orelse return;

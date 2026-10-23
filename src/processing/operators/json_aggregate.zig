@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const path_segments = @import("path_segments.zig");
 const Operator = @import("../operator.zig").Operator;
 const OperatorContext = @import("../context.zig").OperatorContext;
 const record_mod = @import("../record.zig");
@@ -145,20 +146,11 @@ pub const JsonAggregateOperator = struct {
         field_expression: ?[]const u8,
         window: WindowConfig,
     ) !Self {
-        // Split JSONPath field expression into segments (owned copies)
-        const segments: ?[]const []const u8 = if (field_expression) |expr| blk: {
-            const field_path = if (std.mem.startsWith(u8, expr, "$."))
-                expr[2..]
-            else
-                expr;
-
-            var seg_list: std.ArrayListUnmanaged([]const u8) = .empty;
-            var iter = std.mem.splitScalar(u8, field_path, '.');
-            while (iter.next()) |seg| {
-                if (seg.len > 0) try seg_list.append(allocator, try allocator.dupe(u8, seg));
-            }
-            break :blk try seg_list.toOwnedSlice(allocator);
-        } else null;
+        const segments: ?[]const []const u8 = if (field_expression) |expr|
+            try path_segments.splitOwned(allocator, expr, .skip)
+        else
+            null;
+        errdefer if (segments) |segs| path_segments.free(allocator, segs);
 
         return .{
             .name = try allocator.dupe(u8, name),

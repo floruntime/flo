@@ -69,6 +69,9 @@ pub const Result = struct {
     bytes: [RESULT_MAX]u8 = undefined,
     refused_status: ?proto.StatusCode = null,
     refused_reason: proto.Reason = .unclassified,
+    /// Whether a refused entry took effect: one can be refused and still
+    /// change state (a processing job stored as failed).
+    refused_ran: proto.Ran = .no,
     message_len: u16 = 0,
     message: [MESSAGE_MAX]u8 = undefined,
 
@@ -89,16 +92,23 @@ pub const Result = struct {
         self.len = 0;
         self.overflowed = false;
         self.refused_status = null;
+        self.refused_ran = .no;
         self.message_len = 0;
     }
 
     /// The entry applied and changed nothing: what the client is told.
     pub fn refuse(self: *Result, status: proto.StatusCode, reason: proto.Reason, message: []const u8) void {
+        self.refuseRan(status, reason, .no, message);
+    }
+
+    /// `refuse`, for an entry that took effect all the same.
+    pub fn refuseRan(self: *Result, status: proto.StatusCode, reason: proto.Reason, ran: proto.Ran, message: []const u8) void {
         const n = @min(message.len, MESSAGE_MAX);
         @memcpy(self.message[0..n], message[0..n]);
         self.message_len = @intCast(n);
         self.refused_status = status;
         self.refused_reason = reason;
+        self.refused_ran = ran;
     }
 
     /// `refuse`, with the message formatted.
@@ -110,7 +120,7 @@ pub const Result = struct {
     /// The refusal, if the entry was refused; it points into this result.
     pub fn refused(self: *const Result) ?Refused {
         const status = self.refused_status orelse return null;
-        return .{ .status = status, .refusal = .{ .reason = self.refused_reason, .ran = .no, .message = self.message[0..self.message_len] } };
+        return .{ .status = status, .refusal = .{ .reason = self.refused_reason, .ran = self.refused_ran, .message = self.message[0..self.message_len] } };
     }
 
     pub fn putInt(self: *Result, comptime T: type, v: T) void {
