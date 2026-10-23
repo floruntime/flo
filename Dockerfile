@@ -48,16 +48,13 @@ COPY --from=web-builder /build/web/dist/ ./src/node/dashboard/dist/
 # When they differ (e.g. building arm64 on amd64), Zig cross-compiles without QEMU.
 ARG TARGETPLATFORM
 ARG FLO_VERSION=dev
+# The CPU floor is hardware CRC32C: x86-64-v2, ARMv8 with CRC.
 RUN case "${TARGETPLATFORM}" in \
-      linux/arm64)  ZIG_TARGET="aarch64-linux-musl" ;; \
-      linux/amd64)  ZIG_TARGET="x86_64-linux-musl"  ;; \
-      *)            ZIG_TARGET="" ;; \
+      linux/arm64)  ZIG_TARGET="aarch64-linux-musl"; ZIG_CPU="generic+crc" ;; \
+      linux/amd64)  ZIG_TARGET="x86_64-linux-musl";  ZIG_CPU="x86_64_v2" ;; \
+      *)            echo "unsupported platform ${TARGETPLATFORM}" >&2; exit 1 ;; \
     esac && \
-    if [ -n "${ZIG_TARGET}" ]; then \
-      zig build -Drelease -Dtarget=${ZIG_TARGET} -Dversion=${FLO_VERSION}; \
-    else \
-      zig build -Drelease -Dversion=${FLO_VERSION}; \
-    fi
+    zig build -Drelease -Dtarget=${ZIG_TARGET} -Dcpu=${ZIG_CPU} -Drequire-hw-crc -Dversion=${FLO_VERSION}
 
 # Stage 3: Runtime image
 FROM alpine:3.19

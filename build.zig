@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", getGitVersion(b));
+    build_options.addOption(bool, "require_hw_crc", b.option(bool, "require-hw-crc", "Fail unless the target CPU has a CRC32C instruction (release builds set this)") orelse false);
 
     // ── Dashboard Assets ──
     // Generate assets.zig by scanning src/node/dashboard/dist at configure time.

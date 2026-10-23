@@ -52,7 +52,7 @@ jobs:
           VERSION: 0.0.0-smoke
           ARCH: amd64
         run: |
-          zig build --release=safe -Dtarget=x86_64-linux -Dversion="$VERSION"
+          zig build --release=safe -Dtarget=x86_64-linux -Dcpu=x86_64_v2 -Drequire-hw-crc -Dversion="$VERSION"
           cp zig-out/bin/flo flo
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
           mkdir -p dist

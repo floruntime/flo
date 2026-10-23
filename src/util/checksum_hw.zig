@@ -7,13 +7,22 @@ const builtin = @import("builtin");
 /// that can't use one never compiles its asm: the target must have the
 /// instruction, and the code generator must be able to emit it (Zig 0.16's
 /// self-hosted x86_64 backend, the Debug default there, can't encode crc32).
-/// The release targets are baseline CPUs, which have neither SSE4.2 nor ARM
-/// CRC, so they take the software path.
+/// Release builds target CPUs that have it (x86-64-v2, ARMv8 with CRC) and
+/// refuse to build without it (`-Drequire-hw-crc`); a build for a CPU below
+/// that takes the software path.
 const hw_path: enum { x86_64, aarch64, none } = switch (builtin.target.cpu.arch) {
     .x86_64 => if (std.Target.x86.featureSetHas(builtin.target.cpu.features, .sse4_2) and builtin.zig_backend != .stage2_x86_64) .x86_64 else .none,
     .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .crc) and builtin.zig_backend != .stage2_aarch64) .aarch64 else .none,
     else => .none,
 };
+
+// Release builds target a CPU floor that has the instruction (x86-64-v2,
+// ARMv8 with CRC); without it every log entry and peer frame is checksummed
+// about 20x slower, so a release build for a lower CPU fails here.
+comptime {
+    if (@import("build_options").require_hw_crc and hw_path == .none)
+        @compileError(std.fmt.comptimePrint("-Drequire-hw-crc: CPU {s} has no CRC32C instruction; build with -Dcpu=x86_64_v2 (x86_64) or -Dcpu=generic+crc (aarch64)", .{builtin.target.cpu.model.name}));
+}
 
 /// Streaming checksum using hardware acceleration if available.
 pub const HardwareCrc32 = struct {
