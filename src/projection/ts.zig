@@ -1094,24 +1094,6 @@ pub const TSProjection = struct {
         return self.applyEntry(ual_entry, out);
     }
 
-    pub fn memoryUsage(self: *const TSProjection) usize {
-        var mem: usize = @sizeOf(TSProjection);
-
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            mem += kv.key_ptr.len;
-            mem += kv.value_ptr.points.items.len * @sizeOf(StoredPoint);
-        }
-
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            mem += kv.key_ptr.len;
-            mem += kv.value_ptr.items.len * @sizeOf(Block);
-        }
-
-        return mem;
-    }
-
     /// Clear all state, freeing owned memory.
     pub fn reset(self: *TSProjection) void {
         var bit = self.buffers.iterator();
@@ -1282,14 +1264,6 @@ test "ts: query nonexistent series" {
     const result = try ts.queryRange(0, "nonexistent", "field", null, 0, 9999, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
     try testing.expectEqual(@as(usize, 0), result.blocks_matched);
-}
-
-test "ts: memory usage estimate" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
-    defer ts.deinit();
-
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
-    try testing.expect(ts.memoryUsage() > 0);
 }
 
 test "ts: a write's answer carries the longest measurement name an entry can hold, whole" {

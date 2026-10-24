@@ -641,27 +641,6 @@ pub const QueueProjection = struct {
         const self: *QueueProjection = @ptrCast(@alignCast(ctx));
         return self.applyEntry(entry, out);
     }
-
-    pub fn memoryUsage(self: *const QueueProjection) usize {
-        // Approximate: per-message overhead + lanes + payload bytes + known queues
-        var payload_bytes: usize = 0;
-        var it = self.messages.iterator();
-        while (it.next()) |kv| {
-            payload_bytes += kv.value_ptr.payload.len;
-        }
-        var lane_bytes: usize = 0;
-        var lit = self.lanes.valueIterator();
-        while (lit.next()) |l| {
-            lane_bytes += @sizeOf(u64) + @sizeOf(Lane) +
-                l.ready.capacity() * @sizeOf(HeapItem) +
-                l.dlq.capacity * @sizeOf(DLQEntry);
-        }
-        return self.messages.count() * @sizeOf(Message) +
-            lane_bytes +
-            self.known_queues.count() * @sizeOf(QueueMeta) +
-            payload_bytes +
-            @sizeOf(QueueProjection);
-    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -832,16 +811,6 @@ test "queue: stats tracking" {
 
     try testing.expectEqual(@as(u64, 2), q.stats.enqueued);
     try testing.expectEqual(@as(u64, 1), q.stats.dequeued);
-}
-
-test "queue: memory usage estimate" {
-    var q = QueueProjection.init(testing.allocator, .{});
-    defer q.deinit();
-
-    _ = try q.enqueue(100, 0, 1000, 42, "hello");
-    _ = try q.enqueue(101, 0, 2000, 42, "world");
-
-    try testing.expect(q.memoryUsage() > 0);
 }
 
 test "queue: dequeue filters by queue_name_hash" {
