@@ -2,6 +2,7 @@ const std = @import("std");
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const reason_mod = @import("reason.zig");
+const checksum = @import("../util/checksum.zig");
 pub const Refusal = reason_mod.Refusal;
 pub const Reason = reason_mod.Reason;
 pub const TRUNCATED_MARKER = reason_mod.TRUNCATED_MARKER;
@@ -9,7 +10,7 @@ pub const Ran = reason_mod.Ran;
 
 /// Flo Protocol
 /// Binary wire protocol: a 32-byte header carrying the protocol version and
-/// the op table's hash, CRC32 over header and payload.
+/// the op table's hash, CRC32C over header and payload.
 ///
 /// Protocol magic number: "FLO\0" (0x004F4C46 in little-endian)
 /// Null-terminated string representation for clean identification
@@ -17,7 +18,8 @@ pub const MAGIC: u32 = 0x004F4C46;
 
 /// The frame layout's version. Its byte's offset never moves, so a client
 /// from any version can read a refusal answered in its own version byte.
-pub const VERSION: u8 = 0x02;
+/// 3: the header checksum is CRC32C, not IEEE CRC32.
+pub const VERSION: u8 = 0x03;
 
 /// The hash of the op and entry tables this build serves. Every request and
 /// answer header carries it; a server refuses a request carrying another.
@@ -524,22 +526,22 @@ pub const RequestHeader = extern struct {
         }
     }
 
-    /// Compute CRC32 for header (excluding the crc32 field itself) + payload
+    /// CRC32C of the header (without its crc32 field) and the payload.
     pub fn computeCRC32(self: RequestHeader, payload: []const u8) u32 {
-        var hasher = std.hash.Crc32.init();
+        var hasher = checksum.ChecksumStream.init();
 
         // Hash header as bytes, but skip the crc32 field (bytes 16-19)
         const header_bytes = std.mem.asBytes(&self);
         // Hash bytes 0-15 (magic, payload_length, request_id)
-        hasher.update(header_bytes[0..16]);
+        hasher.add(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
         // Hash bytes 20-31 (op_code, version, flags, table_hash)
-        hasher.update(header_bytes[20..32]);
+        hasher.add(header_bytes[20..32]);
 
         // Hash payload
-        hasher.update(payload);
+        hasher.add(payload);
 
-        return hasher.final();
+        return hasher.checksum();
     }
 };
 
@@ -566,20 +568,35 @@ pub const ResponseHeader = extern struct {
         }
     }
 
-    pub fn computeCRC32(self: ResponseHeader, data: []const u8) u32 {
+    /// The checksum a client of this header's version checks: versions
+    /// before 3 used IEEE CRC32. Only a refusal answered in such a client's
+    /// version byte carries one, so it reads "upgrade" rather than a
+    /// checksum failure.
+    pub fn checksumForVersion(self: ResponseHeader, data: []const u8) u32 {
+        if (self.version >= 3) return self.computeCRC32(data);
         var hasher = std.hash.Crc32.init();
+        const header_bytes = std.mem.asBytes(&self);
+        hasher.update(header_bytes[0..16]);
+        hasher.update(header_bytes[20..32]);
+        hasher.update(data);
+        return hasher.final();
+    }
+
+    /// CRC32C of the header (without its crc32 field) and the data.
+    pub fn computeCRC32(self: ResponseHeader, data: []const u8) u32 {
+        var hasher = checksum.ChecksumStream.init();
 
         // Hash header as bytes, but skip the crc32 field (bytes 16-19)
         const header_bytes = std.mem.asBytes(&self);
         // Hash bytes 0-15 (magic, data_len, request_id)
-        hasher.update(header_bytes[0..16]);
+        hasher.add(header_bytes[0..16]);
         // Skip bytes 16-19 (crc32 field)
         // Hash bytes 20-31 (version, status, flags, pad, table_hash)
-        hasher.update(header_bytes[20..32]);
+        hasher.add(header_bytes[20..32]);
 
-        hasher.update(data);
+        hasher.add(data);
 
-        return hasher.final();
+        return hasher.checksum();
     }
 };
 
@@ -623,7 +640,7 @@ pub const Request = struct {
         // Extract payload
         const payload = data[header_size..expected_size];
 
-        // Verify CRC32
+        // Verify the checksum
         const computed_crc = header.computeCRC32(payload);
         if (computed_crc != header.crc32) {
             return error.InvalidChecksum;
@@ -721,7 +738,7 @@ pub const Request = struct {
             return error.BufferTooSmall;
         }
 
-        // Build payload first (needed for CRC32)
+        // Build payload first (needed for the checksum)
         var payload_offset: usize = 0;
         var payload_buffer = buffer[header_size..total_size];
 
@@ -758,12 +775,12 @@ pub const Request = struct {
             }
         }
 
-        // Write header with correct payload_length FIRST (needed for CRC32 computation)
+        // Write header with correct payload_length FIRST (needed for the checksum)
         var header = self.header;
         header.payload_length = @intCast(payload_size);
         header.crc32 = 0; // Zero out CRC32 before computing
 
-        // Compute CRC32 with the correct payload_length set
+        // Compute the checksum with the correct payload_length set
         const crc = header.computeCRC32(payload_buffer[0..payload_offset]);
         header.crc32 = crc;
 
@@ -881,10 +898,10 @@ pub const Response = struct {
 
         @memcpy(buffer[payload_offset..][0..self.data.len], self.data);
 
-        // Compute CRC32 on the full payload (prefix + data)
+        // Compute the checksum on the full payload (prefix + data)
         var header = self.header;
         header.data_len = @intCast(payload_len);
-        header.crc32 = header.computeCRC32(buffer[header_size..total_size]);
+        header.crc32 = header.checksumForVersion(buffer[header_size..total_size]);
 
         // Write header
         @memcpy(buffer[0..header_size], std.mem.asBytes(&header));
@@ -936,7 +953,7 @@ pub const Response = struct {
 
         const response_data = data[header_size..][0..header.data_len];
 
-        // Verify CRC32
+        // Verify the checksum
         const computed_crc = header.computeCRC32(response_data);
         if (computed_crc != header.crc32) {
             return error.InvalidChecksum;
@@ -1020,6 +1037,51 @@ comptime {
     if (@sizeOf(ResponseHeader) != 32) {
         @compileError("ResponseHeader must be exactly 32 bytes");
     }
+}
+
+test "a frame's checksum is CRC32C over the header without its crc32 field, then the body" {
+    // The SDKs check their own against these frames. Request: header bytes
+    // 464c4f00 05000000 0700000000000000, then 0101 03 00 0807060504030201,
+    // then "hello", checksum 0xa2996e56. Answer: the same first 16 bytes,
+    // then 03 00 00 00 0807060504030201, then "hello", checksum 0x47cfdc15.
+    const body = "hello";
+    var header = RequestHeader.init(.kv_get, 7);
+    header.payload_length = body.len;
+    header.table_hash = 0x0102030405060708;
+    const bytes = std.mem.asBytes(&header);
+    var reference = std.hash.crc.@"CRC-32/ISCSI".init();
+    reference.update(bytes[0..16]);
+    reference.update(bytes[20..32]);
+    reference.update(body);
+    try std.testing.expectEqual(reference.final(), header.computeCRC32(body));
+    try std.testing.expectEqual(@as(u32, 0xa2996e56), header.computeCRC32(body));
+    try std.testing.expectEqual(@as(u32, 0xa2996e56), bitwiseCrc32c(&.{ bytes[0..16], bytes[20..32], body }));
+
+    var answer: ResponseHeader = std.mem.zeroes(ResponseHeader);
+    answer.magic = MAGIC;
+    answer.data_len = body.len;
+    answer.request_id = 7;
+    answer.version = VERSION;
+    answer.table_hash = 0x0102030405060708;
+    const abytes = std.mem.asBytes(&answer);
+    var areference = std.hash.crc.@"CRC-32/ISCSI".init();
+    areference.update(abytes[0..16]);
+    areference.update(abytes[20..32]);
+    areference.update(body);
+    try std.testing.expectEqual(areference.final(), answer.computeCRC32(body));
+    try std.testing.expectEqual(@as(u32, 0x47cfdc15), answer.computeCRC32(body));
+    try std.testing.expectEqual(@as(u32, 0x47cfdc15), bitwiseCrc32c(&.{ abytes[0..16], abytes[20..32], body }));
+    try std.testing.expectEqual(@as(u32, 0xe3069283), bitwiseCrc32c(&.{"123456789"}));
+}
+
+/// CRC32C a bit at a time, sharing nothing with util/checksum or std.
+fn bitwiseCrc32c(parts: []const []const u8) u32 {
+    var crc: u32 = 0xffffffff;
+    for (parts) |part| for (part) |byte| {
+        crc ^= byte;
+        for (0..8) |_| crc = (crc >> 1) ^ (if (crc & 1 == 1) @as(u32, 0x82f63b78) else 0);
+    };
+    return crc ^ 0xffffffff;
 }
 
 test "OpCode validation" {

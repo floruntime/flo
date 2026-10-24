@@ -37,7 +37,8 @@ test "e2e/table: a client from another table or protocol is refused readably and
     const cases = [_]struct { version: u8, table_hash: u64, text: []const u8 }{
         .{ .version = proto.VERSION, .table_hash = proto.TABLE_HASH +% 1, .text = try std.fmt.bufPrint(&table_text, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, proto.TABLE_HASH +% 1 }) },
         .{ .version = 1, .table_hash = 0, .text = std.fmt.comptimePrint("server protocol {d}, client protocol 1: upgrade the client", .{proto.VERSION}) },
-        .{ .version = proto.VERSION +% 1, .table_hash = proto.TABLE_HASH, .text = std.fmt.comptimePrint("server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, proto.VERSION +% 1 }) },
+        .{ .version = 2, .table_hash = 0, .text = std.fmt.comptimePrint("server protocol {d}, client protocol 2: upgrade the client", .{proto.VERSION}) },
+        .{ .version = proto.VERSION +% 1, .table_hash = proto.TABLE_HASH, .text = std.fmt.comptimePrint("server protocol {d}, client protocol {d}: upgrade the server", .{ proto.VERSION, proto.VERSION +% 1 }) },
     };
     for (cases) |case| {
         var out: [512]u8 = undefined;
@@ -53,6 +54,14 @@ test "e2e/table: a client from another table or protocol is refused readably and
         try testing.expectEqualStrings(case.text, refusal.message);
         try testing.expectEqual(proto.Reason.table_mismatch, refusal.reason);
         try testing.expectEqual(proto.Ran.no, refusal.ran);
+        // An old client checks IEEE CRC32, so it can read the refusal.
+        const body = out[@sizeOf(proto.ResponseHeader)..n];
+        const bytes = out[0..@sizeOf(proto.ResponseHeader)];
+        var ieee = std.hash.Crc32.init();
+        ieee.update(bytes[0..16]);
+        ieee.update(bytes[20..32]);
+        ieee.update(body);
+        try testing.expectEqual(if (case.version < 3) ieee.final() else answer.computeCRC32(body), answer.crc32);
     }
 
     var http = try ctx.createMetricsHttp();
@@ -60,7 +69,7 @@ test "e2e/table: a client from another table or protocol is refused readably and
     var metrics = try http.get("/metrics");
     defer metrics.deinit();
     try testing.expectEqual(@as(u16, 200), metrics.status);
-    try testing.expect(std.mem.indexOf(u8, metrics.body, "\nflo_client_version_refused_total 3\n") != null);
+    try testing.expect(std.mem.indexOf(u8, metrics.body, "\nflo_client_version_refused_total 4\n") != null);
 
     // Everyone else is still served.
     try ctx.exec(&.{ "kv", "set", "after", "yes" });

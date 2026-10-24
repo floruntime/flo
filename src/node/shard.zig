@@ -4780,6 +4780,13 @@ pub const Shard = struct {
         shard.sendOkResponse(conn, request_id, "");
     }
 
+    /// Which side to upgrade when a client speaks protocol `client`: the
+    /// older one. Two tables have no order, so a table mismatch always names
+    /// the client.
+    fn olderSide(client: u8) []const u8 {
+        return if (client > proto.VERSION) "server" else "client";
+    }
+
     /// Answers a client built from another protocol version or table in its
     /// own version byte, so it can read the refusal, then closes the
     /// connection: nothing more it sends can be read.
@@ -4788,7 +4795,7 @@ pub const Shard = struct {
         const text = (if (theirs.version == proto.VERSION)
             std.fmt.bufPrint(&text_buf, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, theirs.table_hash })
         else
-            std.fmt.bufPrint(&text_buf, "server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, theirs.version })) catch unreachable;
+            std.fmt.bufPrint(&text_buf, "server protocol {d}, client protocol {d}: upgrade the {s}", .{ proto.VERSION, theirs.version, olderSide(theirs.version) })) catch unreachable;
         var body: [proto.Refusal.HEADER_LEN + text_buf.len]u8 = undefined;
         var answer = proto.Response.refusal(.bad_request, theirs.request_id, (proto.Refusal{ .reason = .table_mismatch, .ran = .no, .message = text }).encode(&body));
         answer.header.version = theirs.version;
@@ -8545,8 +8552,10 @@ test "Shard: a client from another table or protocol is answered in its own vers
     const cases = [_]struct { version: u8, table_hash: u64, text: []const u8 }{
         .{ .version = proto.VERSION, .table_hash = proto.TABLE_HASH +% 1, .text = try std.fmt.bufPrint(&want_table, "server table 0x{x:0>16}, client table 0x{x:0>16}: upgrade the client", .{ proto.TABLE_HASH, proto.TABLE_HASH +% 1 }) },
         .{ .version = 1, .table_hash = 0, .text = std.fmt.comptimePrint("server protocol {d}, client protocol 1: upgrade the client", .{proto.VERSION}) },
-        // Another version carrying this table's hash: the version alone decides.
-        .{ .version = proto.VERSION +% 1, .table_hash = proto.TABLE_HASH, .text = std.fmt.comptimePrint("server protocol {d}, client protocol {d}: upgrade the client", .{ proto.VERSION, proto.VERSION +% 1 }) },
+        .{ .version = 2, .table_hash = 0, .text = std.fmt.comptimePrint("server protocol {d}, client protocol 2: upgrade the client", .{proto.VERSION}) },
+        // Another version carrying this table's hash: the version alone
+        // decides, and a newer client names the server as the older side.
+        .{ .version = proto.VERSION +% 1, .table_hash = proto.TABLE_HASH, .text = std.fmt.comptimePrint("server protocol {d}, client protocol {d}: upgrade the server", .{ proto.VERSION, proto.VERSION +% 1 }) },
     };
     for (cases, 1..) |case, refused| {
         const c = try TestClient.open(&shard);
@@ -8572,8 +8581,18 @@ test "Shard: a client from another table or protocol is answered in its own vers
         const body = out[@sizeOf(proto.ResponseHeader)..n];
         try std.testing.expectEqualStrings(case.text, (try proto.Refusal.decode(body)).message);
         try std.testing.expectEqual(proto.Reason.table_mismatch, (try proto.Refusal.decode(body)).reason);
-        try std.testing.expectEqual(answer.crc32, answer.computeCRC32(body));
+        // Checksummed as the client's version checks it: IEEE before 3.
+        try std.testing.expectEqual(if (case.version < 3) ieeeAnswerChecksum(answer, body) else answer.computeCRC32(body), answer.crc32);
     }
+}
+
+fn ieeeAnswerChecksum(header: proto.ResponseHeader, body: []const u8) u32 {
+    const bytes = std.mem.asBytes(&header);
+    var crc = std.hash.Crc32.init();
+    crc.update(bytes[0..16]);
+    crc.update(bytes[20..32]);
+    crc.update(body);
+    return crc.final();
 }
 
 test "Shard: a request with a header flag set is refused, naming the flags" {
