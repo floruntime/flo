@@ -833,6 +833,82 @@ test "workers: a registration whose processes worker.info couldn't list is refus
     try std.testing.expectEqual(worker_ops.MAX_PROCESSES, (try h.info("", "w")).processes.count);
 }
 
+test "workers: processes landing exactly on worker.info's bound register and list whole; a byte more is refused" {
+    const a = std.testing.allocator;
+    const max_key = @import("../protocol/ops.zig").MAX_KEY;
+    const per = worker_ops.ProcessRow.encodedSize(.{ .name = "", .kind = .action, .run_count = 0, .fail_count = 0, .last_run_at_ms = 0 }) catch unreachable;
+    const full = 46;
+    // 46 names of a key's length, then one sized to land on the bound.
+    const last = worker_ops.Processes.byte_bound.? - full * (per + max_key) - per;
+    try std.testing.expect(last <= max_key);
+
+    var w: std.Io.Writer.Allocating = .init(a);
+    defer w.deinit();
+    for ([_]usize{ 0, 1 }) |over| {
+        w.clearRetainingCapacity();
+        const out = &w.writer;
+        try out.writeAll(&.{ 0, 4, 0, 0, 0 });
+        try out.writeInt(u16, full + 1, .little);
+        for (0..full + 1) |i| {
+            const len = if (i == full) last + over else max_key;
+            try out.writeInt(u16, @intCast(len), .little);
+            try out.splatByteAll('x', len);
+            try out.writeByte(0);
+        }
+        // The largest metadata and machine id.
+        try out.writeByte(1);
+        try out.writeInt(u16, worker_ops.MAX_METADATA, .little);
+        try out.splatByteAll('m', worker_ops.MAX_METADATA);
+        try out.writeByte(1);
+        try out.writeInt(u16, worker_ops.MAX_MACHINE_ID, .little);
+        try out.splatByteAll('i', worker_ops.MAX_MACHINE_ID);
+
+        var h = WorkerHandler.init(a);
+        defer h.deinit();
+        const id: [4000]u8 = @splat('w');
+        var req = testRequest("", &id);
+        req.value = w.written();
+        if (over == 1) {
+            try std.testing.expectEqualStrings("processes too long to list together", h.handleRegister(req).?);
+            continue;
+        }
+        try std.testing.expect(h.handleRegister(req) == null);
+        const got = try h.info("", &id);
+        try std.testing.expectEqual(@as(u32, full + 1), got.processes.count);
+        const size = try InfoResponse.encodedSize(got);
+        try std.testing.expect(size <= InfoResponse.max_size);
+        const buf = try a.alloc(u8, InfoResponse.max_size);
+        defer a.free(buf);
+        _ = try InfoResponse.encodeInto(buf, got);
+    }
+}
+
+test "worker.info: a process's runs, failures and last run are what the worker's tasks reported" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    var req = testRequest("", "w");
+    req.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 'b', 0 };
+    try std.testing.expect(h.handleRegister(req) == null);
+    const before = @import("stdx").time.milliTimestamp();
+    h.recordCompletion("", "w", "a");
+    h.recordCompletion("", "w", "a");
+    h.recordFailure("", "w", "a");
+    h.recordFailure("", "w", "b");
+
+    const got = try h.info("", "w");
+    try std.testing.expectEqual(@as(u64, 2), got.worker.tasks_completed);
+    try std.testing.expectEqual(@as(u64, 2), got.worker.tasks_failed);
+    var it = got.processes.iterator();
+    const pa = (try it.next()).?;
+    try std.testing.expectEqual(@as(u64, 2), pa.run_count);
+    try std.testing.expectEqual(@as(u64, 1), pa.fail_count);
+    try std.testing.expect(pa.last_run_at_ms >= before);
+    const pb = (try it.next()).?;
+    try std.testing.expectEqual(@as(u64, 0), pb.run_count);
+    try std.testing.expectEqual(@as(u64, 1), pb.fail_count);
+    try std.testing.expect(pb.last_run_at_ms >= before);
+}
+
 /// Shards' registries, each listed as its shard would answer a gather part.
 const ListShards = struct {
     registries: [3]WorkerHandler,

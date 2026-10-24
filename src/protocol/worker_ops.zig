@@ -75,9 +75,13 @@ pub const ProcessRow = Record(&.{
 
 const Metadata = Optional(Bytes(MAX_METADATA));
 
-/// A worker's processes, as one answer holds them: whatever the row and the
-/// metadata leave of it. Registration refuses processes that wouldn't fit.
-pub const Processes = schema.BoundedList(ProcessRow, MAX_PROCESSES, @intCast(ops.MAX_RESPONSE_BODY - @sizeOf(u32) - WorkerRow.max_size - Metadata.max_size));
+/// The processes list's count prefix: an empty list of them is just that.
+const processes_count_size = schema.BoundedList(ProcessRow, MAX_PROCESSES, ProcessRow.max_size).min_size;
+
+/// A worker's processes, as one answer holds them: whatever the row, the
+/// largest metadata and the list's count prefix leave of it. Registration
+/// refuses processes that wouldn't fit.
+pub const Processes = schema.BoundedList(ProcessRow, MAX_PROCESSES, @intCast(ops.MAX_RESPONSE_BODY - processes_count_size - WorkerRow.max_size - Metadata.max_size));
 
 pub const table = [_]ops.Op{
     .{
@@ -122,4 +126,8 @@ pub fn op(comptime name: []const u8) ops.Op {
 
 comptime {
     ops.check(&table);
+}
+
+test "worker.info's largest answer is exactly one response body" {
+    try std.testing.expectEqual(ops.MAX_RESPONSE_BODY, op("worker.info").response.max_size);
 }
