@@ -116,6 +116,8 @@ jobs:
             test_timeout: 60s
           - step: test-e2e
             test_timeout: 300s
+            # The halt tests drive a fault only a test build carries.
+            flags: -Dtest-faults=true
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -132,7 +134,8 @@ jobs:
         env:
           STEP: ${{ matrix.step }}
           TEST_TIMEOUT: ${{ matrix.test_timeout }}
-        run: zig build "$STEP" --test-timeout "$TEST_TIMEOUT"
+          FLAGS: ${{ matrix.flags }}
+        run: zig build "$STEP" --test-timeout "$TEST_TIMEOUT" $FLAGS
         timeout-minutes: 30
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
@@ -170,6 +173,11 @@ jobs:
         # A node with the cluster secret but no seat sends forged votes and
         # appends under its own id; none may be taken.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --byzantine --seed-timeout=120 --out-dir=/tmp/vopr-byzantine
+        timeout-minutes: 20
+      - name: Swarm with a halting entry
+        # One op's entry fails to apply on every node: each node halts at
+        # the same entry, and the group still elects and changes members.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-halts
         timeout-minutes: 20
       - name: Regression seeds stay green
         # Each seed reaches a bug whose fix landed; it fails if the fix is

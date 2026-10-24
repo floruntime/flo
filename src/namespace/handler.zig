@@ -345,6 +345,7 @@ pub const NamespaceHandler = struct {
         // itself and drops the write.
         if (!self.admits(effective)) return;
         _ = proposeNamespaceEntry(s, .namespace_create, effective, if (counts_write) IMPLICIT_CREATE else "") catch |err| {
+            if (s.quietHalted(err)) return;
             // Every write to the namespace tries again, so said once per
             // interval rather than per write.
             self.implicit_failed += 1;

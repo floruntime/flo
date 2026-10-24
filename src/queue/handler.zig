@@ -725,7 +725,7 @@ pub const QueueHandler = struct {
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
             _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
-                log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
+                if (!shard.quietHalted(err)) log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
             };
             return;
         }

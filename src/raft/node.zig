@@ -373,6 +373,10 @@ pub const RaftNode = struct {
     /// Set by the owner when an entry it owed the disk is gone: nothing
     /// after it can be made durable, so proposals are refused.
     writes_stopped: bool = false,
+    /// The owner's state machine halted at an entry every replica fails
+    /// the same way: it proposes nothing but what elects a leader or
+    /// changes membership, until a repair.
+    halted: bool = false,
     last_applied: u64,
 
     // ── Election timer ─────────────────────────────────────────────────
@@ -447,6 +451,8 @@ pub const RaftNode = struct {
     /// Only possible without durable commits; the owner watches it, since
     /// what it applied above the cut is not what the log now says.
     committed_conflicts: u64,
+    /// The committed index the last such conflict was at, durable or not.
+    conflict_index: u64 = 0,
     /// Term of the config entry at `membership_index`, 0 when unknown.
     membership_term: u64 = 0,
     /// The most recent config entries appended, oldest first; a truncation
@@ -1200,7 +1206,10 @@ pub const RaftNode = struct {
                 // snapshot, or recorded as 0 by a snapshot that didn't keep
                 // its term: no entry has term 0), nor for a heartbeat that
                 // carries no term (a leader that can't place this node).
-                if (self.config.durable_commits and req.prev_log_term != 0 and req.prev_log_index <= self.commit_index and (self.log.entryTerm(req.prev_log_index) orelse 0) != 0) return error.CommittedConflict;
+                if (self.config.durable_commits and req.prev_log_term != 0 and req.prev_log_index <= self.commit_index and (self.log.entryTerm(req.prev_log_index) orelse 0) != 0) {
+                    self.conflict_index = req.prev_log_index;
+                    return error.CommittedConflict;
+                }
                 const tip = self.log.tip();
                 const run_start = if (req.prev_log_index > tip) tip else (self.log.runStart(req.prev_log_index) orelse req.prev_log_index) -| 1;
                 // Never below commit: a committed prefix and a conflicting
@@ -1238,6 +1247,7 @@ pub const RaftNode = struct {
             if (existing_term) |t| {
                 if (t != e.header.term) {
                     if (e.header.index <= self.commit_index) {
+                        self.conflict_index = e.header.index;
                         // Committed history is never truncated when commits
                         // are durable; otherwise the log follows the leader
                         // and commit and apply rewind to the cut.
@@ -1395,6 +1405,7 @@ pub const RaftNode = struct {
     fn appendProposal(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
         if (self.writes_stopped) return error.WritesStopped;
+        if (self.halted and entry_type != .raft_config and entry_type != .raft_noop) return error.Halted;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
         if (self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
@@ -3376,6 +3387,7 @@ test "raft node: a rejection never hints below commit, and committed history tha
         const below: AppendRequest = .{ .term = 2, .leader_id = 1, .prev_log_index = 3, .prev_log_term = 9, .entries = &.{}, .leader_commit = 4 };
         if (durable) {
             try testing.expectError(error.CommittedConflict, follower.handleAppendEntries(below));
+            try testing.expectEqual(@as(u64, 3), follower.conflict_index);
         } else {
             const r = try follower.handleAppendEntries(below);
             try testing.expect(!r.success);
@@ -3453,6 +3465,7 @@ test "raft node: a conflict below the commit index is refused when commits are d
     try testing.expectEqual(@as(u64, 1), lossy.commit_index);
     try testing.expectEqual(@as(u64, 1), lossy.last_applied);
     try testing.expectEqual(@as(u64, 1), lossy.committed_conflicts);
+    try testing.expectEqual(@as(u64, 2), lossy.conflict_index);
 
     var node = try RaftNode.init(testing.allocator, 2, 1, 8192, .{ .durable_commits = true });
     defer node.deinit();
@@ -3465,6 +3478,7 @@ test "raft node: a conflict below the commit index is refused when commits are d
     const conflicting = testEntry(2, 2, "y");
     try testing.expectError(error.CommittedConflict, node.handleAppendEntries(.{ .term = 2, .leader_id = 1, .prev_log_index = 1, .prev_log_term = 1, .entries = &.{conflicting}, .leader_commit = 0 }));
     try testing.expectEqual(@as(u64, 3), node.log.lastIndex());
+    try testing.expectEqual(@as(u64, 2), node.conflict_index);
 }
 
 test "raft node: a lone member elects itself when its timer fires" {

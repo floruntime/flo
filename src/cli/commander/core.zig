@@ -262,6 +262,7 @@ pub const Error = error{
     Usage,
     Refused,
     Retryable,
+    Pending,
     Transport,
     HelpRequested,
     VersionRequested,

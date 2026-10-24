@@ -72,6 +72,7 @@ const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
+const build_options = @import("build_options");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
 const stream_proj_mod = @import("../projection/stream.zig");
@@ -438,6 +439,16 @@ pub const Shard = struct {
     /// which never changes once set, so a reader that sees it true may read
     /// `offline`.
     offline_published: std.atomic.Value(bool),
+    /// The entry this shard halted at, on every replica alike: it applies
+    /// nothing from it on and takes no writes until a repair.
+    halted: ?Halt = null,
+    /// The shard's own writes (checkpoints, acks, run steps) refused since
+    /// the last line saying so, and when the next line may go out.
+    halted_refusals: u64 = 0,
+    halted_line_ms: u64 = 0,
+    /// In a cluster, the damage that made this member diverged, for
+    /// `/status`.
+    diverged_damage: ?silent_loss.Damage = null,
     /// Entries and segments lost without anyone being told, by path.
     losses: silent_loss.Counts,
     /// Where this shard publishes its state for `/ready` and `/status`.
@@ -745,6 +756,7 @@ pub const Shard = struct {
         // takes no part in its group).
         var losses: silent_loss.Counts = .{};
         var boot_damage: ?silent_loss.Damage = null;
+        var boot_halt: ?Halt = null;
         errdefer if (hard_state_store) |store| allocator.destroy(store);
         var durable_log: ?*DurableLog = null;
         errdefer if (durable_log) |dl| {
@@ -850,6 +862,7 @@ pub const Shard = struct {
                     const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
+                    boot_halt = replayed.halt;
                     raft_node.last_applied = replayed.applied_through;
                 } else |err| {
                     if (log_files.badHeaderSegment().len == 0) return err;
@@ -861,6 +874,10 @@ pub const Shard = struct {
             }
 
             raft_node.noteApplied(partition.router.applied_stamp);
+            if (boot_halt) |*h| {
+                raft_node.halted = true;
+                log.err("shard {d} comes up halted at {s}, as it was before the restart. It applies nothing past it and takes no writes until a repair", .{ shard_id, h.reason() });
+            }
 
             shard_data_dir = shard_dir;
         }
@@ -967,6 +984,8 @@ pub const Shard = struct {
             .replies_held = 0,
             .next_forward_id = FORWARD_ID_FIRST,
             .offline = if (cluster_role == .single) boot_damage else null,
+            .diverged_damage = if (cluster_role != .single) boot_damage else null,
+            .halted = boot_halt,
             .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
             .health = boot.health,
@@ -1093,7 +1112,8 @@ pub const Shard = struct {
         if (pending > noop) {
             log.info("shard {d}: applying {d} durable entries above the commit watermark (indices {d}..{d})", .{ self.id, pending, raft.last_applied + 1, raft.commit_index });
         }
-        if (!self.applyCommitted()) {
+        // A shard halted at boot has said so: nothing past its halt applies.
+        if (!self.applyCommitted() and self.halted == null) {
             log.err("shard {d}: not every durable entry above the commit watermark could be applied at boot; projections are missing writes", .{self.id});
         }
     }
@@ -1612,9 +1632,24 @@ pub const Shard = struct {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.offlineMessage(&buf)));
             return;
         }
+        // Halted: writes, a client's or another shard's ask, are refused;
+        // reads are served from the state just before the halt, marked
+        // stale.
+        // Membership changes are exempt: a halted group must still be able
+        // to replace a dead node.
+        const membership_op = req.header.op_code == @backingInt(proto.OpCode.cluster_promote) or req.header.op_code == @backingInt(proto.OpCode.cluster_remove);
+        if (self.halted != null and !status_op and !membership_op and requestWrites(req)) {
+            var buf: [400]u8 = undefined;
+            self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .shard_halted, .ran = .no, .message = self.haltedMessage(&buf) });
+            return;
+        }
+        const was_stale = proto.answering_stale;
+        proto.answering_stale = was_stale or (self.halted != null and !requestWrites(req));
+        defer proto.answering_stale = was_stale;
         if (self.raft_network != null and requestWrites(req) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
-                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(DIVERGED_MESSAGE));
+                const oom = if (self.diverged_damage) |d| d.out_of_memory else false;
+                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
                 return;
             }
             // A replica serves reads and sends writers to the leader
@@ -1846,6 +1881,10 @@ pub const Shard = struct {
         };
         owned_locals = false;
         conn.forwards_in_flight += 1;
+        // This shard's own part was read while it is halted.
+        if (self.halted != null) for (parts) |p| {
+            if (p.owner == self.id) self.gathers.get(ticket).?.stale = true;
+        };
         var done: ?*Gathers.Entry = null;
         for (parts, 0..) |p, i| {
             if (p.owner != self.id) continue;
@@ -1911,6 +1950,8 @@ pub const Shard = struct {
             }
             return self.endGather(e);
         }
+        // One part read a halted shard: the whole answer is stale.
+        if (resp.header.flags & proto.RESPONSE_STALE != 0) e.stale = true;
         const body = self.allocator.dupe(u8, resp.data) catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory for an answer — retry" });
         const done = self.gathers.arrive(self.allocator, part, body) orelse return;
@@ -1922,6 +1963,9 @@ pub const Shard = struct {
         const conn = self.gatherClient(e) orelse return self.endGather(e);
         var bodies: [gather_mod.MAX_PARTS][]const u8 = undefined;
         for (e.answers, 0..) |a, i| bodies[i] = a.?;
+        const was_stale = proto.answering_stale;
+        proto.answering_stale = was_stale or e.stale;
+        defer proto.answering_stale = was_stale;
         e.context.op.merge(self, conn, e.request_id, e.context.state, bodies[0..e.answers.len]) catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
         self.flushToClient(conn.fd);
@@ -2431,6 +2475,15 @@ pub const Shard = struct {
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
             defer if (release) |r| r(self, ctx);
+            if (self.halted) |*h| if (proposed.index >= h.index) {
+                // A membership change takes effect at commit, halted or not.
+                if (self.appliesAroundHalt(proposed.index)) {
+                    var done = persistence_mod.Result{ .index = proposed.index };
+                    return answer(self, conn, req.header.request_id, &done);
+                }
+                var buf: [320]u8 = undefined;
+                return self.sendRefusal(conn, req.header.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = self.pendingMessage(&buf, proposed.index) });
+            };
             if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
                 self.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
                 return;
@@ -3026,6 +3079,95 @@ pub const Shard = struct {
         if (self.forward_count > 0) self.sweepForwards(now);
     }
 
+    /// Stop at entry `e`, which no replica can apply: its `last_applied`
+    /// stays just below it, the Raft node proposes only what elects a
+    /// leader or changes membership, and writes waiting past it are told
+    /// once their entries commit. Every replica halts at the same entry.
+    fn halt(self: *Shard, e: *const entry_mod.Entry, comptime fmt: []const u8, args: anytype) void {
+        if (self.halted != null) return;
+        const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type))) orelse "unknown";
+        self.halted = Halt.init(e, "entry {d} ({s}): " ++ fmt, .{ e.header.index, type_name } ++ args);
+        const raft = self.raft_node;
+        raft.halted = true;
+        raft.last_applied = e.header.index - 1;
+        self.last_entry_applied = false;
+        log.err("shard {d} halted at {s}. It applies nothing past it and takes no writes; reads are served, marked stale. Restarting won't help: the entry has to be repaired (the node's /status says where it halted)", .{ self.id, self.halted.?.reason() });
+        self.answerHaltedPending();
+    }
+
+    /// Whether `err` is a halted shard refusing one of its own writes.
+    /// Those come every tick, so they are counted and said once every 30
+    /// seconds, and the caller logs nothing.
+    pub fn quietHalted(self: *Shard, err: anyerror) bool {
+        if (err != error.Halted) return false;
+        self.halted_refusals += 1;
+        const now = nowMs();
+        if (now >= self.halted_line_ms) {
+            self.halted_line_ms = now + 30_000;
+            log.warn("shard {d} is halted: {d} of its own writes (checkpoints, acks, run steps) refused since the last line", .{ self.id, self.halted_refusals });
+            self.halted_refusals = 0;
+        }
+        return true;
+    }
+
+    /// The entry at `index` is one a halt doesn't stop: a config, which
+    /// takes effect at commit, or a term's no-op.
+    fn appliesAroundHalt(self: *Shard, index: u64) bool {
+        const e = self.raft_node.log.getEntryCopy(index, self.apply_buf) orelse return false;
+        return e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config) or e.header.entry_type == @backingInt(entry_mod.EntryType.raft_noop);
+    }
+
+    /// What a write committed at `index`, at or past the halt, is told.
+    /// The write the shard halted at never runs: a repair skips that entry.
+    fn pendingMessage(self: *const Shard, buf: []u8, index: u64) []const u8 {
+        const h = &(self.halted orelse return "shard is halted; your write will apply when the shard resumes — do not resend");
+        if (index == h.index) return std.fmt.bufPrint(buf, "shard {d} halted at your write (entry {d}): {s}. It has not applied; a repair skips it, so it will not run. Don't resend it unchanged", .{ self.id, h.index, h.reason() }) catch "shard halted at your write; a repair skips it, so it will not run. Don't resend it unchanged";
+        return std.fmt.bufPrint(buf, "shard {d} is halted at entry {d}; your write is entry {d} and will apply when the shard resumes — do not resend", .{ self.id, h.index, index }) catch "shard is halted; your write will apply when the shard resumes — do not resend";
+    }
+
+    /// What a write to a halted shard is refused with.
+    fn haltedMessage(self: *const Shard, buf: []u8) []const u8 {
+        const h = &(self.halted orelse return "unavailable: shard is halted");
+        return std.fmt.bufPrint(buf, "unavailable: shard {d} is halted at {s}; this request was not run. Restarting won't help — the node's /status says where it halted", .{ self.id, h.reason() }) catch "unavailable: shard is halted; this request was not run";
+    }
+
+    /// Writes waiting on entries at or past the halt, once their entries
+    /// commit: told the write applies when the shard resumes. One whose
+    /// entry a later leader replaced never committed, and is told so; one
+    /// not committed yet keeps waiting, since a leader change may still
+    /// drop it.
+    fn answerHaltedPending(self: *Shard) void {
+        const h = &(self.halted orelse return);
+        if (self.pending_count == 0) return;
+        const raft = self.raft_node;
+        for (self.pending) |*slot| {
+            if (!slot.active or slot.index < h.index or slot.index > raft.commit_index) continue;
+            if (raft.log.entryTerm(slot.index)) |term| if (term != slot.term) {
+                self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .unavailable, proto.notRun("unavailable: leader changed, write not applied — retry"));
+                self.endPending(slot);
+                continue;
+            };
+            // A membership change or a term's no-op takes effect at commit,
+            // halted or not: answered as done.
+            if (self.appliesAroundHalt(slot.index)) {
+                var done = persistence_mod.Result{ .index = slot.index };
+                const proxy = self.respond_proxy;
+                loadProxy(proxy, slot.reply_to);
+                slot.answer(self, proxy, slot.request_id, &done);
+                var err_buf: [256]u8 = undefined;
+                if (self.takeProxyAnswer(proxy, slot.request_id, &err_buf)) |answer| {
+                    defer answer.free(self.allocator);
+                    self.deliverDeferred(slot.reply_to, answer.bytes());
+                }
+                self.endPending(slot);
+                continue;
+            }
+            var buf: [320]u8 = undefined;
+            self.deliverDeferredRefusal(slot.reply_to, slot.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = self.pendingMessage(&buf, slot.index) });
+            self.endPending(slot);
+        }
+    }
+
     /// This node's own data is damaged: the projections are missing what
     /// `damage` names and cannot be rebuilt here. On a lone node the shard
     /// goes offline and the others serve; a member stops taking part in
@@ -3036,12 +3178,19 @@ pub const Shard = struct {
         if (self.raft_network == null) {
             self.offline = damage;
             self.offline_published.store(true, .release);
-            log.err("shard {d} is offline on this node: {s}. Its requests are refused; the other shards serve. A restart may help if the cause was memory; otherwise the data directory needs repair", .{ self.id, damage.reason() });
+            const what = if (damage.out_of_memory) "Its log is intact: restart the node once memory is free" else "The data directory needs repair";
+            log.err("shard {d} is offline on this node: {s}. Its requests are refused; the other shards serve. {s}", .{ self.id, damage.reason(), what });
             var buf: [320]u8 = undefined;
             self.stopTakingPart(self.offlineMessage(&buf));
             return;
         }
         self.replica.diverged = true;
+        self.diverged_damage = damage;
+        if (damage.out_of_memory) {
+            log.err("shard {d}: {s}. Its log on disk is intact; it has stopped taking part in the group until it restarts. Restart it once memory is free", .{ self.id, damage.reason() });
+            self.stopTakingPart(OUT_OF_MEMORY_MESSAGE);
+            return;
+        }
         log.err("shard {d}: {s}. This node's copy can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member>", .{ self.id, damage.reason() });
         self.stopTakingPart(DIVERGED_MESSAGE);
     }
@@ -3052,6 +3201,7 @@ pub const Shard = struct {
         if (self.removed_at_ms != null) return .removed;
         if (self.replica.diverged) return .diverged;
         if (self.offline != null) return .offline;
+        if (self.halted != null) return .halted;
         const raft = self.raft_node;
         if (raft.writes_stopped) return .cannot_flush;
         // A node no config names is joining. It is guarded too, since an
@@ -3103,8 +3253,20 @@ pub const Shard = struct {
         }
         const slot = self.health orelse return;
         slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
-        // The reason before the state: a reader that sees offline finds it.
-        if (self.offline) |*damage| slot.setReason(damage.reason());
+        // The reason before the state: a reader that sees offline, halted
+        // or diverged finds it.
+        // The reason is the state's: a shard halted, then diverged, says why
+        // it diverged.
+        if (self.halted) |*h| slot.halt_index.store(h.index, .monotonic);
+        if (self.diverged_damage) |*damage| {
+            slot.setReason(damage.reason());
+        } else if (self.replica.divergedReason()) |why| {
+            slot.setReason(why);
+        } else if (self.offline) |*damage| {
+            slot.setReason(damage.reason());
+        } else if (self.halted) |*h| {
+            slot.setReason(h.reason());
+        }
         const raft = self.raft_node;
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
@@ -3119,7 +3281,8 @@ pub const Shard = struct {
     /// What an offline shard answers every request with.
     fn offlineMessage(self: *const Shard, buf: []u8) []const u8 {
         const damage = &(self.offline orelse return "unavailable: shard is offline on this node");
-        return std.fmt.bufPrint(buf, "unavailable: shard {d} is offline on this node: {s}; a restart may help if the cause was memory", .{ self.id, damage.reason() }) catch "unavailable: shard is offline on this node";
+        const what = if (damage.out_of_memory) "its log is intact: restart the node once memory is free" else "the data directory needs repair";
+        return std.fmt.bufPrint(buf, "unavailable: shard {d} is offline on this node: {s}; {s}", .{ self.id, damage.reason(), what }) catch "unavailable: shard is offline on this node";
     }
 
     /// Lead nothing, and answer what was in flight with `message`.
@@ -3298,11 +3461,14 @@ pub const Shard = struct {
     /// logged, when the projections are missing it; its client, if any, is
     /// told the write committed but did not apply.
     pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry, out: *persistence_mod.Result) bool {
-        const result = applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out);
-        noteApply(&self.losses, self.id, nowMs(), entry, result);
-        if (result != .applied) return false;
-        self.afterApply(entry, out);
-        return true;
+        return self.applyOne(entry, out) == .applied;
+    }
+
+    /// Apply one committed entry and, when it applied, tell its waiters.
+    fn applyOne(self: *Shard, entry: *const entry_mod.Entry, out: *persistence_mod.Result) Verdict {
+        const verdict = verdictOf(&self.losses, self.id, nowMs(), entry, applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out));
+        if (verdict == .applied) self.afterApply(entry, out);
+        return verdict;
     }
 
     /// Apply every committed entry not yet applied. Only the shard's own
@@ -3330,6 +3496,12 @@ pub const Shard = struct {
         // An offline shard's projections are missing an entry: nothing
         // after it may apply over the hole.
         if (self.applying or self.offline != null) return true;
+        // Halted: nothing past the entry applies, but writes committed
+        // after it are told so as their entries commit.
+        if (self.halted != null) {
+            self.answerHaltedPending();
+            return false;
+        }
         // With sync durability a leader's writes commit only once on disk:
         // flushing first lets what that commits apply now.
         self.syncFlushIfNeeded();
@@ -3347,9 +3519,32 @@ pub const Shard = struct {
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
                 if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
-                    raft.noteApplied(e.header.timestamp_ns);
+                    // The leader stamps each entry after the one before it,
+                    // so an entry that isn't is a bug every replica sees.
+                    if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp) {
+                        self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
+                        all_applied = false;
+                        break :drain;
+                    }
                     self.last_result.reset(&e);
-                    const applied = self.applyEntry(&e, &self.last_result);
+                    const verdict = self.applyOne(&e, &self.last_result);
+                    switch (verdict) {
+                        .applied, .duplicate => {},
+                        .halt => |why| {
+                            self.halt(&e, "{s} (a Flo bug)", .{why});
+                            all_applied = false;
+                            break :drain;
+                        },
+                        .local => |damage| {
+                            self.last_entry_applied = false;
+                            self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                            self.damaged(damage);
+                            all_applied = false;
+                            break :drain;
+                        },
+                    }
+                    raft.noteApplied(e.header.timestamp_ns);
+                    const applied = verdict == .applied;
                     // A bug in an applier, never a valid request's doing:
                     // every answer is sized for the longest key.
                     if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
@@ -3490,6 +3685,15 @@ pub const Shard = struct {
 
     // ─── Event loop ──────────────────────────────────────────────────────
 
+    /// Answer the reads whose wait ran out. On a halted shard they read
+    /// stale state, and say so.
+    fn expireWaiters(self: *Shard) void {
+        const was_stale = proto.answering_stale;
+        proto.answering_stale = was_stale or self.halted != null;
+        defer proto.answering_stale = was_stale;
+        self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
+    }
+
     /// Run one iteration of the event loop (for testing).
     pub fn tick(self: *Shard, timeout_ms: u32) !usize {
         // Lazily register acceptor pipe with reactor on first tick
@@ -3531,7 +3735,7 @@ pub const Shard = struct {
         self.publishHealth();
 
         // Expire stale blocking waiters across all subsystems
-        self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
+        self.expireWaiters();
         self.expireReplySlots();
 
         // Run cooperative background tasks (hot_flush, TTL sweep, etc.)
@@ -5496,7 +5700,7 @@ pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         // Same contract as the queue handler's dequeue-ack: log, never fail
         // the dequeue. The ack applies when it commits.
         _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
-            log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
+            if (!shard.quietHalted(err)) log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
         };
     }
 
@@ -5675,6 +5879,8 @@ const FORWARD_PREFIX: usize = 4 + 2;
 /// can never match one in the waiter pool.
 const FORWARD_ID_FIRST: u32 = 0x8000_0000;
 pub const DIVERGED_MESSAGE = replica_mod.DIVERGED_MESSAGE;
+/// A member that ran out of memory applying the log: nothing is lost.
+pub const OUT_OF_MEMORY_MESSAGE = "unavailable: this node ran out of memory applying the log and takes no part until it restarts; use another node";
 
 /// How many step passes one tick takes: a chain of child starts that
 /// deep resolves in one tick on a single node; a deeper one continues on
@@ -5826,6 +6032,75 @@ pub const ApplyResult = union(enum) {
     no_applier,
 };
 
+/// An entry every replica fails the same way, and why. A shard halted at
+/// it applies nothing from it on until a repair.
+pub const Halt = struct {
+    index: u64,
+    term: u64,
+    /// The entry's checksum: with its index and term, what a repair names.
+    crc: u32,
+    len: usize = 0,
+    buf: [192]u8 = undefined,
+
+    pub fn init(e: *const entry_mod.Entry, comptime fmt: []const u8, args: anytype) Halt {
+        var h: Halt = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
+        // Too long for the buffer: kept cut short.
+        h.len = if (std.fmt.bufPrint(&h.buf, fmt, args)) |w| w.len else |_| h.buf.len;
+        return h;
+    }
+
+    pub fn reason(self: *const Halt) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// What an apply came to, for the shard: whether to go on.
+const Verdict = union(enum) {
+    applied,
+    /// An index the partition already holds: counted, nothing lost.
+    duplicate,
+    /// No replica can apply it: why.
+    halt: []const u8,
+    /// This node couldn't, for want of memory or a disk; another may.
+    local: silent_loss.Damage,
+};
+
+/// Judge one apply. Duplicates are counted here; losses are counted by
+/// whoever acts on `local` (`Shard.damaged`, or boot's damage).
+fn verdictOf(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *const entry_mod.Entry, result: ApplyResult) Verdict {
+    const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type))) orelse "unknown";
+    const index = entry.header.index;
+    return switch (result) {
+        .applied => .applied,
+        .partition_reject => |err| if (err == error.IndexNotIncreasing) blk: {
+            counts.noteDuplicate(now_ms, shard_id, index, type_name);
+            break :blk .duplicate;
+        } else if (err == error.OutOfMemory)
+            .{ .local = outOfMemory(silent_loss.Damage.init(.partition_reject, "entry {d} ({s}) could not be held: the partition is out of memory", .{ index, type_name })) }
+        else
+            .{ .halt = "the partition refused it" },
+        .router_error => |err| if (err == error.Halt)
+            .{ .halt = "its projection refused it as malformed" }
+        else
+            .{ .local = localDamage(err, silent_loss.Damage.init(.router_error, "entry {d} ({s}) could not be applied on this node: {s}", .{ index, type_name, applyErrorName(err) })) },
+        .applier_failed => |err| if (err == error.Halt)
+            .{ .halt = "its applier refused it as malformed" }
+        else
+            .{ .local = localDamage(err, silent_loss.Damage.init(.applier_failed, "entry {d} ({s}) could not be applied on this node: {s}", .{ index, type_name, applyErrorName(err) })) },
+        .no_applier => .{ .halt = "no applier on this build takes its type" },
+    };
+}
+
+fn outOfMemory(d: silent_loss.Damage) silent_loss.Damage {
+    var m = d;
+    m.out_of_memory = true;
+    return m;
+}
+
+fn localDamage(err: persistence_mod.ApplyError, d: silent_loss.Damage) silent_loss.Damage {
+    return if (err == error.OutOfMemory) outOfMemory(d) else d;
+}
+
 /// Entry types with nothing to apply: the term's no-op.
 const APPLIES_NOTHING = [_]entry_mod.EntryType{.raft_noop};
 /// Entry types nothing writes today. One that arrives anyway is counted as
@@ -5847,29 +6122,15 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 /// router owns — KV, queue, TS) and then the registry appliers for every
 /// other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
+    if (comptime build_options.test_faults) {
+        if (@import("test_faults.zig").halts(entry)) return .{ .applier_failed = error.Halt };
+    }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
     return .applied;
-}
-
-/// Count and say why an entry did not apply. Its applier, where it had one,
-/// has said what went wrong with the entry itself.
-fn noteApply(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *const entry_mod.Entry, result: ApplyResult) void {
-    const type_name = @tagName(@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type))));
-    const index = entry.header.index;
-    switch (result) {
-        .applied => {},
-        .partition_reject => |err| if (err == error.IndexNotIncreasing)
-            counts.noteDuplicate(now_ms, shard_id, index, type_name)
-        else
-            counts.note(.partition_reject, now_ms, shard_id, "entry index={d} type={s} refused by the partition: {s}; projections are missing it", .{ index, type_name, @errorName(err) }),
-        .router_error => |err| counts.note(.router_error, now_ms, shard_id, "entry index={d} type={s} failed in its projection ({s}); the projection is missing it", .{ index, type_name, applyErrorName(err) }),
-        .applier_failed => |err| counts.note(.applier_failed, now_ms, shard_id, "entry index={d} type={s} could not be applied ({s}); its state is missing it", .{ index, type_name, applyErrorName(err) }),
-        .no_applier => counts.note(.no_applier, now_ms, shard_id, "entry index={d} type={s} has no applier on this build", .{ index, type_name }),
-    }
 }
 
 fn applyErrorName(err: persistence_mod.ApplyError) []const u8 {
@@ -5940,6 +6201,11 @@ fn restoreRaftEntry(shard_id: u16, raft_log: *RaftLog, e: *const entry_mod.Entry
 const ReplayOutcome = struct {
     applied_through: u64 = 0,
     damage: ?silent_loss.Damage = null,
+    /// The entry replay halted at: the rest of the log is restored, and
+    /// none of it applied.
+    halt: ?Halt = null,
+    /// The stamp of the last entry applied.
+    last_stamp: u64 = 0,
     /// Another shard's boot failed, and this one stopped early.
     cancelled: bool = false,
     /// Entries read back, for the progress lines.
@@ -6052,11 +6318,28 @@ fn replaySegmentFile(
         }
 
         // Above the watermark: in the log, not yet in the projections.
-        if (seg_entry.header.index > watermark) continue;
+        // Past a halt: in the log, and nothing of it applies until a repair.
+        if (seg_entry.header.index > watermark or out.halt != null) continue;
 
+        if (out.last_stamp != 0 and seg_entry.header.timestamp_ns <= out.last_stamp) {
+            out.halt = Halt.init(&seg_entry, "entry {d}: its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ seg_entry.header.index, seg_entry.header.timestamp_ns, out.last_stamp });
+            continue;
+        }
         // Nobody waits on a replayed entry's answer.
         replay_result.reset(&seg_entry);
-        noteApply(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
+        switch (verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result))) {
+            .applied, .duplicate => {},
+            .halt => |why| {
+                const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
+                out.halt = Halt.init(&seg_entry, "entry {d} ({s}): {s} (a Flo bug)", .{ seg_entry.header.index, type_name, why });
+                continue;
+            },
+            .local => |damage| {
+                out.damage = damage;
+                return;
+            },
+        }
+        out.last_stamp = seg_entry.header.timestamp_ns;
         out.applied_through = seg_entry.header.index;
     }
 }
@@ -6456,6 +6739,28 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), resp.header.status);
     try std.testing.expectEqual(@as(u64, 8), resp.header.request_id);
+}
+
+test "Shard: on a halted shard a read whose wait runs out is answered marked stale" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    haltForTest(&shard, shard.raft_node.last_applied + 1);
+    var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = c.conn.replyTo(), .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
+    shard.waiter_pool.waiters[0].expires_at_ms = 0;
+    shard.expireWaiters();
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(out[0..n]);
+    try std.testing.expectEqual(@as(u64, 8), resp.header.request_id);
+    try std.testing.expect(resp.header.flags & proto.RESPONSE_STALE != 0);
+    try std.testing.expect(!proto.answering_stale);
 }
 
 test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minutes is refused rather than shortened" {
@@ -12349,6 +12654,28 @@ test "a flipped byte in a sealed segment takes its shard offline, and replay sto
     try t.expectOffline(.segment_unreadable, 2);
 }
 
+test "a member whose segment is damaged at boot is diverged, and /status says why" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(2, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    bytes[bytes.len / 2] ^= 0xff;
+    try DamageTest.writeFile(path, bytes);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    var slot: health_mod.ShardSlot = .{};
+    shard.health = &slot;
+    shard.publishHealth();
+    try std.testing.expectEqual(health_mod.ShardState.diverged, slot.get());
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "is unreadable") != null);
+}
+
 test "a missing middle segment takes its shard offline instead of being taken for compaction" {
     var t: DamageTest = undefined;
     try t.init();
@@ -12408,35 +12735,43 @@ test "an entry of a type this build doesn't know takes its shard offline, not th
     try t.expectOffline(.segment_bad_entry, 1);
 }
 
-test "an entry no projection or applier can take is counted on its path, and its client told it did not apply" {
+test "an entry no projection or applier can take halts its shard at it, applying nothing past it, and is no loss" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    // A 4 KiB partition ring: an 8 KiB entry cannot enter it.
-    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, 4096, 0, 0, .async_flush, 1, .single, .{}, .{});
-    defer shard.deinit();
-    shard.wireHandlerShardPtrs();
-    try std.testing.expect(shard.applyCommitted());
-
-    const Case = struct { entry_type: entry_mod.EntryType, payload: []const u8, path: silent_loss.Path };
+    const Case = struct { entry_type: entry_mod.EntryType, payload: []const u8, why: []const u8 };
     const big = @as([8192]u8, @splat('x'));
     for ([_]Case{
         // The registry applier cannot decode it.
-        .{ .entry_type = .action_invoke, .payload = "not a command payload", .path = .applier_failed },
+        .{ .entry_type = .action_invoke, .payload = "not a command payload", .why = "its applier refused it" },
         // The KV projection cannot decode it.
-        .{ .entry_type = .kv_put, .payload = "not a command payload", .path = .router_error },
+        .{ .entry_type = .kv_put, .payload = "not a command payload", .why = "its projection refused it" },
         // Nothing writes this type, and nothing applies it.
-        .{ .entry_type = .cg_create, .payload = "", .path = .no_applier },
+        .{ .entry_type = .cg_create, .payload = "", .why = "no applier on this build" },
         // Larger than the partition ring.
-        .{ .entry_type = .stream_append, .payload = &big, .path = .partition_reject },
+        .{ .entry_type = .stream_append, .payload = &big, .why = "the partition refused it" },
     }) |c| {
-        const before = shard.losses.total(c.path);
-        _ = try shard.raft_node.propose(c.entry_type, entry_mod.Flags.NONE, c.payload);
+        // A 4 KiB partition ring: an 8 KiB entry cannot enter it.
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, 4096, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.wireHandlerShardPtrs();
+        try std.testing.expect(shard.applyCommitted());
+        const bad = try shard.raft_node.propose(c.entry_type, entry_mod.Flags.NONE, c.payload);
         try std.testing.expect(!shard.applyCommitted());
-        try std.testing.expectEqual(before + 1, shard.losses.total(c.path));
-        try std.testing.expect(!shard.last_entry_applied);
-        // Counted, not offline: replay and apply carry on.
+        const h = shard.halted orelse return error.NotHalted;
+        try std.testing.expectEqual(bad.index, h.index);
+        try std.testing.expectEqual(bad.term, h.term);
+        try std.testing.expect(std.mem.indexOf(u8, h.reason(), c.why) != null);
+        try std.testing.expectEqual(bad.index - 1, shard.raft_node.last_applied);
+        // No loss, and not offline: every replica halts at the same entry.
+        for (std.enums.values(silent_loss.Path)) |path| try std.testing.expectEqual(@as(u64, 0), shard.losses.total(path));
         try std.testing.expect(shard.offline == null);
+        try std.testing.expectEqual(health_mod.ShardState.halted, shard.healthState());
+        // Its writes are refused; a membership change still goes in.
+        try std.testing.expectError(error.Halted, persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+        _ = try shard.raft_node.proposeConfig(&shard.raft_node.latest_config);
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(bad.index - 1, shard.raft_node.last_applied);
     }
 }
 
@@ -12476,9 +12811,9 @@ test "a committed entry this node cannot read back takes its shard offline, and 
     try std.testing.expect(std.mem.indexOf(u8, one[0].data, "shard 0 is offline on this node: committed entry") != null);
 }
 
-/// A client write whose entry nothing applies, parked as a handler parks
+/// A client write whose entry halts its shard, parked as a handler parks
 /// one; its answer function would answer ok.
-const UnappliedWrite = struct {
+const HaltingWrite = struct {
     fn handle(sh: *anyopaque, c: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(sh));
         const proposed = shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "") catch @panic("propose failed");
@@ -12489,41 +12824,43 @@ const UnappliedWrite = struct {
         shard.sendOkResponse(c, request_id, "applied");
     }
 
-    /// The one answer `conn` got: committed, not applied.
-    fn expectToldNotApplied(sh: *Shard, conn: *Connection, fd: std.posix.fd_t) !void {
+    /// The one answer `conn` got: its write is the entry the shard halted
+    /// at, which a repair skips.
+    fn expectToldPending(sh: *Shard, conn: *Connection, fd: std.posix.fd_t) !void {
         var one: [1]proto.Response = undefined;
         var buf: [512]u8 = undefined;
         try ParkTest.responses(sh, conn, fd, &buf, &one);
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.internal_error), one[0].header.status);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.outcome_pending), one[0].header.status);
         const r = try one[0].refused();
-        try std.testing.expectEqualStrings(persistence_mod.COMMITTED_NOT_APPLIED, r.message);
-        try std.testing.expectEqual(proto.Reason.committed_not_applied, r.reason);
-        try std.testing.expectEqual(proto.Ran.yes, r.ran);
+        try std.testing.expectEqual(proto.Reason.shard_halted, r.reason);
+        try std.testing.expectEqual(proto.Ran.unknown, r.ran);
+        try std.testing.expect(std.mem.indexOf(u8, r.message, "halted at your write") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.message, "a repair skips it, so it will not run") != null);
     }
 };
 
-test "a client write whose entry does not apply is told so, whether it commits at once or after a peer's ack" {
+test "a client write whose entry halts its shard is told its outcome is pending, whether it commits at once or after a peer's ack" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
     var pair: [2]std.posix.fd_t = undefined;
 
-    // Alone, the entry commits as it is proposed and applies inside `park`.
+    // Alone, the entry commits as it is proposed and halts inside `park`.
     {
         var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
-        shard.dispatcher.register(.kv_put, UnappliedWrite.handle);
+        shard.dispatcher.register(.kv_put, HaltingWrite.handle);
         try std.testing.expect(shard.applyCommitted());
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
         defer _ = std.c.close(pair[1]);
         const conn = try shard.addConnection(pair[0]);
         try ParkTest.send(&shard, conn, .kv_put, 1, "k", "v");
-        try UnappliedWrite.expectToldNotApplied(&shard, conn, pair[1]);
-        try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
+        try HaltingWrite.expectToldPending(&shard, conn, pair[1]);
+        try std.testing.expect(shard.halted != null);
     }
 
-    // With a peer, it waits for the ack and is answered as it applies.
+    // With a peer, it waits for the ack and is answered as it commits.
     {
         var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
         defer rn.deinit();
@@ -12532,7 +12869,7 @@ test "a client write whose entry does not apply is told so, whether it commits a
         shard.raft_network = &rn;
         shard.wireHandlerShardPtrs();
         try ParkTest.joinPeer(&shard);
-        shard.dispatcher.register(.kv_put, UnappliedWrite.handle);
+        shard.dispatcher.register(.kv_put, HaltingWrite.handle);
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
         defer _ = std.c.close(pair[1]);
         const conn = try shard.addConnection(pair[0]);
@@ -12544,30 +12881,382 @@ test "a client write whose entry does not apply is told so, whether it commits a
         r.peers[0].sent_up_to = last;
         r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = 2 });
         try std.testing.expect(!shard.applyCommitted());
-        try UnappliedWrite.expectToldNotApplied(&shard, conn, pair[1]);
-        try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
+        try HaltingWrite.expectToldPending(&shard, conn, pair[1]);
+        try std.testing.expectEqual(@as(u32, 0), shard.pending_count);
     }
 }
 
-test "an entry that cannot apply at boot is counted, and replay carries on past it" {
+/// Halt `shard` at a made-up entry `index`, as an apply would.
+fn haltForTest(shard: *Shard, index: u64) void {
+    var e = entry_mod.buildEntry(.cg_create, entry_mod.Flags.NONE, 1, index, 0, "");
+    e.header.crc32c = e.computeCrc();
+    shard.halted = Halt.init(&e, "entry {d}: halted for a test", .{index});
+    shard.raft_node.halted = true;
+}
+
+test "a halted shard refuses a client's write, saying where it halted and why, and serves its reads marked stale" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const bad = try shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "");
+    try std.testing.expect(!shard.applyCommitted());
+
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const set = try table_run.op("kv.set").request.encodeInto(&body, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = set }, .client);
+    const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
+    const r = try refused.refused();
+    try std.testing.expectEqual(proto.Reason.shard_halted, r.reason);
+    try std.testing.expectEqual(proto.Ran.no, r.ran);
+    var want: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, r.message, try std.fmt.bufPrint(&want, "shard 0 is halted at entry {d} (cg_create)", .{bad.index})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.message, "Restarting won't help") != null);
+    try std.testing.expect(refused.header.flags & proto.RESPONSE_STALE == 0);
+
+    // A read is answered, from the state before the halt, marked stale.
+    const get = try table_run.op("kv.get").request.encodeInto(&body, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null });
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_get, 2), .namespace = "", .key = "k", .value = get }, .client);
+    const read = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@as(u64, 2), read.header.request_id);
+    try std.testing.expect(read.header.status != @backingInt(proto.StatusCode.unavailable));
+    try std.testing.expect(read.header.flags & proto.RESPONSE_STALE != 0);
+    try std.testing.expect(!proto.answering_stale);
+}
+
+test "a halted group still changes its members: a remove is taken and answered ok once it commits" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const r = t.shard.raft_node;
+    haltForTest(&t.shard, r.last_applied + 1);
+    // Remove node 2: a membership change, which the halt doesn't stop.
+    var body: [5]u8 = undefined;
+    std.mem.writeInt(u32, body[0..4], 2, .little);
+    body[4] = 1;
+    // Leaving a lone voter, it commits as it is proposed.
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 1, "", "", &body, ""), .client);
+    _ = t.shard.applyCommitted();
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(one[0].header.flags & proto.RESPONSE_STALE == 0);
+    try std.testing.expect(!r.latest_config.names(2));
+    // The committed config moves with commit, halted or not.
+    try std.testing.expect(!r.committed_config.names(2));
+}
+
+test "a halted leader of three removes a voter once a peer acks it, and answers the remove ok" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    const three = membership.Config.ofVoters(&.{ 1, 2, 3 });
+    raft.setMembership(&three, raft.commit_index);
+    haltForTest(&t.shard, raft.last_applied + 1);
+    var body: [5]u8 = undefined;
+    std.mem.writeInt(u32, body[0..4], 3, .little);
+    body[4] = 1;
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 8, "", "", &body, ""), .client);
+    // Two voters left: it waits for node 2.
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    const last = raft.log.lastIndex();
+    raft.peers[raft.peerIndex(2).?].sent_up_to = last;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = last, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    var buf: [512]u8 = undefined;
+    var into: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+    try std.testing.expectEqual(proto.StatusCode.ok, into[0].getStatus());
+    try std.testing.expect(!raft.committed_config.names(3));
+}
+
+test "a halted group promotes a caught-up learner and answers ok" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    t.shard.handleJoinRequest(2);
+    try std.testing.expect(t.shard.applyCommitted());
+    t.caughtUp(2);
+    haltForTest(&t.shard, raft.last_applied + 1);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .client);
+    const last = raft.log.lastIndex();
+    raft.peers[raft.peerIndex(2).?].sent_up_to = last;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = last, .from = 2 });
+    _ = t.shard.applyCommitted();
+    var buf: [512]u8 = undefined;
+    var into: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+    try std.testing.expectEqual(proto.StatusCode.ok, into[0].getStatus());
+    try std.testing.expect(raft.committed_config.isVoter(2));
+}
+
+test "a gathered read whose part a halted shard answers is answered, marked stale; a gathered write to it is refused halted" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    haltForTest(&f.two.shards[1], 7);
+    try f.ask(1, &f.keys);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(resp.header.flags & proto.RESPONSE_STALE != 0);
+    try f.expectSettled(0);
+
+    // The same gather carrying a write: shard 1's part is refused halted,
+    // and so is the whole.
+    var c: ConcatOp = .{};
+    const a = &f.two.shards[0];
+    const local = try a.allocator.dupe(u8, "local");
+    const set = try table_run.op("kv.set").request.encodeInto(&f.body_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_put, 8), .namespace = "default", .key = f.keys[1], .value = set };
+    try a.startGather(f.client.conn, req, &.{ .{ .owner = 0, .body = local }, .{ .owner = 1, .body = set } }, &ConcatOp.op, &c);
+    f.two.settle();
+    const refused = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
+    try std.testing.expectEqual(proto.Reason.shard_halted, (try refused.refused()).reason);
+    try std.testing.expectEqual(@as(u32, 0), c.merges);
+    try f.expectSettled(0);
+}
+
+test "a halted coordinator that owns no part of a gathered read answers it unmarked" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const a = &f.two.shards[0];
+    haltForTest(a, 7);
+    var c: ConcatOp = .{};
+    const body = try mget_mod.pieceBody(&f.body_buf, &.{f.keys[1]});
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_mget, 9), .namespace = "default", .key = "", .value = body };
+    try a.startGather(f.client.conn, req, &.{.{ .owner = 1, .body = body }}, &ConcatOp.op, &c);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(resp.header.flags & proto.RESPONSE_STALE == 0);
+    try std.testing.expectEqual(@as(u32, 1), c.merges);
+    try f.expectSettled(0);
+}
+
+test "a shard that runs out of memory applying an entry is told to restart once memory is free; damaged data is told to repair" {
+    var losses: silent_loss.Counts = .{};
+    var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 7, 0, "");
+    e.header.crc32c = e.computeCrc();
+    const oom = verdictOf(&losses, 0, 0, &e, .{ .router_error = error.OutOfMemory }).local;
+    try std.testing.expect(oom.out_of_memory);
+    try std.testing.expect(!verdictOf(&losses, 0, 0, &e, .{ .applier_failed = error.Io }).local.out_of_memory);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var buf: [320]u8 = undefined;
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.damaged(oom);
+        try std.testing.expect(std.mem.indexOf(u8, shard.offlineMessage(&buf), "restart the node once memory is free") != null);
+    }
+    {
+        var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        defer shard.deinit();
+        shard.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry 7 could not be read back", .{}));
+        try std.testing.expect(std.mem.indexOf(u8, shard.offlineMessage(&buf), "needs repair") != null);
+    }
+}
+
+test "a write committed past the halt is told it will apply when the shard resumes" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const r = t.shard.raft_node;
+    const h = (try r.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
+    var set_buf: [64]u8 = undefined;
+    t.send(.kv_put, 1, "k", try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    const last = r.log.lastIndex();
+    r.peers[0].sent_up_to = last;
+    r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    try std.testing.expectEqual(h, t.shard.halted.?.index);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.outcome_pending), one[0].header.status);
+    const m = (try one[0].refused()).message;
+    try std.testing.expect(std.mem.indexOf(u8, m, "will apply when the shard resumes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m, "halted at your write") == null);
+}
+
+test "a write parked past the halt whose entry a later leader replaces is told the leader changed, never that it is pending" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const r = t.shard.raft_node;
+    // H halts; the write after it is still uncommitted when it does.
+    const h = (try r.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
+    const set = table_run.op("kv.set");
+    var set_buf: [64]u8 = undefined;
+    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    const term = r.current_term;
+    r.peers[0].sent_up_to = h;
+    r.handleAppendResponse(.{ .term = term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    try std.testing.expectEqual(h, t.shard.halted.?.index);
+    // Not committed: still waiting.
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    // Node 2 leads term + 1, replaces the write's entry with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, h + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = h, .prev_log_term = term, .entries = (&noop)[0..1], .leader_commit = h + 1 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+}
+
+test "an entry stamped no later than the one before it halts its shard" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+    try std.testing.expect(shard.applyCommitted());
+    const r = shard.raft_node;
+    // An entry no leader would stamp: the same stamp as the one before.
+    const idx = r.log.lastIndex() + 1;
+    var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, r.current_term, idx, r.applied_stamp, "");
+    e.header.crc32c = e.computeCrc();
+    _ = try r.log.append(&e);
+    r.commit_index = idx;
+    try std.testing.expect(!shard.applyCommitted());
+    const h = shard.halted orelse return error.NotHalted;
+    try std.testing.expectEqual(idx, h.index);
+    try std.testing.expect(std.mem.indexOf(u8, h.reason(), "stamp") != null);
+    try std.testing.expectEqual(idx - 1, r.last_applied);
+}
+
+test "Shard: a halted shard counts its own refused writes and says so once per 30 seconds" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    try std.testing.expect(!shard.quietHalted(error.NotLeader));
+    // The first is said at once; the next two wait for the line after.
+    try std.testing.expect(shard.quietHalted(error.Halted));
+    try std.testing.expectEqual(@as(u64, 0), shard.halted_refusals);
+    try std.testing.expect(shard.quietHalted(error.Halted));
+    try std.testing.expect(shard.quietHalted(error.Halted));
+    try std.testing.expectEqual(@as(u64, 2), shard.halted_refusals);
+    shard.halted_line_ms = 0;
+    try std.testing.expect(shard.quietHalted(error.Halted));
+    try std.testing.expectEqual(@as(u64, 0), shard.halted_refusals);
+}
+
+test "Shard: a partition out of memory is this node's damage, never a halt; another refusal halts" {
+    var counts: silent_loss.Counts = .{};
+    var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 7, 1, "");
+    e.header.crc32c = e.computeCrc();
+    switch (verdictOf(&counts, 0, 0, &e, .{ .partition_reject = error.OutOfMemory })) {
+        .local => |d| try std.testing.expect(d.out_of_memory),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(verdictOf(&counts, 0, 0, &e, .{ .partition_reject = error.PayloadTooLarge }) == .halt);
+}
+
+test "replay halts at an entry stamped no later than the one applied before it" {
     var t: DamageTest = undefined;
     try t.init();
     defer t.deinit();
+    var idx: u64 = 0;
     {
         var shard = try t.open();
         defer shard.deinit();
-        // Nothing applies a cg_create; then one more enqueue after it.
-        _ = try shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "");
-        _ = shard.applyCommitted();
+        const r = shard.raft_node;
+        idx = r.log.lastIndex() + 1;
+        var e = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, r.current_term, idx, r.applied_stamp, "");
+        e.header.crc32c = e.computeCrc();
+        _ = try r.log.append(&e);
+        r.commit_index = idx;
+        try std.testing.expect(!shard.applyCommitted());
+        try shard.flushSegmentToDisk();
+    }
+    // A no-op applies whatever its stamp: only the stamp check halts it.
+    var shard = try t.open();
+    defer shard.deinit();
+    const h = shard.halted orelse return error.NotHalted;
+    try std.testing.expectEqual(idx, h.index);
+    try std.testing.expect(std.mem.indexOf(u8, h.reason(), "stamp") != null);
+    try std.testing.expectEqual(idx - 1, shard.raft_node.last_applied);
+}
+
+test "a shard halted before a restart comes up halted at the same entry, with nothing past it applied" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var halted_at: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // Nothing applies a cg_create; an enqueue commits after it.
+        halted_at = (try shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
         _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
-        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(halted_at, shard.halted.?.index);
         try shard.flushSegmentToDisk();
     }
     var shard = try t.open();
     defer shard.deinit();
     try std.testing.expect(shard.offline == null);
-    try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.no_applier));
-    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
+    const h = shard.halted orelse return error.NotHalted;
+    try std.testing.expectEqual(halted_at, h.index);
+    try std.testing.expect(shard.raft_node.halted);
+    try std.testing.expectEqual(halted_at - 1, shard.raft_node.last_applied);
+    // The restored log holds the enqueue; nothing applied it.
+    try std.testing.expect(shard.raft_node.log.lastIndex() > halted_at);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+    shard.applyDeferredTail();
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "Shard: a halted member that then diverges publishes why it diverged, with the index" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    var slot: health_mod.ShardSlot = .{};
+    shard.health = &slot;
+    try std.testing.expect(shard.applyCommitted());
+    haltForTest(&shard, shard.raft_node.last_applied + 1);
+    shard.publishHealth();
+    try std.testing.expectEqual(health_mod.ShardState.halted, slot.get());
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "at index") == null);
+    shard.raft_node.conflict_index = 42;
+    shard.replica.markDiverged(2, 9);
+    shard.publishHealth();
+    try std.testing.expectEqual(health_mod.ShardState.diverged, slot.get());
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "node 2 (term 9) disagrees") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "at index 42") != null);
 }
 
 test "Shard: the state it publishes follows the fields that decide it, the one needing an operator first" {
@@ -13283,7 +13972,7 @@ test "an entry repeating an index the partition holds is counted as a duplicate,
     try std.testing.expect(first == .applied);
     const again = applyEntryCore(shard.defaultPartition(), &shard.replay_registry, &e, &out);
     try std.testing.expect(again == .partition_reject);
-    noteApply(&shard.losses, shard.id, Shard.nowMs(), &e, again);
+    try std.testing.expect(verdictOf(&shard.losses, shard.id, Shard.nowMs(), &e, again) == .duplicate);
 
     try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.partition_reject));
     try std.testing.expectEqual(@as(u64, 1), shard.losses.duplicate_index);
