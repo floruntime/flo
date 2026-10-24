@@ -2382,9 +2382,9 @@ test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
 test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key hashes to" {
     const allocator = std.testing.allocator;
     const KVProjection = @import("../projection/kv.zig").KVProjection;
-    var kv0 = KVProjection.init(allocator, 0);
+    var kv0 = KVProjection.init(allocator);
     defer kv0.deinit();
-    var kv1 = KVProjection.init(allocator, 0);
+    var kv1 = KVProjection.init(allocator);
     defer kv1.deinit();
     var h0 = kv_handler_mod.KVHandler.init(allocator, &kv0);
     var h1 = kv_handler_mod.KVHandler.init(allocator, &kv1);

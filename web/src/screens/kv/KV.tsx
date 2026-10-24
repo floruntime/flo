@@ -57,7 +57,7 @@ export function KV() {
   }, [keys, sel])
 
   const detail = detailQ.data
-  const versions = historyQ.data?.versions ?? []
+  const versions = historyQ.data?.pages.flatMap((p) => p.versions) ?? []
   const totalBytes = keys.reduce((a, k) => a + k.size, 0)
   const value = detail?.found ? detail.value ?? '' : ''
   const counter = detail?.found && isCounter(value)
@@ -213,13 +213,13 @@ export function KV() {
             <div style={{ marginTop: 18 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                 <span className="set-h" style={{ padding: 0, margin: 0 }}>Version history</span>
-                <span className="mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{historyQ.data?.version_count ?? versions.length} version(s)</span>
+                <span className="mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{versions.length}{historyQ.hasNextPage ? '+' : ''} version(s)</span>
               </div>
               {versions.length === 0 ? (
                 <div style={{ color: 'var(--tx-faint)', fontSize: 12 }}>No history.</div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {versions.slice(0, 8).map((v) => (
+                  {versions.map((v) => (
                     <div key={v.version} className="kvrow2" style={{ borderBottom: '1px solid var(--line-soft)' }}>
                       <span className="mono" style={{ fontSize: 12, color: v.tombstone ? 'var(--crit)' : 'var(--tx-2)' }}>
                         v{v.version}{v.tombstone ? ' · tombstone' : ''}
@@ -229,6 +229,13 @@ export function KV() {
                       </span>
                     </div>
                   ))}
+                  {historyQ.hasNextPage && (
+                    <div style={{ display: 'flex', justifyContent: 'center', marginTop: 4 }}>
+                      <Button style={{ padding: '5px 11px', fontSize: 12 }} onClick={() => historyQ.fetchNextPage()} disabled={historyQ.isFetchingNextPage}>
+                        {historyQ.isFetchingNextPage ? 'Loading…' : 'Load older'}
+                      </Button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

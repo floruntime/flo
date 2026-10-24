@@ -604,7 +604,7 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
     try h.init();
     defer h.deinit();
     for ([_][]const u8{ "v1", "v2", "v3" }) |v| _ = try h.set("k", setBody(v, .{}));
-    const two = try h.ok("kv.history", "k", .{ .limit = 2, .routing_key = null });
+    const two = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null, .routing_key = null });
     try testing.expectEqual(@as(u32, 2), two.versions.count);
     var it = two.versions.iterator();
     for ([_]struct { version: u64, value: []const u8 }{ .{ .version = 3, .value = "v3" }, .{ .version = 2, .value = "v2" } }) |want| {
@@ -613,8 +613,53 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
         try testing.expectEqualStrings(want.value, v.value);
         try testing.expect(v.at_ms > 0);
     }
-    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .routing_key = null })).versions.count);
-    try h.no("kv.history", "absent", .{ .limit = 10, .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null, .routing_key = null })).versions.count);
+    try h.no("kv.history", "absent", .{ .limit = 10, .before_version = null, .routing_key = null }, .not_found, .not_found);
+}
+
+test "kv ops: history pages below before_version, and more says older versions follow" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    for ([_][]const u8{ "v1", "v2", "v3", "v4" }) |v| _ = try h.set("k", setBody(v, .{}));
+    // A limit stops the page: more follows.
+    const first = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null, .routing_key = null });
+    try testing.expectEqual(@as(u32, 2), first.versions.count);
+    try testing.expect(first.more);
+    const rest = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 3, .routing_key = null });
+    var it = rest.versions.iterator();
+    for ([_]u64{ 2, 1 }) |want| try testing.expectEqual(want, (try it.next()).?.version);
+    try testing.expect(!rest.more);
+    // Nothing older than the oldest: an empty page, not not-found.
+    const none = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 1, .routing_key = null });
+    try testing.expectEqual(@as(u32, 0), none.versions.count);
+    try testing.expect(!none.more);
+
+    // Values over the byte bound keep one older version beside the current
+    // one, and two of 130 KiB don't fit one answer: its size stops the
+    // first page, and following more reaches the older one.
+    const big = try testing.allocator.alloc(u8, 130 * 1024);
+    defer testing.allocator.free(big);
+    for (0..3) |i| {
+        @memset(big, @intCast('a' + i));
+        _ = try h.ok("kv.set", "big", setBody(big, .{}));
+    }
+    var before: ?u64 = null;
+    var seen: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        const page = try h.ok("kv.history", "big", .{ .limit = kv_ops.MAX_HISTORY, .before_version = before, .routing_key = null });
+        pages += 1;
+        var pit = page.versions.iterator();
+        while (try pit.next()) |v| {
+            try testing.expectEqual(@as(u64, 3 - seen), v.version);
+            before = v.version;
+            seen += 1;
+        }
+        if (!page.more) break;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+    try testing.expectEqual(@as(usize, 2), pages);
 }
 
 test "kv ops: history marks a delete's version deleted" {
@@ -624,7 +669,7 @@ test "kv ops: history marks a delete's version deleted" {
     _ = try h.set("k", setBody("v1", .{}));
     _ = try h.ok("kv.delete", "k", .{ .cas_version = null, .routing_key = null, .txn = null });
     _ = try h.set("k", setBody("v3", .{}));
-    var it = (try h.ok("kv.history", "k", .{ .limit = 10, .routing_key = null })).versions.iterator();
+    var it = (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null, .routing_key = null })).versions.iterator();
     for ([_]struct { version: u64, deleted: bool }{ .{ .version = 3, .deleted = false }, .{ .version = 2, .deleted = true }, .{ .version = 1, .deleted = false } }) |want| {
         const v = (try it.next()).?;
         try testing.expectEqual(want.version, v.version);

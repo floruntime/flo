@@ -39,9 +39,6 @@ pub const ApplyError = persistence.ApplyError;
 pub const ProjectionVTable = struct {
     /// Apply a committed UAL entry to this projection, recording its answer.
     applyFn: *const fn (ctx: *anyopaque, entry: *const Entry, result: *Result) ApplyError!void,
-
-    /// Return current memory usage in bytes.
-    memoryUsageFn: *const fn (ctx: *anyopaque) usize,
 };
 
 /// Type-erased projection handle.
@@ -51,10 +48,6 @@ pub const ProjectionHandle = struct {
 
     pub fn apply(self: ProjectionHandle, entry: *const Entry, result: *Result) ApplyError!void {
         return self.vtable.applyFn(self.ctx, entry, result);
-    }
-
-    pub fn memoryUsage(self: ProjectionHandle) usize {
-        return self.vtable.memoryUsageFn(self.ctx);
     }
 };
 
@@ -193,15 +186,6 @@ pub const ProjectionRouter = struct {
         }
     };
 
-    /// Total memory usage across all registered projections.
-    pub fn totalMemoryUsage(self: *const ProjectionRouter) usize {
-        var total: usize = 0;
-        if (self.kv) |h| total += h.memoryUsage();
-        if (self.queue) |h| total += h.memoryUsage();
-        if (self.ts) |h| total += h.memoryUsage();
-        return total;
-    }
-
     // ─── Internal ──────────────────────────────────────────────────────────
 
     fn applyTo(
@@ -287,7 +271,6 @@ const testing = std.testing;
 const TestProjection = struct {
     apply_count: u32 = 0,
     last_index: u64 = 0,
-    memory: usize = 1024,
 
     fn applyFn(ctx: *anyopaque, entry: *const Entry, _: *Result) ApplyError!void {
         const self: *TestProjection = @ptrCast(@alignCast(ctx));
@@ -295,18 +278,10 @@ const TestProjection = struct {
         self.last_index = entry.header.index;
     }
 
-    fn memoryUsageFn(ctx: *anyopaque) usize {
-        const self: *TestProjection = @ptrCast(@alignCast(ctx));
-        return self.memory;
-    }
-
     fn handle(self: *TestProjection) ProjectionHandle {
         return .{
             .ctx = @ptrCast(self),
-            .vtable = .{
-                .applyFn = applyFn,
-                .memoryUsageFn = memoryUsageFn,
-            },
+            .vtable = .{ .applyFn = applyFn },
         };
     }
 };
@@ -317,17 +292,10 @@ const ErrorProjection = struct {
         return error.Halt;
     }
 
-    fn memoryUsageFn(_: *anyopaque) usize {
-        return 0;
-    }
-
     fn handle(self: *ErrorProjection) ProjectionHandle {
         return .{
             .ctx = @ptrCast(self),
-            .vtable = .{
-                .applyFn = applyFn,
-                .memoryUsageFn = memoryUsageFn,
-            },
+            .vtable = .{ .applyFn = applyFn },
         };
     }
 };
@@ -541,16 +509,6 @@ test "router: batch apply" {
     try testing.expectEqual(@as(u64, 5), router.applied_index);
     try testing.expectEqual(@as(u32, 2), kv_proj.apply_count);
     try testing.expectEqual(@as(u32, 1), queue_proj.apply_count);
-}
-
-test "router: total memory usage" {
-    var kv_proj = TestProjection{ .memory = 2048 };
-    var queue_proj = TestProjection{ .memory = 4096 };
-    var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
-    router.registerQueue(queue_proj.handle());
-
-    try testing.expectEqual(@as(usize, 6144), router.totalMemoryUsage());
 }
 
 test "router: mixed entry types across all projections" {

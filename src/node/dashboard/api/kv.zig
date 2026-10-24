@@ -209,13 +209,16 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 }
 
 /// GET /kv/namespaces/:ns/keys/:key/history - Version history, newest first
-/// Query params: ?limit=N (default 10, at most kv_ops.MAX_HISTORY)
+/// Query params: ?limit=N (default 10, at most kv_ops.MAX_HISTORY) and
+/// ?before_version=V, for the page of versions older than V; `more` says
+/// whether older kept versions follow.
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 10, 1, kv_ops.MAX_HISTORY);
 
     var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV history", err);
     defer reader.deinit();
-    var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .routing_key = null }) catch |err|
+    const before_version = h.parseQueryParam(u64, query_string, "before_version");
+    var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .before_version = before_version, .routing_key = null }) catch |err|
         return try readFailed(allocator, "KV history", err);
     defer got.deinit();
 
@@ -228,6 +231,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
     try obj.stringField("namespace", namespace);
 
     var version_count: i64 = 0;
+    var more = false;
     var arr = try obj.arrayField("versions");
     try arr.begin();
     if (!got.isNotFound()) {
@@ -247,9 +251,11 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
             try vobj.end();
             version_count += 1;
         }
+        more = answer.more;
     }
     try arr.end();
     try obj.intField("version_count", version_count);
+    try obj.boolField("more", more);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }

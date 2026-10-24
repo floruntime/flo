@@ -471,22 +471,28 @@ pub const KVHandler = struct {
         }
     }
 
-    /// A key's versions, newest first, as many as `limit` and one answer
-    /// hold.
-    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, _: ?[]const u8) Error!table_run.Outcome(HistoryResponse) {
+    /// A key's versions, newest first, below `before_version` when given,
+    /// as many as `limit` and one answer hold; `more` says whether older
+    /// kept versions follow. A key with no history at all is not found.
+    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, before_version: ?u64, _: ?[]const u8) Error!table_run.Outcome(HistoryResponse) {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const self = shard.kv_handler;
-        var chain: [kv_ops.MAX_HISTORY]kv_mod.VersionEntry = undefined;
-        const n = self.kv.getHistory(qkey, &chain);
-        if (n == 0) return error.NotFound;
+        var it = self.kv.history(qkey, before_version);
+        if (!it.exists()) return error.NotFound;
         const Versions = HistoryResponse.field_list[0].T;
         var versions = Versions.Builder.init(&self.answer_buf);
-        for (chain[0..@min(n, limit)]) |v| {
+        var shown: u32 = 0;
+        var more = false;
+        while (it.next()) |v| {
             const at_ms: i64 = @intCast(v.timestamp_ns / std.time.ns_per_ms);
-            if (!(versions.add(.{ .version = v.version, .at_ms = at_ms, .deleted = v.tombstone, .value = v.value }) catch return error.Internal)) break;
+            if (shown == limit or !(versions.add(.{ .version = v.version, .at_ms = at_ms, .deleted = v.tombstone, .value = v.value }) catch return error.Internal)) {
+                more = true;
+                break;
+            }
+            shown += 1;
         }
-        return .{ .answer = .{ .versions = versions.value() } };
+        return .{ .answer = .{ .versions = versions.value(), .more = more } };
     }
 
     /// Many keys at once, in the order asked, as many as one answer holds;
@@ -1079,7 +1085,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
 
 test "kv handler: put and get" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1096,7 +1102,7 @@ test "kv handler: put and get" {
 
 test "kv handler: put with CAS success" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1121,7 +1127,7 @@ test "kv handler: put with CAS success" {
 
 test "kv handler: put with CAS failure" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1144,7 +1150,7 @@ test "kv handler: put with CAS failure" {
 
 test "kv handler: put if_not_exists success" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1164,7 +1170,7 @@ test "kv handler: put if_not_exists success" {
 
 test "kv handler: put if_not_exists failure" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1187,7 +1193,7 @@ test "kv handler: put if_not_exists failure" {
 
 test "kv handler: put if_exists success" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1210,7 +1216,7 @@ test "kv handler: put if_exists success" {
 
 test "kv handler: put if_exists failure" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
 
     var handler = KVHandler.init(allocator, &kv);
@@ -1255,7 +1261,7 @@ test "kv handler: reserved key prefixes" {
 
 test "kv handler: the sink's put refuses a key holding a NUL, which would spell another namespace's key" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
     var handler = KVHandler.init(allocator, &kv);
 
@@ -1275,7 +1281,7 @@ test "kv handler: the sink's put refuses a key holding a NUL, which would spell 
 
 test "kv handler: the key walk refuses a NUL filter and lists only default's keys in default" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
     var handler = KVHandler.init(allocator, &kv);
 
@@ -1295,7 +1301,7 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
 
 test "kv handler: a TTL option that isn't 8 bytes is refused, not read as no TTL" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
     var handler = KVHandler.init(allocator, &kv);
 
@@ -1311,7 +1317,7 @@ test "kv handler: a TTL option that isn't 8 bytes is refused, not read as no TTL
 
 test "kv handler: a TTL too large to represent is refused" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator, 0);
+    var kv = KVProjection.init(allocator);
     defer kv.deinit();
     var handler = KVHandler.init(allocator, &kv);
 

@@ -26,10 +26,17 @@ export function useKVKey(ns: string, key: string | null) {
   })
 }
 
+/** A key's versions, newest first, a page at a time; `fetchNextPage`
+    loads the older ones while `hasNextPage`. */
 export function useKVHistory(ns: string, key: string | null) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ['kv', ns, 'history', key],
-    queryFn: () => api.get<KVHistoryResponse>(`kv/namespaces/${enc(ns)}/keys/${enc(key!)}/history`),
+    initialPageParam: undefined as number | undefined,
+    queryFn: ({ pageParam }) =>
+      api.get<KVHistoryResponse>(
+        `kv/namespaces/${enc(ns)}/keys/${enc(key!)}/history${pageParam !== undefined ? `?before_version=${pageParam}` : ''}`,
+      ),
+    getNextPageParam: (last) => (last.more && last.versions.length > 0 ? last.versions[last.versions.length - 1].version : undefined),
     enabled: !!key,
   })
 }

@@ -44,8 +44,18 @@ pub const MAX_WAIT_MS: u64 = 300_000;
 pub const MAX_PATH: u32 = 1024;
 pub const MAX_SCAN: u32 = 1024;
 pub const MAX_MGET: u32 = 256;
-/// Versions a key keeps: the current one and its chain.
-pub const MAX_HISTORY: u32 = 65;
+/// A key's history keeps at most this many older versions, and at most
+/// `HISTORY_MAX_BYTES` of them, each charged its value's bytes plus
+/// `HISTORY_ENTRY_COST`; the oldest go first, and the newest older version
+/// is always kept. Every replica evicts by these, so changing one changes
+/// what every replica keeps: a format change, not a tuning knob.
+pub const HISTORY_MAX_VERSIONS: u32 = 64;
+pub const HISTORY_MAX_BYTES: u32 = 64 * 1024;
+/// A literal, not a struct's size, so what replicas keep doesn't depend
+/// on a layout or the pointer width.
+pub const HISTORY_ENTRY_COST: u32 = 64;
+/// Versions one history answer can list: the current one and the chain.
+pub const MAX_HISTORY: u32 = HISTORY_MAX_VERSIONS + 1;
 pub const MAX_CURSOR: u32 = 64;
 
 /// Room an answer's list has once its other fields are in.
@@ -223,11 +233,15 @@ pub const table = [_]ops.Op{
         .class = .read,
         .request = Record(&.{
             .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_HISTORY), 10), .doc = "Most versions to show" },
+            .{ .name = "before_version", .T = Optional(Version), .doc = "Only versions older than this one; omitted for from the newest" },
             routing_key_field,
         }),
-        .response = Record(&.{.{ .name = "versions", .T = schema.BoundedList(HistoryEntry, MAX_HISTORY, listRoom(1)), .doc = "The key's versions, newest first" }}),
-        .cli = .{ .render = .table, .short = &.{ .{ .field = "limit", .letter = 'l' }, rk_short } },
-        .doc = "A key's versions, newest first, as many as fit one answer.",
+        .response = Record(&.{
+            .{ .name = "versions", .T = schema.BoundedList(HistoryEntry, MAX_HISTORY, listRoom(1 + Bool.max_size)), .doc = "The key's versions, newest first" },
+            .{ .name = "more", .T = Bool, .doc = "Whether older kept versions follow: ask again with before_version set to the last one here" },
+        }),
+        .cli = .{ .expose = .hand, .render = .table, .short = &.{ .{ .field = "limit", .letter = 'l' }, rk_short } },
+        .doc = "A key's versions, newest first, a page at a time.",
     },
     .{
         .name = "kv.mget",

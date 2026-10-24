@@ -235,6 +235,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.scan", .field = "cursor", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
     .{ .op = "kv.history", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.history", .field = "limit", .tests = &.{"kv ops: history answers versions newest first, at most limit; a missing key is not found"} },
+    .{ .op = "kv.history", .field = "before_version", .tests = &.{"kv ops: history pages below before_version, and more says older versions follow"} },
     .{ .op = "kv.mget", .field = "routing_key", .tests = &.{ "Shard: kv.mget with a routing key is answered on that key's shard; without one, each key is found on its own", "kv table: kv.mget routes on its routing key, and stays where it lands without one" } },
     .{ .op = "kv.mget", .field = "keys", .tests = &.{"kv ops: mget answers each key in order, found or not, and next when they don't all fit"} },
     .{ .op = "kv.incr", .field = "delta", .tests = &.{"kv ops: incr adds delta to a counter from 0, and refuses a value that isn't one or a sum past i64"} },
