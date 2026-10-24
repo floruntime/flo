@@ -86,7 +86,7 @@ test "integration: kv_txn — batch payload round-trips through codec" {
 }
 
 test "integration: kv_txn — projection applies kv_batch atomically" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     // Pre-existing state: a key that will be deleted, and a counter to incr.

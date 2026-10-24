@@ -1470,6 +1470,45 @@ test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
     }
 }
 
+test "e2e/kv: history pages with --before-version, and follows more across answers" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for ([_][]const u8{ "p1", "p2", "p3", "p4" }) |v| try ctx.exec(&.{ "kv", "set", "paged", v });
+    // A limit short of the history: the newest rows, and more on stderr.
+    var two = try ctx.cli.run(&.{ "kv", "history", "paged", "--limit", "2", "-o", "raw" });
+    defer two.deinit();
+    try testing.expectEqual(@as(u8, 0), two.exit_code);
+    var lines = std.mem.tokenizeScalar(u8, two.stdout, '\n');
+    for ([_][]const u8{ "4\t", "3\t" }) |want| try testing.expect(std.mem.startsWith(u8, lines.next() orelse return error.TooFewVersions, want));
+    try testing.expect(lines.next() == null);
+    try testing.expectEqualStrings("more: true\n", two.stderr);
+    // Below a version: the older ones, and nothing more.
+    var older = try ctx.cli.run(&.{ "kv", "history", "paged", "--before-version", "3", "-o", "raw" });
+    defer older.deinit();
+    try testing.expectEqual(@as(u8, 0), older.exit_code);
+    lines = std.mem.tokenizeScalar(u8, older.stdout, '\n');
+    for ([_][]const u8{ "2\t", "1\t" }) |want| try testing.expect(std.mem.startsWith(u8, lines.next() orelse return error.TooFewVersions, want));
+    try testing.expect(lines.next() == null);
+    try testing.expectEqualStrings("", older.stderr);
+
+    // Two 130 KiB versions don't fit one answer: the CLI asks again and
+    // prints both, as one list.
+    const big = try testing.allocator.alloc(u8, 130 * 1024);
+    defer testing.allocator.free(big);
+    for ("abc") |c| {
+        @memset(big, c);
+        try ctx.exec(&.{ "kv", "set", "large", big });
+    }
+    var large = try ctx.cli.run(&.{ "kv", "history", "large", "-o", "raw" });
+    defer large.deinit();
+    try testing.expectEqual(@as(u8, 0), large.exit_code);
+    lines = std.mem.tokenizeScalar(u8, large.stdout, '\n');
+    // The newest older version is kept past the byte bound; the oldest went.
+    for ([_][]const u8{ "3\t", "2\t" }) |want| try testing.expect(std.mem.startsWith(u8, lines.next() orelse return error.TooFewVersions, want));
+    try testing.expect(lines.next() == null);
+}
+
 test "e2e/kv: history for non-existent key fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

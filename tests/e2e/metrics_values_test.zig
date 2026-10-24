@@ -287,3 +287,43 @@ test "e2e/metrics: flo_kv_keys counts the live keys, across shards and a restart
     try ctx.restartServer();
     try testing.expectEqual(@as(?u64, 3), try awaitKvKeys(ctx, "default", 3));
 }
+
+fn awaitSeries(ctx: *stdx.testing.TestContext, name: []const u8, namespace: []const u8, want: u64) !?u64 {
+    var label_buf: [64]u8 = undefined;
+    const label = try std.fmt.bufPrint(&label_buf, "namespace=\"{s}\"", .{namespace});
+    var got: ?u64 = null;
+    for (0..50) |_| {
+        var http = try ctx.createMetricsHttp();
+        defer http.deinit();
+        var resp = try http.get("/metrics");
+        defer resp.deinit();
+        got = seriesValue(resp.body, name, label);
+        if (got == want) return got;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return got;
+}
+
+test "e2e/metrics: flo_kv_history_bytes and evictions follow a key's history, and replay counts them again" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true, .durability = .sync },
+    });
+    defer ctx.deinit();
+
+    // 1000-byte values: each older version is charged 1000 + 64.
+    const value: [1000]u8 = @splat('h');
+    try ctx.exec(&.{ "kv", "set", "k", &value, "-n", "hist" });
+    try ctx.exec(&.{ "kv", "set", "k", &value, "-n", "hist" });
+    try testing.expectEqual(@as(?u64, 1064), try awaitSeries(ctx, "flo_kv_history_bytes", "hist", 1064));
+    try testing.expectEqual(@as(?u64, 0), try awaitSeries(ctx, "flo_kv_history_evicted_total", "hist", 0));
+
+    // 66 older versions in all: the byte bound keeps 61 (61 × 1064 ≤ 64 KiB).
+    for (0..65) |_| try ctx.exec(&.{ "kv", "set", "k", &value, "-n", "hist" });
+    try testing.expectEqual(@as(?u64, 61 * 1064), try awaitSeries(ctx, "flo_kv_history_bytes", "hist", 61 * 1064));
+    try testing.expectEqual(@as(?u64, 5), try awaitSeries(ctx, "flo_kv_history_evicted_total", "hist", 5));
+
+    // Replay rebuilds the same history, evicting the same versions again.
+    try ctx.restartServer();
+    try testing.expectEqual(@as(?u64, 61 * 1064), try awaitSeries(ctx, "flo_kv_history_bytes", "hist", 61 * 1064));
+    try testing.expectEqual(@as(?u64, 5), try awaitSeries(ctx, "flo_kv_history_evicted_total", "hist", 5));
+}
