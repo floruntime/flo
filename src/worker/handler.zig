@@ -98,8 +98,8 @@ pub const WorkerRecord = struct {
 };
 
 comptime {
-    // worker.list answers with the record's own type and status values.
-    for (.{ .{ WorkerType, worker_ops.WorkerType }, .{ WorkerStatus, worker_ops.WorkerStatus } }) |pair| {
+    // worker.list and worker.info answer with the record's own values.
+    for (.{ .{ WorkerType, worker_ops.WorkerType }, .{ WorkerStatus, worker_ops.WorkerStatus }, .{ ProcessKind, worker_ops.ProcessKind } }) |pair| {
         const info = @typeInfo(pair[0]).@"enum";
         if (info.field_names.len != @typeInfo(pair[1]).@"enum".field_names.len) @compileError("worker.list's " ++ @typeName(pair[0]) ++ " differs from the record's");
         for (info.field_names, info.field_values) |name, value| {
@@ -109,6 +109,7 @@ comptime {
 }
 
 const ListResponse = table_run.op("worker.list").response;
+const InfoResponse = table_run.op("worker.info").response;
 const Workers = ListResponse.field_list[0].T;
 const Row = worker_ops.WorkerRow;
 
@@ -118,6 +119,8 @@ pub const WorkerHandler = struct {
     workers: std.StringHashMap(WorkerRecord),
     /// worker.list builds its page here; allocated on first use.
     list_buf: ?[]u8 = null,
+    /// worker.info's processes, encoded: one answer at a time.
+    info_buf: ?[]u8 = null,
 
     /// A worker silent this long is unhealthy and takes no work: three
     /// missed beats at the SDKs' 30 s.
@@ -144,6 +147,7 @@ pub const WorkerHandler = struct {
         }
         self.workers.deinit();
         if (self.list_buf) |b| self.allocator.free(b);
+        if (self.info_buf) |b| self.allocator.free(b);
     }
 
     fn freeWorkerRecord(self: *WorkerHandler, w: *WorkerRecord) void {
@@ -184,7 +188,7 @@ pub const WorkerHandler = struct {
         dispatcher.registerWithRoute(.worker_deregister, dispatchWorkerCmd, preRouteByWorker);
         dispatcher.registerWithRoute(.worker_drain, dispatchWorkerCmd, preRouteByWorker);
         dispatcher.register(.worker_list, table_run.handler("worker.list", WorkerHandler, runList));
-        dispatcher.registerWithRoute(.worker_info, dispatchWorkerCmd, preRouteByWorker);
+        dispatcher.registerWithRoute(.worker_info, table_run.handler("worker.info", WorkerHandler, runInfo), preRouteByWorker);
     }
 
     pub fn preRouteByWorker(req: Request) ?u64 {
@@ -233,20 +237,6 @@ pub const WorkerHandler = struct {
                 } else {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
                 }
-            },
-            .worker_info => {
-                const data = shard.worker_handler.serializeWorkerInfo(req.namespace, req.key) catch |err| switch (err) {
-                    error.NotFound => {
-                        shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");
-                        return;
-                    },
-                    else => {
-                        shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "serialization failed");
-                        return;
-                    },
-                };
-                defer shard.worker_handler.allocator.free(data);
-                shard.sendOkResponse(conn, req.header.request_id, data);
             },
             else => {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown worker opcode");
@@ -317,10 +307,16 @@ pub const WorkerHandler = struct {
 
         if (r.done()) return .{ .ok = reg };
         const count = r.int(u16) orelse return refuse(allocator, &reg, "registration cut short in the process count");
+        // worker.info answers with every process, so they must fit its bounds.
+        if (count > worker_ops.MAX_PROCESSES) return refuse(allocator, &reg, std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}));
+        var process_bytes: usize = 0;
         for (0..count) |_| {
             const name = r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind_byte = r.byte() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind = std.enums.fromInt(ProcessKind, kind_byte) orelse return refuse(allocator, &reg, "unknown process kind");
+            process_bytes += worker_ops.ProcessRow.encodedSize(.{ .name = name, .kind = @fromBackingInt(kind_byte), .run_count = 0, .fail_count = 0, .last_run_at_ms = 0 }) catch
+                return refuse(allocator, &reg, std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}));
+            if (process_bytes > worker_ops.Processes.byte_bound.?) return refuse(allocator, &reg, "processes too long to list together");
             const owned = try allocator.dupe(u8, name);
             reg.processes.append(allocator, .{ .name_owned = owned, .kind = kind }) catch |err| {
                 allocator.free(owned);
@@ -528,126 +524,46 @@ pub const WorkerHandler = struct {
         }
     }
 
-    // ── Serialization ───────────────────────────────────────────────────
+    // ── INFO ────────────────────────────────────────────────────────────
 
-    /// Compute wire size for a single worker record.
-    fn workerWireSize(w: *const WorkerRecord) usize {
-        var size: usize = 0;
-        size += 2 + w.id_owned.len; // id_len + id
-        size += 1 + 1; // type + status
-        size += 8 + 8 + 4 + 4; // tasks_completed + tasks_failed + current_load + max_concurrency
-        size += 8 + 8; // registered_at + last_heartbeat
-        // processes
-        size += 2; // process_count
-        for (w.processes.items) |p| {
-            size += 2 + p.name_owned.len; // name_len + name
-            size += 1; // kind
-            size += 8 + 8 + 8; // run_count + fail_count + last_run_at_ms
-        }
-        // metadata
-        size += 1; // has_metadata
-        if (w.metadata_owned) |m| {
-            size += 2 + m.len;
-        }
-        // machine_id
-        size += 1; // has_machine_id
-        if (w.machine_id_owned) |mid| {
-            size += 2 + mid.len;
-        }
-        return size;
+    /// worker.info: the worker's row, metadata and processes, from the
+    /// shard its id routes to.
+    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        return .{ .answer = try shard.worker_handler.info(req.namespace, req.key) };
     }
 
-    /// Write a single worker record into buf at offset, returns new offset.
-    fn writeWorkerRecord(buf: []u8, start: usize, w: *const WorkerRecord) usize {
-        var offset = start;
-        // id
-        std.mem.writeInt(u16, buf[offset..][0..2], @intCast(w.id_owned.len), .little);
-        offset += 2;
-        @memcpy(buf[offset .. offset + w.id_owned.len], w.id_owned);
-        offset += w.id_owned.len;
-        // type + status
-        buf[offset] = @backingInt(w.worker_type);
-        offset += 1;
-        buf[offset] = @backingInt(w.status);
-        offset += 1;
-        // counters
-        std.mem.writeInt(u64, buf[offset..][0..8], w.tasks_completed, .little);
-        offset += 8;
-        std.mem.writeInt(u64, buf[offset..][0..8], w.tasks_failed, .little);
-        offset += 8;
-        std.mem.writeInt(u32, buf[offset..][0..4], w.current_load, .little);
-        offset += 4;
-        std.mem.writeInt(u32, buf[offset..][0..4], w.max_concurrency, .little);
-        offset += 4;
-        // timestamps
-        std.mem.writeInt(i64, buf[offset..][0..8], w.registered_at_ms, .little);
-        offset += 8;
-        std.mem.writeInt(i64, buf[offset..][0..8], w.last_heartbeat_ms, .little);
-        offset += 8;
-        // processes
-        std.mem.writeInt(u16, buf[offset..][0..2], @intCast(w.processes.items.len), .little);
-        offset += 2;
-        for (w.processes.items) |p| {
-            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(p.name_owned.len), .little);
-            offset += 2;
-            @memcpy(buf[offset .. offset + p.name_owned.len], p.name_owned);
-            offset += p.name_owned.len;
-            buf[offset] = @backingInt(p.kind);
-            offset += 1;
-            std.mem.writeInt(u64, buf[offset..][0..8], p.run_count, .little);
-            offset += 8;
-            std.mem.writeInt(u64, buf[offset..][0..8], p.fail_count, .little);
-            offset += 8;
-            std.mem.writeInt(i64, buf[offset..][0..8], p.last_run_at_ms, .little);
-            offset += 8;
-        }
-        // metadata
-        if (w.metadata_owned) |m| {
-            buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(m.len), .little);
-            offset += 2;
-            @memcpy(buf[offset .. offset + m.len], m);
-            offset += m.len;
-        } else {
-            buf[offset] = 0;
-            offset += 1;
-        }
-        // machine_id
-        if (w.machine_id_owned) |mid| {
-            buf[offset] = 1;
-            offset += 1;
-            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(mid.len), .little);
-            offset += 2;
-            @memcpy(buf[offset .. offset + mid.len], mid);
-            offset += mid.len;
-        } else {
-            buf[offset] = 0;
-            offset += 1;
-        }
-        return offset;
-    }
-
-    /// Serialize a single worker's info.
-    fn serializeWorkerInfo(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) ![]u8 {
+    fn info(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) Error!InfoResponse.Value {
+        // A worker id is part of the registry key ("ns\x00id"), so one
+        // holding a NUL could spell another namespace's worker.
+        if (std.mem.indexOfScalar(u8, worker_id, 0) != null) return error.InvalidId;
         const w = self.find(namespace, worker_id) orelse return error.NotFound;
-
-        const total_size = workerWireSize(w);
-        const buf = try self.allocator.alloc(u8, total_size);
-        errdefer self.allocator.free(buf);
-        _ = writeWorkerRecord(buf, 0, w);
-
-        return buf;
+        const buf = self.info_buf orelse blk: {
+            const b = try self.allocator.alloc(u8, worker_ops.Processes.byte_bound.?);
+            self.info_buf = b;
+            break :blk b;
+        };
+        var procs = worker_ops.Processes.Builder.init(buf);
+        // Registration keeps a worker's processes within the answer's bounds.
+        for (w.processes.items) |p| if (!(procs.add(.{
+            .name = p.name_owned,
+            .kind = @fromBackingInt(@backingInt(p.kind)),
+            .run_count = p.run_count,
+            .fail_count = p.fail_count,
+            .last_run_at_ms = p.last_run_at_ms,
+        }) catch unreachable)) unreachable;
+        return .{ .worker = row(w), .metadata = w.metadata_owned, .processes = procs.value() };
     }
 
     // ── LIST ────────────────────────────────────────────────────────────
 
-    pub const Error = error{ OutOfMemory, GatherBusy };
+    pub const Error = error{ OutOfMemory, GatherBusy, NotFound, InvalidId };
 
     pub fn refusal(err: Error) table_run.Refused {
         return switch (err) {
             error.OutOfMemory => .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } },
             error.GatherBusy => .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many reads across shards are under way; this request was not run — retry" } },
+            error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "worker not found" } },
+            error.InvalidId => .{ .status = .bad_request, .refusal = .{ .reason = .malformed, .ran = .no, .message = "worker id must not contain NUL" } },
         };
     }
 
@@ -842,6 +758,79 @@ test "workers: a machine id longer than worker.list's bound is refused" {
     std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID, .little);
     try std.testing.expect(h.handleRegister(req) == null);
     try std.testing.expectEqual(@as(usize, worker_ops.MAX_MACHINE_ID), h.find("", "w").?.machine_id_owned.?.len);
+}
+
+/// A registration of `count` action processes named `name_len` x's, then
+/// `tail` (the metadata and machine id flags and fields).
+fn processesValue(buf: []u8, count: u16, name_len: u16, tail: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(&.{ 0, 4, 0, 0, 0 }) catch unreachable;
+    w.writeInt(u16, count, .little) catch unreachable;
+    for (0..count) |_| {
+        w.writeInt(u16, name_len, .little) catch unreachable;
+        w.splatByteAll('x', name_len) catch unreachable;
+        w.writeByte(0) catch unreachable;
+    }
+    w.writeAll(tail) catch unreachable;
+    return w.buffered();
+}
+
+test "worker.info: the row, metadata and processes, as registered; an unknown worker and a NUL id are refused" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    // Two processes, metadata "{}" and machine id "m1".
+    var req = testRequest("b", "w");
+    req.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 's', 1, 1, 2, 0, '{', '}', 1, 2, 0, 'm', '1' };
+    try std.testing.expect(h.handleRegister(req) == null);
+
+    const got = try h.info("b", "w");
+    try std.testing.expectEqualStrings("w", got.worker.id);
+    try std.testing.expectEqual(@as(u32, 4), got.worker.max_concurrency);
+    try std.testing.expectEqualStrings("m1", got.worker.machine_id.?);
+    try std.testing.expectEqualStrings("{}", got.metadata.?);
+    var it = got.processes.iterator();
+    const a = (try it.next()).?;
+    try std.testing.expectEqualStrings("a", a.name);
+    try std.testing.expectEqual(worker_ops.ProcessKind.action, a.kind);
+    const b = (try it.next()).?;
+    try std.testing.expectEqualStrings("s", b.name);
+    try std.testing.expectEqual(worker_ops.ProcessKind.stream_consumer, b.kind);
+    try std.testing.expect((try it.next()) == null);
+
+    // It encodes within its op's bounds, and decodes back to the same.
+    var buf: [InfoResponse.max_size]u8 = undefined;
+    const body = try InfoResponse.encodeInto(&buf, got);
+    var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+    const back = try InfoResponse.decodeAll(body, &diag);
+    try std.testing.expectEqualStrings("m1", back.worker.machine_id.?);
+    try std.testing.expectEqual(@as(u32, 2), back.processes.count);
+
+    try std.testing.expectError(error.NotFound, h.info("a", "w"));
+    try std.testing.expectError(error.InvalidId, h.info("", "b\x00w"));
+}
+
+test "workers: a registration whose processes worker.info couldn't list is refused" {
+    var h = WorkerHandler.init(std.testing.allocator);
+    defer h.deinit();
+    const buf = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(buf);
+    var req = testRequest("", "w");
+
+    req.value = processesValue(buf, worker_ops.MAX_PROCESSES + 1, 1, &.{});
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}), h.handleRegister(req).?);
+
+    req.value = processesValue(buf, 1, @intCast(@import("../protocol/ops.zig").MAX_KEY + 1), &.{});
+    try std.testing.expectEqualStrings(std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}), h.handleRegister(req).?);
+
+    // Every name fits, but together they pass what an answer holds.
+    req.value = processesValue(buf, worker_ops.MAX_PROCESSES, 200, &.{});
+    try std.testing.expectEqualStrings("processes too long to list together", h.handleRegister(req).?);
+    try std.testing.expectEqual(@as(usize, 0), h.workers.count());
+
+    // At the bounds, it registers and lists.
+    req.value = processesValue(buf, worker_ops.MAX_PROCESSES, 100, &.{});
+    try std.testing.expect(h.handleRegister(req) == null);
+    try std.testing.expectEqual(worker_ops.MAX_PROCESSES, (try h.info("", "w")).processes.count);
 }
 
 /// Shards' registries, each listed as its shard would answer a gather part.

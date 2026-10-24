@@ -64,34 +64,48 @@ test "e2e/worker: register with multiple task types" {
 // Worker Info
 // =============================================================================
 
-test "e2e/worker: info shows details" {
+test "e2e/worker: info shows the worker's row, processes and metadata" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
+    try ctx.exec(&.{ "worker", "register", "info-w1", "resize", "encode", "--labels", "{\"gpu\":true}" });
 
-    // Register a worker
-    try ctx.exec(&.{ "worker", "register", "info-w1", "process" });
-
-    // Get worker info
     var result = try ctx.cli.run(&.{ "worker", "info", "info-w1" });
     defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-
-    const output = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-    try testing.expect(output.len > 0);
-    // Should contain the worker ID in the output
-    try testing.expect(std.mem.indexOf(u8, output, "info-w1") != null);
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    // Times vary; every other line is exact.
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, result.stdout, &std.ascii.whitespace), '\n');
+    for ([_][]const u8{
+        "Worker ID:       info-w1",
+        "Status:          active",
+        "Type:            action",
+        "Current Load:    0 / 10",
+        "Tasks Completed: 0",
+        "Tasks Failed:    0",
+        "Registered:      ",
+        "Last Heartbeat:  ",
+        "",
+        "Processes (2):",
+        "  resize (action) — runs: 0, fails: 0, last_run: 0",
+        "  encode (action) — runs: 0, fails: 0, last_run: 0",
+        "Metadata:        {\"gpu\":true}",
+    }) |want| {
+        const line = lines.next() orelse return error.TooFewLines;
+        if (std.mem.endsWith(u8, want, ":  ") or std.mem.endsWith(u8, want, ":      ")) {
+            try testing.expect(std.mem.startsWith(u8, line, want));
+            _ = try std.fmt.parseInt(i64, line[want.len..], 10);
+        } else try testing.expectEqualStrings(want, line);
+    }
+    try testing.expectEqual(@as(?[]const u8, null), lines.next());
 }
 
 test "e2e/worker: info on non-existent worker" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Get info for a worker that doesn't exist
     var result = try ctx.cli.run(&.{ "worker", "info", "ghost-worker" });
     defer result.deinit();
-
     try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try testing.expectEqualStrings("Error: worker not found [not_found/not_found]", std.mem.trim(u8, result.stderr, &std.ascii.whitespace));
 }
 
 // =============================================================================
@@ -394,7 +408,7 @@ test "e2e/worker: a worker silent past remove_after_ms is removed" {
 
     const Removed = struct {
         fn done(r: stdx.testing.CommandResult) bool {
-            return r.exit_code == 1 and std.mem.eql(u8, std.mem.trim(u8, r.stderr, &std.ascii.whitespace), "Error: worker not found [not_found]");
+            return r.exit_code == 1 and std.mem.eql(u8, std.mem.trim(u8, r.stderr, &std.ascii.whitespace), "Error: worker not found [not_found/not_found]");
         }
     };
     try testing.expect(try pollWorkerInfo(ctx, "silent-w", 20_000, Removed.done));

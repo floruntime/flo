@@ -782,75 +782,28 @@ fn runWorkerInfo(ctx: *commander.Context) commander.Error!void {
 
     try outcome.check(ctx, result);
 
-    const data = result.asRawData() orelse {
-        return outcome.malformed(ctx, "worker record (empty response)");
-    };
+    var diag: schema.Diagnostic = .{};
+    const info = worker_ops.op("worker.info").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "worker.info answer");
+    const w = info.worker;
 
-    // Parse worker_record wire format
-    var reader = WireReader.init(data);
-    const id_len = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
-    const id = reader.readSlice(id_len) orelse return outcome.malformed(ctx, "worker record");
-    const wtype = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
-    const wstatus = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
-    const tasks_completed = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
-    const tasks_failed = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
-    const current_load = reader.readU32() orelse return outcome.malformed(ctx, "worker record");
-    const max_concurrency = reader.readU32() orelse return outcome.malformed(ctx, "worker record");
-    const registered_at = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
-    const last_heartbeat = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
+    ctx.print("Worker ID:       {s}\n", .{w.id});
+    ctx.print("Status:          {s}\n", .{@tagName(w.status)});
+    ctx.print("Type:            {s}\n", .{@tagName(w.worker_type)});
+    ctx.print("Current Load:    {d} / {d}\n", .{ w.current_load, w.max_concurrency });
+    ctx.print("Tasks Completed: {d}\n", .{w.tasks_completed});
+    ctx.print("Tasks Failed:    {d}\n", .{w.tasks_failed});
+    ctx.print("Registered:      {d}\n", .{w.registered_at_ms});
+    ctx.print("Last Heartbeat:  {d}\n", .{w.last_heartbeat_ms});
 
-    const type_str: []const u8 = if (wtype == 0) "action" else "stream";
-    const status_str: []const u8 = switch (wstatus) {
-        0 => "active",
-        1 => "idle",
-        2 => "draining",
-        3 => "unhealthy",
-        else => "unknown",
-    };
-
-    ctx.print("Worker ID:       {s}\n", .{id});
-    ctx.print("Status:          {s}\n", .{status_str});
-    ctx.print("Type:            {s}\n", .{type_str});
-    ctx.print("Current Load:    {d} / {d}\n", .{ current_load, max_concurrency });
-    ctx.print("Tasks Completed: {d}\n", .{tasks_completed});
-    ctx.print("Tasks Failed:    {d}\n", .{tasks_failed});
-    ctx.print("Registered:      {d}\n", .{registered_at});
-    ctx.print("Last Heartbeat:  {d}\n", .{last_heartbeat});
-
-    // Processes
-    const proc_count = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
-    if (proc_count > 0) {
-        ctx.print("\nProcesses ({d}):\n", .{proc_count});
-        var pi: u16 = 0;
-        while (pi < proc_count) : (pi += 1) {
-            const nlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
-            const name = reader.readSlice(nlen) orelse return outcome.malformed(ctx, "worker record");
-            const kind = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
-            const run_count = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
-            const fail_count = reader.readU64() orelse return outcome.malformed(ctx, "worker record");
-            const last_run = reader.readI64() orelse return outcome.malformed(ctx, "worker record");
-            const kind_str: []const u8 = if (kind == 0) "action" else "stream_consumer";
-            ctx.print("  {s} ({s}) — runs: {d}, fails: {d}, last_run: {d}\n", .{
-                name, kind_str, run_count, fail_count, last_run,
-            });
+    if (info.processes.count > 0) {
+        ctx.print("\nProcesses ({d}):\n", .{info.processes.count});
+        var it = info.processes.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "worker.info answer")) |p| {
+            ctx.print("  {s} ({s}) — runs: {d}, fails: {d}, last_run: {d}\n", .{ p.name, @tagName(p.kind), p.run_count, p.fail_count, p.last_run_at_ms });
         }
     }
-
-    // Metadata
-    const has_meta = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
-    if (has_meta == 1) {
-        const mlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
-        const meta = reader.readSlice(mlen) orelse return outcome.malformed(ctx, "worker record");
-        ctx.print("Metadata:        {s}\n", .{meta});
-    }
-
-    // Machine ID
-    const has_mid = reader.readU8() orelse return outcome.malformed(ctx, "worker record");
-    if (has_mid == 1) {
-        const midlen = reader.readU16() orelse return outcome.malformed(ctx, "worker record");
-        const mid = reader.readSlice(midlen) orelse return outcome.malformed(ctx, "worker record");
-        ctx.print("Machine ID:      {s}\n", .{mid});
-    }
+    if (info.metadata) |meta| ctx.print("Metadata:        {s}\n", .{meta});
+    if (w.machine_id) |mid| ctx.print("Machine ID:      {s}\n", .{mid});
 }
 
 // ==================== Testing ====================

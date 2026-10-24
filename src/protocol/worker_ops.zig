@@ -53,6 +53,32 @@ pub const WorkerRow = Record(&.{
 /// The cursor field's largest encoding: presence, then an id.
 const cursor_size = 1 + WorkerId.max_size;
 
+/// What a process on a worker runs.
+pub const ProcessKind = enum(u8) {
+    action = 0,
+    stream_consumer = 1,
+};
+
+/// The most processes a worker registers.
+pub const MAX_PROCESSES: u32 = 1024;
+
+/// The longest metadata a worker registers with.
+pub const MAX_METADATA: u32 = std.math.maxInt(u16);
+
+pub const ProcessRow = Record(&.{
+    .{ .name = "name", .T = Bytes(ops.MAX_KEY) },
+    .{ .name = "kind", .T = schema.Enum(ProcessKind) },
+    .{ .name = "run_count", .T = Int(u64) },
+    .{ .name = "fail_count", .T = Int(u64) },
+    .{ .name = "last_run_at_ms", .T = Int(i64) },
+});
+
+const Metadata = Optional(Bytes(MAX_METADATA));
+
+/// A worker's processes, as one answer holds them: whatever the row and the
+/// metadata leave of it. Registration refuses processes that wouldn't fit.
+pub const Processes = schema.BoundedList(ProcessRow, MAX_PROCESSES, @intCast(ops.MAX_RESPONSE_BODY - @sizeOf(u32) - WorkerRow.max_size - Metadata.max_size));
+
 pub const table = [_]ops.Op{
     .{
         .name = "worker.list",
@@ -72,6 +98,19 @@ pub const table = [_]ops.Op{
         // It follows the cursor to the last page, so it stays written by hand.
         .cli = .{ .expose = .hand, .key = null, .render = .table, .examples = &.{"flo worker list"} },
         .doc = "List a namespace's workers in id order, a page at a time.",
+    },
+    .{
+        .name = "worker.info",
+        .code = 0x324,
+        .class = .read,
+        .request = Record(&.{}),
+        .response = Record(&.{
+            .{ .name = "worker", .T = WorkerRow, .doc = "The worker, as worker.list shows it" },
+            .{ .name = "metadata", .T = Metadata, .doc = "What the worker registered with, as given" },
+            .{ .name = "processes", .T = Processes, .doc = "What the worker runs, as registered, with its counts" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "worker_id", .doc = "The worker's id" }, .render = .record, .examples = &.{"flo worker info w1"} },
+        .doc = "A worker's record: its row, its metadata and its processes.",
     },
 };
 
