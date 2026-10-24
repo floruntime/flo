@@ -1,16 +1,19 @@
-//! The CLI refuses an answer whose checksum doesn't match it, exiting with
-//! the transport code instead of printing what the damaged bytes say.
+//! The CLI refuses an answer whose checksum doesn't match it, or whose
+//! length is over what an answer can hold, exiting with the transport code
+//! instead of printing what the damaged bytes say.
 
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 const proto = @import("src").protocol.proto;
 
-/// Answers one request with an ok answer carrying `body`, the byte at
-/// `corrupt_at` of the frame flipped after its checksum was computed.
+/// Answers one request with `status` and `body` (an ok answer's data or a
+/// refusal's message), the byte at `corrupt_at` of the frame flipped after
+/// its checksum was computed.
 const DamagingServer = struct {
-    listen_fd: std.posix.socket_t,
-    port: u16,
+    listen_fd: std.posix.socket_t = undefined,
+    port: u16 = 0,
+    status: proto.StatusCode = .ok,
     body: []const u8,
     corrupt_at: usize,
     thread: std.Thread = undefined,
@@ -48,7 +51,10 @@ const DamagingServer = struct {
             left -= n;
         }
         var out: [256]u8 = undefined;
-        const frame = proto.Response.serializeOk(header.request_id, self.body, &out) catch return;
+        const frame = if (self.status == .ok)
+            proto.Response.serializeOk(header.request_id, self.body, &out) catch return
+        else
+            proto.Response.serializeRefusal(self.status, header.request_id, proto.unclassified(self.status, self.body), &out);
         out[self.corrupt_at] ^= 0x01;
         _ = net.sysWrite(c, frame) catch return;
     }
@@ -60,15 +66,26 @@ const DamagingServer = struct {
     }
 };
 
-test "e2e/checksum: an answer that fails its checksum exits 5 and says so" {
+test "e2e/checksum: an answer that fails its checksum or claims too much exits 5 and says so" {
     const allocator = testing.allocator;
     const server = try stdx.testing.ServerProcess.init(allocator);
     defer server.deinit();
 
-    // A body byte, then a request_id byte: neither is one the header's
-    // magic, version or table checks read.
-    for ([_]usize{ @sizeOf(proto.ResponseHeader) + 1, @offsetOf(proto.ResponseHeader, "request_id") }) |offset| {
-        var damaging = DamagingServer{ .listen_fd = undefined, .port = 0, .body = &[_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 }, .corrupt_at = offset };
+    const seq = &[_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+    const header_len = @sizeOf(proto.ResponseHeader);
+    const request_id = @offsetOf(proto.ResponseHeader, "request_id");
+    const failed = "Error: the answer from the server failed its checksum\n";
+    // Bytes the header's magic, version and table checks don't read, in an
+    // ok answer, an empty one and a refusal; then data_len's high byte.
+    const cases = [_]struct { status: proto.StatusCode = .ok, body: []const u8 = seq, offset: usize, want: []const u8 = failed }{
+        .{ .offset = header_len + 1 },
+        .{ .offset = request_id },
+        .{ .body = "", .offset = request_id },
+        .{ .status = .conflict, .body = "taken", .offset = header_len + proto.Refusal.HEADER_LEN },
+        .{ .offset = @offsetOf(proto.ResponseHeader, "data_len") + 3, .want = std.fmt.comptimePrint("Error: the server's answer claims {d} bytes, more than an answer can hold\n", .{8 + (1 << 24)}) },
+    };
+    for (cases) |c| {
+        var damaging = DamagingServer{ .status = c.status, .body = c.body, .corrupt_at = c.offset };
         try damaging.start();
         defer damaging.stop();
 
@@ -80,7 +97,7 @@ test "e2e/checksum: an answer that fails its checksum exits 5 and says so" {
         var r = try cmd.waitWithTimeout(10_000);
         defer r.deinit();
         try testing.expectEqual(@as(u8, 5), r.exit_code);
-        try testing.expectEqualStrings("Error: the answer from the server failed its checksum\n", r.stderr);
+        try testing.expectEqualStrings(c.want, r.stderr);
         try testing.expectEqualStrings("", r.stdout);
     }
 }

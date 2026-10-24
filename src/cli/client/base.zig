@@ -86,6 +86,10 @@ pub const Response = struct {
 /// can't carry them.
 pub var foreign_server: ?struct { version: u8, table_hash: u64 } = null;
 
+/// The length an answer claimed when it was over what an answer can hold
+/// (`error.AnswerTooLarge`), for the CLI to name.
+pub var oversized_answer: u32 = 0;
+
 /// Flo Protocol Client
 pub const Client = struct {
     allocator: Allocator,
@@ -249,6 +253,13 @@ pub const Client = struct {
             return err;
         };
 
+        if (response_header.data_len > proto.MAX_ANSWER_BYTES - @sizeOf(proto.ResponseHeader)) {
+            oversized_answer = response_header.data_len;
+            stream.close();
+            self.stream = null;
+            return error.AnswerTooLarge;
+        }
+
         // Read response data
         // Normalize type to mutable slice always; allocate 0 bytes for empty payload
         const data: []u8 = if (response_header.data_len > 0)
@@ -262,8 +273,9 @@ pub const Client = struct {
         }
 
         if (response_header.computeCRC32(data) != response_header.crc32) {
-            // The damage may be in the header, data_len included, so nothing
-            // after it on the socket can be read either.
+            // The damage may be in the header, so nothing after it on the
+            // socket can be trusted. A data_len inflated within the limit
+            // never gets here: the read waits for more and times out.
             self.allocator.free(data);
             stream.close();
             self.stream = null;
@@ -360,9 +372,16 @@ test "resolveEndpointAddress accepts localhost and numeric addresses" {
 test "an answer that fails its checksum is refused and the connection closed" {
     const outcome = @import("../outcome.zig");
     const header_len = @sizeOf(proto.ResponseHeader);
-    // A body byte, then a request_id byte: validate() reads neither.
-    for ([_]usize{ header_len + 1, @offsetOf(proto.ResponseHeader, "request_id") }) |offset| {
-        const server = try outcome.FakeServer.startCorrupt("hello", offset);
+    const request_id = @offsetOf(proto.ResponseHeader, "request_id");
+    // Bytes validate() doesn't read, in an ok answer, an empty one and a
+    // refusal.
+    for ([_]struct { status: proto.StatusCode, body: []const u8, offset: usize }{
+        .{ .status = .ok, .body = "hello", .offset = header_len + 1 },
+        .{ .status = .ok, .body = "hello", .offset = request_id },
+        .{ .status = .ok, .body = "", .offset = request_id },
+        .{ .status = .conflict, .body = "taken", .offset = header_len + proto.Refusal.HEADER_LEN },
+    }) |c| {
+        const server = try outcome.FakeServer.startCorrupt(c.status, c.body, c.offset);
         defer server.stop();
         var ep: [32]u8 = undefined;
         var client = Client.init(std.testing.allocator, server.endpoint(&ep));
@@ -371,4 +390,18 @@ test "an answer that fails its checksum is refused and the connection closed" {
         try std.testing.expectError(error.InvalidChecksum, client.sendRequest(.ping, "", "", ""));
         try std.testing.expect(client.stream == null);
     }
+}
+
+test "an answer claiming more than an answer can hold is refused before allocating" {
+    const outcome = @import("../outcome.zig");
+    // data_len's high byte: the claim grows by 16 MiB.
+    const server = try outcome.FakeServer.startCorrupt(.ok, "hello", @offsetOf(proto.ResponseHeader, "data_len") + 3);
+    defer server.stop();
+    var ep: [32]u8 = undefined;
+    var client = Client.init(std.testing.allocator, server.endpoint(&ep));
+    defer client.deinit();
+    try client.connect();
+    try std.testing.expectError(error.AnswerTooLarge, client.sendRequest(.ping, "", "", ""));
+    try std.testing.expect(client.stream == null);
+    try std.testing.expectEqual(@as(u32, 5 + (1 << 24)), oversized_answer);
 }

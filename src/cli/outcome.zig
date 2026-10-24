@@ -105,6 +105,10 @@ pub fn requestFailed(ctx: *Context, err: anyerror) Error {
         ctx.printErr("Error: the answer from the server failed its checksum\n", .{});
         return error.Transport;
     }
+    if (err == error.AnswerTooLarge) {
+        ctx.printErr("Error: the server's answer claims {d} bytes, more than an answer can hold\n", .{base.oversized_answer});
+        return error.Transport;
+    }
     if (isLocal(err)) {
         ctx.printErr("Error: the request can't be built: {s}\n", .{@errorName(err)});
         return error.Usage;
@@ -199,10 +203,10 @@ pub const FakeServer = struct {
         return startWithTable(status, body, proto.TABLE_HASH);
     }
 
-    /// A server whose ok answer has the byte at `offset` of its frame
-    /// flipped under the checksum it was sent with.
-    pub fn startCorrupt(body: []const u8, offset: usize) !*FakeServer {
-        return spawn(.ok, body, proto.TABLE_HASH, offset);
+    /// A server whose answer has the byte at `offset` of its frame flipped
+    /// under the checksum it was sent with.
+    pub fn startCorrupt(status: proto.StatusCode, body: []const u8, offset: usize) !*FakeServer {
+        return spawn(status, body, proto.TABLE_HASH, offset);
     }
 
     /// A server built from another table: its answers carry `table_hash`.
