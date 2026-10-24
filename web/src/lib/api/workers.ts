@@ -1,14 +1,19 @@
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { api } from './client'
-import type { WorkerInfo } from './types'
+import type { WorkerInfo, WorkersPage } from './types'
 
 const enc = encodeURIComponent
 
-/** Registered workers in a namespace (workers are namespace-scoped server-side). */
+/** Registered workers in a namespace (workers are namespace-scoped
+    server-side), a page at a time; `fetchNextPage` loads the next while
+    `hasNextPage`. */
 export function useWorkers(ns: string) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ['workers', ns],
-    queryFn: () => api.get<WorkerInfo[]>(`workers?namespace=${enc(ns)}`),
+    initialPageParam: '',
+    queryFn: ({ pageParam }) =>
+      api.get<WorkersPage>(`workers?namespace=${enc(ns)}${pageParam ? `&cursor=${enc(pageParam)}` : ''}`),
+    getNextPageParam: (last) => (last.has_more && last.cursor ? last.cursor : undefined),
     // Heartbeats/health drift over time — keep the list reasonably fresh.
     refetchInterval: 10_000,
   })
