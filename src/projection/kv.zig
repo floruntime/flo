@@ -181,7 +181,6 @@ pub const KVProjection = struct {
         gets: u64 = 0,
         scans: u64 = 0,
         expired: u64 = 0,
-        evicted: u64 = 0,
     };
 
     pub fn init(allocator: Allocator) KVProjection {
@@ -539,6 +538,8 @@ pub const KVProjection = struct {
     fn reserveHistory(self: *KVProjection, key: []const u8) !*Chain {
         const gop = try self.version_chains.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = .{};
+        // A failure leaves the chains as they were, not with an empty one.
+        errdefer if (!gop.found_existing) self.version_chains.removeByPtr(gop.key_ptr);
         try gop.value_ptr.items.ensureUnusedCapacity(self.allocator, 1);
         return gop.value_ptr;
     }
@@ -575,7 +576,6 @@ pub const KVProjection = struct {
             std.mem.copyForwards(VersionEntry, items[0 .. items.len - drop], items[drop..]);
             chain.items.shrinkRetainingCapacity(items.len - drop);
             counter.counts.history_evicted += drop;
-            self.stats.evicted += drop;
         }
     }
 
@@ -1109,6 +1109,7 @@ test "kv: an allocation failure in put or delete changes nothing" {
                 try testing.expect(kv.getRaw("ns\x00n") == null);
                 try testing.expect(kv.getRaw("ns\x00d").?.tombstone);
                 try testing.expectEqual(@as(u64, 1), kv.getRaw("ns\x00d").?.version);
+                try testing.expect(kv.version_chains.get("ns\x00d") == null);
                 return err;
             };
         }
