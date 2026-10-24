@@ -14,25 +14,19 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
-const KVProjection = @import("../../../projection/kv.zig").KVProjection;
 const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler;
 const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const ns_keys = @import("../../../namespace/handler.zig");
+const kv_api = @import("kv.zig");
+const kv_ops = @import("../../../protocol/kv_ops.zig");
+const schema = @import("../../../protocol/schema.zig");
+
+/// Key names a namespace's detail shows; the KV view pages through the rest.
+const KV_KEYS_SHOWN: u32 = 100;
 const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
-
-fn getKVProjection(ctx: *DashboardContext, idx: usize) ?*KVProjection {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    const shard: *Shard = @ptrCast(@alignCast(ptrs[idx]));
-    return &shard.defaultPartition().kv;
-}
-
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
 
 /// GET /namespaces - List all namespaces with resource counts
 pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
@@ -250,44 +244,56 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
         try queues_arr.end();
     }
 
-    // kv_keys array — scan from shard KV projections
+    // The first page of the namespace's key names, read as a client over
+    // loopback: the projections are their shards' alone to read. A read
+    // that fails says why, beside the names it got.
     {
         var kv_arr = try obj.arrayField("kv_keys");
         try kv_arr.begin();
-
-        var kv_seen = std.StringHashMap(void).init(allocator);
-        defer kv_seen.deinit();
-
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getKVProjection(ctx, i)) |kv| {
-                var kit = kv.map.iterator();
-                while (kit.next()) |kv_entry| {
-                    const key = kv_entry.key_ptr.*;
-                    // Check if key belongs to this namespace (prefix "namespace:")
-                    if (name.len > 0 and !std.mem.eql(u8, name, "default")) {
-                        const prefix_len = name.len + 1; // "namespace:"
-                        if (key.len <= prefix_len) continue;
-                        if (!std.mem.startsWith(u8, key, name)) continue;
-                        if (key[name.len] != ':') continue;
-                    }
-                    const gop = try kv_seen.getOrPut(key);
-                    if (!gop.found_existing) {
-                        try kv_arr.next();
-                        var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try kobj.begin();
-                        try kobj.stringField("key", key);
-                        try kobj.end();
-                    }
+        var more = false;
+        var failed: ?[]const u8 = null;
+        if (kv_api.Reader.open(allocator, ctx)) |reader_| {
+            var reader = reader_;
+            defer reader.deinit();
+            if (reader.call(kv_ops.op("kv.scan"), name, "", .{ .limit = KV_KEYS_SHOWN, .cursor = "" })) |resp_| {
+                var resp = resp_;
+                defer resp.deinit();
+                if (resp.isError()) {
+                    failed = "KV scan refused";
+                } else {
+                    var diag: schema.Diagnostic = .{};
+                    if (kv_ops.op("kv.scan").response.decodeAll(resp.data, &diag)) |page| {
+                        var it = page.names.iterator();
+                        while (true) {
+                            const key = it.next() catch {
+                                failed = "KV scan: malformed answer";
+                                break;
+                            } orelse break;
+                            try kv_arr.next();
+                            var kobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                            try kobj.begin();
+                            try kobj.stringField("key", key);
+                            try kobj.end();
+                        }
+                        more = page.cursor != null;
+                    } else |_| failed = "KV scan: malformed answer";
                 }
-            }
-        }
-
+            } else |err| failed = timedOutOr(err, "KV scan failed");
+        } else |err| failed = timedOutOr(err, "Loopback connect failed");
         try kv_arr.end();
+        try obj.boolField("kv_keys_more", more);
+        if (failed) |why| try obj.stringField("kv_keys_error", why);
     }
 
     try obj.end();
     return try json_aw.toOwnedSlice();
+}
+
+fn timedOutOr(err: anyerror, otherwise: []const u8) []const u8 {
+    return switch (err) {
+        error.OutOfTime, error.ConnectionTimedOut => "KV scan: the node didn't answer in time",
+        else => otherwise,
+    };
 }
 
 /// GET /namespaces/:ns/streams - Streams in namespace
