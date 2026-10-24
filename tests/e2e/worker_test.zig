@@ -349,9 +349,12 @@ test "e2e/worker: different namespaces" {
 // Worker Expiry
 // =============================================================================
 
-/// Poll `worker info` until `done` holds for its result, or about 8 s pass.
-fn pollWorkerInfo(ctx: *stdx.testing.TestContext, id: []const u8, comptime done: fn (stdx.testing.CommandResult) bool) !bool {
-    for (0..80) |_| {
+/// Poll `worker info` until `done` holds for its result, or `within_ms`
+/// pass: a deadline, not a count, since each poll spawns the CLI and takes
+/// longer on a loaded machine.
+fn pollWorkerInfo(ctx: *stdx.testing.TestContext, id: []const u8, within_ms: u64, comptime done: fn (stdx.testing.CommandResult) bool) !bool {
+    const deadline = stdx.time.monotonicMs() + within_ms;
+    while (stdx.time.monotonicMs() < deadline) {
         var info = try ctx.cli.run(&.{ "worker", "info", id });
         defer info.deinit();
         if (done(info)) return true;
@@ -360,9 +363,11 @@ fn pollWorkerInfo(ctx: *stdx.testing.TestContext, id: []const u8, comptime done:
     return false;
 }
 
-test "e2e/worker: a worker that stops heartbeating is marked unhealthy, refused work, then removed" {
+// Each test asserts one transition: removal is far off while unhealthy is
+// checked, so a slow poll can't step past it.
+test "e2e/worker: a worker that stops heartbeating is marked unhealthy and refused work" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
-        .extra_config = "[workers]\nheartbeat_timeout_ms = 1000\nremove_after_ms = 3000\n",
+        .extra_config = "[workers]\nheartbeat_timeout_ms = 1000\nremove_after_ms = 60000\n",
     } });
     defer ctx.deinit();
     try ctx.exec(&.{ "worker", "register", "silent-w", "process" });
@@ -372,19 +377,27 @@ test "e2e/worker: a worker that stops heartbeating is marked unhealthy, refused 
             return r.exit_code == 0 and r.stdoutContains("Status:          unhealthy");
         }
     };
-    try testing.expect(try pollWorkerInfo(ctx, "silent-w", Unhealthy.done));
+    try testing.expect(try pollWorkerInfo(ctx, "silent-w", 20_000, Unhealthy.done));
 
     var awaited = try ctx.cli.run(&.{ "worker", "await", "process", "-w", "silent-w", "-b", "0" });
     defer awaited.deinit();
     try testing.expectEqual(@as(u8, 3), awaited.exit_code);
     try testing.expectEqualStrings("Error: worker missed its heartbeats; send one, or register again [bad_request/worker_unhealthy]", std.mem.trim(u8, awaited.stderr, &std.ascii.whitespace));
+}
+
+test "e2e/worker: a worker silent past remove_after_ms is removed" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
+        .extra_config = "[workers]\nheartbeat_timeout_ms = 1000\nremove_after_ms = 2000\n",
+    } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "worker", "register", "silent-w", "process" });
 
     const Removed = struct {
         fn done(r: stdx.testing.CommandResult) bool {
             return r.exit_code == 1 and std.mem.eql(u8, std.mem.trim(u8, r.stderr, &std.ascii.whitespace), "Error: worker not found [not_found]");
         }
     };
-    try testing.expect(try pollWorkerInfo(ctx, "silent-w", Removed.done));
+    try testing.expect(try pollWorkerInfo(ctx, "silent-w", 20_000, Removed.done));
     var listed = try ctx.cli.run(&.{ "worker", "list" });
     defer listed.deinit();
     try testing.expectEqual(@as(u8, 0), listed.exit_code);
