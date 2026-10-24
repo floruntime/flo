@@ -479,10 +479,11 @@ test "route workers" {
     var metrics = helpers.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: the list's read is refused
 
     const result = try handleRequest(allocator, .GET, "workers", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"worker list failed: "));
 }
 
 test "route stream detail" {

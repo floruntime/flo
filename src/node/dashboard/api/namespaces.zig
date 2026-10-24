@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
+const loopback = @import("loopback.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
@@ -18,7 +19,6 @@ const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler
 const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const ns_keys = @import("../../../namespace/handler.zig");
-const kv_api = @import("kv.zig");
 const kv_ops = @import("../../../protocol/kv_ops.zig");
 const schema = @import("../../../protocol/schema.zig");
 
@@ -138,7 +138,7 @@ pub fn createNamespace(allocator: Allocator, body: []const u8, ctx: *DashboardCo
     };
     if (ns_keys.nameRefusal(name)) |why| return h.jsonError(allocator, why);
 
-    var client = @import("kv.zig").loopbackConnect(allocator, ctx) catch
+    var client = loopback.connect(allocator, ctx) catch
         return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.namespace.create(&client, name) catch
@@ -252,7 +252,7 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
         try kv_arr.begin();
         var more = false;
         var failed: ?[]const u8 = null;
-        if (kv_api.Reader.open(allocator, ctx)) |reader_| {
+        if (loopback.Reader.open(allocator, ctx)) |reader_| {
             var reader = reader_;
             defer reader.deinit();
             if (reader.call(kv_ops.op("kv.scan"), name, "", .{ .limit = KV_KEYS_SHOWN, .cursor = "" })) |resp_| {

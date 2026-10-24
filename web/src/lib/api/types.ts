@@ -428,6 +428,14 @@ export interface WorkerProcess {
   /** ms timestamp of the last run, or 0 if never. */
   last_run_at: number
 }
+/** One row of the worker list: what worker.list gives, without processes or metadata. */
+export type WorkerListItem = Omit<WorkerInfo, 'metadata' | 'processes'>
+export interface WorkersPage {
+  workers: WorkerListItem[]
+  has_more: boolean
+  /** The last id on the page; pass it back for the next. */
+  cursor: string | null
+}
 export interface WorkerInfo {
   worker_id: string
   status: WorkerStatus
