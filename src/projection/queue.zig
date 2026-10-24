@@ -633,7 +633,6 @@ pub const QueueProjection = struct {
             .ctx = @ptrCast(self),
             .vtable = .{
                 .applyFn = vtableApply,
-                .memoryUsageFn = vtableMemory,
             },
         };
     }
@@ -641,11 +640,6 @@ pub const QueueProjection = struct {
     fn vtableApply(ctx: *anyopaque, entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *QueueProjection = @ptrCast(@alignCast(ctx));
         return self.applyEntry(entry, out);
-    }
-
-    fn vtableMemory(ctx: *anyopaque) usize {
-        const self: *QueueProjection = @ptrCast(@alignCast(ctx));
-        return self.memoryUsage();
     }
 
     pub fn memoryUsage(self: *const QueueProjection) usize {

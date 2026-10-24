@@ -1085,7 +1085,6 @@ pub const TSProjection = struct {
             .ctx = @ptrCast(self),
             .vtable = .{
                 .applyFn = vtableApply,
-                .memoryUsageFn = vtableMemory,
             },
         };
     }
@@ -1093,11 +1092,6 @@ pub const TSProjection = struct {
     fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *TSProjection = @ptrCast(@alignCast(ctx));
         return self.applyEntry(ual_entry, out);
-    }
-
-    fn vtableMemory(ctx: *anyopaque) usize {
-        const self: *TSProjection = @ptrCast(@alignCast(ctx));
-        return self.memoryUsage();
     }
 
     pub fn memoryUsage(self: *const TSProjection) usize {
@@ -1325,14 +1319,6 @@ test "ts: apply entry for ts_write" {
     try applyTest(&ts, &ual_entry);
 
     try testing.expectEqual(@as(u64, 1), ts.stats.points_inserted);
-}
-
-test "ts: projection handle vtable" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
-    defer ts.deinit();
-
-    const handle = ts.projectionHandle();
-    try testing.expect(handle.memoryUsage() > 0);
 }
 
 // ─── Tags as a series dimension (issue #24) ────────────────────────────────

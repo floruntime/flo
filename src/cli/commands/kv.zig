@@ -1,9 +1,10 @@
 //! KV (Key-Value) commands for Flo CLI.
 //!
-//! Every command but `mget` is generated from the KV op table (cli/gen.zig):
-//! its flags are the op's fields, and its answer prints by the op's response
-//! schema. `mget` sends as many requests as its keys need, so it is written
-//! here, on the same op.
+//! Every command but `mget` and `history` is generated from the KV op table
+//! (cli/gen.zig): its flags are the op's fields, and its answer prints by the
+//! op's response schema. `mget` and `history` send as many requests as they
+//! need, so they are written here, on the same ops; `history` keeps the
+//! generated flags.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,6 +41,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
         \\JSON documents.
     );
     gen.addCommands(allocator, kv, &kv_ops.table, &kv_ops.groups);
+    _ = kv.subcommand(gen.command(allocator, kv_ops.op("kv.history")).action(wrapHandler(runHistory)));
     const mget_op = kv_ops.op("kv.mget");
     return kv.subcommand(
         commander.newBuilder(allocator)
@@ -142,6 +144,70 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
         from += answered;
     }
     if (format == .json) ctx.print("]\n", .{});
+}
+
+/// A key's versions, newest first, following `more` until `--limit` are
+/// shown. Rows are kept until the last page, so a page that fails leaves no
+/// half-printed history behind.
+fn runHistory(ctx: *commander.Context) commander.Error!void {
+    const key = ctx.getPositional("key") orelse "";
+    // The flags are the generated ones, which carry text.
+    const limit: u64 = if (ctx.flagChanged("limit")) std.fmt.parseInt(u64, ctx.getString("limit") orelse "", 10) catch 0 else 10;
+    if (limit < 1 or limit > kv_ops.MAX_HISTORY) return outcome.usage(ctx, "--limit is 1 to {d}", .{kv_ops.MAX_HISTORY});
+    var before: ?u64 = null;
+    if (ctx.flagChanged("before-version")) before = std.fmt.parseInt(u64, ctx.getString("before-version") orelse "", 10) catch
+        return outcome.usage(ctx, "--before-version is a version number", .{});
+    const namespace = cli_config.getNamespace(ctx);
+    const format = output.getFormat(ctx);
+    var client = try dialClient(ctx);
+    defer client.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ctx.allocator);
+    const failed = outcome.malformed;
+    var shown: u64 = 0;
+    var more = false;
+    while (true) {
+        var a = try send(ctx, &client, "kv.history", namespace, key, .{ .limit = @intCast(limit - shown), .before_version = before, .routing_key = optionalRoutingKey(ctx) });
+        defer a.deinit();
+        var got: u64 = 0;
+        var it = a.value.versions.iterator();
+        while (it.next() catch return failed(ctx, "kv.history answer")) |v| : (got += 1) {
+            // Newest first: each version older than the one before it.
+            if (before) |b| if (v.version >= b) return failed(ctx, "kv.history answer");
+            before = v.version;
+            switch (format) {
+                .json => {
+                    if (shown + got > 0) out.append(ctx.allocator, ',') catch return failed(ctx, "kv.history answer");
+                    out.print(ctx.allocator, "{{\"version\":{d},\"at_ms\":{d},\"deleted\":{},\"value\":{f}}}", .{ v.version, v.at_ms, v.deleted, output.jsonString(v.value) }) catch return failed(ctx, "kv.history answer");
+                },
+                .table, .raw => out.print(ctx.allocator, "{d}\t{d}\t{}\t{s}\n", .{ v.version, v.at_ms, v.deleted, v.value }) catch return failed(ctx, "kv.history answer"),
+            }
+        }
+        shown += got;
+        more = a.value.more;
+        // An answer that says more follows yet gave nothing would never end.
+        if (!more or shown >= limit) break;
+        if (got == 0) return failed(ctx, "kv.history answer");
+    }
+    switch (format) {
+        .json => ctx.print("{{\"versions\":[{s}],\"more\":{}}}\n", .{ out.items, more }),
+        .table => {
+            ctx.print("VERSION\tAT_MS\tDELETED\tVALUE\n{s}", .{out.items});
+            if (more) ctx.print("more: true\n", .{});
+        },
+        // The rows are the whole of stdout, as scan's are.
+        .raw => {
+            ctx.print("{s}", .{out.items});
+            if (more) sideNote(ctx, "more: true\n");
+        },
+    }
+}
+
+/// A line beside the rows, not an error: on stderr, so `-o raw`'s stdout
+/// stays rows alone.
+fn sideNote(ctx: *commander.Context, text: []const u8) void {
+    ctx.printErr("{s}", .{text});
 }
 
 // ==================== Testing ====================
