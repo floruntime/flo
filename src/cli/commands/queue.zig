@@ -552,3 +552,27 @@ test "queue enqueue reads its answer as exactly an 8-byte sequence number" {
         if (c.want) |e| try std.testing.expectError(e, result) else try result;
     }
 }
+
+test "an answer that fails its checksum ends the command with transport (exit 5)" {
+    const allocator = std.testing.allocator;
+    const server = try outcome.FakeServer.startCorrupt(&[_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 }, @sizeOf(@import("../../protocol/proto.zig").ResponseHeader));
+    defer server.stop();
+    var ep: [32]u8 = undefined;
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.NoPipe;
+    defer _ = std.c.close(fds[0]);
+    const root = try outcome.testRootTo(allocator, try createQueueCommand(allocator), fds[1]);
+    defer root.deinit();
+    const result = root.executeSlice(&.{ "flo", "queue", "enqueue", "q", "x", "--endpoint", server.endpoint(&ep) });
+    _ = std.c.close(fds[1]);
+    var out: [256]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        const got = std.c.read(fds[0], out[n..].ptr, out.len - n);
+        if (got <= 0) break;
+        n += @intCast(got);
+    }
+    try std.testing.expectError(error.Transport, result);
+    try std.testing.expectEqual(@as(u8, 5), outcome.exitCode(result));
+    try std.testing.expectEqualStrings("Error: the answer from the server failed its checksum\n", out[0..n]);
+}

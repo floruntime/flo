@@ -261,6 +261,15 @@ pub const Client = struct {
             try readExact(stream, data);
         }
 
+        if (response_header.computeCRC32(data) != response_header.crc32) {
+            // The damage may be in the header, data_len included, so nothing
+            // after it on the socket can be read either.
+            self.allocator.free(data);
+            stream.close();
+            self.stream = null;
+            return error.InvalidChecksum;
+        }
+
         return Response{
             .status = @fromBackingInt(@intCast(response_header.status)),
             .data = data,
@@ -346,4 +355,20 @@ test "resolveEndpointAddress accepts localhost and numeric addresses" {
         try std.testing.expect(false);
         return;
     };
+}
+
+test "an answer that fails its checksum is refused and the connection closed" {
+    const outcome = @import("../outcome.zig");
+    const header_len = @sizeOf(proto.ResponseHeader);
+    // A body byte, then a request_id byte: validate() reads neither.
+    for ([_]usize{ header_len + 1, @offsetOf(proto.ResponseHeader, "request_id") }) |offset| {
+        const server = try outcome.FakeServer.startCorrupt("hello", offset);
+        defer server.stop();
+        var ep: [32]u8 = undefined;
+        var client = Client.init(std.testing.allocator, server.endpoint(&ep));
+        defer client.deinit();
+        try client.connect();
+        try std.testing.expectError(error.InvalidChecksum, client.sendRequest(.ping, "", "", ""));
+        try std.testing.expect(client.stream == null);
+    }
 }
