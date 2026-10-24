@@ -205,44 +205,66 @@ test "e2e/worker: list on a node of several shards shows every shard's workers o
 // REST API — Worker Endpoints
 // =============================================================================
 
-test "e2e/http/worker: GET /workers returns 200 with JSON" {
+test "e2e/http/worker: GET /workers with none registered is one empty page" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
     defer ctx.deinit();
-
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
 
     var resp = try http.get("/api/v1/workers");
     defer resp.deinit();
-
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.isJson());
-    // Empty server returns empty JSON array
-    try testing.expect(resp.bodyContains("["));
+    try testing.expectEqualStrings("{\"workers\":[],\"has_more\":false,\"cursor\":null}", resp.bodyTrimmed());
 }
 
-test "e2e/http/worker: GET /workers returns registered workers" {
+test "e2e/http/worker: GET /workers pages every shard's workers once, in id order, and only the namespace's" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .dashboard_enabled = true },
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
     });
     defer ctx.deinit();
-
-    // Register a worker via CLI
-    try ctx.exec(&.{ "worker", "register", "http-w1", "process" });
+    const ids = [_][]const u8{ "w-a", "w-b", "w-c", "w-d", "w-e" };
+    for (ids) |id| try ctx.exec(&.{ "worker", "register", id, "process" });
+    try ctx.exec(&.{ "worker", "register", "w-other", "process", "-n", "other" });
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-
-    var resp = try http.get("/api/v1/workers");
-    defer resp.deinit();
-
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.isJson());
-    try testing.expect(resp.bodyContains("http-w1"));
-    try testing.expect(resp.bodyContains("\"worker_id\""));
-    try testing.expect(resp.bodyContains("\"status\""));
+    var seen: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen.items) |id| testing.allocator.free(id);
+        seen.deinit(testing.allocator);
+    }
+    var path_buf: [128]u8 = undefined;
+    var path: []const u8 = "/api/v1/workers?limit=2";
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |c| testing.allocator.free(c);
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        try testing.expect(pages < 10);
+        var resp = try http.get(path);
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.bodyTrimmed(), .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        const workers = root.get("workers").?.array.items;
+        try testing.expect(workers.len <= 2);
+        for (workers) |w| {
+            try seen.append(testing.allocator, try testing.allocator.dupe(u8, w.object.get("worker_id").?.string));
+            try testing.expectEqualStrings("default", w.object.get("namespace").?.string);
+            try testing.expectEqualStrings("action", w.object.get("worker_type").?.string);
+            try testing.expectEqualStrings("active", w.object.get("status").?.string);
+        }
+        try testing.expectEqual(root.get("has_more").?.bool, root.get("cursor").? == .string);
+        if (root.get("cursor").? != .string) break;
+        if (cursor) |c| testing.allocator.free(c);
+        cursor = try testing.allocator.dupe(u8, root.get("cursor").?.string);
+        path = try std.fmt.bufPrint(&path_buf, "/api/v1/workers?limit=2&cursor={s}", .{cursor.?});
+    }
+    try testing.expectEqual(ids.len, seen.items.len);
+    for (ids, seen.items) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expect(pages >= 2);
 }
 
 test "e2e/http/worker: GET /workers/:id returns worker detail" {

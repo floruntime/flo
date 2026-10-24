@@ -9,9 +9,9 @@
 import { useMemo, useState } from 'react'
 import { jhl } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
-import { Crumb, Stats, Stat, OpPill } from '@/components'
+import { Button, Crumb, Stats, Stat, OpPill } from '@/components'
 import { useWorkers, useWorkerDetail } from '@/lib/api/workers'
-import type { WorkerInfo } from '@/lib/api/types'
+import type { WorkerListItem } from '@/lib/api/types'
 import { ASvc, MapPill, afmtN, aAgo, secsAgo, typeColor, W_ST } from './shared'
 import './compute.css'
 
@@ -180,7 +180,9 @@ type ListTab = 'all' | 'action' | 'stream'
 
 function WorkersList({ ns, onOpen }: { ns: string; onOpen: (id: string) => void }) {
   const q = useWorkers(ns)
-  const workers = useMemo<WorkerInfo[]>(() => q.data ?? [], [q.data])
+  const workers = useMemo<WorkerListItem[]>(() => q.data?.pages.flatMap((p) => p.workers) ?? [], [q.data])
+  // A refresh that fails keeps the workers last loaded, marked stale.
+  const stale = q.isError && q.data !== undefined
   const [tab, setTab] = useState<ListTab>('all')
 
   const active = workers.filter((w) => w.status === 'active').length
@@ -199,7 +201,7 @@ function WorkersList({ ns, onOpen }: { ns: string; onOpen: (id: string) => void 
       </div>
 
       <Stats>
-        <Stat label="Workers" value={q.isLoading ? '…' : workers.length} sub={`${active} active · in ${ns}`} />
+        <Stat label="Workers" value={q.isLoading ? '…' : workers.length + (q.hasNextPage ? '+' : '')} sub={`${active} active · in ${ns}`} />
         <Stat label="In-flight" value={inflight} sub="tasks now" />
         <Stat label="Completed" value={afmtN(done)} sub="lifetime" />
         <Stat label="Unhealthy" value={unhealthy} valueColor={unhealthy ? 'var(--crit)' : undefined} sub="no heartbeat" />
@@ -220,9 +222,9 @@ function WorkersList({ ns, onOpen }: { ns: string; onOpen: (id: string) => void 
           ))}
         </div>
 
-        {q.isError ? (
+        {q.isError && !stale ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--crit)', padding: '40px 0' }}>
-            Failed to load workers. Is the server running?
+            Failed to load workers: {q.error.message}
           </div>
         ) : filtered.length === 0 ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '40px 0' }}>
@@ -230,6 +232,13 @@ function WorkersList({ ns, onOpen }: { ns: string; onOpen: (id: string) => void 
           </div>
         ) : (
           <div className="list">
+            {stale && (
+              <div className="li" style={{ color: 'var(--crit)', fontSize: 12 }}>
+                {q.isFetchNextPageError
+                  ? <>Couldn’t load more ({q.error?.message}).</>
+                  : <>Stale: couldn’t refresh ({q.error?.message}). Showing the workers last loaded.</>}
+              </div>
+            )}
             <div className="li head" style={{ gridTemplateColumns: grid }}>
               <div className="c">Worker</div>
               <div className="c">Type</div>
@@ -266,6 +275,13 @@ function WorkersList({ ns, onOpen }: { ns: string; onOpen: (id: string) => void 
                 </div>
               )
             })}
+            {q.hasNextPage && (
+              <div className="li" style={{ justifyContent: 'center' }}>
+                <Button style={{ padding: '5px 11px', fontSize: 12 }} onClick={() => q.fetchNextPage()} disabled={q.isFetchingNextPage}>
+                  {q.isFetchingNextPage ? 'Loading…' : 'Load more'}
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </div>
