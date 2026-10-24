@@ -64,6 +64,9 @@ pub const Invariant = enum {
     /// and stopped taking part. Only an async-mode crash can erase applied
     /// history; anywhere else it is a safety bug.
     divergence,
+    /// Nodes that halted did so at different entries: a halt must come
+    /// from the entry alone, the same on every replica.
+    halt_agreement,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -256,6 +259,8 @@ const SimNode = struct {
     applied_stamp_index: u64 = 0,
     /// The last config this node applied, for `config_safety`.
     applied_config: membership.Config = .{},
+    /// The entry it halted at, 0 for none: it applies nothing from it on.
+    halted_at: u64 = 0,
     /// The tick it applied each index at (index i at [i - 1]), for judging
     /// whether a crash could have erased what it applied.
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
@@ -617,6 +622,8 @@ pub const Simulator = struct {
     /// Tracked incrementally; recomputing it from all ops every tick is
     /// O(ops x ticks) and dominates the whole run.
     max_acked_index: u64,
+    /// Where the first node halted, which every other must match.
+    halt: ?struct { index: u64, term: u64, hash: u64 } = null,
     // Scratch, allocated once.
     apply_buf: []u8,
     delivery: std.ArrayListUnmanaged(Message),
@@ -866,6 +873,23 @@ pub const Simulator = struct {
         return voters - lost >= voters / 2 + 1;
     }
 
+    /// `node` reached the halting op's entry: as production's shard does,
+    /// it applies nothing from it on and proposes only configs and no-ops.
+    fn haltNode(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry) void {
+        const at: @TypeOf(self.halt.?) = .{ .index = e.header.index, .term = e.header.term, .hash = std.hash.Wyhash.hash(HASH_SEED, e.payload) };
+        node.halted_at = at.index;
+        node.raft.halted = true;
+        if (self.halt) |first| {
+            if (first.index != at.index or first.term != at.term or first.hash != at.hash) self.checker.fail(.{
+                .invariant = .halt_agreement,
+                .node = node.id,
+                .index = at.index,
+                .tick = self.now,
+                .detail = "halted at another entry than the first node to halt",
+            });
+        } else self.halt = at;
+    }
+
     fn restartNode(self: *Simulator, node: *SimNode) !void {
         const prev_term = node.max_term_seen;
         node.raft.deinit();
@@ -879,6 +903,8 @@ pub const Simulator = struct {
         attachWall(node);
         node.applied_stamp = 0;
         node.applied_stamp_index = 0;
+        // Its apply starts again from the log, and halts where it did.
+        node.halted_at = 0;
         for (self.nodes, 0..) |_, j| {
             if (j + 1 != node.id) node.raft.addPeer(@intCast(j + 1));
         }
@@ -931,6 +957,14 @@ pub const Simulator = struct {
         self.restarts += 1;
         // Replay applies from the start again.
         node.applied_config = .{};
+        // A node whose log holds the entry the group halted at comes up
+        // halted there, as production's boot replay stops at it.
+        if (self.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |e| {
+            if (e.header.term == h.term and std.hash.Wyhash.hash(HASH_SEED, e.payload) == h.hash) {
+                node.halted_at = h.index;
+                node.raft.halted = true;
+            }
+        };
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
                 .invariant = .term_monotonicity,
@@ -1350,6 +1384,7 @@ pub const Simulator = struct {
         }
         node.disk.applying = true;
         defer node.disk.applying = false;
+        if (node.halted_at != 0) return;
         {
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
@@ -1371,6 +1406,10 @@ pub const Simulator = struct {
                 // The group's own entries (noops, configs) are history too,
                 // but carry no workload op.
                 const is_op = e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config);
+                if (is_op and self.scenario.halt_op != 0 and Workload.opIdFromPayload(e.payload) == self.scenario.halt_op - 1) {
+                    self.haltNode(node, &e);
+                    break;
+                }
                 if (stamp_before != null and e.header.timestamp_ns <= stamp_before.?) self.checker.fail(.{
                     .invariant = .stamp_order,
                     .node = node.id,
@@ -1508,6 +1547,14 @@ pub const Simulator = struct {
 
     fn converged(self: *Simulator) bool {
         if (self.scenario.config_change_permille > 0) return self.convergedMembership();
+        // Halted: every core node stopped at the same entry.
+        if (self.halt) |h| {
+            for (self.nodes, 0..) |*node, i| {
+                if (!self.core[i]) continue;
+                if (!node.up or node.halted_at != h.index) return false;
+            }
+            return true;
+        }
         // Every acked op applied by every core node.
         const target = self.max_acked_index;
         for (self.nodes) |*node| {
@@ -1527,10 +1574,14 @@ pub const Simulator = struct {
         } else return false;
         const cfg = &leader.raft.latest_config;
         if (cfg.member_count == 0 or leader.raft.membership_index > leader.raft.commit_index) return false;
-        if (leader.raft.last_applied < self.max_acked_index) return false;
+        if (self.halt == null and leader.raft.last_applied < self.max_acked_index) return false;
         for (cfg.memberSlice()) |m| {
             const node = &self.nodes[m.id - 1];
             if (!node.up or node.raft.lost_log != .none) return false;
+            if (self.halt) |h| {
+                if (node.halted_at != h.index) return false;
+                continue;
+            }
             if (node.raft.last_applied < self.convergence_target) return false;
         }
         return true;
@@ -1543,6 +1594,8 @@ pub const Simulator = struct {
     fn finalDurabilityCheck(self: *Simulator) void {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
+            // Past a halt nothing applies, so nothing records it.
+            if (self.halt) |h| if (op.index >= h.index) continue;
             if (self.scenario.durability == .async_flush) {
                 // Excuse the op if any crash landed within a flush interval
                 // on EITHER side of the ack — that loss is the mode's

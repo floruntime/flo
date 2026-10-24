@@ -1244,7 +1244,7 @@ pub const ActionsHandler = struct {
     /// needs the run finds it once it applies.
     fn proposeInvoke(shard: *Shard, namespace: []const u8, run_id: []const u8, value: []const u8) ?u64 {
         const proposed = persistence.proposeEntry(shard, .action_invoke, Flags.NONE, namespace, run_id, value) catch |err| {
-            log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
+            if (!shard.quietHalted(err)) log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
             return null;
         };
         return proposed.index;

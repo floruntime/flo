@@ -20,6 +20,8 @@ pub const Summary = struct {
     first_index: u64 = 0,
     last_index: u64 = 0,
     last_term: u64 = 0,
+    /// The last entry's stamp: an entry appended offline is stamped after it.
+    last_stamp: u64 = 0,
     /// What the segments were flushed under: committed as far as this node
     /// knows.
     commit: u64 = 0,
@@ -81,6 +83,7 @@ pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
         if (n == 0) return error.LogUnreadable;
         for (batch[0..n]) |*e| {
             sum.last_term = e.header.term;
+            sum.last_stamp = e.header.timestamp_ns;
             if (e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config)) continue;
             sum.config = membership.decode(e.payload) orelse continue;
             sum.member_count = sum.config.ids(&sum.members).len;
@@ -127,7 +130,11 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
         forced.removed[forced.removed_count] = rm;
         forced.removed_count += 1;
     }
-    var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, term, index, 0, membership.encode(&forced, &cfg_buf));
+    // Stamped after the entry before it, as a leader stamps: apply halts on
+    // a stamp that isn't.
+    const now_ns: u64 = @intCast(@as(i64, @import("stdx").time.milliTimestamp()) * std.time.ns_per_ms);
+    const stamp = @max(sum.last_stamp + 1, now_ns);
+    var e = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, term, index, stamp, membership.encode(&forced, &cfg_buf));
     e.header.crc32c = e.computeCrc();
     try writer.addEntry(&e);
     try dl.flush(index);
@@ -231,9 +238,9 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
 
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
     var es: [3]Entry = .{
-        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 0, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
-        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 4, 3, 0, ""),
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 4, 3, 30, ""),
     };
     for (&es) |*e| e.header.crc32c = e.computeCrc();
     try writeLog(dir, &es, 2);
@@ -255,6 +262,8 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
     try testing.expectEqual(@as(u64, 5), after.config_term);
     try testing.expectEqualSlices(u32, &.{2}, after.configMembers());
     try testing.expect(!after.hard_state.?.lost_log);
+    // Stamped after the entry before it, so applying it doesn't halt.
+    try testing.expect(after.last_stamp > 30);
 }
 
 test "offline: force-members refuses a data dir with no log" {

@@ -373,6 +373,10 @@ pub const RaftNode = struct {
     /// Set by the owner when an entry it owed the disk is gone: nothing
     /// after it can be made durable, so proposals are refused.
     writes_stopped: bool = false,
+    /// The owner's state machine halted at an entry every replica fails
+    /// the same way: it proposes nothing but what elects a leader or
+    /// changes membership, until a repair.
+    halted: bool = false,
     last_applied: u64,
 
     // ── Election timer ─────────────────────────────────────────────────
@@ -1395,6 +1399,7 @@ pub const RaftNode = struct {
     fn appendProposal(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
         if (self.writes_stopped) return error.WritesStopped;
+        if (self.halted and entry_type != .raft_config and entry_type != .raft_noop) return error.Halted;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
         if (self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;

@@ -265,7 +265,7 @@ pub fn failureStatus(err: anyerror) proto.StatusCode {
 /// The same, for handlers that answer with a `CommandResult`.
 pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
-        error.NotLeader, error.WritesStopped => .unavailable,
+        error.NotLeader, error.WritesStopped, error.Halted => .unavailable,
         error.Overloaded => .overloaded,
         error.PayloadTooLarge, error.KeyTooLarge => .invalid_request,
         else => .internal_error,
@@ -295,6 +295,7 @@ pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
     return switch (err) {
         error.NotLeader => "unavailable: electing a leader — retry",
         error.WritesStopped => "unavailable: this shard stopped taking writes — a write left memory before it reached disk; retry once the node restarts",
+        error.Halted => "unavailable: this shard is halted at an entry every replica fails; this write was not run. Restarting won't help — the node's /status says where it halted",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
         error.KeyTooLarge => std.fmt.comptimePrint("bad request: key or name too long — at most {d} bytes, namespace included", .{MAX_ENTRY_KEY}),

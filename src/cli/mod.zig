@@ -175,7 +175,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     result catch |err| switch (err) {
         // Each of these already said why.
         error.HelpRequested, error.VersionRequested => {},
-        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Transport => {},
+        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Pending, error.Transport => {},
         // The commander names the word or flag it couldn't use.
         error.UnknownCommand, error.UnknownFlag, error.MissingFlagValue, error.InvalidFlagValue => {},
         error.MissingRequiredFlag, error.MissingRequiredArg, error.TooManyArgs => {},

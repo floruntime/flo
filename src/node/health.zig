@@ -26,6 +26,11 @@ pub const ShardState = enum(u8) {
     /// On a lone node, its data is damaged: it refuses its own requests and
     /// the other shards serve.
     offline,
+    /// It reached an entry every replica fails the same way and applies
+    /// nothing past it: it serves reads, marked stale, and refuses writes
+    /// until a repair. Every replica halts together, so the node stays
+    /// ready; a 503 would pull the whole group.
+    halted,
     /// Waiting for an init worker to take it.
     loading,
     /// Replaying its log.
@@ -44,7 +49,7 @@ pub const ShardState = enum(u8) {
     removed,
 
     pub fn serves(self: ShardState) bool {
-        return @backingInt(self) <= @backingInt(ShardState.offline);
+        return @backingInt(self) <= @backingInt(ShardState.halted);
     }
 };
 
@@ -112,7 +117,8 @@ pub const ShardSlot = struct {
     /// index the segments hold, which it reaches when replay is done.
     replay_index: Atomic(u64) = .init(0),
     replay_last: Atomic(u64) = .init(0),
-    /// Written once, before the state first reads `offline`.
+    /// Written once, before the state first reads `offline`, `halted` or
+    /// `diverged`.
     reason_len: Atomic(u16) = .init(0),
     reason_buf: [REASON_MAX]u8 = undefined,
     removal: Removal = .{},
@@ -121,6 +127,9 @@ pub const ShardSlot = struct {
     /// stranger's frames with no leader heard, the stuck-member symptom.
     vouched_index: Atomic(u64) = .init(0),
     strangers_while_quiet: Atomic(bool) = .init(false),
+    /// The entry the shard halted at, written before the state reads
+    /// `halted`.
+    halt_index: Atomic(u64) = .init(0),
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -142,11 +151,15 @@ pub const ShardSlot = struct {
         self.set(state);
     }
 
-    /// Keep why the shard went offline. Only the first reason is kept: it
-    /// is the one the shard answers with.
+    /// Keep why the shard is out of service. A new reason replaces the old:
+    /// a shard that halted and then diverged answers with the divergence.
     pub fn setReason(self: *ShardSlot, why: []const u8) void {
-        if (self.reason_len.load(.monotonic) != 0) return;
         const n = @min(why.len, REASON_MAX);
+        const len = self.reason_len.load(.monotonic);
+        if (len == n and std.mem.eql(u8, self.reason_buf[0..n], why[0..n])) return;
+        // Changes are rare: a reader racing one may see it torn once, and
+        // reads it whole next time.
+        self.reason_len.store(0, .release);
         @memcpy(self.reason_buf[0..n], why[0..n]);
         self.reason_len.store(@intCast(n), .release);
     }
@@ -200,10 +213,11 @@ pub const NodeHealth = struct {
             const state = s.get();
             const role: Role = @fromBackingInt(@intCast(s.role.load(.monotonic)));
             try w.print("{{\"id\":{d},\"state\":\"{s}\"", .{ i, @tagName(state) });
-            if (state == .offline) if (s.reason()) |why| {
+            if (state == .offline or state == .halted or state == .diverged) if (s.reason()) |why| {
                 try w.writeAll(",\"reason\":");
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
+            if (state == .halted) try w.print(",\"halt_index\":{d}", .{s.halt_index.load(.monotonic)});
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
@@ -288,6 +302,37 @@ test "health: of several states, /ready names the one that needs someone first" 
     }
 }
 
+test "health: a halted shard keeps the node ready, and /status names where it halted and why; a diverged one names its damage" {
+    var h = try NodeHealth.init(testing.allocator, 1, 2);
+    defer h.deinit(testing.allocator);
+    h.accepting.store(true, .release);
+    h.shards[0].halt_index.store(18234, .monotonic);
+    h.shards[0].setReason("entry 18234 (kv_put): its projection refused it as malformed (a Flo bug)");
+    h.shards[0].publish(.halted, .leader, 18233, 18240);
+    h.shards[1].setReason("entry 9 (kv_put) could not be applied on this node: out of memory");
+    h.shards[1].publish(.ok, .follower, 1, 1);
+    // Every replica halts together: the node stays ready.
+    try testing.expect(h.readiness().ready);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try h.writeStatus(&out.writer, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const s0 = parsed.value.object.get("shards").?.array.items[0].object;
+    try testing.expectEqualStrings("halted", s0.get("state").?.string);
+    try testing.expectEqual(@as(i64, 18234), s0.get("halt_index").?.integer);
+    try testing.expect(std.mem.indexOf(u8, s0.get("reason").?.string, "malformed") != null);
+    // A reason shows only with the state that has one.
+    try testing.expect(parsed.value.object.get("shards").?.array.items[1].object.get("reason") == null);
+
+    h.shards[1].publish(.diverged, .follower, 1, 1);
+    try testing.expect(!h.readiness().ready);
+    out.clearRetainingCapacity();
+    try h.writeStatus(&out.writer, null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "out of memory") != null);
+}
+
 test "health: /status names each shard's state, its reason when offline, and its losses" {
     var registry = MetricsRegistry.init(testing.allocator);
     defer registry.deinit();
@@ -301,8 +346,8 @@ test "health: /status names each shard's state, its reason when offline, and its
     defer h.deinit(testing.allocator);
     h.accepting.store(true, .release);
     h.shards[0].publish(.ok, .leader, 10, 12);
+    h.shards[1].setReason("an older reason is replaced");
     h.shards[1].setReason("segment 00000001.flseg failed its \"checksum\"");
-    h.shards[1].setReason("a later reason is not kept");
     h.shards[1].publish(.offline, .follower, 4, 4);
     h.shards[1].publishVouch(3726, true);
 

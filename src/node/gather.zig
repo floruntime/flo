@@ -81,6 +81,8 @@ pub fn GatherTable(comptime Context: type) type {
             /// Each part's answer body, owned; null until it arrives.
             answers: []?[]u8 = &.{},
             arrived: u16 = 0,
+            /// A part read a halted shard's state: the answer is stale.
+            stale: bool = false,
             context: Context = undefined,
         };
 
