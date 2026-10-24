@@ -101,6 +101,14 @@ pub fn connectFailed(ctx: *Context, err: anyerror, endpoint: []const u8) Error {
 /// the command's input; anything else is the connection.
 pub fn requestFailed(ctx: *Context, err: anyerror) Error {
     if (err == error.TableMismatch) return tableMismatch(ctx);
+    if (err == error.InvalidChecksum) {
+        ctx.printErr("Error: the answer from the server failed its checksum\n", .{});
+        return error.Transport;
+    }
+    if (err == error.AnswerTooLarge) {
+        ctx.printErr("Error: the server's answer claims {d} bytes, more than an answer can hold\n", .{base.oversized_answer});
+        return error.Transport;
+    }
     if (isLocal(err)) {
         ctx.printErr("Error: the request can't be built: {s}\n", .{@errorName(err)});
         return error.Usage;
@@ -186,14 +194,27 @@ pub const FakeServer = struct {
     body: []const u8,
     /// The table hash its answers carry.
     table_hash: u64 = proto.TABLE_HASH,
+    /// An offset into its answer frame whose byte is flipped after the
+    /// checksum is computed, for a damaged answer.
+    corrupt_at: ?usize = null,
     thread: std.Thread = undefined,
 
     pub fn start(status: proto.StatusCode, body: []const u8) !*FakeServer {
         return startWithTable(status, body, proto.TABLE_HASH);
     }
 
+    /// A server whose answer has the byte at `offset` of its frame flipped
+    /// under the checksum it was sent with.
+    pub fn startCorrupt(status: proto.StatusCode, body: []const u8, offset: usize) !*FakeServer {
+        return spawn(status, body, proto.TABLE_HASH, offset);
+    }
+
     /// A server built from another table: its answers carry `table_hash`.
     pub fn startWithTable(status: proto.StatusCode, body: []const u8, table_hash: u64) !*FakeServer {
+        return spawn(status, body, table_hash, null);
+    }
+
+    fn spawn(status: proto.StatusCode, body: []const u8, table_hash: u64, corrupt_at: ?usize) !*FakeServer {
         const net = @import("stdx").net;
         const fd = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer net.sysClose(fd);
@@ -202,7 +223,7 @@ pub const FakeServer = struct {
         try net.sysListen(fd, 1);
         const local = try net.sysLocalIp4(fd);
         const self = try std.heap.page_allocator.create(FakeServer);
-        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body, .table_hash = table_hash };
+        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body, .table_hash = table_hash, .corrupt_at = corrupt_at };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
     }
@@ -237,6 +258,7 @@ pub const FakeServer = struct {
                 proto.Response.serializeOk(header.request_id, self.body, &out) catch return
             else
                 proto.Response.serializeRefusal(self.status, header.request_id, proto.unclassified(self.status, self.body), &out);
+            if (self.corrupt_at) |at| out[at] ^= 0x01;
             _ = net.sysWrite(c, frame) catch return;
             // One answer, then the connection closes: a command that retried
             // would see a lost connection (exit 5), not hang the test.
