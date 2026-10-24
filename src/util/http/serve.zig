@@ -176,9 +176,11 @@ threadlocal var write_deadline_ms: i64 = 0;
 
 /// Milliseconds left before the response being handled must be written,
 /// for a handler that waits on others to keep inside it; null outside one.
+/// Never negative: 0 once the deadline has passed, so a caller handing it
+/// to a timeout can't turn a spent deadline into a wait without end.
 pub fn responseMsLeft() ?i64 {
     if (write_deadline_ms == 0) return null;
-    return write_deadline_ms - nowMs();
+    return @max(0, write_deadline_ms - nowMs());
 }
 
 fn dispatch(allocator: std.mem.Allocator, c: *Conn, handler: anytype, bytes: []const u8) void {
