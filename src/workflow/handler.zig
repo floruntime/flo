@@ -2737,7 +2737,7 @@ pub const WorkflowHandler = struct {
         defer self.allocator.free(value);
 
         const stamp_ns = self.propose(shard, namespace, run_ns_key, value) catch |err| {
-            log.err("workflow run {s}: completion not persisted: {s}", .{ run_ns_key, @errorName(err) });
+            if (!shard.quietHalted(err)) log.err("workflow run {s}: completion not persisted: {s}", .{ run_ns_key, @errorName(err) });
             return err;
         };
         // The applier applies the same record again at commit, at the same
@@ -4265,6 +4265,8 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.metrics_registry = null;
     shard.shard_metrics = null;
     shard.offline = null;
+    shard.halted = null;
+    shard.diverged_damage = null;
     shard.offline_published = .init(false);
     shard.replica.diverged = false;
     shard.losses = .{};
@@ -5691,6 +5693,8 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
     registerTestAction(&actions, "step-a");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    // Its completions apply through the log, as on a shard.
+    handler.registerReplay(&shard.replay_registry);
     createTestDef(&handler, "default:map-wf", "map-wf",
         \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
         \\"start":{"run":"@actions/step-a","input_mapping":"\"$.input\"","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}

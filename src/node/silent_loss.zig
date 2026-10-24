@@ -82,6 +82,9 @@ pub const Counts = struct {
 /// taking part in its group (cluster).
 pub const Damage = struct {
     path: Path,
+    /// This node ran out of memory applying an entry: the log on disk is
+    /// whole, and a restart once memory is free applies it again.
+    out_of_memory: bool = false,
     buf: [192]u8 = undefined,
     len: usize = 0,
 

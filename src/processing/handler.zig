@@ -1563,7 +1563,7 @@ pub const ProcessingHandler = struct {
         std.mem.writeInt(u64, val_buf[8..16], b, .little);
         // The applier records the persisted cursor.
         _ = persistence_mod.proposeEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
-            log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
+            if (!shard.quietHalted(err)) log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
             if (shard.metrics_registry) |m| m.processing.recordError();
             return;
         };

@@ -21,6 +21,7 @@
 //!        [--membership]             the leader changes the membership often
 //!        [--byzantine]              a node with the secret but no seat sends
 //!                                   forged votes and appends
+//!        [--halts]                  one op halts every node that applies it
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -44,6 +45,7 @@ const Args = struct {
     wipes: bool = false,
     membership: bool = false,
     byzantine: bool = false,
+    halts: bool = false,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -60,7 +62,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] " ++
             "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -87,6 +89,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.membership = true;
         } else if (std.mem.eql(u8, arg, "--byzantine")) {
             args.byzantine = true;
+        } else if (std.mem.eql(u8, arg, "--halts")) {
+            args.halts = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
             var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
             while (it.next()) |n| {
@@ -145,6 +149,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.memberships(seed)
     else if (args.byzantine)
         Scenario.outsider(seed)
+    else if (args.halts)
+        Scenario.halting(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
@@ -170,6 +176,9 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     defer sim.deinit();
 
     const s = try sim.run();
+    if (scenario.halt_op != 0) {
+        if (sim.halt) |h| std.debug.print("[vopr] halted at index {d} (term {d}) on every core node\n", .{ h.index, h.term }) else std.debug.print("[vopr] the halting op never committed\n", .{});
+    }
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
             "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d}\n",
@@ -210,12 +219,13 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 if (args.small_ring) " --small-ring" else "",
                 if (args.wipes) " --wipes" else "",
                 if (args.membership) " --membership" else "",
                 if (args.byzantine) " --byzantine" else "",
+                if (args.halts) " --halts" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
@@ -248,6 +258,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.wipes) try argv.append(allocator, "--wipes");
     if (args.membership) try argv.append(allocator, "--membership");
     if (args.byzantine) try argv.append(allocator, "--byzantine");
+    if (args.halts) try argv.append(allocator, "--halts");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -452,8 +463,8 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 

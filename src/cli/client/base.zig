@@ -76,6 +76,7 @@ pub const Response = struct {
             .overloaded => "Server overloaded",
             .rate_limited => "Rate limit exceeded",
             .unavailable => "Unavailable",
+            .outcome_pending => "Committed; applies when its shard resumes — do not resend",
             _ => "Unknown error",
         };
     }
