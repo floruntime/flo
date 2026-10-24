@@ -35,7 +35,13 @@ export function KV() {
   const [touchOpen, setTouchOpen] = useState(false)
   const [delOpen, setDelOpen] = useState(false)
 
-  const keysQ = useKVKeys(ns, search)
+  // The prefix is asked of the server: once typing pauses, not per keystroke.
+  const [prefix, setPrefix] = useState('')
+  useEffect(() => {
+    const t = setTimeout(() => setPrefix(search), 250)
+    return () => clearTimeout(t)
+  }, [search])
+  const keysQ = useKVKeys(ns, prefix)
   const keys = keysQ.data?.pages.flatMap((p) => p.keys) ?? []
   // A refresh that fails keeps the keys last loaded, marked stale.
   const stale = keysQ.isError && keysQ.data !== undefined
@@ -114,13 +120,15 @@ export function KV() {
           </div>
         ) : keys.length === 0 ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '44px 20px' }}>
-            {keysQ.isLoading ? 'Loading…' : <>No keys{search ? <> start with “{search}”</> : <> in <span className="mono">{ns}</span></>}</>}
+            {keysQ.isLoading ? 'Loading…' : <>No keys{prefix ? <> start with “{prefix}”</> : <> in <span className="mono">{ns}</span></>}</>}
           </div>
         ) : (
           <div className="list" style={{ minWidth: 0 }}>
             {stale && (
               <div className="li" style={{ color: 'var(--crit)', fontSize: 12 }}>
-                Stale: couldn’t refresh ({keysQ.error?.message}). Showing the keys last loaded.
+                {keysQ.isFetchNextPageError
+                  ? <>Couldn’t load more ({keysQ.error?.message}).</>
+                  : <>Stale: couldn’t refresh ({keysQ.error?.message}). Showing the keys last loaded.</>}
               </div>
             )}
             <div className="li head" style={{ gridTemplateColumns: '1fr 72px 60px 30px' }}>

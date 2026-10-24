@@ -203,3 +203,36 @@ test "e2e/dashboard: a kv key's value carries its expiry, and its history marks 
     defer ov.deinit();
     try testing.expectEqual(@as(usize, 1), ov.value.object.get("versions").?.array.items.len);
 }
+
+test "e2e/dashboard: a kv key prefix is read percent-encoded, as the console sends it" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
+    });
+    defer ctx.deinit();
+    for ([_][]const u8{ "user:1", "user:2", "user 3", "other" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    for ([_]struct { path: []const u8, keys: []const []const u8 }{
+        .{ .path = "/api/v1/kv/namespaces/default/keys?prefix=user%3A", .keys = &.{ "user:1", "user:2" } },
+        .{ .path = "/api/v1/kv/namespaces/default/keys?prefix=user%203", .keys = &.{"user 3"} },
+        .{ .path = "/api/v1/kv/namespaces/default/keys?prefix=user", .keys = &.{ "user 3", "user:1", "user:2" } },
+    }) |c| {
+        var page = try getPage(http, c.path);
+        defer freePage(&page);
+        var got: std.ArrayList([]const u8) = .empty;
+        defer got.deinit(testing.allocator);
+        for (page.keys.items) |k| try got.append(testing.allocator, k.key);
+        std.mem.sort([]const u8, got.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        try testing.expectEqual(c.keys.len, got.items.len);
+        for (c.keys, got.items) |want, have| try testing.expectEqualStrings(want, have);
+    }
+
+    var nul = try http.get("/api/v1/kv/namespaces/default/keys?prefix=user%00");
+    defer nul.deinit();
+    try testing.expectEqualStrings("{\"error\":\"prefix must not hold a NUL\"}", nul.bodyTrimmed());
+}

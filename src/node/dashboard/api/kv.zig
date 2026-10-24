@@ -80,7 +80,14 @@ const MAX_PAGE: u32 = kv_ops.MAX_MGET;
 /// Read as a client over loopback (`kv.scan`, then `kv.mget` for sizes and
 /// versions): the projections are their shards' alone to read.
 pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const prefix = h.parseQueryParam([]const u8, query_string, "prefix") orelse "";
+    // The console sends the prefix percent-encoded; a NUL in it would spell
+    // another namespace's keys, as in a key.
+    var prefix_buf: [@import("../../../protocol/ops.zig").MAX_KEY]u8 = undefined;
+    const prefix = if (h.parseQueryParam([]const u8, query_string, "prefix")) |raw|
+        h.percentDecode(&prefix_buf, raw) orelse return try h.jsonError(allocator, "prefix must be a percent-encoded key prefix")
+    else
+        "";
+    if (std.mem.indexOfScalar(u8, prefix, 0) != null) return try h.jsonError(allocator, "prefix must not hold a NUL");
     const limit: u32 = @min(h.parseQueryParam(u32, query_string, "limit") orelse 100, MAX_PAGE);
     var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
     const cursor: []const u8 = if (h.parseQueryParam([]const u8, query_string, "cursor")) |hex|
@@ -262,8 +269,13 @@ pub const Reader = struct {
     deadline_ms: i64,
 
     pub fn open(allocator: Allocator, ctx: *DashboardContext) !Reader {
-        const left = serve.responseMsLeft() orelse LOOPBACK_READ_TIMEOUT_MS + WRITE_ROOM_MS;
-        return openUntil(allocator, ctx, nowMs() + left - WRITE_ROOM_MS);
+        return openUntil(allocator, ctx, deadlineFor(nowMs(), serve.responseMsLeft()));
+    }
+
+    /// The reads' deadline, given what is left of the response's (none
+    /// outside a handler): that, less room to write.
+    fn deadlineFor(now_ms: i64, response_left_ms: ?i64) i64 {
+        return now_ms + (response_left_ms orelse LOOPBACK_READ_TIMEOUT_MS + WRITE_ROOM_MS) - WRITE_ROOM_MS;
     }
 
     fn openUntil(allocator: Allocator, ctx: *DashboardContext, deadline_ms: i64) !Reader {
@@ -278,6 +290,8 @@ pub const Reader = struct {
     pub fn call(self: *Reader, comptime op: @import("../../../protocol/ops.zig").Op, namespace: []const u8, key: []const u8, body: op.request.Value) !client_mod.Response {
         const left = self.deadline_ms - nowMs();
         if (left <= 0) return error.OutOfTime;
+        // Per read(), and an answer may take several: a slow one can run
+        // past what is left. On loopback that is a small overrun at most.
         self.client.setReadTimeoutMs(@intCast(@min(left, LOOPBACK_READ_TIMEOUT_MS)));
         return self.client.call(op, namespace, key, body);
     }
@@ -481,7 +495,20 @@ test "Reader: a request whose time is spent reads nothing, and says it timed out
     ctx.listen_port = 1; // nothing listens here: a connect would be refused
 
     try std.testing.expectError(error.OutOfTime, Reader.openUntil(allocator, &ctx, Reader.nowMs()));
+    // Opened in time, a read once the deadline has passed is refused
+    // before any timeout is set.
+    var late: Reader = .{ .client = client_mod.Client.init(allocator, "127.0.0.1:1"), .deadline_ms = Reader.nowMs() - 1 };
+    defer late.deinit();
+    try std.testing.expectError(error.OutOfTime, late.call(kv_ops.op("kv.get"), "default", "k", .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }));
     const answer = try readFailed(allocator, "KV scan", error.OutOfTime);
     defer allocator.free(answer);
     try std.testing.expectEqualStrings("{\"error\":\"KV scan: the node didn't answer in time\"}", answer);
+}
+
+test "Reader: the reads' deadline is the response's, less room to write" {
+    try std.testing.expectEqual(@as(i64, 1000 + 5000 - WRITE_ROOM_MS), Reader.deadlineFor(1000, 5000));
+    // Spent: at or before now, so opening refuses.
+    try std.testing.expect(Reader.deadlineFor(1000, 0) <= 1000);
+    // Outside a handler, one loopback read's worth.
+    try std.testing.expectEqual(@as(i64, 1000 + LOOPBACK_READ_TIMEOUT_MS), Reader.deadlineFor(1000, null));
 }
