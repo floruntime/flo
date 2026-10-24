@@ -320,5 +320,5 @@ pub fn workerInfo(
     namespace: []const u8,
     worker_id: []const u8,
 ) !Response {
-    return client.sendRequest(.worker_info, namespace, worker_id, "");
+    return client.call(worker_ops.op("worker.info"), namespace, worker_id, .{});
 }
