@@ -491,3 +491,83 @@ test "e2e/worker: a worker silent past remove_after_ms is removed" {
     try testing.expectEqual(@as(u8, 0), listed.exit_code);
     try testing.expectEqualStrings("(no workers)", std.mem.trim(u8, listed.stdout, &std.ascii.whitespace));
 }
+
+// =============================================================================
+// Registration limits
+// =============================================================================
+
+const proto = @import("src").protocol.proto;
+
+/// Sends one worker_register for `id` with `value` and returns its refusal's
+/// status and reason, with the message copied into `msg`.
+fn registerRefusal(ctx: *stdx.testing.TestContext, id: []const u8, value: []const u8, msg: []u8) !struct { status: u16, reason: proto.Reason, message: []const u8 } {
+    const a = testing.allocator;
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.worker_register, 9), .namespace = "default", .key = id, .value = value, .options = "" };
+    const buf = try a.alloc(u8, req.wireSize());
+    defer a.free(buf);
+    const bytes = try req.serialize(buf);
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = std.c.write(fd, bytes[sent..].ptr, bytes.len - sent);
+        if (rc <= 0) return error.ShortWrite;
+        sent += @intCast(rc);
+    }
+    var out: [4096]u8 = undefined;
+    var got: usize = 0;
+    for (0..300) |_| {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
+        if (proto.Response.parse(out[0..got])) |resp| {
+            const refusal = try resp.refused();
+            @memcpy(msg[0..refusal.message.len], refusal.message);
+            return .{ .status = resp.header.status, .reason = refusal.reason, .message = msg[0..refusal.message.len] };
+        } else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.NoResponse;
+}
+
+test "e2e/worker: a registration past a limit is refused with that limit's reason" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const a = testing.allocator;
+    const max_key = 4096; // a qualified key's longest: the longest process name
+
+    var w: std.Io.Writer.Allocating = .init(a);
+    defer w.deinit();
+    const Case = struct { processes: usize, name_len: usize, machine_id_len: usize = 0, reason: proto.Reason, why: []const u8 };
+    for ([_]Case{
+        .{ .processes = 1025, .name_len = 0, .reason = .out_of_range, .why = "more than 1024 processes" },
+        .{ .processes = 1, .name_len = max_key + 1, .reason = .field_too_long, .why = std.fmt.comptimePrint("process name longer than {d} bytes", .{max_key}) },
+        // Each name fits; together they pass what worker.info can answer.
+        .{ .processes = 47, .name_len = max_key, .reason = .field_too_long, .why = "processes too long to list together" },
+        .{ .processes = 0, .name_len = 0, .machine_id_len = 256, .reason = .field_too_long, .why = "machine id longer than 255 bytes" },
+    }) |c| {
+        w.clearRetainingCapacity();
+        const out = &w.writer;
+        try out.writeAll(&.{ 0, 4, 0, 0, 0 });
+        try out.writeInt(u16, @intCast(c.processes), .little);
+        for (0..c.processes) |_| {
+            try out.writeInt(u16, @intCast(c.name_len), .little);
+            try out.splatByteAll('p', c.name_len);
+            try out.writeByte(0);
+        }
+        try out.writeByte(0); // no metadata
+        if (c.machine_id_len > 0) {
+            try out.writeByte(1);
+            try out.writeInt(u16, @intCast(c.machine_id_len), .little);
+            try out.splatByteAll('m', c.machine_id_len);
+        } else try out.writeByte(0);
+
+        var msg: [512]u8 = undefined;
+        const r = try registerRefusal(ctx, "limit-w", w.written(), &msg);
+        try testing.expectEqual(@as(u16, @backingInt(proto.StatusCode.bad_request)), r.status);
+        try testing.expectEqual(c.reason, r.reason);
+        try testing.expectEqualStrings(c.why, r.message);
+    }
+    var info = try ctx.cli.run(&.{ "worker", "info", "limit-w" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 1), info.exit_code);
+}
