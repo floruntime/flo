@@ -11,15 +11,6 @@ const checksum_hw = @import("checksum_hw.zig");
 /// - Sufficient for detecting data corruption (bit flips, torn writes)
 /// - Much faster than cryptographic hashes for integrity checking
 pub fn checksum(data: []const u8) u32 {
-    if (@inComptime()) {
-        // For comptime, use a simple hash (CRC32 not available at comptime)
-        if (data.len == 0) return 0;
-        var hash: u32 = 0xFFFFFFFF;
-        for (data) |byte| {
-            hash = hash ^ (@as(u32, byte) << @as(u5, @intCast(hash & 0x1F)));
-        }
-        return hash ^ 0xFFFFFFFF;
-    }
     var stream = ChecksumStream.init();
     stream.add(data);
     return stream.checksum();
