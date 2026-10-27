@@ -70,6 +70,34 @@ jobs:
       - name: Build
         run: zig build
 
+      # The build gzips each dashboard asset into <asset>.<hash of its
+      # bytes>.gz. Every copy must be its source's, including after a source
+      # changes under an older mtime, as a checkout can leave it.
+      - name: Dashboard copies match their sources
+        run: |
+          check() {
+            n=0
+            for gz in $(find src/node/dashboard/dist -name '*.gz'); do
+              src=${gz%.*.gz}
+              gunzip -c "$gz" | cmp -s - "$src" || { echo "::error::$gz is not a copy of $src"; exit 1; }
+              n=$((n+1))
+            done
+            [ "$n" -gt 0 ] || { echo "::error::no compressed dashboard assets"; exit 1; }
+          }
+          check
+          printf '<!-- changed -->\n' >> src/node/dashboard/dist/index.html
+          touch -t 200001010000 src/node/dashboard/dist/index.html
+          zig build
+          check
+          [ "$(find src/node/dashboard/dist -name 'index.html.*.gz' | wc -l)" -eq 1 ] || { echo "::error::the old index.html copy was kept"; exit 1; }
+          # A killed build's half-written copy is neither embedded nor kept.
+          stray=src/node/dashboard/dist/index.html.0123456789abcdef.gz.tmp
+          echo partial > "$stray"
+          zig build
+          [ ! -e "$stray" ] || { echo "::error::a stray .gz.tmp was kept"; exit 1; }
+          ! grep -q 'gz\.tmp' src/node/dashboard/assets.zig || { echo "::error::a .gz.tmp was embedded"; exit 1; }
+          check
+
       # Nothing else compiles the benches; this keeps them building.
       - name: Build the benches
         run: zig build bench

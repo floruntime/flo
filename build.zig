@@ -552,6 +552,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     ) catch unreachable;
 
     var entries: std.ArrayListUnmanaged([]const u8) = .empty;
+    var kept_gz: std.ArrayListUnmanaged([]const u8) = .empty;
     var asset_idx: usize = 0;
     var precompressed: usize = 0;
 
@@ -572,15 +573,27 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
     };
     defer dist_dir.close(io);
 
-    var walker = dist_dir.walk(b.allocator) catch unreachable;
-    defer walker.deinit();
+    // The assets are listed in full before any copy is written: writing into
+    // dist while walking it could hand the walk its own new files.
+    var asset_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    {
+        var walker = dist_dir.walk(b.allocator) catch unreachable;
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            // Source maps, and gzipped copies (a killed build's .tmp too).
+            if (std.mem.endsWith(u8, entry.path, ".map")) continue;
+            if (std.mem.endsWith(u8, entry.path, ".gz") or std.mem.endsWith(u8, entry.path, ".gz.tmp")) continue;
+            asset_paths.append(b.allocator, b.dupe(entry.path)) catch unreachable;
+        }
+    }
+    std.mem.sort([]const u8, asset_paths.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
 
-    while (walker.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        const file_path = entry.path;
-        // Skip source maps and previously-generated .gz files
-        if (std.mem.endsWith(u8, file_path, ".map")) continue;
-        if (std.mem.endsWith(u8, file_path, ".gz")) continue;
+    for (asset_paths.items) |file_path| {
         const mime = getMimeType(file_path);
         const var_name = b.fmt("asset_{d}", .{asset_idx});
         const compressible = isCompressible(file_path);
@@ -588,12 +601,12 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         writer.print("const {s} = @embedFile(\"dist/{s}\");\n", .{ var_name, file_path }) catch unreachable;
         var is_precompressed: u8 = 0;
         if (compressible) {
-            // Embed a gzipped copy too, for clients that accept gzip. Without
-            // gzip only the raw bytes go in; release.yml refuses a binary whose
-            // assets have no compressed copy.
-            const gz_path = b.fmt("{s}.gz", .{file_path});
-            if (gzipFile(b, dist_dir, file_path, gz_path)) {
+            // Embed a gzipped copy too, for clients that accept gzip. If it
+            // can't be made only the raw bytes go in; release.yml refuses a
+            // binary whose assets have no compressed copy.
+            if (gzipFile(b, dist_dir, file_path)) |gz_path| {
                 writer.print("const {s}_gz = @embedFile(\"dist/{s}\");\n", .{ var_name, gz_path }) catch unreachable;
+                kept_gz.append(b.allocator, gz_path) catch unreachable;
                 is_precompressed = 1;
                 precompressed += 1;
             }
@@ -603,6 +616,7 @@ fn generateDashboardAssetsModule(b: *std.Build) *std.Build.Module {
         entries.append(b.allocator, entry_line) catch unreachable;
         asset_idx += 1;
     }
+    deleteStaleGz(b, dist_dir, kept_gz.items);
 
     // get() function with if-else chain (Zig has no string switch)
     writer.writeAll(
@@ -714,31 +728,67 @@ fn isCompressible(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".json");
 }
 
-fn gzipFile(b: *std.Build, dir: std.Io.Dir, src_path: []const u8, dest_path: []const u8) bool {
+/// The gzipped copy of `src_path`, made in-process and named by a hash of
+/// the source bytes: `<asset>.<hash>.gz`. A copy that exists is the copy of
+/// exactly these bytes, whatever the files' mtimes say after a checkout, so
+/// it is reused; otherwise it is written. The header has no name or mtime,
+/// so a commit always gives the same binary. Null, with a warning, if it
+/// can't be made.
+fn gzipFile(b: *std.Build, dir: std.Io.Dir, src_path: []const u8) ?[]const u8 {
     const io = b.graph.io;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path_len = dir.realPath(io, &path_buf) catch |err| {
+    const data = dir.readFileAlloc(io, src_path, b.allocator, .unlimited) catch |err| {
         std.debug.print("Warning: dashboard asset {s} embedded uncompressed: {t}\n", .{ src_path, err });
-        return false;
+        return null;
     };
-    const dir_path = path_buf[0..dir_path_len];
-    const src = b.fmt("{s}/{s}", .{ dir_path, src_path });
-    const dest = b.fmt("{s}/{s}", .{ dir_path, dest_path });
+    // The seed names the compressor and its level: changing either makes
+    // every name new.
+    const gz_path = b.fmt("{s}.{x:0>16}.gz", .{ src_path, std.hash.Wyhash.hash(0x67_7a_62_65_73_74, data) });
+    if (dir.access(io, gz_path, .{})) |_| return gz_path else |_| {}
 
-    const result = std.process.run(b.allocator, io, .{
-        // -n leaves the name and mtime out of the header, so a commit
-        // always gives the same binary. The paths go in as arguments, never
-        // into the command text.
-        .argv = &.{ "sh", "-c", "gzip -9 -n -c \"$1\" > \"$2\" || { rm -f \"$2\"; exit 1; }", "sh", src, dest },
-    }) catch |err| {
+    var out: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(b.allocator, data.len / 2 + 64) catch @panic("out of memory");
+    const window = b.allocator.alloc(u8, std.compress.flate.max_window_len) catch @panic("out of memory");
+    var c = std.compress.flate.Compress.init(&out.writer, window, .gzip, .best) catch |err| {
         std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {t}\n", .{ src_path, err });
-        return false;
+        return null;
     };
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {s}\n", .{ src_path, std.mem.trim(u8, result.stderr, &std.ascii.whitespace) });
-        return false;
+    c.writer.writeAll(data) catch |err| {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {t}\n", .{ src_path, err });
+        return null;
+    };
+    c.finish() catch |err| {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: gzip: {t}\n", .{ src_path, err });
+        return null;
+    };
+    // Written under a temporary name and renamed, so a killed build never
+    // leaves a truncated copy under the real one.
+    const tmp_path = b.fmt("{s}.tmp", .{gz_path});
+    dir.writeFile(io, .{ .sub_path = tmp_path, .data = out.written() }) catch |err| {
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: {t}\n", .{ src_path, err });
+        return null;
+    };
+    dir.rename(tmp_path, dir, gz_path, io) catch |err| {
+        dir.deleteFile(io, tmp_path) catch {};
+        std.debug.print("Warning: dashboard asset {s} embedded uncompressed: {t}\n", .{ src_path, err });
+        return null;
+    };
+    return gz_path;
+}
+
+/// Remove the .gz files no asset uses any more: copies of older sources, and
+/// any left by the earlier `<asset>.gz` naming.
+fn deleteStaleGz(b: *std.Build, dir: std.Io.Dir, kept: []const []const u8) void {
+    const io = b.graph.io;
+    var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+    var walker = dir.walk(b.allocator) catch return;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".gz") and !std.mem.endsWith(u8, entry.path, ".gz.tmp")) continue;
+        for (kept) |k| {
+            if (std.mem.eql(u8, k, entry.path)) break;
+        } else stale.append(b.allocator, b.dupe(entry.path)) catch return;
     }
-    return true;
+    for (stale.items) |path| dir.deleteFile(io, path) catch {};
 }
 
 /// `-Dversion`, or else `git describe` without the leading `v`. A build
