@@ -267,6 +267,58 @@ test "e2e/http/worker: GET /workers pages every shard's workers once, in id orde
     try testing.expect(pages >= 2);
 }
 
+/// `s` percent-encoded as encodeURIComponent does it: all but A-Z a-z 0-9 - _ . ! ~ * ' ( ).
+fn encodeComponent(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-_.!~*'()", c) != null) {
+            buf[n] = c;
+            n += 1;
+        } else {
+            _ = std.fmt.bufPrint(buf[n..][0..3], "%{X:0>2}", .{c}) catch unreachable;
+            n += 3;
+        }
+    }
+    return buf[0..n];
+}
+
+test "e2e/http/worker: GET /workers pages through ids that need percent-encoding, and caps the limit at a page" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
+    });
+    defer ctx.deinit();
+    // In id order. Each is a cursor in turn, sent encoded as the console sends it.
+    const ids = [_][]const u8{ "w a", "w%ird", "w&x=1", "w+/y" };
+    for (ids) |id| try ctx.exec(&.{ "worker", "register", id, "process" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var path_buf: [256]u8 = undefined;
+    var enc_buf: [64]u8 = undefined;
+    var path: []const u8 = "/api/v1/workers?limit=1";
+    for (ids, 0..) |want, i| {
+        var resp = try http.get(path);
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.bodyTrimmed(), .{});
+        defer parsed.deinit();
+        const workers = parsed.value.object.get("workers").?.array.items;
+        try testing.expectEqual(@as(usize, 1), workers.len);
+        try testing.expectEqualStrings(want, workers[0].object.get("worker_id").?.string);
+        const more = i + 1 < ids.len;
+        try testing.expectEqual(more, parsed.value.object.get("has_more").?.bool);
+        if (!more) break;
+        path = try std.fmt.bufPrint(&path_buf, "/api/v1/workers?limit=1&cursor={s}", .{encodeComponent(&enc_buf, want)});
+    }
+
+    // A limit past a page's worth is a page's worth, not a refusal.
+    var capped = try http.get("/api/v1/workers?limit=5000");
+    defer capped.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, capped.bodyTrimmed(), .{});
+    defer parsed.deinit();
+    try testing.expectEqual(ids.len, parsed.value.object.get("workers").?.array.items.len);
+}
+
 test "e2e/http/worker: GET /workers/:id returns worker detail" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },

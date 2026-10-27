@@ -40,7 +40,8 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
         h.percentDecode(&cursor_buf, raw) orelse return try h.jsonError(allocator, "cursor must be the id a page gave")
     else
         "";
-    // An id holding a NUL would spell another namespace's worker.
+    // Registration refuses an id holding a NUL, so such a cursor came from
+    // no page and names no worker: say so rather than list from it.
     if (std.mem.indexOfScalar(u8, cursor, 0) != null) return try h.jsonError(allocator, "cursor must not hold a NUL");
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "worker list", err);
