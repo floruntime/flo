@@ -132,15 +132,26 @@ jobs:
         # three times the slowest test measured locally (unit: a VOPR swarm,
         # 10-20 s; e2e: list paging and the namespace limit, 40-70 s), so a
         # slower runner doesn't flake.
+        #
+        # `skips` is how many tests skip on Linux. A test that skips passes
+        # silently, so a count off by one fails the step: update it, and the
+        # list here, only for a skip you meant.
         include:
           - step: test-unit
             test_timeout: 90s
+            skips: 0
           - step: test-integration
             test_timeout: 60s
+            skips: 0
           - step: test-e2e
             test_timeout: 300s
-            # The halt tests drive a fault only a test build carries.
+            # The halt tests drive a fault only a test build carries; without
+            # it they skip, and the count catches it.
             flags: -Dtest-faults=true
+            # Skips: "e2e/stream: consumer group pending state persists
+            # across restart", until a group made by a group read survives
+            # a restart.
+            skips: 1
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -158,7 +169,15 @@ jobs:
           STEP: ${{ matrix.step }}
           TEST_TIMEOUT: ${{ matrix.test_timeout }}
           FLAGS: ${{ matrix.flags }}
-        run: zig build "$STEP" --test-timeout "$TEST_TIMEOUT" $FLAGS
+          SKIPS: ${{ matrix.skips }}
+        run: |
+          set -o pipefail
+          zig build "$STEP" --test-timeout "$TEST_TIMEOUT" $FLAGS --summary all 2>&1 | tee build.log
+          summary=$(grep '^Build Summary:' build.log | tail -1)
+          skipped=$(echo "$summary" | sed -n -E 's/.*[(, ]([0-9]+) skipped.*/\1/p')
+          if [ "${skipped:-0}" != "$SKIPS" ]; then
+            echo "::error::${skipped:-0} tests skipped, expected $SKIPS ($summary)"; exit 1
+          fi
         timeout-minutes: 30
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
@@ -180,6 +199,12 @@ jobs:
           path: src/node/dashboard/dist
       - name: Build (ReleaseSafe)
         run: zig build -Drelease
+      - name: The binary carries no test faults
+        # A -Dtest-faults build halts a shard on a kv set of this key.
+        run: |
+          if grep -qa 'flo-test-fault-halt' zig-out/bin/flo; then
+            echo "::error::a build without -Dtest-faults carries the test faults"; exit 1
+          fi
       - name: Release allocator
         # main roots every allocation in libc's allocator outside Debug; a
         # toolchain bump must not quietly swap in Zig's slower default.
