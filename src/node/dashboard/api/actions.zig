@@ -13,7 +13,7 @@ const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../../../worker/handler.zig").WorkerHandler;
-const workers = @import("worker.zig");
+const WorkerRecord = @import("../../../worker/handler.zig").WorkerRecord;
 const client_mod = @import("../../../cli/client/mod.zig");
 
 // ── Helpers ──
@@ -45,12 +45,58 @@ fn runOf(run: *const ActionsHandler.RunRecord, namespace: []const u8, name: []co
     return std.mem.eql(u8, run.action_name_owned, name) and std.mem.eql(u8, run.namespace_owned, namespace);
 }
 
-fn workerOf(w: *const @import("../../../worker/handler.zig").WorkerRecord, namespace: []const u8, name: []const u8) bool {
+fn workerOf(w: *const WorkerRecord, namespace: []const u8, name: []const u8) bool {
     if (!std.mem.eql(u8, w.namespace_owned, namespace)) return false;
     for (w.processes.items) |p| {
         if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) return true;
     }
     return false;
+}
+
+/// A worker as action detail embeds it.
+fn writeWorkerJson(writer: anytype, w: *const WorkerRecord) !void {
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("worker_id", w.id_owned);
+    try obj.stringField("status", @tagName(w.status));
+    try obj.stringField("worker_type", if (w.worker_type == .action) "action" else "stream");
+    try obj.stringField("namespace", w.namespace_owned);
+    if (w.machine_id_owned) |mid| {
+        try obj.stringField("machine_id", mid);
+    } else {
+        try obj.nullField("machine_id");
+    }
+    try obj.intField("current_load", @as(i64, @intCast(w.current_load)));
+    try obj.intField("max_concurrent", @as(i64, @intCast(w.max_concurrency)));
+    try obj.intField("tasks_completed", @as(i64, @intCast(w.tasks_completed)));
+    try obj.intField("tasks_failed", @as(i64, @intCast(w.tasks_failed)));
+    try obj.intField("last_seen", w.last_heartbeat_ms);
+    try obj.intField("registered_at", w.registered_at_ms);
+    if (w.metadata_owned) |meta| {
+        try obj.stringField("metadata", meta);
+    } else {
+        try obj.nullField("metadata");
+    }
+
+    // Processes array
+    {
+        var parr = try obj.arrayField("processes");
+        try parr.begin();
+        for (w.processes.items) |p| {
+            try parr.next();
+            var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try pobj.begin();
+            try pobj.stringField("name", p.name_owned);
+            try pobj.stringField("kind", if (p.kind == .action) "action" else "stream_consumer");
+            try pobj.intField("run_count", @as(i64, @intCast(p.run_count)));
+            try pobj.intField("fail_count", @as(i64, @intCast(p.fail_count)));
+            try pobj.intField("last_run_at", p.last_run_at_ms);
+            try pobj.end();
+        }
+        try parr.end();
+    }
+
+    try obj.end();
 }
 
 const LatencyStats = struct { count: u64 = 0, avg_ms: i64 = 0, p99_ms: i64 = 0 };
@@ -368,7 +414,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
                         for (w.processes.items) |p| {
                             if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) {
                                 try workers_arr.next();
-                                try workers.writeWorkerJson(writer, w);
+                                try writeWorkerJson(writer, w);
                                 break;
                             }
                         }
