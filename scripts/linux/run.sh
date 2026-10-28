@@ -15,18 +15,22 @@
 #     blocks the io_uring syscalls and flo cannot start without them.
 #   * The Zig cache lives in a named volume so Linux artifacts never collide
 #     with the host's macOS .zig-cache.
-#   * -Dcpu=baseline+crc is needed on aarch64: checksum_hw.zig emits a crc
-#     instruction that the aarch64 baseline target does not enable.
+#   * -Dcpu=baseline+crc on aarch64 builds for the release CPU floor (ARMv8
+#     with CRC), so log and peer checksums take the hardware path.
+#   * The Zig version is build.zig.zon's minimum_zig_version, and the image
+#     is tagged with it, so a toolchain bump builds a new image.
 set -euo pipefail
 
-IMAGE=flo-linux:0.17.0
+ZIG_VERSION=$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build.zig.zon")
+[ -n "$ZIG_VERSION" ] || { echo "run.sh: no minimum_zig_version in build.zig.zon" >&2; exit 1; }
+IMAGE=flo-linux:$ZIG_VERSION
 VOLUME=flo-zigcache
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARCH="$(uname -m)"; [ "$ARCH" = "arm64" ] && ARCH=aarch64
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "==> building $IMAGE"
-  docker build --build-arg ZIG_ARCH="$ARCH" -t "$IMAGE" "$REPO_ROOT/scripts/linux"
+  docker build --build-arg ZIG_ARCH="$ARCH" --build-arg ZIG_VERSION="$ZIG_VERSION" -t "$IMAGE" "$REPO_ROOT/scripts/linux"
 fi
 if ! docker volume inspect "$VOLUME" >/dev/null 2>&1; then
   docker volume create "$VOLUME" >/dev/null
@@ -38,10 +42,14 @@ CPU_ARG=()
 
 case "${1:-build}" in
   shell) shift; CMD=(bash "$@") ;;
-  *)     CMD=(zig build "$@" "${CPU_ARG[@]}") ;;
+  *)     CMD=(zig build "$@" ${CPU_ARG[@]+"${CPU_ARG[@]}"}) ;;
 esac
 
-exec docker run --rm -it \
+# A terminal only when there is one: agents and CI run this without a TTY.
+TTY=()
+[ -t 0 ] && [ -t 1 ] && TTY=(-it)
+
+exec docker run --rm ${TTY[@]+"${TTY[@]}"} \
   --security-opt seccomp=unconfined \
   --user "$(id -u):$(id -g)" \
   -v "$REPO_ROOT:/w" -v "$VOLUME:/zigcache" -w /w \
