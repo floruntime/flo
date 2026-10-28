@@ -149,8 +149,8 @@ jobs:
             # it they skip, and the count catches it.
             flags: -Dtest-faults=true
             # Skips: "e2e/stream: consumer group pending state persists
-            # across restart", until a group made by a group read survives
-            # a restart.
+            # across restart", until the bug "A consumer group created by a
+            # group read is lost on restart" is fixed.
             skips: 1
     steps:
       - uses: actions/checkout@v4

@@ -3150,10 +3150,8 @@ test "e2e/cluster: leader retains all stream records across a hot-ring wrap" {
         .durability = .sync,
         .tiered_log = .{ .hot_buffer_capacity = 2 * 1024 * 1024, .max_hot_entries = 10 },
     }) catch |err| {
-        // Multi-process cluster bring-up can be flaky under heavy CI load
-        // (ports / formation timing). Skip rather than false-fail.
-        std.debug.print("cluster init failed ({s}); skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        std.debug.print("the three-node cluster did not form: {s}\n", .{@errorName(err)});
+        return err;
     };
     defer cluster.deinit();
 
@@ -3214,8 +3212,8 @@ test "e2e/cluster: follower serves each stream record exactly once (no replicati
         .node_count = 3,
         .durability = .sync,
     }) catch |err| {
-        std.debug.print("cluster init failed ({s}); skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        std.debug.print("the three-node cluster did not form: {s}\n", .{@errorName(err)});
+        return err;
     };
     defer cluster.deinit();
 
