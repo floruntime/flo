@@ -1,4 +1,5 @@
-# Linux build/test environment for flo, matching the Zig version in CI.
+# Linux build/test environment for flo. run.sh passes ZIG_VERSION from
+# build.zig.zon; the default is only for a bare `docker build`.
 #
 # Exists because macOS never compiles flo's Linux-only code paths (io_uring
 # reactor, /proc host stats), so that breakage is invisible on a Mac.
