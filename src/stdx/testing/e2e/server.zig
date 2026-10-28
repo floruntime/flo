@@ -144,6 +144,9 @@ pub const ServerProcess = struct {
     /// is expected; any other signal death is not.
     sent_term: bool = false,
     sent_kill: bool = false,
+    /// A test awaited this run's crash (`awaitCrash`), so its signal death
+    /// is expected.
+    crash_awaited: bool = false,
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
     started: bool,
@@ -292,6 +295,7 @@ pub const ServerProcess = struct {
         self.exit_status = null;
         self.sent_term = false;
         self.sent_kill = false;
+        self.crash_awaited = false;
         self.dump_log_on_failure = true;
 
         return self;
@@ -414,8 +418,10 @@ pub const ServerProcess = struct {
         if (self.config.raft_port > 0) {
             self.raft_port = self.config.raft_port;
         } else if (self.config.join_addresses != null or self.config.cluster_enabled) {
-            // Cluster mode: allocate a separate free port for Raft
-            self.raft_port = try findFreePort();
+            // Cluster mode: a separate free port for Raft, kept across a
+            // restart as a node's configured port is: its peers dial the
+            // address they know.
+            if (self.raft_port == 0) self.raft_port = try findFreePort();
         }
 
         // Build argv dynamically
@@ -488,6 +494,7 @@ pub const ServerProcess = struct {
         self.exit_status = null;
         self.sent_term = false;
         self.sent_kill = false;
+        self.crash_awaited = false;
         self.log_stop.store(false, .release);
         self.log_thread = try std.Thread.spawn(.{}, logServerOutput, .{ log_file, stdout_fd, stderr_fd, &self.log_stop });
         log_file_handed_off = true; // Thread now owns the fd
@@ -563,6 +570,23 @@ pub const ServerProcess = struct {
         self.watchdog = null;
     }
 
+    /// Wait up to `timeout_ms` for the server to die of a signal, as a test
+    /// that makes it crash expects; returns the signal. A clean exit, or
+    /// none in time, is an error.
+    pub fn awaitCrash(self: *Self, timeout_ms: u64) !u8 {
+        const pid = (self.process orelse return error.NotRunning).id;
+        const start_ms = stdx.time.milliTimestamp();
+        while (!self.tryReap(pid)) {
+            if (stdx.time.milliTimestamp() - start_ms > @as(i64, @intCast(timeout_ms))) return error.ServerDidNotCrash;
+            stdx.time.sleep(20 * std.time.ns_per_ms);
+        }
+        const raw: u32 = @bitCast(self.exit_status.?);
+        const sig: u8 = @intCast(raw & 0x7f);
+        if (sig == 0 or sig == 0x7f) return error.ServerDidNotCrash;
+        self.crash_awaited = true;
+        return sig;
+    }
+
     /// Collect the child if it has exited, keeping its status.
     fn tryReap(self: *Self, pid: std.c.pid_t) bool {
         if (self.reaped) return true;
@@ -583,6 +607,7 @@ pub const ServerProcess = struct {
     /// didn't send is called out, since the OOM killer is the usual sender.
     pub fn abnormalExit(self: *const Self, buf: []u8) ?[]const u8 {
         const raw: u32 = @bitCast(self.exit_status orelse return null);
+        if (self.crash_awaited) return null;
         const low = raw & 0x7f;
         if (low == 0) {
             const code = (raw >> 8) & 0xff;
