@@ -319,30 +319,36 @@ test "e2e/http/worker: GET /workers pages through ids that need percent-encoding
     try testing.expectEqual(ids.len, parsed.value.object.get("workers").?.array.items.len);
 }
 
-test "e2e/http/worker: GET /workers/:id returns worker detail" {
+test "e2e/http/worker: GET /workers/:id returns the worker, what it runs, and its counts" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .dashboard_enabled = true },
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
     });
     defer ctx.deinit();
-
-    // Register a worker via CLI
     try ctx.exec(&.{ "worker", "register", "http-detail-w1", "analyze" });
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-
     var resp = try http.get("/api/v1/workers/http-detail-w1");
     defer resp.deinit();
-
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.isJson());
-    try testing.expect(resp.bodyContains("http-detail-w1"));
-    try testing.expect(resp.bodyContains("\"worker_type\""));
-    try testing.expect(resp.bodyContains("\"current_load\""));
-    try testing.expect(resp.bodyContains("\"processes\""));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.bodyTrimmed(), .{});
+    defer parsed.deinit();
+    const w = parsed.value.object;
+    try testing.expectEqualStrings("http-detail-w1", w.get("worker_id").?.string);
+    try testing.expectEqualStrings("default", w.get("namespace").?.string);
+    try testing.expectEqualStrings("action", w.get("worker_type").?.string);
+    try testing.expectEqualStrings("active", w.get("status").?.string);
+    try testing.expectEqual(@as(i64, 0), w.get("current_load").?.integer);
+    try testing.expectEqual(@as(i64, 0), w.get("tasks_completed").?.integer);
+    try testing.expect(w.get("registered_at").?.integer > 0);
+    const processes = w.get("processes").?.array.items;
+    try testing.expectEqual(@as(usize, 1), processes.len);
+    try testing.expectEqualStrings("analyze", processes[0].object.get("name").?.string);
+    try testing.expectEqualStrings("action", processes[0].object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 0), processes[0].object.get("run_count").?.integer);
 }
 
-test "e2e/http/worker: GET /workers/:id not found" {
+test "e2e/http/worker: GET /workers/:id of no worker says so" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
@@ -350,14 +356,62 @@ test "e2e/http/worker: GET /workers/:id not found" {
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-
     var resp = try http.get("/api/v1/workers/nonexistent-worker-xyz");
     defer resp.deinit();
-
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.isJson());
-    // Should contain error message
-    try testing.expect(resp.bodyContains("not found") or resp.bodyContains("error") or resp.bodyContains("Worker not found"));
+    try testing.expectEqualStrings("{\"error\":\"Worker not found\"}", resp.bodyTrimmed());
+}
+
+test "e2e/http/worker: GET /workers/:id opens ids that need percent-encoding" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
+    });
+    defer ctx.deinit();
+    const ids = [_][]const u8{ "w a", "w%ird", "w&x=1", "w+/y" };
+    for (ids) |id| try ctx.exec(&.{ "worker", "register", id, "process" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var path_buf: [256]u8 = undefined;
+    var enc_buf: [64]u8 = undefined;
+    for (ids) |id| {
+        const path = try std.fmt.bufPrint(&path_buf, "/api/v1/workers/{s}", .{encodeComponent(&enc_buf, id)});
+        var resp = try http.get(path);
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.bodyTrimmed(), .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(id, parsed.value.object.get("worker_id").?.string);
+    }
+
+    // In "default" keys are bare, so "b\x00w" would be namespace b's worker w.
+    try ctx.exec(&.{ "worker", "register", "w", "process", "-n", "b" });
+    var nul = try http.get("/api/v1/workers/b%00w");
+    defer nul.deinit();
+    try testing.expectEqual(@as(u16, 404), nul.status);
+}
+
+test "e2e/http/worker: GET /workers/:id finds a worker only in its own namespace" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "worker", "register", "ns-only", "process", "-n", "other" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var missing = try http.get("/api/v1/workers/ns-only");
+    defer missing.deinit();
+    try testing.expectEqual(@as(u16, 200), missing.status);
+    try testing.expectEqualStrings("{\"error\":\"Worker not found\"}", missing.bodyTrimmed());
+
+    var found = try http.get("/api/v1/workers/ns-only?namespace=other");
+    defer found.deinit();
+    try testing.expectEqual(@as(u16, 200), found.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, found.bodyTrimmed(), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ns-only", parsed.value.object.get("worker_id").?.string);
+    try testing.expectEqualStrings("other", parsed.value.object.get("namespace").?.string);
 }
 
 // =============================================================================

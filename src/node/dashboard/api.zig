@@ -163,7 +163,11 @@ pub fn handleRequest(
     }
     if (std.mem.startsWith(u8, path, "workers/")) {
         try only(method, &.{.GET});
-        const worker_id = path["workers/".len..];
+        // The console sends the id encodeURIComponent'd.
+        var decode_buf: [4096]u8 = undefined;
+        const worker_id = helpers.percentDecode(&decode_buf, path["workers/".len..]) orelse return error.NotFound;
+        // A NUL would spell another namespace's worker, so it names none.
+        if (std.mem.indexOfScalar(u8, worker_id, 0) != null) return error.NotFound;
         return workers.getWorkerDetail(allocator, worker_id, query_string, ctx);
     }
 
@@ -484,6 +488,20 @@ test "route workers" {
     const result = try handleRequest(allocator, .GET, "workers", null, "", &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"worker list failed: "));
+}
+
+test "route worker detail: the id is decoded, and one holding a NUL names no worker" {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: a read is refused
+
+    const result = try handleRequest(allocator, .GET, "workers/a%26b", null, "", &ctx);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"worker info failed: "));
+
+    try std.testing.expectError(error.NotFound, handleRequest(allocator, .GET, "workers/b%00w", null, "", &ctx));
 }
 
 test "route stream detail" {
