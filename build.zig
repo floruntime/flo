@@ -36,6 +36,10 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", getGitVersion(b));
     build_options.addOption(bool, "require_hw_crc", b.option(bool, "require-hw-crc", "Fail unless the target CPU has a CRC32C instruction (release builds set this)") orelse false);
+    // Faults e2e drives to reach states no valid request can (a halted
+    // shard). Off unless asked for, so no release or image carries them.
+    const test_faults = b.option(bool, "test-faults", "Compile in the faults e2e tests drive; never for a release") orelse false;
+    build_options.addOption(bool, "test_faults", test_faults);
 
     // ── Dashboard Assets ──
     // Generate assets.zig by scanning src/node/dashboard/dist at configure time.

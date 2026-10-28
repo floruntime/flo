@@ -48,6 +48,9 @@ pub fn Replica(comptime Io: type) type {
         /// applied, or its own data is damaged: its projections cannot be
         /// trusted, so it takes no part until it is wiped and rejoined.
         diverged: bool,
+        /// Why, for `/status`: where the leader's log disagreed.
+        diverged_reason_buf: [160]u8 = undefined,
+        diverged_reason_len: u8 = 0,
         conflicts_seen: u64 = 0,
         /// Last line about a replica speaking out of turn.
         replica_frame_warn_ms: u64 = 0,
@@ -476,8 +479,16 @@ pub fn Replica(comptime Io: type) type {
         pub fn markDiverged(self: *Self, leader: u32, term: u64) void {
             if (self.diverged) return;
             self.diverged = true;
-            log.err("shard {d}: node {d} (term {d}) disagrees with history this node committed and applied; this node's data can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member> (not --cluster): it rejoins with no log and votes only once it has caught up and a quorum has confirmed the term", .{ self.id, leader, term });
+            const at = self.raftNode().conflict_index;
+            const why = std.fmt.bufPrint(&self.diverged_reason_buf, "node {d} (term {d}) disagrees with history this node committed and applied, at index {d}", .{ leader, term, at }) catch self.diverged_reason_buf[0..0];
+            self.diverged_reason_len = @intCast(why.len);
+            log.err("shard {d}: node {d} (term {d}) disagrees with history this node committed and applied, at index {d}; this node's data can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member> (not --cluster): it rejoins with no log and votes only once it has caught up and a quorum has confirmed the term", .{ self.id, leader, term, at });
             self.stopTakingPart(DIVERGED_MESSAGE);
+        }
+
+        /// Why the leader's log made this node diverged; null when it didn't.
+        pub fn divergedReason(self: *const Self) ?[]const u8 {
+            return if (self.diverged_reason_len == 0) null else self.diverged_reason_buf[0..self.diverged_reason_len];
         }
 
         /// The Raft clock: elections, check-quorum, the leader loop, and a

@@ -223,6 +223,11 @@ pub const StatusCode = enum(u8) {
     /// The write reached no leader, or its leader changed before it
     /// committed; the message says whether it may still apply.
     unavailable = 12,
+    /// The write committed but has not applied: its shard halted at it or
+    /// before it. The message says which: one past the halt applies when
+    /// the shard resumes; the one it halted at a repair skips. Resending it
+    /// unchanged would write it twice, or halt again.
+    outcome_pending = 13,
     _,
 };
 
@@ -546,6 +551,14 @@ pub const RequestHeader = extern struct {
 };
 
 /// Response header (32 bytes, matches request header structure)
+/// Response flag: the answer reads state a halted shard holds, from just
+/// before the entry it halted at, and nothing written since.
+pub const RESPONSE_STALE: u8 = 0x01;
+
+/// Set while a halted shard answers a read on this thread: every answer
+/// built meanwhile carries `RESPONSE_STALE`.
+pub threadlocal var answering_stale: bool = false;
+
 pub const ResponseHeader = extern struct {
     magic: u32, // 0-3 (4 bytes)
     data_len: u32, // 4-7 (4 bytes)
@@ -553,7 +566,7 @@ pub const ResponseHeader = extern struct {
     crc32: u32, // 16-19 (4 bytes)
     version: u8, // 20 (1 byte)
     status: u8, // 21 (1 byte)
-    flags: u8, // 22 (1 byte)
+    flags: u8, // 22 (1 byte) - RESPONSE_STALE
     _pad: u8, // 23 (1 byte) - structural padding
     table_hash: u64, // 24-31 (8 bytes) - the server's TABLE_HASH
 
@@ -989,7 +1002,7 @@ pub const Response = struct {
                 .magic = MAGIC,
                 .version = VERSION,
                 .status = @backingInt(status),
-                .flags = 0,
+                .flags = if (answering_stale) RESPONSE_STALE else 0,
                 ._pad = 0,
                 .table_hash = TABLE_HASH,
                 .data_len = @intCast(data.len),
@@ -1013,7 +1026,7 @@ pub const Response = struct {
 /// may follow a write that reached the log, so only they are `unknown`.
 pub fn ranOf(status: StatusCode) Ran {
     return switch (status) {
-        .unavailable, .internal_error => .unknown,
+        .unavailable, .internal_error, .outcome_pending => .unknown,
         else => .no,
     };
 }
@@ -1235,7 +1248,7 @@ test "Response.serializeRefusal: every refusal carries its reason and ran, and a
 test "ranOf: only a status that can follow a write in the log is unknown" {
     inline for (@typeInfo(StatusCode).@"enum".field_values) |value| {
         const status: StatusCode = @fromBackingInt(@intCast(value));
-        const want: Ran = if (status == .unavailable or status == .internal_error) .unknown else .no;
+        const want: Ran = if (status == .unavailable or status == .internal_error or status == .outcome_pending) .unknown else .no;
         try std.testing.expectEqual(want, ranOf(status));
     }
 }

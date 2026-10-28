@@ -81,6 +81,8 @@ pub const ClusterConfig = struct {
     /// Pre-test cooldown: wait for TCP TIME_WAIT sockets to clear
     /// Helps when running tests repeatedly - set to 0 to skip
     pre_test_cooldown_ms: u64 = 2000,
+    /// Serve each node's metrics port, for its `/status`.
+    metrics_enabled: bool = false,
 };
 
 /// Multi-node cluster context for e2e testing
@@ -128,6 +130,7 @@ pub const ClusterContext = struct {
             .tiered_log = config.tiered_log,
             .log_level = config.log_level,
             .cluster_enabled = true, // Seed node needs Raft listener
+            .metrics_enabled = config.metrics_enabled,
         });
         // Covers every node created so far. A per-iteration `errdefer` in the
         // join loop below would only fire for its own iteration, leaking the
@@ -151,6 +154,7 @@ pub const ClusterContext = struct {
                 .tiered_log = config.tiered_log,
                 .log_level = config.log_level,
                 .join_addresses = seed_endpoint,
+                .metrics_enabled = config.metrics_enabled,
             });
             startServerWithRetry(self.servers[i].?) catch |err| {
                 std.debug.print("[cluster] Node {d} of {d} failed to start: {}\n", .{ i, config.node_count, err });

@@ -1868,7 +1868,7 @@ pub const StreamHandler = struct {
             return self.stream.trimStream(name_hash, trim_id) > 0;
         };
         _ = self.proposeTrim(shardFromPtr(sptr), "", name_hash, bound) catch |err| {
-            log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
+            if (!shardFromPtr(sptr).quietHalted(err)) log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
             return false;
         };
         return true;

@@ -76,6 +76,9 @@ pub const Reason = enum(u16) {
     worker_unhealthy = 27,
     /// The worker is draining and takes no new work.
     worker_draining = 28,
+    /// The shard halted at an entry every replica fails the same way; it
+    /// takes no writes until the entry is repaired.
+    shard_halted = 29,
 };
 
 /// Whether a refused request took effect.

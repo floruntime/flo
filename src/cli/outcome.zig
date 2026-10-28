@@ -1,9 +1,12 @@
-//! How a command ends. Every failure is one of five outcomes, each with its
+//! How a command ends. Every failure is one of six outcomes, each with its
 //! own exit code, so a script can tell "absent" from "fix your command" from
-//! "refused" from "retry" from "can't reach":
+//! "refused" from "retry" from "can't reach" from "wait":
 //!
-//!   0 ok · 1 not found · 2 usage · 3 refused · 4 retryable · 5 transport
-//!   (or a cut-off answer, or the CLI out of memory)
+//!   0 ok · 1 not found · 2 usage · 3 refused (also by a halted shard) ·
+//!   4 retryable · 5 transport
+//!   (or a cut-off answer, or the CLI out of memory) · 6 pending (the write
+//!   committed, not applied: it applies on resume, or a repair skips it, as
+//!   the message says; never resend it unchanged)
 //!
 //! Commands report through these helpers rather than printing and choosing
 //! an error themselves.
@@ -35,6 +38,7 @@ pub fn exitCode(result: Error!void) u8 {
         => 2,
         error.Refused => 3,
         error.Retryable => 4,
+        error.Pending => 6,
         // The CLI couldn't finish for a reason outside the command and the
         // server's answer, like a lost connection.
         error.Transport, error.OutOfMemory => 5,
@@ -47,6 +51,7 @@ pub fn ofStatus(status: proto.StatusCode) Error {
     return switch (status) {
         .not_found => error.NotFound,
         .overloaded, .rate_limited, .unavailable => error.Retryable,
+        .outcome_pending => error.Pending,
         .ok,
         .error_generic,
         .bad_request,
@@ -84,6 +89,9 @@ pub fn refusal(ctx: *Context, status: proto.StatusCode, reason: proto.Reason, me
     } else {
         ctx.printErr("Error: " ++ prefix ++ "{s}{s} [{s}/{s}]\n", args ++ .{ bug, message, statusName(status), @tagName(reason) });
     }
+    // A halted shard refuses every write until an operator repairs it:
+    // retrying never helps.
+    if (status == .unavailable and reason == .shard_halted) return error.Refused;
     return ofStatus(status);
 }
 
@@ -359,6 +367,12 @@ test "outcome: each status has its exit code" {
     inline for (.{ .overloaded, .rate_limited, .unavailable }) |s|
         try std.testing.expectEqual(@as(u8, 4), exitCode(ofStatus(s)));
     try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(@fromBackingInt(@intCast(200)))));
+    try std.testing.expectEqual(@as(u8, 6), exitCode(ofStatus(.outcome_pending)));
+    // A halted shard's refusal is final; its pending write still waits.
+    var q = try QuietContext.init(std.testing.allocator);
+    defer q.deinit();
+    try std.testing.expectEqual(@as(u8, 3), exitCode(refusal(&q.ctx, .unavailable, .shard_halted, "halted", "", .{})));
+    try std.testing.expectEqual(@as(u8, 6), exitCode(refusal(&q.ctx, .outcome_pending, .shard_halted, "halted", "", .{})));
     try std.testing.expectEqual(@as(u8, 0), exitCode({}));
     try std.testing.expectEqual(@as(u8, 2), exitCode(error.UnknownFlag));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.Transport));
