@@ -4,7 +4,8 @@ set -e
 # The binary needs hardware CRC32C: x86-64-v2, or ARMv8 with CRC. Below that
 # it stops with an illegal instruction, so refuse here, before anything is
 # unpacked; on an upgrade the installed version stays. The same check, with
-# the same flag lists, is in scripts/install.sh (CI compares them). Only this
+# the same flag lists, is in scripts/install.sh and the Homebrew formula
+# (scripts/check-cpu-floor.sh compares them). Only this
 # arch's line is read: under emulation cpuinfo describes the host.
 case "$(uname -m)" in
     x86_64)  CPU_KEY="flags";    NEEDED="cx16 lahf_lm pni popcnt sse4_1 sse4_2 ssse3" ;;
