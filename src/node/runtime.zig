@@ -184,13 +184,77 @@ pub fn lockExistingDataDir(data_dir: []const u8) !stdx.fs.File {
 fn lockMade(data_dir: []const u8) !stdx.fs.File {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME });
-    return stdx.fs.createFile(path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+    const file = stdx.fs.createFile(path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
         error.WouldBlock => {
             log.err("data dir {s} is in use by another flo server ({s} is locked); stop that server, or give this one another --data-dir", .{ data_dir, LOCK_FILENAME });
             return error.DataDirInUse;
         },
         else => return err,
     };
+    if (otherProcessCanLock(path)) {
+        var fs_buf: [64]u8 = undefined;
+        log.warn("data dir {s} is on a filesystem ({s}) that doesn't enforce flock between processes: nothing stops a second flo server on it, and two servers on one data dir lose data. Put the data dir on a local filesystem (for Docker on a Mac, a named volume, not a bind mount)", .{ data_dir, filesystemOf(data_dir, &fs_buf) orelse "unknown" });
+    }
+    return file;
+}
+
+/// Whether another process can take the exclusive lock this one holds on
+/// `path`, i.e. whether the filesystem ignores flock (Docker Desktop's Mac
+/// bind mounts do). The probe is a forked child, not a second fd here: NFS
+/// emulates flock with per-process POSIX locks, which a second fd in the same
+/// process would take. The child only opens, tries LOCK_NB and exits, so it
+/// can't block or outlive the check.
+fn otherProcessCanLock(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+
+    const pid = std.c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        const fd = std.c.open(&buf, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        std.c._exit(if (fd >= 0 and std.c.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB) == 0) 0 else 1);
+    }
+    var status: c_int = 0;
+    while (std.c.waitpid(pid, &status, 0) < 0) {
+        if (std.c._errno().* != @backingInt(std.c.E.INTR)) return false;
+    }
+    return std.c.W.IFEXITED(@bitCast(status)) and std.c.W.EXITSTATUS(@bitCast(status)) == 0;
+}
+
+/// The type of the filesystem `dir` is on ("ext4", "nfs4", "fakeowner"), from the longest matching mount
+/// point in /proc/self/mountinfo. Null off Linux or when it can't be read.
+fn filesystemOf(dir: []const u8, out: []u8) ?[]const u8 {
+    if (@import("builtin").os.tag != .linux) return null;
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = stdx.fs.cwd().realPathFile(stdx.io.instance(), dir, &real_buf) catch return null;
+    const real = real_buf[0..real_len];
+    var buf: [64 * 1024]u8 = undefined;
+    const text = stdx.fs.readFile("/proc/self/mountinfo", &buf) catch return null;
+    var best_len: usize = 0;
+    var best: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        // "id parent maj:min root mount-point options... - fstype source ..."
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        for (0..4) |_| _ = fields.next() orelse break;
+        const mount_point = fields.next() orelse continue;
+        const sep = std.mem.indexOf(u8, line, " - ") orelse continue;
+        var after = std.mem.tokenizeScalar(u8, line[sep + 3 ..], ' ');
+        const fstype = after.next() orelse continue;
+        // Mount points with spaces are escaped (\040); those never match.
+        const under = std.mem.eql(u8, mount_point, "/") or (std.mem.startsWith(u8, real, mount_point) and
+            (real.len == mount_point.len or real[mount_point.len] == '/'));
+        if (under and mount_point.len >= best_len) {
+            best_len = mount_point.len;
+            best = fstype;
+        }
+    }
+    const fstype = best orelse return null;
+    const n = @min(fstype.len, out.len);
+    @memcpy(out[0..n], fstype[0..n]);
+    return out[0..n];
 }
 
 pub const Runtime = struct {
@@ -1543,4 +1607,19 @@ test "runtime: a data dir is locked by one holder at a time, and freed when it l
     try std.testing.expectError(error.DataDirInUse, lockDataDir(dir));
     stdx.fs.closeFile(first);
     stdx.fs.closeFile(try lockDataDir(dir));
+}
+
+test "runtime: the lock probe sees a lock another process holds, and a free one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, LOCK_FILENAME });
+    defer std.testing.allocator.free(path);
+
+    const held = try lockDataDir(dir);
+    try std.testing.expect(!otherProcessCanLock(path));
+    stdx.fs.closeFile(held);
+    // Unheld, the child takes it: what a filesystem that ignores flock looks like.
+    try std.testing.expect(otherProcessCanLock(path));
 }
