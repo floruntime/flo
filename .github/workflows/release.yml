@@ -106,6 +106,13 @@ jobs:
             echo "::error::flo -V printed '$GOT', expected 'flo $VERSION'"; exit 1
           fi
 
+      - name: The binary carries no test faults
+        # A -Dtest-faults build halts a shard on a kv set of this key.
+        run: |
+          if grep -qa 'flo-test-fault-halt' zig-out/bin/flo; then
+            echo "::error::the release binary carries the test faults"; exit 1
+          fi
+
       - name: Package
         env:
           ARTIFACT: flo-${{ matrix.arch }}-${{ matrix.platform }}
