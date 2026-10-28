@@ -210,8 +210,8 @@ pub const WorkerHandler = struct {
 
         switch (op) {
             .worker_register => {
-                if (shard.worker_handler.handleRegister(req)) |why| {
-                    shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+                if (shard.worker_handler.handleRegister(req)) |refused| {
+                    shard.sendRefusal(conn, req.header.request_id, .bad_request, .{ .reason = refused.reason, .ran = .no, .message = refused.why });
                 } else {
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 }
@@ -255,22 +255,26 @@ pub const WorkerHandler = struct {
     /// defaults; one cut inside a field, a flag other than 0 or 1, or bytes
     /// past the end is refused, never read around.
     /// Why the worker was not registered, or null.
-    fn handleRegister(self: *WorkerHandler, req: Request) ?[]const u8 {
-        if (req.key.len == 0) return "worker id is required";
+    fn handleRegister(self: *WorkerHandler, req: Request) ?Refused {
+        if (req.key.len == 0) return .{ .why = "worker id is required" };
         var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = workerKey(&kbuf, req.namespace, req.key) orelse return "worker id too long, or holds a NUL";
-        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return "worker limit reached";
+        const key = workerKey(&kbuf, req.namespace, req.key) orelse return .{ .why = "worker id too long, or holds a NUL" };
+        if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return .{ .why = "worker limit reached" };
 
-        var reg = switch (parseRegistration(self.allocator, req.value) catch return "worker not registered: out of memory") {
-            .refused => |why| return why,
+        var reg = switch (parseRegistration(self.allocator, req.value) catch return .{ .why = "worker not registered: out of memory" }) {
+            .refused => |refused| return refused,
             .ok => |r| r,
         };
         self.storeRegistration(key, req, &reg) catch {
             reg.deinit(self.allocator);
-            return "worker not registered: out of memory";
+            return .{ .why = "worker not registered: out of memory" };
         };
         return null;
     }
+
+    /// Why a registration was refused. A limit names its reason, so a
+    /// client can tell which it hit without reading the message.
+    const Refused = struct { reason: proto.Reason = .unclassified, why: []const u8 };
 
     const Registration = struct {
         worker_type: WorkerType = .action,
@@ -286,7 +290,7 @@ pub const WorkerHandler = struct {
         }
     };
 
-    const Parsed = union(enum) { ok: Registration, refused: []const u8 };
+    const Parsed = union(enum) { ok: Registration, refused: Refused };
 
     fn parseRegistration(allocator: Allocator, value: []const u8) Allocator.Error!Parsed {
         var r: Reader = .{ .bytes = value };
@@ -295,7 +299,13 @@ pub const WorkerHandler = struct {
         const refuse = struct {
             fn f(a: Allocator, g: *Registration, why: []const u8) Parsed {
                 g.deinit(a);
-                return .{ .refused = why };
+                return .{ .refused = .{ .why = why } };
+            }
+        }.f;
+        const pastLimit = struct {
+            fn f(a: Allocator, g: *Registration, reason: proto.Reason, why: []const u8) Parsed {
+                g.deinit(a);
+                return .{ .refused = .{ .reason = reason, .why = why } };
             }
         }.f;
 
@@ -308,15 +318,15 @@ pub const WorkerHandler = struct {
         if (r.done()) return .{ .ok = reg };
         const count = r.int(u16) orelse return refuse(allocator, &reg, "registration cut short in the process count");
         // worker.info answers with every process, so they must fit its bounds.
-        if (count > worker_ops.MAX_PROCESSES) return refuse(allocator, &reg, std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}));
+        if (count > worker_ops.MAX_PROCESSES) return pastLimit(allocator, &reg, .out_of_range, std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}));
         var process_bytes: usize = 0;
         for (0..count) |_| {
             const name = r.prefixed() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind_byte = r.byte() orelse return refuse(allocator, &reg, "registration cut short in its process list");
             const kind = std.enums.fromInt(ProcessKind, kind_byte) orelse return refuse(allocator, &reg, "unknown process kind");
             process_bytes += worker_ops.ProcessRow.encodedSize(.{ .name = name, .kind = @fromBackingInt(kind_byte), .run_count = 0, .fail_count = 0, .last_run_at_ms = 0 }) catch
-                return refuse(allocator, &reg, std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}));
-            if (process_bytes > worker_ops.Processes.byte_bound.?) return refuse(allocator, &reg, "processes too long to list together");
+                return pastLimit(allocator, &reg, .field_too_long, std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}));
+            if (process_bytes > worker_ops.Processes.byte_bound.?) return pastLimit(allocator, &reg, .field_too_long, "processes too long to list together");
             const owned = try allocator.dupe(u8, name);
             reg.processes.append(allocator, .{ .name_owned = owned, .kind = kind }) catch |err| {
                 allocator.free(owned);
@@ -337,7 +347,7 @@ pub const WorkerHandler = struct {
         };
         // worker.list answers with it, so it must fit the list's bound.
         if (reg.machine_id) |m| if (m.len > worker_ops.MAX_MACHINE_ID)
-            return refuse(allocator, &reg, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
+            return pastLimit(allocator, &reg, .field_too_long, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
 
         if (!r.done()) return refuse(allocator, &reg, "registration has bytes past its end");
         return .{ .ok = reg };
@@ -711,6 +721,14 @@ pub fn mergePages(allocator: Allocator, buf: []u8, limit: u32, bodies: []const [
     return .{ .workers = out.value(), .cursor = if (more) rows.items[out.count - 1].id else null };
 }
 
+/// `req` is refused with `reason` and `why`: a limit's reason is what lets
+/// a client tell it apart without its message.
+fn expectRefusedAs(h: *WorkerHandler, req: Request, reason: proto.Reason, why: []const u8) !void {
+    const refused = h.handleRegister(req) orelse return error.NotRefused;
+    try std.testing.expectEqual(reason, refused.reason);
+    try std.testing.expectEqualStrings(why, refused.why);
+}
+
 fn testRequest(namespace: []const u8, id: []const u8) Request {
     const header = proto.RequestHeader.init(.worker_register, 0);
     return .{ .header = header, .namespace = namespace, .key = id, .value = "", .options = "" };
@@ -734,12 +752,14 @@ test "workers: an unknown worker type or process kind is refused, and nothing is
 
     var bad_type = testRequest("", "w1");
     bad_type.value = &.{2};
-    try std.testing.expectEqualStrings("unknown worker type", h.handleRegister(bad_type).?);
+    try std.testing.expectEqualStrings("unknown worker type", h.handleRegister(bad_type).?.why);
 
     // [type][max_concurrency:u32][count:u16]([len:u16][name][kind])* — the second kind is unknown.
     var bad_kind = testRequest("", "w2");
     bad_kind.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 'b', 0xee };
-    try std.testing.expectEqualStrings("unknown process kind", h.handleRegister(bad_kind).?);
+    try std.testing.expectEqualStrings("unknown process kind", h.handleRegister(bad_kind).?.why);
+    // Not a limit: no reason of its own yet.
+    try std.testing.expectEqual(proto.Reason.unclassified, h.handleRegister(bad_kind).?.reason);
     try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 }
 
@@ -753,7 +773,7 @@ test "workers: a machine id longer than worker.list's bound is refused" {
     @memset(value[11..], 'm');
     var req = testRequest("", "w");
     req.value = &value;
-    try std.testing.expect(h.handleRegister(req) != null);
+    try expectRefusedAs(&h, req, .field_too_long, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
     req.value = value[0 .. value.len - 1];
     std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID, .little);
     try std.testing.expect(h.handleRegister(req) == null);
@@ -817,14 +837,14 @@ test "workers: a registration whose processes worker.info couldn't list is refus
     var req = testRequest("", "w");
 
     req.value = processesValue(buf, worker_ops.MAX_PROCESSES + 1, 1, &.{});
-    try std.testing.expectEqualStrings(std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}), h.handleRegister(req).?);
+    try expectRefusedAs(&h, req, .out_of_range, std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}));
 
     req.value = processesValue(buf, 1, @intCast(@import("../protocol/ops.zig").MAX_KEY + 1), &.{});
-    try std.testing.expectEqualStrings(std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}), h.handleRegister(req).?);
+    try expectRefusedAs(&h, req, .field_too_long, std.fmt.comptimePrint("process name longer than {d} bytes", .{@import("../protocol/ops.zig").MAX_KEY}));
 
     // Every name fits, but together they pass what an answer holds.
     req.value = processesValue(buf, worker_ops.MAX_PROCESSES, 200, &.{});
-    try std.testing.expectEqualStrings("processes too long to list together", h.handleRegister(req).?);
+    try expectRefusedAs(&h, req, .field_too_long, "processes too long to list together");
     try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 
     // At the bounds, it registers and lists.
@@ -869,7 +889,7 @@ test "workers: processes landing exactly on worker.info's bound register and lis
         var req = testRequest("", &id);
         req.value = w.written();
         if (over == 1) {
-            try std.testing.expectEqualStrings("processes too long to list together", h.handleRegister(req).?);
+            try expectRefusedAs(&h, req, .field_too_long, "processes too long to list together");
             continue;
         }
         try std.testing.expect(h.handleRegister(req) == null);
@@ -922,8 +942,8 @@ const ListShards = struct {
     }
 
     fn add(self: *ListShards, shard: usize, namespace: []const u8, id: []const u8) !void {
-        if (self.registries[shard].handleRegister(testRequest(namespace, id))) |why| {
-            std.debug.print("{s}\n", .{why});
+        if (self.registries[shard].handleRegister(testRequest(namespace, id))) |refused| {
+            std.debug.print("{s}\n", .{refused.why});
             return error.Refused;
         }
     }
@@ -1135,7 +1155,7 @@ test "workers: a registration cut inside a field, with a bad flag, or with bytes
     }) |c| {
         var req = testRequest("", "w");
         req.value = c.value;
-        try std.testing.expectEqualStrings(c.why, h.handleRegister(req).?);
+        try std.testing.expectEqualStrings(c.why, h.handleRegister(req).?.why);
     }
     try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 
@@ -1165,8 +1185,8 @@ test "workers: a re-registration short of memory at any point keeps the old one 
             if (h.handleRegister(first)) |_| return error.OutOfMemory;
             var again = testRequest("", "w");
             again.value = &.{ 0, 9, 0, 0, 0, 1, 0, 1, 0, 'b', 0, 1, 2, 0, '{', '}', 1, 1, 0, 'h' };
-            if (h.handleRegister(again)) |why| {
-                try std.testing.expectEqualStrings("worker not registered: out of memory", why);
+            if (h.handleRegister(again)) |refused| {
+                try std.testing.expectEqualStrings("worker not registered: out of memory", refused.why);
                 // The old registration is still there, untouched.
                 const w = h.find("", "w").?;
                 try std.testing.expectEqual(@as(u32, 1), w.max_concurrency);
