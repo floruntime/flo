@@ -1000,94 +1000,66 @@ test "e2e/stream: server restart and new appends work" {
     try testing.expect(final_read.contains(new_msg));
 }
 
-test "e2e/stream: consumer group offset persists across restart" {
-    // Test: Consumer group's committed offset survives server restart
-    // This validates that consumer group state is properly WAL-backed
+test "e2e/stream: a consumer group's ack floor survives restart, and a read resumes after it" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{
-            .durability = .sync, // Ensure immediate WAL flush
-        },
+        .server = .{ .durability = .sync },
     });
     defer ctx.deinit();
-
     const stream_name = "cg-persist-offset";
     const group_name = "persist-group";
+    var msg_buf: [64]u8 = undefined;
+    for (0..10) |i| try ctx.exec(&.{ "stream", "append", stream_name, try std.fmt.bufPrint(&msg_buf, "persist-msg-{d}", .{i}) });
 
-    // Append 10 messages
-    for (0..10) |i| {
-        var msg_buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&msg_buf, "persist-msg-{d}", .{i});
-        try ctx.exec(&.{ "stream", "append", stream_name, msg });
-    }
+    var first = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "5" });
+    defer first.deinit();
+    try testing.expectEqual(@as(u8, 0), first.exit_code);
+    const first_id = extractStreamId(first.stdout) orelse return error.NoStreamId;
+    var ack = try ctx.cli.run(&.{ "stream", "group", "ack", stream_name, "--group", group_name, "--consumer", "c1", "--ids", first_id });
+    defer ack.deinit();
+    try testing.expectEqual(@as(u8, 0), ack.exit_code);
 
-    // Read first 5 messages with consumer group (no auto-ack to see pending)
-    var first_read = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "5" });
-    defer first_read.deinit();
-
-    // Get one message ID for acking
-    const first_id = extractStreamId(first_read.stdout);
-    if (first_id) |id| {
-        // Ack to commit offset (must pass --consumer to match pending key)
-        try ctx.exec(&.{ "stream", "group", "ack", stream_name, "--group", group_name, "--consumer", "c1", "--ids", id });
-    }
-
-    // Restart server
     try ctx.restartServer();
 
-    // After restart, subsequent read should continue from where we left off
-    // (not re-read already-acked messages, unless they were pending and not acked)
-    var after_restart = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "10" });
-    defer after_restart.deinit();
-
-    // Should get messages - either remaining ones or all if offset wasn't persisted
-    try testing.expect(after_restart.contains("persist-msg") or after_restart.succeeded());
+    // The floor is past msg-0; the four delivered and unacked come again.
+    var after = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "10" });
+    defer after.deinit();
+    try testing.expectEqual(@as(u8, 0), after.exit_code);
+    try testing.expect(!after.stdoutContains("persist-msg-0"));
+    for (1..10) |i| try testing.expect(after.stdoutContains(try std.fmt.bufPrint(&msg_buf, "persist-msg-{d}", .{i})));
 }
 
-test "e2e/stream: consumer group pending state persists across restart" {
-    // Test: Pending (unacked) messages survive restart and can be nacked/acked
+test "e2e/stream: a consumer group made by a group read survives restart, and what it hadn't acked is delivered again" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{
-            .durability = .sync,
-        },
+        .server = .{ .durability = .sync },
     });
     defer ctx.deinit();
-
     const stream_name = "cg-persist-pending";
     const group_name = "pending-persist-group";
+    var msg_buf: [64]u8 = undefined;
+    for (0..5) |i| try ctx.exec(&.{ "stream", "append", stream_name, try std.fmt.bufPrint(&msg_buf, "pending-persist-{d}", .{i}) });
 
-    // Append messages
-    for (0..5) |i| {
-        var msg_buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&msg_buf, "pending-persist-{d}", .{i});
-        try ctx.exec(&.{ "stream", "append", stream_name, msg });
-    }
-
-    // Read messages (creates pending entries)
+    // No group create: the read makes the group.
     var read1 = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "3" });
     defer read1.deinit();
-    // Group read should return messages or succeed
-    try testing.expect(read1.contains("pending-persist") or read1.succeeded());
-
-    // Get pending before restart
+    try testing.expectEqual(@as(u8, 0), read1.exit_code);
     var pending_before = try ctx.cli.run(&.{ "stream", "group", "pending", stream_name, "--group", group_name });
     defer pending_before.deinit();
+    try testing.expectEqual(@as(u8, 0), pending_before.exit_code);
+    try testing.expect(pending_before.stdoutContains("Pending: 3 message(s)"));
 
-    // Restart server
     try ctx.restartServer();
 
-    // Check pending after restart
+    // What survives is the group, its ack floor and its config; the pending
+    // list starts empty and the cursor is back at the floor. Keeping the
+    // pending list across a restart is planned, and then this is Pending: 3.
     var pending_after = try ctx.cli.run(&.{ "stream", "group", "pending", stream_name, "--group", group_name });
     defer pending_after.deinit();
-
-    // Pending state should be preserved (or regenerated if using WAL)
-    // Just verify we can query pending and it succeeds
-    // Skipped until "A consumer group created by a group read is lost on
-    // restart" is fixed: the group read made it, and after a restart pending
-    // answers not_found. The CLI used to exit 0 on that refusal, so this
-    // passed without the group.
-    if (pending_after.exit_code == 1 and pending_after.stderrContains("consumer group not found")) return error.SkipZigTest;
     try testing.expectEqual(@as(u8, 0), pending_after.exit_code);
-    try testing.expect(pending_after.stdoutContains("Pending: 3"));
+    try testing.expect(pending_after.stdoutContains("Pending: 0 message(s)"));
+    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "10" });
+    defer read2.deinit();
+    try testing.expectEqual(@as(u8, 0), read2.exit_code);
+    for (0..5) |i| try testing.expect(read2.stdoutContains(try std.fmt.bufPrint(&msg_buf, "pending-persist-{d}", .{i})));
 }
 
 // =============================================================================

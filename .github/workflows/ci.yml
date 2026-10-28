@@ -148,10 +148,7 @@ jobs:
             # The halt tests drive a fault only a test build carries; without
             # it they skip, and the count catches it.
             flags: -Dtest-faults=true
-            # Skips: "e2e/stream: consumer group pending state persists
-            # across restart", until the bug "A consumer group created by a
-            # group read is lost on restart" is fixed.
-            skips: 1
+            skips: 0
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
