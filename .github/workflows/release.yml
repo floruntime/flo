@@ -270,6 +270,8 @@ jobs:
           TAG: ${{ steps.tag.outputs.TAG }}
         run: |
           python3 scripts/homebrew-bump.py homebrew-tap/Formula/flo.rb "$TAG" artifacts
+          # The formula checks the CPU floor too; its lists must match flo's.
+          scripts/check-cpu-floor.sh homebrew-tap/Formula/flo.rb
           cd homebrew-tap
           if git diff --quiet; then
             echo "Formula already at $TAG."

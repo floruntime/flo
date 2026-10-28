@@ -75,7 +75,8 @@ fi
 # Only this arch's line is read: under emulation (an amd64 container on an
 # arm64 host) cpuinfo describes the host, and then there's nothing to judge.
 # The same check, with the same flag lists, is in
-# packaging/scripts/preinstall.sh (CI compares them).
+# packaging/scripts/preinstall.sh and the Homebrew formula
+# (scripts/check-cpu-floor.sh compares them).
 if [ "$OS" = "linux" ]; then
   case "$ARCH" in
     x86_64)  CPU_KEY="flags";    NEEDED="cx16 lahf_lm pni popcnt sse4_1 sse4_2 ssse3" ;;
