@@ -181,7 +181,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -202,6 +202,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.divergences_beyond_tolerance,
             s.vouches_taken,
             sim.stranger_frames,
+            s.state_checks,
+            s.rebuilt_checks,
         },
     );
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });

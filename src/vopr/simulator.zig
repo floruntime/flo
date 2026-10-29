@@ -28,6 +28,7 @@ const membership = @import("../raft/membership.zig");
 const transport = @import("../raft/transport.zig");
 const RaftFrame = @import("../raft/raft_queue.zig").Frame;
 const replica_mod = @import("../replica/replica.zig");
+const families = @import("families.zig");
 const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
@@ -68,6 +69,11 @@ pub const Invariant = enum {
     /// Nodes that halted did so at different entries: a halt must come
     /// from the entry alone, the same on every replica.
     halt_agreement,
+    /// Two replicas hold different family state after applying the same
+    /// history, or a replica rebuilt by replay holds other state than one
+    /// that applied those entries live: apply read something besides the
+    /// entry and the state.
+    state_checksum,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -268,6 +274,19 @@ const SimNode = struct {
     /// The tick it applied each index at (index i at [i - 1]), for judging
     /// whether a crash could have erased what it applied.
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
+    /// The toy family it applies, and the index it last applied it at.
+    counter: families.Counter = .{},
+    families_index: u64 = 0,
+    /// Its apply rewound without a restart, so the family holds entries
+    /// the log no longer does and cannot roll them back: the checker
+    /// leaves it out until it restarts.
+    families_stale: bool = false,
+    /// A hash over every entry it applied in this life, in order: two
+    /// replicas' states are compared only after the same history.
+    history: u64 = 0,
+    /// The highest index it applied before its last restart; applying one
+    /// at or below it rebuilds state, above it is live.
+    replay_through: u64 = 0,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -390,6 +409,7 @@ const SimIo = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
+const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool };
 
 const Checker = struct {
     allocator: Allocator,
@@ -423,9 +443,17 @@ const Checker = struct {
     /// one tick's message processing).
     leaders: std.AutoHashMapUnmanaged(u64, NodeId) = .empty,
     violations: std.ArrayListUnmanaged(Violation) = .empty,
+    /// states[i] is the first family state recorded after index i+1, with
+    /// the history that led to it.
+    states: std.ArrayListUnmanaged(?StateCanon) = .empty,
+    /// States compared after the same history, and how many of those set
+    /// a rebuilt replica against a live one.
+    state_checks: u64 = 0,
+    rebuilt_checks: u64 = 0,
 
     fn deinit(self: *Checker) void {
         self.canonical.deinit(self.allocator);
+        self.states.deinit(self.allocator);
         self.leaders.deinit(self.allocator);
         self.violations.deinit(self.allocator);
     }
@@ -471,6 +499,35 @@ const Checker = struct {
                 .detail = "new leader holds a different term at a committed index",
             });
         }
+    }
+
+    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, rebuilt: bool, tick: u64) void {
+        while (self.states.items.len < idx) self.states.append(self.allocator, null) catch @panic("checker OOM");
+        const slot = &self.states.items[idx - 1];
+        const canon = slot.* orelse {
+            slot.* = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt };
+            return;
+        };
+        // Another history reached this index: async mode can erase applied
+        // history, and the log's own checks judge whether it was legal.
+        // States after it are compared from here on.
+        if (canon.history != history) {
+            slot.* = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt };
+            return;
+        }
+        self.state_checks += 1;
+        if (canon.rebuilt != rebuilt) self.rebuilt_checks += 1;
+        if (canon.checksum == checksum) return;
+        self.fail(.{
+            .invariant = .state_checksum,
+            .node = node,
+            .index = idx,
+            .tick = tick,
+            .detail = if (canon.rebuilt != rebuilt)
+                "a replica rebuilt by replay holds other state than one that applied the same history live"
+            else
+                "two replicas hold different state after applying the same history",
+        });
     }
 
     fn onApply(
@@ -551,6 +608,9 @@ pub const Options = struct {
     /// The guard without its boot wait: the demonstrator of the split vote
     /// the wait prevents.
     no_lost_log_wait: bool = false,
+    /// A bug planted in the toy family's apply or checksum: the
+    /// demonstrator of what `state_checksum` catches.
+    family_mutant: families.Mutant = .none,
     /// Print per-phase progress.
     verbose: bool = false,
     /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
@@ -588,6 +648,10 @@ pub const Summary = struct {
     vouches_taken: u64,
     /// Wyhash over the canonical history — two runs of one seed must agree.
     canonical_hash: u64,
+    /// Family states compared after the same history; of those, a
+    /// replica rebuilt by replay against one that applied live.
+    state_checks: u64,
+    rebuilt_checks: u64,
     violation_count: usize,
 };
 
@@ -721,6 +785,7 @@ pub const Simulator = struct {
             node.raft.deinit();
             node.disk.deinit();
             node.applied_ticks.deinit(self.allocator);
+            node.counter.deinit(self.allocator);
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
             self.allocator.free(node.replica.rpc_out);
@@ -964,6 +1029,11 @@ pub const Simulator = struct {
         self.restarts += 1;
         // Replay applies from the start again.
         node.applied_config = .{};
+        node.replay_through = node.applied_ticks.items.len;
+        node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
+        node.families_index = 0;
+        node.families_stale = false;
+        node.history = 0;
         // A node whose log holds the entry the group halted at comes up
         // halted there, as production's boot replay stops at it.
         if (self.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |e| {
@@ -1518,9 +1588,28 @@ pub const Simulator = struct {
                         node.raft.recordConfig(idx, e.header.term, &cfg);
                     }
                 }
+                self.applyFamilies(node, &e, idx, is_op);
                 node.raft.last_applied = idx;
             }
         }
+    }
+
+    /// The toy family's apply, then its state for the checker.
+    fn applyFamilies(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, is_op: bool) void {
+        if (idx <= node.families_index) node.families_stale = true;
+        node.families_index = idx;
+        if (node.families_stale) return;
+        const step = [2]u64{ e.header.term, std.hash.Wyhash.hash(HASH_SEED, e.payload) };
+        node.history = std.hash.Wyhash.hash(node.history, std.mem.asBytes(&step));
+        const live = idx > node.replay_through;
+        const mutant = self.options.family_mutant;
+        if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, .{
+            .mutant = mutant,
+            .node_now = self.nodeNow(node),
+            .leader = node.raft.role == .leader,
+            .live = live,
+        });
+        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), !live, self.now);
     }
 
     // ── Log durability (runs before fault injection) ───────────────────
@@ -1835,6 +1924,8 @@ pub const Simulator = struct {
                 break :blk n;
             },
             .canonical_hash = h.final(),
+            .state_checks = self.checker.state_checks,
+            .rebuilt_checks = self.checker.rebuilt_checks,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -1978,6 +2069,73 @@ test "vopr sim: crashes with sync durability still converge" {
     try testing.expect(s.ok);
     try testing.expect(s.crashes > 0);
     try testing.expect(s.restarts > 0);
+}
+
+/// A run with crashes and restarts, so replicas rebuild by replay.
+fn restartingScenario(seed: u64) Scenario {
+    var scenario = Scenario.calm(seed);
+    scenario.crash_permille = 5;
+    scenario.restart_permille = 100;
+    scenario.ticks_safety = 6_000;
+    return scenario;
+}
+
+test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family state after the same history" {
+    var checks: u64 = 0;
+    var rebuilt: u64 = 0;
+    for ([_]u64{ 77, 78, 79 }) |seed| {
+        for ([_]scenario_mod.DurabilityMode{ .sync, .async_flush }) |durability| {
+            var scenario = restartingScenario(seed);
+            scenario.durability = durability;
+            var sim = try Simulator.init(testing.allocator, scenario, .{});
+            defer sim.deinit();
+            const s = try sim.run();
+            if (!s.ok) {
+                var buf: [4096]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&buf);
+                sim.printViolations(&w) catch {};
+                std.debug.print("seed {d} {s}:\n{s}\n", .{ seed, @tagName(durability), w.buffered() });
+            }
+            try testing.expect(s.ok);
+            checks += s.state_checks;
+            rebuilt += s.rebuilt_checks;
+        }
+    }
+    try testing.expect(checks >= 1000);
+    try testing.expect(rebuilt >= 500);
+}
+
+/// What `state_checksum` found under a mutant: any violation, and one
+/// that set a replica rebuilt by replay against one that applied live.
+const Caught = struct { any: bool = false, rebuilt_vs_live: bool = false };
+
+fn stateChecksumUnder(mutant: families.Mutant) !Caught {
+    var sim = try Simulator.init(testing.allocator, restartingScenario(77), .{ .family_mutant = mutant });
+    defer sim.deinit();
+    _ = try sim.run();
+    var found: Caught = .{};
+    for (sim.checker.violations.items) |v| {
+        if (v.invariant != .state_checksum) continue;
+        found.any = true;
+        if (std.mem.startsWith(u8, v.detail, "a replica rebuilt by replay")) found.rebuilt_vs_live = true;
+    }
+    return found;
+}
+
+test "vopr sim: apply that reads the node's clock fails state_checksum" {
+    try testing.expect((try stateChecksumUnder(.node_clock)).any);
+}
+
+test "vopr sim: a refusal decided by the replica, not the entry, fails state_checksum" {
+    try testing.expect((try stateChecksumUnder(.local_refusal)).any);
+}
+
+test "vopr sim: a checksum in map order fails state_checksum between a rebuilt replica and a live one" {
+    try testing.expect((try stateChecksumUnder(.map_order)).rebuilt_vs_live);
+}
+
+test "vopr sim: an effect only live apply runs fails state_checksum between a rebuilt replica and a live one" {
+    try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
 }
 
 fn runTicks(sim: *Simulator, n: u64) !void {
