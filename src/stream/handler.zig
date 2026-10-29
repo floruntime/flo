@@ -1083,14 +1083,22 @@ pub const StreamHandler = struct {
         const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group) orelse return NAME_TOO_LONG;
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
-        // Auto-create group and join consumer if not exists
+        // The first read of a group creates it, and joins the consumer.
         const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
         const now_ns = now_ms * 1_000_000;
-        self.stream.createGroup(group_name, now_ns) catch |err| {
-            if (err != error.AlreadyExists) {
-                return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
+        if (self.stream.createGroup(group_name, now_ns)) {
+            // The group survives a restart through the log, as a created
+            // one does. The read doesn't wait for the entry: a crash before
+            // it commits loses a group that has acked nothing, and its
+            // records are delivered again.
+            const logged = self.groupCommitResult(group_name, true);
+            if (logged == .err) {
+                _ = self.stream.deleteGroup(group_name);
+                return logged;
             }
-        };
+        } else |err| if (err != error.AlreadyExists) {
+            return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
+        }
         _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
 
         const capped: usize = readLimit(req);
