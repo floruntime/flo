@@ -580,13 +580,13 @@ pub const WorkerHandler = struct {
     /// worker.list: each shard holds the workers that registered on it, so
     /// every shard answers its own page after `cursor` and the pages merge.
     /// A worker.list another shard sent here is that gather's part.
-    fn runList(shard: *Shard, conn: *Connection, req: Request, limit: u32, cursor: []const u8) Error!table_run.Outcome(ListResponse) {
+    fn runList(shard: *Shard, conn: *Connection, req: Request, limit: u32, cursor: []const u8, action: []const u8) Error!table_run.Outcome(ListResponse) {
         const h = shard.worker_handler;
-        if (conn == shard.forward_proxy) return .{ .answer = try h.page(req.namespace, limit, cursor) };
+        if (conn == shard.forward_proxy) return .{ .answer = try h.page(req.namespace, limit, cursor, action) };
 
         const shards: usize = if (shard.peer_mailboxes) |m| m.len else 1;
         var parts: [gather_mod.MAX_PARTS]gather_mod.Part = undefined;
-        const local = try encodeBody(h.allocator, try h.page(req.namespace, limit, cursor));
+        const local = try encodeBody(h.allocator, try h.page(req.namespace, limit, cursor, action));
         const state = ListGather.create(h.allocator, limit) catch |err| {
             h.allocator.free(local);
             return err;
@@ -598,16 +598,17 @@ pub const WorkerHandler = struct {
         return .wait;
     }
 
-    /// This shard's workers in `namespace` after `cursor`, in id order, as
-    /// many as `limit` and the answer allow. The cursor is the last id given
-    /// when more are left.
-    fn page(self: *WorkerHandler, namespace: []const u8, limit: u32, cursor: []const u8) Error!ListResponse.Value {
+    /// This shard's workers in `namespace` after `cursor` that run `action`
+    /// (any, if empty), in id order, as many as `limit` and the answer allow.
+    /// The cursor is the last id given when more are left.
+    fn page(self: *WorkerHandler, namespace: []const u8, limit: u32, cursor: []const u8, action: []const u8) Error!ListResponse.Value {
         var after: std.ArrayList(*const WorkerRecord) = .empty;
         defer after.deinit(self.allocator);
         var it = self.workers.valueIterator();
         while (it.next()) |w| {
             if (!std.mem.eql(u8, w.namespace_owned, homeOf(namespace))) continue;
             if (std.mem.order(u8, w.id_owned, cursor) != .gt) continue;
+            if (action.len > 0 and !runsAction(w, action)) continue;
             try after.append(self.allocator, w);
         }
         std.mem.sort(*const WorkerRecord, after.items, {}, struct {
@@ -622,6 +623,13 @@ pub const WorkerHandler = struct {
         }
         const more = out.count < after.items.len;
         return .{ .workers = out.value(), .cursor = if (more) after.items[out.count - 1].id_owned else null };
+    }
+
+    fn runsAction(w: *const WorkerRecord, action: []const u8) bool {
+        for (w.processes.items) |p| {
+            if (p.kind == .action and std.mem.eql(u8, p.name_owned, action)) return true;
+        }
+        return false;
     }
 
     fn listBuf(self: *WorkerHandler) Error![]u8 {
@@ -948,9 +956,25 @@ const ListShards = struct {
         }
     }
 
+    /// Register `id` running one process, `name`, of `kind`.
+    fn addRunning(self: *ListShards, shard: usize, namespace: []const u8, id: []const u8, kind: ProcessKind, name: []const u8) !void {
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeAll(&.{ 0, 4, 0, 0, 0, 1, 0 });
+        try w.writeInt(u16, @intCast(name.len), .little);
+        try w.writeAll(name);
+        try w.writeAll(&.{ @backingInt(kind), 0, 0 }); // no metadata, no machine id
+        var req = testRequest(namespace, id);
+        req.value = w.buffered();
+        if (self.registries[shard].handleRegister(req)) |why| {
+            std.debug.print("{s}\n", .{why.why});
+            return error.Refused;
+        }
+    }
+
     /// Every page from the start, merged as a gather merges them; the ids
     /// in order, and the number of pages.
-    fn listAll(self: *ListShards, namespace: []const u8, limit: u32, ids: *std.ArrayList([]u8)) !usize {
+    fn listAll(self: *ListShards, namespace: []const u8, limit: u32, action: []const u8, ids: *std.ArrayList([]u8)) !usize {
         const a = std.testing.allocator;
         var buf: [Workers.byte_bound.?]u8 = undefined;
         var cursor: std.ArrayList(u8) = .empty;
@@ -960,7 +984,7 @@ const ListShards = struct {
             // Every page moves the cursor on; one that doesn't would loop.
             if (pages > 10_000) return error.CursorStuck;
             var bodies: [3][]u8 = undefined;
-            for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(namespace, limit, cursor.items));
+            for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(namespace, limit, cursor.items, action));
             defer for (bodies) |b| a.free(b);
             const merged = try mergePages(a, &buf, limit, &bodies);
             try std.testing.expect(merged.workers.count <= limit);
@@ -991,7 +1015,7 @@ test "worker.list: pages over shards whose ids interleave give every worker once
     for ([_]u32{ 1, 2, 3, 7, 20, worker_ops.MAX_LIST }) |limit| {
         var ids: std.ArrayList([]u8) = .empty;
         defer freeIds(&ids);
-        const pages = try s.listAll("ns", limit, &ids);
+        const pages = try s.listAll("ns", limit, "", &ids);
         try std.testing.expectEqual(@as(usize, 20), ids.items.len);
         for (ids.items, 0..) |id, i| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}), id);
         try std.testing.expectEqual((20 + limit - 1) / limit, pages);
@@ -1007,9 +1031,42 @@ test "worker.list: workers all on one shard are paged to the last, though the ot
     for ([_]u32{ 1, 5, 20 }) |limit| {
         var ids: std.ArrayList([]u8) = .empty;
         defer freeIds(&ids);
-        _ = try s.listAll("ns", limit, &ids);
+        _ = try s.listAll("ns", limit, "", &ids);
         try std.testing.expectEqual(@as(usize, 20), ids.items.len);
     }
+}
+
+test "worker.list: an action filter pages only that action's workers, each page full, to the last" {
+    var s: ListShards = undefined;
+    s.init();
+    defer s.deinit();
+    var name: [8]u8 = undefined;
+    // Every third runs "a"; the rest run "b", or a stream consumer named "a",
+    // or are in another namespace, interleaved across the shards.
+    for (0..30) |i| {
+        const id = try std.fmt.bufPrint(&name, "w{d:0>2}", .{i});
+        const shard = i * 7 % 3;
+        switch (i % 3) {
+            0 => try s.addRunning(shard, "ns", id, .action, "a"),
+            1 => try s.addRunning(shard, "ns", id, .action, "b"),
+            else => try s.addRunning(shard, "ns", id, .stream_consumer, "a"),
+        }
+    }
+    try s.addRunning(0, "other", "w99", .action, "a");
+
+    for ([_]u32{ 1, 3, 4, 10 }) |limit| {
+        var ids: std.ArrayList([]u8) = .empty;
+        defer freeIds(&ids);
+        const pages = try s.listAll("ns", limit, "a", &ids);
+        try std.testing.expectEqual(@as(usize, 10), ids.items.len);
+        for (ids.items, 0..) |id, i| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{i * 3}), id);
+        try std.testing.expectEqual((10 + limit - 1) / limit, pages);
+    }
+
+    var ids: std.ArrayList([]u8) = .empty;
+    defer freeIds(&ids);
+    _ = try s.listAll("ns", 10, "none", &ids);
+    try std.testing.expectEqual(@as(usize, 0), ids.items.len);
 }
 
 test "worker.list: a page cut short by the answer's room still loses no worker" {
@@ -1026,7 +1083,7 @@ test "worker.list: a page cut short by the answer's room still loses no worker" 
     }
     var ids: std.ArrayList([]u8) = .empty;
     defer freeIds(&ids);
-    const pages = try s.listAll("ns", worker_ops.MAX_LIST, &ids);
+    const pages = try s.listAll("ns", worker_ops.MAX_LIST, "", &ids);
     try std.testing.expect(pages > 1);
     try std.testing.expectEqual(@as(usize, 150), ids.items.len);
     for (ids.items, 0..) |id, i| {
@@ -1065,7 +1122,7 @@ test "worker.list: a namespace with no workers is one empty page" {
     try s.add(1, "other", "w1");
     var ids: std.ArrayList([]u8) = .empty;
     defer freeIds(&ids);
-    try std.testing.expectEqual(@as(usize, 1), try s.listAll("ns", 10, &ids));
+    try std.testing.expectEqual(@as(usize, 1), try s.listAll("ns", 10, "", &ids));
     try std.testing.expectEqual(@as(usize, 0), ids.items.len);
 }
 

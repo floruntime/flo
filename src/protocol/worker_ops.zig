@@ -93,6 +93,7 @@ pub const table = [_]ops.Op{
         .request = Record(&.{
             .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_LIST), MAX_LIST), .doc = "Most workers on the page" },
             .{ .name = "cursor", .T = WorkerId, .doc = "The last id of the page before; omit to start" },
+            .{ .name = "action", .T = Bytes(ops.MAX_KEY), .doc = "Only workers that run this action; omit for all" },
         }),
         .response = Record(&.{
             .{ .name = "workers", .T = schema.BoundedList(WorkerRow, MAX_LIST, @intCast(ops.MAX_RESPONSE_BODY - @sizeOf(u32) - cursor_size)), .doc = "The namespace's workers, in id order" },
