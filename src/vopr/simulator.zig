@@ -20,6 +20,7 @@ const stdx = @import("stdx");
 const PRNG = @import("stdx").PRNG;
 const raft_node = @import("../raft/node.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const repair = @import("../node/repair.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
@@ -261,6 +262,9 @@ const SimNode = struct {
     applied_config: membership.Config = .{},
     /// The entry it halted at, 0 for none: it applies nothing from it on.
     halted_at: u64 = 0,
+    /// It took the committed repair that skips the group's halt, and
+    /// passes over that entry.
+    skipped: bool = false,
     /// The tick it applied each index at (index i at [i - 1]), for judging
     /// whether a crash could have erased what it applied.
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
@@ -624,6 +628,9 @@ pub const Simulator = struct {
     max_acked_index: u64,
     /// Where the first node halted, which every other must match.
     halt: ?struct { index: u64, term: u64, hash: u64 } = null,
+    /// Where the leader put the repair that skips the halt (`repair_halt`),
+    /// 0 until it does.
+    repair_at: u64 = 0,
     // Scratch, allocated once.
     apply_buf: []u8,
     delivery: std.ArrayListUnmanaged(Message),
@@ -697,7 +704,7 @@ pub const Simulator = struct {
                 const k: i64 = scenario.clock_skew_ms;
                 node.wall_offset_ms = self.clock_prng.random().intRangeAtMost(i64, -k, k);
             }
-            attachWall(node);
+            attachHost(node);
             for (self.nodes, 0..) |_, j| {
                 if (i != j) node.raft.addPeer(@intCast(j + 1));
             }
@@ -878,7 +885,7 @@ pub const Simulator = struct {
     fn haltNode(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry) void {
         const at: @TypeOf(self.halt.?) = .{ .index = e.header.index, .term = e.header.term, .hash = std.hash.Wyhash.hash(HASH_SEED, e.payload) };
         node.halted_at = at.index;
-        node.raft.halted = true;
+        node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
         if (self.halt) |first| {
             if (first.index != at.index or first.term != at.term or first.hash != at.hash) self.checker.fail(.{
                 .invariant = .halt_agreement,
@@ -900,7 +907,7 @@ pub const Simulator = struct {
             self.scenario.log_capacity,
             self.raftConfig(),
         );
-        attachWall(node);
+        attachHost(node);
         node.applied_stamp = 0;
         node.applied_stamp_index = 0;
         // Its apply starts again from the log, and halts where it did.
@@ -962,7 +969,7 @@ pub const Simulator = struct {
         if (self.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |e| {
             if (e.header.term == h.term and std.hash.Wyhash.hash(HASH_SEED, e.payload) == h.hash) {
                 node.halted_at = h.index;
-                node.raft.halted = true;
+                node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
             }
         };
         if (node.raft.current_term < prev_term) {
@@ -1119,6 +1126,16 @@ pub const Simulator = struct {
     /// that entry left its sender, one network delay before this node
     /// applied it, could have erased it.
     fn onDiverged(self: *Simulator, node: *SimNode) void {
+        // A leader said it applied the entry this node halted at. Every
+        // replica here halts at the same entry on the same build, so none
+        // ever does.
+        if (node.replica.halted_alone) return self.checker.fail(.{
+            .invariant = .halt_agreement,
+            .node = node.id,
+            .index = node.halted_at,
+            .tick = self.now,
+            .detail = "a halted node was told a leader applied the entry it halted at",
+        });
         const contradicted = node.raft.commit_index + 1;
         const applied_at: ?u64 = if (contradicted <= node.applied_ticks.items.len) node.applied_ticks.items[contradicted - 1] else null;
         const erasable = self.scenario.durability == .async_flush and self.crashes > 0 and
@@ -1223,8 +1240,57 @@ pub const Simulator = struct {
     /// skew takes a node's below it.
     const WALL_EPOCH_MS: u64 = 1_700_000_000_000;
 
-    fn attachWall(node: *SimNode) void {
+    /// What the shard gives its Raft node: the wall clock, one build for
+    /// every node (a versioned one, so a leader's halt verdict counts), and
+    /// whether a repair skipped an entry.
+    fn attachHost(node: *SimNode) void {
         node.raft.wall_clock = .{ .ctx = &node.wall_ns, .now_ns = readWall };
+        node.raft.build = 1;
+        node.raft.repaired = .{ .ctx = node, .check = nodeRepaired };
+    }
+
+    fn nodeRepaired(ctx: ?*anyopaque, h: raft_node.HaltAt) bool {
+        const node: *SimNode = @ptrCast(@alignCast(ctx.?));
+        const halt = node.sim.halt orelse return false;
+        return node.skipped and h.index == halt.index and h.term == halt.term;
+    }
+
+    /// A halted node takes a committed repair that names its halt, as the
+    /// shard's apply does, and goes on past it.
+    fn resumeIfSkipped(self: *Simulator, node: *SimNode) bool {
+        const h = node.raft.halt_at orelse return false;
+        var idx = h.index + 1;
+        while (idx <= node.raft.commit_index) : (idx += 1) {
+            const e = node.raft.log.getEntryCopy(idx, self.apply_buf) orelse continue;
+            const skip = repair.Skip.decode(&e) orelse continue;
+            if (skip.index != h.index or skip.term != h.term or skip.crc != h.crc) continue;
+            node.skipped = true;
+            node.halted_at = 0;
+            node.raft.halt_at = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// The operator's repair, once every core node halted: the leader
+    /// proposes the skip. One a later leader cut from the log is proposed
+    /// again.
+    fn repairHalt(self: *Simulator) !void {
+        if (!self.scenario.repair_halt) return;
+        const h = self.halt orelse return;
+        for (self.nodes, 0..) |*node, i| {
+            if (self.core[i] and (!node.up or node.halted_at != h.index)) return;
+        }
+        const leader = for (self.nodes) |*node| {
+            if (node.up and node.raft.role == .leader) break node;
+        } else return;
+        if (self.repair_at != 0) {
+            if (leader.raft.log.getEntryCopy(self.repair_at, self.apply_buf)) |e| if (repair.Skip.decode(&e)) |sk| if (sk.index == h.index) return;
+        }
+        const halted = leader.raft.log.getEntryCopy(h.index, self.apply_buf) orelse return;
+        var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+        const proposed = leader.raft.propose(.repair_skip, entry_mod.Flags.NONE, repair.Skip.of(&halted, "vopr").encode(&p)) catch return;
+        self.repair_at = proposed.index;
     }
 
     fn readWall(ctx: ?*anyopaque) u64 {
@@ -1384,7 +1450,7 @@ pub const Simulator = struct {
         }
         node.disk.applying = true;
         defer node.disk.applying = false;
-        if (node.halted_at != 0) return;
+        if (node.halted_at != 0 and !self.resumeIfSkipped(node)) return;
         {
             while (node.raft.last_applied < node.raft.commit_index) {
                 const idx = node.raft.last_applied + 1;
@@ -1405,7 +1471,9 @@ pub const Simulator = struct {
                 };
                 // The group's own entries (noops, configs) are history too,
                 // but carry no workload op.
-                const is_op = e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config);
+                // An entry a repair skips is passed over: it applies nothing.
+                const passed_over = node.skipped and self.halt != null and idx == self.halt.?.index;
+                const is_op = !passed_over and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config) and e.header.entry_type != @backingInt(entry_mod.EntryType.repair_skip);
                 if (is_op and self.scenario.halt_op != 0 and Workload.opIdFromPayload(e.payload) == self.scenario.halt_op - 1) {
                     self.haltNode(node, &e);
                     break;
@@ -1547,22 +1615,26 @@ pub const Simulator = struct {
 
     fn converged(self: *Simulator) bool {
         if (self.scenario.config_change_permille > 0) return self.convergedMembership();
-        // Halted: every core node stopped at the same entry.
         if (self.halt) |h| {
-            for (self.nodes, 0..) |*node, i| {
-                if (!self.core[i]) continue;
-                if (!node.up or node.halted_at != h.index) return false;
+            // Halted: every core node stopped at the same entry.
+            if (!self.scenario.repair_halt) {
+                for (self.nodes, 0..) |*node, i| {
+                    if (!self.core[i]) continue;
+                    if (!node.up or node.halted_at != h.index) return false;
+                }
+                return true;
             }
-            return true;
+            // Repaired: every core node goes on past it, as below.
+            if (self.repair_at == 0) return false;
         }
         // Every acked op applied by every core node.
-        const target = self.max_acked_index;
+        const target = @max(self.max_acked_index, self.repair_at);
         for (self.nodes) |*node| {
             if (node.guard_watched and (!node.up or node.raft.lost_log != .none)) return false;
         }
         for (self.nodes, 0..) |*node, i| {
             if (!self.core[i]) continue;
-            if (!node.up) return false;
+            if (!node.up or node.halted_at != 0) return false;
             if (node.raft.last_applied < target) return false;
         }
         return true;
@@ -1578,11 +1650,12 @@ pub const Simulator = struct {
         for (cfg.memberSlice()) |m| {
             const node = &self.nodes[m.id - 1];
             if (!node.up or node.raft.lost_log != .none) return false;
-            if (self.halt) |h| {
+            if (self.halt) |h| if (!self.scenario.repair_halt) {
                 if (node.halted_at != h.index) return false;
                 continue;
-            }
-            if (node.raft.last_applied < self.convergence_target) return false;
+            };
+            if (node.halted_at != 0) return false;
+            if (node.raft.last_applied < @max(self.convergence_target, self.repair_at)) return false;
         }
         return true;
     }
@@ -1594,8 +1667,9 @@ pub const Simulator = struct {
     fn finalDurabilityCheck(self: *Simulator) void {
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
-            // Past a halt nothing applies, so nothing records it.
-            if (self.halt) |h| if (op.index >= h.index) continue;
+            // Past a halt nothing applies, so nothing records it; past a
+            // repair, all but the skipped entry does.
+            if (self.halt) |h| if (op.index == h.index or (!self.scenario.repair_halt and op.index >= h.index)) continue;
             if (self.scenario.durability == .async_flush) {
                 // Excuse the op if any crash landed within a flush interval
                 // on EITHER side of the ack — that loss is the mode's
@@ -1651,6 +1725,7 @@ pub const Simulator = struct {
         try self.submitOps();
         self.applyAll();
         try self.ackSweep();
+        try self.repairHalt();
         self.syncStableStorage();
         try self.repairDiverged();
         try self.injectFaults();

@@ -127,9 +127,11 @@ pub const ShardSlot = struct {
     /// stranger's frames with no leader heard, the stuck-member symptom.
     vouched_index: Atomic(u64) = .init(0),
     strangers_while_quiet: Atomic(bool) = .init(false),
-    /// The entry the shard halted at, written before the state reads
-    /// `halted`.
+    /// The entry the shard halted at, as a repair names it: written
+    /// before the state reads `halted`.
     halt_index: Atomic(u64) = .init(0),
+    halt_term: Atomic(u64) = .init(0),
+    halt_crc: Atomic(u32) = .init(0),
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -217,7 +219,7 @@ pub const NodeHealth = struct {
                 try w.writeAll(",\"reason\":");
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
-            if (state == .halted) try w.print(",\"halt_index\":{d}", .{s.halt_index.load(.monotonic)});
+            if (state == .halted) try w.print(",\"halt_index\":{d},\"halt_term\":{d},\"halt_crc\":{d}", .{ s.halt_index.load(.monotonic), s.halt_term.load(.monotonic), s.halt_crc.load(.monotonic) });
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
@@ -307,6 +309,8 @@ test "health: a halted shard keeps the node ready, and /status names where it ha
     defer h.deinit(testing.allocator);
     h.accepting.store(true, .release);
     h.shards[0].halt_index.store(18234, .monotonic);
+    h.shards[0].halt_term.store(7, .monotonic);
+    h.shards[0].halt_crc.store(0xdeadbeef, .monotonic);
     h.shards[0].setReason("entry 18234 (kv_put): its projection refused it as malformed (a Flo bug)");
     h.shards[0].publish(.halted, .leader, 18233, 18240);
     h.shards[1].setReason("entry 9 (kv_put) could not be applied on this node: out of memory");
@@ -322,6 +326,8 @@ test "health: a halted shard keeps the node ready, and /status names where it ha
     const s0 = parsed.value.object.get("shards").?.array.items[0].object;
     try testing.expectEqualStrings("halted", s0.get("state").?.string);
     try testing.expectEqual(@as(i64, 18234), s0.get("halt_index").?.integer);
+    try testing.expectEqual(@as(i64, 7), s0.get("halt_term").?.integer);
+    try testing.expectEqual(@as(i64, 0xdeadbeef), s0.get("halt_crc").?.integer);
     try testing.expect(std.mem.indexOf(u8, s0.get("reason").?.string, "malformed") != null);
     // A reason shows only with the state that has one.
     try testing.expect(parsed.value.object.get("shards").?.array.items[1].object.get("reason") == null);

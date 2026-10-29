@@ -245,10 +245,12 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — AppendResponse (46 bytes; the last 8 are the sender's clock)
+// Serialization — AppendResponse (67 bytes): term, success, match, from,
+//   hint, guarded, leader_commit, clock, then the halt: flag u8, index u64,
+//   term u64, crc u32 (zero when not halted)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 46;
+pub const APPEND_RESP_SIZE: usize = 67;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -269,6 +271,15 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u64, buf[off..][0..8], resp.clock_ns, .little);
     off += 8;
+    const h = resp.halt orelse node_mod.HaltAt{ .index = 0, .term = 0, .crc = 0 };
+    buf[off] = @intFromBool(resp.halt != null);
+    off += 1;
+    std.mem.writeInt(u64, buf[off..][0..8], h.index, .little);
+    off += 8;
+    std.mem.writeInt(u64, buf[off..][0..8], h.term, .little);
+    off += 8;
+    std.mem.writeInt(u32, buf[off..][0..4], h.crc, .little);
+    off += 4;
     return off;
 }
 
@@ -294,6 +305,11 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
         .guarded = data[off] & 1 != 0,
         .leader_commit = std.mem.readInt(u64, data[off + 1 ..][0..8], .little),
         .clock_ns = std.mem.readInt(u64, data[off + 9 ..][0..8], .little),
+        .halt = if (data[off + 17] & 1 == 0) null else .{
+            .index = std.mem.readInt(u64, data[off + 18 ..][0..8], .little),
+            .term = std.mem.readInt(u64, data[off + 26 ..][0..8], .little),
+            .crc = std.mem.readInt(u32, data[off + 34 ..][0..4], .little),
+        },
     };
 }
 
@@ -372,12 +388,13 @@ pub fn deserializeTermCheckResponse(data: []const u8) ?TermCheckResponse {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization — AppendRequest (variable size)
-//   Fixed prefix: 40 bytes (term, leader_id, prev_log_index, prev_log_term,
-//                           leader_commit, entry_count)
+//   Fixed prefix: 64 bytes (term, leader_id, prev_log_index, prev_log_term,
+//                           leader_commit, entry_count, then the halt
+//                           verdict: index u64, term u64, build u64)
 //   Then N entries, each: 40-byte header + payload_len payload bytes.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_REQ_PREFIX: usize = 40;
+pub const APPEND_REQ_PREFIX: usize = 64;
 
 /// Compute the serialized size for an AppendRequest.
 pub fn appendRequestSize(req: AppendRequest) usize {
@@ -405,6 +422,12 @@ pub fn serializeAppendRequest(req: AppendRequest, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u32, buf[off..][0..4], @intCast(req.entries.len), .little);
     off += 4;
+    std.mem.writeInt(u64, buf[off..][0..8], req.halt_verdict.index, .little);
+    off += 8;
+    std.mem.writeInt(u64, buf[off..][0..8], req.halt_verdict.term, .little);
+    off += 8;
+    std.mem.writeInt(u64, buf[off..][0..8], req.halt_verdict.build, .little);
+    off += 8;
 
     // Serialize each entry
     for (req.entries) |*e| {
@@ -424,6 +447,7 @@ pub const AppendRequestHeader = struct {
     prev_log_term: u64,
     leader_commit: u64,
     entry_count: u32,
+    halt_verdict: node_mod.HaltVerdict,
     entries_data: []const u8,
 };
 
@@ -443,6 +467,12 @@ pub fn deserializeAppendRequestHeader(data: []const u8) ?AppendRequestHeader {
     off += 8;
     const entry_count = std.mem.readInt(u32, data[off..][0..4], .little);
     off += 4;
+    const verdict: node_mod.HaltVerdict = .{
+        .index = std.mem.readInt(u64, data[off..][0..8], .little),
+        .term = std.mem.readInt(u64, data[off + 8 ..][0..8], .little),
+        .build = std.mem.readInt(u64, data[off + 16 ..][0..8], .little),
+    };
+    off += 24;
 
     return .{
         .term = term,
@@ -451,6 +481,7 @@ pub fn deserializeAppendRequestHeader(data: []const u8) ?AppendRequestHeader {
         .prev_log_term = prev_term,
         .leader_commit = leader_commit,
         .entry_count = entry_count,
+        .halt_verdict = verdict,
         .entries_data = data[off..],
     };
 }
@@ -617,6 +648,7 @@ fn everyFieldSet(comptime T: type) T {
         @field(v, name) = switch (@typeInfo(ftype)) {
             .bool => true,
             .int => @intCast(1000 + i * 7),
+            .optional => |o| everyFieldSet(o.child),
             else => @compileError("everyFieldSet: add a case for " ++ @typeName(ftype)),
         };
     }
@@ -650,6 +682,7 @@ test "transport: AppendRequest roundtrip with entries" {
         .prev_log_term = 0,
         .entries = &entries,
         .leader_commit = 0,
+        .halt_verdict = .{ .index = 41, .term = 3, .build = 0x0123456789abcdef },
     };
 
     var buf: [4096]u8 = undefined;
@@ -661,6 +694,7 @@ test "transport: AppendRequest roundtrip with entries" {
     try testing.expectEqual(@as(u64, 1), header.term);
     try testing.expectEqual(@as(u32, 1), header.leader_id);
     try testing.expectEqual(@as(u32, 2), header.entry_count);
+    try testing.expectEqual(req.halt_verdict, header.halt_verdict);
 
     // Parse entries
     var out: [8]Entry = undefined;
@@ -819,7 +853,7 @@ test "transport: 2-shard message exchange simulation" {
     try testing.expectEqual(@as(u64, 9), ae_header.leader_commit);
 
     // Node 2 sends response back
-    var resp_buf: [64]u8 = undefined;
+    var resp_buf: [APPEND_RESP_SIZE]u8 = undefined;
     const resp_len = serializeAppendResponse(.{
         .term = 3,
         .success = true,

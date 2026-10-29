@@ -10,6 +10,7 @@ const testing = std.testing;
 const stdx = @import("stdx");
 const test_faults = @import("src").node.test_faults;
 const HALT_KEY = test_faults.HALT_KEY;
+const apply_marker = @import("src").node.apply_marker;
 
 /// A node's `/status`, parsed.
 fn nodeStatus(http: anytype) !std.json.Parsed(std.json.Value) {
@@ -116,5 +117,61 @@ test "e2e/halt: every node of a three-node group halts at the same entry" {
         const out = try cluster.execCaptureAnyOn(i, &.{ "kv", "get", "before" });
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("kept", std.mem.trim(u8, out, &std.ascii.whitespace));
+    }
+    // None diverged: the leader halted there too, so it told no one it
+    // halted alone.
+    for (0..3) |i| {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(i).?.metrics_port);
+        defer http.deinit();
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        try testing.expectEqual(at, haltIndex(parsed, 0));
+    }
+}
+
+test "e2e/halt: a follower that halts where its leader applied halted alone and is diverged (a build with no version says it can't tell); the group goes on" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    const off: []const [2][]const u8 = &.{.{ test_faults.OFF_ENV, "1" }};
+    var env: @FieldType(stdx.testing.ClusterConfig, "node_env") = @splat(&.{});
+    // Node 2 alone halts at the fault; the seed, which leads, applies it.
+    env[0] = off;
+    env[1] = off;
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .node_env = env });
+    defer cluster.deinit();
+    testing.allocator.free(try cluster.pollUntilContains(0, &.{ "cluster", "status", "-o", "json" }, "\"role\":\"leader\"", 40, 250));
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", HALT_KEY, "x" }, 20, 250);
+
+    // A build with a version knows the leader's is its own: halted alone,
+    // so diverged. A dev or dirty one can't tell, so it stays halted and
+    // says both ways out.
+    const versioned = apply_marker.build_hash != 0;
+    const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(2).?.metrics_port);
+    defer http.deinit();
+    var tries: usize = 0;
+    while (tries < 80) : (tries += 1) {
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        const s = parsed.value.object.get("shards").?.array.items[0].object;
+        const state = s.get("state").?.string;
+        const why = if (s.get("reason")) |r| r.string else "";
+        if (versioned and std.mem.eql(u8, state, "diverged")) {
+            try testing.expect(std.mem.indexOf(u8, why, "halted alone") != null);
+            break;
+        }
+        if (!versioned and std.mem.eql(u8, state, "halted") and std.mem.indexOf(u8, why, "can't be told apart") != null) break;
+        try testing.expect(!std.mem.eql(u8, state, "diverged") or versioned);
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    } else {
+        cluster.printLogs();
+        return error.NoVerdict;
+    }
+    // The write applied where it ran, and the group takes writes.
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "after", "taken" }, 20, 250);
+    for (0..2) |i| {
+        const out = try cluster.pollUntilContains(i, &.{ "kv", "get", "after" }, "taken", 40, 250);
+        defer testing.allocator.free(out);
+        const x = try cluster.execCaptureAnyOn(i, &.{ "kv", "get", HALT_KEY });
+        defer testing.allocator.free(x);
+        try testing.expectEqualStrings("x", std.mem.trim(u8, x, &std.ascii.whitespace));
     }
 }

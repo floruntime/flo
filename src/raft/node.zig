@@ -87,6 +87,8 @@ pub const PeerState = struct {
     /// monotonic time when the report arrived (0: none yet).
     clock_ns: u64 = 0,
     clock_at_ms: u64 = 0,
+    /// The entry the peer last said it is halted at.
+    halt: ?HaltAt = null,
 };
 
 /// Acks in a row at the commit index that make a peer caught up.
@@ -244,6 +246,44 @@ pub const VoteResponse = struct {
     clock_ns: u64 = 0,
 };
 
+/// The entry a node's shard is halted at, as a repair names it.
+pub const HaltAt = struct {
+    index: u64,
+    term: u64,
+    crc: u32,
+};
+
+/// A leader applied the entry a follower is halted at, on build `build`.
+/// The follower judges it against its own build: the same one means it
+/// halted alone, another means upgrading it applies the entry.
+pub const HaltVerdict = struct {
+    /// 0: no verdict.
+    index: u64 = 0,
+    term: u64 = 0,
+    build: u64 = 0,
+
+    /// Whether this verdict is about the halt `h`.
+    pub fn about(self: HaltVerdict, h: HaltAt) bool {
+        return self.index != 0 and self.index == h.index and self.term == h.term;
+    }
+};
+
+/// Whether a committed repair skips the entry `h`, as the owner's state
+/// machine knows it. An entry passed over by a skip isn't one this node
+/// applied.
+pub const Repaired = struct {
+    ctx: ?*anyopaque = null,
+    check: *const fn (ctx: ?*anyopaque, h: HaltAt) bool = never,
+
+    fn never(_: ?*anyopaque, _: HaltAt) bool {
+        return false;
+    }
+
+    pub fn of(self: Repaired, h: HaltAt) bool {
+        return self.check(self.ctx, h);
+    }
+};
+
 /// AppendEntries request (simplified for state machine testing).
 pub const AppendRequest = struct {
     term: u64,
@@ -252,6 +292,7 @@ pub const AppendRequest = struct {
     prev_log_term: u64,
     entries: []const Entry,
     leader_commit: u64,
+    halt_verdict: HaltVerdict = .{},
 };
 
 /// AppendEntries response.
@@ -274,6 +315,8 @@ pub const AppendResponse = struct {
     guarded: bool = false,
     /// The responder's wall clock (`RaftNode.nextStamp`).
     clock_ns: u64 = 0,
+    /// The entry the responder is halted at, if it is.
+    halt: ?HaltAt = null,
 };
 
 /// Where a node reads the wall clock. A simulation gives each node its own.
@@ -373,10 +416,16 @@ pub const RaftNode = struct {
     /// Set by the owner when an entry it owed the disk is gone: nothing
     /// after it can be made durable, so proposals are refused.
     writes_stopped: bool = false,
-    /// The owner's state machine halted at an entry every replica fails
-    /// the same way: it proposes nothing but what elects a leader or
-    /// changes membership, until a repair.
-    halted: bool = false,
+    /// The entry the owner's state machine halted at, which every replica
+    /// fails the same way: it proposes nothing but what elects a leader,
+    /// changes membership or repairs it, until a repair. Followers report
+    /// it to the leader.
+    halt_at: ?HaltAt = null,
+    /// The owner's build, as a leader's halt verdict names it; 0 for one
+    /// with no version (a dev or dirty build), which can't be told apart
+    /// from another of the same name.
+    build: u64 = 0,
+    repaired: Repaired = .{},
     last_applied: u64,
 
     // ── Election timer ─────────────────────────────────────────────────
@@ -1159,6 +1208,7 @@ pub const RaftNode = struct {
         resp.guarded = self.lost_log != .none;
         resp.leader_commit = req.leader_commit;
         resp.clock_ns = self.wall_clock.read();
+        resp.halt = self.halt_at;
         return resp;
     }
 
@@ -1346,6 +1396,7 @@ pub const RaftNode = struct {
                 self.peers[i].last_contact_ms = self.current_time_ms;
                 self.noteClock(i, resp.clock_ns);
                 self.peers[i].guarded = resp.guarded;
+                self.peers[i].halt = resp.halt;
                 if (resp.success) {
                     // A late or duplicated ack may report less than we already
                     // know matched; a response can also outlive the log it
@@ -1390,6 +1441,23 @@ pub const RaftNode = struct {
         self.advanceCommitIndex();
     }
 
+    /// What to tell peer `i` about the entry it is halted at, given this
+    /// leader's own entry at that index (null when it can't be read). Said
+    /// only by a leader that applied that very entry: one that hasn't, or
+    /// halted there too, knows nothing a halt doesn't; one whose repair
+    /// skipped it passed over it, as the peer will once the skip reaches
+    /// it; and one holding another entry there leaves the peer to log
+    /// repair.
+    pub fn haltVerdictFor(self: *const RaftNode, i: usize, own: ?*const Entry) HaltVerdict {
+        if (self.role != .leader) return .{};
+        const h = self.peers[i].halt orelse return .{};
+        const e = own orelse return .{};
+        if (e.header.index != h.index or e.header.term != h.term or e.header.crc32c != h.crc) return .{};
+        if (self.last_applied < h.index) return .{};
+        if (self.repaired.of(h)) return .{};
+        return .{ .index = h.index, .term = h.term, .build = self.build };
+    }
+
     // ── Propose (Leader) ────────────────────────────────────────────────
 
     /// Propose an entry (leader only), with `flags` in its header (e.g.
@@ -1405,7 +1473,7 @@ pub const RaftNode = struct {
     fn appendProposal(self: *RaftNode, entry_type: EntryType, flags: u16, timestamp_ns: u64, payload: []const u8) !ProposeResult {
         if (self.role != .leader) return error.NotLeader;
         if (self.writes_stopped) return error.WritesStopped;
-        if (self.halted and entry_type != .raft_config and entry_type != .raft_noop and entry_type != .repair_skip) return error.Halted;
+        if (self.halt_at != null and entry_type != .raft_config and entry_type != .raft_noop and entry_type != .repair_skip) return error.Halted;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
         if (self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
@@ -1798,6 +1866,8 @@ pub const RaftNode = struct {
             self.peers[i].last_contact_ms = 0;
             self.peers[i].caught_up_streak = 0;
             self.peers[i].joining_since_ms = self.current_time_ms;
+            // Heard again from this leadership's answers.
+            self.peers[i].halt = null;
         }
         // An entry of this term, so the entries of earlier terms commit as
         // soon as it replicates: a leader may only count a majority for its
@@ -4687,4 +4757,72 @@ test "raft node: a request past the ceiling is refused without overflow, whateve
     const append = try node.handleAppendEntries(.{ .term = MAX_TERM + 5, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
     try testing.expect(!append.success);
     try testing.expectEqual(MAX_TERM + 10, node.current_term);
+}
+
+test "raft node: a leader says it applied the entry a follower halted at only when it did, and names its build" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    node.build = 77;
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    const h = (try node.propose(.kv_put, 0, "h")).index;
+    var buf: [64]u8 = undefined;
+    const own = node.log.getEntryCopy(h, &buf).?;
+    const halt: HaltAt = .{ .index = h, .term = own.header.term, .crc = own.header.crc32c };
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = h - 1, .from = 2, .halt = halt });
+    const none: HaltVerdict = .{};
+    const applied: HaltVerdict = .{ .index = h, .term = halt.term, .build = 77 };
+
+    // Not applied here yet: a lagging leader knows nothing a halt doesn't.
+    node.last_applied = h - 1;
+    try testing.expectEqual(none, node.haltVerdictFor(0, &own));
+    // Halted there too: the halt rewinds what it applied to below the entry.
+    node.halt_at = halt;
+    try testing.expectEqual(none, node.haltVerdictFor(0, &own));
+    node.halt_at = null;
+
+    node.last_applied = h;
+    try testing.expectEqual(applied, node.haltVerdictFor(0, &own));
+    // Passed over by a repair, not applied.
+    const Skipped = struct {
+        fn check(_: ?*anyopaque, _: HaltAt) bool {
+            return true;
+        }
+    };
+    node.repaired = .{ .check = Skipped.check };
+    try testing.expectEqual(none, node.haltVerdictFor(0, &own));
+    node.repaired = .{};
+    // Another entry at that index here, or none readable: log repair's.
+    var other = entry_mod.buildEntry(.kv_put, 0, own.header.term, h, own.header.timestamp_ns, "x");
+    other.header.crc32c = other.computeCrc();
+    try testing.expectEqual(none, node.haltVerdictFor(0, &other));
+    try testing.expectEqual(none, node.haltVerdictFor(0, null));
+    // A peer that answers without a halt has none.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = h, .from = 2 });
+    try testing.expectEqual(none, node.haltVerdictFor(0, &own));
+    // Only a leader says it, and a new leadership hears halts afresh.
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = h, .from = 2, .halt = halt });
+    try testing.expectEqual(applied, node.haltVerdictFor(0, &own));
+    node.stepDown(2);
+    try testing.expectEqual(none, node.haltVerdictFor(0, &own));
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expect(node.peers[0].halt == null);
+}
+
+test "raft node: a follower's halt rides on every append answer" {
+    var node = try RaftNode.init(testing.allocator, 2, 1000, 16384, .{});
+    defer node.deinit();
+    node.addPeer(1);
+    const halt: HaltAt = .{ .index = 4, .term = 1, .crc = 9 };
+    node.halt_at = halt;
+    const ok = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(?HaltAt, halt), ok.halt);
+    const refused = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 9, .prev_log_term = 1, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!refused.success);
+    try testing.expectEqual(@as(?HaltAt, halt), refused.halt);
 }

@@ -47,6 +47,14 @@ pub const build_name: []const u8 = blk: {
     break :blk full[0..@min(full.len, BUILD_MAX)];
 };
 
+/// This build, as a leader's halt verdict names it: 0 for a build with no
+/// version, a dev or dirty one, which another build of the same name can't
+/// be told apart from. Never 0 otherwise.
+pub const build_hash: u64 = if (std.mem.eql(u8, build_options.version, "dev") or std.mem.endsWith(u8, build_options.version, "-dirty"))
+    0
+else
+    @max(1, std.hash.Wyhash.hash(0, build_name));
+
 /// A crash a marker recorded.
 pub const Crash = struct {
     shard: u16,

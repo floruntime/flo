@@ -146,6 +146,9 @@ pub const Scenario = struct {
     /// apply, as an applier bug would; 0 for none. Every node must halt at
     /// the same entry.
     halt_op: u64 = 0,
+    /// Once every core node halted, an operator's repair skips the entry,
+    /// and every node goes on past it.
+    repair_halt: bool = false,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -239,6 +242,7 @@ pub const Scenario = struct {
         s.durability = .sync;
         var prng = PRNG.init(std.hash.Wyhash.hash(0x4A17, std.mem.asBytes(&seed)));
         s.halt_op = prng.intRange(u64, 1, 64);
+        s.repair_halt = prng.boolean();
         return s;
     }
 
@@ -331,8 +335,7 @@ pub const Scenario = struct {
             \\  "clock_drift_ppm": {d},
             \\  "clock_skew_ms": {d},
             \\  "outsider_permille": {d},
-            \\  "halt_op": {d}
-            \\}}
+            \\  "halt_op": {d},
             \\
         , .{
             self.seed,                    self.node_count,            self.log_capacity,
@@ -347,6 +350,12 @@ pub const Scenario = struct {
             self.config_change_permille,  self.clock_drift_ppm,       self.clock_skew_ms,
             self.outsider_permille,       self.halt_op,
         });
+        // A second print: one format takes at most 32 arguments.
+        try writer.print(
+            \\  "repair_halt": {}
+            \\}}
+            \\
+        , .{self.repair_halt});
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -395,6 +404,10 @@ pub const Scenario = struct {
             .clock_skew_ms = if (obj.get("clock_skew_ms") == null) 0 else try jsonInt(u32, obj, "clock_skew_ms"),
             .outsider_permille = if (obj.get("outsider_permille") == null) 0 else try jsonInt(u16, obj, "outsider_permille"),
             .halt_op = if (obj.get("halt_op") == null) 0 else try jsonU64(obj, "halt_op"),
+            .repair_halt = if (obj.get("repair_halt")) |v| switch (v) {
+                .bool => |b| b,
+                else => return error.InvalidField,
+            } else false,
         };
     }
 };
@@ -520,6 +533,7 @@ test "vopr scenario: the halt slice runs sync, halts at one of its first ops, an
     try s.writeJson(&w);
     const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
     try testing.expectEqual(s.halt_op, back.halt_op);
+    try testing.expectEqual(s.repair_halt, back.repair_halt);
     // Pins written before it ran without one.
     try testing.expectEqual(@as(u64, 0), Scenario.fromSeed(7).halt_op);
 }
@@ -536,7 +550,8 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 32), obj.count());
+    try testing.expectEqual(@as(usize, 33), obj.count());
+    try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.outsider_permille), obj.get("outsider_permille").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.halt_op)), obj.get("halt_op").?.integer);
     try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);
