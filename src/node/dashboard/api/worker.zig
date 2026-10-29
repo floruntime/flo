@@ -30,7 +30,7 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "worker list", err);
     defer reader.deinit();
-    var got = reader.call(worker_ops.op("worker.list"), ns, "", .{ .limit = limit, .cursor = cursor }) catch |err|
+    var got = reader.call(worker_ops.op("worker.list"), ns, "", .{ .limit = limit, .cursor = cursor, .action = "" }) catch |err|
         return try loopback.readFailed(allocator, "worker list", err);
     defer got.deinit();
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
@@ -49,20 +49,7 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
         var it = page.workers.iterator();
         while (it.next() catch return try h.jsonError(allocator, "worker list: malformed answer")) |w| {
             try arr.next();
-            var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-            try obj.begin();
-            try obj.stringField("worker_id", w.id);
-            try obj.stringField("status", @tagName(w.status));
-            try obj.stringField("worker_type", @tagName(w.worker_type));
-            try obj.stringField("namespace", ns);
-            if (w.machine_id) |m| try obj.stringField("machine_id", m) else try obj.nullField("machine_id");
-            try obj.intField("current_load", @as(i64, w.current_load));
-            try obj.intField("max_concurrent", @as(i64, w.max_concurrency));
-            try obj.intField("tasks_completed", @as(i64, @intCast(w.tasks_completed)));
-            try obj.intField("tasks_failed", @as(i64, @intCast(w.tasks_failed)));
-            try obj.intField("last_seen", w.last_heartbeat_ms);
-            try obj.intField("registered_at", w.registered_at_ms);
-            try obj.end();
+            try writeWorkerRow(writer, w, ns);
         }
         try arr.end();
     }
@@ -70,6 +57,46 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     if (page.cursor) |next| try outer.stringField("cursor", next) else try outer.nullField("cursor");
     try outer.end();
     return try json_aw.toOwnedSlice();
+}
+
+/// One worker as a page of the worker list gives it.
+pub fn writeWorkerRow(writer: anytype, w: anytype, namespace: []const u8) !void {
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("worker_id", w.id);
+    try obj.stringField("status", @tagName(w.status));
+    try obj.stringField("worker_type", @tagName(w.worker_type));
+    try obj.stringField("namespace", namespace);
+    if (w.machine_id) |m| try obj.stringField("machine_id", m) else try obj.nullField("machine_id");
+    try obj.intField("current_load", @as(i64, w.current_load));
+    try obj.intField("max_concurrent", @as(i64, w.max_concurrency));
+    try obj.intField("tasks_completed", @as(i64, @intCast(w.tasks_completed)));
+    try obj.intField("tasks_failed", @as(i64, @intCast(w.tasks_failed)));
+    try obj.intField("last_seen", w.last_heartbeat_ms);
+    try obj.intField("registered_at", w.registered_at_ms);
+    try obj.end();
+}
+
+/// Every worker in `namespace` that runs action `action`, as rows of `arr`,
+/// read a page at a time to the last.
+pub fn writeActionWorkers(reader: *loopback.Reader, arr: anytype, writer: anytype, namespace: []const u8, action: []const u8) !void {
+    var cursor_buf: [worker_ops.WorkerId.max_size]u8 = undefined;
+    var cursor: []const u8 = "";
+    while (true) {
+        var got = try reader.call(worker_ops.op("worker.list"), namespace, "", .{ .limit = worker_ops.MAX_LIST, .cursor = cursor, .action = action });
+        defer got.deinit();
+        if (got.isError()) return error.Refused;
+        var diag: schema.Diagnostic = .{};
+        const page = try worker_ops.op("worker.list").response.decodeAll(got.data, &diag);
+        var it = page.workers.iterator();
+        while (try it.next()) |w| {
+            try arr.next();
+            try writeWorkerRow(writer, w, namespace);
+        }
+        const next = page.cursor orelse return;
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
 }
 
 /// GET /workers/:id — One worker, with what it registered and runs. Read as

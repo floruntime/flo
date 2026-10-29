@@ -7614,7 +7614,7 @@ test "Shard: worker.list on a node of two shards lists both shards' workers, in 
     var seen: usize = 0;
     var pages: usize = 0;
     while (true) : (pages += 1) {
-        const body = try List.request.encodeInto(&body_buf, .{ .limit = 5, .cursor = cursor });
+        const body = try List.request.encodeInto(&body_buf, .{ .limit = 5, .cursor = cursor, .action = "" });
         a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.worker_list, 200 + pages), .namespace = "default", .key = "", .value = body }, .client);
         f.two.settle();
         const resp = try f.answer();

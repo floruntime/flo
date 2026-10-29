@@ -299,7 +299,7 @@ pub fn workerFail(
 
 /// A page of the namespace's workers after `cursor` (empty: from the start).
 pub fn workerList(client: *Client, namespace: []const u8, limit: u32, cursor: []const u8) !Response {
-    return client.call(worker_ops.op("worker.list"), namespace, "", .{ .limit = limit, .cursor = cursor });
+    return client.call(worker_ops.op("worker.list"), namespace, "", .{ .limit = limit, .cursor = cursor, .action = "" });
 }
 
 /// Drain a worker (mark as draining — stops new task assignments)

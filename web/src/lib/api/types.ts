@@ -261,7 +261,6 @@ export interface ActionInfo {
   max_retries: number
   created_at: number
   updated_at: number
-  worker_count: number
   runs: ActionRunCounts
 }
 export interface ActionRun {
@@ -297,8 +296,8 @@ export interface ActionDetailInfo {
   updated_at: number
   runs: ActionRunCounts
   recent_runs: ActionRun[]
-  /** Workers handling this action. */
-  workers: WorkerInfo[]
+  /** Workers running this action, as the worker list gives them. */
+  workers: WorkerListItem[]
 }
 export interface ActionInvokeResult {
   action: string

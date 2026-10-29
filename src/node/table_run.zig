@@ -257,6 +257,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.txn.rollback", .field = "txn", .tests = &.{"kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it"} },
     .{ .op = "worker.list", .field = "limit", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
     .{ .op = "worker.list", .field = "cursor", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
+    .{ .op = "worker.list", .field = "action", .tests = &.{"worker.list: an action filter pages only that action's workers, each page full, to the last"} },
 };
 
 /// The files that bind table ops' functions: where `_ = field;` would

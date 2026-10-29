@@ -12,9 +12,9 @@ const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Shard = @import("../../shard.zig").Shard;
 const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
-const WorkerHandler = @import("../../../worker/handler.zig").WorkerHandler;
-const WorkerRecord = @import("../../../worker/handler.zig").WorkerRecord;
 const client_mod = @import("../../../cli/client/mod.zig");
+const loopback = @import("loopback.zig");
+const worker_api = @import("worker.zig");
 
 // ── Helpers ──
 
@@ -43,60 +43,6 @@ fn shardCount(ctx: *DashboardContext) usize {
 /// namespaces is two actions, with runs of their own.
 fn runOf(run: *const ActionsHandler.RunRecord, namespace: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, run.action_name_owned, name) and std.mem.eql(u8, run.namespace_owned, namespace);
-}
-
-fn workerOf(w: *const WorkerRecord, namespace: []const u8, name: []const u8) bool {
-    if (!std.mem.eql(u8, w.namespace_owned, namespace)) return false;
-    for (w.processes.items) |p| {
-        if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) return true;
-    }
-    return false;
-}
-
-/// A worker as action detail embeds it.
-fn writeWorkerJson(writer: anytype, w: *const WorkerRecord) !void {
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-    try obj.stringField("worker_id", w.id_owned);
-    try obj.stringField("status", @tagName(w.status));
-    try obj.stringField("worker_type", if (w.worker_type == .action) "action" else "stream");
-    try obj.stringField("namespace", w.namespace_owned);
-    if (w.machine_id_owned) |mid| {
-        try obj.stringField("machine_id", mid);
-    } else {
-        try obj.nullField("machine_id");
-    }
-    try obj.intField("current_load", @as(i64, @intCast(w.current_load)));
-    try obj.intField("max_concurrent", @as(i64, @intCast(w.max_concurrency)));
-    try obj.intField("tasks_completed", @as(i64, @intCast(w.tasks_completed)));
-    try obj.intField("tasks_failed", @as(i64, @intCast(w.tasks_failed)));
-    try obj.intField("last_seen", w.last_heartbeat_ms);
-    try obj.intField("registered_at", w.registered_at_ms);
-    if (w.metadata_owned) |meta| {
-        try obj.stringField("metadata", meta);
-    } else {
-        try obj.nullField("metadata");
-    }
-
-    // Processes array
-    {
-        var parr = try obj.arrayField("processes");
-        try parr.begin();
-        for (w.processes.items) |p| {
-            try parr.next();
-            var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-            try pobj.begin();
-            try pobj.stringField("name", p.name_owned);
-            try pobj.stringField("kind", if (p.kind == .action) "action" else "stream_consumer");
-            try pobj.intField("run_count", @as(i64, @intCast(p.run_count)));
-            try pobj.intField("fail_count", @as(i64, @intCast(p.fail_count)));
-            try pobj.intField("last_run_at", p.last_run_at_ms);
-            try pobj.end();
-        }
-        try parr.end();
-    }
-
-    try obj.end();
 }
 
 const LatencyStats = struct { count: u64 = 0, avg_ms: i64 = 0, p99_ms: i64 = 0 };
@@ -181,7 +127,6 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                 if (!gop.found_existing) {
                     // Count runs for this action across all shards
                     var counts = h.RunCounts{};
-                    var worker_count: u64 = 0;
                     for (0..n) |si| {
                         if (getShard(ctx, si)) |s| {
                             var rit = s.actions_handler.runs.iterator();
@@ -197,11 +142,6 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                                         .timed_out => counts.timed_out += 1,
                                     }
                                 }
-                            }
-                            // Count workers that handle this action
-                            var wit = s.worker_handler.workers.iterator();
-                            while (wit.next()) |we| {
-                                if (workerOf(we.value_ptr, rec.namespace_owned, rec.name_owned)) worker_count += 1;
                             }
                         }
                     }
@@ -220,7 +160,6 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                     try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
                     try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
                     try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-                    try obj.intField("worker_count", @as(i64, @intCast(worker_count)));
                     try writeLatency(&obj, computeLatency(allocator, ctx, rec.namespace_owned, rec.name_owned));
                     {
                         var runs_obj = try obj.objectField("runs");
@@ -401,26 +340,20 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
             try recent_arr.end();
         }
 
-        // workers — workers that handle this action
+        // The workers that run it, read as a client over loopback
+        // (`worker.list`, filtered to the action).
         {
             var workers_arr = try obj.arrayField("workers");
             try workers_arr.begin();
-            for (0..n) |i| {
-                if (getShard(ctx, i)) |shard| {
-                    var wit = shard.worker_handler.workers.iterator();
-                    while (wit.next()) |we| {
-                        const w = we.value_ptr;
-                        if (!std.mem.eql(u8, w.namespace_owned, ns_filter)) continue;
-                        for (w.processes.items) |p| {
-                            if (p.kind == .action and std.mem.eql(u8, p.name_owned, name)) {
-                                try workers_arr.next();
-                                try writeWorkerJson(writer, w);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            var reader = loopback.Reader.open(allocator, ctx) catch |err| {
+                json_aw.deinit();
+                return try loopback.readFailed(allocator, "action workers", err);
+            };
+            defer reader.deinit();
+            worker_api.writeActionWorkers(&reader, &workers_arr, writer, ns_filter, name) catch |err| {
+                json_aw.deinit();
+                return try loopback.readFailed(allocator, "action workers", err);
+            };
             try workers_arr.end();
         }
     } else {

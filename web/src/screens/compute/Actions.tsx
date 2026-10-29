@@ -461,16 +461,15 @@ function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => voi
           </div>
         ) : (
           <div className="list">
-            <div className="li head" style={{ gridTemplateColumns: '1.5fr 100px 90px 70px' }}>
+            <div className="li head" style={{ gridTemplateColumns: '1.5fr 100px 70px' }}>
               <div className="c">Action</div>
               <div className="c r">Invocations</div>
-              <div className="c r">Workers</div>
               <div className="c r">Errors</div>
             </div>
             {filtered.map((r) => {
               const errs = errCount(r.runs)
               return (
-                <div className="li" key={r.name} style={{ gridTemplateColumns: '1.5fr 100px 90px 70px' }} onClick={() => onOpen(r.name)}>
+                <div className="li" key={r.name} style={{ gridTemplateColumns: '1.5fr 100px 70px' }} onClick={() => onOpen(r.name)}>
                   <div style={{ minWidth: 0 }}>
                     <div className="mono nw" style={{ fontWeight: 500, color: r.enabled ? 'var(--tx)' : 'var(--tx-3)' }}>
                       {r.name}
@@ -485,9 +484,6 @@ function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => voi
                     </div>
                   </div>
                   <span className="c r mono">{afmtN(r.runs.total)}</span>
-                  <span className="c r mono" style={{ color: r.worker_count ? 'var(--info)' : 'var(--tx-3)' }}>
-                    {r.worker_count}
-                  </span>
                   <span className="c r mono" style={{ color: errs > 20 ? 'var(--crit)' : errs > 0 ? 'var(--warn)' : 'var(--tx-3)' }}>
                     {errs}
                   </span>

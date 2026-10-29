@@ -418,26 +418,34 @@ test "e2e/http/worker: GET /workers/:id finds a worker only in its own namespace
 // REST API — Workers in Action Detail
 // =============================================================================
 
-test "e2e/http/worker: action detail includes workers array" {
+test "e2e/http/worker: action detail lists exactly the workers that run the action, from every shard and only its namespace" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .dashboard_enabled = true },
+        .server = .{ .dashboard_enabled = true, .shards = 2 },
     });
     defer ctx.deinit();
-
-    // Register an action and a worker
-    try ctx.exec(&.{ "action", "register", "http-act-with-workers" });
-    try ctx.exec(&.{ "worker", "register", "act-detail-w1", "http-act-with-workers" });
+    try ctx.exec(&.{ "action", "register", "act-x" });
+    try ctx.exec(&.{ "worker", "register", "x-1", "act-x" });
+    try ctx.exec(&.{ "worker", "register", "x-2", "act-x" });
+    try ctx.exec(&.{ "worker", "register", "y-1", "act-y" });
+    try ctx.exec(&.{ "worker", "register", "both", "act-y", "act-x" });
+    try ctx.exec(&.{ "worker", "register", "x-3", "act-x" });
+    try ctx.exec(&.{ "worker", "register", "x-other", "act-x", "-n", "other" });
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-
-    var resp = try http.get("/api/v1/actions/http-act-with-workers");
+    var resp = try http.get("/api/v1/actions/act-x");
     defer resp.deinit();
-
     try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.isJson());
-    try testing.expect(resp.bodyContains("\"workers\""));
-    try testing.expect(resp.bodyContains("act-detail-w1"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.bodyTrimmed(), .{});
+    defer parsed.deinit();
+    const workers = parsed.value.object.get("workers").?.array.items;
+    const want = [_][]const u8{ "both", "x-1", "x-2", "x-3" };
+    try testing.expectEqual(want.len, workers.len);
+    for (want, workers) |id, w| {
+        try testing.expectEqualStrings(id, w.object.get("worker_id").?.string);
+        try testing.expectEqualStrings("default", w.object.get("namespace").?.string);
+        try testing.expectEqualStrings("active", w.object.get("status").?.string);
+    }
 }
 
 // =============================================================================
