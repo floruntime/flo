@@ -71,6 +71,7 @@ const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
 const apply_marker = @import("apply_marker.zig");
+const offline_mod = @import("offline.zig");
 const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
@@ -911,6 +912,7 @@ pub const Shard = struct {
             raft_node.noteApplied(replayed_stamp);
             if (boot_halt) |*h| {
                 raft_node.halted = true;
+                marker.halted(h.index, h.term, h.crc);
                 log.err("shard {d} comes up halted at {s}, as it was before the restart. It applies nothing past it and takes no writes until a repair", .{ shard_id, h.reason() });
             }
 
@@ -3131,6 +3133,7 @@ pub const Shard = struct {
         raft.last_applied = e.header.index - 1;
         self.last_entry_applied = false;
         self.skip_scan_from = e.header.index + 1;
+        self.marker.halted(e.header.index, e.header.term, e.header.crc32c);
         log.err("shard {d} halted at {s}. It applies nothing past it and takes no writes; reads are served, marked stale. Restarting won't help: the entry has to be repaired (the node's /status says where it halted)", .{ self.id, self.halted.?.reason() });
         self.answerHaltedPending();
     }
@@ -3154,6 +3157,7 @@ pub const Shard = struct {
             log.info("shard {d}: the repair at entry {d} skips entry {d} ({s}); going on past it", .{ self.id, idx, h.index, skip.reason });
             self.halted = null;
             raft.halted = false;
+            self.marker.resumed();
             // The entry is passed over when the apply reaches it again. One
             // whose apply ran before it halted already left what a pass-over
             // leaves, and the partition takes nothing twice.
@@ -6559,6 +6563,7 @@ fn replaySegmentFile(
                 out.damage = localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ seg_entry.header.index, @errorName(err) }));
                 return;
             };
+            log.info("shard {d}: entry {d} is skipped by a repair; passing over it", .{ shard_id, seg_entry.header.index });
             out.applied_through = seg_entry.header.index;
             continue;
         }
@@ -6585,7 +6590,10 @@ fn replaySegmentFile(
                 return;
             },
         }
-        out.last_stamp = seg_entry.header.timestamp_ns;
+        // A skip is exempt from the stamp check, so it may be stamped
+        // before the entry ahead of it; the applied stamp never goes back,
+        // as live.
+        out.last_stamp = @max(out.last_stamp, seg_entry.header.timestamp_ns);
         out.applied_through = seg_entry.header.index;
     }
 }
@@ -13706,6 +13714,10 @@ test "Shard: a shard halted before a restart goes on once a skip commits, as one
         defer shard.deinit();
         shard.applyDeferredTail();
         try std.testing.expectEqual(h, shard.halted.?.index);
+        // The boot that halted again says so, for the offline repair.
+        const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+        defer std.testing.allocator.free(shard_dir);
+        try std.testing.expectEqual(h, apply_marker.read(shard_dir, 0).halt.?.index);
         // The stamp of the entry before the halt, as a shard halted live
         // keeps: replay's own, not the router's, which passed the halt.
         var e_buf: [256]u8 = undefined;
@@ -13862,6 +13874,95 @@ test "Shard: a skip never halts, even stamped out of order" {
     r.commit_index = skip.header.index;
     try std.testing.expect(shard.applyCommitted());
     try std.testing.expect(shard.halted == null and shard.offline == null);
+}
+
+test "Shard: a skip stamped out of order replays as it applied live, and the stamp never goes back" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var after: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        const r = shard.raft_node;
+        const h = try HaltCase.no_applier.propose(&shard);
+        try std.testing.expect(!shard.applyCommitted());
+        var e_buf: [256]u8 = undefined;
+        const halted = r.log.getEntryCopy(h, &e_buf).?;
+        const last = r.applied_stamp;
+        var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+        var skip = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, r.current_term, r.log.lastIndex() + 1, last - 1000, repair.Skip.of(&halted, "").encode(&p));
+        skip.header.crc32c = skip.computeCrc();
+        _ = try r.log.append(&skip);
+        // After the skip's stamp, but not after the last applied entry's.
+        const cmd = entry_mod.CommandPayload{ .namespace_hash = node_router.namespaceHash(""), .key_length = 1, .value_length = 5, .key = "q", .value = &[_]u8{ 0, 0, 0, 0, 'Z' } };
+        var cmd_buf: [64]u8 = undefined;
+        var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, r.current_term, skip.header.index + 1, last - 500, cmd_buf[0..cmd.serialize(&cmd_buf).?]);
+        e.header.crc32c = e.computeCrc();
+        _ = try r.log.append(&e);
+        r.commit_index = e.header.index;
+        try std.testing.expect(!shard.applyCommitted());
+        after = (shard.halted orelse return error.NotHalted).index;
+        try std.testing.expectEqual(e.header.index, after);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expectEqual(after, (shard.halted orelse return error.NotHalted).index);
+}
+
+test "Shard: a skip above the watermark it was sealed under is not taken at boot; the shard halts, then resumes as it applies" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        h = try HaltCase.no_applier.propose(&shard);
+        const at = try proposeSkip(&shard, h);
+        // One segment, sealed before the skip counts as committed, as a
+        // flush ahead of its commit leaves it.
+        try shard.rebufferGap(shard.durable_log.?.writer);
+        try shard.durable_log.?.flush(at - 1);
+        const files = try shard.durable_log.?.segments();
+        const last = files[files.len - 1];
+        try std.testing.expect(last.holds_skip and last.first_index <= h and last.last_index == at);
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expectEqual(h, (shard.halted orelse return error.NotHalted).index);
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+}
+
+test "Shard: a halted shard's marker names the entry it halted at until a skip takes it past" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt == null);
+    const h = try HaltCase.no_applier.propose(&shard);
+    try std.testing.expect(!shard.applyCommitted());
+    var e_buf: [256]u8 = undefined;
+    const halted = shard.raft_node.log.getEntryCopy(h, &e_buf).?;
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt.?.names(&halted));
+    try offline_mod.skippable(shard_dir, 0, &halted);
+    // The last enqueue, which applied.
+    var before_buf: [256]u8 = undefined;
+    var at = h - 1;
+    const before = while (at > 0) : (at -= 1) {
+        const e = shard.raft_node.log.getEntryCopy(at, &before_buf).?;
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.queue_enqueue)) break e;
+    } else return error.NoEnqueue;
+    try std.testing.expectError(error.NotHalted, offline_mod.skippable(shard_dir, 0, &before));
+    _ = try proposeSkip(&shard, h);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt == null);
+    try std.testing.expectError(error.NotHalted, offline_mod.skippable(shard_dir, 0, &halted));
 }
 
 test "Shard: a skip of an entry this node applied takes the shard offline: it holds what no replica does" {

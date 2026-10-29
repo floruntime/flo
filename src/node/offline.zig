@@ -12,6 +12,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const durable_log_mod = @import("../storage/durable_log.zig");
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const repair = @import("repair.zig");
+const apply_marker = @import("apply_marker.zig");
 
 const Entry = entry_mod.Entry;
 
@@ -154,7 +155,7 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     if (hs.lost_log) try hard_state_mod.save(dir, cleared);
 }
 
-pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, IsSkip };
+pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, IsSkip, NotSkippable, NotHalted };
 
 /// Shard `dir`'s entry at `index`, its payload in `arena`.
 pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena: []u8) !Entry {
@@ -169,13 +170,31 @@ pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena:
     return one[0];
 }
 
-/// Append a repair skip of `halted` to the stopped shard in `dir`, sealed
-/// as committed: its next boot passes over the entry, and so does every
-/// boot after. Returns the skip's index.
-pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, sum: *const Summary, halted: *const Entry, reason: []const u8) !u64 {
+/// Whether `e` is the entry the stopped shard `shard` in `dir` is halted
+/// at. On a single node the majority that must have halted at it is the
+/// node: its marker names the entry the shard last halted at, or whose
+/// apply crashed it. Any other entry may have applied, and skipping it
+/// would lose a write its client was told succeeded.
+pub fn skippable(dir: []const u8, shard: u16, e: *const Entry) SkipError!void {
+    switch (@as(entry_mod.EntryType, @fromBackingInt(e.header.entry_type))) {
+        .repair_skip => return error.IsSkip,
+        // Applied around a halt, so never what a shard halts at.
+        .raft_config, .raft_noop => return error.NotSkippable,
+        else => {},
+    }
+    const held = apply_marker.read(dir, shard);
+    if (held.halt) |*h| if (h.names(e)) return;
+    if (held.crash) |*c| if (c.names(e)) return;
+    return error.NotHalted;
+}
+
+/// Append a repair skip of `halted` to the stopped shard `shard` in `dir`,
+/// sealed as committed: its next boot passes over the entry, and so does
+/// every boot after, if it is `skippable`. Returns the skip's index.
+pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum: *const Summary, halted: *const Entry, reason: []const u8) !u64 {
     if (sum.last_index == 0) return error.NoLog;
     if (sum.truncation_pending) return error.TruncationIncomplete;
-    if (halted.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip)) return error.IsSkip;
+    try skippable(dir, shard, halted);
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
     var writer = SegmentWriter.init(allocator, 0);
@@ -341,4 +360,32 @@ test "offline: a retired secret is recognised, with when, and others are not" {
     try testing.expectEqual(@as(?u64, null), try retiredAt(testing.allocator, root, "new"));
     var d: [10]u8 = undefined;
     try testing.expectEqualStrings("2025-10-09", formatDate(&d, 1_760_000_000));
+}
+
+test "offline: a skip is only of the entry the shard is halted at, and never of a config, a no-op or a skip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(root);
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es: [4]Entry = .{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&membership.Config.ofVoters(&.{1}), &cfg_buf)),
+        entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 1, 3, 30, ""),
+        entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 4, 40, "x"),
+    };
+    for (&es) |*e| e.header.crc32c = e.computeCrc();
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
+    var m = try apply_marker.Marker.open(root, 0);
+    defer m.close();
+    // Even halted there.
+    for (es[0..3], [_]anyerror{ error.NotSkippable, error.NotSkippable, error.IsSkip }) |*e, want| {
+        m.halted(e.header.index, e.header.term, e.header.crc32c);
+        try testing.expectError(want, skippable(root, 0, e));
+    }
+    m.halted(4, 1, es[3].header.crc32c);
+    try skippable(root, 0, &es[3]);
+    try testing.expectError(error.NotHalted, skippable(root, 1, &es[3]));
+    m.halted(4, 2, es[3].header.crc32c);
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
 }

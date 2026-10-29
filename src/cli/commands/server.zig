@@ -177,6 +177,9 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                         \\runs, on this build or any later one. Its client was told so. The
                         \\other entries apply in order.
                         \\
+                        \\Only the entry the shard is halted at is skipped: the one its last
+                        \\run halted at, or whose apply crashed it.
+                        \\
                         \\Without --yes it prints the entry it would skip and stops.
                     )
                     .examples(&.{
@@ -738,7 +741,7 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
 fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     const index = ctx.getUint("index") orelse 0;
     if (index == 0) return outcome.usage(ctx, "--index is required: the entry the shard halted at (its /status says, as halt_index)", .{});
-    const shard_flag = ctx.getUint("shard") orelse 0;
+    const shard_flag = ctx.getChangedUint("shard") orelse return outcome.usage(ctx, "--shard is required: the shard that halted (its /status says)", .{});
     if (shard_flag > std.math.maxInt(u16)) return outcome.usage(ctx, "--shard {d} is past the last shard", .{shard_flag});
     const shard: u16 = @intCast(shard_flag);
     var config = try offlineConfig(ctx);
@@ -773,15 +776,24 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     };
     const type_name = std.enums.tagName(@import("../../storage/ual/entry.zig").EntryType, @fromBackingInt(halted.header.entry_type)) orelse "unknown";
     ctx.print("\nshard {d}, entry {d}: {s}, term {d}, {d} bytes{s}\n", .{ shard, index, type_name, halted.header.term, halted.payload.len, if (index > sum.commit) " (not committed as last flushed)" else "" });
+    offline.skippable(dir, shard, &halted) catch |err| return skipRefusal(ctx, err, shard, index, &halted);
     if (!ctx.getBool("yes")) {
         ctx.print("Would append a repair at index {d} that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{sum.last_index + 1});
         return;
     }
-    const at = offline.repairSkip(ctx.allocator, dir, &sum, &halted, ctx.getString("reason") orelse "") catch |err| switch (err) {
-        error.IsSkip => return outcome.localRefusal(ctx, "entry {d} is itself a repair; a skip is never skipped", .{index}),
+    const at = offline.repairSkip(ctx.allocator, dir, shard, &sum, &halted, ctx.getString("reason") orelse "") catch |err| switch (err) {
+        error.IsSkip, error.NotSkippable, error.NotHalted => return skipRefusal(ctx, err, shard, index, &halted),
         else => return outcome.localRefusal(ctx, "cannot write the repair: {}", .{err}),
     };
     ctx.print("Entry {d} is skipped (repair at index {d}). Start the server: shard {d} comes up past it.\n", .{ index, at, shard });
+}
+
+fn skipRefusal(ctx: *commander.Context, err: anyerror, shard: u16, index: u64, halted: *const @import("../../storage/ual/entry.zig").Entry) commander.Error!void {
+    return switch (err) {
+        error.IsSkip => outcome.localRefusal(ctx, "entry {d} is itself a repair; a skip is never skipped", .{index}),
+        error.NotSkippable => outcome.localRefusal(ctx, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{index}),
+        else => outcome.localRefusal(ctx, "shard {d} is not halted at entry {d} (term {d}): only the entry a shard halted at is skipped. Start the server to see where it halts", .{ shard, index, halted.header.term }),
+    };
 }
 
 /// The data directory a server's PID file is in, as `server start` would

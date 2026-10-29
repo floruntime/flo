@@ -50,14 +50,34 @@ fn haltOne(ctx: *stdx.testing.TestContext) !Halted {
 }
 
 fn repairSkip(ctx: *stdx.testing.TestContext, h: Halted, yes: bool) !stdx.testing.CommandResult {
+    var shard_buf: [8]u8 = undefined;
+    const shard = try std.fmt.bufPrint(&shard_buf, "{d}", .{h.shard});
+    return repairSkipArgs(ctx, h.index, &.{ "--shard", shard }, yes);
+}
+
+fn repairSkipArgs(ctx: *stdx.testing.TestContext, index: i64, shard_args: []const []const u8, yes: bool) !stdx.testing.CommandResult {
     const offline = try CliRunner.init(testing.allocator, ctx.server.flo_binary, "127.0.0.1:1");
     defer offline.deinit();
-    var shard_buf: [8]u8 = undefined;
     var index_buf: [24]u8 = undefined;
-    const shard = try std.fmt.bufPrint(&shard_buf, "{d}", .{h.shard});
-    const index = try std.fmt.bufPrint(&index_buf, "{d}", .{h.index});
-    const base = [_][]const u8{ "server", "repair", "skip", "--config", ctx.server.config_file, "--data-dir", ctx.server.getDataDir(), "--shard", shard, "--index", index, "--reason", "e2e" };
-    return if (yes) offline.runRaw(&(base ++ [_][]const u8{"--yes"})) else offline.runRaw(&base);
+    var args: [16][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "server", "repair", "skip", "--config", ctx.server.config_file, "--data-dir", ctx.server.getDataDir() }) |a| {
+        args[n] = a;
+        n += 1;
+    }
+    for (shard_args) |a| {
+        args[n] = a;
+        n += 1;
+    }
+    for ([_][]const u8{ "--index", try std.fmt.bufPrint(&index_buf, "{d}", .{index}), "--reason", "e2e" }) |a| {
+        args[n] = a;
+        n += 1;
+    }
+    if (yes) {
+        args[n] = "--yes";
+        n += 1;
+    }
+    return offline.runRaw(args[0..n]);
 }
 
 /// Restart as a build with the faults off, which applies the halting entry.
@@ -146,4 +166,35 @@ test "e2e/repair: a running server's data directory is refused" {
     try testing.expect(refused.contains("in use by a running flo server"));
     try testing.expect(!refused.stdoutContains("is skipped"));
     try testing.expectEqual(h.index, ((try haltedShard(ctx.server.metrics_port)) orelse return error.NotHalted).index);
+}
+
+test "e2e/repair: only the entry a shard is halted at is skipped; an acked write is refused" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "kv", "set", "acked", "yes" });
+    ctx.server.stop();
+    {
+        var no_shard = try repairSkipArgs(ctx, 2, &.{}, true);
+        defer no_shard.deinit();
+        try testing.expect(no_shard.exit_code != 0);
+        try testing.expect(no_shard.contains("--shard is required"));
+    }
+    // Every entry the log holds, the noop and config among them: none is
+    // halted at, so none is skipped.
+    var held: usize = 0;
+    var index: i64 = 1;
+    while (index <= 16) : (index += 1) {
+        var r = try repairSkipArgs(ctx, index, &.{ "--shard", "0" }, true);
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(!r.stdoutContains("is skipped"));
+        if (r.contains("doesn't hold entry")) continue;
+        held += 1;
+        try testing.expect(r.contains("is not halted at entry") or r.contains("never skipped"));
+    }
+    try testing.expect(held >= 2);
+    try ctx.restartServer();
+    try testing.expectEqualStrings("yes", try ctx.execCapture(&.{ "kv", "get", "acked" }));
 }
