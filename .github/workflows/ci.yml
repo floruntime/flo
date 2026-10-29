@@ -130,8 +130,7 @@ jobs:
         # A hung test is killed at its step's limit and fails by name; the
         # job's timeout-minutes stays as the backstop. Each limit is about
         # three times the slowest test measured locally (unit: a VOPR swarm,
-        # 10-20 s; e2e: list paging and the namespace limit, 40-70 s), so a
-        # slower runner doesn't flake.
+        # 10-20 s), so a slower runner doesn't flake.
         #
         # `skips` is how many tests skip on Linux. A test that skips passes
         # silently, so a count off by one fails the step: update it, and the
@@ -143,19 +142,11 @@ jobs:
           - step: test-integration
             test_timeout: 60s
             skips: 0
-          - step: test-e2e
-            test_timeout: 300s
-            # The halt tests drive a fault only a test build carries; without
-            # it they skip, and the count catches it.
-            flags: -Dtest-faults=true
-            skips: 0
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-
-      # The e2e suite drives a real server, which embeds the console.
       - uses: actions/download-artifact@v4
         with:
           name: dashboard-dist
@@ -165,13 +156,10 @@ jobs:
         env:
           STEP: ${{ matrix.step }}
           TEST_TIMEOUT: ${{ matrix.test_timeout }}
-          FLAGS: ${{ matrix.flags }}
           SKIPS: ${{ matrix.skips }}
-          # The e2e runner appends each test's time here (tests/e2e/helpers/test_runner.zig).
-          FLO_TEST_TIMES: ${{ runner.temp }}/test-times.tsv
         run: |
           set -o pipefail
-          zig build "$STEP" --test-timeout "$TEST_TIMEOUT" $FLAGS --summary all 2>&1 | tee build.log
+          zig build "$STEP" --test-timeout "$TEST_TIMEOUT" --summary all 2>&1 | tee build.log
           summary=$(grep '^Build Summary:' build.log | tail -1)
           skipped=$(echo "$summary" | sed -n -E 's/.*[(, ]([0-9]+) skipped.*/\1/p')
           if [ "${skipped:-0}" != "$SKIPS" ]; then
@@ -179,25 +167,129 @@ jobs:
           fi
         timeout-minutes: 30
 
-      - name: Slowest tests
-        if: always() && matrix.step == 'test-e2e'
+  # The e2e suite runs as shards, whole files balanced on the per-file times
+  # in tests/e2e/shard_times.tsv (scripts/e2e-shard-times.sh refreshes them).
+  # The `test-e2e` job below checks that the shards add up to the whole suite.
+  e2e-shard:
+    name: test-e2e ${{ matrix.shard }}
+    needs: web
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/4', '2/4', '3/4', '4/4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The suite drives a real server, which embeds the console.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: src/node/dashboard/dist
+
+      # A hung test is killed at --test-timeout and fails by name, about three
+      # times the slowest test (list paging, 34 s on CI). The halt tests drive
+      # a fault only a -Dtest-faults build carries; without it they skip, and
+      # the skip count in test-e2e catches it.
+      - name: zig build test-e2e -De2e-shard=${{ matrix.shard }}
         env:
-          TIMES: ${{ runner.temp }}/test-times.tsv
+          SHARD: ${{ matrix.shard }}
+          # The e2e runner appends each test's time here (tests/e2e/helpers/test_runner.zig).
+          FLO_TEST_TIMES: ${{ runner.temp }}/shard/test-times.tsv
+          OUT: ${{ runner.temp }}/shard
         run: |
-          [ -s "$TIMES" ] || exit 0
+          set +e -o pipefail
+          mkdir -p "$OUT"
+          zig build test-e2e -De2e-shard="$SHARD" -Dtest-faults=true --test-timeout 300s --summary all 2>&1 | tee build.log
+          status=$?
+          grep '^Build Summary:' build.log | tail -1 > "$OUT/summary.txt"
+          exit $status
+        timeout-minutes: 30
+      # What test-e2e sums: the build's count of this shard's tests (written
+      # at configure time, so present even when the run fails), the run's
+      # summary line, and each test's time.
+      - name: Shard report
+        if: always()
+        env:
+          OUT: ${{ runner.temp }}/shard
+        run: |
+          mkdir -p "$OUT"
+          cp zig-out/e2e-shard.txt "$OUT/" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-times-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/shard/
+          if-no-files-found: ignore
+
+  # The required check. It fails unless every shard passed, the shards are
+  # exactly 1..N of one N, their tests add up to the whole suite, and their
+  # skips add up to `SKIPS`.
+  test-e2e:
+    name: test-e2e
+    needs: e2e-shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: e2e-test-times-*
+          path: shards
+      - name: Check the shards add up
+        env:
+          RESULT: ${{ needs.e2e-shard.result }}
+          # How many tests skip on Linux. A test that skips passes silently,
+          # so a count off by one fails here: update it only for a skip you
+          # meant.
+          SKIPS: 0
+        run: |
+          fail() { echo "::error::$*"; bad=1; }
+          bad=0
+          [ "$RESULT" = success ] || fail "a shard did not pass ($RESULT)"
+          n= ; total= ; sum_declared=0 ; sum_skipped=0 ; seen=
+          for d in shards/*/; do
+            info=$(cat "$d/e2e-shard.txt" 2>/dev/null) || { fail "$d has no shard report (it never configured)"; continue; }
+            i=$(echo "$info" | sed -E 's/^shard=([0-9]+)\/.*/\1/')
+            of=$(echo "$info" | sed -E 's/^shard=[0-9]+\/([0-9]+) .*/\1/')
+            declared=$(echo "$info" | sed -E 's/.* declared=([0-9]+).*/\1/')
+            t=$(echo "$info" | sed -E 's/.* total=([0-9]+).*/\1/')
+            summary=$(cat "$d/summary.txt" 2>/dev/null || true)
+            ran=$(echo "$summary" | sed -n -E 's/.*; [0-9]+\/([0-9]+) tests passed.*/\1/p')
+            skipped=$(echo "$summary" | sed -n -E 's/.*[(, ]([0-9]+) skipped.*/\1/p')
+            echo "shard $i/$of: declared $declared of $t; ${summary:-no summary}"
+            [ -z "$n" ] && n=$of && total=$t
+            [ "$of" = "$n" ] || fail "shard $i says N=$of, another says N=$n"
+            [ "$t" = "$total" ] || fail "shard $i says the suite has $t tests, another says $total"
+            case " $seen " in *" $i "*) fail "shard $i ran twice";; esac
+            seen="$seen $i"
+            # The root's own tests and the sentinel run in every shard on top.
+            [ "${ran:-0}" -ge "$declared" ] || fail "shard $i ran ${ran:-0} tests, fewer than its $declared"
+            sum_declared=$((sum_declared + declared))
+            sum_skipped=$((sum_skipped + ${skipped:-0}))
+          done
+          [ -n "$n" ] || fail "no shard reported"
+          for i in $(seq 1 "${n:-0}"); do
+            case " $seen " in *" $i "*) ;; *) fail "shard $i/$n did not report";; esac
+          done
+          [ "$sum_declared" = "${total:-x}" ] || fail "the shards hold $sum_declared tests, the suite $total"
+          [ "$sum_skipped" = "$SKIPS" ] || fail "$sum_skipped tests skipped, expected $SKIPS"
+          exit $bad
+      - name: Slowest tests
+        if: always()
+        run: |
+          times=$(find shards -name test-times.tsv)
+          [ -n "$times" ] || exit 0
           {
             echo '### Slowest e2e tests (ms)'; echo '```'
-            sort -rn "$TIMES" | head -20
+            cat $times | sort -rn | head -20
+            echo '```'; echo '### e2e time per shard (s)'; echo '```'
+            for f in $times; do printf '%s\t%s\n' "$(awk -F'\t' '{ s += $1 } END { printf "%d", s / 1000 }' "$f")" "$(cat "$(dirname "$f")/e2e-shard.txt" 2>/dev/null | cut -d' ' -f1)"; done
             echo '```'; echo '### e2e time per file (ms)'; echo '```'
-            awk -F'\t' '{ f = $2; sub(/\.test\..*/, "", f); t[f] += $1; n[f]++ } END { for (f in t) printf "%d\t%d\t%s\n", t[f], n[f], f }' "$TIMES" | sort -rn
+            cat $times | awk -F'\t' '{ f = $2; sub(/\.test\..*/, "", f); t[f] += $1; n[f]++ } END { for (f in t) printf "%d\t%d\t%s\n", t[f], n[f], f }' | sort -rn
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: always() && matrix.step == 'test-e2e'
-        with:
-          name: e2e-test-times
-          path: ${{ runner.temp }}/test-times.tsv
-          if-no-files-found: ignore
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
