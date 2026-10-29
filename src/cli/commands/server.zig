@@ -5,6 +5,7 @@
 //!   flo server stop [--data-dir ./data] [--force]
 //!   flo server status [--data-dir ./data]
 //!   flo server repair skip --data-dir ./data --shard N --index I [--yes]
+//!   flo server salvage --data-dir ./data --shard N --truncate-after I [--yes]
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -194,6 +195,31 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     .boolFlag("yes", 0, "Append the repair")
                     .action(wrapHandler(runRepairSkip)),
             ),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("salvage")
+                .about("Cut a stopped single node's damaged shard back to what reads")
+                .longAbout(
+                    \\For a shard offline on a single node because its data won't read (its
+                    \\/status says why). On the stopped node, it drops every entry after the
+                    \\one named, and the shard comes up with the entries through it. What it
+                    \\drops is gone for good, committed writes included: their clients were
+                    \\told they succeeded.
+                    \\
+                    \\Without --yes it prints what it would drop, and the highest entry it can
+                    \\keep (the last before the damage), and stops.
+                )
+                .examples(&.{
+                    "flo server salvage --data-dir /var/lib/flo --shard 3 --truncate-after 18233",
+                    "flo server salvage --data-dir /var/lib/flo --shard 3 --truncate-after 18233 --yes",
+                })
+                .stringFlag("config", 'c', "", "Config file naming the data directory")
+                .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
+                .uintFlag("shard", 0, 0, "The damaged shard")
+                .uintFlag("truncate-after", 0, 0, "The last entry to keep")
+                .boolFlag("yes", 0, "Drop the entries")
+                .action(wrapHandler(runSalvage)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -645,6 +671,18 @@ fn offlineConfig(ctx: *commander.Context) commander.Error!server_config.ServerCo
 
 /// Lock the data dir and read its cluster group, printing what it holds.
 fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.File) commander.Error!offline.Summary {
+    try lockOffline(ctx, data_dir, lock);
+    const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
+        stdx.fs.closeFile(lock.*);
+        return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
+    };
+    printGroup(ctx, data_dir, &sum);
+    return sum;
+}
+
+/// Lock the data dir, refusing a running server's and a format this binary
+/// doesn't read.
+fn lockOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.File) commander.Error!void {
     lock.* = runtime_mod.lockExistingDataDir(data_dir) catch |err| return switch (err) {
         error.DataDirMissing => outcome.usage(ctx, "data directory {s} does not exist", .{data_dir}),
         error.DataDirInUse => outcome.localRefusal(ctx, "data directory {s} is in use by a running flo server; stop it first", .{data_dir}),
@@ -660,10 +698,9 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         stdx.fs.closeFile(lock.*);
         return outcome.localRefusal(ctx, "{s}", .{r.message});
     }
-    const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
-        stdx.fs.closeFile(lock.*);
-        return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
-    };
+}
+
+fn printGroup(ctx: *commander.Context, data_dir: []const u8, sum: *const offline.Summary) void {
     ctx.print("data dir:    {s} (cluster group)\n", .{data_dir});
     if (sum.hard_state) |hs| {
         ctx.print("hard state:  node {d}, term {d}, voted for {d}{s}\n", .{ hs.node_id, hs.term, hs.voted_for, if (hs.lost_log) "; lost-log guard on, not voting yet" else "" });
@@ -683,7 +720,6 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         ctx.print("members:     no member list in the log\n", .{});
     }
     if (sum.truncation_pending) ctx.print("note:        a log truncation is pending; the server finishes it at its next start\n", .{});
-    return sum;
 }
 
 fn runInspect(ctx: *commander.Context) commander.Error!void {
@@ -794,6 +830,76 @@ fn skipRefusal(ctx: *commander.Context, err: anyerror, shard: u16, index: u64, h
         error.NotSkippable => outcome.localRefusal(ctx, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{index}),
         else => outcome.localRefusal(ctx, "shard {d} is not halted at entry {d} (term {d}): only the entry a shard halted at is skipped. Start the server to see where it halts", .{ shard, index, halted.header.term }),
     };
+}
+
+fn runSalvage(ctx: *commander.Context) commander.Error!void {
+    const shard_flag = ctx.getChangedUint("shard") orelse return outcome.usage(ctx, "--shard is required: the shard that is offline (its /status says)", .{});
+    if (shard_flag > std.math.maxInt(u16)) return outcome.usage(ctx, "--shard {d} is past the last shard", .{shard_flag});
+    const shard: u16 = @intCast(shard_flag);
+    const after = ctx.getChangedUint("truncate-after") orelse return outcome.usage(ctx, "--truncate-after is required: the last entry to keep (run with any value to see the highest that reads)", .{});
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
+    defer ctx.allocator.free(data_dir);
+    var lock: stdx.fs.File = undefined;
+    try lockOffline(ctx, data_dir, &lock);
+    defer stdx.fs.closeFile(lock);
+
+    // The group's log may be the damaged one, so it is read only as far as
+    // it reads.
+    var group_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const group_dir = offline.groupDir(&group_buf, data_dir) catch return outcome.usage(ctx, "data directory path too long", .{});
+    const group = offline.readable(ctx.allocator, group_dir) catch |err| {
+        return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
+    };
+    // A member's copy is replaced by rejoining; cut here, it would hold
+    // less than the group says it does.
+    if (group.member_count > 1) {
+        return outcome.localRefusal(ctx, "this data directory belongs to a cluster of {d}; a member's damaged shard is recovered by rejoining (move the data directory aside and start with --join), not by salvage", .{group.member_count});
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = offline.shardDir(&dir_buf, data_dir, shard) catch return outcome.usage(ctx, "data directory path too long", .{});
+    if (stdx.fs.openDir(dir, .{})) |d| stdx.fs.closeDir(d) else |_| {
+        return outcome.localRefusal(ctx, "{s} has no shard {d}", .{ data_dir, shard });
+    }
+    const r = offline.readable(ctx.allocator, dir) catch |err| return switch (err) {
+        error.LogStartsAfterOne => outcome.localRefusal(ctx, "shard {d}'s log doesn't start at entry 1, and salvage only cuts a log that holds its whole history", .{shard}),
+        error.OverlappingSegments => outcome.localRefusal(ctx, "two of shard {d}'s segments hold the same entry with no cut pending, so nothing says which is the log", .{shard}),
+        else => outcome.localRefusal(ctx, "cannot read shard {d}'s log: {}", .{ shard, err }),
+    };
+    ctx.print("data dir:    {s}, shard {d}\n", .{ data_dir, shard });
+    ctx.print("log:         indices {d}..{d}{s}, reads through {d}\n", .{ r.first_index, r.last_index, if (r.unreadable_headers > 0) " or more" else "", r.through });
+    if (r.damage()) |why| ctx.print("damage:      {s}\n", .{why});
+    ctx.print("committed:   through {d} (as last flushed)\n", .{r.commit});
+    if (r.pending_cut) |j| ctx.print("note:        a cut after {d} is pending\n", .{j});
+
+    offline.checkSalvage(&r, after) catch |err| return switch (err) {
+        error.NoLog => outcome.localRefusal(ctx, "shard {d} has no log; there is nothing to salvage", .{shard}),
+        error.PendingCutLower => outcome.localRefusal(ctx, "a cut after entry {d} is already pending on shard {d}, and it drops more than this would: run salvage with --truncate-after {d} or lower, or start and stop the server once to finish it", .{ r.pending_cut.?, shard, r.pending_cut.? }),
+        error.PastReadable => if (r.damage() != null)
+            outcome.localRefusal(ctx, "entry {d} is past the damage: the highest entry shard {d} can keep is {d}. Run again with --truncate-after {d}", .{ after, shard, r.through, r.through })
+        else
+            outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
+        error.NothingToCut => outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
+    };
+    const lost = offline.lostAfter(&r, after);
+    const more = if (lost.at_least) "at least " else "";
+    ctx.print("\nWARNING: this drops {s}{d} entries after entry {d} from shard {d}, {s}{d} of them committed as last flushed.\n", .{ more, lost.entries, after, shard, more, lost.committed });
+    ctx.print("A committed entry is a write its client was told succeeded. Dropped, it is gone from this node for good.\n", .{});
+    if (!ctx.getBool("yes")) {
+        ctx.print("\nWould cut shard {d}'s log after entry {d}. Run again with --yes to do it.\n", .{ shard, after });
+        return;
+    }
+    const cleared = offline.salvage(ctx.allocator, dir, shard, &r, after) catch |err| return switch (err) {
+        error.SegmentUnreadable => outcome.localRefusal(ctx, "a segment of shard {d} that holds entries at or below {d} won't read; the cut is recorded, and finishes when salvage runs again with a lower --truncate-after", .{ shard, after }),
+        error.SalvageIncomplete => outcome.localRefusal(ctx, "shard {d}'s log still holds entries after {d} once cut; leave the data directory as it is and report this", .{ shard, after }),
+        else => outcome.localRefusal(ctx, "cannot cut shard {d}'s log: {}. The cut is recorded; run salvage again to finish it", .{ shard, err }),
+    };
+    if (cleared.crash) |c| ctx.print("Cleared the crash on entry {d}, which the cut dropped.\n", .{c.index});
+    if (cleared.halt) |h| ctx.print("Cleared the halt at entry {d}, which the cut dropped.\n", .{h.index});
+    ctx.print("\nShard {d}'s log now ends at entry {d}. Start the server: the shard comes up with the entries through it.\n", .{ shard, after });
 }
 
 /// The data directory a server's PID file is in, as `server start` would

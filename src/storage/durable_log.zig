@@ -27,6 +27,9 @@ pub const SegmentFile = struct {
     commit_index_at_seal: u64,
     /// The header says it holds a repair skip.
     holds_skip: bool = false,
+    /// The header would not read; listed only by a recovery listing, with
+    /// first_index from the filename and the rest unknown.
+    unreadable: bool = false,
     path: []const u8,
 };
 
@@ -157,6 +160,20 @@ pub const DurableLog = struct {
         try self.clearIntent();
     }
 
+    /// Drop every entry above `after_index` from a stopped shard whose log
+    /// may be damaged above it: an offline salvage. The cut is recorded
+    /// first, as `truncateAfter` records it, and finished by the recovery
+    /// pass, which deletes a file wholly above the cut even when its header
+    /// won't read. A cut already pending lower is kept. Fails with
+    /// `SegmentUnreadable` when a damaged file holds entries at or below
+    /// `after_index`.
+    pub fn salvageAfter(self: *DurableLog, after_index: u64) !void {
+        std.debug.assert(self.writer.entry_count == 0);
+        const pending = try self.readIntent();
+        try self.writeIntent(@min(after_index, pending orelse after_index));
+        try self.recoverTruncation();
+    }
+
     /// Finish a truncation that did not complete: one a previous run
     /// recorded on disk, or one this run still holds in memory, whichever
     /// cuts lower. A no-op with neither.
@@ -169,6 +186,9 @@ pub const DurableLog = struct {
         const files = try self.listSegments(false);
         defer self.freeSegments(files);
         try self.applyCut(files, after_index);
+        // A file whose header wouldn't read was above the cut, or applyCut
+        // refused: it is gone now, and so is the damage it named.
+        self.bad_header_len = 0;
         try self.clearIntent();
         self.invalidate();
         self.pending_cut = null;
@@ -211,6 +231,7 @@ pub const DurableLog = struct {
         var deleted: usize = 0;
         for (files) |f| {
             if (f.first_index <= after_index and f.last_index > after_index) {
+                if (f.unreadable) return error.SegmentUnreadable;
                 try self.rewriteBelow(f, after_index);
                 rewritten += 1;
             }
@@ -256,10 +277,13 @@ pub const DurableLog = struct {
 
     /// Sealed segments in index order, read fresh from the directory.
     /// Two files holding the same index means a truncation never finished
-    /// and replay would pick one silently; with `check_overlap` that is an
-    /// error. Recovery turns it off because it is there to fix exactly
-    /// that. Caller frees with `freeSegments`.
-    pub fn listSegments(self: *DurableLog, check_overlap: bool) ![]SegmentFile {
+    /// and replay would pick one silently; `strict` makes that an error, and
+    /// a header that won't read too. Recovery is not strict, because it is
+    /// there to fix exactly that: it lists a file whose header won't read as
+    /// `unreadable`, by its filename, so a cut below it can delete it (the
+    /// name is still recorded for `badHeaderSegment`). Caller frees with
+    /// `freeSegments`.
+    pub fn listSegments(self: *DurableLog, strict: bool) ![]SegmentFile {
         var files: std.ArrayListUnmanaged(SegmentFile) = .empty;
         errdefer {
             for (files.items) |f| self.allocator.free(f.path);
@@ -284,7 +308,17 @@ pub const DurableLog = struct {
                 const kept = @min(de.name.len, self.bad_header.len);
                 @memcpy(self.bad_header[0..kept], de.name[0..kept]);
                 self.bad_header_len = kept;
-                return err;
+                if (strict) return err;
+                const digits = de.name[0 .. de.name.len - ".flseg".len];
+                const first = std.fmt.parseInt(u64, digits, 10) catch return err;
+                try files.append(self.allocator, .{
+                    .first_index = first,
+                    .last_index = std.math.maxInt(u64),
+                    .commit_index_at_seal = 0,
+                    .unreadable = true,
+                    .path = path,
+                });
+                continue;
             };
             try files.append(self.allocator, .{
                 .first_index = hdr.first_index,
@@ -295,7 +329,7 @@ pub const DurableLog = struct {
             });
         }
         std.mem.sort(SegmentFile, files.items, {}, lessByFirstIndex);
-        if (check_overlap and files.items.len > 1) {
+        if (strict and files.items.len > 1) {
             for (files.items[1..], 0..) |f, i| {
                 const prev = files.items[i];
                 if (f.first_index <= prev.last_index) {
@@ -981,4 +1015,91 @@ test "durable log: a cut retried after its deletes already happened still syncs 
     try dl.recoverTruncation();
     try testing.expectEqual(before + 1, stdx.fs.dir_syncs.load(.monotonic));
     try testing.expect((try dl.readIntent()) == null);
+}
+
+fn corruptHeader(path: []const u8) !void {
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(bytes);
+    bytes[0] ^= 0xff;
+    const file = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAll(file, bytes);
+}
+
+test "durable log: a salvage deletes a file above the cut whose header won't read, and refuses one it would rewrite" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |i| {
+        try writer.addEntry(&testEntry(i, 1, "x"));
+        if (i % 2 == 0) try dl.flush(i);
+    }
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    try fileNames(td.path, &names);
+    var path_buf: [512]u8 = undefined;
+    // Entries 3-4 sit in a file whose header won't read.
+    try corruptHeader(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ td.path, names.items[1] }));
+    try testing.expectError(error.InvalidHeaderMagic, dl.listSegments(true));
+
+    // A cut that would rewrite it is refused, with the cut still recorded.
+    try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(3));
+    try testing.expectEqual(@as(?u64, 3), try dl.readIntent());
+
+    try dl.salvageAfter(2);
+    try testing.expectEqual(@as(usize, 0), dl.badHeaderSegment().len);
+    try testing.expect((try dl.readIntent()) == null);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(usize, 1), files.len);
+    try testing.expectEqual(@as(u64, 2), files[0].last_index);
+    try testing.expectEqual(@as(u64, 2), try dl.watermark());
+}
+
+test "durable log: a salvage below a pending cut records its own cut first, and one above keeps the lower" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    for ([_]u64{ 1, 2, 3, 4 }) |i| {
+        try writer.addEntry(&testEntry(i, 1, "x"));
+        if (i % 2 == 0) try dl.flush(i);
+    }
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    try fileNames(td.path, &names);
+    var path_buf: [512]u8 = undefined;
+    // The cut below fails on the damaged first file, after recording itself:
+    // a crash there finishes at 1, not at the pending 3.
+    try corruptHeader(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ td.path, names.items[0] }));
+    try dl.writeIntent(3);
+    try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(1));
+    try testing.expectEqual(@as(?u64, 1), try dl.readIntent());
+    try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(2));
+    try testing.expectEqual(@as(?u64, 1), try dl.readIntent());
+}
+
+test "durable log: a recovery listing refuses a damaged file whose name is not an index" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/backup.flseg", .{td.path});
+    const file = try stdx.fs.createFile(path, .{});
+    stdx.fs.closeFile(file);
+    try testing.expectError(error.TooSmall, dl.listSegments(false));
 }

@@ -11,6 +11,7 @@ const membership = @import("../raft/membership.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const durable_log_mod = @import("../storage/durable_log.zig");
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
 const repair = @import("repair.zig");
 const apply_marker = @import("apply_marker.zig");
 
@@ -216,6 +217,168 @@ pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum
     return index;
 }
 
+// ─── Salvage ─────────────────────────────────────────────────────────────────
+
+/// What a stopped shard's log holds, read as far as it reads: the walk
+/// stops at the first segment that won't read, an entry that won't parse,
+/// or a hole, and everything past it is counted from the headers that do
+/// read.
+pub const Readable = struct {
+    first_index: u64 = 0,
+    /// The last entry read in order from the start: the highest index a
+    /// salvage can keep.
+    through: u64 = 0,
+    /// The highest index a readable header names.
+    last_index: u64 = 0,
+    /// The highest commit a readable header was sealed under.
+    commit: u64 = 0,
+    /// Files whose header won't read: what they held is not counted.
+    unreadable_headers: usize = 0,
+    /// Why the walk stopped short of `last_index`, if it did.
+    damage_buf: [160]u8 = undefined,
+    damage_len: usize = 0,
+    /// A cut a previous run recorded but did not finish.
+    pending_cut: ?u64 = null,
+    /// The member list's size, from the latest config the walk read.
+    member_count: usize = 0,
+
+    pub fn damage(self: *const Readable) ?[]const u8 {
+        return if (self.damage_len == 0) null else self.damage_buf[0..self.damage_len];
+    }
+
+    fn stop(self: *Readable, comptime fmt: []const u8, args: anytype) void {
+        if (self.damage_len != 0) return;
+        self.damage_len = if (std.fmt.bufPrint(&self.damage_buf, fmt, args)) |m| m.len else |_| self.damage_buf.len;
+    }
+};
+
+/// Read the stopped shard in `dir` for a salvage. Writes nothing.
+pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
+    var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
+    var r: Readable = .{};
+    var intent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const intent = try std.fmt.bufPrint(&intent_buf, "{s}/{s}", .{ segs, durable_log_mod.INTENT_FILENAME });
+    var text: [32]u8 = undefined;
+    if (stdx.fs.readFile(intent, &text)) |t| {
+        r.pending_cut = std.fmt.parseInt(u64, std.mem.trim(u8, t, " \n\r\t"), 10) catch return error.CorruptTruncateIntent;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    var writer = SegmentWriter.init(allocator, 0);
+    defer writer.deinit();
+    var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
+    defer dl.deinit();
+    const files = try dl.listSegments(false);
+    defer dl.freeSegments(files);
+    if (files.len == 0) return r;
+    // A cut past the pending one is already decided.
+    const end = r.pending_cut orelse std.math.maxInt(u64);
+    for (files, 0..) |f, i| {
+        if (f.unreadable) {
+            r.unreadable_headers += 1;
+            continue;
+        }
+        r.last_index = @max(r.last_index, @min(f.last_index, end));
+        r.commit = @max(r.commit, f.commit_index_at_seal);
+        // Overlap is a pending cut's leftover; without one, nothing says
+        // which copy is the log.
+        if (r.pending_cut == null and i > 0 and !files[i - 1].unreadable and f.first_index <= files[i - 1].last_index)
+            return error.OverlappingSegments;
+    }
+    r.first_index = files[0].first_index;
+    // Nothing on disk records a snapshot, so a log that doesn't start at 1
+    // has lost its start some other way, and replay can't rebuild from it.
+    if (r.first_index > 1) return error.LogStartsAfterOne;
+
+    var next: u64 = r.first_index;
+    walk: for (files) |f| {
+        const name = std.fs.path.basename(f.path);
+        if (next > end) break;
+        if (f.first_index < next) continue; // a pending cut's leftover
+        if (f.unreadable) {
+            r.stop("segment {s} has a header that will not read", .{name});
+            break;
+        }
+        if (f.first_index != next) {
+            r.stop("no segment holds entries {d}..{d}", .{ next, f.first_index - 1 });
+            break;
+        }
+        const opened = SegmentReader.initFromFile(allocator, f.path) catch |err| {
+            r.stop("segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+            break;
+        };
+        defer allocator.free(opened.buf);
+        var offset: usize = 0;
+        const data_len = opened.reader.data_end - opened.reader.data_start;
+        while (offset < data_len and next <= end) {
+            const e = opened.reader.readEntryAt(offset) orelse {
+                r.stop("segment {s} holds an entry at byte {d} that will not parse", .{ name, offset });
+                break :walk;
+            };
+            const etype = std.enums.fromInt(entry_mod.EntryType, e.header.entry_type) orelse {
+                r.stop("segment {s} holds an entry at byte {d} of unknown type 0x{x:0>2}", .{ name, offset, e.header.entry_type });
+                break :walk;
+            };
+            if (e.header.index != next) {
+                r.stop("segment {s} holds entry {d} where {d} was next", .{ name, e.header.index, next });
+                break :walk;
+            }
+            if (etype == .raft_config) if (membership.decode(e.payload)) |cfg| {
+                var ids: [membership.MAX_MEMBERS]u32 = undefined;
+                r.member_count = cfg.ids(&ids).len;
+            };
+            r.through = next;
+            next += 1;
+            offset += e.totalSize();
+        }
+    }
+    if (r.damage_len == 0 and r.unreadable_headers > 0) r.stop("{d} segment(s) have a header that will not read", .{r.unreadable_headers});
+    return r;
+}
+
+/// Entries a cut after `after` drops, as far as the readable headers say,
+/// and how many of them were committed as last flushed.
+pub const Lost = struct { entries: u64, committed: u64, at_least: bool };
+
+pub fn lostAfter(r: *const Readable, after: u64) Lost {
+    return .{
+        .entries = r.last_index -| after,
+        .committed = r.commit -| after,
+        .at_least = r.unreadable_headers > 0,
+    };
+}
+
+pub const SalvageCutError = error{ NoLog, PastReadable, NothingToCut, PendingCutLower };
+
+/// Drop every entry above `after` from the stopped shard `shard` in `dir`,
+/// and clear the marker records that name one. `r` is `readable(dir)`.
+/// Returns the marker records it cleared.
+pub fn salvage(allocator: std.mem.Allocator, dir: []const u8, shard: u16, r: *const Readable, after: u64) !apply_marker.Held {
+    try checkSalvage(r, after);
+    var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
+    var writer = SegmentWriter.init(allocator, 0);
+    defer writer.deinit();
+    var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
+    defer dl.deinit();
+    try dl.salvageAfter(after);
+    // Read back strictly: nothing past the cut, and no commit past it.
+    for (try dl.segments()) |f| if (f.last_index > after) return error.SalvageIncomplete;
+    if (try dl.watermark() > after) return error.SalvageIncomplete;
+    return apply_marker.clearAbove(dir, shard, after);
+}
+
+/// Whether a salvage may cut `r` after `after`.
+pub fn checkSalvage(r: *const Readable, after: u64) SalvageCutError!void {
+    if (r.last_index == 0 and r.unreadable_headers == 0) return error.NoLog;
+    if (r.pending_cut) |j| if (after > j) return error.PendingCutLower;
+    if (after > r.through) return error.PastReadable;
+    if (after >= r.last_index and r.unreadable_headers == 0) return error.NothingToCut;
+}
+
 // ─── Retired secrets ─────────────────────────────────────────────────────────
 
 /// Secrets `force-members` retired, one per line: the hex SHA-256
@@ -388,4 +551,113 @@ test "offline: a skip is only of the entry the shard is halted at, and never of 
     try testing.expectError(error.NotHalted, skippable(root, 1, &es[3]));
     m.halted(4, 2, es[3].header.crc32c);
     try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
+}
+
+fn kvEntries(comptime first: u64, comptime n: usize) [n]Entry {
+    var es: [n]Entry = undefined;
+    for (&es, 0..) |*e, i| {
+        e.* = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, first + i, (first + i) * 10, "v");
+        e.header.crc32c = e.computeCrc();
+    }
+    return es;
+}
+
+fn damageSegment(dir: []const u8, first: u64, at: usize) !void {
+    var name_buf: [64]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/segs/{s}", .{ dir, @import("../storage/ual/segment.zig").segmentFilename(&name_buf, first).? });
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(bytes);
+    bytes[at] ^= 0xff;
+    const file = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAll(file, bytes);
+}
+
+test "offline: salvage reads up to a header that won't read, counts what lies past it as lost, and keeps the rest" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    try writeLog(dir, &kvEntries(1, 3), 3);
+    try writeLog(dir, &kvEntries(4, 3), 6);
+    try writeLog(dir, &kvEntries(7, 3), 8);
+    try damageSegment(dir, 4, 0);
+
+    const r = try readable(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 3), r.through);
+    try testing.expectEqual(@as(u64, 9), r.last_index);
+    try testing.expectEqual(@as(u64, 8), r.commit);
+    try testing.expect(std.mem.indexOf(u8, r.damage().?, "0000000004.flseg") != null);
+    const lost = lostAfter(&r, 3);
+    try testing.expectEqual(@as(u64, 6), lost.entries);
+    try testing.expectEqual(@as(u64, 5), lost.committed);
+    try testing.expect(lost.at_least);
+    // At or past the damage: refused, not clamped.
+    try testing.expectError(error.PastReadable, checkSalvage(&r, 4));
+
+    const crashed = kvEntries(7, 1)[0];
+    try apply_marker.writeCrashForTest(dir, 2, &crashed, apply_marker.build_name);
+    {
+        var m = try apply_marker.Marker.open(dir, 2);
+        defer m.close();
+        m.halted(5, 1, 0);
+    }
+    const cleared = try salvage(testing.allocator, dir, 2, &r, 2);
+    try testing.expectEqual(@as(u64, 7), cleared.crash.?.index);
+    try testing.expectEqual(@as(u64, 5), cleared.halt.?.index);
+    const held = apply_marker.read(dir, 2);
+    try testing.expect(held.crash == null and held.halt == null);
+
+    const after = try summarizeDir(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 2), after.last_index);
+    try testing.expectEqual(@as(u64, 2), after.commit);
+    try testing.expect(!after.truncation_pending);
+}
+
+test "offline: salvage stops at a segment whose entries fail their checksum, and refuses a cut with nothing to drop" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    try writeLog(dir, &kvEntries(1, 2), 2);
+    try writeLog(dir, &kvEntries(3, 2), 4);
+    var r = try readable(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 4), r.through);
+    try testing.expect(r.damage() == null);
+    try testing.expectError(error.NothingToCut, checkSalvage(&r, 4));
+    try checkSalvage(&r, 3);
+
+    try damageSegment(dir, 3, @import("../storage/ual/segment.zig").HEADER_SIZE + 2);
+    r = try readable(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 2), r.through);
+    try testing.expect(std.mem.indexOf(u8, r.damage().?, "unreadable") != null);
+    const lost = lostAfter(&r, 2);
+    try testing.expectEqual(@as(u64, 2), lost.entries);
+    try testing.expect(!lost.at_least);
+    _ = try salvage(testing.allocator, dir, 0, &r, 2);
+    try testing.expectEqual(@as(u64, 2), (try summarizeDir(testing.allocator, dir)).last_index);
+}
+
+test "offline: salvage keeps a lower pending cut and refuses one above it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    try writeLog(dir, &kvEntries(1, 6), 6);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const intent = try std.fmt.bufPrint(&path_buf, "{s}/segs/{s}", .{ dir, durable_log_mod.INTENT_FILENAME });
+    const f = try stdx.fs.createFile(intent, .{});
+    try stdx.fs.writeAll(f, "4\n");
+    stdx.fs.closeFile(f);
+
+    const r = try readable(testing.allocator, dir);
+    try testing.expectEqual(@as(?u64, 4), r.pending_cut);
+    try testing.expectEqual(@as(u64, 4), r.through);
+    try testing.expectEqual(@as(u64, 4), r.last_index);
+    try testing.expectError(error.PendingCutLower, checkSalvage(&r, 5));
+    _ = try salvage(testing.allocator, dir, 0, &r, 3);
+    const after = try summarizeDir(testing.allocator, dir);
+    try testing.expectEqual(@as(u64, 3), after.last_index);
+    try testing.expect(!after.truncation_pending);
 }
