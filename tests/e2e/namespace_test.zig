@@ -33,6 +33,16 @@ test "e2e/namespace: create and list" {
     // Verify it appears in the list
     const list = try ctx.execCapture(&.{ "ns", "ls" });
     try testing.expect(std.mem.indexOf(u8, list, "myapp") != null);
+    // As JSON, an object per name, in name order.
+    var json = try ctx.cli.run(&.{ "ns", "ls", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    try testing.expectEqualStrings("[{\"name\":\"default\"},{\"name\":\"myapp\"}]\n", json.stdout);
+    // "default" was never created.
+    var builtin = try ctx.cli.run(&.{ "ns", "info", "default" });
+    defer builtin.deinit();
+    try testing.expectEqual(@as(u8, 0), builtin.exit_code);
+    try testing.expectEqualStrings("Namespace:  default\nCreated at: built in\n", builtin.stdout);
 }
 
 test "e2e/namespace: create multiple namespaces" {

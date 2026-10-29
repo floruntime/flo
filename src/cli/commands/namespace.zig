@@ -153,7 +153,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             switch (format) {
                 .json => {
                     if (shown > 0) out.append(ctx.allocator, ',') catch return outcome.malformed(ctx, "namespace.list answer");
-                    out.print(ctx.allocator, "{f}", .{output.jsonString(name)}) catch return outcome.malformed(ctx, "namespace.list answer");
+                    // An object per name, so fields can join it later.
+                    out.print(ctx.allocator, "{{\"name\":{f}}}", .{output.jsonString(name)}) catch return outcome.malformed(ctx, "namespace.list answer");
                 },
                 .raw => out.print(ctx.allocator, "{s}\n", .{name}) catch return outcome.malformed(ctx, "namespace.list answer"),
                 .table => table.addRow(&.{name}) catch return outcome.malformed(ctx, "namespace.list answer"),
@@ -161,6 +162,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             shown += 1;
         }
         const next = page.cursor orelse break;
+        // A cursor that doesn't move on would page forever.
+        if (std.mem.order(u8, next, cursor) != .gt) return outcome.malformed(ctx, "namespace.list answer (its cursor didn't advance)");
         @memcpy(cursor_buf[0..next.len], next);
         cursor = cursor_buf[0..next.len];
     }
@@ -191,7 +194,8 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
         .json => ctx.print("{{\"name\":{f},\"created_at_ms\":{d}}}\n", .{ output.jsonString(name), info.created_at_ms }),
         else => {
             ctx.print("Namespace:  {s}\n", .{name});
-            ctx.print("Created at: {d} (ms since the epoch)\n", .{info.created_at_ms});
+            // "default" was never created: it is there from the start.
+            if (info.created_at_ms == 0) ctx.print("Created at: built in\n", .{}) else ctx.print("Created at: {d} (ms since the epoch)\n", .{info.created_at_ms});
         },
     }
 }

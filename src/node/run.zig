@@ -49,12 +49,6 @@ pub const Refused = struct {
 /// held here for a leader. Everyone may run every other op, until clients
 /// authenticate; then this is the one function that changes.
 pub fn authorize(principal: Principal, origin: Origin, req: proto.Request) union(enum) { ok: Authorized, refused: Refused } {
-    // An internal op from a client is answered as an op no handler serves,
-    // so the client port says nothing of what peers send.
-    if (table.isInternal(req.header.op_code)) switch (origin) {
-        .shard, .peer, .held => {},
-        .client, .admin => return .{ .refused = unknownOp(req.header.op_code) },
-    };
     if (adminOnly(req.header.op_code)) switch (origin) {
         .admin, .peer, .held => {},
         .client, .shard => return .{ .refused = .{ .status = .unauthorized, .refusal = .{ .reason = .admin_only, .ran = .no, .message = ADMIN_ONLY_MESSAGE } } },
@@ -63,14 +57,21 @@ pub fn authorize(principal: Principal, origin: Origin, req: proto.Request) union
 }
 
 /// The refusal of an op no handler serves: the dispatcher's for an unknown
-/// code, and an internal op's from a client. Its message is valid until the
-/// thread's next call.
+/// code, and an internal op's from a client (`Shard.dispatchLocal`). Its
+/// message is valid until the thread's next call.
 pub fn unknownOp(op: u16) Refused {
     const S = struct {
         threadlocal var buf: [32]u8 = undefined;
     };
     const message = std.fmt.bufPrint(&S.buf, "unknown op 0x{x}", .{op}) catch unreachable;
     return .{ .status = .bad_request, .refusal = .{ .reason = .unknown_op, .ran = .no, .message = message } };
+}
+
+/// An op only another shard or node sends, from a client's socket or the
+/// admin socket: answered exactly as an unknown op, wherever that would be
+/// answered, so the client port says nothing of what peers send.
+pub fn internalFromClient(op: u16, origin: Origin) bool {
+    return table.isInternal(op) and (origin == .client or origin == .admin);
 }
 
 pub const ADMIN_ONLY_MESSAGE = "unauthorized: this op is served only on the node's admin socket (admin.sock in its data directory, unless [admin] socket places it elsewhere); run the command on the node itself";

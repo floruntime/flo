@@ -1513,6 +1513,9 @@ pub const Shard = struct {
             }
         }
 
+        // An internal op from a client runs where an unknown op would: here.
+        if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
+
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
             .local => self.dispatchLocal(conn, req, auth),
@@ -1533,7 +1536,7 @@ pub const Shard = struct {
     /// routing, decided before anything runs.
     fn forwardTarget(self: *Shard, req: proto.Request) ?ForwardTo {
         const op = req.header.op_code;
-        if (op >= proto.MAX_OPCODES) return null;
+        if (op >= proto.MAX_OPCODES or table.isInternal(op)) return null;
         if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const single = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!single) return null;
@@ -1675,6 +1678,10 @@ pub const Shard = struct {
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
     fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
+        // Taken through every check below as an unknown op is, then answered
+        // as one, so nothing tells the two apart.
+        const internal_from_client = run_mod.internalFromClient(req.header.op_code, auth.origin);
+        const writes = !internal_from_client and requestWrites(req);
         const status_op = req.header.op_code == @backingInt(proto.OpCode.cluster_status) or req.header.op_code == @backingInt(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.removed_message));
@@ -1693,15 +1700,15 @@ pub const Shard = struct {
         const membership_op = req.header.op_code == @backingInt(proto.OpCode.cluster_promote) or req.header.op_code == @backingInt(proto.OpCode.cluster_remove);
         // And so is the repair that ends the halt.
         const repair_op = req.header.op_code == @backingInt(proto.OpCode.cluster_repair_skip);
-        if (self.halted != null and !status_op and !membership_op and !repair_op and requestWrites(req)) {
+        if (self.halted != null and !status_op and !membership_op and !repair_op and writes) {
             var buf: [400]u8 = undefined;
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .shard_halted, .ran = .no, .message = self.haltedMessage(&buf) });
             return;
         }
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !requestWrites(req));
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
-        if (self.raft_network != null and requestWrites(req) and (self.replica.diverged or self.raft_node.role != .leader)) {
+        if (self.raft_network != null and writes and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
                 const oom = if (self.diverged_damage) |d| d.out_of_memory else false;
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
@@ -1736,6 +1743,7 @@ pub const Shard = struct {
             }
             if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self);
         }
+        if (internal_from_client) return answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code);
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
     }
 
@@ -11056,6 +11064,11 @@ test "Shard: an internal op from a client is answered as an unknown one, and not
     const r = try one[0].refused();
     try std.testing.expectEqual(proto.Reason.unknown_op, r.reason);
     try std.testing.expectEqualStrings("unknown op 0x16", r.message);
+    // The admin socket is a client's socket too.
+    shard.runRequest(conn, try ParkTest.request(.namespace_ensure, 2, proto.DEFAULT_NAMESPACE, "fresh", "", ""), .admin);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqualStrings("unknown op 0x16", (try one[0].refused()).message);
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
     try std.testing.expect(!shard.namespace_handler.namespaces.contains("fresh"));
 }

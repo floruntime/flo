@@ -94,6 +94,14 @@ test "e2e/decode: the retired namespace settings codes and an internal op are un
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
         try testing.expectEqualStrings(c.says, r.data);
     }
+    // Refused for anything else, the two are refused alike: a bad envelope
+    // namespace says so for both, so neither answer tells them apart.
+    var unknown_buf: [512]u8 = undefined;
+    const unknown = try rawCall(ctx, @fromBackingInt(0x017), "Bad.Name", "fresh", "", &unknown_buf);
+    const internal = try rawCall(ctx, .namespace_ensure, "Bad.Name", "fresh", "", &out);
+    try testing.expectEqual(unknown.status, internal.status);
+    try testing.expectEqualStrings(unknown.data, internal.data);
+    try testing.expect(std.mem.startsWith(u8, internal.data, "invalid namespace name"));
     var info = try ctx.cli.run(&.{ "ns", "info", "fresh" });
     defer info.deinit();
     try testing.expectEqual(@as(u8, 1), info.exit_code);
