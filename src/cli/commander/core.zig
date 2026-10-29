@@ -263,6 +263,7 @@ pub const Error = error{
     Refused,
     Retryable,
     Pending,
+    Unusable,
     Transport,
     HelpRequested,
     VersionRequested,
@@ -374,6 +375,14 @@ pub const Context = struct {
     /// Get uint flag value
     pub fn getUint(self: *Context, name: []const u8) ?u32 {
         if (self.getFlag(name)) |flag| return flag.getUint();
+        return null;
+    }
+
+    /// A string flag's value if it was given, even empty; null if it wasn't.
+    pub fn getChangedString(self: *Context, name: []const u8) ?[]const u8 {
+        if (self.getFlag(name)) |flag| {
+            if (flag.changed) return flag.getString() orelse "";
+        }
         return null;
     }
 

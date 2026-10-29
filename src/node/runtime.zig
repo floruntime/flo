@@ -160,9 +160,9 @@ pub const RuntimeConfig = struct {
 };
 
 /// Node runtime — manages shard threads, acceptor thread, and lifecycle.
-pub const LOCK_FILENAME = "flo.lock";
+pub const LOCK_FILENAME = data_format.LOCK_FILENAME;
 
-pub const ADMIN_SOCKET_FILENAME = "admin.sock";
+pub const ADMIN_SOCKET_FILENAME = data_format.ADMIN_SOCKET_FILENAME;
 
 /// The admin socket's path: `configured`, else admin.sock in `data_dir`.
 /// Both are expanded already. The server and the CLI agree through this.
@@ -176,6 +176,23 @@ pub fn adminSocketPath(buf: []u8, data_dir: []const u8, configured: ?[]const u8)
 pub fn lockDataDir(data_dir: []const u8) !stdx.fs.File {
     try stdx.fs.makePath(data_dir);
     return lockMade(data_dir);
+}
+
+/// Whether `data_dir` holds a lock file, held or not.
+pub fn lockFileExists(data_dir: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME }) catch return false;
+    stdx.fs.access(path, .{}) catch return false;
+    return true;
+}
+
+/// Removes `data_dir`'s lock file: for a command that made it and then
+/// refused the directory, so a refusal leaves nothing behind. The lock
+/// itself goes when its holder closes it.
+pub fn removeLockFile(data_dir: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME }) catch return;
+    stdx.fs.deleteFile(path) catch {};
 }
 
 /// The same lock for an offline tool, which must not create a data dir a
@@ -595,6 +612,9 @@ pub const Runtime = struct {
             return error.InvalidBindAddress;
         };
 
+        // A directory refused for its format, or as not Flo's, is left as
+        // it was found: without the lock file, if this start made it.
+        const lock_was_there = lockFileExists(data_dir);
         self.data_dir_lock = try lockDataDir(data_dir);
 
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
@@ -605,7 +625,10 @@ pub const Runtime = struct {
 
         // 0. The data directory's format, then its topology: a newer format
         // is refused before anything in it is read.
-        try data_format.check(self.allocator, data_dir);
+        data_format.check(self.allocator, data_dir) catch |err| {
+            if (data_format.isRefusal(err) and !lock_was_there) removeLockFile(data_dir);
+            return err;
+        };
         try manifest.ensureTopology(
             self.allocator,
             data_dir,
@@ -1549,6 +1572,15 @@ test "Runtime: boot 2 shards and shutdown" {
     try std.testing.expect(!runtime.started);
 }
 
+/// A FORMAT in `data_dir`, as a server that ran there wrote it: what a
+/// test that builds a data directory by hand needs before a start reads it.
+fn writeFormatFile(data_dir: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const f = try stdx.fs.createFileAbsolute(try std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, data_format.FILENAME }), .{});
+    defer stdx.fs.closeFile(f);
+    try stdx.fs.writeAll(f, std.fmt.comptimePrint("{d}\n", .{data_format.CURRENT}));
+}
+
 test "Runtime: a shard that cannot boot fails the start with its own error, and nothing is left behind" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1556,6 +1588,7 @@ test "Runtime: a shard that cannot boot fails the start with its own error, and 
     defer std.testing.allocator.free(data_dir);
     // Shard 2's directory is a file, so its init fails; the others boot,
     // or stop early, and are freed.
+    try writeFormatFile(data_dir);
     {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
         defer std.testing.allocator.free(path);
@@ -1639,6 +1672,7 @@ test "Runtime: a shard that cannot boot stops the others' replays before they fi
     const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
     defer std.testing.allocator.free(data_dir);
     for ([_]u16{ 0, 1, 3 }) |id| try writeShardLog(data_dir, id, 4, 20_000);
+    try writeFormatFile(data_dir);
     {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
         defer std.testing.allocator.free(path);

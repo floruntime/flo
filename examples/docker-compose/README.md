@@ -32,6 +32,16 @@ Data is stored in the `flo-data` Docker volume. To inspect:
 docker volume inspect flo-data
 ```
 
+A server refuses a volume written by an older Flo and exits with code 78;
+`restart: unless-stopped` then restarts it in a loop. There is no migration:
+stop the service and empty the volume, then start it again:
+
+```bash
+docker compose stop flo
+docker compose run --rm flo server wipe -c /etc/flo/flo.toml --yes
+docker compose start flo
+```
+
 ## Logs
 
 ```bash
