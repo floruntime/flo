@@ -5045,18 +5045,13 @@ pub const Shard = struct {
     /// 0 voter, 1 replica, 2 joining (never caught up). Contact and match
     /// are the leader's; elsewhere, and for the answering node, they are
     /// all ones (unknown). The address is 0 where no link is up.
-    /// A member's row in the members answer: `[id:u32][role:u8][ip4:4]
-    /// [port:u16][contact_ago_ms:u32][match:u64][halted:u8][halt_index:u64]
-    /// [halt_term:u64][halt_crc:u32]`.
-    pub const MEMBER_ROW = 44;
-
     fn dispatchClusterMembers(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const raft = shard.raft_node;
         // A node running alone, or one not yet named, is a group of itself.
         const cfg = if (raft.latest_config.member_count > 0) raft.latest_config else membership.Config.ofVoters(&.{shard.cluster_node_id});
-        var buf: [13 + membership.MAX_MEMBERS * MEMBER_ROW + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
+        var buf: [13 + membership.MAX_MEMBERS * 23 + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
         std.mem.writeInt(u32, buf[0..4], if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id, .little);
         std.mem.writeInt(u64, buf[4..12], raft.commit_index, .little);
         buf[12] = cfg.member_count;
@@ -5078,14 +5073,7 @@ pub const Shard = struct {
             }
             std.mem.writeInt(u32, buf[off + 11 ..][0..4], contact, .little);
             std.mem.writeInt(u64, buf[off + 15 ..][0..8], match, .little);
-            // This node's own halt, and a member's as the leader last heard it.
-            const halted_at: ?raft_node_mod.HaltAt = if (m.id == raft.id) raft.halt_at else if (raft.role == .leader) if (raft.peerProgress(m.id)) |p| p.halt else null else null;
-            const h = halted_at orelse raft_node_mod.HaltAt{ .index = 0, .term = 0, .crc = 0, .build = 0 };
-            buf[off + 23] = @intFromBool(halted_at != null);
-            std.mem.writeInt(u64, buf[off + 24 ..][0..8], h.index, .little);
-            std.mem.writeInt(u64, buf[off + 32 ..][0..8], h.term, .little);
-            std.mem.writeInt(u32, buf[off + 40 ..][0..4], h.crc, .little);
-            off += MEMBER_ROW;
+            off += 23;
         }
         buf[off] = cfg.removed_count;
         off += 1;

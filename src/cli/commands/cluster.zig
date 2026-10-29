@@ -188,10 +188,8 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
     defer response.deinit();
 
     // [leader:u32][commit:u64][members:u8], per member
-    // [id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64]
-    // [halted:u8][halt_index:u64][halt_term:u64][halt_crc:u32], then
-    // [removed:u8], per removed id [id:u32][when_ms:u64].
-    const row = 44;
+    // [id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64],
+    // then [removed:u8], per removed id [id:u32][when_ms:u64].
     const data = response.data;
     if (data.len < 13) {
         return outcome.malformed(ctx, "member list");
@@ -199,24 +197,24 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
     const leader_id = std.mem.readInt(u32, data[0..4], .little);
     const commit = std.mem.readInt(u64, data[4..12], .little);
     const count = data[12];
-    if (data.len < 13 + @as(usize, count) * row + 1) {
+    if (data.len < 13 + @as(usize, count) * 23 + 1) {
         return outcome.malformed(ctx, "member list");
     }
-    const removed_count = data[13 + @as(usize, count) * row];
-    if (data.len != 14 + @as(usize, count) * row + @as(usize, removed_count) * 12) {
+    const removed_count = data[13 + @as(usize, count) * 23];
+    if (data.len != 14 + @as(usize, count) * 23 + @as(usize, removed_count) * 12) {
         return outcome.malformed(ctx, "member list");
     }
 
     var table = output.Table.init(ctx.allocator);
     defer table.deinit();
     if (!json_output) {
-        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG", "HALTED AT" }) |col| table.addColumn(col, .left) catch return error.OutOfMemory;
+        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG" }) |col| table.addColumn(col, .left) catch return error.OutOfMemory;
     } else {
         ctx.print("{{\"leader\":{d},\"members\":[", .{leader_id});
     }
-    var cells: [5][48]u8 = undefined;
+    var cells: [5][32]u8 = undefined;
     for (0..count) |i| {
-        const m = data[13 + i * row ..][0..row];
+        const m = data[13 + i * 23 ..][0..23];
         const id = std.mem.readInt(u32, m[0..4], .little);
         const role: []const u8 = switch (m[4]) {
             0 => if (id == leader_id) "voter (leader)" else "voter",
@@ -231,23 +229,17 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
         const contact_s = if (contact == std.math.maxInt(u32)) "-" else std.fmt.bufPrint(&cells[1], "{d} ms ago", .{contact}) catch "?";
         const lag_s = if (match == std.math.maxInt(u64)) "-" else std.fmt.bufPrint(&cells[2], "{d}", .{commit -| match}) catch "?";
         const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{id}) catch "?";
-        const halted = m[23] != 0;
-        const halt_index = std.mem.readInt(u64, m[24..32], .little);
-        const halt_term = std.mem.readInt(u64, m[32..40], .little);
-        const halt_crc = std.mem.readInt(u32, m[40..44], .little);
-        const halt_s = if (!halted) "-" else std.fmt.bufPrint(&cells[4], "{d} (term {d}, crc {x:0>8})", .{ halt_index, halt_term, halt_crc }) catch "?";
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
             ctx.print("{{\"id\":{d},\"role\":{f},\"address\":{f}", .{ id, output.jsonString(if (m[4] == 0) "voter" else role), output.jsonString(address) });
             if (contact != std.math.maxInt(u32)) ctx.print(",\"last_contact_ms\":{d}", .{contact});
             if (match != std.math.maxInt(u64)) ctx.print(",\"lag\":{d}", .{commit -| match});
-            if (halted) ctx.print(",\"halt\":{{\"index\":{d},\"term\":{d},\"crc\":{d}}}", .{ halt_index, halt_term, halt_crc });
             ctx.print("}}", .{});
         } else {
-            table.addRow(&.{ id_s, role, address, contact_s, lag_s, halt_s }) catch return error.OutOfMemory;
+            table.addRow(&.{ id_s, role, address, contact_s, lag_s }) catch return error.OutOfMemory;
         }
     }
-    const removed_at = 14 + @as(usize, count) * row;
+    const removed_at = 14 + @as(usize, count) * 23;
     if (json_output) {
         ctx.print("],\"removed\":[", .{});
         for (0..removed_count) |i| {
@@ -261,11 +253,11 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
     for (0..removed_count) |i| {
         const rm = data[removed_at + i * 12 ..][0..12];
         const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{std.mem.readInt(u32, rm[0..4], .little)}) catch "?";
-        table.addRow(&.{ id_s, "removed", "-", "-", "-", "-" }) catch return error.OutOfMemory;
+        table.addRow(&.{ id_s, "removed", "-", "-", "-" }) catch return error.OutOfMemory;
     }
     ctx.print("\n", .{});
     table.print(ctx);
-    if (leader_id == 0) ctx.print("\nNo leader known; contact, lag and other members' halts are the leader's to report.\n", .{});
+    if (leader_id == 0) ctx.print("\nNo leader known; contact and lag are the leader's to report.\n", .{});
     ctx.print("\n", .{});
 }
 
