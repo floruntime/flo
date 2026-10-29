@@ -170,7 +170,7 @@ pub const ServerProcess = struct {
     /// Wait time between SIGTERM and SIGKILL (ms)
     pub const SHUTDOWN_GRACE_PERIOD_MS: u64 = 500;
     /// Wait time after SIGKILL before proceeding (ms)
-    /// Each test uses unique ports (findFreePort) and data dirs, so minimal wait suffices
+    /// Each server binds ports the OS picks, so a short wait suffices
     pub const POST_KILL_WAIT_MS: u64 = 100;
 
     /// Durability mode for persistence
@@ -224,8 +224,11 @@ pub const ServerProcess = struct {
         // Cluster configuration
         /// Join addresses for cluster mode (e.g., "127.0.0.1:4445")
         join_addresses: ?[]const u8 = null,
-        /// Node ID (0 = auto-generate)
+        /// Node ID. 0 gives a cluster node one from `nextNodeId`, since a
+        /// node on port 0 refuses to derive its own.
         node_id: u32 = 0,
+        /// Start a cluster node with no node id, so it derives one.
+        derive_node_id: bool = false,
         /// Raft RPC port (0 = auto-assign)
         raft_port: u16 = 0,
         /// Enable cluster mode (starts Raft listener) - for seed nodes without join_addresses
@@ -326,28 +329,32 @@ pub const ServerProcess = struct {
 
     /// Start the server with custom timeout
     pub fn startWithTimeout(self: *Self, timeout_ms: u64) !void {
-        try self.spawn();
-        try self.awaitReady(timeout_ms);
+        const start_ms = stdx.time.milliTimestamp();
+        try self.launch();
+        self.awaitPorts(timeout_ms);
+        const spent: u64 = @intCast(stdx.time.milliTimestamp() - start_ms);
+        try self.awaitReady(timeout_ms -| spent);
     }
 
-    /// Pick the ports, write the config and start the process, without
-    /// waiting for it: `port`, `metrics_port` and `dashboard_port` are set
-    /// on return. Follow with `awaitReady`.
+    /// Write the config and start the process, without waiting for it to
+    /// be ready. The server binds port 0 for each listener and reports what
+    /// it bound, so no port is picked here and handed out later. `port`,
+    /// `metrics_port` and `dashboard_port` are set on return, once its HTTP
+    /// listeners are up (0 if it exited first); `raft_port` once ready.
+    /// Follow with `awaitReady`.
     pub fn spawn(self: *Self) !void {
+        try self.launch();
+        self.awaitPorts(DEFAULT_READY_TIMEOUT_MS);
+    }
+
+    fn launch(self: *Self) !void {
         if (self.started or self.process != null) return error.AlreadyStarted;
 
         try claimCheckout();
 
-        // Find free port for main server
-        self.port = try findFreePort();
-
-        // Allocate ports for optional services
-        if (self.config.dashboard_enabled) {
-            self.dashboard_port = try findFreePort();
-        }
-        if (self.config.metrics_enabled) {
-            self.metrics_port = try findFreePort();
-        }
+        self.port = 0;
+        self.dashboard_port = 0;
+        self.metrics_port = 0;
 
         // Write config file with actual ports
         var config_buf: [2048]u8 = undefined;
@@ -373,13 +380,7 @@ pub const ServerProcess = struct {
         try config_writer.print("\n", .{});
 
         try config_writer.print("[metrics]\nenabled = {}\n", .{self.config.metrics_enabled});
-        if (self.config.metrics_enabled) {
-            try config_writer.print("port = {d}\n", .{self.metrics_port});
-        }
         try config_writer.print("\n[dashboard]\nenabled = {}\n", .{self.config.dashboard_enabled});
-        if (self.config.dashboard_enabled) {
-            try config_writer.print("port = {d}\n", .{self.dashboard_port});
-        }
         if (self.config.dashboard_hosts) |h| try config_writer.print("hosts = \"{s}\"\n", .{h});
         if (self.config.dashboard_cors_origins) |o| try config_writer.print("cors_origins = \"{s}\"\n", .{o});
 
@@ -410,23 +411,15 @@ pub const ServerProcess = struct {
         var log_file_handed_off = false;
         errdefer if (!log_file_handed_off) stdx.fs.closeFile(log_file);
 
-        // Build dynamic argv with cluster options
-        const port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.port});
-        defer self.allocator.free(port_str);
         const shards_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.config.shards});
         defer self.allocator.free(shards_str);
 
-        // Allocate raft_port if needed for cluster mode
-        // In tests, we use a separate dynamically allocated port (not derived from main port)
-        // because main port can be high in ephemeral range, causing overflow when adding offset.
-        if (self.config.raft_port > 0) {
-            self.raft_port = self.config.raft_port;
-        } else if (self.config.join_addresses != null or self.config.cluster_enabled) {
-            // Cluster mode: a separate free port for Raft, kept across a
-            // restart as a node's configured port is: its peers dial the
-            // address they know.
-            if (self.raft_port == 0) self.raft_port = try findFreePort();
-        }
+        // The peer port: the configured one, else the one this node bound
+        // when it first started (its peers dial the address they know), else
+        // 0 for the server to pick on a first start.
+        if (self.config.raft_port > 0) self.raft_port = self.config.raft_port;
+        const cluster_node = self.config.join_addresses != null or self.config.cluster_enabled;
+        if (cluster_node and self.config.node_id == 0 and !self.config.derive_node_id) self.config.node_id = nextNodeId();
 
         // Build argv dynamically
         var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -437,7 +430,7 @@ pub const ServerProcess = struct {
             "server",
             "start",
             "--port",
-            port_str,
+            "0",
             "--data-dir",
             self.config.data_dir_of orelse self.data_dir,
             "--config",
@@ -511,6 +504,43 @@ pub const ServerProcess = struct {
         log_file_handed_off = true; // Thread now owns the fd
     }
 
+    /// Wait for the server's ports line, printed once its HTTP listeners
+    /// are up and before its shards replay. A server that exits or stalls
+    /// first leaves the ports 0, and `awaitReady` reports it.
+    fn awaitPorts(self: *Self, timeout_ms: u64) void {
+        const start_ms = stdx.time.milliTimestamp();
+        while (stdx.time.milliTimestamp() - start_ms < @as(i64, @intCast(timeout_ms))) {
+            if (self.serverLine(PORTS_LINE)) |line| {
+                defer self.allocator.free(line);
+                self.port = portAfter(line, "client ") orelse 0;
+                self.metrics_port = portAfter(line, "metrics ") orelse 0;
+                self.dashboard_port = portAfter(line, "dashboard ") orelse 0;
+                return;
+            }
+            if (self.process) |*proc| if (self.tryReap(proc.id)) return;
+            stdx.time.sleep(READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
+        }
+    }
+
+    /// The first whole line of the server's output that starts with
+    /// `prefix`, owned by the caller; null while there is none. Only the
+    /// head of the log is read: both lines come before the server serves,
+    /// and a busy server's log can outgrow `readLogs`.
+    fn serverLine(self: *Self, prefix: []const u8) ?[]const u8 {
+        const file = stdx.fs.openFileAbsolute(self.log_file_path, .{}) catch return null;
+        defer stdx.fs.closeFile(file);
+        const head = self.allocator.alloc(u8, 1 << 20) catch return null;
+        defer self.allocator.free(head);
+        const n = stdx.fs.readAll(file, head) catch return null;
+        var lines = std.mem.splitScalar(u8, head[0..n], '\n');
+        while (lines.next()) |line| {
+            // A line still being written has no newline yet.
+            if (lines.index == null) break;
+            if (std.mem.startsWith(u8, line, prefix)) return self.allocator.dupe(u8, line) catch null;
+        }
+        return null;
+    }
+
     /// Wait for a server `spawn` started to accept connections; on failure
     /// show its log tail and kill it.
     pub fn awaitReady(self: *Self, timeout_ms: u64) !void {
@@ -565,8 +595,7 @@ pub const ServerProcess = struct {
                 }
             }
 
-            // Brief wait for OS resource release after a forced kill (each
-            // test uses unique ports via findFreePort, so minimal delay suffices)
+            // Brief wait for OS resource release after a forced kill
             if (forced) stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
 
             self.joinLogThread();
@@ -780,26 +809,15 @@ pub const ServerProcess = struct {
         self.started = false;
     }
 
-    /// Wait for server to be ready (accepting TCP connections)
+    /// Wait for the server's ready line, printed once it serves clients,
+    /// and take the ports it names.
     fn waitForReady(self: *Self, timeout_ms: u64) !void {
         const start_time = stdx.time.milliTimestamp();
 
         while (stdx.time.milliTimestamp() - start_time < @as(i64, @intCast(timeout_ms))) {
-            // Check main port — this is always required
-            const main_ready = self.tryConnect(self.port);
-
-            // Check dashboard port if enabled (wired into runtime)
-            const dashboard_ready = if (self.config.dashboard_enabled and self.dashboard_port > 0)
-                self.tryConnect(self.dashboard_port)
-            else
-                true;
-
-            // Readiness is deliberately just the client and dashboard ports.
-            // The metrics exporter binds only when enabled, and the Raft
-            // listener only when the node can have peers, so neither is a
-            // reliable readiness signal.
-
-            if (main_ready and dashboard_ready) {
+            if (self.serverLine(READY_LINE)) |line| {
+                defer self.allocator.free(line);
+                if (portAfter(line, "peer ")) |peer| self.raft_port = peer;
                 return;
             }
             // A server that refused its config has already exited; waiting
@@ -810,17 +828,6 @@ pub const ServerProcess = struct {
         }
 
         return error.ServerNotReady;
-    }
-
-    /// Try to establish a TCP connection to a port
-    fn tryConnect(self: *Self, port: u16) bool {
-        const ip4 = stdx.net.parseIp4Bind(self.hostForClients()) catch .{ 127, 0, 0, 1 };
-        const addr = stdx.net.Address.initIp4(ip4, port);
-        const stream = stdx.net.tcpConnectToAddress(addr) catch {
-            return false;
-        };
-        stream.close();
-        return true;
     }
 
     /// Get the port the server is listening on
@@ -880,43 +887,29 @@ pub const ServerProcess = struct {
     }
 };
 
-/// Find a free TCP port by binding to port 0
-/// Ports this process has handed out. A picked port is closed before the
-/// server binds it, so without this a later pick (another node's client or
-/// raft port) could be handed the same one and the second bind would fail.
-var handed_out: [1 << 16]bool = @splat(false);
-var handed_out_lock: @import("../../sync.zig").Mutex = .{};
+/// Node ids for this process's cluster nodes: distinct within it, and
+/// unlikely to match another test process's.
+var next_node_id: std.atomic.Value(u32) = .init(0);
 
-fn findFreePort() !u16 {
-    handed_out_lock.lock();
-    defer handed_out_lock.unlock();
-    for (0..64) |_| {
-        const port = try pickPort();
-        if (handed_out[port]) continue;
-        handed_out[port] = true;
-        return port;
+fn nextNodeId() u32 {
+    if (next_node_id.load(.monotonic) == 0) {
+        const base: u32 = @as(u32, @intCast(@mod(std.c.getpid(), 40_000))) * 100_000 + 1;
+        _ = next_node_id.cmpxchgStrong(0, base, .monotonic, .monotonic);
     }
-    return error.NoFreePort;
+    return next_node_id.fetchAdd(1, .monotonic);
 }
 
-fn pickPort() !u16 {
-    const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (sock < 0) return error.SocketFailed;
-    defer _ = std.c.close(sock);
+const PORTS_LINE = "Flo server ports: ";
+const READY_LINE = "Flo server ready on ";
 
-    var on: c_int = 1;
-    _ = std.c.setsockopt(sock, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int));
-
-    var addr = stdx.net.SocketAddrV4.initIp4(.{ 127, 0, 0, 1 }, 0);
-    if (std.c.bind(sock, addr.anyPtr(), addr.anyLen()) != 0) return error.BindFailed;
-
-    var bound_addr: std.posix.sockaddr align(4) = undefined;
-    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    if (std.c.getsockname(sock, &bound_addr, &len) != 0) return error.GetSocknameFailed;
-
-    // Extract port from sockaddr_in
-    const addr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound_addr));
-    return std.mem.bigToNative(u16, addr_in.port);
+/// The port after `key` in one of the server's port lines (`client 52341`,
+/// `peer none`); null for none, or for a key the line doesn't hold.
+fn portAfter(line: []const u8, key: []const u8) ?u16 {
+    const at = std.mem.indexOf(u8, line, key) orelse return null;
+    const rest = line[at + key.len ..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    return std.fmt.parseInt(u16, rest[0..end], 10) catch null;
 }
 
 /// Find the flo binary path
@@ -1042,8 +1035,12 @@ fn logServerOutput(log_file: std.Io.File, stdout_fd: std.posix.fd_t, stderr_fd: 
 // Tests
 // =============================================================================
 
-test "ServerProcess: findFreePort returns valid port" {
-    const port = try findFreePort();
-    try testing.expect(port > 0);
-    try testing.expect(port >= 1024); // Typically not privileged
+test "ServerProcess: the ports a server's lines name" {
+    const ports = "Flo server ports: client 52341, metrics none, dashboard 52345";
+    try testing.expectEqual(@as(?u16, 52341), portAfter(ports, "client "));
+    try testing.expectEqual(@as(?u16, null), portAfter(ports, "metrics "));
+    try testing.expectEqual(@as(?u16, 52345), portAfter(ports, "dashboard "));
+    const ready = "Flo server ready on 0.0.0.0:52341 (peer 52342, metrics none, dashboard none)";
+    try testing.expectEqual(@as(?u16, 52342), portAfter(ready, "peer "));
+    try testing.expectEqual(@as(?u16, null), portAfter(ready, "client "));
 }

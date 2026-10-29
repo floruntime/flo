@@ -93,6 +93,8 @@ pub const DashboardServer = struct {
         const addr = @import("stdx").net.SocketAddrV4.initIp4(bind_ip, self.config.port);
         try @import("stdx").net.sysBind(sock, addr.anyPtr(), addr.anyLen());
         try @import("stdx").net.sysListen(sock, 64);
+        // Port 0 asks the OS for one; from here on `config.port` is the one bound.
+        self.config.port = (try @import("stdx").net.sysLocalIp4(sock)).port;
 
         self.listener = sock;
         self.running.store(true, .release);

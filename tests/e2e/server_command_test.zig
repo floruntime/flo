@@ -64,8 +64,9 @@ test "e2e/server: --port 0 binds a free port, reports it when ready and in statu
     try testing.expectEqual(@as(u8, 0), stop.exit_code);
     var out = try start.waitWithTimeout(10_000);
     defer out.deinit();
-    var want_buf: [64]u8 = undefined;
-    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ready on 0.0.0.0:{d}\n", .{port})));
+    var want_buf: [96]u8 = undefined;
+    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ports: client {d}, metrics none, dashboard none\n", .{port})));
+    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ready on 0.0.0.0:{d} (peer none, metrics none, dashboard none)\n", .{port})));
 }
 
 test "e2e/server: stop and status find a server started from a config file" {
@@ -205,4 +206,27 @@ test "e2e/server: a metrics port already in use refuses the start, naming the po
 
 test "e2e/server: a dashboard port already in use refuses the start, naming the port" {
     try expectBindRefused("dashboard");
+}
+
+test "e2e/server: a cluster node on port 0 needs a node id; with one it starts, and restarts as the same node" {
+    const allocator = testing.allocator;
+    const derived = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .derive_node_id = true });
+    defer derived.deinit();
+    derived.dump_log_on_failure = false;
+    try testing.expectError(error.ServerNotReady, derived.startWithTimeout(10_000));
+    try testing.expect(try derived.logsContain("--port 0 picks another port on every start, and this node's id would be derived from it"));
+
+    const named = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true });
+    defer named.deinit();
+    try named.start();
+    const id = named.config.node_id;
+    try testing.expect(id != 0);
+    // A restart on another port keeps the id the data dir stored, even
+    // with none configured.
+    named.stop();
+    named.config.node_id = 0;
+    named.config.derive_node_id = true;
+    try named.start();
+    var want_buf: [64]u8 = undefined;
+    try testing.expect(try named.logsContain(try std.fmt.bufPrint(&want_buf, "cluster: this node is {d} (stored in the data dir)", .{id})));
 }

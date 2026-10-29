@@ -67,6 +67,8 @@ pub const HttpMetricsServer = struct {
         const addr = stdx.net.SocketAddrV4.initIp4(bind_ip, self.port);
         try stdx.net.sysBind(sock, addr.anyPtr(), addr.anyLen());
         try stdx.net.sysListen(sock, 16);
+        // Port 0 asks the OS for one; from here on `port` is the one bound.
+        self.port = (try stdx.net.sysLocalIp4(sock)).port;
 
         self.listener = sock;
         self.running.store(true, .release);
