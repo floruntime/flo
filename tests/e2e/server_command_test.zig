@@ -64,8 +64,9 @@ test "e2e/server: --port 0 binds a free port, reports it when ready and in statu
     try testing.expectEqual(@as(u8, 0), stop.exit_code);
     var out = try start.waitWithTimeout(10_000);
     defer out.deinit();
-    var want_buf: [64]u8 = undefined;
-    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ready on 0.0.0.0:{d}\n", .{port})));
+    var want_buf: [96]u8 = undefined;
+    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ports: client {d}, metrics none, dashboard none\n", .{port})));
+    try testing.expect(out.stdoutContains(try std.fmt.bufPrint(&want_buf, "Flo server ready on 0.0.0.0:{d} (peer none, metrics none, dashboard none)\n", .{port})));
 }
 
 test "e2e/server: stop and status find a server started from a config file" {

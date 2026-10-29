@@ -334,6 +334,38 @@ pub const Runtime = struct {
     /// would interleave writes to the same segments and manifest.
     data_dir_lock: ?stdx.fs.File,
 
+    /// The client port this runtime bound: the configured one, or the one
+    /// the OS picked for port 0. 0 before `start` binds it.
+    client_port: u16 = 0,
+
+    /// Told the ports once the HTTP listeners are up, before the shards
+    /// replay: with port 0 the only way to reach a booting node.
+    on_listening: ?Listening = null,
+
+    pub const Listening = struct {
+        ctx: *anyopaque,
+        f: *const fn (ctx: *anyopaque, ports: Ports) void,
+    };
+
+    /// The ports this node bound; null for a listener it does not run.
+    /// The peer port is bound after the HTTP listeners, so it is null
+    /// until then.
+    pub const Ports = struct {
+        client: u16,
+        peer: ?u16,
+        metrics: ?u16,
+        dashboard: ?u16,
+    };
+
+    pub fn ports(self: *const Runtime) Ports {
+        return .{
+            .client = self.client_port,
+            .peer = if (self.raft_network) |rn| rn.listen_port else null,
+            .metrics = if (self.metrics_server) |ms| ms.port else null,
+            .dashboard = if (self.dashboard_server) |ds| ds.config.port else null,
+        };
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         if (config.num_shards > server_config.MAX_SHARDS) {
             log.err("shards = {d}: at most {d} per node", .{ config.num_shards, server_config.MAX_SHARDS });
@@ -525,7 +557,7 @@ pub const Runtime = struct {
 
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
         const host = std.posix.gethostname(&host_buf) catch "localhost";
-        return .{ .id = cluster_config.ClusterConfig.generateNodeId(host, self.config.listen_port), .source = .derived };
+        return .{ .id = cluster_config.ClusterConfig.generateNodeId(host, self.client_port), .source = .derived };
     }
 
     /// Start the runtime: create shards, spawn threads, start acceptor.
@@ -564,6 +596,15 @@ pub const Runtime = struct {
             self.shard_count,
             self.config.partition_count,
         );
+
+        // The client socket is bound before anything uses this node's
+        // client port (the derived node id, the dashboard, the peer hello):
+        // with port 0 the OS picks it here. It listens only once the shards
+        // run.
+        const client_fd = try Acceptor.bindSocket(bind_ip, self.config.listen_port);
+        var client_fd_owned = true;
+        errdefer if (client_fd_owned) stdx.net.sysClose(client_fd);
+        self.client_port = (try stdx.net.sysLocalIp4(client_fd)).port;
 
         // 1. Create per-shard pipes
         const pipes = try self.allocator.alloc([2]i32, self.shard_count);
@@ -653,6 +694,7 @@ pub const Runtime = struct {
         };
         self.health = node_health;
         try self.startHttp(bind_ip);
+        if (self.on_listening) |l| l.f(l.ctx, self.ports());
 
         // 2. Create shards, replaying each one's log, several at once.
         const shards = try self.allocator.alloc(Shard, self.shard_count);
@@ -793,7 +835,7 @@ pub const Runtime = struct {
             // use). Nothing is published to this runtime's teardown until
             // both exist and the network thread is up.
             errdefer self.allocator.destroy(rn);
-            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.config.listen_port, bind_ip, secret);
+            rn.* = try RaftNetwork.init(self.allocator, node_id, raft_port, self.client_port, bind_ip, secret);
             errdefer rn.deinit();
             rn.setRaftQueue(q);
             if (self.metrics_registry) |metrics| rn.setReplicationMetrics(&metrics.replication);
@@ -855,9 +897,10 @@ pub const Runtime = struct {
 
         // 4. Create and start acceptor
         var acceptor = Acceptor.init(write_ends, shards[0].router);
-        try acceptor.listen(bind_ip, self.config.listen_port);
+        try acceptor.listenOn(client_fd);
+        client_fd_owned = false;
         self.acceptor = acceptor;
-        log.debug("Runtime.start: acceptor listening on {s}:{d}", .{ self.config.listen_addr, self.config.listen_port });
+        log.debug("Runtime.start: acceptor listening on {s}:{d}", .{ self.config.listen_addr, self.client_port });
 
         // 5. Spawn acceptor thread
         self.acceptor_thread = try std.Thread.spawn(.{}, acceptorThread, .{&self.acceptor.?});
@@ -908,7 +951,7 @@ pub const Runtime = struct {
 
             const ctx = try self.allocator.create(DashboardContext);
             ctx.* = DashboardContext.init(self.allocator, metrics, self.shard_count);
-            ctx.listen_port = self.config.listen_port;
+            ctx.listen_port = self.client_port;
             // Dashboard writes go through the client port; a node bound to one
             // interface is not reachable at 127.0.0.1.
             ctx.client_ip4 = if (std.mem.eql(u8, &bind_ip, &stdx.net.any_ip4)) .{ 127, 0, 0, 1 } else bind_ip;
@@ -1117,9 +1160,7 @@ pub const Runtime = struct {
     /// The client port this runtime bound: the configured one, or the one
     /// the OS picked for port 0. 0 before `start`.
     pub fn boundPort(self: *const Runtime) u16 {
-        const acceptor = self.acceptor orelse return 0;
-        const local = stdx.net.sysLocalIp4(acceptor.listen_fd) catch return self.config.listen_port;
-        return local.port;
+        return self.client_port;
     }
 
     /// Graceful shutdown in reverse order.

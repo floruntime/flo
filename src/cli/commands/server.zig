@@ -621,17 +621,28 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     };
     var runtime_done = false;
     defer if (!runtime_done) runtime.deinit();
+    runtime.on_listening = .{ .ctx = ctx, .f = printListening };
 
     // Start the runtime
     runtime.start() catch |err| {
         return outcome.localRefusal(ctx, "cannot start runtime: {}", .{err});
     };
 
-    // The port bound, not asked for: with port 0 it is the only way to
-    // learn where clients connect.
+    // The ports bound, not asked for: with port 0 this is the only way to
+    // learn where clients and peers connect.
     const bound_port = runtime.boundPort();
+    const ports = runtime.ports();
+    var peer_buf: [8]u8 = undefined;
+    var metrics_buf: [8]u8 = undefined;
+    var dashboard_buf: [8]u8 = undefined;
     ctx.print("\n", .{});
-    ctx.print("Flo server ready on {s}:{d}\n", .{ config.bind, bound_port });
+    ctx.print("Flo server ready on {s}:{d} (peer {s}, metrics {s}, dashboard {s})\n", .{
+        config.bind,
+        bound_port,
+        portText(&peer_buf, ports.peer),
+        portText(&metrics_buf, ports.metrics),
+        portText(&dashboard_buf, ports.dashboard),
+    });
     ctx.print("Build: {s}\n", .{build_info.line});
     ctx.print("Press Ctrl+C to stop.\n", .{});
     ctx.print("\n", .{});
@@ -925,6 +936,26 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     if (cleared.crash) |c| ctx.print("Cleared the crash on entry {d}, which the cut dropped.\n", .{c.index});
     if (cleared.halt) |h| ctx.print("Cleared the halt at entry {d}, which the cut dropped.\n", .{h.index});
     ctx.print("\nShard {d}'s log now ends at entry {d}. Start the server: the shard comes up with the entries through it.\n", .{ shard, after });
+}
+
+/// The client, metrics and dashboard ports, printed once the HTTP
+/// listeners are up and before the shards replay, so a booting node with
+/// port 0 can be probed. Clients connect only after the ready line.
+fn printListening(raw: *anyopaque, ports: Runtime.Ports) void {
+    const ctx: *commander.Context = @ptrCast(@alignCast(raw));
+    var metrics_buf: [8]u8 = undefined;
+    var dashboard_buf: [8]u8 = undefined;
+    ctx.print("Flo server ports: client {d}, metrics {s}, dashboard {s}\n", .{
+        ports.client,
+        portText(&metrics_buf, ports.metrics),
+        portText(&dashboard_buf, ports.dashboard),
+    });
+}
+
+/// A port, or "none" for a listener the node does not run.
+fn portText(buf: *[8]u8, port: ?u16) []const u8 {
+    const p = port orelse return "none";
+    return std.fmt.bufPrint(buf, "{d}", .{p}) catch unreachable;
 }
 
 /// The data directory a server's PID file is in, as `server start` would

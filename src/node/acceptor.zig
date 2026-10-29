@@ -74,8 +74,10 @@ pub const Acceptor = struct {
         };
     }
 
-    /// Bind to `bind` (the `[server] bind` address) and listen on `port`.
-    pub fn listen(self: *Acceptor, bind: [4]u8, port: u16) !void {
+    /// A socket bound to `bind` (the `[server] bind` address) and `port`,
+    /// not yet listening. Binding fixes the port (the OS picks one for 0)
+    /// before anything hands it out, while connects are still refused.
+    pub fn bindSocket(bind: [4]u8, port: u16) !i32 {
         const stdx_net = @import("stdx").net;
         const addr = stdx_net.SocketAddrV4.initIp4(bind, port);
 
@@ -87,10 +89,25 @@ pub const Acceptor = struct {
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
         try stdx_net.sysBind(fd, addr.anyPtr(), addr.anyLen());
-        try stdx_net.sysListen(fd, 128);
+        return fd;
+    }
 
+    /// Listen on `fd`, a socket from `bindSocket`. The acceptor owns it
+    /// once this returns.
+    pub fn listenOn(self: *Acceptor, fd: i32) !void {
+        const stdx_net = @import("stdx").net;
+        try stdx_net.sysListen(fd, 128);
         self.listen_fd = fd;
-        log.debug("Acceptor listening on {d}.{d}.{d}.{d}:{d} fd={d} shard_count={d}", .{ bind[0], bind[1], bind[2], bind[3], port, fd, self.shard_count });
+        if (stdx_net.sysLocalIp4(fd)) |local| {
+            log.debug("Acceptor listening on {d}.{d}.{d}.{d}:{d} fd={d} shard_count={d}", .{ local.ip4[0], local.ip4[1], local.ip4[2], local.ip4[3], local.port, fd, self.shard_count });
+        } else |_| {}
+    }
+
+    /// Bind to `bind` and listen on `port` in one step.
+    pub fn listen(self: *Acceptor, bind: [4]u8, port: u16) !void {
+        const fd = try bindSocket(bind, port);
+        errdefer _ = std.c.close(fd);
+        try self.listenOn(fd);
     }
 
     /// Accept one connection and route it to the correct shard.
@@ -409,4 +426,21 @@ test "acceptor: listens on the configured bind address" {
     try acceptor.listen(.{ 127, 0, 0, 1 }, 0);
     const local = try @import("stdx").net.sysLocalIp4(acceptor.listen_fd);
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.ip4);
+}
+
+test "acceptor: a bound socket refuses connects until it listens" {
+    const stdx_net = @import("stdx").net;
+    var shard_pipes = [_]i32{ -1, -1 };
+    var acceptor = Acceptor.init(&shard_pipes, Router.init(4096, 2, 0));
+    const fd = try Acceptor.bindSocket(.{ 127, 0, 0, 1 }, 0);
+    var owned = true;
+    defer if (owned) stdx_net.sysClose(fd);
+    const port = (try stdx_net.sysLocalIp4(fd)).port;
+    try std.testing.expect(port != 0);
+    try std.testing.expectError(error.ConnectFailed, stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 200));
+    try acceptor.listenOn(fd);
+    owned = false;
+    defer acceptor.close();
+    const client = try stdx_net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
+    _ = std.c.close(client);
 }
