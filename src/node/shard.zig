@@ -1687,7 +1687,7 @@ pub const Shard = struct {
             return;
         }
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or (self.halted != null and !requestWrites(req));
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !requestWrites(req));
         defer proto.answering_stale = was_stale;
         if (self.raft_network != null and requestWrites(req) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
@@ -3636,8 +3636,11 @@ pub const Shard = struct {
     /// `applyCommitted`, stopping after index `limit`.
     fn applyThrough(self: *Shard, limit: u64) bool {
         // An offline shard's projections are missing an entry: nothing
-        // after it may apply over the hole.
-        if (self.applying or self.offline != null) return true;
+        // after it may apply over the hole. A diverged member's state is
+        // history the group disagrees with; applying the leader's entries
+        // over it (after an async-flush rewind, say) would make it neither
+        // its own history nor the group's, so it stays as it was.
+        if (self.applying or self.offline != null or self.replica.diverged) return true;
         // Halted: nothing past the entry applies until a committed repair
         // skips it, but writes committed after it are told so as their
         // entries commit.
@@ -3885,11 +3888,11 @@ pub const Shard = struct {
 
     // ─── Event loop ──────────────────────────────────────────────────────
 
-    /// Answer the reads whose wait ran out. On a halted shard they read
-    /// stale state, and say so.
+    /// Answer the reads whose wait ran out. On a halted or diverged shard
+    /// they read stale state, and say so.
     fn expireWaiters(self: *Shard) void {
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or self.halted != null;
+        proto.answering_stale = was_stale or self.halted != null or self.replica.diverged;
         defer proto.answering_stale = was_stale;
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
     }
@@ -14900,4 +14903,30 @@ test "Shard: a follower and the leader publish the same live key count for the s
         try std.testing.expectEqual(run.keys, follower_metrics.kvLiveKeys("orders"));
         try std.testing.expectEqual(run.keys, leader_metrics.kvLiveKeys("orders"));
     }
+}
+
+test "Shard: a diverged member applies nothing more, and its reads say they are stale" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var pbuf: [64]u8 = undefined;
+    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v1", .ttl_ms = null }));
+    try ParkTest.ack(&t.shard);
+    const frozen = raft.last_applied;
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(u8, 0), (try t.ask(.cluster_status, "", &buf)).header.flags & proto.RESPONSE_STALE);
+
+    // Diverged, then entries keep committing: none applies.
+    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v2", .ttl_ms = null }));
+    t.shard.replica.markDiverged(2, raft.current_term);
+    const last = raft.log.lastIndex();
+    raft.commit_index = last;
+    try std.testing.expect(t.shard.applyCommitted());
+    try std.testing.expectEqual(frozen, raft.last_applied);
+    try std.testing.expect(raft.commit_index > raft.last_applied);
+    // Its reads are served, from that state, marked stale.
+    try std.testing.expectEqual(proto.RESPONSE_STALE, (try t.ask(.cluster_status, "", &buf)).header.flags & proto.RESPONSE_STALE);
 }
