@@ -888,7 +888,6 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     if (r.damage()) |why| ctx.print("damage:      {s}\n", .{why});
     ctx.print("committed:   through {d} (as last flushed)\n", .{r.commit});
     if (r.pending_cut) |j| ctx.print("note:        a cut after {d} is pending\n", .{j});
-    if (group.config_unknown) ctx.print("note:        past the damage, the cluster group's log may hold a member list this can't read; if this node was ever a cluster member, rejoin it instead\n", .{});
 
     offline.checkSalvage(&r, after) catch |err| return switch (err) {
         error.NoLog => outcome.localRefusal(ctx, "shard {d} has no log; there is nothing to salvage", .{shard}),
@@ -913,6 +912,7 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     const more = if (lost.at_least) "at least " else "";
     ctx.print("\nWARNING: this drops {s}{d} entries after entry {d} from shard {d}, {s}{d} of them committed as last flushed.\n", .{ more, lost.entries, after, shard, more, lost.committed });
     ctx.print("A committed entry is a write its client was told succeeded. Dropped, it is gone from this node for good.\n", .{});
+    if (group.config_unknown) ctx.print("Past the damage, the cluster group's log may hold a member list this can't read. If this node was ever a cluster member, don't salvage it: rejoin it instead.\n", .{});
     if (!ctx.getBool("yes")) {
         ctx.print("\nWould cut shard {d}'s log after entry {d}. Run again with --yes to do it.\n", .{ shard, after });
         return;
