@@ -78,9 +78,6 @@ pub const ClusterConfig = struct {
     /// Tiered-log config applied to every node (e.g. a small hot_buffer_capacity
     /// to force hot-ring wrap/spill in replication tests).
     tiered_log: ServerProcess.TieredLogConfig = .{},
-    /// Pre-test cooldown: wait for TCP TIME_WAIT sockets to clear
-    /// Helps when running tests repeatedly - set to 0 to skip
-    pre_test_cooldown_ms: u64 = 2000,
     /// Serve each node's metrics port, for its `/status`.
     metrics_enabled: bool = false,
 };
@@ -102,13 +99,6 @@ pub const ClusterContext = struct {
     pub fn init(allocator: Allocator, config: ClusterConfig) !Self {
         if (config.node_count < 2 or config.node_count > MAX_NODES) {
             return error.InvalidNodeCount;
-        }
-
-        // Pre-test cooldown: wait for TCP TIME_WAIT sockets to clear
-        // This helps prevent port conflicts when tests run back-to-back
-        if (config.pre_test_cooldown_ms > 0) {
-            std.debug.print("[cluster] Pre-test cooldown: waiting {d}ms for TCP cleanup...\n", .{config.pre_test_cooldown_ms});
-            stdx.time.sleep(config.pre_test_cooldown_ms * std.time.ns_per_ms);
         }
 
         var self = Self{
