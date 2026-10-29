@@ -161,16 +161,28 @@ pub const DurableLog = struct {
     }
 
     /// Drop every entry above `after_index` from a stopped shard whose log
-    /// may be damaged above it: an offline salvage. The cut is recorded
-    /// first, as `truncateAfter` records it, and finished by the recovery
-    /// pass, which deletes a file wholly above the cut even when its header
-    /// won't read. A cut already pending lower is kept. Fails with
-    /// `SegmentUnreadable` when a damaged file holds entries at or below
-    /// `after_index`.
+    /// may be damaged above it: an offline salvage. The cut is recorded, as
+    /// `truncateAfter` records it, and finished by the recovery pass, which
+    /// deletes a file wholly above the cut even when its header won't read.
+    /// A cut already pending lower is kept. Fails with `SegmentUnreadable`,
+    /// before recording anything, when a damaged file holds entries at or
+    /// below the cut: a cut recorded there would stop every boot after.
     pub fn salvageAfter(self: *DurableLog, after_index: u64) !void {
         std.debug.assert(self.writer.entry_count == 0);
         const pending = try self.readIntent();
-        try self.writeIntent(@min(after_index, pending orelse after_index));
+        const cut = @min(after_index, pending orelse after_index);
+        {
+            const files = try self.listSegments(false);
+            defer self.freeSegments(files);
+            for (files) |f| {
+                if (f.first_index > cut or f.last_index <= cut) continue;
+                if (f.unreadable) return error.SegmentUnreadable;
+                // The one file the cut rewrites must read whole.
+                const opened = SegmentReader.initFromFile(self.allocator, f.path) catch return error.SegmentUnreadable;
+                self.allocator.free(opened.buf);
+            }
+        }
+        try self.writeIntent(cut);
         try self.recoverTruncation();
     }
 
@@ -1048,9 +1060,10 @@ test "durable log: a salvage deletes a file above the cut whose header won't rea
     try corruptHeader(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ td.path, names.items[1] }));
     try testing.expectError(error.InvalidHeaderMagic, dl.listSegments(true));
 
-    // A cut that would rewrite it is refused, with the cut still recorded.
+    // A cut that would rewrite it is refused, and nothing is recorded: a
+    // boot would otherwise stop on it.
     try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(3));
-    try testing.expectEqual(@as(?u64, 3), try dl.readIntent());
+    try testing.expect((try dl.readIntent()) == null);
 
     try dl.salvageAfter(2);
     try testing.expectEqual(@as(usize, 0), dl.badHeaderSegment().len);
@@ -1062,14 +1075,14 @@ test "durable log: a salvage deletes a file above the cut whose header won't rea
     try testing.expectEqual(@as(u64, 2), try dl.watermark());
 }
 
-test "durable log: a salvage below a pending cut records its own cut first, and one above keeps the lower" {
+test "durable log: a salvage below a pending cut records its own, one above keeps the lower, and a refused one leaves the pending cut as it was" {
     var td = try TestDir.init();
     defer td.deinit();
     var writer = SegmentWriter.init(testing.allocator, 0);
     defer writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &writer, td.path);
     defer dl.deinit();
-    for ([_]u64{ 1, 2, 3, 4 }) |i| {
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |i| {
         try writer.addEntry(&testEntry(i, 1, "x"));
         if (i % 2 == 0) try dl.flush(i);
     }
@@ -1080,14 +1093,20 @@ test "durable log: a salvage below a pending cut records its own cut first, and 
     }
     try fileNames(td.path, &names);
     var path_buf: [512]u8 = undefined;
-    // The cut below fails on the damaged first file, after recording itself:
-    // a crash there finishes at 1, not at the pending 3.
+
+    // Pending at 5; a salvage after 4 cuts there, after 6 keeps the 5.
+    try dl.writeIntent(5);
+    try dl.salvageAfter(6);
+    try testing.expectEqual(@as(u64, 5), try dl.watermark());
+    try dl.writeIntent(5);
+    try dl.salvageAfter(4);
+    try testing.expectEqual(@as(u64, 4), try dl.watermark());
+
+    // Refused on a damaged file it would rewrite: the pending cut stays.
     try corruptHeader(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ td.path, names.items[0] }));
     try dl.writeIntent(3);
     try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(1));
-    try testing.expectEqual(@as(?u64, 1), try dl.readIntent());
-    try testing.expectError(error.SegmentUnreadable, dl.salvageAfter(2));
-    try testing.expectEqual(@as(?u64, 1), try dl.readIntent());
+    try testing.expectEqual(@as(?u64, 3), try dl.readIntent());
 }
 
 test "durable log: a recovery listing refuses a damaged file whose name is not an index" {
