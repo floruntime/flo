@@ -24,13 +24,13 @@ pub const KvState = struct {
     /// The `kv.ns_counts` commits the shard last published.
     published_commits: u64 = std.math.maxInt(u64),
     /// Where the shard publishes each namespace's counts, once looked up:
-    /// node-local, never state. Keys owned.
+    /// node-local, never state. Keys owned, from the shard's allocator.
     publish_to: std.StringHashMapUnmanaged(*anyopaque) = .empty,
 
-    pub fn deinit(self: *KvState) void {
+    pub fn deinit(self: *KvState, allocator: std.mem.Allocator) void {
         var it = self.publish_to.keyIterator();
-        while (it.next()) |k| self.store.allocator.free(k.*);
-        self.publish_to.deinit(self.store.allocator);
+        while (it.next()) |k| allocator.free(k.*);
+        self.publish_to.deinit(allocator);
     }
 
     /// The shard points this at its Raft node, so a read judges expiry by

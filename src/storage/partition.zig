@@ -132,7 +132,7 @@ pub const Partition = struct {
         }
         self.warm_store.deinit(self.allocator);
 
-        self.kv.deinit();
+        self.kv.deinit(self.allocator);
         self.apply_scratch.deinit();
         self.store.deinit();
         self.ts.deinit();

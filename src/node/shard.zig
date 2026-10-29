@@ -3381,8 +3381,8 @@ pub const Shard = struct {
                     all = false;
                     continue;
                 };
-                const name = kv.store.allocator.dupe(u8, n.ns) catch break :blk km;
-                kv.publish_to.put(kv.store.allocator, name, km) catch kv.store.allocator.free(name);
+                const name = self.allocator.dupe(u8, n.ns) catch break :blk km;
+                kv.publish_to.put(self.allocator, name, km) catch self.allocator.free(name);
                 break :blk km;
             };
             km.publishCounts(self.id, n.counts.live, n.counts.bytes, n.counts.history_bytes, n.counts.history_evicted);
