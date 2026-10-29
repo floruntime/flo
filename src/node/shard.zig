@@ -10655,6 +10655,17 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
 }
 
 test "Shard: park answers from its own entry when a later one has already committed" {
+    try parkAnswersFromOwnEntry(false);
+}
+
+test "Shard: park answers from its own entry when the later one is a millisecond on" {
+    try parkAnswersFromOwnEntry(true);
+}
+
+/// `apart` sleeps between the two appends, so they are stamped in different
+/// milliseconds and both have sequence 0: the records differ only by
+/// timestamp.
+fn parkAnswersFromOwnEntry(apart: bool) !void {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -10673,25 +10684,35 @@ test "Shard: park answers from its own entry when a later one has already commit
     // The first write is answered from the first's result.
     const Seen = struct {
         var index: u64 = 0;
-        var seq: ?u64 = null;
+        var id: ?StreamID = null;
         fn respond(_: *Shard, _: *Connection, _: u64, result: *const persistence_mod.Result) void {
             index = result.index;
             var r = result.reader();
-            seq = r.int(u64);
+            const seq = r.int(u64) orelse return;
+            id = .{ .sequence = seq, .timestamp_ms = r.int(u64) orelse return };
         }
     };
+    Seen.id = null;
     const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
     defer std.testing.allocator.free(v);
     const first = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    if (apart) @import("stdx").time.sleep(2 * std.time.ns_per_ms);
     _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
     shard.park(conn, try ParkTest.request(.stream_append, 50, "", "s", "a", ""), first, Seen.respond);
     try std.testing.expectEqual(first.index, Seen.index);
     // The dispatch that parked applies the rest; the second record is not
-    // the one the first write was answered with.
+    // the one the first write was answered with. A record is named by its
+    // whole ID: the sequence alone restarts each millisecond.
     try std.testing.expect(shard.applyCommitted());
     const hash = node_router.nameHash(node_router.namespaceHash(""), "s");
-    try std.testing.expectEqual(shard.stream_handler.stream.streamFirstId(hash).sequence, Seen.seq.?);
-    try std.testing.expect(Seen.seq.? != shard.stream_handler.stream.streamLastId(hash).sequence);
+    const first_id = shard.stream_handler.stream.streamFirstId(hash);
+    const last_id = shard.stream_handler.stream.streamLastId(hash);
+    try std.testing.expect(Seen.id.?.eql(first_id));
+    try std.testing.expect(!Seen.id.?.eql(last_id));
+    if (apart) {
+        try std.testing.expectEqual(@as(u64, 0), first_id.sequence);
+        try std.testing.expectEqual(@as(u64, 0), last_id.sequence);
+    }
 }
 
 test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
