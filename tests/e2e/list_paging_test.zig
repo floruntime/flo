@@ -1,11 +1,13 @@
 //! Every list op pages: a request's value is `[limit:u32][cursor]`, and the
-//! answer ends `[has_more:u8][cursor_len:u16][cursor]`. Each family is paged
+//! answer ends `[has_more:u8][cursor_len:u16][cursor]`; a list on the op
+//! table pages by its schema's `limit` and `cursor`. Each family is paged
 //! two at a time and must return every name exactly once.
 
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
 const kv_ops = @import("src").protocol.kv_ops;
+const namespace_ops = @import("src").protocol.namespace_ops;
 const proto = @import("src").protocol.proto;
 
 /// How one entry of a family's list answer is laid out; returns the name
@@ -51,21 +53,22 @@ fn listPage(ctx: *stdx.testing.TestContext, op: proto.OpCode, cursor: []const u8
 }
 
 fn listPageOn(fd: std.c.fd_t, op: proto.OpCode, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
-    if (op == .kv_scan) return kvScanPage(fd, limit, cursor, out);
+    if (op == .kv_scan) return tablePage(kv_ops.op("kv.scan"), fd, limit, cursor, out);
+    if (op == .namespace_list) return tablePage(namespace_ops.op("namespace.list"), fd, limit, cursor, out);
     var value: [4 + 256]u8 = undefined;
     std.mem.writeInt(u32, value[0..4], limit, .little);
     @memcpy(value[4..][0..cursor.len], cursor);
     return call(fd, op, "", value[0 .. 4 + cursor.len], out);
 }
 
-/// A kv.scan page, sent as the table op it is and given back in the other
-/// families' layout, so one pager reads them all.
-fn kvScanPage(fd: std.c.fd_t, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
-    const op = kv_ops.op("kv.scan");
+/// A page of a list on the op table (kv.scan, namespace.list), sent as the
+/// table op it is and given back in the other families' layout, so one
+/// pager reads them all.
+fn tablePage(comptime op: @import("src").protocol.ops.Op, fd: std.c.fd_t, limit: u32, cursor: []const u8, out: []u8) ![]const u8 {
     var body_buf: [op.request.max_size]u8 = undefined;
     const body = try op.request.encodeInto(&body_buf, .{ .limit = limit, .cursor = cursor });
     var answer_buf: [256 * 1024]u8 = undefined;
-    const data = try call(fd, .kv_scan, "", body, &answer_buf);
+    const data = try call(fd, @fromBackingInt(op.code), "", body, &answer_buf);
     var diag: @import("src").protocol.schema.Diagnostic = .{};
     const page = try op.response.decodeAll(data, &diag);
     var pos: usize = 4;
@@ -160,7 +163,7 @@ test "e2e/list: every list family pages by cursor, each name once" {
     try expectPagesThrough(ctx, .kv_scan, scanEntry, &NAMES);
     try expectPagesThrough(ctx, .ts_list, nameU16, &NAMES);
     const ns_names = [_][]const u8{ "pg-a-ns", "pg-b-ns", "pg-c-ns", "pg-d-ns", "pg-e-ns", "pg-f-ns", "pg-g-ns" };
-    try expectPagesThrough(ctx, .namespace_list, nameU16, &ns_names);
+    try expectPagesThrough(ctx, .namespace_list, scanEntry, &ns_names);
 }
 
 test "e2e/list: the CLI's --limit is the server's page size" {

@@ -33,6 +33,16 @@ test "e2e/namespace: create and list" {
     // Verify it appears in the list
     const list = try ctx.execCapture(&.{ "ns", "ls" });
     try testing.expect(std.mem.indexOf(u8, list, "myapp") != null);
+    // As JSON, an object per name, in name order.
+    var json = try ctx.cli.run(&.{ "ns", "ls", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    try testing.expectEqualStrings("[{\"name\":\"default\"},{\"name\":\"myapp\"}]\n", json.stdout);
+    // "default" was never created.
+    var builtin = try ctx.cli.run(&.{ "ns", "info", "default" });
+    defer builtin.deinit();
+    try testing.expectEqual(@as(u8, 0), builtin.exit_code);
+    try testing.expectEqualStrings("Namespace:  default\nCreated at: built in\n", builtin.stdout);
 }
 
 test "e2e/namespace: create multiple namespaces" {
@@ -62,8 +72,8 @@ test "e2e/namespace: create duplicate fails" {
     var result = try ctx.cli.run(&.{ "ns", "create", "dup_test" });
     defer result.deinit();
 
-    // Should indicate failure (namespace already exists)
-    try stdx.testing.assertFailed(result);
+    try testing.expectEqual(@as(u8, 3), result.exit_code);
+    try stdx.testing.assertStderrContains(result, "Error: namespace already exists [conflict]");
 }
 
 test "e2e/namespace: info" {
@@ -77,19 +87,22 @@ test "e2e/namespace: info" {
     var result = try ctx.cli.run(&.{ "ns", "info", "infotest" });
     defer result.deinit();
 
-    try stdx.testing.assertSucceeded(result);
-    try stdx.testing.assertContains(result, "infotest");
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
+    try stdx.testing.assertStdoutContains(result, "Namespace:  infotest\nCreated at: ");
+    // Created just now: a real time, not zero.
+    const at = std.mem.indexOf(u8, result.stdout, "Created at: ").? + "Created at: ".len;
+    const end = std.mem.indexOfScalarPos(u8, result.stdout, at, ' ').?;
+    try testing.expect(try std.fmt.parseInt(i64, result.stdout[at..end], 10) > 1_700_000_000_000);
 }
 
 test "e2e/namespace: info non-existent fails" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Info on non-existent namespace should fail
     var result = try ctx.cli.run(&.{ "ns", "info", "nonexistent_ns_67890" });
     defer result.deinit();
-
-    try stdx.testing.assertFailed(result);
+    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    try stdx.testing.assertStderrContains(result, "Error: namespace not found [no_namespace/not_found]");
 }
 
 // =============================================================================
@@ -197,7 +210,7 @@ test "e2e/namespace: the CLI has no way to set a namespace setting" {
     try stdx.testing.assertStderrContains(result, "unknown flag --set");
 }
 
-test "e2e/namespace: delete is refused, with or without --force, and the namespace and its data stay" {
+test "e2e/namespace: delete is refused, and the namespace and its data stay" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     const ns = "keep-me";
@@ -206,9 +219,10 @@ test "e2e/namespace: delete is refused, with or without --force, and the namespa
     try ctx.exec(&.{ "stream", "append", "orders", "order-1", "-n", ns });
     try ctx.exec(&.{ "queue", "enqueue", "jobs", "job-1", "-n", ns });
 
-    for ([_][]const []const u8{ &.{ "ns", "delete", ns }, &.{ "ns", "delete", ns, "--force" }, &.{ "ns", "delete", "default", "--force" } }) |args| {
-        var r = try ctx.cli.run(args);
+    for ([_][]const u8{ ns, "default" }) |name| {
+        var r = try ctx.cli.run(&.{ "ns", "delete", name });
         defer r.deinit();
+        try testing.expectEqual(@as(u8, 3), r.exit_code);
         try stdx.testing.assertStderrContains(r, "namespace delete isn't supported yet");
     }
     const list = try ctx.execCapture(&.{ "ns", "ls" });

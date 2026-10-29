@@ -14,6 +14,8 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
+const schema = @import("../../protocol/schema.zig");
+const namespace_ops = @import("../../protocol/namespace_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -59,7 +61,6 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
                     "flo ns rm staging",
                 })
                 .arg("name", "Name of the namespace to delete")
-                .boolFlag("force", 'f', "No effect while delete is refused")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -76,7 +77,7 @@ pub fn createNamespaceCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("info")
-                .about("Get namespace information")
+                .about("Show when a namespace was created; exits 1 if there is none")
                 .examples(&.{
                     "flo namespace info myapp",
                 })
@@ -106,14 +107,13 @@ fn runCreate(ctx: *commander.Context) commander.Error!void {
 fn runDelete(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?;
     const endpoint = cli_config.getEndpoint(ctx);
-    const force = ctx.getBool("force");
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.delete(&client, name, force) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.namespace.delete(&client, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
@@ -121,29 +121,56 @@ fn runDelete(ctx: *commander.Context) commander.Error!void {
     ctx.print("Deleted namespace: {s}\n", .{name});
 }
 
+/// Every name, a page at a time, following the cursor to the last page.
 fn runList(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
-
-    if (output.isVerbose(ctx)) {
-        ctx.printErr("[verbose] LIST namespaces endpoint={s}\n", .{endpoint});
-    }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.namespace.list(&client) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
+    const format = output.getFormat(ctx);
+    var table = output.Table.init(ctx.allocator);
+    defer table.deinit();
+    table.addColumn("NAMESPACE", .left) catch return outcome.malformed(ctx, "namespace.list answer");
+    // Kept until the last page, so a page that fails leaves no half-printed list.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ctx.allocator);
 
-    try outcome.check(ctx, result);
+    var cursor_buf: [namespace_ops.Name.bound]u8 = undefined;
+    var cursor: []const u8 = "";
+    var shown: usize = 0;
+    while (true) {
+        var result = client_mod.namespace.list(&client, cursor) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
 
-    if (result.asRawData()) |data| {
-        output.printWireList(ctx, data, "(no namespaces)", &.{
-            .{ .field = "name", .header = "NAMESPACE", .field_type = .str_u16 },
-        }) catch return outcome.malformed(ctx, "list");
-    } else {
-        output.printEmptyList(ctx, "(no namespaces)");
+        var diag: schema.Diagnostic = .{};
+        const page = namespace_ops.op("namespace.list").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "namespace.list answer");
+        var it = page.names.iterator();
+        while (it.next() catch return outcome.malformed(ctx, "namespace.list answer")) |name| {
+            switch (format) {
+                .json => {
+                    if (shown > 0) out.append(ctx.allocator, ',') catch return outcome.malformed(ctx, "namespace.list answer");
+                    // An object per name, so fields can join it later.
+                    out.print(ctx.allocator, "{{\"name\":{f}}}", .{output.jsonString(name)}) catch return outcome.malformed(ctx, "namespace.list answer");
+                },
+                .raw => out.print(ctx.allocator, "{s}\n", .{name}) catch return outcome.malformed(ctx, "namespace.list answer"),
+                .table => table.addRow(&.{name}) catch return outcome.malformed(ctx, "namespace.list answer"),
+            }
+            shown += 1;
+        }
+        const next = page.cursor orelse break;
+        // A cursor that doesn't move on would page forever.
+        if (std.mem.order(u8, next, cursor) != .gt) return outcome.malformed(ctx, "namespace.list answer (its cursor didn't advance)");
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    switch (format) {
+        .json => ctx.print("[{s}]\n", .{out.items}),
+        .raw => ctx.print("{s}", .{out.items}),
+        .table => if (shown == 0) output.printEmptyList(ctx, "(no namespaces)") else table.print(ctx),
     }
 }
 
@@ -161,17 +188,14 @@ fn runInfo(ctx: *commander.Context) commander.Error!void {
 
     try outcome.check(ctx, result);
 
-    // Parse response: [exists: u8][name_len: u16][name: bytes]
-    const data = result.asRawData() orelse return outcome.malformed(ctx, "namespace info");
-    if (data.len == 0) return outcome.malformed(ctx, "namespace info");
-
-    const exists = data[0] != 0;
-
-    if (exists) {
-        ctx.print("Namespace: {s}\n", .{name});
-        ctx.print("Status: exists\n", .{});
-    } else {
-        ctx.print("Namespace '{s}' does not exist\n", .{name});
-        return error.NotFound;
+    var diag: schema.Diagnostic = .{};
+    const info = namespace_ops.op("namespace.info").response.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "namespace.info answer");
+    switch (output.getFormat(ctx)) {
+        .json => ctx.print("{{\"name\":{f},\"created_at_ms\":{d}}}\n", .{ output.jsonString(name), info.created_at_ms }),
+        else => {
+            ctx.print("Namespace:  {s}\n", .{name});
+            // "default" was never created: it is there from the start.
+            if (info.created_at_ms == 0) ctx.print("Created at: built in\n", .{}) else ctx.print("Created at: {d} (ms since the epoch)\n", .{info.created_at_ms});
+        },
     }
 }

@@ -77,6 +77,7 @@ pub const Response = struct {
             .rate_limited => "Rate limit exceeded",
             .unavailable => "Unavailable",
             .outcome_pending => "Committed, not applied: its shard halted — do not resend it unchanged",
+            .no_namespace => "Namespace not found",
             _ => "Unknown error",
         };
     }

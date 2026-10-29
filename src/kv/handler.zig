@@ -980,7 +980,7 @@ pub const KVHandler = struct {
     /// null. The caller counts a refusal as a dropped record.
     pub fn sinkPropose(shard: *Shard, namespace: []const u8, qkey: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
         if (isReservedKey(kv_state.Qualified.of(qkey).key)) return "access to reserved key denied";
-        shard.namespace_handler.proposeImplicitCreate(namespace, shard, false);
+        shard.namespace_handler.proposeImplicitCreate(namespace, shard);
         _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms }) catch |err| return switch (err) {
             error.NotLeader => "this node doesn't lead its group",
             error.WritesStopped => "the shard stopped taking writes",

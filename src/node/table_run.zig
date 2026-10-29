@@ -27,6 +27,8 @@ pub fn Outcome(comptime Response: type) type {
         park: Park,
         /// A waiter holds the request, and answers it.
         wait,
+        /// Refuse it, with a message the family's errors don't fix.
+        refused: Refused,
     };
 }
 
@@ -77,6 +79,7 @@ pub fn handler(comptime name: []const u8, comptime Family: type, comptime functi
                 .answer => |v| answer(the_op.response, shard, conn, req.header.request_id, v),
                 .park => |p| shard.parkHolding(conn, req, p.proposed, p.answer, p.release, p.ctx),
                 .wait => conn.response_deferred = true,
+                .refused => |r| shard.sendRefusal(conn, req.header.request_id, r.status, r.refusal),
             }
         }
     }.run;
@@ -258,12 +261,14 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.txn.rollback", .field = "txn", .tests = &.{"kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it"} },
     .{ .op = "worker.list", .field = "limit", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
     .{ .op = "worker.list", .field = "cursor", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },
+    .{ .op = "namespace.list", .field = "limit", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
+    .{ .op = "namespace.list", .field = "cursor", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
     .{ .op = "worker.list", .field = "action", .tests = &.{"worker.list: an action filter pages only that action's workers, each page full, to the last"} },
 };
 
 /// The files that bind table ops' functions: where `_ = field;` would
 /// drop a decoded field unread.
-const handler_files = [_][]const u8{ "src/kv/handler.zig", "src/worker/handler.zig" };
+const handler_files = [_][]const u8{ "src/kv/handler.zig", "src/worker/handler.zig", "src/namespace/handler.zig" };
 
 test "table_run: every request field of every table op has a test" {
     inline for (table.op_table) |o| {

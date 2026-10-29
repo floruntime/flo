@@ -1,19 +1,9 @@
-//! Namespace Handler — registers namespace management opcodes with Dispatcher.
+//! Namespace Handler — the namespace registry and its ops.
 //!
-//! Namespace operations are controller-only commands that route to Shard 0.
-//! They manage the namespace registry (create, delete, list, info).
-//!
-//! ## Opcode Range
-//!
-//!   Commands:   0xB0–0xB3  (create, delete, list, info)
-//!   Responses:  0xB4–0xB7
-//!
-//! ## Namespace Semantics
-//!
-//! - The namespace name is passed in `req.key` (not `req.namespace`).
-//! - All mutations go through Controller Raft on Shard 0 (when wired).
-//! - No pre-route hooks — all namespace commands route to controller.
-//! - Reserved namespaces (`_sys`, `_internal`, `_flo`) cannot be created/deleted.
+//! The namespace ops are on the op table (protocol/namespace_ops.zig) and
+//! route to shard 0. The namespace an op acts on is its key, not the
+//! envelope's namespace. A name with a leading `_` is the system's and is
+//! never created.
 //!
 //! ## Namespace Key Utilities (public API for all subsystems)
 //!
@@ -42,7 +32,10 @@ const stdx = @import("stdx");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
-const result_mod = @import("../protocol/result.zig");
+const schema = @import("../protocol/schema.zig");
+const namespace_ops = @import("../protocol/namespace_ops.zig");
+const namespace_entries = @import("../protocol/namespace_entries.zig");
+const table_run = @import("../node/table_run.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
@@ -51,7 +44,6 @@ const persistence_mod = @import("../storage/persistence.zig");
 const Result = persistence_mod.Result;
 const router = @import("../node/router.zig");
 
-const CommandResult = result_mod.CommandResult;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -232,12 +224,16 @@ pub const NamespaceHandler = struct {
     implicit_failed: u64 = 0,
     implicit_warn_ms: i64 = 0,
 
-    /// In-memory namespace registry. Keys are owned copies of namespace names.
-    /// Will be replaced by Controller Raft storage when wired.
+    /// The namespaces this shard knows. Keys are owned copies of their names.
     namespaces: std.StringHashMap(NamespaceMeta),
     /// Namespace hash → name, for the appliers that see only the hash on
     /// every committed entry. Kept in step with `namespaces`.
     names_by_hash: std.AutoHashMap(u32, []const u8),
+    /// The id of the last namespace a create made here: what an ensure
+    /// that proposed it answers once it applies.
+    last_created_id: u32 = 0,
+    /// A page of names, built for each namespace.list answer.
+    list_buf: ?[]u8 = null,
 
     const MAX_NAMESPACES: usize = 1024;
 
@@ -251,9 +247,9 @@ pub const NamespaceHandler = struct {
 
     pub const NamespaceMeta = struct {
         created_at_ns: u64,
-        /// Tracks whether data has been written to this namespace.
-        /// Incremented by markNamespaceHasData(), used for non-empty delete check.
-        data_count: u32 = 0,
+        /// The log index of the entry that made it known here; 0 for
+        /// "default", which is known before any entry.
+        created_index: u64 = 0,
     };
 
     /// "default" is registered from the start, before replay, with no log
@@ -284,6 +280,7 @@ pub const NamespaceHandler = struct {
         }
         self.namespaces.deinit();
         self.names_by_hash.deinit();
+        if (self.list_buf) |b| self.allocator.free(b);
     }
 
     /// Insert an owned name into both maps; frees it if either insert fails.
@@ -302,49 +299,31 @@ pub const NamespaceHandler = struct {
         return kv.key;
     }
 
-    // ── Namespace Data Tracking ─────────────────────────────────────────
+    // ── Implicit creation ───────────────────────────────────────────────
 
-    /// Mark a namespace as having data written to it.
-    /// Called by KV/Stream/Queue handlers after successful writes.
-    /// Auto-creates the "default" namespace entry when called with empty or "default" name.
-    /// When `shard` is provided and the namespace is new, persists a namespace_create
-    /// entry to the segment log so the namespace survives restart.
+    /// A write named `name` (empty is "default"): an unknown namespace is
+    /// created, through the log, so it survives restart and reaches
+    /// followers. Without a shard (tests), it is registered directly.
     pub fn markNamespaceHasData(self: *NamespaceHandler, name: []const u8, shard: ?*Shard) void {
         const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
-        if (self.namespaces.getPtr(effective)) |meta| {
-            meta.data_count +|= 1; // saturating add
-            return;
-        }
+        if (self.namespaces.contains(effective)) return;
         if (shard) |s| {
-            self.proposeImplicitCreate(effective, s, true);
+            self.proposeImplicitCreate(effective, s);
         } else {
             _ = self.applyCreate(effective);
-            if (self.namespaces.getPtr(effective)) |meta| meta.data_count = 1;
         }
     }
-
-    /// The value of a namespace_create proposed for a write that has
-    /// already applied (`counts_write`): its applier counts that write. An
-    /// explicit create, or one proposed ahead of its write, carries an
-    /// empty value.
-    const IMPLICIT_CREATE = "implicit";
 
     /// Implicit creation (e.g. "default" on the first bare-namespace write):
     /// a namespace_create entry, applied like an explicit one so it
     /// survives restart and reaches followers. One in flight per name.
-    /// `counts_write`: the write that caused it found no namespace to count
-    /// against where it was accepted, so the create counts it. A create
-    /// proposed ahead of its write counts nothing, and that write, counted
-    /// where it is accepted while the create is still pending, is not
-    /// counted either: `data_count` stays 0 until the namespace's next
-    /// write. Only tests read it.
-    pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard, counts_write: bool) void {
+    pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard) void {
         const effective = if (name.len == 0 or std.mem.eql(u8, name, "default")) "default" else name;
         if (self.namespaces.contains(effective) or self.pending_creates.contains(effective)) return;
         // Not proposed when it would be refused; a sink checks `admission`
         // itself and drops the write.
         if (!self.admits(effective)) return;
-        _ = proposeNamespaceEntry(s, .namespace_create, effective, if (counts_write) IMPLICIT_CREATE else "") catch |err| {
+        _ = proposeCreate(s, effective) catch |err| {
             if (s.quietHalted(err)) return;
             // Every write to the namespace tries again, so said once per
             // interval rather than per write.
@@ -352,7 +331,7 @@ pub const NamespaceHandler = struct {
             const now = @import("stdx").time.milliTimestamp();
             if (now - self.implicit_warn_ms >= 30_000) {
                 self.implicit_warn_ms = now;
-                log.warn("namespace: implicit create of '{s}' not persisted: {s} ({d} failed so far); its writes are not metered until it is", .{ effective, @errorName(err), self.implicit_failed });
+                log.warn("namespace: implicit create of '{s}' not persisted: {s} ({d} failed so far); each write to it tries again", .{ effective, @errorName(err), self.implicit_failed });
             }
             return;
         };
@@ -415,14 +394,6 @@ pub const NamespaceHandler = struct {
         self.pending_creates.clearRetainingCapacity();
     }
 
-    /// Check if a namespace has had data written to it.
-    pub fn namespaceHasData(self: *NamespaceHandler, name: []const u8) bool {
-        if (self.namespaces.get(name)) |meta| {
-            return meta.data_count > 0;
-        }
-        return false;
-    }
-
     // ── Appliers ────────────────────────────────────────────────────────
     // Called from the registry for every committed namespace entry.
 
@@ -439,120 +410,100 @@ pub const NamespaceHandler = struct {
     /// replica, whatever proposed it.
     pub fn applyCreate(self: *NamespaceHandler, name: []const u8) CreateOutcome {
         const now_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
-        return self.applyCreateAt(name, now_ns);
+        return self.applyCreateAt(name, now_ns, 0);
     }
 
     /// `applyCreate` from a log entry: created when the entry was stamped,
-    /// the same on every replica.
-    pub fn applyCreateAt(self: *NamespaceHandler, name: []const u8, created_at_ns: u64) CreateOutcome {
+    /// the same on every replica, at the entry's index.
+    pub fn applyCreateAt(self: *NamespaceHandler, name: []const u8, created_at_ns: u64, index: u64) CreateOutcome {
         if (self.namespaces.contains(name)) return .existed; // idempotent
         if (nameRefusal(name) != null) return .invalid;
         if (self.collides(name)) return .collision;
         if (!isDefault(name) and self.namespaces.count() >= MAX_NAMESPACES) return .full;
         const owned = self.allocator.dupe(u8, name) catch return .failed;
-        self.insertNamespace(owned, .{ .created_at_ns = created_at_ns }) catch {
+        self.insertNamespace(owned, .{ .created_at_ns = created_at_ns, .created_index = index }) catch {
             self.allocator.free(owned);
             return .failed;
         };
         return .created;
     }
 
-    /// Apply a Raft-committed namespace deletion to the local registry.
-    pub fn applyDelete(self: *NamespaceHandler, name: []const u8) void {
-        if (self.removeNamespace(name)) |owned| {
-            self.allocator.free(owned);
-        }
-    }
+    // ── Ops ─────────────────────────────────────────────────────────────
+    // Every namespace op routes to shard 0, the namespaces' one owner.
 
-    // ── Dispatcher Registration ─────────────────────────────────────────
+    const ListResponse = namespace_ops.op("namespace.list").response;
+    const InfoResponse = namespace_ops.op("namespace.info").response;
+    const EnsureResponse = namespace_ops.op("namespace.ensure").response;
+    const Empty = namespace_ops.op("namespace.create").response;
 
     pub fn register(dispatcher: *Dispatcher) void {
-        // No pre-route hooks — namespace commands route to Controller (Shard 0).
-        dispatcher.register(.namespace_create, dispatchNamespace);
-        dispatcher.register(.namespace_delete, dispatchNamespace);
-        dispatcher.registerWalk(.namespace_list, dispatchNamespace, localScanNamespaces);
-        dispatcher.register(.namespace_info, dispatchNamespace);
-        dispatcher.register(.namespace_config_set, dispatchNamespace);
-        dispatcher.register(.namespace_config_get, dispatchNamespace);
-    }
-
-    /// ShardWalker LocalScanFn for namespace_list — returns namespace names
-    /// from one shard's NamespaceHandler registry.
-    fn localScanNamespaces(
-        ctx: *anyopaque,
-        _: []const u8, // namespace (ignored — namespaces are global)
-        _: []const u8, // filter
-        _: ?[]const u8, // cursor
-        _: u32, // limit
-    ) dispatcher_mod.NameWalker.ScanResult {
-        const handler: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(handler.namespaces.count());
-
-        var count: usize = 0;
-        var it = handler.namespaces.iterator();
-        while (it.next()) |entry| {
-            if (count >= name_buf.len) break;
-            name_buf[count] = entry.key_ptr.*;
-            count += 1;
-        }
-
-        return .{ .items = name_buf[0..count], .next_cursor = null };
-    }
-
-    fn dispatchNamespace(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-
-        if (op == .namespace_config_set or op == .namespace_config_get) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, SETTINGS_REFUSAL);
-            return;
-        }
-
-        // Reads (list, info) always go to local handler
-        if (op == .namespace_list or op == .namespace_info) {
-            const cmd_result = shard.namespace_handler.handleCommand(req);
-            defer shard.namespace_handler.freeResult(cmd_result);
-            sendNamespaceResponse(shard, conn, req.header.request_id, cmd_result);
-            return;
-        }
-
-        // Mutations (create, delete): validate then persist via UAL
-        switch (op) {
-            .namespace_create => dispatchCreate(shard, conn, req),
-            .namespace_delete => dispatchDelete(shard, conn, req),
-            else => shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown namespace mutation"),
+        inline for (.{
+            .{ "namespace.create", OpCode.namespace_create, runCreate },
+            .{ "namespace.delete", OpCode.namespace_delete, runDelete },
+            .{ "namespace.list", OpCode.namespace_list, runList },
+            .{ "namespace.info", OpCode.namespace_info, runInfo },
+            .{ "namespace.ensure", OpCode.namespace_ensure, runEnsure },
+        }) |o| {
+            comptime std.debug.assert(namespace_ops.op(o[0]).route == .shard0);
+            dispatcher.register(o[1], table_run.handler(o[0], NamespaceHandler, o[2]));
+            dispatcher.setShardRoute(o[1], toShard0);
         }
     }
 
-    fn dispatchCreate(shard: *Shard, conn: *Connection, req: Request) void {
-        const name = req.key;
+    fn toShard0(_: Request) ?u16 {
+        return 0;
+    }
 
-        if (nameRefusal(name)) |why| {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
-            return;
-        }
-        if (shard.namespace_handler.namespaces.contains(name)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .conflict, "namespace already exists");
-            return;
-        }
-        if (shard.namespace_handler.admission(name)) |r| {
-            shard.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
-            return;
-        }
+    pub const Error = error{ OutOfMemory, Exists, NoNamespace, DeleteRefused, LeaderUnknown, WritesStopped, TooManyProposals, Internal };
 
-        const proposed = proposeNamespaceEntry(shard, .namespace_create, name, &.{}) catch |err| {
-            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "not persisted"));
-            return;
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => refused(.internal_error, .internal, "internal error: out of memory"),
+            error.Exists => refused(.conflict, .unclassified, "namespace already exists"),
+            error.NoNamespace => refused(.no_namespace, .not_found, "namespace not found"),
+            error.DeleteRefused => refused(.bad_request, .unclassified, DELETE_REFUSAL),
+            error.LeaderUnknown => refused(.unavailable, .leader_unknown, persistence_mod.failureMessage(error.NotLeader, "")),
+            error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
+            error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
+            error.Internal => refused(.internal_error, .internal, "internal error: the request couldn't be run"),
         };
-        shard.namespace_handler.notePending(name);
-        shard.park(conn, req, proposed, answerCreate);
+    }
+
+    fn refused(status: proto.StatusCode, reason: proto.Reason, message: []const u8) table_run.Refused {
+        return .{ .status = status, .refusal = .{ .reason = reason, .ran = .no, .message = message } };
+    }
+
+    fn proposeError(err: anyerror) Error {
+        return switch (err) {
+            error.NotLeader => error.LeaderUnknown,
+            error.WritesStopped => error.WritesStopped,
+            error.Overloaded => error.TooManyProposals,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Internal,
+        };
+    }
+
+    /// Refuses `name` with its grammar's own reason, or with the room or
+    /// id it would need; null when it may be created.
+    fn createRefusal(self: *const NamespaceHandler, name: []const u8) ?Refusal {
+        if (nameRefusal(name)) |why| return .{ .status = .bad_request, .message = why };
+        return self.admission(name);
+    }
+
+    fn runCreate(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(Empty) {
+        const self = shard.namespace_handler;
+        const name = req.key;
+        if (self.namespaces.contains(name)) return error.Exists;
+        if (self.createRefusal(name)) |r| return .{ .refused = .{ .status = r.status, .refusal = proto.notRun(r.message) } };
+        const proposed = proposeCreate(shard, name) catch |err| return proposeError(err);
+        self.notePending(name);
+        return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
     }
 
     /// Two creates can both pass the handler's checks before either
     /// applies: the applier's result says which one made the name.
-    fn answerCreate(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
-        shard.sendOkResponse(conn, request_id, "");
+    fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        table_run.answer(Empty, shard, conn, request_id, .{});
     }
 
     /// A namespace's data can live on any shard, keyed by a name that a
@@ -560,34 +511,83 @@ pub const NamespaceHandler = struct {
     /// the name retired, delete is refused.
     pub const DELETE_REFUSAL = "namespace delete isn't supported yet: a namespace's data can't be removed safely across shards";
 
-    fn dispatchDelete(shard: *Shard, conn: *Connection, req: Request) void {
-        shard.sendErrorResponse(conn, req.header.request_id, .bad_request, DELETE_REFUSAL);
+    fn runDelete(_: *Shard, _: *Connection, _: Request) Error!table_run.Outcome(Empty) {
+        return error.DeleteRefused;
     }
 
-    /// No namespace setting has anything that enforces it, so none is
-    /// accepted: one comes back together with the code that applies it.
-    pub const SETTINGS_REFUSAL = "namespace settings aren't supported yet: none would take effect";
+    fn runList(shard: *Shard, _: *Connection, _: Request, limit: u32, cursor: []const u8) Error!table_run.Outcome(ListResponse) {
+        return .{ .answer = try shard.namespace_handler.page(limit, cursor) };
+    }
+
+    /// The names after `cursor`, in name order, as many as `limit` allows.
+    /// The cursor is the last name given when more are left.
+    pub fn page(self: *NamespaceHandler, limit: u32, cursor: []const u8) Error!ListResponse.Value {
+        const names = try self.allocator.alloc([]const u8, self.namespaces.count());
+        defer self.allocator.free(names);
+        var n: usize = 0;
+        var it = self.namespaces.keyIterator();
+        while (it.next()) |k| {
+            if (std.mem.order(u8, k.*, cursor) != .gt) continue;
+            names[n] = k.*;
+            n += 1;
+        }
+        std.mem.sort([]const u8, names[0..n], {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        const Names = ListResponse.field_list[0].T;
+        const buf = self.list_buf orelse blk: {
+            const b = try self.allocator.alloc(u8, Names.byte_bound.?);
+            self.list_buf = b;
+            break :blk b;
+        };
+        var out = Names.Builder.init(buf);
+        for (names[0..n]) |name| {
+            if (out.count == limit or !(out.add(name) catch unreachable)) break; // a valid name never breaks its schema
+        }
+        const more = out.count < n;
+        return .{ .names = out.value(), .cursor = if (more) names[out.count - 1] else null };
+    }
+
+    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        const name = req.key;
+        if (nameRefusal(name)) |why| return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun(why) } };
+        const meta = shard.namespace_handler.namespaces.get(name) orelse return error.NoNamespace;
+        return .{ .answer = .{ .created_at_ms = @intCast(meta.created_at_ns / std.time.ns_per_ms) } };
+    }
+
+    /// Create-or-get: a namespace known here answers at once, with the
+    /// index it was created at; a new one answers once its create applies.
+    fn runEnsure(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(EnsureResponse) {
+        const self = shard.namespace_handler;
+        const name = req.key;
+        if (self.namespaces.get(name)) |meta| return .{ .answer = .{ .id = router.namespaceHash(name), .published_index = meta.created_index } };
+        if (self.createRefusal(name)) |r| return .{ .refused = .{ .status = r.status, .refusal = proto.notRun(r.message) } };
+        const proposed = proposeCreate(shard, name) catch |err| return proposeError(err);
+        self.notePending(name);
+        return .{ .park = .{ .proposed = proposed, .answer = answerEnsure } };
+    }
+
+    fn answerEnsure(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        table_run.answer(EnsureResponse, shard, conn, request_id, .{ .id = shard.namespace_handler.last_created_id, .published_index = result.index });
+    }
 
     // ── UAL Persistence ─────────────────────────────────────────────────
 
-    /// Propose a namespace mutation as a UAL entry through Raft.
-    /// The entry uses CommandPayload format: key = namespace name, value = payload.
-    /// Namespace entries use empty namespace ("") to get namespace_hash=0
-    /// because namespaces are global, not scoped to a namespace.
-    fn proposeNamespaceEntry(
-        shard: *Shard,
-        entry_type: entry_mod.EntryType,
-        name: []const u8,
-        value: []const u8,
-    ) !persistence_mod.ProposeResult {
-        return persistence_mod.proposeEntry(shard, entry_type, entry_mod.Flags.NONE, "", name, value);
+    /// Propose `name`'s create, with its id: today its name's hash, which
+    /// every entry in the namespace carries.
+    fn proposeCreate(shard: *Shard, name: []const u8) !persistence_mod.ProposeResult {
+        const P = namespace_entries.Create;
+        var buf: [P.max_size]u8 = undefined;
+        const bytes = P.encodeInto(&buf, .{ .name = name, .id = router.namespaceHash(name) }) catch return error.PayloadTooLarge;
+        return shard.raft_node.propose(.namespace_create, entry_mod.Flags.NONE, bytes);
     }
 
     /// Register this handler's entry types with the ReplayRegistry.
     pub fn registerReplay(self: *NamespaceHandler, registry: *persistence_mod.ReplayRegistry) void {
         registry.register(.namespace_create, @ptrCast(self), replayEntryThunk);
-        registry.register(.namespace_delete, @ptrCast(self), replayEntryThunk);
-        registry.register(.namespace_config, @ptrCast(self), replayEntryThunk);
+        registry.register(.namespace_bind, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
@@ -595,185 +595,45 @@ pub const NamespaceHandler = struct {
         return self.replayEntry(entry, out);
     }
 
-    /// Apply a namespace UAL entry, at boot or after Raft commit. A create
-    /// refused for its name, its id or the cap is refused the same way on
-    /// every replica; a delete of a name that's gone changes nothing.
+    /// Apply a namespace entry, at boot or after commit. A create refused
+    /// for its name, its id or the cap is refused the same way on every
+    /// replica. A bind that disagrees with what this shard holds breaks
+    /// the log, on every replica alike, and halts.
     pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
-        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return error.Halt;
-        const name = cmd.key;
-        if (name.len == 0) return error.Halt;
-
-        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
-        switch (etype) {
+        var diag: schema.Diagnostic = .{};
+        switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
             .namespace_create => {
-                if (self.pending_creates.fetchRemove(name)) |kv| self.allocator.free(kv.key);
-                switch (self.applyCreateAt(name, entry.header.timestamp_ns)) {
-                    .created => {},
+                const c = namespace_entries.Create.decodeAll(entry.payload, &diag) catch return error.Halt;
+                // The id is the name's hash; one that isn't was never proposed.
+                if (c.id != router.namespaceHash(c.name)) return error.Halt;
+                if (self.pending_creates.fetchRemove(c.name)) |kv| self.allocator.free(kv.key);
+                switch (self.applyCreateAt(c.name, entry.header.timestamp_ns, entry.header.index)) {
+                    .created => self.last_created_id = c.id,
                     .existed => out.refuse(.conflict, .unclassified, "namespace already exists"),
-                    .invalid => out.refuse(.bad_request, .unclassified, nameRefusal(name) orelse "invalid namespace name"),
+                    .invalid => out.refuse(.bad_request, .unclassified, nameRefusal(c.name) orelse "invalid namespace name"),
                     .collision => out.refuse(.bad_request, .unclassified, COLLISION_MESSAGE),
                     .full => out.refuse(.bad_request, .unclassified, LIMIT_MESSAGE),
                     .failed => return error.OutOfMemory,
                 }
-                if (std.mem.eql(u8, cmd.value, IMPLICIT_CREATE)) {
-                    if (self.namespaces.getPtr(name)) |meta| meta.data_count = @max(meta.data_count, 1);
-                }
             },
-            .namespace_delete => self.applyDelete(name),
-            .namespace_config => out.refuse(.bad_request, .unclassified, SETTINGS_REFUSAL),
+            .namespace_bind => {
+                const b = namespace_entries.Bind.decodeAll(entry.payload, &diag) catch return error.Halt;
+                if (b.id != router.namespaceHash(b.name)) return error.Halt;
+                if (self.names_by_hash.get(b.id)) |bound| {
+                    if (!std.mem.eql(u8, bound, b.name)) return error.Halt;
+                    return; // bound already: nothing to do
+                }
+                if (nameRefusal(b.name) != null) return error.Halt;
+                const owned = self.allocator.dupe(u8, b.name) catch return error.OutOfMemory;
+                self.insertNamespace(owned, .{ .created_at_ns = entry.header.timestamp_ns, .created_index = entry.header.index }) catch {
+                    self.allocator.free(owned);
+                    return error.OutOfMemory;
+                };
+            },
             else => return error.Halt,
         }
     }
-
-    // ── Core Command Logic ──────────────────────────────────────────────
-
-    fn handleCommand(self: *NamespaceHandler, req: Request) CommandResult {
-        const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        return switch (op) {
-            .namespace_create => self.handleCreate(req),
-            .namespace_delete => self.handleDelete(req),
-            .namespace_list => self.handleList(req),
-            .namespace_info => self.handleInfo(req),
-            else => .{ .err = .{ .code = .invalid_request, .message = "unknown namespace opcode" } },
-        };
-    }
-
-    // ── CREATE ──────────────────────────────────────────────────────────
-
-    fn handleCreate(self: *NamespaceHandler, req: Request) CommandResult {
-        const name = req.key;
-        if (nameRefusal(name)) |why| {
-            return .{ .err = .{ .code = .invalid_request, .message = why } };
-        }
-        return switch (self.applyCreate(name)) {
-            .created => .{ .namespace_created = {} },
-            .existed => .{ .err = .{ .code = .already_exists, .message = "namespace already exists" } },
-            .invalid => .{ .err = .{ .code = .invalid_request, .message = "invalid namespace name" } },
-            .collision => .{ .err = .{ .code = .invalid_request, .message = COLLISION_MESSAGE } },
-            .full => .{ .err = .{ .code = .invalid_request, .message = LIMIT_MESSAGE } },
-            .failed => .{ .err = .{ .code = .internal_error, .message = "namespace not registered: out of memory" } },
-        };
-    }
-
-    // ── DELETE ──────────────────────────────────────────────────────────
-
-    fn handleDelete(_: *NamespaceHandler, _: Request) CommandResult {
-        return .{ .err = .{ .code = .invalid_request, .message = DELETE_REFUSAL } };
-    }
-
-    // ── LIST ────────────────────────────────────────────────────────────
-
-    fn handleList(self: *NamespaceHandler, req: Request) CommandResult {
-        _ = req;
-        const data = self.serializeNamespaceList() catch {
-            return .{ .err = .{ .code = .internal_error, .message = "namespace list serialization failed" } };
-        };
-
-        return .{ .namespace_list = .{ .data = data } };
-    }
-
-    // ── INFO ────────────────────────────────────────────────────────────
-
-    fn handleInfo(self: *NamespaceHandler, req: Request) CommandResult {
-        const name = req.key;
-
-        if (name.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "namespace name is required" } };
-        }
-        // The answer is built in a fixed buffer sized for a valid name.
-        if (nameRefusal(name)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
-
-        const exists = self.namespaces.contains(name);
-
-        // Duplicate the name for the response
-        const owned_name = self.allocator.dupe(u8, name) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "allocation failed" } };
-        };
-
-        return .{ .namespace_info = .{
-            .exists = exists,
-            .name = owned_name,
-        } };
-    }
-
-    // ── Serialization ───────────────────────────────────────────────────
-
-    /// Wire format: [count:u32] ([name_len:u16][name:bytes])*
-    fn serializeNamespaceList(self: *NamespaceHandler) ![]u8 {
-        // Calculate total size
-        var total_size: usize = 4; // count header
-        var entry_count: u32 = 0;
-        var it = self.namespaces.iterator();
-        while (it.next()) |entry| {
-            total_size += 2 + entry.key_ptr.*.len; // u16 name_len + name bytes
-            entry_count += 1;
-        }
-
-        const buf = try self.allocator.alloc(u8, total_size);
-        errdefer self.allocator.free(buf);
-        var offset: usize = 0;
-
-        std.mem.writeInt(u32, buf[offset..][0..4], entry_count, .little);
-        offset += 4;
-
-        var it2 = self.namespaces.iterator();
-        while (it2.next()) |entry| {
-            const name = entry.key_ptr.*;
-            std.mem.writeInt(u16, buf[offset..][0..2], @intCast(name.len), .little);
-            offset += 2;
-            @memcpy(buf[offset .. offset + name.len], name);
-            offset += name.len;
-        }
-
-        return buf;
-    }
-
-    // ── Free Result ─────────────────────────────────────────────────────
-
-    pub fn freeResult(self: *NamespaceHandler, cmd_result: CommandResult) void {
-        switch (cmd_result) {
-            .namespace_list => |r| {
-                self.allocator.free(r.data);
-            },
-            .namespace_info => |r| {
-                self.allocator.free(r.name);
-            },
-            else => {},
-        }
-    }
 };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Response Helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Map namespace CommandResult variants to wire responses.
-fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
-    switch (cmd_result) {
-        .ok, .namespace_created, .namespace_deleted => {
-            shard.sendOkResponse(conn, request_id, "");
-        },
-        .err => |e| {
-            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
-        },
-        .namespace_list => |n| {
-            shard.sendOkResponse(conn, request_id, n.data);
-        },
-        .namespace_info => |n| {
-            // Wire format: [exists:u8][name_len:u16 LE][name:bytes]
-            var buf: [3 + 128]u8 = undefined;
-            buf[0] = if (n.exists) 1 else 0;
-            std.mem.writeInt(u16, buf[1..3], @intCast(n.name.len), .little);
-            if (n.name.len > 0) {
-                @memcpy(buf[3 .. 3 + n.name.len], n.name);
-            }
-            shard.sendOkResponse(conn, request_id, buf[0 .. 3 + n.name.len]);
-        },
-        else => {
-            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled namespace response");
-        },
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
@@ -781,201 +641,128 @@ fn sendNamespaceResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_
 
 const testing = std.testing;
 
-fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
-    return .{
-        .header = proto.RequestHeader.init(op, 1),
-        .namespace = "",
-        .key = key,
-        .value = value,
-        .options = "",
-    };
+/// A namespace entry at `index`, its payload coded by its schema into `buf`.
+fn testEntry(comptime t: entry_mod.EntryType, index: u64, stamp_ns: u64, v: namespace_entries.Payload(@backingInt(t)).Value, buf: []u8) !entry_mod.Entry {
+    const bytes = try namespace_entries.Payload(@backingInt(t)).encodeInto(buf, v);
+    return entry_mod.buildEntry(t, 0, 1, index, stamp_ns, bytes);
 }
 
-test "namespace handler: dispatcher registration" {
+test "namespace handler: every namespace op is registered, routed to shard 0, and settings are gone" {
     var dispatcher = Dispatcher.init();
     NamespaceHandler.register(&dispatcher);
-
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_create));
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_delete));
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_list));
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_info));
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_config_set));
-    try testing.expect(dispatcher.hasHandler(OpCode.namespace_config_get));
-
-    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
+    const req: Request = .{ .header = proto.RequestHeader.init(.namespace_list, 1), .namespace = "", .key = "", .value = "", .options = "" };
+    for ([_]OpCode{ .namespace_create, .namespace_delete, .namespace_list, .namespace_info, .namespace_ensure }) |op| {
+        try testing.expect(dispatcher.hasHandler(op));
+        try testing.expectEqual(@as(?u16, 0), dispatcher.shard_route[@backingInt(op)].?(req));
+    }
+    try testing.expectEqual(@as(u16, 5), dispatcher.handler_count);
+    for ([_]u16{ 0x014, 0x015 }) |retired| try testing.expect(std.enums.tagName(OpCode, @fromBackingInt(retired)) == null);
 }
 
-test "namespace handler: create" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_create, "production", ""));
-    switch (result) {
-        .namespace_created => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
-}
-
-test "namespace handler: create duplicate fails" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(makeRequest(.namespace_create, "test-ns", ""));
-    const result = handler.handleCommand(makeRequest(.namespace_create, "test-ns", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.already_exists, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
-}
-
-test "namespace handler: create empty name" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_create, "", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: create invalid name" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_create, "has spaces", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: create reserved name" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_create, "_sys", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-
-    const result2 = handler.handleCommand(makeRequest(.namespace_create, "_internal:test", ""));
-    switch (result2) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: delete is refused, whatever the namespace holds, and nothing is removed" {
+test "namespace handler: list pages in name order, holding default from the start" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
-    _ = handler.handleCommand(makeRequest(.namespace_create, "staging", ""));
-    for ([_][]const u8{ "", "\x01" }) |force| {
-        switch (handler.handleCommand(makeRequest(.namespace_delete, "staging", force))) {
-            .err => |e| try testing.expectEqualStrings(NamespaceHandler.DELETE_REFUSAL, e.message),
-            else => return error.TestUnexpectedResult,
-        }
-    }
-    try testing.expect(handler.namespaces.contains("staging"));
+    const only = try handler.page(namespace_ops.MAX_LIST, "");
+    try testing.expectEqual(@as(u32, 1), only.names.count);
+    try testing.expect(only.cursor == null);
+
+    for ([_][]const u8{ "gamma", "alpha", "beta" }) |n| _ = handler.applyCreate(n);
+    // limit 2: alpha, beta, then a cursor; from it, default and gamma.
+    const first = try handler.page(2, "");
+    var it = first.names.iterator();
+    try testing.expectEqualStrings("alpha", (try it.next()).?);
+    try testing.expectEqualStrings("beta", (try it.next()).?);
+    try testing.expectEqualStrings("beta", first.cursor.?);
+    const rest = try handler.page(2, first.cursor.?);
+    var it2 = rest.names.iterator();
+    try testing.expectEqualStrings("default", (try it2.next()).?);
+    try testing.expectEqualStrings("gamma", (try it2.next()).?);
+    try testing.expect(rest.cursor == null);
+    // A cursor past the last name: an empty last page.
+    const past = try handler.page(2, "zzz");
+    try testing.expectEqual(@as(u32, 0), past.names.count);
+    try testing.expect(past.cursor == null);
 }
 
-test "namespace handler: markNamespaceHasData" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
+test "namespace handler: a create entry carries its name's id, and one that doesn't halts" {
+    var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
+    var buf: [namespace_entries.Create.max_size]u8 = undefined;
+    const e = try testEntry(.namespace_create, 7, 1234 * std.time.ns_per_s, .{ .name = "stamped", .id = router.namespaceHash("stamped") }, &buf);
+    var out = Result.start(&e);
+    try handler.replayEntry(&e, &out);
+    try testing.expect(out.refused() == null);
+    const meta = handler.namespaces.get("stamped").?;
+    try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), meta.created_at_ns);
+    try testing.expectEqual(@as(u64, 7), meta.created_index);
+    try testing.expectEqual(router.namespaceHash("stamped"), handler.last_created_id);
+    // A second create of the name is refused where it applies, not where
+    // it was proposed: two can pass the handler's checks before either applies.
+    var again = Result.start(&e);
+    try handler.replayEntry(&e, &again);
+    try testing.expectEqual(proto.StatusCode.conflict, again.refused().?.status);
 
-    _ = handler.handleCommand(makeRequest(.namespace_create, "tracked", ""));
-    try testing.expect(!handler.namespaceHasData("tracked"));
+    const wrong = try testEntry(.namespace_create, 8, 0, .{ .name = "other", .id = router.namespaceHash("other") +% 1 }, &buf);
+    var w = Result.start(&wrong);
+    try testing.expectError(error.Halt, handler.replayEntry(&wrong, &w));
+    try testing.expect(!handler.namespaces.contains("other"));
+}
 
-    handler.markNamespaceHasData("tracked", null);
-    try testing.expect(handler.namespaceHasData("tracked"));
+test "namespace handler: a bind registers a name once, and a bind that disagrees halts" {
+    var handler = try NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+    var buf: [namespace_entries.Bind.max_size]u8 = undefined;
+    const id = router.namespaceHash("orders");
+    const bind = try testEntry(.namespace_bind, 3, 0, .{ .id = id, .name = "orders" }, &buf);
+    var out = Result.start(&bind);
+    try handler.replayEntry(&bind, &out);
+    try testing.expectEqualStrings("orders", handler.nameForHash(id).?);
+    // The same bind again changes nothing.
+    var again = Result.start(&bind);
+    try handler.replayEntry(&bind, &again);
+    try testing.expect(again.refused() == null);
+    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
 
-    // Default namespace is auto-created on first implicit write
-    handler.markNamespaceHasData("default", null);
-    try testing.expect(handler.namespaceHasData("default"));
+    // An id that isn't its name's, or a bound id under another name.
+    var buf2: [namespace_entries.Bind.max_size]u8 = undefined;
+    const wrong_id = try testEntry(.namespace_bind, 4, 0, .{ .id = id, .name = "other" }, &buf2);
+    var w = Result.start(&wrong_id);
+    try testing.expectError(error.Halt, handler.replayEntry(&wrong_id, &w));
+    try testing.expectEqualStrings("orders", handler.nameForHash(id).?);
+}
 
-    // Non-existent namespace is auto-created on write
+test "namespace handler: a bound id under another name halts" {
+    var handler = try NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
+    // Two valid names with one 32-bit id: the second's bind breaks the log.
+    var seen = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer seen.deinit();
+    var a: [16]u8 = undefined;
+    var b: [16]u8 = undefined;
+    const pair = for (0..1_000_000) |i| {
+        const name = try std.fmt.bufPrint(&a, "c{d}", .{i});
+        const got = try seen.getOrPut(router.namespaceHash(name));
+        if (got.found_existing) break .{ name, try std.fmt.bufPrint(&b, "c{d}", .{got.value_ptr.*}) };
+        got.value_ptr.* = @intCast(i);
+    } else return error.NoCollisionFound;
+    var buf: [namespace_entries.Bind.max_size]u8 = undefined;
+    const first = try testEntry(.namespace_bind, 1, 0, .{ .id = router.namespaceHash(pair[1]), .name = pair[1] }, &buf);
+    var out = Result.start(&first);
+    try handler.replayEntry(&first, &out);
+    var buf2: [namespace_entries.Bind.max_size]u8 = undefined;
+    const second = try testEntry(.namespace_bind, 2, 0, .{ .id = router.namespaceHash(pair[0]), .name = pair[0] }, &buf2);
+    var out2 = Result.start(&second);
+    try testing.expectError(error.Halt, handler.replayEntry(&second, &out2));
+    try testing.expectEqualStrings(pair[1], handler.nameForHash(router.namespaceHash(pair[0])).?);
+}
+
+test "namespace handler: a write to an unknown namespace registers it" {
+    var handler = try NamespaceHandler.init(testing.allocator);
+    defer handler.deinit();
     handler.markNamespaceHasData("ghost", null);
-    try testing.expect(handler.namespaceHasData("ghost"));
-}
-
-test "namespace handler: list" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(makeRequest(.namespace_create, "alpha", ""));
-    _ = handler.handleCommand(makeRequest(.namespace_create, "beta", ""));
-
-    const result = handler.handleCommand(makeRequest(.namespace_list, "", ""));
-    switch (result) {
-        .namespace_list => |r| {
-            defer handler.freeResult(result);
-            const count_ns = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 3), count_ns);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: list holds default from the start" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_list, "", ""));
-    switch (result) {
-        .namespace_list => |r| {
-            defer handler.freeResult(result);
-            const count_ns = std.mem.readInt(u32, r.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 1), count_ns);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: info existing" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(makeRequest(.namespace_create, "myns", ""));
-
-    const result = handler.handleCommand(makeRequest(.namespace_info, "myns", ""));
-    switch (result) {
-        .namespace_info => |r| {
-            defer handler.freeResult(result);
-            try testing.expect(r.exists);
-            try testing.expectEqualStrings("myns", r.name);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "namespace handler: info non-existing" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    const result = handler.handleCommand(makeRequest(.namespace_info, "missing", ""));
-    switch (result) {
-        .namespace_info => |r| {
-            defer handler.freeResult(result);
-            try testing.expect(!r.exists);
-            try testing.expectEqualStrings("missing", r.name);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    try testing.expect(handler.namespaces.contains("ghost"));
+    handler.markNamespaceHasData("", null);
+    try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
 }
 
 test "namespace handler: the name grammar, with a reason for each refusal" {
@@ -1072,17 +859,6 @@ test "namespace handler: a name whose id another namespace holds is refused, by 
     try testing.expectEqualStrings(pair[1], handler.nameForHash(router.namespaceHash(pair[0])).?);
 }
 
-test "namespace handler: freeResult non-allocated is no-op" {
-    const allocator = testing.allocator;
-    var handler = try NamespaceHandler.init(allocator);
-    defer handler.deinit();
-
-    handler.freeResult(.ok);
-    handler.freeResult(.{ .err = .{ .code = .invalid_request, .message = "test" } });
-    handler.freeResult(.{ .namespace_created = {} });
-    handler.freeResult(.{ .namespace_deleted = {} });
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Namespace Key Utilities — Tests
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1173,22 +949,6 @@ test "namespace handler: applyCreate adds to local registry" {
     try testing.expect(handler.namespaces.contains("test-ns"));
 }
 
-test "namespace handler: a namespace created through the log was created at its entry's stamp" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-    var buf: [128]u8 = undefined;
-    const e = entry_mod.buildCommandEntry(.namespace_create, 0, 1, 1, 1234 * std.time.ns_per_s, 0, "stamped", "", &buf) orelse unreachable;
-    var out = Result.start(&e);
-    try handler.replayEntry(&e, &out);
-    try testing.expect(out.refused() == null);
-    try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), handler.namespaces.get("stamped").?.created_at_ns);
-    // A second create of the name is refused where it applies, not where
-    // it was proposed: two can pass the handler's checks before either applies.
-    var again = Result.start(&e);
-    try handler.replayEntry(&e, &again);
-    try testing.expectEqual(proto.StatusCode.conflict, again.refused().?.status);
-}
-
 test "namespace handler: applyCreate is idempotent" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
@@ -1198,27 +958,7 @@ test "namespace handler: applyCreate is idempotent" {
     try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
 }
 
-test "namespace handler: applyDelete removes from local registry" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    _ = handler.applyCreate("test-ns");
-    try testing.expect(handler.namespaces.contains("test-ns"));
-
-    handler.applyDelete("test-ns");
-    try testing.expect(!handler.namespaces.contains("test-ns"));
-    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
-}
-
-test "namespace handler: applyDelete non-existent is no-op" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-
-    handler.applyDelete("does-not-exist"); // should not crash
-    try testing.expectEqual(@as(usize, 1), handler.namespaces.count());
-}
-
-test "namespace: a committed entry's hash resolves to the name until it is deleted" {
+test "namespace: a committed entry's hash resolves to the name" {
     var handler = try NamespaceHandler.init(std.testing.allocator);
     defer handler.deinit();
 
@@ -1230,9 +970,6 @@ test "namespace: a committed entry's hash resolves to the name until it is delet
     // Re-applying (a replay) neither duplicates nor loses the mapping.
     _ = handler.applyCreate("prod");
     try std.testing.expectEqualStrings("prod", handler.nameForHash(hash).?);
-
-    handler.applyDelete("prod");
-    try std.testing.expect(handler.nameForHash(hash) == null);
     try std.testing.expect(handler.nameForHash(router.namespaceHash("never")) == null);
 }
 

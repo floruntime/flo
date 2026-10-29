@@ -66,9 +66,9 @@ pub const OpCode = enum(u16) {
     namespace_delete = 0x011,
     namespace_list = 0x012,
     namespace_info = 0x013,
-    /// Refused: no namespace setting is supported yet.
-    namespace_config_set = 0x014,
-    namespace_config_get = 0x015,
+    // 0x014 and 0x015 were namespace settings, never supported; retired.
+    /// A shard asking shard 0 for a namespace's id, creating it if new.
+    namespace_ensure = 0x016,
 
     // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
     cluster_status = 0x030,
@@ -231,6 +231,10 @@ pub const StatusCode = enum(u8) {
     /// the shard resumes; the one it halted at a repair skips. Resending it
     /// unchanged would write it twice, or halt again.
     outcome_pending = 13,
+    /// The namespace the request names doesn't exist. Not `not_found`,
+    /// which means a missing key, so a client never mistakes one for the
+    /// other.
+    no_namespace = 14,
     _,
 };
 
