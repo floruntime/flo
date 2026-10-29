@@ -26,6 +26,20 @@ pub const Term = union(enum) {
     Unknown: u32,
 };
 
+/// This process's environment as it is now, `setenv` included. Caller
+/// deinits.
+pub fn currentEnv(allocator: Allocator) !std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(allocator);
+    errdefer map.deinit();
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+        const entry = std.mem.span(entry_ptr);
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        try map.put(entry[0..eq], entry[eq + 1 ..]);
+    }
+    return map;
+}
+
 pub const Child = struct {
     allocator: Allocator,
     argv: []const []const u8,
@@ -33,6 +47,9 @@ pub const Child = struct {
     stdout_behavior: StdIoBehavior = .Inherit,
     stderr_behavior: StdIoBehavior = .Inherit,
     pgid: ?std.c.pid_t = null,
+    /// The child's whole environment; null inherits the one this process
+    /// started with.
+    env_map: ?*const std.process.Environ.Map = null,
 
     /// Set after `spawn()` succeeds.
     inner: ?NativeChild = null,
@@ -67,6 +84,7 @@ pub const Child = struct {
             .stdout = toStdIo(self.stdout_behavior),
             .stderr = toStdIo(self.stderr_behavior),
             .pgid = self.pgid,
+            .environ_map = self.env_map,
         };
         var child = try std.process.spawn(io(), opts);
         _ = &child;

@@ -14,6 +14,12 @@
 //! The write is one pwrite into a file opened at boot, with no fsync: a
 //! crash leaves the page cache, and a power loss is not an apply bug. A
 //! record cut short or never written fails its checksum and reads as none.
+//!
+//! The file's second record is the entry the shard is halted at, written
+//! when it halts and cleared when it resumes or boots (a boot that halts
+//! again writes it again). Nothing at boot reads it: it tells the offline
+//! repair which entry this shard is halted at, so that repair skips only
+//! that one.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -104,6 +110,7 @@ pub const Marker = struct {
         const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return error.MarkerOpenFailed;
         var m: Marker = .{ .fd = fd, .shard = shard };
+        m.resumed();
         var rec: [RECORD_SIZE]u8 = undefined;
         if (std.c.pread(fd, &rec, rec.len, 0) != rec.len) return m;
         const c = Crash.decode(&rec) orelse return m;
@@ -145,12 +152,61 @@ pub const Marker = struct {
         self.clear();
     }
 
+    /// Clear the crash: a committed repair skips its entry, so no build
+    /// applies it again, this one or another.
+    pub fn skipped(self: *Marker) void {
+        const c = &(self.crashed orelse return);
+        log.info("shard {d}: entry {d} crashed this node, and a repair skips it", .{ self.shard, c.index });
+        self.clear();
+    }
+
+    /// The shard halted at the entry `index`, `term`, `crc`.
+    pub fn halted(self: *Marker, index: u64, term: u64, crc: u32) void {
+        if (self.fd < 0) return;
+        var h: Crash = .{ .shard = self.shard, .index = index, .term = term, .entry_crc = crc, .build_len = @intCast(build_name.len) };
+        @memcpy(h.build_buf[0..build_name.len], build_name);
+        var rec: [RECORD_SIZE]u8 = undefined;
+        h.encode(&rec);
+        _ = std.c.pwrite(self.fd, &rec, rec.len, RECORD_SIZE);
+    }
+
+    /// The shard is halted no more.
+    pub fn resumed(self: *Marker) void {
+        if (self.fd < 0) return;
+        const zero: [RECORD_SIZE]u8 = @splat(0);
+        _ = std.c.pwrite(self.fd, &zero, zero.len, RECORD_SIZE);
+    }
+
     fn clear(self: *Marker) void {
         self.crashed = null;
         const zero: [RECORD_SIZE]u8 = @splat(0);
         _ = std.c.pwrite(self.fd, &zero, zero.len, 0);
     }
 };
+
+/// What a stopped shard's marker holds, read without changing it: the
+/// crash, from any build, and the entry it was halted at.
+pub const Held = struct { crash: ?Crash = null, halt: ?Crash = null };
+
+pub fn read(shard_dir: []const u8, shard: u16) Held {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ shard_dir, FILENAME }, 0) catch return .{};
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return .{};
+    defer _ = std.c.close(fd);
+    var recs: [2 * RECORD_SIZE]u8 = undefined;
+    const n = std.c.pread(fd, &recs, recs.len, 0);
+    var held: Held = .{};
+    if (n >= RECORD_SIZE) held.crash = Crash.decode(recs[0..RECORD_SIZE]);
+    if (n == recs.len) held.halt = Crash.decode(recs[RECORD_SIZE..]);
+    if (held.crash) |c| if (c.shard != shard) {
+        held.crash = null;
+    };
+    if (held.halt) |h| if (h.shard != shard) {
+        held.halt = null;
+    };
+    return held;
+}
 
 const Applying = struct {
     fd: std.posix.fd_t,
@@ -234,6 +290,32 @@ fn holdsRecord(m: *const Marker) bool {
     var rec: [RECORD_SIZE]u8 = undefined;
     if (std.c.pread(m.fd, &rec, rec.len, 0) != rec.len) return false;
     return Crash.decode(&rec) != null;
+}
+
+test "apply marker: a halt is held until the shard resumes or boots, and a crash beside it is kept" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmpPath(&tmp, &pbuf);
+    const e = testEntry(7, 3);
+    try testing.expect(read(dir, 2).halt == null);
+    try writeCrashForTest(dir, 2, &e, build_name);
+    {
+        var m = try Marker.open(dir, 2);
+        defer m.close();
+        m.halted(7, 3, e.header.crc32c);
+        const held = read(dir, 2);
+        try testing.expect(held.halt.?.names(&e));
+        try testing.expect(held.crash.?.names(&e));
+        try testing.expect(read(dir, 1).halt == null);
+        m.resumed();
+        try testing.expect(read(dir, 2).halt == null);
+        m.halted(7, 3, e.header.crc32c);
+    }
+    var m = try Marker.open(dir, 2);
+    defer m.close();
+    try testing.expect(read(dir, 2).halt == null);
+    try testing.expect(read(dir, 2).crash.?.names(&e));
 }
 
 fn tmpPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {

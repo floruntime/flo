@@ -9,5 +9,6 @@ pub const reactor = @import("reactor.zig");
 pub const shard = @import("shard.zig");
 pub const test_faults = @import("test_faults.zig");
 pub const apply_marker = @import("apply_marker.zig");
+pub const repair = @import("repair.zig");
 pub const connection = @import("connection.zig");
 pub const router = @import("router.zig");

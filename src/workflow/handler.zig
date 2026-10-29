@@ -3738,20 +3738,20 @@ pub const WorkflowHandler = struct {
         const raw_name = if (sep) |i| ns_key_raw[i + 1 ..] else ns_key_raw;
         out.putBytes(raw_name);
 
+        // Parsed before anything changes: a definition that won't parse
+        // halts here and leaves the one it would replace in place.
+        var def = self.parseStored(yaml, ns_key_raw) catch |err| {
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
+        };
+        defer def.deinit(self.allocator);
+
         const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
-        // Remove old definition if exists
         if (self.definitions.fetchRemove(ns_key)) |old| {
             self.allocator.free(old.key); // old ns-qualified key
             self.allocator.free(old.value.name_owned);
             self.allocator.free(old.value.version_owned);
             self.allocator.free(old.value.yaml_owned);
         }
-
-        var def = self.parseStored(yaml, ns_key_raw) catch |err| {
-            self.allocator.free(ns_key);
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
-        };
-        defer def.deinit(self.allocator);
 
         const version = self.allocator.dupe(u8, def.version) catch {
             self.allocator.free(ns_key);
@@ -4266,6 +4266,9 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.shard_metrics = null;
     shard.offline = null;
     shard.halted = null;
+    shard.marker = .{};
+    shard.skips = .{};
+    shard.skip_scan_from = 0;
     shard.diverged_damage = null;
     shard.offline_published = .init(false);
     shard.replica.diverged = false;
@@ -5169,6 +5172,28 @@ test "workflow replay: an unknown status, or a complete entry without its output
     try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{3}, 2));
     try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2));
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
+}
+
+test "workflow replay: a redefinition that won't parse halts and keeps the definition it would replace" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    const yaml =
+        \\kind: Workflow
+        \\name: wf
+        \\version: "1"
+        \\
+        \\start:
+        \\  run: "@actions/a"
+        \\  transitions:
+        \\    success: flo.Completed
+        \\    failure: flo.Failed
+    ;
+    var out: Result = .{};
+    try handler.replayCreate("default:wf", yaml, 1, &out);
+    try testing.expectError(error.Halt, handler.replayCreate("default:wf", "kind: [", 2, &out));
+    const def = handler.definitions.get("default:wf") orelse return error.DefinitionDropped;
+    try testing.expectEqualStrings("1", def.version_owned);
+    try testing.expectEqual(@as(usize, 1), handler.definitions.count());
 }
 
 test "workflow replay: a run starts and completes at its entries' stamps, not the host's clock" {

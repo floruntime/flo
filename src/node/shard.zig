@@ -71,6 +71,8 @@ const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
 const apply_marker = @import("apply_marker.zig");
+const offline_mod = @import("offline.zig");
+const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
 const build_options = @import("build_options");
@@ -446,6 +448,12 @@ pub const Shard = struct {
     /// Where a crash in apply is recorded, and the entry the last one, on
     /// this build, crashed on: it halts there rather than crash again.
     marker: apply_marker.Marker = .{},
+    /// The entries the log's committed repair skips name: each applies
+    /// nothing here, as on every replica.
+    skips: repair.Skips = .{},
+    /// A halted shard looks for the skip naming its halt among committed
+    /// entries from here on; each looks only at what committed since.
+    skip_scan_from: u64 = 0,
     /// The shard's own writes (checkpoints, acks, run steps) refused since
     /// the last line saying so, and when the next line may go out.
     halted_refusals: u64 = 0,
@@ -763,6 +771,8 @@ pub const Shard = struct {
         var boot_halt: ?Halt = null;
         var marker: apply_marker.Marker = .{};
         errdefer marker.close();
+        var skips: repair.Skips = .{};
+        errdefer skips.deinit(allocator);
         errdefer if (hard_state_store) |store| allocator.destroy(store);
         var durable_log: ?*DurableLog = null;
         errdefer if (durable_log) |dl| {
@@ -866,15 +876,23 @@ pub const Shard = struct {
             // is damage, and replay stops there.
             _ = durable_log.?.removeTornTail() catch |err| log.warn("shard {d}: could not remove a torn segment flush: {s}", .{ shard_id, @errorName(err) });
             var watermark: u64 = 0;
+            var replayed_stamp: u64 = 0;
             if (boot_damage == null) {
                 const log_files = durable_log.?;
-                if (listDurable(log_files)) |files| {
+                if (listDurable(log_files)) |files| replay: {
                     for (files) |f| watermark = @max(watermark, f.commit_index_at_seal);
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, &marker, boot);
+                    // Before anything applies: a skipped entry must not run,
+                    // whatever this build would make of it. The skip set
+                    // wins over a crash marker too.
+                    boot_damage = try collectSkips(allocator, files, watermark, &skips);
+                    if (boot_damage != null) break :replay;
+                    if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
                     boot_halt = replayed.halt;
                     raft_node.last_applied = replayed.applied_through;
+                    replayed_stamp = replayed.last_stamp;
                 } else |err| {
                     if (log_files.badHeaderSegment().len == 0) return err;
                     boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
@@ -888,9 +906,13 @@ pub const Shard = struct {
                 log.warn("shard {d}: no segment carries a commit watermark; everything is applied at boot through the log instead of replay", .{shard_id});
             }
 
-            raft_node.noteApplied(partition.router.applied_stamp);
+            // Replay's own, not the router's: an entry replay halted at
+            // moved the router's past it, and a shard that halted live
+            // keeps the stamp of the entry before.
+            raft_node.noteApplied(replayed_stamp);
             if (boot_halt) |*h| {
                 raft_node.halted = true;
+                marker.halted(h.index, h.term, h.crc);
                 log.err("shard {d} comes up halted at {s}, as it was before the restart. It applies nothing past it and takes no writes until a repair", .{ shard_id, h.reason() });
             }
 
@@ -1002,6 +1024,7 @@ pub const Shard = struct {
             .diverged_damage = if (cluster_role != .single) boot_damage else null,
             .halted = boot_halt,
             .marker = marker,
+            .skips = skips,
             .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
             .health = boot.health,
@@ -1200,6 +1223,7 @@ pub const Shard = struct {
 
     pub fn deinit(self: *Shard) void {
         self.marker.close();
+        self.skips.deinit(self.allocator);
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
         self.waiting_fds.deinit(self.allocator);
@@ -3108,8 +3132,75 @@ pub const Shard = struct {
         raft.halted = true;
         raft.last_applied = e.header.index - 1;
         self.last_entry_applied = false;
+        self.skip_scan_from = e.header.index + 1;
+        self.marker.halted(e.header.index, e.header.term, e.header.crc32c);
         log.err("shard {d} halted at {s}. It applies nothing past it and takes no writes; reads are served, marked stale. Restarting won't help: the entry has to be repaired (the node's /status says where it halted)", .{ self.id, self.halted.?.reason() });
         self.answerHaltedPending();
+    }
+
+    /// Go on past the halt once a committed repair skips it: the skip is
+    /// among the committed entries after it. Each call looks only at what
+    /// committed since the last.
+    fn resumePastSkip(self: *Shard) bool {
+        const h = self.halted orelse return true;
+        const raft = self.raft_node;
+        var idx = @max(self.skip_scan_from, h.index + 1);
+        while (idx <= raft.commit_index) : (idx += 1) {
+            const e = raft.log.getEntryCopy(idx, self.apply_buf) orelse continue;
+            const skip = repair.Skip.decode(&e) orelse continue;
+            if (skip.index != h.index or skip.term != h.term or skip.crc != h.crc) continue;
+            self.skips.add(self.allocator, &skip) catch {
+                // Looked at again on the next call.
+                self.skip_scan_from = idx;
+                return false;
+            };
+            log.info("shard {d}: the repair at entry {d} skips entry {d} ({s}); going on past it", .{ self.id, idx, h.index, skip.reason });
+            self.halted = null;
+            raft.halted = false;
+            self.marker.resumed();
+            // The entry is passed over when the apply reaches it again. One
+            // whose apply ran before it halted already left what a pass-over
+            // leaves, and the partition takes nothing twice.
+            if (self.marker.crashed) |*c| if (c.index == h.index) self.marker.skipped();
+            return true;
+        }
+        self.skip_scan_from = raft.commit_index + 1;
+        return false;
+    }
+
+    /// A repair skip applied. Where its entry was skipped, or lies below
+    /// the log's start, there is nothing to do; one that names no entry of
+    /// this log, an entry at or past itself, or another skip skips nothing,
+    /// the same on every replica. A replica that applied the entry it names
+    /// holds what no other does: false, and the shard is damaged.
+    fn checkSkip(self: *Shard, e: *const entry_mod.Entry) bool {
+        const at = e.header.index;
+        const skip = repair.Skip.decode(e) orelse {
+            log.warn("shard {d}: entry {d} is a repair skip that won't decode; it skips nothing", .{ self.id, at });
+            return true;
+        };
+        if (self.skips.holds(&skip)) return true;
+        if (skip.index >= at) {
+            log.warn("shard {d}: the repair at entry {d} names entry {d}, not one before it; it skips nothing", .{ self.id, at, skip.index });
+            return true;
+        }
+        const raft = self.raft_node;
+        if (skip.index < raft.log.start()) return true;
+        // Overwrites `e`, and the reason with it.
+        const named = raft.log.getEntryCopy(skip.index, self.apply_buf) orelse {
+            log.warn("shard {d}: the repair at entry {d} names entry {d}, which this node can't read back; it skips nothing here", .{ self.id, at, skip.index });
+            return true;
+        };
+        if (!skip.names(&named)) {
+            log.warn("shard {d}: the repair at entry {d} names entry {d} in term {d}, which this log doesn't hold; it skips nothing", .{ self.id, at, skip.index, skip.term });
+            return true;
+        }
+        if (isSkip(&named)) {
+            log.warn("shard {d}: the repair at entry {d} names another repair; a skip is never skipped", .{ self.id, at });
+            return true;
+        }
+        self.damaged(silent_loss.Damage.init(.applied_skipped, "entry {d} applied on this node, but the repair at entry {d} skips it on every replica", .{ skip.index, at }));
+        return false;
     }
 
     /// Whether `err` is a halted shard refusing one of its own writes.
@@ -3521,9 +3612,10 @@ pub const Shard = struct {
         // An offline shard's projections are missing an entry: nothing
         // after it may apply over the hole.
         if (self.applying or self.offline != null) return true;
-        // Halted: nothing past the entry applies, but writes committed
-        // after it are told so as their entries commit.
-        if (self.halted != null) {
+        // Halted: nothing past the entry applies until a committed repair
+        // skips it, but writes committed after it are told so as their
+        // entries commit.
+        if (self.halted != null and !self.resumePastSkip()) {
             self.answerHaltedPending();
             return false;
         }
@@ -3544,9 +3636,24 @@ pub const Shard = struct {
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
                 if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                    if (skippedHere(&self.skips, &e)) {
+                        self.last_entry_applied = false;
+                        self.last_result.reset(&e);
+                        self.defaultPartition().passOverSkipped(&e) catch |err| {
+                            self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                            self.damaged(localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ next_idx, @errorName(err) })));
+                            all_applied = false;
+                            break :drain;
+                        };
+                        // Its client is told it didn't run; the shard is
+                        // as the repair wants it.
+                        self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                        continue;
+                    }
                     // The leader stamps each entry after the one before it,
-                    // so an entry that isn't is a bug every replica sees.
-                    if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp) {
+                    // so an entry that isn't is a bug every replica sees. A
+                    // skip never halts.
+                    if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp and !isSkip(&e)) {
                         self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
                         all_applied = false;
                         break :drain;
@@ -3576,6 +3683,11 @@ pub const Shard = struct {
                     if (!applied) all_applied = false;
                     self.last_entry_applied = applied;
                     self.answerPending(next_idx, e.header.term, applied, &self.last_result);
+                    // Last: it reads the entry it names into the same buffer.
+                    if (isSkip(&e) and !self.checkSkip(&e)) {
+                        all_applied = false;
+                        break :drain;
+                    }
                 } else {
                     self.last_entry_applied = false;
                     self.last_result.index = next_idx;
@@ -6169,8 +6281,9 @@ fn localDamage(err: persistence_mod.ApplyError, d: silent_loss.Damage) silent_lo
     return if (err == error.OutOfMemory) outOfMemory(d) else d;
 }
 
-/// Entry types with nothing to apply: the term's no-op.
-const APPLIES_NOTHING = [_]entry_mod.EntryType{.raft_noop};
+/// Entry types with nothing to apply: the term's no-op, and a repair skip,
+/// whose effect is the shard's (`Shard.checkSkip`).
+const APPLIES_NOTHING = [_]entry_mod.EntryType{ .raft_noop, .repair_skip };
 /// Entry types nothing writes today. One that arrives anyway is counted as
 /// having no applier.
 const NEVER_WRITTEN = [_]entry_mod.EntryType{ .cg_create, .raft_snapshot };
@@ -6288,6 +6401,53 @@ const ReplayOutcome = struct {
 /// How often a long replay says how far it has got.
 const REPLAY_PROGRESS_MS: u64 = 5_000;
 
+/// The committed repair skips in the log: those at or below `watermark`,
+/// the one index boot knows committed, in the segments whose header says
+/// they hold one. Every flush seals a whole segment, so there is no open
+/// tail on disk to miss. A skip above the watermark, or not yet in this
+/// replica's log (a follower behind the majority that committed it), is
+/// honoured once it arrives. Until then a build that halts at the entry
+/// halts and waits, and one that doesn't applies it first and then
+/// diverges (`Shard.checkSkip`): the one window, a repair and an upgrade
+/// at the same moment, widest for a lagging follower.
+///
+/// A log that starts after a snapshot needs nothing more: a skip comes
+/// after its entry, so a snapshot past the skip covers both, and one
+/// between them leaves a skip for an entry the log no longer holds.
+fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.SegmentFile, watermark: u64, skips: *repair.Skips) !?silent_loss.Damage {
+    for (files) |sf| {
+        if (!sf.holds_skip or sf.first_index > watermark) continue;
+        const name = std.fs.path.basename(sf.path);
+        const opened = SegmentReader.initFromFile(allocator, sf.path) catch |err| {
+            return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+        };
+        defer allocator.free(opened.buf);
+        var offset: usize = 0;
+        const data_len = opened.reader.data_end - opened.reader.data_start;
+        while (offset < data_len) {
+            const e = opened.reader.readEntryAt(offset) orelse {
+                return silent_loss.Damage.init(.segment_bad_entry, "segment {s} holds an entry at byte {d} that will not parse", .{ name, offset });
+            };
+            offset += e.totalSize();
+            if (e.header.index > watermark) break;
+            const skip = repair.Skip.decode(&e) orelse continue;
+            if (skip.index >= e.header.index) continue;
+            try skips.add(allocator, &skip);
+        }
+    }
+    return null;
+}
+
+/// Whether a committed repair skips `e` on this shard. A skip entry itself
+/// is never skipped: it changes nothing a pass-over would leave out.
+fn skippedHere(skips: *const repair.Skips, e: *const entry_mod.Entry) bool {
+    return !isSkip(e) and skips.skips(e);
+}
+
+fn isSkip(e: *const entry_mod.Entry) bool {
+    return e.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip);
+}
+
 /// Replay all .flseg segment files in `dir_path`: every entry is restored
 /// into the Raft log and applied through `applyEntryCore`, exactly as when
 /// it was first committed. Replay stops at the first damage: what follows
@@ -6304,6 +6464,7 @@ fn replaySegments(
     shard_id: u16,
     losses: *silent_loss.Counts,
     marker: *apply_marker.Marker,
+    skips: *const repair.Skips,
     boot: Shard.Boot,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
@@ -6319,7 +6480,7 @@ fn replaySegments(
             out.cancelled = true;
             break;
         }
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, marker, boot, last, &out);
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, marker, skips, boot, last, &out);
         if (out.damage != null or out.cancelled) break;
     }
     if (out.entries > 0 and !out.cancelled) {
@@ -6338,6 +6499,7 @@ fn replaySegmentFile(
     shard_id: u16,
     losses: *silent_loss.Counts,
     marker: *apply_marker.Marker,
+    skips: *const repair.Skips,
     boot: Shard.Boot,
     last: u64,
     out: *ReplayOutcome,
@@ -6394,7 +6556,18 @@ fn replaySegmentFile(
         // Past a halt: in the log, and nothing of it applies until a repair.
         if (seg_entry.header.index > watermark or out.halt != null) continue;
 
-        if (out.last_stamp != 0 and seg_entry.header.timestamp_ns <= out.last_stamp) {
+        // A repair skips it: taken as a halt on it left a replica that
+        // halted live, and its applier never runs.
+        if (skippedHere(skips, &seg_entry)) {
+            partition.passOverSkipped(&seg_entry) catch |err| {
+                out.damage = localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ seg_entry.header.index, @errorName(err) }));
+                return;
+            };
+            log.info("shard {d}: entry {d} is skipped by a repair; passing over it", .{ shard_id, seg_entry.header.index });
+            out.applied_through = seg_entry.header.index;
+            continue;
+        }
+        if (out.last_stamp != 0 and seg_entry.header.timestamp_ns <= out.last_stamp and !isSkip(&seg_entry)) {
             out.halt = Halt.init(&seg_entry, "entry {d}: its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ seg_entry.header.index, seg_entry.header.timestamp_ns, out.last_stamp });
             continue;
         }
@@ -6417,7 +6590,10 @@ fn replaySegmentFile(
                 return;
             },
         }
-        out.last_stamp = seg_entry.header.timestamp_ns;
+        // A skip is exempt from the stamp check, so it may be stamped
+        // before the entry ahead of it; the applied stamp never goes back,
+        // as live.
+        out.last_stamp = @max(out.last_stamp, seg_entry.header.timestamp_ns);
         out.applied_through = seg_entry.header.index;
     }
 }
@@ -13401,6 +13577,405 @@ test "a shard halted before a restart comes up halted at the same entry, with no
     try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
     shard.applyDeferredTail();
     try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+/// What a skip decides on a replica: whether the partition holds the skipped
+/// entry and the router has passed it, and what the projections hold. A
+/// replica that halted live and one that booted past the skip must agree.
+const SkipState = struct {
+    in_ual: bool,
+    in_warm: bool,
+    router_past: bool,
+    queued: u64,
+    kv: usize,
+    defs: usize,
+    def_version: [8]u8 = @splat(0),
+    action_runs: usize,
+
+    fn of(shard: *Shard, h: u64) SkipState {
+        const p = shard.defaultPartition();
+        var st: SkipState = .{
+            .in_ual = p.ual.contains(h),
+            .in_warm = p.warm_store.contains(h),
+            .router_past = p.router.applied_index >= h,
+            .queued = DamageTest.queued(shard),
+            .kv = shard.kv_handler.kv.count(),
+            .defs = shard.workflow_handler.definitions.count(),
+            .action_runs = shard.actions_handler.runs.count(),
+        };
+        if (shard.workflow_handler.definitions.get("default:wf")) |d| {
+            const n = @min(d.version_owned.len, st.def_version.len);
+            @memcpy(st.def_version[0..n], d.version_owned[0..n]);
+        }
+        return st;
+    }
+};
+
+/// The halting entries a skip is tested over, one per way an apply halts.
+const HaltCase = enum {
+    /// No applier takes it: halts after the partition took it.
+    no_applier,
+    /// The KV projection refuses it as malformed.
+    kv_malformed,
+    /// The queue projection refuses it as malformed.
+    queue_malformed,
+    /// A redefinition that won't parse: the workflow applier halts.
+    workflow_redefine,
+    /// An invoke that won't decode: the actions applier halts.
+    action_malformed,
+
+    const WF_YAML =
+        \\kind: Workflow
+        \\name: wf
+        \\version: "1"
+        \\
+        \\start:
+        \\  run: "@actions/a"
+        \\  transitions:
+        \\    success: flo.Completed
+        \\    failure: flo.Failed
+    ;
+
+    /// Propose the entry that halts, and anything it needs before it.
+    fn propose(c: HaltCase, shard: *Shard) !u64 {
+        const raft = shard.raft_node;
+        switch (c) {
+            .no_applier => return (try raft.propose(.cg_create, entry_mod.Flags.NONE, "")).index,
+            .kv_malformed => return (try raft.propose(.kv_put, entry_mod.Flags.NONE, "\x01")).index,
+            .queue_malformed => return (try raft.propose(.queue_enqueue, entry_mod.Flags.NONE, "\x01")).index,
+            .workflow_redefine => {
+                _ = try persistence_mod.proposeEntry(shard, .workflow_create, entry_mod.Flags.NONE, "", "default:wf", WF_YAML);
+                try std.testing.expect(shard.applyCommitted());
+                return (try persistence_mod.proposeEntry(shard, .workflow_create, entry_mod.Flags.NONE, "", "default:wf", "kind: [")).index;
+            },
+            .action_malformed => return (try raft.propose(.action_invoke, entry_mod.Flags.NONE, "\x01")).index,
+        }
+    }
+};
+
+/// Propose a skip of entry `h`, as a repair commits one.
+fn proposeSkip(shard: *Shard, h: u64) !u64 {
+    var e_buf: [4096]u8 = undefined;
+    const halted = shard.raft_node.log.getEntryCopy(h, &e_buf) orelse return error.NoEntry;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    return (try shard.raft_node.propose(.repair_skip, entry_mod.Flags.NONE, repair.Skip.of(&halted, "test").encode(&p))).index;
+}
+
+test "Shard: a committed skip takes a halted shard past its halt, and a restart passes over the entry the same way" {
+    for (std.enums.values(HaltCase)) |c| {
+        errdefer std.debug.print("halt case: {t}\n", .{c});
+        var t: DamageTest = undefined;
+        try t.init();
+        defer t.deinit();
+        var h: u64 = 0;
+        var live: SkipState = undefined;
+        {
+            var shard = try t.open();
+            defer shard.deinit();
+            h = try c.propose(&shard);
+            _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+            try std.testing.expect(!shard.applyCommitted());
+            try std.testing.expectEqual(h, shard.halted.?.index);
+            // Proposed while halted: a skip is exempt from the halt.
+            _ = try proposeSkip(&shard, h);
+            try std.testing.expect(shard.applyCommitted());
+            try std.testing.expect(shard.halted == null);
+            try std.testing.expect(!shard.raft_node.halted);
+            try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
+            live = SkipState.of(&shard, h);
+            try shard.flushSegmentToDisk();
+        }
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.applyDeferredTail();
+        try std.testing.expect(shard.halted == null);
+        try std.testing.expect(shard.offline == null);
+        try std.testing.expectEqual(live, SkipState.of(&shard, h));
+        if (c == .workflow_redefine) try std.testing.expectEqualStrings("1", std.mem.sliceTo(&live.def_version, 0));
+    }
+}
+
+test "Shard: a shard halted before a restart goes on once a skip commits, as one halted live does" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        h = try HaltCase.no_applier.propose(&shard);
+        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+        try std.testing.expect(!shard.applyCommitted());
+        try shard.flushSegmentToDisk();
+    }
+    var resumed: SkipState = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.applyDeferredTail();
+        try std.testing.expectEqual(h, shard.halted.?.index);
+        // The boot that halted again says so, for the offline repair.
+        const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+        defer std.testing.allocator.free(shard_dir);
+        try std.testing.expectEqual(h, apply_marker.read(shard_dir, 0).halt.?.index);
+        // The stamp of the entry before the halt, as a shard halted live
+        // keeps: replay's own, not the router's, which passed the halt.
+        var e_buf: [256]u8 = undefined;
+        try std.testing.expectEqual(shard.raft_node.log.getEntryCopy(h - 1, &e_buf).?.header.timestamp_ns, shard.raft_node.applied_stamp);
+        _ = try proposeSkip(&shard, h);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null);
+        try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
+        resumed = SkipState.of(&shard, h);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null);
+    try std.testing.expectEqual(resumed, SkipState.of(&shard, h));
+}
+
+test "Shard: a skip of an entry whose apply crashed passes over it, clears the marker, and a restart agrees" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    var e_buf: [256]u8 = undefined;
+    var crashed: entry_mod.Entry = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // The second enqueue's entry.
+        crashed = shard.raft_node.log.getEntryCopy(shard.raft_node.last_applied - 2, &e_buf).?;
+    }
+    try apply_marker.writeCrashForTest(shard_dir, 0, &crashed, apply_marker.build_name);
+    var resumed: SkipState = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.applyDeferredTail();
+        try std.testing.expectEqual(crashed.header.index, shard.halted.?.index);
+        _ = try proposeSkip(&shard, crashed.header.index);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null);
+        try std.testing.expect(shard.marker.crashed == null);
+        // The crashed enqueue never ran; the two after it did.
+        try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES - 1), DamageTest.queued(&shard));
+        resumed = SkipState.of(&shard, crashed.header.index);
+        try shard.flushSegmentToDisk();
+    }
+    // The marker would halt this build again; the skip set wins.
+    try apply_marker.writeCrashForTest(shard_dir, 0, &crashed, apply_marker.build_name);
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        shard.applyDeferredTail();
+        try std.testing.expect(shard.halted == null);
+        try std.testing.expect(shard.marker.crashed == null);
+        try std.testing.expectEqual(resumed, SkipState.of(&shard, crashed.header.index));
+    }
+    // With no marker this build applies the entry, as a fixed build would:
+    // the skip still wins.
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(resumed, SkipState.of(&shard, crashed.header.index));
+}
+
+test "Shard: a second skip for the same entry changes nothing, live or after a restart" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        h = try HaltCase.no_applier.propose(&shard);
+        try std.testing.expect(!shard.applyCommitted());
+        _ = try proposeSkip(&shard, h);
+        _ = try proposeSkip(&shard, h);
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null and shard.offline == null);
+        try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(usize, 1), shard.skips.named.items.len);
+}
+
+test "Shard: a skip that names no entry of this log, an entry after it, or another skip skips nothing" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    const raft = shard.raft_node;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    var e_buf: [4096]u8 = undefined;
+    const enq = raft.log.getEntryCopy(raft.last_applied - 1, &e_buf).?;
+    // The right index in another term; an index at or past the skip's own.
+    var wrong_term = repair.Skip.of(&enq, "");
+    wrong_term.term += 1;
+    _ = try raft.propose(.repair_skip, entry_mod.Flags.NONE, wrong_term.encode(&p));
+    const ahead: repair.Skip = .{ .index = raft.log.lastIndex() + 5, .term = raft.current_term, .crc = 0 };
+    _ = try raft.propose(.repair_skip, entry_mod.Flags.NONE, ahead.encode(&p));
+    // A skip of the first skip.
+    const first = raft.log.lastIndex() - 1;
+    _ = try proposeSkip(&shard, first);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "Shard: a skip naming the halted index in another term leaves the shard halted" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    const h = try HaltCase.no_applier.propose(&shard);
+    try std.testing.expect(!shard.applyCommitted());
+    var e_buf: [256]u8 = undefined;
+    var other = repair.Skip.of(&shard.raft_node.log.getEntryCopy(h, &e_buf).?, "");
+    other.term += 1;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    _ = try shard.raft_node.propose(.repair_skip, entry_mod.Flags.NONE, other.encode(&p));
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(h, shard.halted.?.index);
+    other.term -= 1;
+    other.crc +%= 1;
+    _ = try shard.raft_node.propose(.repair_skip, entry_mod.Flags.NONE, other.encode(&p));
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(h, shard.halted.?.index);
+}
+
+test "Shard: a skip never halts, even stamped out of order" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    const r = shard.raft_node;
+    const h = try HaltCase.no_applier.propose(&shard);
+    try std.testing.expect(!shard.applyCommitted());
+    var e_buf: [256]u8 = undefined;
+    const halted = r.log.getEntryCopy(h, &e_buf).?;
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    // Stamped no later than the entry before it.
+    var skip = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, r.current_term, r.log.lastIndex() + 1, r.applied_stamp, repair.Skip.of(&halted, "").encode(&p));
+    skip.header.crc32c = skip.computeCrc();
+    _ = try r.log.append(&skip);
+    r.commit_index = skip.header.index;
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+}
+
+test "Shard: a skip stamped out of order replays as it applied live, and the stamp never goes back" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var after: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        const r = shard.raft_node;
+        const h = try HaltCase.no_applier.propose(&shard);
+        try std.testing.expect(!shard.applyCommitted());
+        var e_buf: [256]u8 = undefined;
+        const halted = r.log.getEntryCopy(h, &e_buf).?;
+        const last = r.applied_stamp;
+        var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+        var skip = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, r.current_term, r.log.lastIndex() + 1, last - 1000, repair.Skip.of(&halted, "").encode(&p));
+        skip.header.crc32c = skip.computeCrc();
+        _ = try r.log.append(&skip);
+        // After the skip's stamp, but not after the last applied entry's.
+        const cmd = entry_mod.CommandPayload{ .namespace_hash = node_router.namespaceHash(""), .key_length = 1, .value_length = 5, .key = "q", .value = &[_]u8{ 0, 0, 0, 0, 'Z' } };
+        var cmd_buf: [64]u8 = undefined;
+        var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, r.current_term, skip.header.index + 1, last - 500, cmd_buf[0..cmd.serialize(&cmd_buf).?]);
+        e.header.crc32c = e.computeCrc();
+        _ = try r.log.append(&e);
+        r.commit_index = e.header.index;
+        try std.testing.expect(!shard.applyCommitted());
+        after = (shard.halted orelse return error.NotHalted).index;
+        try std.testing.expectEqual(e.header.index, after);
+        try shard.flushSegmentToDisk();
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expectEqual(after, (shard.halted orelse return error.NotHalted).index);
+}
+
+test "Shard: a skip above the watermark it was sealed under is not taken at boot; the shard halts, then resumes as it applies" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var h: u64 = 0;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        h = try HaltCase.no_applier.propose(&shard);
+        const at = try proposeSkip(&shard, h);
+        // One segment, sealed before the skip counts as committed, as a
+        // flush ahead of its commit leaves it.
+        try shard.rebufferGap(shard.durable_log.?.writer);
+        try shard.durable_log.?.flush(at - 1);
+        const files = try shard.durable_log.?.segments();
+        const last = files[files.len - 1];
+        try std.testing.expect(last.holds_skip and last.first_index <= h and last.last_index == at);
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expectEqual(h, (shard.halted orelse return error.NotHalted).index);
+    shard.applyDeferredTail();
+    try std.testing.expect(shard.halted == null and shard.offline == null);
+}
+
+test "Shard: a halted shard's marker names the entry it halted at until a skip takes it past" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt == null);
+    const h = try HaltCase.no_applier.propose(&shard);
+    try std.testing.expect(!shard.applyCommitted());
+    var e_buf: [256]u8 = undefined;
+    const halted = shard.raft_node.log.getEntryCopy(h, &e_buf).?;
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt.?.names(&halted));
+    try offline_mod.skippable(shard_dir, 0, &halted);
+    // The last enqueue, which applied.
+    var before_buf: [256]u8 = undefined;
+    var at = h - 1;
+    const before = while (at > 0) : (at -= 1) {
+        const e = shard.raft_node.log.getEntryCopy(at, &before_buf).?;
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.queue_enqueue)) break e;
+    } else return error.NoEnqueue;
+    try std.testing.expectError(error.NotHalted, offline_mod.skippable(shard_dir, 0, &before));
+    _ = try proposeSkip(&shard, h);
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(apply_marker.read(shard_dir, 0).halt == null);
+    try std.testing.expectError(error.NotHalted, offline_mod.skippable(shard_dir, 0, &halted));
+}
+
+test "Shard: a skip of an entry this node applied takes the shard offline: it holds what no replica does" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    // The last enqueue applied here.
+    _ = try proposeSkip(&shard, shard.raft_node.last_applied - 1);
+    try std.testing.expect(!shard.applyCommitted());
+    const off = shard.offline orelse return error.NotOffline;
+    try std.testing.expectEqual(silent_loss.Path.applied_skipped, off.path);
 }
 
 test "Shard: a halted member that then diverges publishes why it diverged, with the index" {

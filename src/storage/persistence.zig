@@ -53,6 +53,11 @@ pub const ApplyError = error{
     /// The entry breaks what every node holds true of the log: a payload
     /// that will not decode, a step no prepared write can ask for. Every
     /// node that applies it fails the same way.
+    ///
+    /// An applier returns it before changing anything. A repair skips the
+    /// entry and applies the rest after it, live on a shard that halted
+    /// there and at boot on one that never ran it, so a change made before
+    /// the halt would be on some replicas and not others.
     Halt,
 };
 
@@ -178,6 +183,8 @@ pub const Refused = struct { status: proto.StatusCode, refusal: proto.Refusal };
 
 /// An applier: called for every committed entry of a registered type, on
 /// every node, live or at boot. It records the entry's answer in `result`.
+/// It validates before it mutates: an entry it halts on (`error.Halt`)
+/// leaves no trace.
 pub const ReplayFn = *const fn (ctx: *anyopaque, entry: *const Entry, result: *Result) ApplyError!void;
 
 /// Maps EntryType → applier. Handlers register their owned entry types

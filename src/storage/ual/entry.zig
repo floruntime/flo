@@ -93,6 +93,9 @@ pub const EntryType = enum(u8) {
     raft_config = 0xF0,
     raft_noop = 0xF1,
     raft_snapshot = 0xF2,
+    /// A repair: the entry a shard halted at applies nothing, on every
+    /// replica, and the shard goes on past it.
+    repair_skip = 0xF3,
 
     // ── Workflow ──
     workflow_create = 0x50,
@@ -130,7 +133,7 @@ pub const EntryType = enum(u8) {
             .namespace_create, .namespace_delete, .namespace_config => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => true,
-            .raft_config, .raft_noop, .raft_snapshot => false,
+            .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
     }
 };

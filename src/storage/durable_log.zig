@@ -25,6 +25,8 @@ pub const SegmentFile = struct {
     first_index: u64,
     last_index: u64,
     commit_index_at_seal: u64,
+    /// The header says it holds a repair skip.
+    holds_skip: bool = false,
     path: []const u8,
 };
 
@@ -288,6 +290,7 @@ pub const DurableLog = struct {
                 .first_index = hdr.first_index,
                 .last_index = hdr.last_index,
                 .commit_index_at_seal = hdr.commit_index_at_seal,
+                .holds_skip = hdr.flags & segment.FLAG_HOLDS_SKIP != 0,
                 .path = path,
             });
         }
@@ -514,6 +517,42 @@ test "durable log: watermark is the highest commit index any segment was sealed 
     try writer.addEntry(&testEntry(4, 1, "d"));
     try dl.flush(3);
     try testing.expectEqual(@as(u64, 3), try dl.watermark());
+}
+
+test "durable log: a segment holding a repair skip says so in its header, and a cut that drops it doesn't" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+
+    try writer.addEntry(&testEntry(1, 1, "a"));
+    try dl.flush(1);
+    try writer.addEntry(&testEntry(2, 1, "b"));
+    var skip = entry_mod.buildEntry(.repair_skip, 0, 1, 3, 3000, "s");
+    skip.header.crc32c = skip.computeCrc();
+    try writer.addEntry(&skip);
+    try dl.flush(3);
+    {
+        const files = try dl.listSegments(true);
+        defer dl.freeSegments(files);
+        try testing.expect(!files[0].holds_skip);
+        try testing.expect(files[1].holds_skip);
+    }
+    // Rewritten below the skip, the segment no longer holds one.
+    try dl.truncateAfter(2);
+    const files = try dl.listSegments(true);
+    defer dl.freeSegments(files);
+    try testing.expectEqual(@as(u64, 2), files[1].last_index);
+    try testing.expect(!files[1].holds_skip);
+    // So does a cut inside the writer's buffer.
+    var buffered = skip;
+    buffered.header.index = 4;
+    try writer.addEntry(&buffered);
+    try testing.expect(writer.holds_skip);
+    writer.truncateAfter(3);
+    try testing.expect(!writer.holds_skip);
 }
 
 test "durable log: readRange serves the writer buffer, then each sealed segment" {

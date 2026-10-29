@@ -1,7 +1,8 @@
 //! A stopped node's cluster group, read and repaired offline: what
 //! `flo server inspect` prints and what `flo server force-members` writes.
-//! Only shard 0 is replicated, so only its directory is read. Callers hold
-//! the data dir's lock for the whole command.
+//! Only shard 0 is replicated, so only its directory is read for those. A
+//! single node's halted shard is repaired offline too (`repairSkip`).
+//! Callers hold the data dir's lock for the whole command.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -10,6 +11,8 @@ const membership = @import("../raft/membership.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const durable_log_mod = @import("../storage/durable_log.zig");
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
+const repair = @import("repair.zig");
+const apply_marker = @import("apply_marker.zig");
 
 const Entry = entry_mod.Entry;
 
@@ -42,10 +45,18 @@ pub fn groupDir(buf: []u8, data_dir: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ data_dir, GROUP_DIR });
 }
 
+pub fn shardDir(buf: []u8, data_dir: []const u8, shard: u16) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{d:0>5}", .{ data_dir, shard });
+}
+
 /// Read shard 0's hard state, log range and latest config. Writes nothing.
 pub fn summarize(allocator: std.mem.Allocator, data_dir: []const u8) !Summary {
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try groupDir(&dir_buf, data_dir);
+    return summarizeDir(allocator, try groupDir(&dir_buf, data_dir));
+}
+
+/// The same, for the shard whose directory is `dir`.
+pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
 
@@ -142,6 +153,67 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     var cleared = hs;
     cleared.lost_log = false;
     if (hs.lost_log) try hard_state_mod.save(dir, cleared);
+}
+
+pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, IsSkip, NotSkippable, NotHalted };
+
+/// Shard `dir`'s entry at `index`, its payload in `arena`.
+pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena: []u8) !Entry {
+    var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
+    var writer = SegmentWriter.init(allocator, 0);
+    defer writer.deinit();
+    var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
+    defer dl.deinit();
+    var one: [1]Entry = undefined;
+    if (dl.readRange(index, &one, arena) != 1 or one[0].header.index != index) return error.NotInLog;
+    return one[0];
+}
+
+/// Whether `e` is the entry the stopped shard `shard` in `dir` is halted
+/// at. On a single node the majority that must have halted at it is the
+/// node: its marker names the entry the shard last halted at, or whose
+/// apply crashed it. Any other entry may have applied, and skipping it
+/// would lose a write its client was told succeeded.
+pub fn skippable(dir: []const u8, shard: u16, e: *const Entry) SkipError!void {
+    switch (@as(entry_mod.EntryType, @fromBackingInt(e.header.entry_type))) {
+        .repair_skip => return error.IsSkip,
+        // Applied around a halt, so never what a shard halts at.
+        .raft_config, .raft_noop => return error.NotSkippable,
+        else => {},
+    }
+    const held = apply_marker.read(dir, shard);
+    if (held.halt) |*h| if (h.names(e)) return;
+    if (held.crash) |*c| if (c.names(e)) return;
+    return error.NotHalted;
+}
+
+/// Append a repair skip of `halted` to the stopped shard `shard` in `dir`,
+/// sealed as committed: its next boot passes over the entry, and so does
+/// every boot after, if it is `skippable`. Returns the skip's index.
+pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum: *const Summary, halted: *const Entry, reason: []const u8) !u64 {
+    if (sum.last_index == 0) return error.NoLog;
+    if (sum.truncation_pending) return error.TruncationIncomplete;
+    try skippable(dir, shard, halted);
+    var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
+    var writer = SegmentWriter.init(allocator, 0);
+    defer writer.deinit();
+    var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
+    defer dl.deinit();
+
+    const term = if (sum.hard_state) |hs| @max(hs.term, sum.last_term) else sum.last_term;
+    const index = sum.last_index + 1;
+    // Stamped after the entry before it, as a leader stamps.
+    const now_ns: u64 = @intCast(@as(i64, @import("stdx").time.milliTimestamp()) * std.time.ns_per_ms);
+    const stamp = @max(sum.last_stamp + 1, now_ns);
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    var e = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, term, index, stamp, repair.Skip.of(halted, reason).encode(&p));
+    e.header.crc32c = e.computeCrc();
+    try writer.addEntry(&e);
+    // Sealed with the watermark at its own index: boot knows it committed.
+    try dl.flush(index);
+    return index;
 }
 
 // ─── Retired secrets ─────────────────────────────────────────────────────────
@@ -288,4 +360,32 @@ test "offline: a retired secret is recognised, with when, and others are not" {
     try testing.expectEqual(@as(?u64, null), try retiredAt(testing.allocator, root, "new"));
     var d: [10]u8 = undefined;
     try testing.expectEqualStrings("2025-10-09", formatDate(&d, 1_760_000_000));
+}
+
+test "offline: a skip is only of the entry the shard is halted at, and never of a config, a no-op or a skip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(root);
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var es: [4]Entry = .{
+        entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, ""),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&membership.Config.ofVoters(&.{1}), &cfg_buf)),
+        entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 1, 3, 30, ""),
+        entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 4, 40, "x"),
+    };
+    for (&es) |*e| e.header.crc32c = e.computeCrc();
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
+    var m = try apply_marker.Marker.open(root, 0);
+    defer m.close();
+    // Even halted there.
+    for (es[0..3], [_]anyerror{ error.NotSkippable, error.NotSkippable, error.IsSkip }) |*e, want| {
+        m.halted(e.header.index, e.header.term, e.header.crc32c);
+        try testing.expectError(want, skippable(root, 0, e));
+    }
+    m.halted(4, 1, es[3].header.crc32c);
+    try skippable(root, 0, &es[3]);
+    try testing.expectError(error.NotHalted, skippable(root, 1, &es[3]));
+    m.halted(4, 2, es[3].header.crc32c);
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
 }

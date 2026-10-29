@@ -147,6 +147,9 @@ pub const ServerProcess = struct {
     /// A test awaited this run's crash (`awaitCrash`), so its signal death
     /// is expected.
     crash_awaited: bool = false,
+    /// Set in the server's environment at its next spawn, over what this
+    /// process has.
+    extra_env: []const [2][]const u8 = &.{},
     tmp_dir: testing.TmpDir,
     flo_binary: []const u8,
     started: bool,
@@ -296,6 +299,7 @@ pub const ServerProcess = struct {
         self.sent_term = false;
         self.sent_kill = false;
         self.crash_awaited = false;
+        self.extra_env = &.{};
         self.dump_log_on_failure = true;
 
         return self;
@@ -469,6 +473,13 @@ pub const ServerProcess = struct {
         }
 
         var child = stdx.process.Child.init(argv_list.items, self.allocator);
+        var env: ?std.process.Environ.Map = null;
+        defer if (env) |*m| m.deinit();
+        if (self.extra_env.len > 0) {
+            env = try stdx.process.currentEnv(self.allocator);
+            for (self.extra_env) |kv| try env.?.put(kv[0], kv[1]);
+            child.env_map = &env.?;
+        }
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
