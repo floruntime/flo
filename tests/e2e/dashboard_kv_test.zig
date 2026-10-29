@@ -202,6 +202,12 @@ test "e2e/dashboard: a kv key's value carries its expiry, and its history marks 
     const ov = try std.json.parseFromSlice(std.json.Value, testing.allocator, one.bodyTrimmed(), .{});
     defer ov.deinit();
     try testing.expectEqual(@as(usize, 1), ov.value.object.get("versions").?.array.items.len);
+
+    // A before_version that isn't a number is refused, not read as "from the newest".
+    var bad = try http.get("/api/v1/kv/namespaces/default/keys/h/history?before_version=abc");
+    defer bad.deinit();
+    try testing.expect(bad.bodyContains("before_version must be a version number"));
+    try testing.expect(!bad.bodyContains("versions"));
 }
 
 test "e2e/dashboard: a kv key prefix is read percent-encoded, as the console sends it" {

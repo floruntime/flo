@@ -1051,6 +1051,7 @@ test "kv: history keeps at most HISTORY_MAX_BYTES, but always the newest older v
     const kept = kv_ops.HISTORY_MAX_BYTES / per;
     try testing.expectEqual(1 + kept, historyOf(&kv, "k", null, &hist));
     try testing.expectEqual(@as(u64, kept * per), kv.namespaceCounts("default").history_bytes);
+    try testing.expectEqual(@as(u64, 19 - kept), kv.namespaceCounts("default").history_evicted);
 
     // One value larger than the whole budget evicts everything older, and
     // is itself kept once something overwrites it.
@@ -1058,7 +1059,10 @@ test "kv: history keeps at most HISTORY_MAX_BYTES, but always the newest older v
     defer testing.allocator.free(big);
     @memset(big, 'b');
     try kv.put("k", big, 21, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 20 - kept), kv.namespaceCounts("default").history_evicted);
+    // Overwriting it pushes it into history, which evicts all the others in one write.
     try kv.put("k", "after", 22, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 20), kv.namespaceCounts("default").history_evicted);
     try testing.expectEqual(@as(usize, 2), historyOf(&kv, "k", null, &hist));
     try testing.expectEqual(big.len, hist[1].value.len);
     try testing.expectEqual(@as(u64, big.len + kv_ops.HISTORY_ENTRY_COST), kv.namespaceCounts("default").history_bytes);

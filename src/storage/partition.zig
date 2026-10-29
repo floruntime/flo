@@ -71,7 +71,7 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
-        const kv = kv_mod.KVProjection.init(allocator); // 0 = no memory limit
+        const kv = kv_mod.KVProjection.init(allocator);
         const queue = queue_mod.QueueProjection.init(allocator, .{});
         const stream = stream_mod.StreamProjection.init(allocator);
         const ts = ts_mod.TSProjection.init(allocator, .{});

@@ -215,9 +215,13 @@ pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u
 pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 10, 1, kv_ops.MAX_HISTORY);
 
+    const before_version: ?u64 = if (h.parseQueryParam([]const u8, query_string, "before_version")) |raw|
+        std.fmt.parseInt(u64, raw, 10) catch return try h.jsonError(allocator, "before_version must be a version number")
+    else
+        null;
+
     var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV history", err);
     defer reader.deinit();
-    const before_version = h.parseQueryParam(u64, query_string, "before_version");
     var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .before_version = before_version, .routing_key = null }) catch |err|
         return try readFailed(allocator, "KV history", err);
     defer got.deinit();

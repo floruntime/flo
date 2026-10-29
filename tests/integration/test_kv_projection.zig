@@ -6,7 +6,7 @@ const KVProjection = src.projection.kv.KVProjection;
 const ScanEntry = src.projection.kv.ScanEntry;
 
 test "integration: KV projection 10000 operations" {
-    var kv = KVProjection.init(testing.allocator); // 0 = unlimited memory
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     // Put 10000 keys
