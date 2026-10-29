@@ -4,6 +4,7 @@
 //!   flo server start [--config flo.toml] [--port 9000] [--data-dir ./data] [--shards N]
 //!   flo server stop [--data-dir ./data] [--force]
 //!   flo server status [--data-dir ./data]
+//!   flo server repair skip --data-dir ./data --shard N --index I [--yes]
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -160,6 +161,36 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
                 .boolFlag("yes", 0, "Make the change")
                 .action(wrapHandler(runForceMembers)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("repair")
+                .about("Repair a stopped single node's halted shard")
+                .subcommand(
+                commander.newBuilder(allocator)
+                    .name("skip")
+                    .about("Skip the entry a shard halted at")
+                    .longAbout(
+                        \\For a shard halted at an entry no build can apply (its /status says
+                        \\where, and why). On a stopped single node, it appends a repair that
+                        \\skips that entry: the shard comes up past it, and the write never
+                        \\runs, on this build or any later one. Its client was told so. The
+                        \\other entries apply in order.
+                        \\
+                        \\Without --yes it prints the entry it would skip and stops.
+                    )
+                    .examples(&.{
+                        "flo server repair skip --data-dir /var/lib/flo --shard 3 --index 18234",
+                        "flo server repair skip --data-dir /var/lib/flo --shard 3 --index 18234 --reason \"malformed invoke\" --yes",
+                    })
+                    .stringFlag("config", 'c', "", "Config file naming the data directory")
+                    .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
+                    .uintFlag("shard", 0, 0, "The halted shard")
+                    .uintFlag("index", 0, 0, "The entry it halted at")
+                    .stringFlag("reason", 0, "", "Why, recorded with the repair")
+                    .boolFlag("yes", 0, "Append the repair")
+                    .action(wrapHandler(runRepairSkip)),
+            ),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -702,6 +733,55 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
     ctx.print("\nNode {d} is now the only voter (member list at index {d}).\n", .{ hs.node_id, sum.last_index + 1 });
     ctx.print("Restart it with a new [cluster] secret (flo server secret); with it the nodes left out cannot link.\n", .{});
     ctx.print("Reset the other nodes' data before they rejoin with --join and the new secret.\n", .{});
+}
+
+fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
+    const index = ctx.getUint("index") orelse 0;
+    if (index == 0) return outcome.usage(ctx, "--index is required: the entry the shard halted at (its /status says, as halt_index)", .{});
+    const shard_flag = ctx.getUint("shard") orelse 0;
+    if (shard_flag > std.math.maxInt(u16)) return outcome.usage(ctx, "--shard {d} is past the last shard", .{shard_flag});
+    const shard: u16 = @intCast(shard_flag);
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
+    defer ctx.allocator.free(data_dir);
+    var lock: stdx.fs.File = undefined;
+    const group = try openOffline(ctx, data_dir, &lock);
+    defer stdx.fs.closeFile(lock);
+    // A member's shard is repaired by its group: skipped offline here, it
+    // would hold what the others don't.
+    if (group.member_count > 1) {
+        return outcome.localRefusal(ctx, "this data directory belongs to a cluster of {d}; a member's shard is repaired by the cluster, not offline", .{group.member_count});
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = offline.shardDir(&dir_buf, data_dir, shard) catch return outcome.usage(ctx, "data directory path too long", .{});
+    if (stdx.fs.openDir(dir, .{})) |d| stdx.fs.closeDir(d) else |_| {
+        return outcome.localRefusal(ctx, "{s} has no shard {d}", .{ data_dir, shard });
+    }
+    const sum = offline.summarizeDir(ctx.allocator, dir) catch |err| {
+        return outcome.localRefusal(ctx, "cannot read shard {d}'s log: {}", .{ shard, err });
+    };
+    if (sum.truncation_pending) {
+        return outcome.localRefusal(ctx, "shard {d} has a log truncation pending; start and stop the server once to finish it, then run repair again", .{shard});
+    }
+    const arena = ctx.allocator.alloc(u8, 4 * 1024 * 1024) catch return outcome.localRefusal(ctx, "out of memory", .{});
+    defer ctx.allocator.free(arena);
+    const halted = offline.entryAt(ctx.allocator, dir, index, arena) catch {
+        return outcome.localRefusal(ctx, "shard {d}'s log doesn't hold entry {d} (it holds {d}..{d})", .{ shard, index, sum.first_index, sum.last_index });
+    };
+    const type_name = std.enums.tagName(@import("../../storage/ual/entry.zig").EntryType, @fromBackingInt(halted.header.entry_type)) orelse "unknown";
+    ctx.print("\nshard {d}, entry {d}: {s}, term {d}, {d} bytes{s}\n", .{ shard, index, type_name, halted.header.term, halted.payload.len, if (index > sum.commit) " (not committed as last flushed)" else "" });
+    if (!ctx.getBool("yes")) {
+        ctx.print("Would append a repair at index {d} that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{sum.last_index + 1});
+        return;
+    }
+    const at = offline.repairSkip(ctx.allocator, dir, &sum, &halted, ctx.getString("reason") orelse "") catch |err| switch (err) {
+        error.IsSkip => return outcome.localRefusal(ctx, "entry {d} is itself a repair; a skip is never skipped", .{index}),
+        else => return outcome.localRefusal(ctx, "cannot write the repair: {}", .{err}),
+    };
+    ctx.print("Entry {d} is skipped (repair at index {d}). Start the server: shard {d} comes up past it.\n", .{ index, at, shard });
 }
 
 /// The data directory a server's PID file is in, as `server start` would

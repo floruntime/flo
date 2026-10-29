@@ -145,6 +145,14 @@ pub const Marker = struct {
         self.clear();
     }
 
+    /// Clear the crash: a committed repair skips its entry, so no build
+    /// applies it again, this one or another.
+    pub fn skipped(self: *Marker) void {
+        const c = &(self.crashed orelse return);
+        log.info("shard {d}: entry {d} crashed this node, and a repair skips it", .{ self.shard, c.index });
+        self.clear();
+    }
+
     fn clear(self: *Marker) void {
         self.crashed = null;
         const zero: [RECORD_SIZE]u8 = @splat(0);

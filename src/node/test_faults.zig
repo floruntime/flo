@@ -43,9 +43,14 @@ pub const Fault = enum {
 
 pub const HALT_KEY = "flo-test-fault-halt";
 
+/// Set in a server's environment, the faults are off: the build applies
+/// every entry, as a fixed build would.
+pub const OFF_ENV = "FLO_TEST_FAULTS_OFF";
+
 /// The fault a kv set of `entry` asks for, if any.
 pub fn of(entry: *const entry_mod.Entry) ?Fault {
     if (entry.header.entry_type != @backingInt(entry_mod.EntryType.kv_put)) return null;
+    if (std.c.getenv(OFF_ENV) != null) return null;
     var diag: schema.Diagnostic = .{};
     const put = kv_entries.Put.decodeAll(entry.payload, &diag) catch return null;
     return ofKey(put.key);

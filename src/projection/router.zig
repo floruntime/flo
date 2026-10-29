@@ -247,7 +247,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .stream_append, .stream_trim, .stream_delete => .none,
 
         // Raft control — consensus layer
-        .raft_config, .raft_noop => .none,
+        .raft_config, .raft_noop, .repair_skip => .none,
 
         // Snapshot installation
         .raft_snapshot => .snapshot,

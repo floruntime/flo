@@ -26,6 +26,9 @@ pub const Path = enum {
     segment_bad_entry,
     /// An index no segment holds, below entries that are held.
     index_hole,
+    /// An entry this node applied, which a committed repair skips on every
+    /// replica.
+    applied_skipped,
 };
 
 pub const PATH_COUNT = @typeInfo(Path).@"enum".field_names.len;

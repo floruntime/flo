@@ -45,6 +45,9 @@ pub const Compression = enum(u8) {
 // SegmentHeader (64 bytes, extern for exact layout)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// A segment holding a `repair_skip` entry.
+pub const FLAG_HOLDS_SKIP: u8 = 1;
+
 pub const SegmentHeader = extern struct {
     magic: [8]u8 align(1),
     version: u16 align(1),
@@ -61,7 +64,9 @@ pub const SegmentHeader = extern struct {
     /// above it goes into the log only and is applied once commit is
     /// re-established, since a new leader may truncate it.
     commit_index_at_seal: u64 align(1),
-    reserved: [1]u8 align(1),
+    /// `FLAG_HOLDS_SKIP`: boot reads the skips a log holds before it
+    /// applies anything, and reads only the segments that say so.
+    flags: u8 align(1),
 
     comptime {
         if (@sizeOf(SegmentHeader) != HEADER_SIZE) {

@@ -40,6 +40,8 @@ pub const SegmentWriter = struct {
     /// commit index at flush, clamped to the cut when a truncation rewrites
     /// a file.
     commit_index_at_seal: u64,
+    /// Whether a buffered entry is a repair skip.
+    holds_skip: bool = false,
     /// Entries the append hook could not buffer (allocation failure). Each
     /// one is an entry that would be missing from disk after a restart, so
     /// it is counted and logged rather than dropped silently.
@@ -88,6 +90,7 @@ pub const SegmentWriter = struct {
         self.last_ts_ns = 0;
         self.entry_count = 0;
         self.entry_type_bitmap = 0;
+        self.holds_skip = false;
     }
 
     /// Add an entry to the segment: all or nothing, so on error the buffer
@@ -121,6 +124,7 @@ pub const SegmentWriter = struct {
         self.last_ts_ns = entry.header.timestamp_ns;
         self.entry_count += 1;
         self.entry_type_bitmap = segment.bitmapSet(self.entry_type_bitmap, entry.header.entry_type);
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip)) self.holds_skip = true;
     }
 
     /// Drop every buffered entry above `after_index`. Entries are
@@ -140,12 +144,14 @@ pub const SegmentWriter = struct {
         var kept: u32 = 0;
         var last_kept: ?Entry = null;
         var bitmap: u32 = 0;
+        var holds_skip = false;
         while (offset < self.data.items.len) {
             const e = Entry.deserialize(self.data.items[offset..]) orelse break;
             if (e.header.index > after_index) break;
             kept += 1;
             last_kept = e;
             bitmap = segment.bitmapSet(bitmap, e.header.entry_type);
+            if (e.header.entry_type == @backingInt(entry_mod.EntryType.repair_skip)) holds_skip = true;
             offset += e.totalSize();
         }
         self.data.shrinkRetainingCapacity(offset);
@@ -154,6 +160,7 @@ pub const SegmentWriter = struct {
         }
         self.entry_count = kept;
         self.entry_type_bitmap = bitmap;
+        self.holds_skip = holds_skip;
         if (last_kept) |e| {
             self.last_index = e.header.index;
             self.last_ts_ns = e.header.timestamp_ns;
@@ -192,7 +199,7 @@ pub const SegmentWriter = struct {
             // something does.
             .compression = @backingInt(segment.Compression.none),
             .commit_index_at_seal = self.commit_index_at_seal,
-            .reserved = .{0},
+            .flags = if (self.holds_skip) segment.FLAG_HOLDS_SKIP else 0,
         };
         const hdr_bytes = hdr.asBytes();
         @memcpy(result[offset .. offset + segment.HEADER_SIZE], hdr_bytes);

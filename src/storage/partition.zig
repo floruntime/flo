@@ -146,6 +146,23 @@ pub const Partition = struct {
     /// entry's index and what the router made of it, which the shard counts
     /// when a projection failed.
     pub fn applyRouted(self: *Partition, e: *const Entry, out: *router_mod.Result) !Applied {
+        return self.take(e, out, .apply);
+    }
+
+    /// Take an entry a repair skips as a halt on it left the partition: in
+    /// the hot ring and warm store, and in no projection. A replica that
+    /// halted on it live and one that boots past it then hold the same. The
+    /// router isn't told: the next entry it applies moves it past.
+    pub fn passOverSkipped(self: *Partition, e: *const Entry) error{OutOfMemory}!void {
+        var out: router_mod.Result = .{};
+        _ = self.take(e, &out, .pass_over) catch |err| switch (err) {
+            // Refused before anything was taken, as the halt on it was.
+            error.EntryTooLarge, error.IndexNotIncreasing => return,
+            else => |e2| return e2,
+        };
+    }
+
+    fn take(self: *Partition, e: *const Entry, out: *router_mod.Result, how: enum { apply, pass_over }) !Applied {
         // The hot ring and the warm store exist for the stream read path,
         // which fetches record payloads by index. The KV projection holds its
         // own values and nothing reads a KV payload back from the partition
@@ -155,9 +172,12 @@ pub const Partition = struct {
 
         // Route to projections via the real router (idempotent)
         var failed: ?router_mod.ApplyError = null;
-        const route = self.router.apply(e, out) catch |err| blk: {
-            failed = err;
-            break :blk .skipped_no_projection;
+        const route = switch (how) {
+            .apply => self.router.apply(e, out) catch |err| blk: {
+                failed = err;
+                break :blk .skipped_no_projection;
+            },
+            .pass_over => .skipped_no_projection,
         };
 
         // Track committed index
