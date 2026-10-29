@@ -224,8 +224,11 @@ pub const ServerProcess = struct {
         // Cluster configuration
         /// Join addresses for cluster mode (e.g., "127.0.0.1:4445")
         join_addresses: ?[]const u8 = null,
-        /// Node ID (0 = auto-generate)
+        /// Node ID. 0 gives a cluster node one from `nextNodeId`, since a
+        /// node on port 0 refuses to derive its own.
         node_id: u32 = 0,
+        /// Start a cluster node with no node id, so it derives one.
+        derive_node_id: bool = false,
         /// Raft RPC port (0 = auto-assign)
         raft_port: u16 = 0,
         /// Enable cluster mode (starts Raft listener) - for seed nodes without join_addresses
@@ -415,6 +418,8 @@ pub const ServerProcess = struct {
         // when it first started (its peers dial the address they know), else
         // 0 for the server to pick on a first start.
         if (self.config.raft_port > 0) self.raft_port = self.config.raft_port;
+        const cluster_node = self.config.join_addresses != null or self.config.cluster_enabled;
+        if (cluster_node and self.config.node_id == 0 and !self.config.derive_node_id) self.config.node_id = nextNodeId();
 
         // Build argv dynamically
         var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -881,6 +886,18 @@ pub const ServerProcess = struct {
         return self.config.metrics_enabled;
     }
 };
+
+/// Node ids for this process's cluster nodes: distinct within it, and
+/// unlikely to match another test process's.
+var next_node_id: std.atomic.Value(u32) = .init(0);
+
+fn nextNodeId() u32 {
+    if (next_node_id.load(.monotonic) == 0) {
+        const base: u32 = @as(u32, @intCast(@mod(std.c.getpid(), 40_000))) * 100_000 + 1;
+        _ = next_node_id.cmpxchgStrong(0, base, .monotonic, .monotonic);
+    }
+    return next_node_id.fetchAdd(1, .monotonic);
+}
 
 const PORTS_LINE = "Flo server ports: ";
 const READY_LINE = "Flo server ready on ";

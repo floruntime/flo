@@ -652,6 +652,14 @@ pub const Runtime = struct {
         // and port changes, so a member that moves is an update, not a stranger.
         const identity = try self.resolveClusterNodeId(data_dir);
         const cluster_node_id = identity.id;
+        // A derived id comes from hostname:port, and port 0 is another port
+        // every start. The id is stored only once the node first persists a
+        // term, and a leader names a joiner in the membership before that:
+        // a joiner restarted in between would come back as a stranger.
+        if (self.config.clusterListenerWanted() and identity.source == .derived and self.config.listen_port == 0) {
+            log.err("cluster: --port 0 picks another port on every start, and this node's id would be derived from it; give its first start [cluster] node_id (or --node-id), or a fixed --port", .{});
+            return error.ClusterNodeIdUnstable;
+        }
         if (self.config.clusterListenerWanted()) {
             log.info("cluster: this node is {d} ({s})", .{ cluster_node_id, switch (identity.source) {
                 .stored => "stored in the data dir",
