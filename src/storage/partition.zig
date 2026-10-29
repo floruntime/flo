@@ -6,6 +6,7 @@
 //! Data flow:
 //!   propose(entry) → UAL.append → ProjectionRouter.apply → advance applied_index
 
+const contract_store = @import("../contract/store.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("ual/entry.zig");
@@ -42,6 +43,11 @@ pub const Partition = struct {
     queue: queue_mod.QueueProjection,
     stream: stream_mod.StreamProjection,
     ts: ts_mod.TSProjection,
+
+    /// The state of every family a contract machine keeps, and the scratch
+    /// one entry's staged writes live in.
+    store: contract_store.Store,
+    apply_scratch: std.heap.ArenaAllocator,
 
     /// Raft state placeholders (real Raft added in Phase 3).
     current_term: u64,
@@ -85,6 +91,8 @@ pub const Partition = struct {
             .queue = queue,
             .stream = stream,
             .ts = ts,
+            .store = contract_store.Store.init(allocator),
+            .apply_scratch = std.heap.ArenaAllocator.init(allocator),
             .current_term = 0,
             .committed_index = 0,
             .warm_store = .{},
@@ -122,6 +130,8 @@ pub const Partition = struct {
         }
         self.warm_store.deinit(self.allocator);
 
+        self.apply_scratch.deinit();
+        self.store.deinit();
         self.ts.deinit();
         self.stream.deinit();
         self.queue.deinit();

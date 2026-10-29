@@ -42,6 +42,11 @@ pub const vopr = @import("vopr/mod.zig");
 // Projection Engines: KV, Queue, Stream, TimeSeries (NEW)
 // =============================================================================
 pub const projection = @import("projection/mod.zig");
+pub const contract = struct {
+    pub const store = @import("contract/store.zig");
+    pub const view = @import("contract/view.zig");
+    pub const machine = @import("contract/machine.zig");
+};
 
 // =============================================================================
 // KV subsystem internals (handler + per-shard txn table)
