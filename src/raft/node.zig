@@ -89,6 +89,8 @@ pub const PeerState = struct {
     clock_at_ms: u64 = 0,
     /// The entry the peer last said it is halted at.
     halt: ?HaltAt = null,
+    /// The peer has answered this leadership.
+    answered: bool = false,
 };
 
 /// Acks in a row at the commit index that make a peer caught up.
@@ -1397,6 +1399,7 @@ pub const RaftNode = struct {
                 self.noteClock(i, resp.clock_ns);
                 self.peers[i].guarded = resp.guarded;
                 self.peers[i].halt = resp.halt;
+                self.peers[i].answered = true;
                 if (resp.success) {
                     // A late or duplicated ack may report less than we already
                     // know matched; a response can also outlive the log it
@@ -1458,6 +1461,43 @@ pub const RaftNode = struct {
         return .{ .index = h.index, .term = h.term, .build = self.build };
     }
 
+    /// What a leader knows of a member's halt.
+    pub const PeerHalt = union(enum) { none, at: HaltAt, unknown };
+
+    /// Peer `id`'s halt as its last answer to this leadership said, or
+    /// unknown when it hasn't answered within an election timeout: a halt
+    /// heard by an earlier leadership may since have been repaired or
+    /// resumed, so a new leader hears each one afresh.
+    pub fn peerHalt(self: *const RaftNode, id: NodeId) PeerHalt {
+        if (self.role != .leader) return .unknown;
+        const p = self.peers[self.peerIndex(id) orelse return .unknown];
+        const heard = p.answered and self.current_time_ms -| p.last_contact_ms <= self.config.election_timeout_max_ms;
+        if (!heard) return .unknown;
+        return if (p.halt) |h| .{ .at = h } else .none;
+    }
+
+    /// The voters this leader knows are halted at exactly `h`: itself, and
+    /// each voting peer whose `peerHalt` is `h`.
+    pub fn votersHaltedAt(self: *const RaftNode, h: HaltAt, out: *[MAX_PEERS + 1]NodeId) []NodeId {
+        var n: usize = 0;
+        if (self.role != .leader) return out[0..0];
+        if (self.timer_enabled) if (self.halt_at) |own| if (std.meta.eql(own, h)) {
+            out[n] = self.id;
+            n += 1;
+        };
+        for (self.peers[0..self.peer_count], self.peer_ids[0..self.peer_count]) |p, id| {
+            if (!p.voter) continue;
+            switch (self.peerHalt(id)) {
+                .at => |at| if (std.meta.eql(at, h)) {
+                    out[n] = id;
+                    n += 1;
+                },
+                .none, .unknown => {},
+            }
+        }
+        return out[0..n];
+    }
+
     // ── Propose (Leader) ────────────────────────────────────────────────
 
     /// Propose an entry (leader only), with `flags` in its header (e.g.
@@ -1476,7 +1516,11 @@ pub const RaftNode = struct {
         if (self.halt_at != null and entry_type != .raft_config and entry_type != .raft_noop and entry_type != .repair_skip) return error.Halted;
         // A leader far ahead of its followers holds that many clients; past
         // the cap the client is told, and its reads are the backpressure.
-        if (self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
+        // A repair is exempt: it is what lets a halted group take writes
+        // again. It is not exempt from `writes_stopped` above: that means an
+        // entry may not reach disk, and a skip lost from disk would be
+        // applied past on some replicas and not others.
+        if (entry_type != .repair_skip and self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
 
         var e = entry_mod.buildEntry(
             entry_type,
@@ -1868,6 +1912,7 @@ pub const RaftNode = struct {
             self.peers[i].joining_since_ms = self.current_time_ms;
             // Heard again from this leadership's answers.
             self.peers[i].halt = null;
+            self.peers[i].answered = false;
         }
         // An entry of this term, so the entries of earlier terms commit as
         // soon as it replicates: a leader may only count a majority for its
@@ -4825,4 +4870,75 @@ test "raft node: a follower's halt rides on every append answer" {
     const refused = try node.handleAppendEntries(.{ .term = 1, .leader_id = 1, .prev_log_index = 9, .prev_log_term = 1, .entries = &.{}, .leader_commit = 0 });
     try testing.expect(!refused.success);
     try testing.expectEqual(@as(?HaltAt, halt), refused.halt);
+}
+
+test "raft node: a leader counts a voter halted at an entry only on this leadership's recent answer, and itself only when halted there" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 16384, .{});
+    defer node.deinit();
+    for ([_]NodeId{ 2, 3, 4, 5 }) |id| node.addPeer(id);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 3 });
+    try testing.expectEqual(Role.leader, node.role);
+    const h: HaltAt = .{ .index = 7, .term = 1, .crc = 99 };
+    var ids: [MAX_PEERS + 1]NodeId = undefined;
+
+    // Unheard: unknown, not "not halted".
+    try testing.expectEqual(RaftNode.PeerHalt.unknown, node.peerHalt(2));
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 0, .from = 2, .halt = h });
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 0, .from = 3, .halt = h });
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 0, .from = 4 });
+    try testing.expectEqual(RaftNode.PeerHalt{ .at = h }, node.peerHalt(2));
+    try testing.expectEqual(RaftNode.PeerHalt.none, node.peerHalt(4));
+    try testing.expectEqualSlices(NodeId, &.{ 2, 3 }, node.votersHaltedAt(h, &ids));
+
+    // The leader counts only when halted at that very entry.
+    node.halt_at = .{ .index = 7, .term = 1, .crc = 98 };
+    try testing.expectEqualSlices(NodeId, &.{ 2, 3 }, node.votersHaltedAt(h, &ids));
+    node.halt_at = h;
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, node.votersHaltedAt(h, &ids));
+    try testing.expect(node.votersHaltedAt(h, &ids).len >= node.quorum());
+    // Another term or checksum at that index isn't the same halt.
+    try testing.expectEqualSlices(NodeId, &.{}, node.votersHaltedAt(.{ .index = 7, .term = 2, .crc = 99 }, &ids));
+
+    // A replica's halt doesn't count toward voters.
+    node.peers[node.peerIndex(3).?].voter = false;
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2 }, node.votersHaltedAt(h, &ids));
+    node.peers[node.peerIndex(3).?].voter = true;
+
+    // A report not refreshed within an election timeout is unknown.
+    node.current_time_ms += node.config.election_timeout_max_ms + 1;
+    try testing.expectEqual(RaftNode.PeerHalt.unknown, node.peerHalt(2));
+    try testing.expectEqualSlices(NodeId, &.{1}, node.votersHaltedAt(h, &ids));
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 0, .from = 2, .halt = h });
+    node.handleAppendResponse(.{ .term = 1, .success = true, .match_index = 0, .from = 3, .halt = h });
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, node.votersHaltedAt(h, &ids));
+
+    // A new leadership inherits none of them: it hears each afresh.
+    node.stepDown(2);
+    try testing.expectEqualSlices(NodeId, &.{}, node.votersHaltedAt(h, &ids));
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 4 });
+    _ = node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 5 });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectEqual(RaftNode.PeerHalt.unknown, node.peerHalt(2));
+    try testing.expectEqualSlices(NodeId, &.{1}, node.votersHaltedAt(h, &ids));
+    node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 2, .halt = h });
+    node.handleAppendResponse(.{ .term = node.current_term, .success = true, .match_index = 0, .from = 3, .halt = h });
+    try testing.expectEqualSlices(NodeId, &.{ 1, 2, 3 }, node.votersHaltedAt(h, &ids));
+}
+
+test "raft node: a repair skip is proposed past the outstanding cap and while halted, but not once writes have stopped" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 1 << 20, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    _ = candidacy(&node).?;
+    _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
+    try testing.expectEqual(Role.leader, node.role);
+    while (node.log.lastIndex() - node.commit_index < MAX_OUTSTANDING) _ = try node.propose(.kv_put, 0, "x");
+    try testing.expectError(error.Overloaded, node.propose(.kv_put, 0, "x"));
+    node.halt_at = .{ .index = 2, .term = 1, .crc = 0 };
+    _ = try node.propose(.repair_skip, 0, "s");
+    node.writes_stopped = true;
+    try testing.expectError(error.WritesStopped, node.propose(.repair_skip, 0, "s"));
 }

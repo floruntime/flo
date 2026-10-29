@@ -166,6 +166,169 @@ pub fn tcpConnectToAddress(address: Address) ConnectError!Stream {
     return .{ .handle = fd };
 }
 
+/// The longest path a Unix socket address holds: `sun_path` less its
+/// terminating zero (103 bytes on macOS, 107 on Linux).
+pub const UNIX_PATH_MAX = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len - 1;
+
+fn unixAddress(path: []const u8) error{NameTooLong}!posix.sockaddr.un {
+    if (path.len > UNIX_PATH_MAX) return error.NameTooLong;
+    var addr = std.mem.zeroes(posix.sockaddr.un);
+    addr.family = posix.AF.UNIX;
+    if (@hasField(posix.sockaddr.un, "len")) addr.len = @sizeOf(posix.sockaddr.un);
+    @memcpy(addr.path[0..path.len], path);
+    return addr;
+}
+
+pub const UnixListenError = SocketError || error{
+    NameTooLong,
+    ChmodFailed,
+    /// The directory may be written by others and isn't sticky: one of
+    /// them could replace the socket, or what a path-based chmod reaches.
+    UnsafeDirectory,
+    /// Something at `path` isn't a socket this user owns.
+    PathNotOurs,
+    /// A server answers on `path` already.
+    PathInUse,
+};
+
+/// A socket `unixListen` bound, and the file it bound, so only that file
+/// is removed at the end.
+pub const UnixListener = struct {
+    fd: posix.socket_t,
+    file: @import("fs.zig").Meta,
+};
+
+/// A non-blocking Unix stream socket listening at `path`, which only its
+/// owner may connect to. A socket this user left at `path` is replaced
+/// when nothing answers on it; anything else there is refused, as is a
+/// directory others may write to that isn't sticky.
+pub fn unixListen(path: []const u8) UnixListenError!UnixListener {
+    const fs = @import("fs.zig");
+    const addr = try unixAddress(path);
+    const path_z: [*:0]const u8 = @ptrCast(&addr.path);
+    var dir_buf: [@typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len]u8 = undefined;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const dir_z = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{dir}, 0) catch return error.NameTooLong;
+    const parent = (fs.lstatMeta(dir_z) catch return error.Unexpected) orelse return error.Unexpected;
+    if (parent.mode & 0o022 != 0 and parent.mode & fs.Meta.ISVTX == 0) return error.UnsafeDirectory;
+    if (fs.lstatMeta(path_z) catch return error.Unexpected) |there| {
+        if (!there.isSocket() or there.uid != std.c.getuid()) return error.PathNotOurs;
+        if (unixConnect(path)) |s| {
+            s.close();
+            return error.PathInUse;
+        } else |_| {}
+        _ = std.c.unlink(path_z);
+    }
+    const fd = try sysSocket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    errdefer _ = std.c.close(fd);
+    try sysBind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    errdefer _ = std.c.unlink(path_z);
+    // The mode is set by path, before `listen`: until then a connect is
+    // refused, so none comes in under the default mode. The directory is
+    // checked above, so no one else can swap the file the path names.
+    if (std.c.chmod(path_z, 0o600) != 0) return error.ChmodFailed;
+    const file = (fs.lstatMeta(path_z) catch return error.Unexpected) orelse return error.Unexpected;
+    try sysListen(fd, 16);
+    return .{ .fd = fd, .file = file };
+}
+
+/// Remove the socket file `l` bound at `path`, if it is still that file.
+pub fn unixUnlink(path: []const u8, l: @import("fs.zig").Meta) void {
+    const addr = unixAddress(path) catch return;
+    const path_z: [*:0]const u8 = @ptrCast(&addr.path);
+    const now = (@import("fs.zig").lstatMeta(path_z) catch return) orelse return;
+    if (now.same(l)) _ = std.c.unlink(path_z);
+}
+
+/// Connect to the Unix stream socket at `path` if this user owns it: one
+/// another user put there could answer as the server would.
+pub fn unixConnectOwned(path: []const u8) (ConnectError || error{ NameTooLong, NotOurs })!Stream {
+    const addr = try unixAddress(path);
+    const path_z: [*:0]const u8 = @ptrCast(&addr.path);
+    const there = (@import("fs.zig").lstatMeta(path_z) catch return error.Unexpected) orelse return error.ConnectionRefused;
+    if (!there.isSocket() or there.uid != std.c.getuid()) return error.NotOurs;
+    return unixConnect(path);
+}
+
+/// Connect to the Unix stream socket at `path`.
+pub fn unixConnect(path: []const u8) (ConnectError || error{NameTooLong})!Stream {
+    const addr = try unixAddress(path);
+    const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.Unexpected;
+    errdefer _ = std.c.close(fd);
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) {
+        return switch (std.posix.errno(@as(c_int, -1))) {
+            .CONNREFUSED, .NOENT => error.ConnectionRefused,
+            .ACCES, .PERM => error.PermissionDenied,
+            else => error.Unexpected,
+        };
+    }
+    return .{ .handle = fd };
+}
+
+test "net: a Unix socket listens at its path with mode 0600, takes a connection, and a path too long is refused" {
+    var z: [64]u8 = undefined;
+    const path_z = try std.fmt.bufPrintSentinel(&z, "/tmp/flo-unix-{d}.sock", .{std.c.getpid()}, 0);
+    const l = try unixListen(path_z);
+    defer {
+        _ = std.c.close(l.fd);
+        unixUnlink(path_z, l.file);
+    }
+    const st = try @import("fs.zig").statFile(path_z, .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@backingInt(st.permissions))) & 0o777);
+    const client = try unixConnectOwned(path_z);
+    defer client.close();
+    const long: [UNIX_PATH_MAX + 1]u8 = @splat('a');
+    try std.testing.expectError(error.NameTooLong, unixListen(&long));
+    // A second server on the same path is refused while the first answers.
+    try std.testing.expectError(error.PathInUse, unixListen(path_z));
+}
+
+test "net: a Unix socket replaces only a dead socket of its owner's, and unlinks only its own file" {
+    var z: [64]u8 = undefined;
+    const path_z = try std.fmt.bufPrintSentinel(&z, "/tmp/flo-unix-dead-{d}.sock", .{std.c.getpid()}, 0);
+    const first = try unixListen(path_z);
+    _ = std.c.close(first.fd);
+    // Dead: nothing answers, so a new server takes the path.
+    const second = try unixListen(path_z);
+    defer _ = std.c.close(second.fd);
+    // A stop removes the file only if it is still the one that stop bound.
+    // A file system may hand the new file the old one's inode number, so
+    // the identity is tried here as a recycled inode would present it,
+    // rather than by racing the file system's clock.
+    var older = second.file;
+    older.ctime_ns -= 1;
+    unixUnlink(path_z, older);
+    var other = second.file;
+    other.ino +%= 1;
+    unixUnlink(path_z, other);
+    try std.testing.expect((try @import("fs.zig").lstatMeta(path_z)) != null);
+    unixUnlink(path_z, second.file);
+    try std.testing.expect((try @import("fs.zig").lstatMeta(path_z)) == null);
+    // A file that isn't a socket is never taken over.
+    const f = try @import("fs.zig").createFile(path_z, .{});
+    @import("fs.zig").closeFile(f);
+    defer _ = std.c.unlink(path_z.ptr);
+    try std.testing.expectError(error.PathNotOurs, unixListen(path_z));
+    try std.testing.expectError(error.NotOurs, unixConnectOwned(path_z));
+}
+
+test "net: a Unix socket refuses a directory others may write that isn't sticky" {
+    var z: [64]u8 = undefined;
+    const dir_z = try std.fmt.bufPrintSentinel(&z, "/tmp/flo-unix-dir-{d}", .{std.c.getpid()}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(dir_z.ptr, 0o700));
+    defer _ = std.c.rmdir(dir_z.ptr);
+    _ = std.c.chmod(dir_z.ptr, 0o777);
+    var p: [80]u8 = undefined;
+    const path = try std.fmt.bufPrint(&p, "{s}/a.sock", .{dir_z});
+    try std.testing.expectError(error.UnsafeDirectory, unixListen(path));
+    // Sticky, as /tmp is: others can't remove or replace what this user made.
+    _ = std.c.chmod(dir_z.ptr, 0o1777);
+    const l = try unixListen(path);
+    _ = std.c.close(l.fd);
+    unixUnlink(path, l.file);
+}
+
 /// Resolve `host` (DNS or IP literal) and connect to the first usable address.
 pub fn tcpConnectToHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !Stream {
     var list = try getAddressList(allocator, host, port);

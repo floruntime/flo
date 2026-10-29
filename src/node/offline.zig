@@ -198,7 +198,8 @@ pub fn repairSkip(allocator: std.mem.Allocator, dir: []const u8, shard: u16, sum
     try skippable(dir, shard, halted);
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const segs = try std.fmt.bufPrint(&segs_buf, "{s}/segs", .{dir});
-    var writer = SegmentWriter.init(allocator, 0);
+    // Stamped with the shard, as its own segments are.
+    var writer = SegmentWriter.init(allocator, shard);
     defer writer.deinit();
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();

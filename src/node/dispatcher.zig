@@ -86,7 +86,7 @@ pub fn opWrites(op: proto.OpCode) bool {
         .namespace_create, .namespace_delete, .namespace_config_set => true,
         // Membership changes are made by the leader; a follower carries
         // them there like any write.
-        .cluster_promote, .cluster_remove => true,
+        .cluster_promote, .cluster_remove, .cluster_repair_skip => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
         .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,

@@ -319,3 +319,47 @@ test "makePathDurable syncs the parent only for a directory it created, so a par
     try makePathDurable(child);
     try std.testing.expectEqual(before + 1, dir_syncs.load(.monotonic));
 }
+
+/// A path's own identity and owner, not following a symlink: what
+/// `std.Io` doesn't report.
+pub const Meta = struct {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    /// When the inode last changed, in ns. A file system may give a new
+    /// file a deleted one's inode number (tmpfs does), so the number alone
+    /// doesn't say a file is still the one seen.
+    ctime_ns: i128,
+
+    pub const IFMT: u32 = 0o170000;
+    pub const IFSOCK: u32 = 0o140000;
+    pub const ISVTX: u32 = 0o1000;
+
+    pub fn isSocket(self: Meta) bool {
+        return self.mode & IFMT == IFSOCK;
+    }
+
+    pub fn same(self: Meta, other: Meta) bool {
+        return self.dev == other.dev and self.ino == other.ino and self.ctime_ns == other.ctime_ns;
+    }
+};
+
+/// `path`'s Meta, or null when nothing is there.
+pub fn lstatMeta(at: [*:0]const u8) error{Unexpected}!?Meta {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var buf: linux.Statx = undefined;
+        if (std.c.statx(std.c.AT.FDCWD, at, std.c.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true, .INO = true, .CTIME = true }, &buf) != 0) {
+            return if (std.posix.errno(@as(c_int, -1)) == .NOENT) null else error.Unexpected;
+        }
+        return .{ .dev = (@as(u64, buf.dev_major) << 32) | buf.dev_minor, .ino = buf.ino, .mode = buf.mode, .uid = buf.uid, .ctime_ns = @as(i128, buf.ctime.sec) * std.time.ns_per_s + buf.ctime.nsec };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, at, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
+        return if (std.posix.errno(@as(c_int, -1)) == .NOENT) null else error.Unexpected;
+    }
+    const ct = st.ctime();
+    return .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino), .mode = @intCast(st.mode), .uid = @intCast(st.uid), .ctime_ns = @as(i128, ct.sec) * std.time.ns_per_s + ct.nsec };
+}

@@ -78,6 +78,9 @@ pub const OpCode = enum(u16) {
     /// `[id:u32][yes:u8]`: remove a member; `yes` accepts a change that
     /// leaves an even number of voters, or two.
     cluster_remove = 0x033,
+    /// `[index:u64][yes:u8][reason]`: skip the entry the group halted at
+    /// (`cluster_wire.RepairSkip`). Served only on a node's admin socket.
+    cluster_repair_skip = 0x034,
 
     // 0x050–0x0FF: infra reserve (auth, rate-limit, telemetry, audit)
 

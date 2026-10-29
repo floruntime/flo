@@ -131,6 +131,11 @@ pub const ServerProcess = struct {
     data_dir: []const u8,
     config_file: []const u8,
     log_file_path: []const u8,
+    /// Where `[admin] socket` puts the node's admin socket: a test's data
+    /// dir is too deep for a Unix socket path (103 bytes on macOS), so it
+    /// is named after the dir instead, which keeps it the node's own across
+    /// restarts.
+    admin_socket: []const u8,
     /// Print the captured server log if startup fails. Callers that retry set
     /// this false for all but the final attempt, so one failure is not
     /// reported three times.
@@ -275,6 +280,9 @@ pub const ServerProcess = struct {
         errdefer allocator.free(config_path);
         self.config_file = config_path;
 
+        self.admin_socket = try std.fmt.allocPrint(allocator, "/tmp/flo-e2e-{s}.sock", .{std.fs.path.basename(self.data_dir)});
+        errdefer allocator.free(self.admin_socket);
+
         // Create log file path
         const log_path = try std.fmt.allocPrint(allocator, "{s}/server.log", .{self.data_dir});
         errdefer allocator.free(log_path);
@@ -317,6 +325,7 @@ pub const ServerProcess = struct {
         self.allocator.free(self.flo_binary);
         self.allocator.free(self.config_file);
         self.allocator.free(self.log_file_path);
+        self.allocator.free(self.admin_socket);
         self.allocator.free(self.data_dir);
         self.tmp_dir.cleanup();
         self.allocator.destroy(self);
@@ -392,6 +401,7 @@ pub const ServerProcess = struct {
             if (self.config.cluster_secret_file) |f| try config_writer.print("secret_file = \"{s}\"\n", .{f});
         }
 
+        try config_writer.print("\n[admin]\nsocket = \"{s}\"\n", .{self.admin_socket});
         try config_writer.print("\n[logging]\nlevel = \"{s}\"\n", .{self.config.log_level});
         if (self.config.extra_config) |x| try config_writer.print("\n{s}", .{x});
 

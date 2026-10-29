@@ -79,6 +79,8 @@ pub const Reason = enum(u16) {
     /// The shard halted at an entry every replica fails the same way; it
     /// takes no writes until the entry is repaired.
     shard_halted = 29,
+    /// The op is served only on the node's admin socket.
+    admin_only = 30,
 };
 
 /// Whether a refused request took effect.

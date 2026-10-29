@@ -643,8 +643,9 @@ pub fn Replica(comptime Io: type) type {
             self.stoppedLeading("unavailable: lost leadership before commit — write may still apply");
         }
 
-        /// This node's entry at `index`, its payload in the RPC scratch.
-        fn ownEntry(self: *Self, index: u64) ?*const entry_mod.Entry {
+        /// This node's entry at `index`, its payload in the RPC scratch: good
+        /// until the next pump.
+        pub fn ownEntry(self: *Self, index: u64) ?*const entry_mod.Entry {
             if (self.raftNode().log.getRange(index, self.rpc_entries[0..1], self.rpc_arena) != 1) return null;
             return &self.rpc_entries[0];
         }

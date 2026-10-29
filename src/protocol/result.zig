@@ -271,32 +271,6 @@ pub const CommandResult = union(enum) {
     },
 
     // =========================================================================
-    // Cluster Management Responses
-    // =========================================================================
-
-    /// Cluster status response
-    cluster_status: struct {
-        node_id: u32,
-        leader_id: u32,
-        term: u64,
-        state: ClusterState,
-        member_count: u32,
-    },
-
-    /// Cluster members response
-    cluster_members: struct {
-        /// Pre-serialized wire data
-        /// Format: [count: u32] + [node_id: u32][state: u8][addr_len: u16][addr: bytes]...
-        data: []const u8,
-    },
-
-    /// Cluster join response
-    cluster_join_ok: struct {
-        assigned_node_id: u32,
-        leader_id: u32,
-    },
-
-    // =========================================================================
     // Namespace Management Responses
     // =========================================================================
 
@@ -393,12 +367,6 @@ pub const CommandResult = union(enum) {
     // =========================================================================
     // Supporting Types
     // =========================================================================
-
-    pub const ClusterState = enum(u8) {
-        follower = 0,
-        candidate = 1,
-        leader = 2,
-    };
 
     pub const Error = struct {
         code: ErrorCode,

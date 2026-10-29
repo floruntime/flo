@@ -79,6 +79,10 @@ pub const ServerConfig = struct {
     // [workers] section
     workers: WorkersConfig = .{},
 
+    // [admin] section: where the admin socket listens; null for admin.sock
+    // in the data dir.
+    admin_socket: ?[]const u8 = null,
+
     // [logging] section
     log_level: LogLevel = .info,
     log_format: LogFormat = .text,
@@ -150,6 +154,7 @@ pub const ServerConfig = struct {
             .cluster_seeds = self.cluster.seeds,
             .cluster_secret = self.cluster.secret,
             .cluster_failover_timeout_ms = self.cluster.failover_timeout_ms,
+            .admin_socket = self.admin_socket,
             .worker_heartbeat_timeout_ms = self.workers.heartbeat_timeout_ms,
             .worker_remove_after_ms = self.workers.remove_after_ms,
         };
@@ -220,6 +225,9 @@ const sections = [_]Section{
         .{ .name = "raft_port", .kind = .integer, .max = PORT_MAX },
         .{ .name = "seeds", .kind = .string_or_array },
         .{ .name = "failover_timeout_ms", .kind = .integer },
+    } },
+    .{ .name = "admin", .keys = &.{
+        .{ .name = "socket", .kind = .string },
     } },
     .{ .name = "workers", .keys = &.{
         .{ .name = "heartbeat_timeout_ms", .kind = .integer, .min = 1000 },
@@ -433,6 +441,10 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             log.err("[workers] remove_after_ms = {d} is below heartbeat_timeout_ms = {d}: a worker would be removed before it is marked unhealthy", .{ config.workers.remove_after_ms, config.workers.heartbeat_timeout_ms });
             return error.InvalidSetting;
         }
+    }
+
+    if (table.getTable("admin")) |a| {
+        if (a.getString("socket")) |sock| config.admin_socket = try config.dupeString(sock);
     }
 
     // Parse [metrics] section

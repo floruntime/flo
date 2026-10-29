@@ -692,7 +692,7 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         stdx.fs.closeFile(lock.*);
         return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
     };
-    printGroup(ctx, data_dir, &sum);
+    printGroup(ctx, data_dir, 0, &sum);
     return sum;
 }
 
@@ -716,8 +716,9 @@ fn lockOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
     }
 }
 
-fn printGroup(ctx: *commander.Context, data_dir: []const u8, sum: *const offline.Summary) void {
-    ctx.print("data dir:    {s} (cluster group)\n", .{data_dir});
+/// What shard `shard`'s log holds; shard 0's is the cluster group.
+fn printGroup(ctx: *commander.Context, data_dir: []const u8, shard: u16, sum: *const offline.Summary) void {
+    if (shard == 0) ctx.print("data dir:    {s} (cluster group)\n", .{data_dir}) else ctx.print("data dir:    {s} (shard {d})\n", .{ data_dir, shard });
     if (sum.hard_state) |hs| {
         ctx.print("hard state:  node {d}, term {d}, voted for {d}{s}\n", .{ hs.node_id, hs.term, hs.voted_for, if (hs.lost_log) "; lost-log guard on, not voting yet" else "" });
     } else {
@@ -729,7 +730,8 @@ fn printGroup(ctx: *commander.Context, data_dir: []const u8, sum: *const offline
         ctx.print("log:         indices {d}..{d}, last term {d}\n", .{ sum.first_index, sum.last_index, sum.last_term });
         ctx.print("committed:   through {d} (as last flushed)\n", .{sum.commit});
     }
-    if (sum.member_count > 0) {
+    // Only shard 0's log holds the member list.
+    if (shard != 0) {} else if (sum.member_count > 0) {
         var voters: [membership.MAX_MEMBERS]u32 = undefined;
         ctx.print("members:     {any}, voters {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config.voterIds(&voters), sum.config_index, sum.config_term });
     } else {
@@ -802,22 +804,25 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     defer ctx.allocator.free(data_dir);
     var lock: stdx.fs.File = undefined;
-    const group = try openOffline(ctx, data_dir, &lock);
+    try lockOffline(ctx, data_dir, &lock);
     defer stdx.fs.closeFile(lock);
-    // A member's shard is repaired by its group: skipped offline here, it
-    // would hold what the others don't.
-    if (group.member_count > 1) {
-        return outcome.localRefusal(ctx, "this data directory belongs to a cluster of {d}; a member's shard is repaired by the cluster, not offline", .{group.member_count});
-    }
-
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = offline.shardDir(&dir_buf, data_dir, shard) catch return outcome.usage(ctx, "data directory path too long", .{});
     if (stdx.fs.openDir(dir, .{})) |d| stdx.fs.closeDir(d) else |_| {
         return outcome.localRefusal(ctx, "{s} has no shard {d}", .{ data_dir, shard });
     }
     const sum = offline.summarizeDir(ctx.allocator, dir) catch |err| {
-        return outcome.localRefusal(ctx, "cannot read shard {d}'s log: {}", .{ shard, err });
+        return outcome.localRefusal(ctx, "cannot read shard {d}'s log in {s}: {}", .{ shard, data_dir, err });
     };
+    printGroup(ctx, data_dir, shard, &sum);
+    // A member's shard is repaired by its group: skipped offline here, it
+    // would hold what the others don't.
+    const group = offline.summarize(ctx.allocator, data_dir) catch |err| {
+        return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
+    };
+    if (group.member_count > 1) {
+        return outcome.localRefusal(ctx, "this data directory belongs to a cluster of {d}; a member's shard is repaired by the cluster (flo cluster repair skip), not offline", .{group.member_count});
+    }
     if (sum.truncation_pending) {
         return outcome.localRefusal(ctx, "shard {d} has a log truncation pending; start and stop the server once to finish it, then run repair again", .{shard});
     }
@@ -956,6 +961,20 @@ fn printListening(raw: *anyopaque, ports: Runtime.Ports) void {
 fn portText(buf: *[8]u8, port: ?u16) []const u8 {
     const p = port orelse return "none";
     return std.fmt.bufPrint(buf, "{d}", .{p}) catch unreachable;
+}
+
+/// The admin socket of the server `server start` would run with these
+/// flags: --data-dir and --config, as for `server stop`. Written to `buf`.
+pub fn adminSocketPath(ctx: *commander.Context, buf: []u8) commander.Error![]const u8 {
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
+        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
+    defer ctx.allocator.free(data_dir);
+    const configured = if (config.admin_socket) |c| expandTilde(ctx.allocator, c) catch |err|
+        return outcome.usage(ctx, "cannot expand [admin] socket: {}", .{err}) else null;
+    defer if (configured) |c| ctx.allocator.free(c);
+    return runtime_mod.adminSocketPath(buf, data_dir, configured) catch outcome.usage(ctx, "the admin socket path is too long", .{});
 }
 
 /// The data directory a server's PID file is in, as `server start` would
