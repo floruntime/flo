@@ -537,3 +537,23 @@ test "kv machine: a JSON patch sets $ on a missing key, deletes the key at $, an
     // "text" is the one live key left.
     try testing.expectEqual(@as(u64, 1), kv.state().liveKeys("default"));
 }
+
+test "kv machine: a JSON patch whose merge outgrows a value is refused and changes nothing" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    const gpa = testing.allocator;
+    const buf = try gpa.alloc(u8, kv_ops.MAX_DOCUMENT + kv_ops.MAX_PATH + 256);
+    defer gpa.free(buf);
+    // A document as large as a patch may carry, then a field that grows it past a value.
+    const doc = try gpa.alloc(u8, kv_ops.MAX_DOCUMENT);
+    defer gpa.free(doc);
+    @memset(doc, 'x');
+    @memcpy(doc[0..6], "{\"a\":\"");
+    @memcpy(doc[doc.len - 2 ..], "\"}");
+    _ = try kv.apply(&testEntry(buf, .kv_json_patch, .{ .key = "doc", .path = "$", .document = doc }, kv.index + 1, STAMP));
+    const field = doc[5 .. doc.len - 1];
+    const r = try kv.apply(&testEntry(buf, .kv_json_patch, .{ .key = "doc", .path = "$.b", .document = field }, kv.index + 1, STAMP));
+    try testing.expectEqual(proto.Reason.field_too_long, r.refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 1), kv.state().get("doc").?.version);
+    try testing.expectEqual(doc.len, kv.state().get("doc").?.value.len);
+}
