@@ -1177,7 +1177,7 @@ pub const Runtime = struct {
         }
         self.walk_ctx_slices[0] = ts_ctxs;
 
-        // kv_scan (full scan) → each shard's KVProjection
+        // kv_scan (full scan) → each shard's KV state
         const kv_ctxs = try self.allocator.alloc(*anyopaque, n);
         for (0..n) |i| {
             kv_ctxs[i] = @ptrCast(&shards[i].defaultPartition().kv);

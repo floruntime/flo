@@ -30,8 +30,7 @@ const std = @import("std");
 const time_units = @import("../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
-const result_mod = @import("../protocol/result.zig");
-const kv_mod = @import("../projection/kv.zig");
+const kv_state = @import("state.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
@@ -55,9 +54,7 @@ const gather_mod = @import("../node/gather.zig");
 const log = @import("stdx").log;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 
-const CommandResult = result_mod.CommandResult;
-const KVProjection = kv_mod.KVProjection;
-const ScanEntry = kv_mod.ScanEntry;
+const KvState = kv_state.KvState;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -89,18 +86,11 @@ const RESERVED_PREFIXES = [_][]const u8{
 // KVHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// A TTL option of another width is refused rather than read as none.
-const TTL_WIDTH = "ttl_ms must be 8 bytes (a u64 of milliseconds)";
-
 pub const KVHandler = struct {
     // ── Fields ──────────────────────────────────────────────────────────
 
-    kv: *KVProjection,
+    kv: *KvState,
     allocator: Allocator,
-
-    /// Version counter for the processing sink's direct writes. Writes
-    /// through the log use the log index as their version.
-    next_lsn: u64,
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
@@ -115,11 +105,10 @@ pub const KVHandler = struct {
     /// The cursor a scan answers with.
     cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined,
 
-    pub fn init(allocator: Allocator, kv: *KVProjection) KVHandler {
+    pub fn init(allocator: Allocator, kv: *KvState) KVHandler {
         return .{
             .kv = kv,
             .allocator = allocator,
-            .next_lsn = 1,
             .metrics_registry = null,
             .txn_table = txn_mod.TxnTable.init(allocator),
         };
@@ -295,7 +284,7 @@ pub const KVHandler = struct {
     }
 
     /// A committed key as kv.get answers it, here and from a waiting get.
-    pub fn getAnswer(e: *const kv_mod.KVEntry) GetResponse.Value {
+    pub fn getAnswer(e: kv_state.Current) GetResponse.Value {
         return .{
             .version = e.version,
             .value = e.value,
@@ -865,7 +854,7 @@ pub const KVHandler = struct {
     // ── Shard Walker: Local Scan ──────────────────────────────────────
 
     /// ShardWalker LocalScanFn for kv_scan — scans key names from one shard's
-    /// KVProjection. Returns borrowed references (zero allocation).
+    /// KV state. Returns borrowed references (zero allocation).
     /// Filters reserved keys and strips namespace prefix.
     /// When filter is non-empty, only returns keys matching the prefix filter.
     fn localScanKeys(
@@ -875,35 +864,19 @@ pub const KVHandler = struct {
         _: ?[]const u8,
         limit: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const kv: *KVProjection = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var ns_buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        };
-        const key_buf = dispatcher_mod.scanScratch(kv.map.count());
-
-        // In "default" the filter is the whole scan prefix, so one holding a NUL would select another namespace's keys.
+        const kv: *KvState = @ptrCast(@alignCast(ctx));
+        const key_buf = dispatcher_mod.scanScratch(kv.totalEntries());
+        // A key can't hold the separator, so a filter that does names nothing.
         if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
-        // Build scan prefix: namespace prefix + optional filter
-        const ns_prefix = nsPrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
-        var scan_prefix = ns_prefix;
-        if (filter.len > 0 and ns_prefix.len + filter.len <= S.ns_buf.len) {
-            @memcpy(S.ns_buf[ns_prefix.len..][0..filter.len], filter);
-            scan_prefix = S.ns_buf[0 .. ns_prefix.len + filter.len];
-        }
-
-        // Scan qualified key names from projection (filtered by prefix)
-        const raw_count = kv.scanKeyNames(scan_prefix, key_buf);
-
-        // Strip namespace prefix and filter reserved keys in-place
+        // Keys come back in key order and without their namespace.
+        const ns = if (namespace.len == 0) "default" else namespace;
+        const raw_count = kv.scanKeyNames(ns, filter, key_buf);
         var count: usize = 0;
         const cap: usize = if (limit > 0) @intCast(limit) else key_buf.len;
         for (key_buf[0..raw_count]) |key| {
             if (count >= cap) break;
-            const stripped = stripNsPrefix(key, namespace);
-            // A default scan has no prefix, so it also sees other namespaces' "ns\x00key" entries.
-            if (std.mem.indexOfScalar(u8, stripped, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
-            if (!isReservedKey(stripped)) {
-                key_buf[count] = stripped;
+            if (!isReservedKey(key)) {
+                key_buf[count] = key;
                 count += 1;
             }
         }
@@ -963,88 +936,66 @@ pub const KVHandler = struct {
 
     // ── Sink put ─────────────────────────────────────────────────────────
 
-    /// The processing KV sink's write. It runs outside `run()` and the log,
-    /// on whichever shard owns the key, until sinks propose through the
-    /// owning shard like any other writer.
-    pub fn sinkPut(self: *KVHandler, req: Request) CommandResult {
-        return self.handlePutDirect(req);
-    }
+    /// A sink's write for the shard that owns its key, as an inbox message
+    /// carries it: `[ns len u8][ns][ttl? u8][ttl u64][key len u16][key][value]`.
+    pub const SinkPut = struct {
+        namespace: []const u8,
+        qkey: []const u8,
+        value: []const u8,
+        ttl_ms: ?u64,
 
-    fn handlePutDirect(self: *KVHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "key is required" } };
-        }
-        if (isReservedKey(req.key)) {
-            return .{ .err = .{ .code = .unauthorized, .message = "access to reserved key denied" } };
-        }
-
-        // Namespace-qualify key for projection operations
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, req.namespace, req.key) catch |err|
-            return qualifyRefusal(err);
-
-        // CAS check (qualified key)
-        if (req.getCasVersion()) |expected_version| {
-            const current = self.kv.get(qkey);
-            if (current) |entry| {
-                if (entry.version != expected_version) {
-                    return .{ .kv_cas_failed = .{ .current_version = entry.version } };
-                }
-            } else {
-                if (expected_version != 0) {
-                    return .{ .kv_cas_failed = .{ .current_version = 0 } };
-                }
-            }
+        /// The message's bytes, owned by the caller (the receiver frees
+        /// them), or null out of memory.
+        pub fn encode(self: SinkPut, allocator: Allocator) ?[]u8 {
+            const buf = allocator.alloc(u8, 1 + self.namespace.len + 9 + 2 + self.qkey.len + self.value.len) catch return null;
+            var off: usize = 0;
+            buf[0] = @intCast(self.namespace.len);
+            @memcpy(buf[1..][0..self.namespace.len], self.namespace);
+            off = 1 + self.namespace.len;
+            buf[off] = @intFromBool(self.ttl_ms != null);
+            std.mem.writeInt(u64, buf[off + 1 ..][0..8], self.ttl_ms orelse 0, .little);
+            off += 9;
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.qkey.len), .little);
+            off += 2;
+            @memcpy(buf[off..][0..self.qkey.len], self.qkey);
+            off += self.qkey.len;
+            @memcpy(buf[off..][0..self.value.len], self.value);
+            return buf;
         }
 
-        // NX / XX conditions (qualified key)
-        if (req.getIfNotExists()) {
-            if (self.kv.get(qkey) != null) return .kv_condition_not_met;
+        pub fn decode(bytes: []const u8) ?SinkPut {
+            if (bytes.len < 1) return null;
+            const ns_end = 1 + @as(usize, bytes[0]);
+            if (bytes.len < ns_end + 11) return null;
+            const ttl: ?u64 = if (bytes[ns_end] != 0) std.mem.readInt(u64, bytes[ns_end + 1 ..][0..8], .little) else null;
+            const key_len = std.mem.readInt(u16, bytes[ns_end + 9 ..][0..2], .little);
+            const key_at = ns_end + 11;
+            if (bytes.len < key_at + key_len) return null;
+            return .{ .namespace = bytes[1..ns_end], .qkey = bytes[key_at..][0..key_len], .value = bytes[key_at + key_len ..], .ttl_ms = ttl };
         }
-        if (req.getIfExists()) {
-            if (self.kv.get(qkey) == null) return .kv_condition_not_met;
-        }
+    };
 
-        const lsn = self.nextLsn();
-        const timestamp = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ttl = req.getTtlMs() catch return .{ .err = .{ .code = .invalid_request, .message = TTL_WIDTH } };
-        const expiry_ns: u64 = if (ttl) |ttl_ms| blk: {
-            if (ttl_ms == 0) break :blk 0;
-            break :blk time_units.expiryNs(timestamp, ttl_ms) orelse
-                return .{ .err = .{ .code = .invalid_request, .message = "ttl too large" } };
-        } else 0;
-
-        self.kv.put(qkey, req.value, lsn, 0, timestamp, expiry_ns) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "put failed" } };
+    /// The processing KV sink's write of `qkey`, which this shard owns:
+    /// proposed as any put is, unanswered. The reason it couldn't be, or
+    /// null. The caller counts a refusal as a dropped record.
+    pub fn sinkPropose(shard: *Shard, namespace: []const u8, qkey: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
+        if (isReservedKey(kv_state.Qualified.of(qkey).key)) return "access to reserved key denied";
+        shard.namespace_handler.proposeImplicitCreate(namespace, shard, false);
+        _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms }) catch |err| return switch (err) {
+            error.NotLeader => "this node doesn't lead its group",
+            error.WritesStopped => "the shard stopped taking writes",
+            error.Halted => "the shard is halted",
+            error.Overloaded => "too many writes wait for commit",
+            else => @errorName(err),
         };
-        const version = if (self.kv.get(qkey)) |entry| entry.version else 1;
-        return .{ .kv_put_ok = .{ .version = version } };
-    }
-
-    // ── Helpers ─────────────────────────────────────────────────────────
-
-    fn nextLsn(self: *KVHandler) u64 {
-        const lsn = self.next_lsn;
-        self.next_lsn += 1;
-        return lsn;
+        shard.namespace_handler.markNamespaceHasData(namespace, shard);
+        return null;
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────
     // (Moved to unified WaiterPool in node/waiter_pool.zig)
     // Handlers use shard.waiter_pool.register() / .notify() / .expireTimeouts()
 };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Response Serialization — CommandResult → Wire Response
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// The sink's refusal for a key that can't be qualified.
-fn qualifyRefusal(err: error{ KeyTooLarge, KeyHasNul }) CommandResult {
-    return switch (err) {
-        error.KeyHasNul => .{ .err = .{ .code = .invalid_request, .message = "key must not contain NUL" } },
-        error.KeyTooLarge => .{ .err = .{ .code = .kv_key_too_large, .message = "namespace + key too large" } },
-    };
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Utilities
@@ -1065,174 +1016,6 @@ fn isReservedKey(key: []const u8) bool {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-
-/// The value the projection holds for `key` in the default namespace.
-fn stored(handler: *KVHandler, key: []const u8) ?[]const u8 {
-    var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const entry = handler.kv.get(qualifyKey(&qbuf, "default", key) catch return null) orelse return null;
-    return entry.value;
-}
-
-fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
-    return .{
-        .header = proto.RequestHeader.init(op, 1),
-        .namespace = "default",
-        .key = key,
-        .value = value,
-        .options = options,
-    };
-}
-
-test "kv handler: put and get" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Put
-    const put_result = handler.handlePutDirect(makeRequest(.kv_put, "mykey", "myval", ""));
-    switch (put_result) {
-        .kv_put_ok => |p| try testing.expectEqual(@as(u64, 1), p.version),
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqualStrings("myval", stored(&handler, "mykey").?);
-}
-
-test "kv handler: put with CAS success" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Initial put (version = 1)
-    _ = handler.handlePutDirect(makeRequest(.kv_put, "k", "v1", ""));
-
-    // CAS put with version 1 → should succeed
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU64(.cas_version, 1);
-    const opts = builder.getOptions();
-
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "k", "v2", opts));
-    switch (result) {
-        .kv_put_ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqualStrings("v2", stored(&handler, "k").?);
-}
-
-test "kv handler: put with CAS failure" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Initial put (version = 1)
-    _ = handler.handlePutDirect(makeRequest(.kv_put, "k", "v1", ""));
-
-    // CAS put with wrong version 42 → should fail
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU64(.cas_version, 42);
-    const opts = builder.getOptions();
-
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "k", "v2", opts));
-    switch (result) {
-        .kv_cas_failed => |c| try testing.expectEqual(@as(u64, 1), c.current_version),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: put if_not_exists success" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addFlag(.if_not_exists);
-    const opts = builder.getOptions();
-
-    // Key doesn't exist → should succeed
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "new_key", "val", opts));
-    switch (result) {
-        .kv_put_ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: put if_not_exists failure" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Pre-populate
-    _ = handler.handlePutDirect(makeRequest(.kv_put, "existing", "val", ""));
-
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addFlag(.if_not_exists);
-    const opts = builder.getOptions();
-
-    // Key exists → should fail
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "existing", "new_val", opts));
-    switch (result) {
-        .kv_condition_not_met => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: put if_exists success" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    // Pre-populate
-    _ = handler.handlePutDirect(makeRequest(.kv_put, "existing", "old", ""));
-
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addFlag(.if_exists);
-    const opts = builder.getOptions();
-
-    // Key exists → should succeed
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "existing", "new", opts));
-    switch (result) {
-        .kv_put_ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "kv handler: put if_exists failure" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-
-    var handler = KVHandler.init(allocator, &kv);
-
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addFlag(.if_exists);
-    const opts = builder.getOptions();
-
-    // Key doesn't exist → should fail
-    const result = handler.handlePutDirect(makeRequest(.kv_put, "missing", "val", opts));
-    switch (result) {
-        .kv_condition_not_met => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
 
 test "kv handler: every KV op in the table has a handler, and the key-routed ones a route" {
     var dispatcher = Dispatcher.init();
@@ -1259,36 +1042,20 @@ test "kv handler: reserved key prefixes" {
     try testing.expect(!isReservedKey("")); // empty key
 }
 
-test "kv handler: the sink's put refuses a key holding a NUL, which would spell another namespace's key" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-    var handler = KVHandler.init(allocator, &kv);
-
-    var b_put = makeRequest(.kv_put, "k", "b-value", "");
-    b_put.namespace = "b";
-    _ = handler.handlePutDirect(b_put);
-    // "default" keys are stored bare, so this spells b's "k".
-    switch (handler.handlePutDirect(makeRequest(.kv_put, "b\x00k", "overwrite", ""))) {
-        .err => |e| {
-            try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code);
-            try testing.expectEqualStrings("key must not contain NUL", e.message);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expectEqualStrings("b-value", kv.get("b\x00k").?.value);
-}
-
 test "kv handler: the key walk refuses a NUL filter and lists only default's keys in default" {
     const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-    var handler = KVHandler.init(allocator, &kv);
-
-    var b_put = makeRequest(.kv_put, "k", "b-value", "");
-    b_put.namespace = "b";
-    _ = handler.handlePutDirect(b_put);
-    _ = handler.handlePutDirect(makeRequest(.kv_put, "mine", "default-value", ""));
+    var store = @import("../contract/store.zig").Store.init(allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    var kv: KvState = .{ .store = &store };
+    var pbuf: [64]u8 = undefined;
+    for ([_][2][]const u8{ .{ "b\x00k", "b-value" }, .{ "mine", "default-value" } }, 1..) |kvp, i| {
+        const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, i, i, try kv_entries.Put.encodeInto(&pbuf, .{ .key = kvp[0], .value = kvp[1], .ttl_ms = null }));
+        var out: Result = .{};
+        out.reset(&e);
+        try @import("../contract/machine.zig").applyEntry(&@import("machine.zig").machine, &store, &scratch, &e, &out);
+    }
 
     try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, "default", "b\x00", null, 0).items.len);
     const all = KVHandler.localScanKeys(&kv, "default", "", null, 0).items;
@@ -1297,36 +1064,4 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
     const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 0).items;
     try testing.expectEqual(@as(usize, 1), b_keys.len);
     try testing.expectEqualStrings("k", b_keys[0]);
-}
-
-test "kv handler: a TTL option that isn't 8 bytes is refused, not read as no TTL" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-    var handler = KVHandler.init(allocator, &kv);
-
-    var obuf: [32]u8 = undefined;
-    var b = proto.OptionsBuilder.init(&obuf);
-    try b.addString(.ttl_ms, "abcd");
-    switch (handler.handlePutDirect(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
-        .err => |e| try testing.expectEqualStrings(TTL_WIDTH, e.message),
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expect(kv.get("k") == null);
-}
-
-test "kv handler: a TTL too large to represent is refused" {
-    const allocator = testing.allocator;
-    var kv = KVProjection.init(allocator);
-    defer kv.deinit();
-    var handler = KVHandler.init(allocator, &kv);
-
-    var obuf: [32]u8 = undefined;
-    var b = proto.OptionsBuilder.init(&obuf);
-    try b.addU64(.ttl_ms, std.math.maxInt(u64));
-    switch (handler.handlePutDirect(makeRequest(.kv_put, "k", "v", b.getOptions()))) {
-        .err => |e| try testing.expectEqualStrings("ttl too large", e.message),
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expect(kv.get("k") == null);
 }

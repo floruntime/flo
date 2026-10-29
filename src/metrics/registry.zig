@@ -1402,7 +1402,7 @@ fn writeKVMetrics(
     try writer.print("# TYPE flo_kv_history_bytes gauge\n", .{});
     try writer.print("flo_kv_history_bytes{{{s}}} {d}\n", .{ labels, snapshot.history_bytes });
 
-    try writer.print("# HELP flo_kv_history_evicted_total Older versions this node evicted from this namespace's history since it started, replay included\n", .{});
+    try writer.print("# HELP flo_kv_history_evicted_total Older versions evicted from this namespace's history, ever: replicated state, the same on every replica and across restarts\n", .{});
     try writer.print("# TYPE flo_kv_history_evicted_total counter\n", .{});
     try writer.print("flo_kv_history_evicted_total{{{s}}} {d}\n", .{ labels, snapshot.history_evicted_total });
 }

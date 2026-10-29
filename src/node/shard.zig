@@ -8,7 +8,8 @@
 //! - **ConnectionPool**: active connections (fd → Connection)
 //! - **Router**: hash → partition → shard mapping
 //! - **SlabAllocator**: fixed-size slab pools for cross-shard payloads
-//! - **KVProjection + KVHandler**: in-memory KV storage and dispatch
+//! - **KvState + KVHandler**: KV's applied state (its contract machine's
+//!   families) and dispatch
 //!
 //! ## Lifecycle
 //!
@@ -65,8 +66,7 @@ const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const cluster_wire = @import("../protocol/cluster_wire.zig");
 const acceptor_mod = @import("acceptor.zig");
-const KVProjection = @import("../projection/kv.zig").KVProjection;
-const KVEntry = @import("../projection/kv.zig").KVEntry;
+const kv_state = @import("../kv/state.zig");
 const KVMetrics = @import("../metrics/registry.zig").KVMetrics;
 const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
@@ -2219,6 +2219,7 @@ pub const Shard = struct {
         switch (msg.tag) {
             .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
+            .kv_sink_put => self.runKvSinkPut(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
             .cancel_reads => {
@@ -2249,6 +2250,17 @@ pub const Shard = struct {
                 if (i == self.id) continue;
                 mb.wake.set(.stream_appended);
             }
+        }
+    }
+
+    /// A processing KV sink on another shard wrote a key this shard owns.
+    fn runKvSinkPut(self: *Shard, msg: InboxMessage) void {
+        const bytes = inboxPayload(msg);
+        defer if (bytes.len > 0) self.allocator.free(bytes);
+        const put = KVHandler.SinkPut.decode(bytes) orelse
+            return self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
+        if (KVHandler.sinkPropose(self, put.namespace, put.qkey, put.value, put.ttl_ms)) |why| {
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.qkey, why);
         }
     }
 
@@ -3360,29 +3372,30 @@ pub const Shard = struct {
         return .ok;
     }
 
-    /// Publish each namespace's counts that changed since the last time,
-    /// for /metrics and the dashboard: they read them from another thread,
-    /// never the projection. A namespace whose metrics can't be registered
-    /// is tried again next time.
+    /// Publish every namespace's counts once any changed, for /metrics and
+    /// the dashboard: they read them from another thread, never the store.
+    /// A namespace whose metrics can't be registered is tried again next
+    /// time.
     fn publishLiveKeys(self: *Shard) void {
         const kv = self.kv_handler.kv;
-        if (!kv.live_keys_changed) return;
+        if (!kv.countsChanged()) return;
         const registry = self.metrics_registry orelse return;
         var all = true;
-        var it = kv.live_keys.iterator();
-        while (it.next()) |e| {
-            const c = e.value_ptr.counts;
-            if (std.meta.eql(c, e.value_ptr.published)) continue;
+        var it = kv.namespaces();
+        while (it.next()) |n| {
             // Looked up once: a namespace's metrics never move.
-            const km: *KVMetrics = if (e.value_ptr.publish_to) |p| @ptrCast(@alignCast(p)) else registry.registerKVNamespace(e.key_ptr.*) catch {
-                all = false;
-                continue;
+            const km: *KVMetrics = if (kv.publish_to.get(n.ns)) |p| @ptrCast(@alignCast(p)) else blk: {
+                const km = registry.registerKVNamespace(n.ns) catch {
+                    all = false;
+                    continue;
+                };
+                const name = self.allocator.dupe(u8, n.ns) catch break :blk km;
+                kv.publish_to.put(self.allocator, name, km) catch self.allocator.free(name);
+                break :blk km;
             };
-            e.value_ptr.publish_to = km;
-            km.publishCounts(self.id, c.live, c.bytes, c.history_bytes, c.history_evicted);
-            e.value_ptr.published = c;
+            km.publishCounts(self.id, n.counts.live, n.counts.bytes, n.counts.history_bytes, n.counts.history_evicted);
         }
-        if (all) kv.live_keys_changed = false;
+        if (all) kv.markPublished();
     }
 
     /// Publish this shard's state and losses. The runtime calls it once
@@ -3821,7 +3834,7 @@ pub const Shard = struct {
                 var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
                 const key = kv_entries.Key.decode(&r, "key") catch return;
                 if (self.metrics_registry) |mr| {
-                    if (mr.registerKVNamespace(KVProjection.namespaceOf(key))) |km| switch (etype) {
+                    if (mr.registerKVNamespace(kv_state.Qualified.of(key).ns)) |km| switch (etype) {
                         .kv_put => km.recordSet(),
                         .kv_delete => km.recordDelete(),
                         else => {},
@@ -4160,7 +4173,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start => {
+                .action_start, .kv_sink_put => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -5890,7 +5903,7 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 }
 
 /// Answers a waiting `kv.get`.
-fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, entry: *const KVEntry) void {
+fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, entry: kv_state.Current) void {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").ofKey(waiter.key()) == .panic_answering_waiter) @panic("test fault: panic answering a waiting read");
     }
@@ -6424,14 +6437,14 @@ fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
 
 fn routedToProjection(etype: entry_mod.EntryType) bool {
     return switch (projection_router.routeTarget(etype)) {
-        .kv, .queue, .ts => true,
+        .queue, .ts => true,
         .none, .snapshot => false,
     };
 }
 
 /// The one apply path: the partition (hot ring plus the projections the
-/// router owns — KV, queue, TS) and then the registry appliers for every
-/// other entry type.
+/// router owns: queue and TS), then a contract machine for the types one
+/// owns (KV's), then the registry appliers for every other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").of(entry)) |f| {
@@ -6443,6 +6456,9 @@ pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, en
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
     if (contract_machine.ownerOf(&contract_machines.list, etype)) |m| {
+        // The router has seen every index up to its own: one at or below it
+        // was applied already, and must not be twice.
+        if (applied.route == .skipped_already_applied) return .applied;
         contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
         return .applied;
     }
@@ -7118,7 +7134,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     const version = shard.defaultPartition().kv.get(present).?.version;
     // A TTL far off, so the timeout's answer must carry it.
     const expires_at_ms: i64 = 4_000_000_000_000;
-    shard.defaultPartition().kv.map.getPtr(present).?.expiry_ns = @as(u64, @intCast(expires_at_ms)) * std.time.ns_per_ms;
+    try shard.defaultPartition().kv.setExpiryForTest(present, @as(u64, @intCast(expires_at_ms)) * std.time.ns_per_ms);
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 7, .key = present, .min_version = version, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
@@ -7630,8 +7646,8 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
         if (shardOf(a, k) == 0) break k;
     } else return error.TestUnexpectedResult;
     var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    try two.shards[1].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "", far), "routed", 1, 0, 0, 0);
-    try two.shards[shardOf(a, "own")].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "", "own"), "plain", 1, 0, 0, 0);
+    try two.shards[1].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "", far), "routed");
+    try two.shards[shardOf(a, "own")].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "", "own"), "plain");
 
     const op = table_run.op("kv.mget");
     const Keys = op.request.field_list[0].T;
@@ -7718,7 +7734,7 @@ const MgetGatherFixture = struct {
         for (self.keys, 0..) |k, n| {
             // Each value names its key, so order shows in the answer.
             @memset(value, @intCast('a' + n));
-            try self.two.shards[n % 2].defaultPartition().kv.put(try handler_mod.qualifyKey(&qbuf, "default", k), value, 1, 0, 0, 0);
+            try self.two.shards[n % 2].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "default", k), value);
         }
         self.client = try TestClient.open(a);
         self.out = try std.testing.allocator.alloc(u8, proto.MAX_ANSWER_BYTES);
@@ -11503,7 +11519,7 @@ test "every entry type has exactly one applier, or is listed as needing none, or
     var full: ReplayRegistry = .{};
     inline for (@typeInfo(entry_mod.EntryType).@"enum".field_values) |value| {
         const t: entry_mod.EntryType = @fromBackingInt(@intCast(value));
-        if (!routedToProjection(t) and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
+        if (!routedToProjection(t) and contract_machine.ownerOf(&contract_machines.list, t) == null and !listed(&APPLIES_NOTHING, t) and !listed(&NEVER_WRITTEN, t)) full.register(t, @ptrCast(&ctx), Noop.apply);
     }
     try checkAppliers(0, &full);
 
@@ -13185,8 +13201,8 @@ test "an entry no projection or applier can take halts its shard at it, applying
     for ([_]Case{
         // The registry applier cannot decode it.
         .{ .entry_type = .action_invoke, .payload = "not a command payload", .why = "its applier refused it" },
-        // The KV projection cannot decode it.
-        .{ .entry_type = .kv_put, .payload = "not a command payload", .why = "its projection refused it" },
+        // The KV machine cannot decode it.
+        .{ .entry_type = .kv_put, .payload = "not a command payload", .why = "its applier refused it" },
         // Nothing writes this type, and nothing applies it.
         .{ .entry_type = .cg_create, .payload = "", .why = "no applier on this build" },
         // Larger than the partition ring.
@@ -13761,7 +13777,7 @@ const SkipState = struct {
             .in_warm = p.warm_store.contains(h),
             .router_past = p.router.applied_index >= h,
             .queued = DamageTest.queued(shard),
-            .kv = shard.kv_handler.kv.count(),
+            .kv = shard.kv_handler.kv.countLive(),
             .defs = shard.workflow_handler.definitions.count(),
             .action_runs = shard.actions_handler.runs.count(),
         };
@@ -15200,10 +15216,28 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
             return .{ .name = "toy", .entry_types = &.{t}, .families = &.{}, .keys = keys, .apply = apply };
         }
     };
-    try checkAppliersWith(&.{}, 0, &shard.replay_registry);
+    const listed_now = contract_machines.list;
+    try checkAppliersWith(&listed_now, 0, &shard.replay_registry);
     // A type nothing else applies: the machine is its applier.
-    try checkAppliersWith(&.{Toy.owning(.raft_snapshot)}, 0, &shard.replay_registry);
+    try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Routed to a projection, or registered by a handler, too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&.{Toy.owning(.kv_put)}, 0, &shard.replay_registry));
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&.{Toy.owning(.stream_append)}, 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.queue_enqueue)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.stream_append)}), 0, &shard.replay_registry));
+    // KV's types are its machine's: without it, they have no applier.
+    try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
+}
+
+test "applyEntryCore: a KV entry delivered twice applies once" {
+    var part = try Partition.init(std.testing.allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    var registry: ReplayRegistry = .{};
+    var buf: [64]u8 = undefined;
+    const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = "k", .value = "v", .ttl_ms = null }));
+    for (0..2) |_| {
+        var out: persistence_mod.Result = .{};
+        out.reset(&e);
+        try std.testing.expect(applyEntryCore(&part, &registry, &e, &out) == .applied);
+    }
+    try std.testing.expectEqual(@as(u64, 1), part.kv.get("k").?.version);
 }

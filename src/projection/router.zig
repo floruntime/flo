@@ -5,8 +5,6 @@
 //! Partition calls `router.apply(entry)` which dispatches by EntryType.
 //!
 //! Routing table:
-//!   kv_put, kv_delete, kv_batch,
-//!   kv_incr, kv_expire              → KVProjection
 //!   queue_enqueue, queue_ack, etc.  → QueueProjection
 //!   ts_write, ts_write_batch        → TSProjection
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
@@ -78,7 +76,6 @@ pub const ProjectionRouter = struct {
     applied_stamp: u64 = 0,
 
     /// Registered projection engines (optional — set to null if not present).
-    kv: ?ProjectionHandle,
     queue: ?ProjectionHandle,
     ts: ?ProjectionHandle,
     // Stream has no projection — reads go directly to UAL.
@@ -92,7 +89,6 @@ pub const ProjectionRouter = struct {
         entries_no_projection: u64 = 0,
         entries_error: u64 = 0,
         snapshots_triggered: u64 = 0,
-        kv_entries: u64 = 0,
         queue_entries: u64 = 0,
         ts_entries: u64 = 0,
     };
@@ -100,16 +96,10 @@ pub const ProjectionRouter = struct {
     pub fn init() ProjectionRouter {
         return .{
             .applied_index = 0,
-            .kv = null,
             .queue = null,
             .ts = null,
             .stats = .{},
         };
-    }
-
-    /// Register the KV projection.
-    pub fn registerKV(self: *ProjectionRouter, handle: ProjectionHandle) void {
-        self.kv = handle;
     }
 
     /// Register the Queue projection.
@@ -140,7 +130,6 @@ pub const ProjectionRouter = struct {
             self.applied_stamp = @max(self.applied_stamp, entry.header.timestamp_ns);
         }
         return switch (target) {
-            .kv => self.applyTo(self.kv, entry, out, &self.stats.kv_entries),
             .queue => self.applyTo(self.queue, entry, out, &self.stats.queue_entries),
             .ts => self.applyTo(self.ts, entry, out, &self.stats.ts_entries),
             .none => blk: {
@@ -215,7 +204,6 @@ pub const ProjectionRouter = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const RouteTarget = enum(u8) {
-    kv,
     queue,
     ts,
     none,
@@ -225,9 +213,8 @@ const RouteTarget = enum(u8) {
 /// Determine which projection an entry type routes to.
 pub fn routeTarget(entry_type: EntryType) RouteTarget {
     return switch (entry_type) {
-        // KV
-        .kv_put, .kv_delete, .kv_batch => .kv,
-        .kv_incr, .kv_expire => .kv,
+        // KV: its contract machine (kv/machine.zig).
+        .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire => .none,
 
         // Consumer-group durability: cg_commit / cg_delete carry
         // consumer-group state, which lives on the StreamProjection. They are
@@ -310,10 +297,10 @@ fn makeEntry(entry_type: EntryType, index: u64) Entry {
 }
 
 test "router: routing table correctness" {
-    // KV types
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_put));
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_delete));
-    try testing.expectEqual(RouteTarget.kv, routeTarget(.kv_batch));
+    // KV: a contract machine's, not a projection's
+    try testing.expectEqual(RouteTarget.none, routeTarget(.kv_put));
+    try testing.expectEqual(RouteTarget.none, routeTarget(.kv_delete));
+    try testing.expectEqual(RouteTarget.none, routeTarget(.kv_batch));
 
     // Consumer group → none (applied via stream handler replay registry)
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_commit));
@@ -340,21 +327,6 @@ test "router: routing table correctness" {
 
     // Snapshot
     try testing.expectEqual(RouteTarget.snapshot, routeTarget(.raft_snapshot));
-}
-
-test "router: kv entry routed to kv projection" {
-    var kv_proj = TestProjection{};
-    var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
-
-    const entry = makeEntry(.kv_put, 1);
-    const result = try applyOne(&router, &entry);
-
-    try testing.expectEqual(ApplyResult.applied, result);
-    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count);
-    try testing.expectEqual(@as(u64, 1), kv_proj.last_index);
-    try testing.expectEqual(@as(u64, 1), router.applied_index);
-    try testing.expectEqual(@as(u64, 1), router.stats.kv_entries);
 }
 
 test "router: queue entry routed to queue projection" {
@@ -386,17 +358,17 @@ test "router: ts entry routed to ts projection" {
 test "router: consumer group entry not routed to a projection" {
     // cg_commit / cg_delete carry consumer-group state owned by the
     // StreamProjection and are applied via the stream handler's replay
-    // registry, so the projection router must NOT route them to KV.
-    var kv_proj = TestProjection{};
+    // registry, so the projection router must not route them to a projection.
+    var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
+    router.registerQueue(q_proj.handle());
 
     const entry = makeEntry(.cg_commit, 1);
     const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
-    try testing.expectEqual(@as(u32, 0), kv_proj.apply_count);
-    try testing.expectEqual(@as(u64, 0), router.stats.kv_entries);
+    try testing.expectEqual(@as(u32, 0), q_proj.apply_count);
+    try testing.expectEqual(@as(u64, 0), router.stats.queue_entries);
 }
 
 test "router: stream entry has no projection" {
@@ -426,48 +398,48 @@ test "router: raft snapshot triggers installation" {
 }
 
 test "router: idempotency — duplicate entries skipped" {
-    var kv_proj = TestProjection{};
+    var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
+    router.registerQueue(q_proj.handle());
 
-    const entry = makeEntry(.kv_put, 1);
+    const entry = makeEntry(.queue_enqueue, 1);
 
     // Apply once
     _ = try applyOne(&router, &entry);
-    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count);
+    try testing.expectEqual(@as(u32, 1), q_proj.apply_count);
 
     // Apply same index again — should be skipped
     const result = try applyOne(&router, &entry);
     try testing.expectEqual(ApplyResult.skipped_already_applied, result);
-    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // unchanged
+    try testing.expectEqual(@as(u32, 1), q_proj.apply_count); // unchanged
     try testing.expectEqual(@as(u64, 1), router.stats.entries_skipped);
 }
 
 test "router: entries must be applied in order" {
-    var kv_proj = TestProjection{};
+    var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
+    router.registerQueue(q_proj.handle());
 
     // Apply index 1, 2, 3 in order
-    _ = try applyOne(&router, &makeEntry(.kv_put, 1));
-    _ = try applyOne(&router, &makeEntry(.kv_delete, 2));
-    _ = try applyOne(&router, &makeEntry(.kv_put, 3));
+    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 1));
+    _ = try applyOne(&router, &makeEntry(.queue_ack, 2));
+    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 3));
 
-    try testing.expectEqual(@as(u32, 3), kv_proj.apply_count);
+    try testing.expectEqual(@as(u32, 3), q_proj.apply_count);
     try testing.expectEqual(@as(u64, 3), router.applied_index);
 
     // Index 2 again — skipped
-    const r = try applyOne(&router, &makeEntry(.kv_put, 2));
+    const r = try applyOne(&router, &makeEntry(.queue_enqueue, 2));
     try testing.expectEqual(ApplyResult.skipped_already_applied, r);
-    try testing.expectEqual(@as(u32, 3), kv_proj.apply_count);
+    try testing.expectEqual(@as(u32, 3), q_proj.apply_count);
 }
 
 test "router: apply error counted but index advances" {
     var err_proj = ErrorProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(err_proj.handle());
+    router.registerQueue(err_proj.handle());
 
-    const entry = makeEntry(.kv_put, 1);
+    const entry = makeEntry(.queue_enqueue, 1);
     try testing.expectError(error.Halt, applyOne(&router, &entry));
     try testing.expectEqual(@as(u64, 1), router.stats.entries_error);
     // Index still advances — we don't retry
@@ -478,59 +450,56 @@ test "router: unregistered projection acts as no_projection" {
     var router = ProjectionRouter.init();
     // No projections registered
 
-    const entry = makeEntry(.kv_put, 1);
+    const entry = makeEntry(.queue_enqueue, 1);
     const result = try applyOne(&router, &entry);
 
-    // KV projection not registered — treated as no projection
+    // Queue projection not registered — treated as no projection
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
     try testing.expectEqual(@as(u64, 1), router.applied_index);
 }
 
 test "router: batch apply" {
-    var kv_proj = TestProjection{};
     var queue_proj = TestProjection{};
+    var ts_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
     router.registerQueue(queue_proj.handle());
+    router.registerTS(ts_proj.handle());
 
     const entries = [_]Entry{
-        makeEntry(.kv_put, 1),
+        makeEntry(.ts_write, 1),
         makeEntry(.queue_enqueue, 2),
         makeEntry(.stream_append, 3), // no projection
-        makeEntry(.kv_delete, 4),
+        makeEntry(.ts_delete, 4),
         makeEntry(.raft_noop, 5), // no projection
     };
 
     const result = router.applyBatch(&entries);
 
-    try testing.expectEqual(@as(u32, 3), result.applied); // kv_put + queue + kv_delete
+    try testing.expectEqual(@as(u32, 3), result.applied); // ts_write + queue + ts_delete
     try testing.expectEqual(@as(u32, 2), result.no_projection); // stream + noop
     try testing.expectEqual(@as(u32, 5), result.total());
     try testing.expectEqual(@as(u64, 5), router.applied_index);
-    try testing.expectEqual(@as(u32, 2), kv_proj.apply_count);
+    try testing.expectEqual(@as(u32, 2), ts_proj.apply_count);
     try testing.expectEqual(@as(u32, 1), queue_proj.apply_count);
 }
 
 test "router: mixed entry types across all projections" {
-    var kv_proj = TestProjection{};
     var queue_proj = TestProjection{};
     var ts_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerKV(kv_proj.handle());
     router.registerQueue(queue_proj.handle());
     router.registerTS(ts_proj.handle());
 
-    _ = try applyOne(&router, &makeEntry(.kv_put, 1));
+    _ = try applyOne(&router, &makeEntry(.kv_put, 1)); // → none (the KV machine)
     _ = try applyOne(&router, &makeEntry(.queue_enqueue, 2));
     _ = try applyOne(&router, &makeEntry(.ts_write, 3));
     _ = try applyOne(&router, &makeEntry(.cg_commit, 4)); // → none (stream replay registry)
     _ = try applyOne(&router, &makeEntry(.queue_ack, 5));
     _ = try applyOne(&router, &makeEntry(.ts_write_batch, 6));
 
-    try testing.expectEqual(@as(u32, 1), kv_proj.apply_count); // kv_put only
     try testing.expectEqual(@as(u32, 2), queue_proj.apply_count); // enqueue + ack
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count); // write + write_batch
-    // cg_commit routes to none, so 5 applied + 1 no-projection.
-    try testing.expectEqual(@as(u64, 5), router.stats.entries_applied);
-    try testing.expectEqual(@as(u64, 1), router.stats.entries_no_projection);
+    // kv_put and cg_commit route to none, so 4 applied + 2 no-projection.
+    try testing.expectEqual(@as(u64, 4), router.stats.entries_applied);
+    try testing.expectEqual(@as(u64, 2), router.stats.entries_no_projection);
 }

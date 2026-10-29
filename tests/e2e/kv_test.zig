@@ -2247,6 +2247,39 @@ test "e2e/kv: txn rollback discards staged ops" {
     try expectNotFound(result);
 }
 
+test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes, and says which op (counting from 1)" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "whole" });
+    const tid_prefix = "txn: ";
+    const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
+    var end = idx + tid_prefix.len;
+    while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
+    const tid_str = begin_out[idx + tid_prefix.len .. end];
+
+    try ctx.exec(&.{ "kv", "set", "whole:a", "1", "--routing-key", "whole", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "whole:b", "2", "--routing-key", "whole", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "incr", "whole:text", "--routing-key", "whole", "--txn", tid_str });
+    // Between the incr's buffering and the commit, the key stops being a
+    // counter: only the commit's apply can find that out.
+    try ctx.exec(&.{ "kv", "set", "whole:text", "not a counter", "--routing-key", "whole" });
+
+    var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid_str });
+    defer commit.deinit();
+    try testing.expectEqual(@as(u8, 3), commit.exit_code);
+    try testing.expect(std.mem.indexOf(u8, commit.stderr, "the transaction's op 3:") != null);
+    try testing.expect(std.mem.indexOf(u8, commit.stderr, "nothing in the transaction applied") != null);
+    try testing.expect(std.mem.indexOf(u8, commit.stderr, "[bad_request/wrong_type]") != null);
+
+    // Neither put applied, and the value the incr met is as it was.
+    var a = try ctx.cli.run(&.{ "kv", "get", "whole:a", "--routing-key", "whole" });
+    defer a.deinit();
+    try expectNotFound(a);
+    const text = try ctx.execCapture(&.{ "kv", "get", "whole:text", "--routing-key", "whole" });
+    try testing.expect(std.mem.indexOf(u8, text, "not a counter") != null);
+}
+
 test "e2e/kv: txn unknown id is rejected" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

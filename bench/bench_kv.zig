@@ -1,14 +1,17 @@
-//! Benchmark: KVProjection operations per second
+//! Benchmark: KV operations per second, through the KV machine as a shard
+//! applies them (staged on a View, committed to the families), and reads
+//! over the committed state.
 //!
-//! Measures put, get, delete, scan, and scanPrefix throughput.
+//! Measures put, get, delete, scan and prefix scan.
 
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
 
-const KVProjection = src.projection.kv.KVProjection;
+const TestKv = src.kv.machine.TestKv;
+const entry_mod = src.storage.ual.entry;
+const kv_entries = src.protocol.kv_entries;
 
-const WARMUP_ITERS = 1_000;
 const BENCH_ITERS = 100_000;
 
 fn formatKey(buf: *[32]u8, i: usize) []const u8 {
@@ -19,120 +22,47 @@ fn formatVal(buf: *[64]u8, i: usize) []const u8 {
     return std.fmt.bufPrint(buf, "bench-value-{d:0>8}-padding-data", .{i}) catch "bench-val";
 }
 
-fn benchPut(kv: *KVProjection) !void {
-    var kbuf: [32]u8 = undefined;
-    var vbuf: [64]u8 = undefined;
-    for (0..BENCH_ITERS) |i| {
-        const key = formatKey(&kbuf, i);
-        const val = formatVal(&vbuf, i);
-        try kv.put(key, val, @as(u64, @intCast(i)) + 1, 1, 0, 0);
-    }
-}
-
-fn benchGet(kv: *KVProjection) void {
-    var kbuf: [32]u8 = undefined;
-    var found: u64 = 0;
-    for (0..BENCH_ITERS) |i| {
-        const key = formatKey(&kbuf, i);
-        if (kv.get(key)) |_| {
-            found += 1;
-        }
-    }
-    std.mem.doNotOptimizeAway(found);
-}
-
-fn benchDelete(kv: *KVProjection) !void {
-    var kbuf: [32]u8 = undefined;
-    for (0..BENCH_ITERS) |i| {
-        const key = formatKey(&kbuf, i);
-        try kv.delete(key, @as(u64, @intCast(i)) + BENCH_ITERS + 1, 1, 0);
-    }
-}
-
-fn benchScan(kv: *KVProjection, iters: usize) void {
-    var results: [100]src.projection.kv.ScanEntry = undefined;
-    var total: u64 = 0;
-    for (0..iters) |_| {
-        total += kv.scan(&results);
-    }
-    std.mem.doNotOptimizeAway(total);
-}
-
-fn benchScanPrefix(kv: *KVProjection, iters: usize) void {
-    var results: [100]src.projection.kv.ScanEntry = undefined;
-    var total: u64 = 0;
-    for (0..iters) |_| {
-        total += kv.scanPrefix("bench-key-0000", &results);
-    }
-    std.mem.doNotOptimizeAway(total);
+fn report(name: []const u8, n: u64, start: i128, extra: []const u8) void {
+    const ns: u64 = @intCast(stdx.time.nanoTimestamp() - start);
+    std.debug.print("  {s:<12} {d:>12} ops/sec  ({d} ns/op{s})\n", .{ name, n * 1_000_000_000 / ns, ns / n, extra });
 }
 
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
+    std.debug.print("\n=== KV Benchmark (the KV machine) ===\n\n", .{});
+    var kv = TestKv.init(allocator);
+    defer kv.deinit();
+    var kbuf: [32]u8 = undefined;
+    var vbuf: [64]u8 = undefined;
 
-    std.debug.print("\n=== KVProjection Benchmark ===\n\n", .{});
+    var start = stdx.time.nanoTimestamp();
+    for (0..BENCH_ITERS) |i| try kv.put(formatKey(&kbuf, i), formatVal(&vbuf, i), 0);
+    report("KV Put:", BENCH_ITERS, start, ", one key and its namespace's counts per entry");
 
-    // ── Put Benchmark ──
-    {
-        var kv = KVProjection.init(allocator);
-        defer kv.deinit();
+    const st = kv.state();
+    start = stdx.time.nanoTimestamp();
+    var found: u64 = 0;
+    for (0..BENCH_ITERS) |i| found += @intFromBool(st.get(formatKey(&kbuf, i)) != null);
+    std.mem.doNotOptimizeAway(found);
+    report("KV Get:", BENCH_ITERS, start, "");
 
-        const start = stdx.time.nanoTimestamp();
-        try benchPut(&kv);
-        const elapsed_ns: u64 = @intCast(stdx.time.nanoTimestamp() - start);
-        const ops = @as(u64, BENCH_ITERS) * 1_000_000_000 / elapsed_ns;
-        std.debug.print("  KV Put:       {d:>12} ops/sec  ({d} ns/op, {d} keys)\n", .{
-            ops, elapsed_ns / BENCH_ITERS, BENCH_ITERS,
-        });
+    var names: [100][]const u8 = undefined;
+    start = stdx.time.nanoTimestamp();
+    for (0..10_000) |_| found += st.scanKeyNames("default", "", &names);
+    std.mem.doNotOptimizeAway(found);
+    report("KV Scan:", 10_000, start, ", batch=100");
 
-        // ── Get Benchmark (keys are hot) ──
-        {
-            const gstart = stdx.time.nanoTimestamp();
-            benchGet(&kv);
-            const gel: u64 = @intCast(stdx.time.nanoTimestamp() - gstart);
-            const gops = @as(u64, BENCH_ITERS) * 1_000_000_000 / gel;
-            std.debug.print("  KV Get:       {d:>12} ops/sec  ({d} ns/op)\n", .{
-                gops, gel / BENCH_ITERS,
-            });
-        }
+    start = stdx.time.nanoTimestamp();
+    for (0..10_000) |_| found += st.scanKeyNames("default", "bench-key-0000", &names);
+    std.mem.doNotOptimizeAway(found);
+    report("KV ScanPfx:", 10_000, start, ", prefix=14B");
 
-        // ── Scan Benchmark (full table scan) ──
-        {
-            const scan_iters: usize = 10_000;
-            const sstart = stdx.time.nanoTimestamp();
-            benchScan(&kv, scan_iters);
-            const sel: u64 = @intCast(stdx.time.nanoTimestamp() - sstart);
-            const sops = @as(u64, scan_iters) * 1_000_000_000 / sel;
-            std.debug.print("  KV Scan:      {d:>12} ops/sec  ({d} ns/op, batch=100)\n", .{
-                sops, sel / scan_iters,
-            });
-        }
-
-        // ── ScanPrefix Benchmark ──
-        {
-            const prefix_iters: usize = 10_000;
-            const pstart = stdx.time.nanoTimestamp();
-            benchScanPrefix(&kv, prefix_iters);
-            const pel: u64 = @intCast(stdx.time.nanoTimestamp() - pstart);
-            const pops = @as(u64, prefix_iters) * 1_000_000_000 / pel;
-            std.debug.print("  KV ScanPfx:   {d:>12} ops/sec  ({d} ns/op, prefix=14B)\n", .{
-                pops, pel / prefix_iters,
-            });
-        }
-
-        // ── Delete Benchmark ──
-        {
-            const dstart = stdx.time.nanoTimestamp();
-            try benchDelete(&kv);
-            const del: u64 = @intCast(stdx.time.nanoTimestamp() - dstart);
-            const dops = @as(u64, BENCH_ITERS) * 1_000_000_000 / del;
-            std.debug.print("  KV Delete:    {d:>12} ops/sec  ({d} ns/op)\n", .{
-                dops, del / BENCH_ITERS,
-            });
-        }
+    var pbuf: [64]u8 = undefined;
+    start = stdx.time.nanoTimestamp();
+    for (0..BENCH_ITERS) |i| {
+        const p = try kv_entries.Delete.encodeInto(&pbuf, .{ .key = formatKey(&kbuf, i) });
+        _ = try kv.apply(&entry_mod.buildEntry(.kv_delete, 0, 1, kv.index + 1, 0, p));
     }
-
+    report("KV Delete:", BENCH_ITERS, start, "");
     std.debug.print("\n", .{});
 }

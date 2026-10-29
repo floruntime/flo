@@ -4,7 +4,9 @@
 
 const machine = @import("machine.zig");
 
-pub const list = [_]machine.Machine{};
+pub const list = [_]machine.Machine{
+    @import("../kv/machine.zig").machine,
+};
 
 comptime {
     machine.check(&list);
