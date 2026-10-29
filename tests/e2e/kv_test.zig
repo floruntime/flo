@@ -2247,7 +2247,7 @@ test "e2e/kv: txn rollback discards staged ops" {
     try expectNotFound(result);
 }
 
-test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes, and says which op" {
+test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes, and says which op (counting from 1)" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2268,7 +2268,7 @@ test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes,
     var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid_str });
     defer commit.deinit();
     try testing.expectEqual(@as(u8, 3), commit.exit_code);
-    try testing.expect(std.mem.indexOf(u8, commit.stderr, "the transaction's op 2:") != null);
+    try testing.expect(std.mem.indexOf(u8, commit.stderr, "the transaction's op 3:") != null);
     try testing.expect(std.mem.indexOf(u8, commit.stderr, "nothing in the transaction applied") != null);
     try testing.expect(std.mem.indexOf(u8, commit.stderr, "[bad_request/wrong_type]") != null);
 

@@ -8,7 +8,8 @@
 //! - **ConnectionPool**: active connections (fd → Connection)
 //! - **Router**: hash → partition → shard mapping
 //! - **SlabAllocator**: fixed-size slab pools for cross-shard payloads
-//! - **KVProjection + KVHandler**: in-memory KV storage and dispatch
+//! - **KvState + KVHandler**: KV's applied state (its contract machine's
+//!   families) and dispatch
 //!
 //! ## Lifecycle
 //!
@@ -2244,18 +2245,19 @@ pub const Shard = struct {
         }
     }
 
-    /// A workflow on another shard needs a run created here; its bytes are
-    /// ours to free.
     /// A processing KV sink on another shard wrote a key this shard owns.
     fn runKvSinkPut(self: *Shard, msg: InboxMessage) void {
         const bytes = inboxPayload(msg);
         defer if (bytes.len > 0) self.allocator.free(bytes);
-        const put = KVHandler.SinkPut.decode(bytes) orelse return;
+        const put = KVHandler.SinkPut.decode(bytes) orelse
+            return self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
         if (KVHandler.sinkPropose(self, put.namespace, put.qkey, put.value, put.ttl_ms)) |why| {
             self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.qkey, why);
         }
     }
 
+    /// A workflow on another shard needs a run created here; its bytes are
+    /// ours to free.
     fn startActionRun(self: *Shard, msg: InboxMessage) void {
         const ptr = msg.payload_ptr orelse return;
         const data: [*]u8 = @ptrCast(ptr);
@@ -3373,9 +3375,15 @@ pub const Shard = struct {
         var all = true;
         var it = kv.namespaces();
         while (it.next()) |n| {
-            const km = registry.registerKVNamespace(n.ns) catch {
-                all = false;
-                continue;
+            // Looked up once: a namespace's metrics never move.
+            const km: *KVMetrics = if (kv.publish_to.get(n.ns)) |p| @ptrCast(@alignCast(p)) else blk: {
+                const km = registry.registerKVNamespace(n.ns) catch {
+                    all = false;
+                    continue;
+                };
+                const name = kv.store.allocator.dupe(u8, n.ns) catch break :blk km;
+                kv.publish_to.put(kv.store.allocator, name, km) catch kv.store.allocator.free(name);
+                break :blk km;
             };
             km.publishCounts(self.id, n.counts.live, n.counts.bytes, n.counts.history_bytes, n.counts.history_evicted);
         }
@@ -6428,8 +6436,8 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 }
 
 /// The one apply path: the partition (hot ring plus the projections the
-/// router owns — KV, queue, TS) and then the registry appliers for every
-/// other entry type.
+/// router owns: queue and TS), then a contract machine for the types one
+/// owns (KV's), then the registry appliers for every other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").of(entry)) |f| {

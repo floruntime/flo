@@ -287,7 +287,7 @@ test "kv machine: a transaction whose incr or expire fails applies none of its w
         defer testing.allocator.free(b.payload);
         const r = try kv.apply(&b.entry);
         const refusal = r.refused().?.refusal;
-        try testing.expect(std.mem.indexOf(u8, refusal.message, "op 2") != null);
+        try testing.expect(std.mem.indexOf(u8, refusal.message, "op 3:") != null);
         try testing.expect(std.mem.indexOf(u8, refusal.message, "nothing in the transaction applied") != null);
         try testing.expect(kv.state().get("a") == null);
         try testing.expectEqualStrings("not a counter", kv.state().get("text").?.value);
@@ -402,4 +402,87 @@ test "kv machine: keys of one namespace never reach another's, and the default n
     try testing.expectEqual(@as(usize, 1), st.scanKeyNames("a", "", &names));
     try testing.expectEqualStrings("k", names[0]);
     try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", &names));
+}
+
+test "kv machine: a key with no namespace halts its entry, a put's or a transaction's, before anything changes" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    try kv.put("k", "v", 0);
+    const store_mod = @import("../contract/store.zig");
+    const before = store_mod.checksum(&kv.store, machine.Values.ID);
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Halt, kv.apply(&putEntry(&buf, "\x00k", "v", 2, 0, 0)));
+    const b = try batchEntry(&.{
+        .{ .kind = .put, .key = @constCast("a"), .value = @constCast("1"), .ttl_ms = 0 },
+        .{ .kind = .delete, .key = @constCast("\x00k"), .value = @constCast(""), .ttl_ms = 0 },
+    }, 3, 0);
+    defer testing.allocator.free(b.payload);
+    try testing.expectError(error.Halt, kv.apply(&b.entry));
+    try testing.expectEqual(before, store_mod.checksum(&kv.store, machine.Values.ID));
+    try testing.expectEqual(@as(u64, 0), kv.store.undeclared_keys);
+}
+
+/// A namespace's live keys, stored bytes and history charge, counted from
+/// the families themselves.
+fn recount(kv: *TestKv, ns: []const u8) machine.Counts {
+    const view_mod = @import("../contract/view.zig");
+    const read: view_mod.ReadView = .{ .store = &kv.store };
+    var pb: [machine.MAX_KEY]u8 = undefined;
+    const prefix = view_mod.key(&pb, ns, "") catch unreachable;
+    var c: machine.Counts = .{};
+    var values = read.range(machine.Values, prefix);
+    while (values.next() catch unreachable) |item| {
+        const key = item.key[prefix.len..];
+        // As the key was written: bare in the default namespace.
+        const qlen = if (std.mem.eql(u8, ns, "default")) key.len else ns.len + 1 + key.len;
+        c.live += @intFromBool(!item.value.tombstone);
+        c.bytes += qlen + item.value.value.len;
+    }
+    var history = read.range(machine.History, prefix);
+    while (history.next() catch unreachable) |item| c.history_bytes += item.value.charge();
+    return c;
+}
+
+test "kv machine: random entries keep every namespace's counts equal to a recount of its keys" {
+    var prng = std.Random.DefaultPrng.init(0xC0_47);
+    const rand = prng.random();
+    const namespaces = [_][]const u8{ "default", "a", "bb" };
+    for (0..8) |_| {
+        var kv = TestKv.init(testing.allocator);
+        defer kv.deinit();
+        var big: [20_000]u8 = undefined;
+        @memset(&big, 'v');
+        for (0..300) |_| {
+            var kb: [32]u8 = undefined;
+            const ns = namespaces[rand.uintLessThan(usize, namespaces.len)];
+            const name = std.fmt.bufPrint(kb[16..], "k{d}", .{rand.uintLessThan(u8, 6)}) catch unreachable;
+            const qkey = if (std.mem.eql(u8, ns, "default")) name else std.fmt.bufPrint(&kb, "{s}\x00{s}", .{ ns, name }) catch unreachable;
+            const stamp = STAMP + @as(u64, rand.uintLessThan(u32, 4)) * std.time.ns_per_s;
+            const buf = try testing.allocator.alloc(u8, 24_000);
+            defer testing.allocator.free(buf);
+            var delta: [8]u8 = undefined;
+            std.mem.writeInt(i64, &delta, rand.intRangeAtMost(i64, -3, 3), .little);
+            switch (rand.uintLessThan(u8, 6)) {
+                0, 1 => _ = try kv.apply(&putEntry(buf, qkey, big[0..rand.uintLessThan(usize, big.len)], kv.index + 1, stamp, if (rand.boolean()) 0 else 1_500)),
+                2 => _ = try kv.apply(&testEntry(buf, .kv_delete, .{ .key = qkey }, kv.index + 1, stamp)),
+                3 => _ = try kv.apply(&testEntry(buf, .kv_incr, .{ .key = qkey, .delta = std.mem.readInt(i64, &delta, .little) }, kv.index + 1, stamp)),
+                4 => _ = try kv.apply(&testEntry(buf, .kv_expire, .{ .key = qkey, .ttl_ms = rand.uintLessThan(u32, 3_000) }, kv.index + 1, stamp)),
+                else => {
+                    const b = try batchEntry(&.{
+                        .{ .kind = .put, .key = @constCast(qkey), .value = big[0..rand.uintLessThan(usize, 4_000)], .ttl_ms = 0 },
+                        .{ .kind = .incr, .key = @constCast(qkey), .value = &delta, .ttl_ms = 0 },
+                    }, kv.index + 1, stamp);
+                    defer testing.allocator.free(b.payload);
+                    _ = try kv.apply(&b.entry);
+                },
+            }
+            for (namespaces) |n| {
+                const kept = kv.state().countsOf(n);
+                const counted = recount(&kv, n);
+                try testing.expectEqual(counted.live, kept.live);
+                try testing.expectEqual(counted.bytes, kept.bytes);
+                try testing.expectEqual(counted.history_bytes, kept.history_bytes);
+            }
+        }
+    }
 }

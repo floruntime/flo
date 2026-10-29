@@ -121,7 +121,7 @@ Projections are deterministic state machines that consume UAL entries and mainta
 
 | Projection | Data Structure | Purpose |
 |-----------|---------------|---------|
-| **KVProjection** | Hash table + MVCC version chain | Key-value lookups with versioning |
+| **KV machine** (`kv/machine.zig`) | Families in ordered maps: values, version history, per-namespace counts | Key-value lookups with versioning; applied through a contract `View` |
 | **QueueProjection** | Priority heaps + lease tracker + DLQ | Ordered delivery with leases |
 | **StreamProjection** | Offset index + consumer group state | Append-only reads with groups |
 | **TSProjection** | Columnar write buffers + block index | Time-series aggregation queries |

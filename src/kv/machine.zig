@@ -164,6 +164,15 @@ pub const Counts = struct {
     }
 };
 
+// Each KV entry's code is its UAL type's: `kv.put` is `kv_put`, so a
+// renumbering on either side fails the build instead of mis-decoding.
+comptime {
+    for (kv_entries.table) |e| {
+        const tag = "kv_" ++ e.name["kv.".len..];
+        if (@backingInt(@field(entry_mod.EntryType, tag)) != e.type_code) @compileError("KV entry '" ++ e.name ++ "' has code " ++ std.fmt.comptimePrint("{d}", .{e.type_code}) ++ ", but " ++ tag ++ " is another");
+    }
+}
+
 pub const Values = view_mod.Family(10, "kv.value", Current);
 pub const History = view_mod.Family(11, "kv.history", Version);
 pub const NsCounts = view_mod.Family(12, "kv.ns_counts", Counts);
@@ -228,7 +237,7 @@ fn declare(out: *KeySet, qkey: []const u8) error{OutOfMemory}!void {
     try out.add(Values.ID, q.ns, q.key);
     out.addRange(History.ID, q.ns, frame(&framed, q.key)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // An entry with no namespace touches nothing: apply halts on it.
+        // A key with no namespace: apply halts on it before touching anything.
         error.NoNamespace => {},
     };
     try out.add(NsCounts.ID, q.ns, "");
@@ -266,6 +275,14 @@ const Stamp = struct {
     }
 };
 
+/// `qkey` split, or a halt for a key with no namespace (`\x00key`): no
+/// handler writes one, and its keys couldn't be declared.
+fn split(qkey: []const u8) ApplyError!Qualified {
+    const q = Qualified.of(qkey);
+    if (q.ns.len == 0) return error.Halt;
+    return q;
+}
+
 /// Answers: put, the key's version; delete, whether the key was there
 /// (u8); incr, its version and value; expire, nothing; batch, its op
 /// count (u16). A payload that won't decode is a bug in the proposer, and
@@ -278,22 +295,22 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type)))) {
         .kv_put => {
             const p = kv_entries.Put.decodeAll(e.payload, &diag) catch return error.Halt;
-            const version = try put(view, Qualified.of(p.key), p.value, .string, at, time_units.expiryAfter(at.ns, p.ttl_ms orelse 0));
+            const version = try put(view, try split(p.key), p.value, .string, at, time_units.expiryAfter(at.ns, p.ttl_ms orelse 0));
             out.putInt(u64, version);
         },
         .kv_delete => {
             const p = kv_entries.Delete.decodeAll(e.payload, &diag) catch return error.Halt;
-            out.putInt(u8, @intFromBool(try delete(view, Qualified.of(p.key), at)));
+            out.putInt(u8, @intFromBool(try delete(view, try split(p.key), at)));
         },
         .kv_incr => {
             const p = kv_entries.Incr.decodeAll(e.payload, &diag) catch return error.Halt;
-            const r = incr(view, Qualified.of(p.key), p.delta, at) catch |err| return refused(out, err, "");
+            const r = incr(view, try split(p.key), p.delta, at) catch |err| return refused(out, err, "");
             out.putInt(u64, r.version);
             out.putInt(i64, r.value);
         },
         .kv_expire => {
             const p = kv_entries.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
-            expire(view, Qualified.of(p.key), time_units.expiryAfter(at.ns, p.ttl_ms), at) catch |err| return refused(out, err, "");
+            expire(view, try split(p.key), time_units.expiryAfter(at.ns, p.ttl_ms), at) catch |err| return refused(out, err, "");
         },
         .kv_batch => {
             // Decoded and checked whole before any op applies.
@@ -302,22 +319,23 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var ops: u16 = 0;
             while (check.next() catch return error.Halt) |op| {
                 if (kv_entries.batchOpRule(op) != null) return error.Halt;
+                _ = try split(op.key);
                 ops += 1;
             }
             var it = batch.ops.iterator();
             var n: u16 = 0;
             while (it.next() catch return error.Halt) |op| : (n += 1) {
-                const q = Qualified.of(op.key);
+                const q = try split(op.key);
                 switch (op.kind) {
                     .put => _ = try put(view, q, op.value.?, .string, at, time_units.expiryAfter(at.ns, op.ttl_ms orelse 0)),
                     .delete => _ = try delete(view, q, at),
                     .incr => _ = incr(view, q, op.delta.?, at) catch |err| {
                         var buf: [48]u8 = undefined;
-                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n}) catch "");
+                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n + 1}) catch "");
                     },
                     .expire => expire(view, q, time_units.expiryAfter(at.ns, op.ttl_ms.?), at) catch |err| {
                         var buf: [48]u8 = undefined;
-                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n}) catch "");
+                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n + 1}) catch "");
                     },
                 }
             }
