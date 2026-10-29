@@ -131,3 +131,62 @@ test "e2e/salvage: a shard offline on a segment that won't read comes up with th
     try ctx.exec(&.{ "kv", "set", "after", "taken" });
     try testing.expectEqualStrings("taken", try ctx.execCapture(&.{ "kv", "get", "after" }));
 }
+
+test "e2e/salvage: a cut that drops a repair of an entry it keeps is refused unless told to undo it" {
+    const test_faults = @import("src").node.test_faults;
+    if (!test_faults.enabled) return error.SkipZigTest;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    {
+        var r = try ctx.execResult(&.{ "kv", "set", test_faults.HALT_KEY, "x" });
+        defer r.deinit();
+    }
+    var state_buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("halted", try shardState(ctx.server.metrics_port, &state_buf));
+    const halt_index = blk: {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", ctx.server.metrics_port);
+        defer http.deinit();
+        var resp = try http.get("/status");
+        defer resp.deinit();
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+        defer parsed.deinit();
+        break :blk parsed.value.object.get("shards").?.array.items[0].object.get("halt_index").?.integer;
+    };
+    ctx.server.stop();
+    var index_buf: [24]u8 = undefined;
+    const index = try std.fmt.bufPrint(&index_buf, "{d}", .{halt_index});
+    {
+        const offline = try CliRunner.init(testing.allocator, ctx.server.flo_binary, "127.0.0.1:1");
+        defer offline.deinit();
+        var done = try offline.runRaw(&.{ "server", "repair", "skip", "--config", ctx.server.config_file, "--data-dir", ctx.server.getDataDir(), "--shard", "0", "--index", index, "--yes" });
+        defer done.deinit();
+        try testing.expect(done.stdoutContains("is skipped"));
+    }
+    try ctx.restartServer();
+    try ctx.exec(&.{ "kv", "set", "after", "taken" });
+    ctx.server.stop();
+
+    // Kept: the halting entry. Dropped: the repair, and the write after it.
+    {
+        var refused = try salvage(ctx, index, true);
+        defer refused.deinit();
+        try testing.expect(refused.exit_code != 0);
+        try testing.expect(refused.stdoutContains("drops the repair at entry"));
+        try testing.expect(refused.contains("--undo-repairs"));
+    }
+    try ctx.restartServer();
+    try testing.expectEqualStrings("ok", try shardState(ctx.server.metrics_port, &state_buf));
+    ctx.server.stop();
+    {
+        const offline = try CliRunner.init(testing.allocator, ctx.server.flo_binary, "127.0.0.1:1");
+        defer offline.deinit();
+        var done = try offline.runRaw(&.{ "server", "salvage", "--config", ctx.server.config_file, "--data-dir", ctx.server.getDataDir(), "--shard", "0", "--truncate-after", index, "--undo-repairs", "--yes" });
+        defer done.deinit();
+        try testing.expectEqual(@as(u8, 0), done.exit_code);
+    }
+    // The repair is gone, so the entry halts the shard again.
+    try ctx.restartServer();
+    try testing.expectEqualStrings("halted", try shardState(ctx.server.metrics_port, &state_buf));
+}

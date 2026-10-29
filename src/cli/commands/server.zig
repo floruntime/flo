@@ -207,6 +207,10 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\drops is gone for good, committed writes included: their clients were
                     \\told they succeeded.
                     \\
+                    \\A repair after the cut that skips an entry before it would be dropped
+                    \\too, and that entry would run again: salvage refuses, unless
+                    \\--undo-repairs says to.
+                    \\
                     \\Without --yes it prints what it would drop, and the highest entry it can
                     \\keep (the last before the damage), and stops.
                 )
@@ -218,6 +222,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("data-dir", 'd', "", "Data directory (overrides the config)")
                 .uintFlag("shard", 0, 0, "The damaged shard")
                 .uintFlag("truncate-after", 0, 0, "The last entry to keep")
+                .boolFlag("undo-repairs", 0, "Cut even where it drops a repair that skips an entry it keeps")
                 .boolFlag("yes", 0, "Drop the entries")
                 .action(wrapHandler(runSalvage)),
         )
@@ -884,6 +889,13 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
             outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
         error.NothingToCut => outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
     };
+    var undone_buf: [offline.Readable.MAX_SKIPS]offline.Readable.SkipAt = undefined;
+    const undone = undone_buf[0..r.undone(after, &undone_buf)];
+    for (undone) |sk| ctx.print("repair:      the cut drops the repair at entry {d}, which skips entry {d}: entry {d} applies again at the next start, or the shard halts on it\n", .{ sk.at, sk.skipped, sk.skipped });
+    if (r.skips_unknown) ctx.print("repair:      past the damage, a repair may be dropped that this can't read; the entry it skips would apply again\n", .{});
+    if (undone.len > 0 and !ctx.getBool("undo-repairs")) {
+        return outcome.localRefusal(ctx, "the cut would undo {d} repair(s) (above); run again with --undo-repairs to cut anyway, or keep more with a higher --truncate-after", .{undone.len});
+    }
     const lost = offline.lostAfter(&r, after);
     const more = if (lost.at_least) "at least " else "";
     ctx.print("\nWARNING: this drops {s}{d} entries after entry {d} from shard {d}, {s}{d} of them committed as last flushed.\n", .{ more, lost.entries, after, shard, more, lost.committed });

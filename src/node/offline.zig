@@ -241,6 +241,29 @@ pub const Readable = struct {
     pending_cut: ?u64 = null,
     /// The member list's size, from the latest config the walk read.
     member_count: usize = 0,
+    /// The repair skips the walk read, as far as there is room.
+    skips: [MAX_SKIPS]SkipAt = undefined,
+    skip_count: usize = 0,
+    /// Skips the walk didn't read or keep: past the room above, in a
+    /// header that won't read, or past the damage in a file whose header
+    /// says it holds one.
+    skips_unknown: bool = false,
+
+    pub const MAX_SKIPS = 64;
+    /// A skip at index `at` of the entry at `skipped`.
+    pub const SkipAt = struct { at: u64, skipped: u64 };
+
+    /// The skips a cut after `after` drops while keeping the entry they
+    /// skip: that entry applies again at the next boot, or halts the shard.
+    pub fn undone(self: *const Readable, after: u64, out: []SkipAt) usize {
+        var n: usize = 0;
+        for (self.skips[0..self.skip_count]) |sk| {
+            if (sk.at <= after or sk.skipped > after or n == out.len) continue;
+            out[n] = sk;
+            n += 1;
+        }
+        return n;
+    }
 
     pub fn damage(self: *const Readable) ?[]const u8 {
         return if (self.damage_len == 0) null else self.damage_buf[0..self.damage_len];
@@ -326,6 +349,12 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
                 r.stop("segment {s} holds entry {d} where {d} was next", .{ name, e.header.index, next });
                 break :walk;
             }
+            if (etype == .repair_skip) if (repair.Skip.decode(&e)) |sk| {
+                if (r.skip_count < Readable.MAX_SKIPS) {
+                    r.skips[r.skip_count] = .{ .at = next, .skipped = sk.index };
+                    r.skip_count += 1;
+                } else r.skips_unknown = true;
+            };
             if (etype == .raft_config) if (membership.decode(e.payload)) |cfg| {
                 var ids: [membership.MAX_MEMBERS]u32 = undefined;
                 r.member_count = cfg.ids(&ids).len;
@@ -336,6 +365,10 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
         }
     }
     if (r.damage_len == 0 and r.unreadable_headers > 0) r.stop("{d} segment(s) have a header that will not read", .{r.unreadable_headers});
+    if (r.unreadable_headers > 0) r.skips_unknown = true;
+    for (files) |f| if (f.holds_skip and f.last_index > r.through) {
+        r.skips_unknown = true;
+    };
     return r;
 }
 
@@ -660,4 +693,32 @@ test "offline: salvage keeps a lower pending cut and refuses one above it" {
     const after = try summarizeDir(testing.allocator, dir);
     try testing.expectEqual(@as(u64, 3), after.last_index);
     try testing.expect(!after.truncation_pending);
+}
+
+test "offline: salvage names a repair the cut drops whose skipped entry it keeps" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    var es = kvEntries(1, 4);
+    var p: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+    // Entry 4 skips entry 2.
+    es[3] = entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 1, 4, 40, repair.Skip.of(&es[1], "test").encode(&p));
+    es[3].header.crc32c = es[3].computeCrc();
+    try writeLog(dir, &es, 4);
+    try writeLog(dir, &kvEntries(5, 2), 6);
+
+    const r = try readable(testing.allocator, dir);
+    try testing.expect(!r.skips_unknown);
+    var out: [Readable.MAX_SKIPS]Readable.SkipAt = undefined;
+    const undone = out[0..r.undone(3, &out)];
+    try testing.expectEqual(@as(usize, 1), undone.len);
+    try testing.expectEqual(Readable.SkipAt{ .at = 4, .skipped = 2 }, undone[0]);
+    // Kept with it, or dropped with it: nothing undone.
+    try testing.expectEqual(@as(usize, 0), r.undone(4, &out));
+    try testing.expectEqual(@as(usize, 0), r.undone(1, &out));
+
+    // Past the damage, a skip in a file whose header says so is unknown.
+    try damageSegment(dir, 1, @import("../storage/ual/segment.zig").HEADER_SIZE + 2);
+    try testing.expect((try readable(testing.allocator, dir)).skips_unknown);
 }
