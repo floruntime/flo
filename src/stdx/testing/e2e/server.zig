@@ -870,13 +870,29 @@ pub const ServerProcess = struct {
 };
 
 /// Find a free TCP port by binding to port 0
+/// Ports this process has handed out. A picked port is closed before the
+/// server binds it, so without this a later pick (another node's client or
+/// raft port) could be handed the same one and the second bind would fail.
+var handed_out: [1 << 16]bool = @splat(false);
+var handed_out_lock: @import("../../sync.zig").Mutex = .{};
+
 fn findFreePort() !u16 {
+    handed_out_lock.lock();
+    defer handed_out_lock.unlock();
+    for (0..64) |_| {
+        const port = try pickPort();
+        if (handed_out[port]) continue;
+        handed_out[port] = true;
+        return port;
+    }
+    return error.NoFreePort;
+}
+
+fn pickPort() !u16 {
     const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
     if (sock < 0) return error.SocketFailed;
     defer _ = std.c.close(sock);
 
-    // Allow reuse of TIME_WAIT ports — critical when running hundreds of tests
-    // back-to-back, each spawning/stopping server processes
     var on: c_int = 1;
     _ = std.c.setsockopt(sock, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int));
 

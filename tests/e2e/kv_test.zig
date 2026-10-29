@@ -850,18 +850,11 @@ test "e2e/kv/cluster: write on node1 readable from node2 and node3" {
     // Write on node 1
     try cluster.execOn(0, &.{ "kv", "set", "cluster_key_1", "value_from_node1" });
 
-    // Small delay for replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
-
-    // Read from node 2
-    const value2 = try cluster.execCaptureOn(1, &.{ "kv", "get", "cluster_key_1" });
+    // Each follower has it once replication reaches it.
+    const value2 = try cluster.pollUntilContains(1, &.{ "kv", "get", "cluster_key_1" }, "value_from_node1", 40, 100);
     defer testing.allocator.free(value2);
-    try testing.expect(std.mem.indexOf(u8, value2, "value_from_node1") != null);
-
-    // Read from node 3
-    const value3 = try cluster.execCaptureOn(2, &.{ "kv", "get", "cluster_key_1" });
+    const value3 = try cluster.pollUntilContains(2, &.{ "kv", "get", "cluster_key_1" }, "value_from_node1", 40, 100);
     defer testing.allocator.free(value3);
-    try testing.expect(std.mem.indexOf(u8, value3, "value_from_node1") != null);
 }
 
 test "e2e/kv/cluster: data available after node1 dies" {
@@ -871,31 +864,16 @@ test "e2e/kv/cluster: data available after node1 dies" {
     // Write on node 0
     try cluster.execOn(0, &.{ "kv", "set", "survive_key", "must_survive" });
 
-    // Small delay for replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    // Replicated to both followers before node 0 goes.
+    for (1..3) |node| testing.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", "survive_key" }, "must_survive", 40, 100));
 
-    // Verify replication before killing
-    const before_value = try cluster.execCaptureOn(1, &.{ "kv", "get", "survive_key" });
-    defer testing.allocator.free(before_value);
-
-    // Kill node 0
     cluster.stopNode(0);
 
-    // Small delay for signal propagation
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
-
-    // Give cluster time to detect failure and re-elect leader
-    @import("stdx").time.sleep(2 * std.time.ns_per_s);
-
-    // Data should still be readable from node 2
-    const value2 = try cluster.execCaptureOn(1, &.{ "kv", "get", "survive_key" });
+    // Both survivors still serve it once they have a leader again.
+    const value2 = try cluster.pollUntilContains(1, &.{ "kv", "get", "survive_key" }, "must_survive", 40, 250);
     defer testing.allocator.free(value2);
-    try testing.expect(std.mem.indexOf(u8, value2, "must_survive") != null);
-
-    // Data should still be readable from node 3
-    const value3 = try cluster.execCaptureOn(2, &.{ "kv", "get", "survive_key" });
+    const value3 = try cluster.pollUntilContains(2, &.{ "kv", "get", "survive_key" }, "must_survive", 40, 250);
     defer testing.allocator.free(value3);
-    try testing.expect(std.mem.indexOf(u8, value3, "must_survive") != null);
 }
 
 test "e2e/kv/cluster: writes continue after leader failure" {
@@ -913,9 +891,7 @@ test "e2e/kv/cluster: writes continue after leader failure" {
     // Initial write on node 1
     try cluster.execOn(0, &.{ "kv", "set", "before_failure", "initial_value" });
     std.debug.print("Write to node 0 succeeded\n", .{});
-
-    // Small delay for replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    testing.allocator.free(try cluster.pollUntilContains(1, &.{ "kv", "get", "before_failure" }, "initial_value", 40, 100));
 
     // Kill node 1 (seed/original leader)
     const kill_time = stdx.time.milliTimestamp();
@@ -1902,9 +1878,8 @@ test "e2e/kv/cluster: mget after replication" {
     try cluster.execOn(0, &.{ "kv", "set", "cmg_a", "cluster_alpha" });
     try cluster.execOn(0, &.{ "kv", "set", "cmg_b", "cluster_beta" });
     try cluster.execOn(0, &.{ "kv", "set", "cmg_c", "cluster_gamma" });
-
-    // Allow replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    // The last write replicated means the earlier ones are too.
+    for (1..3) |node| testing.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", "cmg_c" }, "cluster_gamma", 40, 100));
 
     // MGET from node 1 — keys were written on node 0
     const result1 = try cluster.execCaptureOnWithRetry(1, &.{
@@ -1935,9 +1910,8 @@ test "e2e/kv/cluster: mget reads from all nodes" {
     try cluster.execOn(0, &.{ "kv", "set", "cmg_n0", "from_node0" });
     try cluster.execOn(1, &.{ "kv", "set", "cmg_n1", "from_node1" });
     try cluster.execOn(2, &.{ "kv", "set", "cmg_n2", "from_node2" });
-
-    // Allow replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    // The last write replicated means the earlier ones are too.
+    for (0..3) |node| testing.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", "cmg_n2" }, "from_node2", 40, 100));
 
     // MGET all three keys from each node
     for (0..3) |node| {
@@ -1959,9 +1933,7 @@ test "e2e/kv/cluster: mget with partial hits across cluster" {
     // Only set 2 of 4 keys
     try cluster.execOn(0, &.{ "kv", "set", "cmg_hit_a", "found_a" });
     try cluster.execOn(1, &.{ "kv", "set", "cmg_hit_b", "found_b" });
-
-    // Allow replication
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    testing.allocator.free(try cluster.pollUntilContains(2, &.{ "kv", "get", "cmg_hit_b" }, "found_b", 40, 100));
 
     // MGET 4 keys (2 exist, 2 missing) from node 2
     const result = try cluster.execCaptureOnWithRetry(2, &.{
@@ -1984,19 +1956,14 @@ test "e2e/kv/cluster: mget after node failure" {
     try cluster.execOn(0, &.{ "kv", "set", "cmg_survive_a", "survives_a" });
     try cluster.execOn(0, &.{ "kv", "set", "cmg_survive_b", "survives_b" });
 
-    // Allow replication to all 3 nodes
-    @import("stdx").time.sleep(500 * std.time.ns_per_ms);
+    for (1..3) |node| testing.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", "cmg_survive_b" }, "survives_b", 40, 100));
 
-    // Kill node 0
     cluster.stopNode(0);
 
-    // Allow re-election
-    @import("stdx").time.sleep(3 * std.time.ns_per_s);
-
-    // MGET from surviving node — data should be available
-    const result = try cluster.execCaptureOnWithRetry(1, &.{
+    // A survivor serves both once it has a leader again.
+    const result = try cluster.pollUntilContains(1, &.{
         "kv", "mget", "cmg_survive_a", "cmg_survive_b", "--output", "json",
-    }, 5, 1000);
+    }, "survives_b", 40, 250);
     defer testing.allocator.free(result);
 
     try testing.expect(std.mem.indexOf(u8, result, "survives_a") != null);
