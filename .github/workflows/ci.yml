@@ -321,6 +321,11 @@ jobs:
         # main roots every allocation in libc's allocator outside Debug; a
         # toolchain bump must not quietly swap in Zig's slower default.
         run: ./zig-out/bin/flo version --verbose | tee /dev/stderr | grep -qF 'alloc=libc'
+      - name: The binary says it carries no test faults
+        run: |
+          if ./zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
+            echo "::error::a build without -Dtest-faults says it carries them"; exit 1
+          fi
       - name: Swarm
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
         timeout-minutes: 20

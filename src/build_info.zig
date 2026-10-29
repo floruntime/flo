@@ -21,5 +21,15 @@ pub fn deinit() void {
     if (builtin.mode == .debug) _ = safe_allocator.deinit();
 }
 
-/// e.g. "zig 0.17.0, safe, alloc=libc"
-pub const line = std.fmt.comptimePrint("zig {s}, {t}, alloc={s}", .{ builtin.zig_version_string, builtin.mode, allocator_name });
+/// Whether the faults e2e tests drive are compiled in (`-Dtest-faults`).
+/// The line says so, so a test can refuse a build without them, and a
+/// release check can refuse one with them.
+pub const test_faults = @import("build_options").test_faults;
+
+/// e.g. "zig 0.17.0, safe, alloc=libc", with ", test-faults" when they
+/// are compiled in.
+pub const line = std.fmt.comptimePrint("zig {s}, {t}, alloc={s}{s}", .{ builtin.zig_version_string, builtin.mode, allocator_name, if (test_faults) ", test-faults" else "" });
+
+test "build_info: the line names the test faults exactly when they are compiled in" {
+    try std.testing.expectEqual(test_faults, std.mem.endsWith(u8, line, ", test-faults"));
+}

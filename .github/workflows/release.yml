@@ -113,6 +113,9 @@ jobs:
           if grep -qa 'flo-test-fault-' zig-out/bin/flo; then
             echo "::error::the release binary carries the test faults"; exit 1
           fi
+          if zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
+            echo "::error::the release binary says it carries the test faults"; exit 1
+          fi
 
       - name: Package
         env:
