@@ -20,6 +20,8 @@ pub const OpState = workload.OpState;
 pub const network = @import("network.zig");
 pub const SimNetwork = network.SimNetwork;
 
+pub const families = @import("families.zig");
+
 pub const simulator = @import("simulator.zig");
 pub const Simulator = simulator.Simulator;
 pub const Summary = simulator.Summary;
@@ -29,5 +31,6 @@ test {
     _ = scenario;
     _ = workload;
     _ = network;
+    _ = families;
     _ = simulator;
 }
