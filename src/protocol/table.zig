@@ -9,6 +9,9 @@ const kv_ops = @import("kv_ops.zig");
 const action_ops = @import("action_ops.zig");
 const worker_ops = @import("worker_ops.zig");
 const kv_entries = @import("kv_entries.zig");
+const golden = @import("golden.zig");
+const proto = @import("proto.zig");
+const EntryType = @import("../storage/ual/entry.zig").EntryType;
 
 pub const op_table = kv_ops.table ++ action_ops.table ++ worker_ops.table;
 /// The groups the table's ops form under their families.
@@ -27,26 +30,39 @@ pub fn isOp(code: u16) bool {
     return false;
 }
 
+/// Whether table op `code` administers the node.
+pub fn isAdmin(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return op.class == .admin;
+    return false;
+}
+
 /// Whether table op `code` may create its namespace.
 pub fn creates(code: u16) bool {
     inline for (op_table) |op| if (op.code == code) return op.creates;
     return false;
 }
 
-/// Bump this in any change to a request, answer or log-entry layout that is
-/// still coded by hand rather than declared in the tables above: the table
-/// hash can't see those layouts, so without a bump a client or node built
-/// before the change would be misread instead of refused. It goes once every
-/// layout is declared in a table.
-pub const HAND_LAYOUT_EPOCH: u32 = 5;
+/// Bump this in any change to a layout still coded by hand with no golden
+/// vector (`golden.NO_VECTOR_YET`): the hash can't see those, so without a
+/// bump a client or node built before the change would be misread instead
+/// of refused. The op codes, entry types, status codes and refusal reasons
+/// are hashed by name and value, and the golden vectors by their bytes, so
+/// adding one of those or changing a vectored layout needs no bump. It goes
+/// once that list is empty.
+pub const HAND_LAYOUT_EPOCH: u32 = 6;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);
 
 fn hash(comptime op_list: []const ops.Op, comptime entry_list: []const entries.Entry, comptime epoch: u32) u64 {
     comptime {
+        @setEvalBranchQuota(1_000_000);
         const tables = ops.tableHash(op_list, entry_list);
         var h = std.hash.Wyhash.init(tables);
         h.update(std.mem.asBytes(&epoch));
+        ops.hashEnum(&h, proto.OpCode);
+        ops.hashEnum(&h, EntryType);
+        ops.hashEnum(&h, proto.StatusCode);
+        golden.hash(&h);
         return h.final();
     }
 }

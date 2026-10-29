@@ -29,9 +29,16 @@ const connection = @import("connection.zig");
 // Acceptor
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Set on an fd handed to a shard when it came from the admin socket. Fds
+/// are small non-negative numbers, so the bit is free.
+pub const ADMIN_TAG: i32 = 1 << 30;
+
 pub const Acceptor = struct {
     /// Listen socket fd.
     listen_fd: i32,
+
+    /// The admin socket's listen fd, or -1 when there is none.
+    admin_fd: i32 = -1,
 
     /// Per-shard pipe write ends. Index = shard_id.
     shard_pipes: []i32,
@@ -141,6 +148,21 @@ pub const Acceptor = struct {
 
         self.accepted_total += 1;
         return target;
+    }
+
+    /// Accept one connection on the admin socket, if one is waiting, and
+    /// hand it to shard 0 tagged as an admin connection: admin ops act on
+    /// the node, and every node in a cluster runs one shard.
+    pub fn acceptAdmin(self: *Acceptor) !void {
+        if (self.admin_fd < 0) return;
+        const rc = std.c.accept(self.admin_fd, null, null);
+        if (rc < 0) return;
+        const fd: i32 = @intCast(rc);
+        errdefer _ = std.c.close(fd);
+        std.debug.assert(fd & ADMIN_TAG == 0);
+        @import("stdx").net.sysFcntlSetNonblocking(fd) catch {};
+        try self.handoff(fd | ADMIN_TAG, 0);
+        self.accepted_total += 1;
     }
 
     /// Peek at the first bytes using MSG_PEEK and determine the target shard.
@@ -266,11 +288,15 @@ pub const Acceptor = struct {
         self.running.store(false, .release);
     }
 
-    /// Close the listen socket.
+    /// Close the listen sockets.
     pub fn close(self: *Acceptor) void {
         if (self.listen_fd >= 0) {
             _ = std.c.close(self.listen_fd);
             self.listen_fd = -1;
+        }
+        if (self.admin_fd >= 0) {
+            _ = std.c.close(self.admin_fd);
+            self.admin_fd = -1;
         }
     }
 };

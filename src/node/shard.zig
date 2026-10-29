@@ -63,6 +63,8 @@ const node_router = @import("router.zig");
 const SlabAllocator = @import("slab.zig").SlabAllocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
+const cluster_wire = @import("../protocol/cluster_wire.zig");
+const acceptor_mod = @import("acceptor.zig");
 const KVProjection = @import("../projection/kv.zig").KVProjection;
 const KVEntry = @import("../projection/kv.zig").KVEntry;
 const KVMetrics = @import("../metrics/registry.zig").KVMetrics;
@@ -454,6 +456,11 @@ pub const Shard = struct {
     /// A halted shard looks for the skip naming its halt among committed
     /// entries from here on; each looks only at what committed since.
     skip_scan_from: u64 = 0,
+    /// A repair skip applied since the last seal. Its segment is sealed at
+    /// once, with the watermark at or past it, so boot collects it before
+    /// replay: left above the watermark, a later build that can apply the
+    /// skipped entry would apply it on boot, then meet the skip.
+    seal_skip: bool = false,
     /// The shard's own writes (checkpoints, acks, run steps) refused since
     /// the last line saying so, and when the next line may go out.
     halted_refusals: u64 = 0,
@@ -964,6 +971,7 @@ pub const Shard = struct {
         dispatcher.register(.cluster_members, dispatchClusterMembers);
         dispatcher.register(.cluster_promote, dispatchClusterPromote);
         dispatcher.register(.cluster_remove, dispatchClusterRemove);
+        dispatcher.register(.cluster_repair_skip, dispatchClusterRepairSkip);
 
         // Register ping handler
         dispatcher.register(.ping, handlePing);
@@ -1468,7 +1476,7 @@ pub const Shard = struct {
         }
 
         switch (origin) {
-            .client => self.route(conn, req, auth),
+            .client, .admin => self.route(conn, req, auth),
             .shard, .held => self.dispatchLocal(conn, req, auth),
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
@@ -1681,7 +1689,9 @@ pub const Shard = struct {
         // Membership changes are exempt: a halted group must still be able
         // to replace a dead node.
         const membership_op = req.header.op_code == @backingInt(proto.OpCode.cluster_promote) or req.header.op_code == @backingInt(proto.OpCode.cluster_remove);
-        if (self.halted != null and !status_op and !membership_op and requestWrites(req)) {
+        // And so is the repair that ends the halt.
+        const repair_op = req.header.op_code == @backingInt(proto.OpCode.cluster_repair_skip);
+        if (self.halted != null and !status_op and !membership_op and !repair_op and requestWrites(req)) {
             var buf: [400]u8 = undefined;
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .shard_halted, .ran = .no, .message = self.haltedMessage(&buf) });
             return;
@@ -1696,8 +1706,10 @@ pub const Shard = struct {
                 return;
             }
             // A replica serves reads and sends writers to the leader
-            // rather than carrying their writes.
-            if (!self.raft_node.timer_enabled and self.raft_node.self_named) return self.redirectToLeader(conn, req);
+            // rather than carrying their writes. A repair came over the
+            // admin socket, which the leader's client port would refuse,
+            // so it is carried like a voter's.
+            if (!self.raft_node.timer_enabled and self.raft_node.self_named and !repair_op) return self.redirectToLeader(conn, req);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -3713,9 +3725,12 @@ pub const Shard = struct {
                     self.last_entry_applied = applied;
                     self.answerPending(next_idx, e.header.term, applied, &self.last_result);
                     // Last: it reads the entry it names into the same buffer.
-                    if (isSkip(&e) and !self.checkSkip(&e)) {
-                        all_applied = false;
-                        break :drain;
+                    if (isSkip(&e)) {
+                        if (!self.checkSkip(&e)) {
+                            all_applied = false;
+                            break :drain;
+                        }
+                        self.seal_skip = true;
                     }
                 } else {
                     self.last_entry_applied = false;
@@ -3734,6 +3749,10 @@ pub const Shard = struct {
             // can commit it, so apply again until a flush commits nothing new.
             self.syncFlushIfNeeded();
             if (raft.last_applied >= @min(raft.commit_index, limit)) break;
+        }
+        if (self.seal_skip) {
+            self.seal_skip = false;
+            self.flushSegmentToDisk() catch |err| log.warn("shard {d}: could not seal the segment holding a repair skip: {s}; it seals with the next flush", .{ self.id, @errorName(err) });
         }
         if (self.wake_workers) {
             self.wake_workers = false;
@@ -4442,12 +4461,14 @@ pub const Shard = struct {
             const n = posix.read(self.acceptor_pipe_rd, &fd_buf) catch return;
             if (n != @sizeOf(i32)) return;
 
-            const client_fd: i32 = @as(*align(1) const i32, @ptrCast(&fd_buf)).*;
+            const tagged: i32 = @as(*align(1) const i32, @ptrCast(&fd_buf)).*;
+            const client_fd = tagged & ~acceptor_mod.ADMIN_TAG;
 
-            _ = self.addConnection(client_fd) catch {
+            const conn = self.addConnection(client_fd) catch {
                 _ = std.c.close(client_fd);
                 continue;
             };
+            conn.admin = tagged & acceptor_mod.ADMIN_TAG != 0;
 
             self.reactor.addSource(.{
                 .fd = client_fd,
@@ -4617,7 +4638,7 @@ pub const Shard = struct {
             const pending_before = conn.write_buf.readable();
             const forwards_before = conn.forwards_in_flight;
             var answered_deferred = false;
-            if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, .client);
+            if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, if (conn.admin) .admin else .client);
             // Parked here as a blocking read: one more toward its cap.
             if (held == null and conn.response_deferred and conn.forwards_in_flight == forwards_before and blockingWait(req) != null) conn.local_reads +|= 1;
             // Its wait is spent (counted into its deadline if it went to
@@ -5047,62 +5068,61 @@ pub const Shard = struct {
         const member_count: u32 = @intCast(@max(1, raft.memberIds(&ids).len));
         const leader_id: u32 = if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id;
 
-        var buf: [30]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], shard.cluster_node_id, .little);
-        std.mem.writeInt(u32, buf[4..8], leader_id, .little);
-        std.mem.writeInt(u64, buf[8..16], raft.current_term, .little);
-        buf[16] = state;
-        std.mem.writeInt(u32, buf[17..21], member_count, .little);
-        std.mem.writeInt(u64, buf[21..29], shard.replica.vouchedIndex(), .little);
-        buf[29] = @intFromBool(shard.replica.strangersWhileQuiet(nowMs()));
-
-        shard.sendOkResponse(conn, req.header.request_id, &buf);
+        var buf: [cluster_wire.Status.SIZE]u8 = undefined;
+        const status: cluster_wire.Status = .{
+            .node_id = shard.cluster_node_id,
+            .leader_id = leader_id,
+            .term = raft.current_term,
+            .state = state,
+            .member_count = member_count,
+            .vouched_index = shard.replica.vouchedIndex(),
+            .strangers_while_quiet = shard.replica.strangersWhileQuiet(nowMs()),
+        };
+        shard.sendOkResponse(conn, req.header.request_id, status.encode(&buf));
     }
 
-    /// `[leader:u32][commit:u64][members:u8]`, then per member
-    /// `[id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64]`,
-    /// then `[removed:u8]` and per removed id `[id:u32][when_ms:u64]`. Role
-    /// 0 voter, 1 replica, 2 joining (never caught up). Contact and match
-    /// are the leader's; elsewhere, and for the answering node, they are
-    /// all ones (unknown). The address is 0 where no link is up.
+    /// Each member's id, role, address, and, from the leader, its last
+    /// contact, match and halt (`cluster_wire.Members`). A node knows its
+    /// own halt; only the leader hears the others'.
     fn dispatchClusterMembers(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const raft = shard.raft_node;
         // A node running alone, or one not yet named, is a group of itself.
         const cfg = if (raft.latest_config.member_count > 0) raft.latest_config else membership.Config.ofVoters(&.{shard.cluster_node_id});
-        var buf: [13 + membership.MAX_MEMBERS * 23 + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id, .little);
-        std.mem.writeInt(u64, buf[4..12], raft.commit_index, .little);
-        buf[12] = cfg.member_count;
-        var off: usize = 13;
+        var rows: [membership.MAX_MEMBERS]cluster_wire.Member = undefined;
         const now = nowMs();
-        for (cfg.memberSlice()) |m| {
-            std.mem.writeInt(u32, buf[off..][0..4], m.id, .little);
-            buf[off + 4] = if (m.voter) 0 else if (m.caught_up) 1 else 2;
+        for (cfg.memberSlice(), 0..) |m, i| {
             const addr = if (shard.raft_network) |rn| rn.clientAddress(m.id) else null;
-            @memcpy(buf[off + 5 ..][0..4], &(if (addr) |a| a.ip4 else [4]u8{ 0, 0, 0, 0 }));
-            std.mem.writeInt(u16, buf[off + 9 ..][0..2], if (addr) |a| a.port else 0, .little);
-            var contact: u32 = std.math.maxInt(u32);
-            var match: u64 = std.math.maxInt(u64);
-            if (raft.role == .leader) {
+            var row: cluster_wire.Member = .{
+                .id = m.id,
+                .role = if (m.voter) 0 else if (m.caught_up) 1 else 2,
+                .ip4 = if (addr) |a| a.ip4 else .{ 0, 0, 0, 0 },
+                .port = if (addr) |a| a.port else 0,
+                .contact_ago_ms = cluster_wire.Member.UNKNOWN_CONTACT,
+                .match = cluster_wire.Member.UNKNOWN_MATCH,
+                .halt = .unknown,
+            };
+            if (m.id == shard.cluster_node_id) {
+                row.halt = if (raft.halt_at) |h| .{ .at = .{ .index = h.index, .term = h.term, .crc = h.crc } } else .none;
+            } else if (raft.role == .leader) {
                 if (raft.peerProgress(m.id)) |p| {
-                    contact = @intCast(@min(now -| @max(p.last_contact_ms, raft.leader_since_ms), std.math.maxInt(u32) - 1));
-                    match = p.match_index;
+                    row.contact_ago_ms = @intCast(@min(now -| @max(p.last_contact_ms, raft.leader_since_ms), cluster_wire.Member.UNKNOWN_CONTACT - 1));
+                    row.match = p.match_index;
                 }
+                row.halt = switch (raft.peerHalt(m.id)) {
+                    .none => .none,
+                    .unknown => .unknown,
+                    .at => |h| .{ .at = .{ .index = h.index, .term = h.term, .crc = h.crc } },
+                };
             }
-            std.mem.writeInt(u32, buf[off + 11 ..][0..4], contact, .little);
-            std.mem.writeInt(u64, buf[off + 15 ..][0..8], match, .little);
-            off += 23;
+            rows[i] = row;
         }
-        buf[off] = cfg.removed_count;
-        off += 1;
-        for (cfg.removedSlice()) |rm| {
-            std.mem.writeInt(u32, buf[off..][0..4], rm.id, .little);
-            std.mem.writeInt(u64, buf[off + 4 ..][0..8], rm.when_ms, .little);
-            off += 12;
-        }
-        shard.sendOkResponse(conn, req.header.request_id, buf[0..off]);
+        var gone: [membership.MAX_REMOVED]cluster_wire.Removed = undefined;
+        for (cfg.removedSlice(), 0..) |rm, i| gone[i] = .{ .id = rm.id, .when_ms = rm.when_ms };
+        var buf: [cluster_wire.Members.maxSize(membership.MAX_MEMBERS, membership.MAX_REMOVED)]u8 = undefined;
+        const leader: u32 = if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id;
+        shard.sendOkResponse(conn, req.header.request_id, cluster_wire.Members.encode(&buf, leader, raft.commit_index, rows[0..cfg.member_count], gone[0..cfg.removed_count]));
     }
 
     /// Make a caught-up replica a voter, answered once the change commits.
@@ -5110,8 +5130,7 @@ pub const Shard = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         if (shard.raft_network == null) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, ALONE_MESSAGE);
-        if (req.value.len != 4) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "promote takes one node id");
-        const id = std.mem.readInt(u32, req.value[0..4], .little);
+        const id = (cluster_wire.Promote.decode(req.value) catch return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "promote takes one node id")).id;
         const raft = shard.raft_node;
         var msg: [200]u8 = undefined;
         const m = raft.latest_config.find(id) orelse
@@ -5132,9 +5151,9 @@ pub const Shard = struct {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         if (shard.raft_network == null) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, ALONE_MESSAGE);
-        if (req.value.len != 5) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "remove takes one node id");
-        const id = std.mem.readInt(u32, req.value[0..4], .little);
-        const yes = req.value[4] != 0;
+        const change = cluster_wire.Remove.decode(req.value) catch return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "remove takes one node id");
+        const id = change.id;
+        const yes = change.yes;
         const raft = shard.raft_node;
         var msg: [240]u8 = undefined;
         const m = raft.latest_config.find(id) orelse
@@ -5153,6 +5172,79 @@ pub const Shard = struct {
         // Dated 0: the config entry dates it with its own stamp.
         const next = raft.latest_config.without(id, 0);
         shard.proposeAdminChange(conn, req, &next);
+    }
+
+    /// Skip the entry the group halted at: only on a leader halted at that
+    /// very entry, with a majority of the voters known halted there too.
+    /// Without `yes`, it says what it would skip and who is halted there,
+    /// and changes nothing; with it, it is answered once the skip commits.
+    /// A minority halted there halted alone, and a leader that applied the
+    /// entry runs a build that can: neither is fixed by dropping the write.
+    fn dispatchClusterRepairSkip(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        const rid = req.header.request_id;
+        if (shard.raft_network == null) return shard.sendErrorResponse(conn, rid, .bad_request, "this node runs alone (started without --cluster or --join); stop it and repair it offline: flo server repair skip");
+        const ask = cluster_wire.RepairSkip.decode(req.value) catch return shard.sendErrorResponse(conn, rid, .bad_request, "bad request: a repair skip takes an entry index and a reason of at most 256 bytes");
+        const raft = shard.raft_node;
+        if (raft.role != .leader) return shard.sendRefusal(conn, rid, .unavailable, proto.notRun("unavailable: the leader changed — retry"));
+        var msg: [400]u8 = undefined;
+        const e = shard.replica.ownEntry(ask.index) orelse
+            return shard.sendErrorResponse(conn, rid, .not_found, std.fmt.bufPrint(&msg, "the leader's log doesn't hold entry {d}", .{ask.index}) catch "no such entry");
+        const etype = e.header.entry_type;
+        if (etype == @backingInt(entry_mod.EntryType.repair_skip))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is itself a repair; a skip is never skipped", .{ask.index}) catch "a skip is never skipped");
+        if (etype == @backingInt(entry_mod.EntryType.raft_config) or etype == @backingInt(entry_mod.EntryType.raft_noop))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{ask.index}) catch "never skipped");
+        const target: raft_node_mod.HaltAt = .{ .index = ask.index, .term = e.header.term, .crc = e.header.crc32c };
+        const entry_size: u32 = @intCast(e.payload.len);
+        var ids: [raft_node_mod.MAX_PEERS + 1]raft_node_mod.NodeId = undefined;
+        const halted = raft.votersHaltedAt(target, &ids);
+        if (raft.repaired.of(target))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is skipped already; each node passes over it as the repair reaches it", .{ask.index}) catch "skipped already");
+        const own_halt = raft.halt_at;
+        if (own_halt == null or !std.meta.eql(own_halt.?, target)) {
+            const text = if (own_halt) |h|
+                std.fmt.bufPrint(&msg, "the leader is halted at entry {d} (term {d}), not {d}: only the entry the group halted at is skipped", .{ h.index, h.term, ask.index })
+            else if (raft.last_applied >= ask.index and halted.len > 0)
+                std.fmt.bufPrint(&msg, "the leader applied entry {d}, where node(s) {any} halted: they run a build that fails it and the leader's doesn't. Upgrade them to the leader's build, which applies it; a skip would drop a write the leader already applied", .{ ask.index, halted })
+            else
+                std.fmt.bufPrint(&msg, "the leader is not halted at entry {d}: only the entry the group halted at is skipped (flo cluster members shows each node's halt)", .{ask.index});
+            return shard.sendErrorResponse(conn, rid, .bad_request, text catch "the leader is not halted at that entry");
+        }
+        const voters = raft.clusterSize();
+        if (halted.len < raft.quorum()) {
+            const text = std.fmt.bufPrint(&msg, "unavailable: only node(s) {any} of {d} voters are known halted at entry {d} (term {d}); a skip needs {d}. A voter that halted alone is diverged instead, and one that hasn't answered lately doesn't count — retry once they answer (flo cluster members shows each node's halt)", .{ halted, voters, ask.index, target.term, raft.quorum() }) catch "unavailable: no majority is halted at that entry";
+            return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(text));
+        }
+        if (!ask.yes) {
+            const answer: cluster_wire.RepairSkipAnswer = .{
+                .skipped = false,
+                .skip_index = 0,
+                .entry = .{ .index = target.index, .term = target.term, .crc = target.crc },
+                .entry_type = etype,
+                .entry_size = entry_size,
+                .voters = voters,
+                .halted = halted,
+            };
+            var buf: [cluster_wire.RepairSkipAnswer.maxSize(raft_node_mod.MAX_PEERS + 1)]u8 = undefined;
+            return shard.sendOkResponse(conn, rid, answer.encode(&buf));
+        }
+        var payload: [repair.Skip.MAX_PAYLOAD]u8 = undefined;
+        const skip: repair.Skip = .{ .index = target.index, .term = target.term, .crc = target.crc, .reason = ask.reason };
+        const proposed = raft.propose(.repair_skip, entry_mod.Flags.NONE, skip.encode(&payload)) catch |err| return shard.sendRefusal(conn, rid, .unavailable, proto.notRun(switch (err) {
+            error.NotLeader => "unavailable: the leader changed — retry",
+            error.WritesStopped => "unavailable: the leader stopped taking writes (an entry could not reach disk); restart it, then repair",
+            else => "unavailable: the repair could not be put in the log — retry",
+        }));
+        shard.replica.pump(nowMs());
+        shard.park(conn, req, proposed, respondSkipCommitted);
+    }
+
+    fn respondSkipCommitted(shard: *Shard, conn: *Connection, request_id: u64, result: *const persistence_mod.Result) void {
+        const answer: cluster_wire.RepairSkipAnswer = .{ .skipped = true, .skip_index = result.index, .entry = .{ .index = 0, .term = 0, .crc = 0 }, .entry_type = 0, .entry_size = 0, .voters = 0, .halted = &.{} };
+        var buf: [cluster_wire.RepairSkipAnswer.maxSize(0)]u8 = undefined;
+        shard.sendOkResponse(conn, request_id, answer.encode(&buf));
     }
 
     const ALONE_MESSAGE = "this node runs alone (started without --cluster or --join); there is no membership to change";
@@ -12629,6 +12721,17 @@ const AdminTest = struct {
         return self.ask(.cluster_remove, &v, buf);
     }
 
+    /// A repair skip of `index` from `origin`.
+    fn repairSkip(self: *AdminTest, origin: run_mod.Origin, index: u64, yes: bool, buf: []u8) !?proto.Response {
+        var v: [cluster_wire.RepairSkip.MAX_SIZE]u8 = undefined;
+        const body = try (cluster_wire.RepairSkip{ .index = index, .yes = yes, .reason = "test" }).encode(&v);
+        self.shard.runRequest(self.conn, try ParkTest.request(.cluster_repair_skip, 7, "", "", body, ""), origin);
+        if (self.conn.response_deferred) return null;
+        var into: [1]proto.Response = undefined;
+        try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &into);
+        return into[0];
+    }
+
     fn caughtUp(self: *AdminTest, id: u32) void {
         const raft = self.shard.raft_node;
         const p = &raft.peers[raft.peerIndex(id).?];
@@ -12866,7 +12969,11 @@ const DamageTest = struct {
     }
 
     fn open(self: *DamageTest) !Shard {
-        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{});
+        return self.openWith(.sync);
+    }
+
+    fn openWith(self: *DamageTest, durability: Durability) !Shard {
+        var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, self.pipe_fds[0], self.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, durability, 1, .single, .{}, .{});
         shard.wireHandlerShardPtrs();
         return shard;
     }
@@ -14929,4 +15036,127 @@ test "Shard: a diverged member applies nothing more, and its reads say they are 
     try std.testing.expect(raft.commit_index > raft.last_applied);
     // Its reads are served, from that state, marked stale.
     try std.testing.expectEqual(proto.RESPONSE_STALE, (try t.ask(.cluster_status, "", &buf)).header.flags & proto.RESPONSE_STALE);
+}
+
+test "Shard: a repair skip runs only from the admin socket, on a leader halted at the entry with a majority halted there; its dry run changes nothing" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    var ids: [8]u32 = undefined;
+
+    var pbuf: [64]u8 = undefined;
+    const applied = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v", .ttl_ms = null }))).index;
+    try ParkTest.ack(&t.shard);
+    // An entry every replica fails: the leader halts at it once it commits.
+    const h = (try raft.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
+    raft.peers[0].sent_up_to = h;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    const halt = raft.halt_at.?;
+    try std.testing.expectEqual(h, halt.index);
+
+    // Not from a client's socket, or another shard.
+    var r = (try t.repairSkip(.client, h, false, &buf)).?;
+    try std.testing.expectEqual(proto.Reason.admin_only, (try r.refused()).reason);
+    // Never a config or a term's no-op.
+    try expectAnswer((try t.repairSkip(.admin, 1, false, &buf)).?, .bad_request, "never skipped");
+    // Only where the leader is halted.
+    var want: [64]u8 = undefined;
+    try expectAnswer((try t.repairSkip(.admin, applied, false, &buf)).?, .bad_request, try std.fmt.bufPrint(&want, "not {d}:", .{applied}));
+    // The peer hasn't said it halted there: one of two voters is no majority.
+    try expectAnswer((try t.repairSkip(.admin, h, true, &buf)).?, .unavailable, "of 2 voters");
+    try std.testing.expectEqual(h, raft.log.lastIndex());
+
+    // Once it says so: the dry run names the entry and who halted there.
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = halt });
+    r = (try t.repairSkip(.admin, h, false, &buf)).?;
+    try std.testing.expectEqual(proto.StatusCode.ok, r.getStatus());
+    const would = try cluster_wire.RepairSkipAnswer.decode(r.data, &ids);
+    try std.testing.expect(!would.skipped);
+    try std.testing.expectEqual(halt.crc, would.entry.crc);
+    try std.testing.expectEqual(@backingInt(entry_mod.EntryType.cg_create), would.entry_type);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, would.halted);
+    try std.testing.expectEqual(@as(u8, 2), would.voters);
+    try std.testing.expectEqual(h, raft.log.lastIndex());
+
+    // With yes, from a peer that forwarded it: proposed, answered at commit.
+    try std.testing.expect((try t.repairSkip(.peer, h, true, &buf)) == null);
+    const s = raft.log.lastIndex();
+    var ebuf: [512]u8 = undefined;
+    const skip_entry = raft.log.getEntryCopy(s, &ebuf).?;
+    try std.testing.expect(repair.Skip.decode(&skip_entry).?.names(&(raft.log.getEntryCopy(h, &buf).?)));
+    raft.peers[0].sent_up_to = s;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = s, .from = 2, .halt = halt });
+    try std.testing.expect(t.shard.applyCommitted());
+    try std.testing.expect(t.shard.halted == null);
+    var into: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
+    const done = try cluster_wire.RepairSkipAnswer.decode(into[0].data, &ids);
+    try std.testing.expect(done.skipped);
+    try std.testing.expectEqual(s, done.skip_index);
+
+    // Asked again, it is skipped already, not a build split.
+    t.conn.response_deferred = false;
+    try expectAnswer((try t.repairSkip(.admin, h, false, &buf)).?, .bad_request, "skipped already");
+}
+
+test "Shard: a leader that applied the entry its followers halted at says to upgrade them, not to skip it" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    var pbuf: [64]u8 = undefined;
+    const h = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v", .ttl_ms = null }))).index;
+    try ParkTest.ack(&t.shard);
+    var ebuf: [512]u8 = undefined;
+    const e = raft.log.getEntryCopy(h, &ebuf).?;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2, .halt = .{ .index = h, .term = e.header.term, .crc = e.header.crc32c } });
+    try expectAnswer((try t.repairSkip(.admin, h, false, &buf)).?, .bad_request, "Upgrade them");
+}
+
+test "Shard: a skip seals its segment as it applies, under a watermark at or past it, so the next boot takes it before replay" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var h: u64 = 0;
+    {
+        // Flushed on a timer, not at commit: only the seal puts it on disk.
+        var shard = try t.openWith(.async_flush);
+        defer shard.deinit();
+        h = try HaltCase.no_applier.propose(&shard);
+        try std.testing.expect(!shard.applyCommitted());
+        const at = try proposeSkip(&shard, h);
+        try std.testing.expect(shard.applyCommitted());
+        const files = try shard.durable_log.?.segments();
+        const last = files[files.len - 1];
+        try std.testing.expect(last.holds_skip and last.last_index >= at and last.commit_index_at_seal >= at);
+    }
+    var shard = try t.open();
+    defer shard.deinit();
+    // Taken at boot: replay passed over the entry rather than halting at it.
+    try std.testing.expect(shard.halted == null);
+}
+
+test "Shard: a replica carries a repair from its admin socket to the leader rather than sending the client there" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    // A replica: named in the config, not a voter, following node 1.
+    raft.self_named = true;
+    raft.timer_enabled = false;
+    raft.role = .follower;
+    raft.leader_id = 1;
+    var buf: [256]u8 = undefined;
+    const held = t.shard.forward_count;
+    // Held for the leader, unanswered here: not a redirect to its client port.
+    try std.testing.expect((try t.repairSkip(.admin, 5, false, &buf)) == null);
+    try std.testing.expectEqual(held + 1, t.shard.forward_count);
 }

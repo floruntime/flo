@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const proto = @import("../protocol/proto.zig");
+const table = @import("../protocol/table.zig");
 
 /// Who is asking. Every connection is anonymous until clients authenticate.
 pub const Principal = union(enum) {
@@ -15,6 +16,9 @@ pub const Principal = union(enum) {
 pub const Origin = enum {
     /// A client's socket.
     client,
+    /// The node's admin socket: a Unix socket only its owner may connect
+    /// to, so the host's file permission is the check.
+    admin,
     /// Another shard of this node, which routed it.
     shard,
     /// Another node, which forwarded it to its leader here.
@@ -39,10 +43,24 @@ pub const Refused = struct {
     refusal: proto.Refusal,
 };
 
-/// Whether `principal` may run `req`. Everyone may, until clients
+/// Whether `principal` may run `req`. An op that administers the node
+/// runs only from its admin socket, or as a request already authorized
+/// at an edge: one a peer forwarded over its authenticated link, or one
+/// held here for a leader. Everyone may run every other op, until clients
 /// authenticate; then this is the one function that changes.
 pub fn authorize(principal: Principal, origin: Origin, req: proto.Request) union(enum) { ok: Authorized, refused: Refused } {
+    if (adminOnly(req.header.op_code)) switch (origin) {
+        .admin, .peer, .held => {},
+        .client, .shard => return .{ .refused = .{ .status = .unauthorized, .refusal = .{ .reason = .admin_only, .ran = .no, .message = ADMIN_ONLY_MESSAGE } } },
+    };
     return .{ .ok = .{ .op = req.header.op_code, .principal = principal, .origin = origin, .seal = .{} } };
+}
+
+pub const ADMIN_ONLY_MESSAGE = "unauthorized: this op is served only on the node's admin socket (admin.sock in its data directory, unless [admin] socket places it elsewhere); run the command on the node itself";
+
+/// Ops that administer the node rather than its data.
+fn adminOnly(op: u16) bool {
+    return op == @backingInt(proto.OpCode.cluster_repair_skip) or table.isAdmin(op);
 }
 
 /// What makes an Authorized without `authorize`, or reaches a handler
@@ -196,4 +214,16 @@ test "run: no file but this one makes an Authorized, and none but the dispatcher
     }
     try std.testing.expectEqual(@as(usize, 0), found);
     try std.testing.expect(files > 100);
+}
+
+test "run: an admin op runs only from the admin socket or as a request already authorized at an edge" {
+    const admin_req: proto.Request = .{ .header = proto.RequestHeader.init(.cluster_repair_skip, 1), .namespace = "", .key = "", .value = "" };
+    const data_req: proto.Request = .{ .header = proto.RequestHeader.init(.cluster_status, 2), .namespace = "", .key = "", .value = "" };
+    inline for (.{ Origin.admin, Origin.peer, Origin.held }) |o| try std.testing.expect(authorize(.anonymous, o, admin_req) == .ok);
+    inline for (.{ Origin.client, Origin.shard }) |o| {
+        const r = authorize(.anonymous, o, admin_req).refused;
+        try std.testing.expectEqual(proto.StatusCode.unauthorized, r.status);
+        try std.testing.expectEqual(proto.Reason.admin_only, r.refusal.reason);
+    }
+    inline for (@typeInfo(Origin).@"enum".field_names) |name| try std.testing.expect(authorize(.anonymous, @field(Origin, name), data_req) == .ok);
 }

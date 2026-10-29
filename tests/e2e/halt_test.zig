@@ -8,9 +8,10 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
-const test_faults = @import("src").node.test_faults;
+const src = @import("src");
+const test_faults = src.node.test_faults;
 const HALT_KEY = test_faults.HALT_KEY;
-const apply_marker = @import("src").node.apply_marker;
+const apply_marker = src.node.apply_marker;
 
 /// A node's `/status`, parsed.
 fn nodeStatus(http: anytype) !std.json.Parsed(std.json.Value) {
@@ -80,6 +81,36 @@ test "e2e/halt: a lone node's shard halts at the entry, refuses writes saying wh
     try testing.expectEqualStrings("kept", try ctx.execCapture(&.{ "kv", "get", "before" }));
 }
 
+/// The node whose member list has heard every member halted at `at`: the
+/// leader, which alone hears the others' halts.
+fn leaderHeardHalts(cluster: anytype, at: i64) !usize {
+    var needle_buf: [48]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\"halt\":{{\"index\":{d},", .{at});
+    var tries: usize = 0;
+    while (tries < 80) : (tries += 1) {
+        for (0..3) |i| {
+            const out = cluster.execCaptureAnyOn(i, &.{ "cluster", "members", "-o", "json" }) catch continue;
+            defer testing.allocator.free(out);
+            if (std.mem.count(u8, out, needle) == 3) return i;
+        }
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
+    cluster.printLogs();
+    return error.NoLeaderHeardAllHalts;
+}
+
+/// `flo cluster repair skip` through node `node`'s admin socket.
+fn repairSkip(cluster: anytype, node: usize, at: i64, yes: bool) !stdx.testing.CommandResult {
+    var index_buf: [24]u8 = undefined;
+    const index = try std.fmt.bufPrint(&index_buf, "{d}", .{at});
+    const config = cluster.getServer(node).?.config_file;
+    const cli = cluster.clis[node].?;
+    return if (yes)
+        cli.run(&.{ "cluster", "repair", "skip", "--index", index, "--config", config, "--reason", "e2e", "--yes" })
+    else
+        cli.run(&.{ "cluster", "repair", "skip", "--index", index, "--config", config });
+}
+
 test "e2e/halt: every node of a three-node group halts at the same entry" {
     if (!test_faults.enabled) return error.SkipZigTest;
     var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
@@ -127,6 +158,109 @@ test "e2e/halt: every node of a three-node group halts at the same entry" {
         defer parsed.deinit();
         try testing.expectEqual(at, haltIndex(parsed, 0));
     }
+    // And the leader has heard all three halts.
+    _ = try leaderHeardHalts(&cluster, at.?);
+}
+
+test "e2e/halt: a repair from any member's admin socket skips the entry the group halted at; every node goes on past it, across a restart" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true });
+    defer cluster.deinit();
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "before", "kept" }, 20, 250);
+    {
+        var r = try cluster.clis[0].?.run(&.{ "kv", "set", HALT_KEY, "x" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 6), r.exit_code);
+    }
+    var at: i64 = 0;
+    {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(0).?.metrics_port);
+        defer http.deinit();
+        var tries: usize = 0;
+        at = while (tries < 80) : (tries += 1) {
+            const parsed = try nodeStatus(http);
+            defer parsed.deinit();
+            if (haltIndex(parsed, 0)) |h| break h;
+            stdx.time.sleep(250 * std.time.ns_per_ms);
+        } else return error.NodeNotHalted;
+    }
+    const leader = try leaderHeardHalts(&cluster, at);
+    const follower = (leader + 1) % 3;
+
+    // Only its owner may connect to the socket.
+    const st = try stdx.fs.statFile(cluster.getServer(follower).?.admin_socket, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@backingInt(st.permissions))) & 0o777);
+
+    // The dry run shows the entry and who halted there, and changes nothing.
+    {
+        var r = try repairSkip(&cluster, follower, at, false);
+        defer r.deinit();
+        if (r.exit_code != 0) std.debug.print("dry run: {s}{s}\n", .{ r.stdout, r.stderr });
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        try testing.expect(r.stdoutContains("of 3 voters"));
+        try testing.expect(r.stdoutContains("Would append a repair"));
+    }
+    _ = try leaderHeardHalts(&cluster, at);
+
+    // Over a client's TCP connection it is refused as admin-only, unrun.
+    {
+        var conn = src.cli_client.Client.init(testing.allocator, cluster.getNodeEndpoint(follower).?);
+        defer conn.deinit();
+        try conn.connect();
+        var body: [9]u8 = undefined;
+        std.mem.writeInt(u64, body[0..8], @intCast(at), .little);
+        body[8] = 1;
+        var resp = try conn.sendRequest(.cluster_repair_skip, "", "", &body);
+        defer resp.deinit();
+        try testing.expectEqual(src.protocol.proto.StatusCode.unauthorized, resp.status);
+        try testing.expectEqual(src.protocol.proto.Reason.admin_only, resp.reason());
+        try testing.expect(std.mem.indexOf(u8, resp.errorMessage(), "admin socket") != null);
+    }
+    _ = try leaderHeardHalts(&cluster, at);
+
+    // With --yes, from a follower: forwarded to the leader, and committed.
+    {
+        var r = try repairSkip(&cluster, follower, at, true);
+        defer r.deinit();
+        if (r.exit_code != 0) std.debug.print("repair: {s}{s}\n", .{ r.stdout, r.stderr });
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        try testing.expect(r.stdoutContains("is skipped (repair at index"));
+    }
+    // Every node goes on past it: the write never ran, and new ones are taken.
+    for (0..3) |i| {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(i).?.metrics_port);
+        defer http.deinit();
+        var tries: usize = 0;
+        while (tries < 80) : (tries += 1) {
+            const parsed = try nodeStatus(http);
+            defer parsed.deinit();
+            if (haltIndex(parsed, 0) == null) break;
+            stdx.time.sleep(250 * std.time.ns_per_ms);
+        } else {
+            cluster.printLogs();
+            return error.StillHalted;
+        }
+    }
+    try cluster.execOnWithRetry(follower, &.{ "kv", "set", "after", "taken" }, 20, 250);
+    for (0..3) |i| {
+        const out = try cluster.pollUntilContains(i, &.{ "kv", "get", "after" }, "taken", 40, 250);
+        testing.allocator.free(out);
+        var r = try cluster.clis[i].?.run(&.{ "kv", "get", HALT_KEY });
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0 and !r.stdoutContains("x"));
+    }
+    // A restart passes over it the same way.
+    cluster.stopNode(follower);
+    try cluster.restartNode(follower);
+    const out = try cluster.pollUntilContains(follower, &.{ "kv", "get", "after" }, "taken", 40, 250);
+    testing.allocator.free(out);
+    {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(follower).?.metrics_port);
+        defer http.deinit();
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(?i64, null), haltIndex(parsed, 0));
+    }
 }
 
 test "e2e/halt: a follower that halts where its leader applied halted alone and is diverged (a build with no version says it can't tell); the group goes on" {
@@ -167,6 +301,18 @@ test "e2e/halt: a follower that halts where its leader applied halted alone and 
     }
     // The write applied where it ran, and the group takes writes.
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "after", "taken" }, 20, 250);
+    // A repair of it is refused: the leader isn't halted there.
+    if (!versioned) {
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        const at = haltIndex(parsed, 0).?;
+        for (0..3) |i| {
+            var r = try repairSkip(&cluster, i, at, true);
+            defer r.deinit();
+            try testing.expectEqual(@as(u8, 3), r.exit_code);
+            try testing.expect(std.mem.indexOf(u8, r.stderr, "Upgrade them") != null or std.mem.indexOf(u8, r.stderr, "not halted") != null);
+        }
+    }
     for (0..2) |i| {
         const out = try cluster.pollUntilContains(i, &.{ "kv", "get", "after" }, "taken", 40, 250);
         defer testing.allocator.free(out);

@@ -111,6 +111,8 @@ pub const RuntimeConfig = struct {
     /// The one timing knob: a leader unheard for this long is replaced.
     /// Election timeouts are [½, 1] × this, heartbeats a sixth of it.
     cluster_failover_timeout_ms: u32 = 1500,
+    /// Where the admin socket listens; null for admin.sock in the data dir.
+    admin_socket: ?[]const u8 = null,
     /// A worker silent this long is unhealthy; this long, removed.
     worker_heartbeat_timeout_ms: u64 = 90_000,
     worker_remove_after_ms: u64 = 600_000,
@@ -159,6 +161,15 @@ pub const RuntimeConfig = struct {
 
 /// Node runtime — manages shard threads, acceptor thread, and lifecycle.
 pub const LOCK_FILENAME = "flo.lock";
+
+pub const ADMIN_SOCKET_FILENAME = "admin.sock";
+
+/// The admin socket's path: `configured`, else admin.sock in `data_dir`.
+/// Both are expanded already. The server and the CLI agree through this.
+pub fn adminSocketPath(buf: []u8, data_dir: []const u8, configured: ?[]const u8) error{NoSpaceLeft}![]const u8 {
+    if (configured) |c| return std.fmt.bufPrint(buf, "{s}", .{c});
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ data_dir, ADMIN_SOCKET_FILENAME });
+}
 
 /// Take the data dir's lock, or refuse if another server holds it. The lock
 /// is the OS's (flock), so it goes when the holder exits, however it exits.
@@ -281,6 +292,11 @@ pub const Runtime = struct {
 
     /// Acceptor thread.
     acceptor_thread: ?std.Thread,
+    /// The admin socket's path while it listens, to remove at stop.
+    admin_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    admin_path_len: usize = 0,
+    /// The file it bound: only that is removed at stop.
+    admin_file: ?stdx.fs.Meta = null,
 
     /// Write-ends of shard pipes (slice into pipes for acceptor).
     pipe_write_ends: ?[]i32,
@@ -907,6 +923,7 @@ pub const Runtime = struct {
         var acceptor = Acceptor.init(write_ends, shards[0].router);
         try acceptor.listenOn(client_fd);
         client_fd_owned = false;
+        try self.listenAdmin(&acceptor, data_dir);
         self.acceptor = acceptor;
         log.debug("Runtime.start: acceptor listening on {s}:{d}", .{ self.config.listen_addr, self.client_port });
 
@@ -917,6 +934,49 @@ pub const Runtime = struct {
 
         self.started = true;
         log.debug("Runtime.start: all components started, node is ready", .{});
+    }
+
+    /// Listen on the admin socket. A node starts without one rather than
+    /// not at all when the path can't hold one safely: it serves only
+    /// admin commands, and the warning says how to place it. One whose
+    /// path another server answers on, or someone else's file holds, is
+    /// refused: `[admin] socket` names it outside the data dir's lock, so
+    /// two nodes could be configured onto one path.
+    fn listenAdmin(self: *Runtime, acc: *Acceptor, data_dir: []const u8) !void {
+        const configured = if (self.config.admin_socket) |c| stdx.fs.expandTilde(self.allocator, c) catch {
+            log.warn("admin socket: cannot expand [admin] socket \"{s}\"; starting without one, so admin commands (flo cluster repair skip) can't reach this node", .{c});
+            return;
+        } else null;
+        defer if (configured) |c| self.allocator.free(c);
+        const path = adminSocketPath(&self.admin_path_buf, data_dir, configured) catch {
+            log.warn("admin socket: the path is too long; starting without one, so admin commands (flo cluster repair skip) can't reach this node. Set [admin] socket to a shorter path", .{});
+            return;
+        };
+        if (path.len > stdx.net.UNIX_PATH_MAX) {
+            log.warn("admin socket: {s} is {d} bytes, past the {d} a Unix socket path may hold; starting without one, so admin commands (flo cluster repair skip) can't reach this node. Set [admin] socket to a shorter path", .{ path, path.len, stdx.net.UNIX_PATH_MAX });
+            return;
+        }
+        const l = stdx.net.unixListen(path) catch |err| switch (err) {
+            error.PathInUse => {
+                log.err("admin socket: a server already answers on {s}; give each node its own [admin] socket, or leave it unset for admin.sock in the data directory", .{path});
+                return error.AdminSocketInUse;
+            },
+            error.PathNotOurs => {
+                log.err("admin socket: {s} is held by a file that isn't this user's socket; remove it, or set [admin] socket to a path only this user can write", .{path});
+                return error.AdminSocketInUse;
+            },
+            error.UnsafeDirectory => {
+                log.warn("admin socket: the directory of {s} can be written by other users and isn't sticky; starting without one, so admin commands (flo cluster repair skip) can't reach this node. Set [admin] socket in a directory only this user can write", .{path});
+                return;
+            },
+            else => {
+                log.warn("admin socket: cannot listen at {s}: {s}; starting without one, so admin commands (flo cluster repair skip) can't reach this node", .{ path, @errorName(err) });
+                return;
+            },
+        };
+        acc.admin_fd = l.fd;
+        self.admin_file = l.file;
+        self.admin_path_len = path.len;
     }
 
     /// The metrics registry, the exporter and the dashboard, before any
@@ -1204,6 +1264,11 @@ pub const Runtime = struct {
             acc.close();
             self.acceptor = null;
         }
+        if (self.admin_file) |file| {
+            stdx.net.unixUnlink(self.admin_path_buf[0..self.admin_path_len], file);
+            self.admin_file = null;
+            self.admin_path_len = 0;
+        }
 
         // 3. Send shutdown to each shard
         if (self.shards) |shards| {
@@ -1337,6 +1402,7 @@ fn acceptorThread(acc: *Acceptor) void {
     acc.running.store(true, .release);
     while (acc.running.load(.acquire)) {
         _ = acc.acceptOne() catch {};
+        acc.acceptAdmin() catch {};
         // Small yield to avoid busy-spin when no connections pending
         stdx.time.sleep(100_000); // 100μs
     }

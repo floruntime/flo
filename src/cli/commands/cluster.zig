@@ -5,6 +5,7 @@
 //!   flo cluster members [--endpoint <host:port>]    List cluster members
 //!   flo cluster promote <id>...                     Make caught-up replicas voters
 //!   flo cluster remove <id> [--yes]                 Remove a member
+//!   flo cluster repair skip --index I [--yes]       Skip the entry the group halted at
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,6 +15,10 @@ const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
 const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
+const wire = @import("../../protocol/cluster_wire.zig");
+const server_cmd = @import("server.zig");
+const stdx = @import("stdx");
+const EntryType = @import("../../storage/ual/entry.zig").EntryType;
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -92,6 +97,36 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                 })
                 .action(wrapHandler(runRemove)),
         )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("repair")
+                .about("Repair a halted cluster")
+                .subcommand(
+                commander.newBuilder(allocator)
+                    .name("skip")
+                    .about("Skip the entry the cluster halted at")
+                    .longAbout(
+                        \\When every node fails the same write the same way, the cluster
+                        \\halts at it and takes no more writes. This skips that write: it
+                        \\never runs, on this build or a later one, and the cluster goes on.
+                        \\
+                        \\Run it on any member: it goes to the node's admin socket, then to the
+                        \\leader. The leader skips only the entry it is halted at itself, and
+                        \\only once a majority of voters say they are halted there too. Without
+                        \\--yes it shows the entry and who is halted at it, and changes nothing.
+                    )
+                    .uintFlag("index", 0, 0, "The entry the cluster halted at (flo cluster members shows it)")
+                    .stringFlag("reason", 0, "", "Why, recorded with the repair")
+                    .boolFlag("yes", 0, "Skip it")
+                    .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
+                    .stringFlag("data-dir", 'd', "", "The node's data directory (overrides the config)")
+                    .examples(&.{
+                        "flo cluster repair skip --index 18234 --data-dir /var/lib/flo",
+                        "flo cluster repair skip --index 18234 --data-dir /var/lib/flo --reason \"malformed invoke\" --yes",
+                    })
+                    .action(wrapHandler(runRepairSkip)),
+            ),
+        )
         .build();
 }
 
@@ -126,17 +161,14 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     var response = try ask(ctx, .cluster_status, "");
     defer response.deinit();
 
-    // Parse response data
-    // [node_id:u32][leader_id:u32][term:u64][state:u8][member_count:u32][vouched_index:u64][strangers_while_quiet:u8]
-    if (response.data.len != 30) return outcome.malformed(ctx, "cluster status");
-
-    const node_id = std.mem.readInt(u32, response.data[0..4], .little);
-    const leader_id = std.mem.readInt(u32, response.data[4..8], .little);
-    const term = std.mem.readInt(u64, response.data[8..16], .little);
-    const state = response.data[16];
-    const member_count = std.mem.readInt(u32, response.data[17..21], .little);
-    const vouched_index = std.mem.readInt(u64, response.data[21..29], .little);
-    const strangers_while_quiet = response.data[29] != 0;
+    const status = wire.Status.decode(response.data) catch return outcome.malformed(ctx, "cluster status");
+    const node_id = status.node_id;
+    const leader_id = status.leader_id;
+    const term = status.term;
+    const state = status.state;
+    const member_count = status.member_count;
+    const vouched_index = status.vouched_index;
+    const strangers_while_quiet = status.strangers_while_quiet;
 
     // Generate human-readable node names
     var node_name_buf: [11]u8 = undefined;
@@ -186,78 +218,71 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
 
     var response = try ask(ctx, .cluster_members, "");
     defer response.deinit();
-
-    // [leader:u32][commit:u64][members:u8], per member
-    // [id:u32][role:u8][ip4:4][port:u16][contact_ago_ms:u32][match:u64],
-    // then [removed:u8], per removed id [id:u32][when_ms:u64].
-    const data = response.data;
-    if (data.len < 13) {
-        return outcome.malformed(ctx, "member list");
-    }
-    const leader_id = std.mem.readInt(u32, data[0..4], .little);
-    const commit = std.mem.readInt(u64, data[4..12], .little);
-    const count = data[12];
-    if (data.len < 13 + @as(usize, count) * 23 + 1) {
-        return outcome.malformed(ctx, "member list");
-    }
-    const removed_count = data[13 + @as(usize, count) * 23];
-    if (data.len != 14 + @as(usize, count) * 23 + @as(usize, removed_count) * 12) {
-        return outcome.malformed(ctx, "member list");
-    }
+    const list = wire.Members.decode(response.data) catch return outcome.malformed(ctx, "member list");
 
     var table = output.Table.init(ctx.allocator);
     defer table.deinit();
     if (!json_output) {
-        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG" }) |col| table.addColumn(col, .left) catch return error.OutOfMemory;
+        for ([_][]const u8{ "ID", "ROLE", "ADDRESS", "LAST CONTACT", "LAG", "HALTED AT" }) |col| table.addColumn(col, .left) catch return error.OutOfMemory;
     } else {
-        ctx.print("{{\"leader\":{d},\"members\":[", .{leader_id});
+        ctx.print("{{\"leader\":{d},\"members\":[", .{list.leader});
     }
-    var cells: [5][32]u8 = undefined;
-    for (0..count) |i| {
-        const m = data[13 + i * 23 ..][0..23];
-        const id = std.mem.readInt(u32, m[0..4], .little);
-        const role: []const u8 = switch (m[4]) {
-            0 => if (id == leader_id) "voter (leader)" else "voter",
+    var cells: [6][48]u8 = undefined;
+    var unknown_halts = false;
+    for (0..list.count()) |i| {
+        const m = list.member(i) catch unreachable; // checked by decode
+        const role: []const u8 = switch (m.role) {
+            0 => if (m.id == list.leader) "voter (leader)" else "voter",
             1 => "replica",
             2 => "joining",
             else => "unknown",
         };
-        const port = std.mem.readInt(u16, m[9..11], .little);
-        const contact = std.mem.readInt(u32, m[11..15], .little);
-        const match = std.mem.readInt(u64, m[15..23], .little);
-        const address = if (port != 0) std.fmt.bufPrint(&cells[0], "{d}.{d}.{d}.{d}:{d}", .{ m[5], m[6], m[7], m[8], port }) catch "?" else "-";
-        const contact_s = if (contact == std.math.maxInt(u32)) "-" else std.fmt.bufPrint(&cells[1], "{d} ms ago", .{contact}) catch "?";
-        const lag_s = if (match == std.math.maxInt(u64)) "-" else std.fmt.bufPrint(&cells[2], "{d}", .{commit -| match}) catch "?";
-        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{id}) catch "?";
+        const address = if (m.port != 0) std.fmt.bufPrint(&cells[0], "{d}.{d}.{d}.{d}:{d}", .{ m.ip4[0], m.ip4[1], m.ip4[2], m.ip4[3], m.port }) catch "?" else "-";
+        const contact_s = if (m.contact_ago_ms == wire.Member.UNKNOWN_CONTACT) "-" else std.fmt.bufPrint(&cells[1], "{d} ms ago", .{m.contact_ago_ms}) catch "?";
+        const lag_s = if (m.match == wire.Member.UNKNOWN_MATCH) "-" else std.fmt.bufPrint(&cells[2], "{d}", .{list.commit -| m.match}) catch "?";
+        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{m.id}) catch "?";
+        const halt_s = switch (m.halt) {
+            .none => "-",
+            .unknown => "?",
+            .at => |h| std.fmt.bufPrint(&cells[4], "{d} (term {d})", .{ h.index, h.term }) catch "?",
+        };
+        unknown_halts = unknown_halts or m.halt == .unknown;
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":{d},\"role\":{f},\"address\":{f}", .{ id, output.jsonString(if (m[4] == 0) "voter" else role), output.jsonString(address) });
-            if (contact != std.math.maxInt(u32)) ctx.print(",\"last_contact_ms\":{d}", .{contact});
-            if (match != std.math.maxInt(u64)) ctx.print(",\"lag\":{d}", .{commit -| match});
+            ctx.print("{{\"id\":{d},\"role\":{f},\"address\":{f}", .{ m.id, output.jsonString(if (m.role == 0) "voter" else role), output.jsonString(address) });
+            if (m.contact_ago_ms != wire.Member.UNKNOWN_CONTACT) ctx.print(",\"last_contact_ms\":{d}", .{m.contact_ago_ms});
+            if (m.match != wire.Member.UNKNOWN_MATCH) ctx.print(",\"lag\":{d}", .{list.commit -| m.match});
+            switch (m.halt) {
+                .none => ctx.print(",\"halt\":null", .{}),
+                .unknown => ctx.print(",\"halt\":\"unknown\"", .{}),
+                .at => |h| ctx.print(",\"halt\":{{\"index\":{d},\"term\":{d},\"crc\":{d}}}", .{ h.index, h.term, h.crc }),
+            }
             ctx.print("}}", .{});
         } else {
-            table.addRow(&.{ id_s, role, address, contact_s, lag_s }) catch return error.OutOfMemory;
+            table.addRow(&.{ id_s, role, address, contact_s, lag_s, halt_s }) catch return error.OutOfMemory;
         }
     }
-    const removed_at = 14 + @as(usize, count) * 23;
     if (json_output) {
         ctx.print("],\"removed\":[", .{});
-        for (0..removed_count) |i| {
-            const rm = data[removed_at + i * 12 ..][0..12];
+        for (0..list.removedCount()) |i| {
+            const rm = list.removed(i);
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":{d},\"removed_at_ms\":{d}}}", .{ std.mem.readInt(u32, rm[0..4], .little), std.mem.readInt(u64, rm[4..12], .little) });
+            ctx.print("{{\"id\":{d},\"removed_at_ms\":{d}}}", .{ rm.id, rm.when_ms });
         }
         ctx.print("]}}\n", .{});
         return;
     }
-    for (0..removed_count) |i| {
-        const rm = data[removed_at + i * 12 ..][0..12];
-        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{std.mem.readInt(u32, rm[0..4], .little)}) catch "?";
-        table.addRow(&.{ id_s, "removed", "-", "-", "-" }) catch return error.OutOfMemory;
+    for (0..list.removedCount()) |i| {
+        const id_s = std.fmt.bufPrint(&cells[3], "{d}", .{list.removed(i).id}) catch "?";
+        table.addRow(&.{ id_s, "removed", "-", "-", "-", "-" }) catch return error.OutOfMemory;
     }
     ctx.print("\n", .{});
     table.print(ctx);
-    if (leader_id == 0) ctx.print("\nNo leader known; contact and lag are the leader's to report.\n", .{});
+    if (list.leader == 0) {
+        ctx.print("\nNo leader known; contact, lag and the others' halts are the leader's to report.\n", .{});
+    } else if (unknown_halts) {
+        ctx.print("\n?: only the leader hears the members' halts; ask it, or a member it hasn't heard from lately.\n", .{});
+    }
     ctx.print("\n", .{});
 }
 
@@ -268,9 +293,8 @@ fn runPromote(ctx: *commander.Context) commander.Error!void {
     // One change at a time: each waits until the one before has committed.
     for (ctx.args) |arg| {
         const id = std.fmt.parseInt(u32, arg, 10) catch return outcome.usage(ctx, "{s} is not a node id", .{arg});
-        var value: [4]u8 = undefined;
-        std.mem.writeInt(u32, &value, id, .little);
-        try sendChange(ctx, .cluster_promote, &value);
+        var value: [wire.Promote.SIZE]u8 = undefined;
+        try sendChange(ctx, .cluster_promote, (wire.Promote{ .id = id }).encode(&value));
         ctx.print("node {d} is a voter\n", .{id});
     }
 }
@@ -280,10 +304,8 @@ fn runRemove(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "give one node id: flo cluster remove <id> [--yes]", .{});
     }
     const id = std.fmt.parseInt(u32, ctx.args[0], 10) catch return outcome.usage(ctx, "{s} is not a node id", .{ctx.args[0]});
-    var value: [5]u8 = undefined;
-    std.mem.writeInt(u32, value[0..4], id, .little);
-    value[4] = @intFromBool(ctx.getBool("yes"));
-    try sendChange(ctx, .cluster_remove, &value);
+    var value: [wire.Remove.SIZE]u8 = undefined;
+    try sendChange(ctx, .cluster_remove, (wire.Remove{ .id = id, .yes = ctx.getBool("yes") }).encode(&value));
     ctx.print("node {d} removed; it cannot rejoin under that id\n", .{id});
 }
 
@@ -291,6 +313,58 @@ fn runRemove(ctx: *commander.Context) commander.Error!void {
 fn sendChange(ctx: *commander.Context, op: proto.OpCode, value: []const u8) commander.Error!void {
     var response = try ask(ctx, op, value);
     response.deinit();
+}
+
+fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
+    const index = ctx.getUint("index") orelse 0;
+    if (index == 0) return outcome.usage(ctx, "--index is required: the entry the cluster halted at (flo cluster members shows it, as HALTED AT)", .{});
+    const reason = ctx.getString("reason") orelse "";
+    if (reason.len > wire.RepairSkip.MAX_REASON) return outcome.usage(ctx, "--reason is {d} bytes; at most {d}", .{ reason.len, wire.RepairSkip.MAX_REASON });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try server_cmd.adminSocketPath(ctx, &path_buf);
+    if (path.len > stdx.net.UNIX_PATH_MAX) {
+        return outcome.localRefusal(ctx, "the admin socket {s} is {d} bytes, past the {d} a Unix socket path may hold, so the node started without one. Set [admin] socket to a shorter path in its config and restart it", .{ path, path.len, stdx.net.UNIX_PATH_MAX });
+    }
+
+    // The dry run first, so what is skipped is always shown.
+    var dry = try askAdmin(ctx, path, .{ .index = index, .yes = false, .reason = reason });
+    defer dry.deinit();
+    var ids: [32]u32 = undefined;
+    const would = wire.RepairSkipAnswer.decode(dry.data, &ids) catch return outcome.malformed(ctx, "repair answer");
+    const type_name = std.enums.tagName(EntryType, @fromBackingInt(would.entry_type)) orelse "unknown";
+    ctx.print("\nentry {d}: {s}, term {d}, {d} bytes\n", .{ would.entry.index, type_name, would.entry.term, would.entry_size });
+    ctx.print("halted there: node(s) {any}, of {d} voters\n", .{ would.halted, would.voters });
+    if (!ctx.getBool("yes")) {
+        ctx.print("Would append a repair that skips it: the write never runs, on this build or a later one. Run again with --yes to do it.\n", .{});
+        return;
+    }
+    var done = try askAdmin(ctx, path, .{ .index = index, .yes = true, .reason = reason });
+    defer done.deinit();
+    const skipped = wire.RepairSkipAnswer.decode(done.data, &ids) catch return outcome.malformed(ctx, "repair answer");
+    if (!skipped.skipped) return outcome.malformed(ctx, "repair answer");
+    ctx.print("Entry {d} is skipped (repair at index {d}). Each node passes over it as the repair reaches it.\n", .{ index, skipped.skip_index });
+}
+
+/// Send a repair skip to the node's admin socket at `path`; its ok answer,
+/// which the caller frees.
+fn askAdmin(ctx: *commander.Context, path: []const u8, body: wire.RepairSkip) commander.Error!client_mod.Response {
+    var client = client_mod.Client.init(ctx.allocator, path);
+    defer client.deinit();
+    client.connectUnix(path) catch |err| return switch (err) {
+        error.ConnectionRefused => outcome.localRefusal(ctx, "no server listens on the admin socket {s}: is a node running on this data directory? One that started without its socket logged why", .{path}),
+        error.PermissionDenied => outcome.localRefusal(ctx, "permission denied on the admin socket {s}: run as the user the server runs as", .{path}),
+        // Another user's socket could answer as the server would.
+        error.NotOurs => outcome.localRefusal(ctx, "{s} isn't a socket you own, so it isn't your server's admin socket: run as the user the server runs as, or check [admin] socket", .{path}),
+        else => outcome.localRefusal(ctx, "cannot connect to the admin socket {s}: {s}", .{ path, @errorName(err) }),
+    };
+    var buf: [wire.RepairSkip.MAX_SIZE]u8 = undefined;
+    const value = body.encode(&buf) catch unreachable; // the reason's length is checked
+    var response = client.sendRequest(.cluster_repair_skip, "", "", value) catch |err| return outcome.requestFailed(ctx, err);
+    outcome.check(ctx, response) catch |err| {
+        response.deinit();
+        return err;
+    };
+    return response;
 }
 
 // ==================== Testing ====================

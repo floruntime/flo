@@ -298,6 +298,8 @@ pub const Connection = struct {
     closing: bool = false,
     /// Who sent this connection's requests; see `run.authorize`.
     principal: @import("run.zig").Principal = .anonymous,
+    /// Accepted on the node's admin socket.
+    admin: bool = false,
 
     /// The client's requests are not read or run while its unsent answers
     /// pile up; resumed once they drain, or once it has read nothing for a

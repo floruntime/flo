@@ -169,6 +169,14 @@ pub const Client = struct {
         posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&write_timeout)) catch {};
     }
 
+    /// Connect to a node's admin socket at `path`.
+    pub fn connectUnix(self: *Self, path: []const u8) !void {
+        self.stream = try @import("stdx").net.unixConnectOwned(path);
+        const timeout = posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
+        posix.setsockopt(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
+
     /// Set socket read timeout in seconds. Use 0 to disable (wait forever).
     /// Must be called after connect().
     pub fn setReadTimeoutSec(self: *Self, seconds: u32) void {
