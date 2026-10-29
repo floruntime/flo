@@ -72,7 +72,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("name", "Workflow name")
                 .arg("input", "Input payload (JSON)")
-                .stringFlag("version", 'v', "latest", "Workflow version")
+                .stringFlag("version", 0, "latest", "Workflow version")
                 .stringFlag("idempotency-key", 'k', "", "Idempotency key for dedup")
                 .stringFlag("run-id", 'r', "", "Custom run ID (optional; not wfr-<hex>-<hex>, which the server mints)")
                 .action(wrapHandler(runStart)),
@@ -87,7 +87,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("run_id", "Workflow run ID")
                 .stringFlag("type", 't', "", "Signal type (required)")
-                .stringFlag("payload", 'p', "", "Signal payload (JSON)")
+                .stringFlag("payload", 0, "", "Signal payload (JSON)")
                 .action(wrapHandler(runSignal)),
         )
         .subcommand(
@@ -131,7 +131,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Get workflow definition")
                 .aliases(&.{ "def", "show" })
                 .arg("name", "Workflow name")
-                .stringFlag("version", 'v', "", "Specific version (default: latest)")
+                .stringFlag("version", 0, "", "Specific version (default: latest)")
                 .action(wrapHandler(runGetDefinition)),
         )
         .subcommand(
@@ -143,7 +143,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                     "flo workflow disable order-processing --version 1.0.0",
                 })
                 .arg("name", "Workflow name")
-                .stringFlag("version", 'v', "", "Specific version (default: all versions)")
+                .stringFlag("version", 0, "", "Specific version (default: all versions)")
                 .action(wrapHandler(runDisable)),
         )
         .subcommand(
@@ -155,7 +155,7 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                     "flo workflow enable order-processing --version 1.0.0",
                 })
                 .arg("name", "Workflow name")
-                .stringFlag("version", 'v', "", "Specific version (default: all versions)")
+                .stringFlag("version", 0, "", "Specific version (default: all versions)")
                 .action(wrapHandler(runEnable)),
         )
         .subcommand(

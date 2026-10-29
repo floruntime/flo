@@ -32,7 +32,30 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Run the CLI
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const root = try buildRoot(allocator);
+    defer root.deinit();
 
+    // Pass through the args slice provided by main (Juicy Main).
+    const result = root.executeSlice(args);
+    result catch |err| switch (err) {
+        // Each of these already said why.
+        error.HelpRequested, error.VersionRequested => {},
+        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Pending, error.Transport => {},
+        // The commander names the word or flag it couldn't use.
+        error.UnknownCommand, error.UnknownFlag, error.MissingFlagValue, error.InvalidFlagValue => {},
+        error.MissingRequiredFlag, error.MissingRequiredArg, error.TooManyArgs => {},
+        else => {
+            var stderr_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&stderr_buf, "Error: {s}\n", .{@errorName(err)}) catch "Error\n";
+            _ = @import("stdx").io.writeFd(std.posix.STDERR_FILENO, msg);
+        },
+    };
+    const code = outcome.exitCode(result);
+    if (code != 0) std.process.exit(code);
+}
+
+/// The whole command tree.
+fn buildRoot(allocator: std.mem.Allocator) !*commander.Command {
     // Create commands from dedicated modules
     const server = try commands.createServerCommand(allocator);
     const cluster = try commands.createClusterCommand(allocator);
@@ -49,7 +72,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const ts = try commands.createTsCommand(allocator);
     const validate = try commands.createValidateCommand(allocator);
 
-    var root = try commander.newBuilder(allocator)
+    return commander.newBuilder(allocator)
         .name("flo")
         .about("Flo - High-performance distributed platform")
         .usage("flo <command> [args...]")
@@ -165,28 +188,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 .action(wrapHandler(showHelp)),
         )
         .build();
-    defer root.deinit();
-
-    // Pass through the args slice provided by main (Juicy Main).
-    const argv = args;
-
-    // Execute
-    const result = root.executeSlice(argv);
-    result catch |err| switch (err) {
-        // Each of these already said why.
-        error.HelpRequested, error.VersionRequested => {},
-        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Pending, error.Transport => {},
-        // The commander names the word or flag it couldn't use.
-        error.UnknownCommand, error.UnknownFlag, error.MissingFlagValue, error.InvalidFlagValue => {},
-        error.MissingRequiredFlag, error.MissingRequiredArg, error.TooManyArgs => {},
-        else => {
-            var stderr_buf: [512]u8 = undefined;
-            const msg = std.fmt.bufPrint(&stderr_buf, "Error: {s}\n", .{@errorName(err)}) catch "Error\n";
-            _ = @import("stdx").io.writeFd(std.posix.STDERR_FILENO, msg);
-        },
-    };
-    const code = outcome.exitCode(result);
-    if (code != 0) std.process.exit(code);
 }
 
 // ==================== Command Handlers ====================
@@ -331,4 +332,48 @@ fn showHelp(ctx: *commander.Context) commander.Error!void {
     } else {
         ctx.command.printHelp();
     }
+}
+
+// A short flag must mean one thing wherever it can be typed: a command's own
+// `-e` shadows the inherited `-e`, so `flo stream read -e host:port` once set
+// the end ID instead of the endpoint.
+test "cli: every short flag means one thing in each command" {
+    const gpa = std.testing.allocator;
+    const root = try buildRoot(gpa);
+    defer root.deinit();
+    var clashes: usize = 0;
+    try checkShortFlags(gpa, root, &clashes);
+    try std.testing.expectEqual(@as(usize, 0), clashes);
+}
+
+fn checkShortFlags(gpa: std.mem.Allocator, cmd: *commander.Command, clashes: *usize) !void {
+    var visible: std.ArrayListUnmanaged(commander.Flag) = .empty;
+    defer visible.deinit(gpa);
+    try visible.appendSlice(gpa, cmd.flags.items);
+    try visible.appendSlice(gpa, cmd.persistent_flags.items);
+    var up = cmd.parent;
+    while (up) |p| : (up = p.parent) try visible.appendSlice(gpa, p.persistent_flags.items);
+
+    for (visible.items, 0..) |a, i| for (visible.items[i + 1 ..]) |b| {
+        const same_long = std.mem.eql(u8, a.long, b.long);
+        const short_clash = a.short != 0 and a.short == b.short and !same_long;
+        const long_clash = same_long and a.short != b.short;
+        if (short_clash or long_clash) {
+            var names: [8][]const u8 = undefined;
+            var depth: usize = 0;
+            var at: ?*commander.Command = cmd;
+            while (at) |c| : (at = c.parent) {
+                if (depth < names.len) names[depth] = c.name;
+                depth += 1;
+            }
+            var k = @min(depth, names.len);
+            while (k > 0) {
+                k -= 1;
+                std.debug.print("{s} ", .{names[k]});
+            }
+            std.debug.print(": -{c} --{s} vs -{c} --{s}\n", .{ if (a.short == 0) ' ' else a.short, a.long, if (b.short == 0) ' ' else b.short, b.long });
+            clashes.* += 1;
+        }
+    };
+    for (cmd.commands.items) |sub| try checkShortFlags(gpa, sub, clashes);
 }

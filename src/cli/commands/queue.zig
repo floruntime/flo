@@ -52,7 +52,7 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("queue", "Queue name")
                 .arg("payload", "Message payload")
-                .uintFlag("priority", 'p', 0, "Priority (0-255; lower is taken first)")
+                .uintFlag("priority", 0, 0, "Priority (0-255; lower is taken first)")
                 .action(wrapHandler(runEnqueue)),
         )
         .subcommand(
