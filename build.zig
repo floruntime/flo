@@ -170,6 +170,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .filters = test_filters,
+        .test_runner = .{ .path = b.path("tests/e2e/helpers/test_runner.zig"), .mode = .server },
     });
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);

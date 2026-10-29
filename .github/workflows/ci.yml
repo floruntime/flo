@@ -167,6 +167,8 @@ jobs:
           TEST_TIMEOUT: ${{ matrix.test_timeout }}
           FLAGS: ${{ matrix.flags }}
           SKIPS: ${{ matrix.skips }}
+          # The e2e runner appends each test's time here (tests/e2e/helpers/test_runner.zig).
+          FLO_TEST_TIMES: ${{ runner.temp }}/test-times.tsv
         run: |
           set -o pipefail
           zig build "$STEP" --test-timeout "$TEST_TIMEOUT" $FLAGS --summary all 2>&1 | tee build.log
@@ -176,6 +178,26 @@ jobs:
             echo "::error::${skipped:-0} tests skipped, expected $SKIPS ($summary)"; exit 1
           fi
         timeout-minutes: 30
+
+      - name: Slowest tests
+        if: always() && matrix.step == 'test-e2e'
+        env:
+          TIMES: ${{ runner.temp }}/test-times.tsv
+        run: |
+          [ -s "$TIMES" ] || exit 0
+          {
+            echo '### Slowest e2e tests (ms)'; echo '```'
+            sort -rn "$TIMES" | head -20
+            echo '```'; echo '### e2e time per file (ms)'; echo '```'
+            awk -F'\t' '{ f = $2; sub(/\.test\..*/, "", f); t[f] += $1; n[f]++ } END { for (f in t) printf "%d\t%d\t%s\n", t[f], n[f], f }' "$TIMES" | sort -rn
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.step == 'test-e2e'
+        with:
+          name: e2e-test-times
+          path: ${{ runner.temp }}/test-times.tsv
+          if-no-files-found: ignore
 
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
