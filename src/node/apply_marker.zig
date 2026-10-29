@@ -216,6 +216,31 @@ pub fn read(shard_dir: []const u8, shard: u16) Held {
     return held;
 }
 
+/// Zero the records of a stopped shard's marker that name an entry above
+/// `index`, which a salvage dropped: neither is an entry the shard holds
+/// any more. Returns what it cleared.
+pub fn clearAbove(shard_dir: []const u8, shard: u16, index: u64) !Held {
+    const held = read(shard_dir, shard);
+    var cleared: Held = .{};
+    if (held.crash) |c| if (c.index > index) {
+        cleared.crash = c;
+    };
+    if (held.halt) |h| if (h.index > index) {
+        cleared.halt = h;
+    };
+    if (cleared.crash == null and cleared.halt == null) return cleared;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ shard_dir, FILENAME }, 0);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    if (fd < 0) return error.MarkerOpenFailed;
+    defer _ = std.c.close(fd);
+    const zero: [RECORD_SIZE]u8 = @splat(0);
+    if (cleared.crash != null and std.c.pwrite(fd, &zero, zero.len, 0) != zero.len) return error.MarkerWriteFailed;
+    if (cleared.halt != null and std.c.pwrite(fd, &zero, zero.len, RECORD_SIZE) != zero.len) return error.MarkerWriteFailed;
+    if (std.c.fsync(fd) != 0) return error.MarkerWriteFailed;
+    return cleared;
+}
+
 const Applying = struct {
     fd: std.posix.fd_t,
     shard: u16,
@@ -518,4 +543,27 @@ test "apply marker: a fault while recording keeps the first record" {
     var m = try Marker.open(dir, 0);
     defer m.close();
     try testing.expect(m.crashed.?.names(&first));
+}
+
+test "apply marker: a salvage clears the records above its cut and keeps those at or below" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmpPath(&tmp, &pbuf);
+    try testing.expect((try clearAbove(dir, 0, 5)).crash == null);
+    const crash = testEntry(9, 2);
+    try writeCrashForTest(dir, 0, &crash, build_name);
+    {
+        var m = try Marker.open(dir, 0);
+        defer m.close();
+        m.halted(4, 2, 1234);
+    }
+    var cleared = try clearAbove(dir, 0, 5);
+    try testing.expect(cleared.crash.?.names(&crash));
+    try testing.expect(cleared.halt == null);
+    try testing.expect(read(dir, 0).crash == null);
+    try testing.expectEqual(@as(u64, 4), read(dir, 0).halt.?.index);
+    cleared = try clearAbove(dir, 0, 3);
+    try testing.expectEqual(@as(u64, 4), cleared.halt.?.index);
+    try testing.expect(read(dir, 0).halt == null);
 }
