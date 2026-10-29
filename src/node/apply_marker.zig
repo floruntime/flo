@@ -47,6 +47,9 @@ pub const build_name: []const u8 = blk: {
     break :blk full[0..@min(full.len, BUILD_MAX)];
 };
 
+/// This build, as a halt reported to the leader names it.
+pub const build_hash: u64 = std.hash.Wyhash.hash(0, build_name);
+
 /// A crash a marker recorded.
 pub const Crash = struct {
     shard: u16,

@@ -80,6 +80,9 @@ pub const ClusterConfig = struct {
     tiered_log: ServerProcess.TieredLogConfig = .{},
     /// Serve each node's metrics port, for its `/status`.
     metrics_enabled: bool = false,
+    /// Environment added to each node's, by node: one node's build behaving
+    /// unlike the others'.
+    node_env: [MAX_NODES][]const [2][]const u8 = @splat(&.{}),
 };
 
 /// Multi-node cluster context for e2e testing
@@ -122,6 +125,7 @@ pub const ClusterContext = struct {
             .cluster_enabled = true, // Seed node needs Raft listener
             .metrics_enabled = config.metrics_enabled,
         });
+        self.servers[0].?.extra_env = config.node_env[0];
         // Covers every node created so far. A per-iteration `errdefer` in the
         // join loop below would only fire for its own iteration, leaking the
         // nodes already started when a later one fails.
@@ -146,6 +150,7 @@ pub const ClusterContext = struct {
                 .join_addresses = seed_endpoint,
                 .metrics_enabled = config.metrics_enabled,
             });
+            self.servers[i].?.extra_env = config.node_env[i];
             startServerWithRetry(self.servers[i].?) catch |err| {
                 std.debug.print("[cluster] Node {d} of {d} failed to start: {}\n", .{ i, config.node_count, err });
                 return err;

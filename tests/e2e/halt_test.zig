@@ -117,4 +117,65 @@ test "e2e/halt: every node of a three-node group halts at the same entry" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("kept", std.mem.trim(u8, out, &std.ascii.whitespace));
     }
+    // The leader hears every member's halt, the same one, and since it
+    // halted there too, tells no one it halted alone.
+    var told_all = false;
+    var tries: usize = 0;
+    while (!told_all and tries < 40) : (tries += 1) {
+        for (0..3) |i| {
+            const out = try cluster.execCaptureAnyOn(i, &.{ "cluster", "members", "-o", "json" });
+            defer testing.allocator.free(out);
+            var needle_buf: [48]u8 = undefined;
+            const needle = try std.fmt.bufPrint(&needle_buf, "\"halt\":{{\"index\":{d},", .{at.?});
+            if (std.mem.count(u8, out, needle) == 3) told_all = true;
+        }
+        if (!told_all) stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
+    try testing.expect(told_all);
+    for (0..3) |i| {
+        const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(i).?.metrics_port);
+        defer http.deinit();
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        try testing.expectEqual(at, haltIndex(parsed, 0));
+    }
+}
+
+test "e2e/halt: a follower that halts where its leader applied, on the same build, halted alone and is diverged; the group goes on" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    const off: []const [2][]const u8 = &.{.{ test_faults.OFF_ENV, "1" }};
+    var env: @FieldType(stdx.testing.ClusterConfig, "node_env") = @splat(&.{});
+    // Node 2 alone halts at the fault; the seed, which leads, applies it.
+    env[0] = off;
+    env[1] = off;
+    var cluster = try stdx.testing.ClusterContext.init(testing.allocator, .{ .node_count = 3, .metrics_enabled = true, .node_env = env });
+    defer cluster.deinit();
+    testing.allocator.free(try cluster.pollUntilContains(0, &.{ "cluster", "status", "-o", "json" }, "\"role\":\"leader\"", 40, 250));
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", HALT_KEY, "x" }, 20, 250);
+
+    const http = try stdx.testing.HttpRunner.init(testing.allocator, "127.0.0.1", cluster.getServer(2).?.metrics_port);
+    defer http.deinit();
+    var tries: usize = 0;
+    while (tries < 80) : (tries += 1) {
+        const parsed = try nodeStatus(http);
+        defer parsed.deinit();
+        const s = parsed.value.object.get("shards").?.array.items[0].object;
+        if (std.mem.eql(u8, s.get("state").?.string, "diverged")) {
+            try testing.expect(std.mem.indexOf(u8, s.get("reason").?.string, "halted alone") != null);
+            break;
+        }
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    } else {
+        cluster.printLogs();
+        return error.NotDiverged;
+    }
+    // The write applied where it ran, and the group takes writes.
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "after", "taken" }, 20, 250);
+    for (0..2) |i| {
+        const out = try cluster.pollUntilContains(i, &.{ "kv", "get", "after" }, "taken", 40, 250);
+        defer testing.allocator.free(out);
+        const x = try cluster.execCaptureAnyOn(i, &.{ "kv", "get", HALT_KEY });
+        defer testing.allocator.free(x);
+        try testing.expectEqualStrings("x", std.mem.trim(u8, x, &std.ascii.whitespace));
+    }
 }

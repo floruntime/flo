@@ -739,6 +739,7 @@ pub const Shard = struct {
         errdefer allocator.destroy(raft_node);
         raft_node.* = try RaftNode.init(allocator, node_id, @as(u32, shard_id), raftRingCapacity(ual_capacity), raft_config);
         errdefer raft_node.deinit();
+        raft_node.build = apply_marker.build_hash;
         // KV reads judge expiry by the time line the stamps follow.
         partition.kv.read_clock = .{ .ctx = raft_node, .now_ns = RaftNode.nowOpaque };
         const rpc_entries = try allocator.alloc(entry_mod.Entry, RPC_MAX_ENTRIES);
@@ -911,7 +912,7 @@ pub const Shard = struct {
             // keeps the stamp of the entry before.
             raft_node.noteApplied(replayed_stamp);
             if (boot_halt) |*h| {
-                raft_node.halted = true;
+                raft_node.halt_at = .{ .index = h.index, .term = h.term, .crc = h.crc, .build = raft_node.build };
                 marker.halted(h.index, h.term, h.crc);
                 log.err("shard {d} comes up halted at {s}, as it was before the restart. It applies nothing past it and takes no writes until a repair", .{ shard_id, h.reason() });
             }
@@ -3129,7 +3130,7 @@ pub const Shard = struct {
         const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type))) orelse "unknown";
         self.halted = Halt.init(e, "entry {d} ({s}): " ++ fmt, .{ e.header.index, type_name } ++ args);
         const raft = self.raft_node;
-        raft.halted = true;
+        raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .build = raft.build };
         raft.last_applied = e.header.index - 1;
         self.last_entry_applied = false;
         self.skip_scan_from = e.header.index + 1;
@@ -3156,7 +3157,7 @@ pub const Shard = struct {
             };
             log.info("shard {d}: the repair at entry {d} skips entry {d} ({s}); going on past it", .{ self.id, idx, h.index, skip.reason });
             self.halted = null;
-            raft.halted = false;
+            raft.halt_at = null;
             self.marker.resumed();
             // The entry is passed over when the apply reaches it again. One
             // whose apply ran before it halted already left what a pass-over
@@ -3366,7 +3367,11 @@ pub const Shard = struct {
         // or diverged finds it.
         // The reason is the state's: a shard halted, then diverged, says why
         // it diverged.
-        if (self.halted) |*h| slot.halt_index.store(h.index, .monotonic);
+        if (self.halted) |*h| {
+            slot.halt_index.store(h.index, .monotonic);
+            slot.halt_term.store(h.term, .monotonic);
+            slot.halt_crc.store(h.crc, .monotonic);
+        }
         if (self.diverged_damage) |*damage| {
             slot.setReason(damage.reason());
         } else if (self.replica.divergedReason()) |why| {
@@ -3374,7 +3379,11 @@ pub const Shard = struct {
         } else if (self.offline) |*damage| {
             slot.setReason(damage.reason());
         } else if (self.halted) |*h| {
-            slot.setReason(h.reason());
+            var buf: [health_mod.REASON_MAX]u8 = undefined;
+            slot.setReason(if (self.replica.haltAppliedElsewhere())
+                std.fmt.bufPrint(&buf, "{s}; the leader's build applies this entry: upgrade this node", .{h.reason()}) catch h.reason()
+            else
+                h.reason());
         }
         const raft = self.raft_node;
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
@@ -5036,13 +5045,18 @@ pub const Shard = struct {
     /// 0 voter, 1 replica, 2 joining (never caught up). Contact and match
     /// are the leader's; elsewhere, and for the answering node, they are
     /// all ones (unknown). The address is 0 where no link is up.
+    /// A member's row in the members answer: `[id:u32][role:u8][ip4:4]
+    /// [port:u16][contact_ago_ms:u32][match:u64][halted:u8][halt_index:u64]
+    /// [halt_term:u64][halt_crc:u32]`.
+    pub const MEMBER_ROW = 44;
+
     fn dispatchClusterMembers(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const raft = shard.raft_node;
         // A node running alone, or one not yet named, is a group of itself.
         const cfg = if (raft.latest_config.member_count > 0) raft.latest_config else membership.Config.ofVoters(&.{shard.cluster_node_id});
-        var buf: [13 + membership.MAX_MEMBERS * 23 + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
+        var buf: [13 + membership.MAX_MEMBERS * MEMBER_ROW + 1 + membership.MAX_REMOVED * 12]u8 = undefined;
         std.mem.writeInt(u32, buf[0..4], if (shard.raft_network != null) raft.leader_id else shard.cluster_node_id, .little);
         std.mem.writeInt(u64, buf[4..12], raft.commit_index, .little);
         buf[12] = cfg.member_count;
@@ -5064,7 +5078,14 @@ pub const Shard = struct {
             }
             std.mem.writeInt(u32, buf[off + 11 ..][0..4], contact, .little);
             std.mem.writeInt(u64, buf[off + 15 ..][0..8], match, .little);
-            off += 23;
+            // This node's own halt, and a member's as the leader last heard it.
+            const halted_at: ?raft_node_mod.HaltAt = if (m.id == raft.id) raft.halt_at else if (raft.role == .leader) if (raft.peerProgress(m.id)) |p| p.halt else null else null;
+            const h = halted_at orelse raft_node_mod.HaltAt{ .index = 0, .term = 0, .crc = 0, .build = 0 };
+            buf[off + 23] = @intFromBool(halted_at != null);
+            std.mem.writeInt(u64, buf[off + 24 ..][0..8], h.index, .little);
+            std.mem.writeInt(u64, buf[off + 32 ..][0..8], h.term, .little);
+            std.mem.writeInt(u32, buf[off + 40 ..][0..4], h.crc, .little);
+            off += MEMBER_ROW;
         }
         buf[off] = cfg.removed_count;
         off += 1;
@@ -13170,7 +13191,7 @@ fn haltForTest(shard: *Shard, index: u64) void {
     var e = entry_mod.buildEntry(.cg_create, entry_mod.Flags.NONE, 1, index, 0, "");
     e.header.crc32c = e.computeCrc();
     shard.halted = Halt.init(&e, "entry {d}: halted for a test", .{index});
-    shard.raft_node.halted = true;
+    shard.raft_node.halt_at = .{ .index = index, .term = 1, .crc = e.header.crc32c, .build = shard.raft_node.build };
 }
 
 test "a halted shard refuses a client's write, saying where it halted and why, and serves its reads marked stale" {
@@ -13570,7 +13591,7 @@ test "a shard halted before a restart comes up halted at the same entry, with no
     try std.testing.expect(shard.offline == null);
     const h = shard.halted orelse return error.NotHalted;
     try std.testing.expectEqual(halted_at, h.index);
-    try std.testing.expect(shard.raft_node.halted);
+    try std.testing.expect(shard.raft_node.halt_at != null);
     try std.testing.expectEqual(halted_at - 1, shard.raft_node.last_applied);
     // The restored log holds the enqueue; nothing applied it.
     try std.testing.expect(shard.raft_node.log.lastIndex() > halted_at);
@@ -13680,7 +13701,7 @@ test "Shard: a committed skip takes a halted shard past its halt, and a restart 
             _ = try proposeSkip(&shard, h);
             try std.testing.expect(shard.applyCommitted());
             try std.testing.expect(shard.halted == null);
-            try std.testing.expect(!shard.raft_node.halted);
+            try std.testing.expect(shard.raft_node.halt_at == null);
             try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES + 1), DamageTest.queued(&shard));
             live = SkipState.of(&shard, h);
             try shard.flushSegmentToDisk();
@@ -13976,6 +13997,28 @@ test "Shard: a skip of an entry this node applied takes the shard offline: it ho
     try std.testing.expect(!shard.applyCommitted());
     const off = shard.offline orelse return error.NotOffline;
     try std.testing.expectEqual(silent_loss.Path.applied_skipped, off.path);
+}
+
+test "Shard: a halted member whose leader applied its entry on another build says to upgrade, and publishes the halt as a repair names it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    var slot: health_mod.ShardSlot = .{};
+    shard.health = &slot;
+    try std.testing.expect(shard.applyCommitted());
+    haltForTest(&shard, shard.raft_node.last_applied + 1);
+    const h = shard.raft_node.halt_at.?;
+    shard.publishHealth();
+    try std.testing.expectEqual(health_mod.ShardState.halted, slot.get());
+    try std.testing.expectEqual(h.term, slot.halt_term.load(.monotonic));
+    try std.testing.expectEqual(h.crc, slot.halt_crc.load(.monotonic));
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "upgrade") == null);
+    shard.replica.halt_applied_elsewhere = h;
+    shard.publishHealth();
+    try std.testing.expectEqual(health_mod.ShardState.halted, slot.get());
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "the leader's build applies this entry: upgrade this node") != null);
 }
 
 test "Shard: a halted member that then diverges publishes why it diverged, with the index" {

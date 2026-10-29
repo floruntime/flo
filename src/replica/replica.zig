@@ -51,6 +51,12 @@ pub fn Replica(comptime Io: type) type {
         /// Why, for `/status`: where the leader's log disagreed.
         diverged_reason_buf: [160]u8 = undefined,
         diverged_reason_len: u8 = 0,
+        /// The leader, on another build, applied the entry this node is
+        /// halted at: the build is what halts, and upgrading this node
+        /// applies it. Cleared once the halt is gone.
+        halt_applied_elsewhere: ?raft_node_mod.HaltAt = null,
+        /// Diverged because the leader applied the entry this node halted at.
+        halted_alone: bool = false,
         conflicts_seen: u64 = 0,
         /// Last line about a replica speaking out of turn.
         replica_frame_warn_ms: u64 = 0,
@@ -212,6 +218,7 @@ pub fn Replica(comptime Io: type) type {
                         .prev_log_term = hdr.prev_log_term,
                         .leader_commit = hdr.leader_commit,
                         .entries = self.rpc_entries[0..count],
+                        .halt_verdict = hdr.halt_verdict,
                     };
                     const led_by = raft.leader_id;
                     const was = raft.role;
@@ -231,6 +238,14 @@ pub fn Replica(comptime Io: type) type {
                         self.conflicts_seen = raft.committed_conflicts;
                         return self.markDiverged(hdr.leader_id, hdr.term);
                     }
+                    if (hdr.term == raft.current_term) if (raft.halt_at) |h| if (hdr.halt_verdict.about(h)) switch (hdr.halt_verdict.kind) {
+                        .alone => return self.markHaltedAlone(hdr.leader_id, hdr.term, h),
+                        .other_build => if (!self.haltAppliedElsewhere()) {
+                            self.halt_applied_elsewhere = h;
+                            log.warn("shard {d}: leader {d} applied entry {d}, which this node halted at; it runs another build. Upgrade this node to the leader's build and it applies the entry", .{ self.id, hdr.leader_id, h.index });
+                        },
+                        else => {},
+                    };
                     if (was == .leader and raft.role != .leader) self.leadershipLost("a leader with a newer term spoke");
                     if (raft.leader_id != led_by and raft.leader_id != 0) log.info("shard {d}: following node {d} (term {d})", .{ self.id, raft.leader_id, raft.current_term });
                     // A leader of this term still sends to this node as a member.
@@ -486,6 +501,27 @@ pub fn Replica(comptime Io: type) type {
             self.stopTakingPart(DIVERGED_MESSAGE);
         }
 
+        /// The leader applied the entry this node halted at, on the same
+        /// build: the halt is this node's alone, so what it holds is no
+        /// other replica's, and only a wipe and rejoin brings it back.
+        fn markHaltedAlone(self: *Self, leader: u32, term: u64, h: raft_node_mod.HaltAt) void {
+            if (self.diverged) return;
+            self.diverged = true;
+            self.halted_alone = true;
+            const why = std.fmt.bufPrint(&self.diverged_reason_buf, "node {d} (term {d}) applied entry {d}, which this node halted at on the same build: it halted alone", .{ leader, term, h.index }) catch self.diverged_reason_buf[0..0];
+            self.diverged_reason_len = @intCast(why.len);
+            log.err("shard {d}: node {d} (term {d}) applied entry {d}, which this node halted at on the same build; the halt is this node's alone, so its data can no longer be trusted and it has stopped taking part in the group. Stop it, move its data directory aside, and start it again with --join <a live member> (not --cluster)", .{ self.id, leader, term, h.index });
+            self.stopTakingPart(DIVERGED_MESSAGE);
+        }
+
+        /// Whether the leader, on another build, applied the entry this
+        /// node is halted at now.
+        pub fn haltAppliedElsewhere(self: *Self) bool {
+            const e = self.halt_applied_elsewhere orelse return false;
+            const h = self.raftNode().halt_at orelse return false;
+            return std.meta.eql(e, h);
+        }
+
         /// Why the leader's log made this node diverged; null when it didn't.
         pub fn divergedReason(self: *const Self) ?[]const u8 {
             return if (self.diverged_reason_len == 0) null else self.diverged_reason_buf[0..self.diverged_reason_len];
@@ -590,6 +626,12 @@ pub fn Replica(comptime Io: type) type {
             self.stoppedLeading("unavailable: lost leadership before commit — write may still apply");
         }
 
+        /// This node's entry at `index`, its payload in the RPC scratch.
+        fn ownEntry(self: *Self, index: u64) ?*const entry_mod.Entry {
+            if (self.raftNode().log.getRange(index, self.rpc_entries[0..1], self.rpc_arena) != 1) return null;
+            return &self.rpc_entries[0];
+        }
+
         /// The leader loop, once per tick and after anything that changes what
         /// a peer should hear: a heartbeat on its interval, otherwise a batch
         /// from the peer's next index when it is behind and nothing is in
@@ -631,6 +673,9 @@ pub fn Replica(comptime Io: type) type {
                     }
                 }
                 const prev_term = known_term orelse 0;
+                // Before the batch: the leader's own entry is read into the
+                // same scratch.
+                const verdict = if (p.halt) |h| raft.haltVerdictFor(i, self.ownEntry(h.index)) else raft_node_mod.HaltVerdict{};
                 var entries: []const entry_mod.Entry = &.{};
                 if (want_data and !p.below_log) {
                     const count = raft.log.getRange(next, self.rpc_entries, self.rpc_arena);
@@ -654,6 +699,7 @@ pub fn Replica(comptime Io: type) type {
                     .prev_log_term = prev_term,
                     .leader_commit = raft.commit_index,
                     .entries = entries,
+                    .halt_verdict = verdict,
                 };
                 const n = transport.serializeAppendRequest(req, self.rpc_out) orelse {
                     log.err("shard {d}: a batch of {d} entries from index {d} does not fit a frame", .{ self.id, entries.len, next });
@@ -689,7 +735,7 @@ const TestIo = struct {
         const h = of(r);
         if (msg_type == .append_entries) {
             const hdr = transport.deserializeAppendRequestHeader(payload).?;
-            h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count }) catch @panic("OOM");
+            h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count, .verdict = hdr.halt_verdict }) catch @panic("OOM");
         }
         return true;
     }
@@ -741,7 +787,7 @@ const Harness = struct {
     arena: [4096]u8 = undefined,
     out: [8192]u8 = undefined,
 
-    const Append = struct { to: u32, entries: u32 };
+    const Append = struct { to: u32, entries: u32, verdict: raft_node_mod.HaltVerdict = .{} };
 
     fn init(self: *Harness) !void {
         self.* = .{ .replica = undefined, .raft = try RaftNode.init(testing.allocator, 1, 1, 1 << 16, .{ .durable_commits = false }) };
@@ -772,12 +818,76 @@ const Harness = struct {
         self.replica.handleRaftFrame(.{ .source_node = from, .group_id = 1, .msg_type = .append_entries_response, .payload = buf[0..n] });
     }
 
+    /// What the last append to `to` told it about its halt.
+    fn lastVerdictTo(self: *const Harness, to: u32) raft_node_mod.HaltVerdict {
+        var i = self.appends.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.appends.items[i].to == to) return self.appends.items[i].verdict;
+        }
+        return .{};
+    }
+
+    /// An append from `leader` in `term`, carrying `verdict`.
+    fn appendFrom(self: *Harness, leader: u32, term: u64, verdict: raft_node_mod.HaltVerdict) void {
+        var buf: [transport.APPEND_REQ_PREFIX]u8 = undefined;
+        const n = transport.serializeAppendRequest(.{ .term = term, .leader_id = leader, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{}, .halt_verdict = verdict }, &buf).?;
+        self.replica.handleRaftFrame(.{ .source_node = leader, .group_id = 1, .msg_type = .append_entries, .payload = buf[0..n] });
+    }
+
     fn ack(self: *Harness, from: u32, match: u64) void {
         var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
         const n = transport.serializeAppendResponse(.{ .term = self.raft.current_term, .success = true, .match_index = match, .from = from }, &buf).?;
         self.replica.handleRaftFrame(.{ .source_node = from, .group_id = 1, .msg_type = .append_entries_response, .payload = buf[0..n] });
     }
 };
+
+test "replica: a leader that applied the entry a follower halted at tells that follower, and no other" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const at = (try h.raft.propose(.kv_put, 0, "h")).index;
+    var buf: [64]u8 = undefined;
+    const own = h.raft.log.getEntryCopy(at, &buf).?;
+    const halt: raft_node_mod.HaltAt = .{ .index = at, .term = own.header.term, .crc = own.header.crc32c, .build = h.raft.build };
+    var rbuf: [transport.APPEND_RESP_SIZE]u8 = undefined;
+    const n = transport.serializeAppendResponse(.{ .term = h.raft.current_term, .success = true, .match_index = at, .from = 2, .halt = halt }, &rbuf).?;
+    h.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 1, .msg_type = .append_entries_response, .payload = rbuf[0..n] });
+    h.raft.last_applied = at;
+    h.now += h.raft.config.heartbeat_interval_ms;
+    h.replica.pump(h.now);
+    try testing.expectEqual(raft_node_mod.HaltVerdict{ .index = at, .term = halt.term, .kind = .alone }, h.lastVerdictTo(2));
+    try testing.expectEqual(raft_node_mod.HaltVerdict{}, h.lastVerdictTo(3));
+}
+
+test "replica: a follower told it halted alone is diverged; told another build applied it, it says so and stays halted" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const halt: raft_node_mod.HaltAt = .{ .index = 2, .term = 1, .crc = 5, .build = h.raft.build };
+    h.raft.halt_at = halt;
+    const term = h.raft.current_term + 1;
+    // About another halt, or with no verdict: nothing.
+    h.appendFrom(2, term, .{ .index = 3, .term = 1, .kind = .alone });
+    h.appendFrom(2, term, .{ .index = 2, .term = 2, .kind = .alone });
+    h.appendFrom(2, term, .{});
+    try testing.expect(!h.replica.diverged);
+    // A leader of an older term says nothing.
+    h.appendFrom(3, term - 1, .{ .index = 2, .term = 1, .kind = .alone });
+    try testing.expect(!h.replica.diverged);
+
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .kind = .other_build });
+    try testing.expect(!h.replica.diverged);
+    try testing.expect(h.replica.haltAppliedElsewhere());
+    // Said of the halt it was about only.
+    h.raft.halt_at = .{ .index = 2, .term = 1, .crc = 6, .build = h.raft.build };
+    try testing.expect(!h.replica.haltAppliedElsewhere());
+    h.raft.halt_at = halt;
+
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .kind = .alone });
+    try testing.expect(h.replica.diverged and h.replica.halted_alone);
+    try testing.expect(std.mem.indexOf(u8, h.replica.divergedReason().?, "halted alone") != null);
+}
 
 test "replica: a stale ack sends no second batch, and a lost latest ack is resent after the RPC timeout" {
     var h: Harness = undefined;

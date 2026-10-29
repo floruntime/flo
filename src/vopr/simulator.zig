@@ -878,7 +878,7 @@ pub const Simulator = struct {
     fn haltNode(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry) void {
         const at: @TypeOf(self.halt.?) = .{ .index = e.header.index, .term = e.header.term, .hash = std.hash.Wyhash.hash(HASH_SEED, e.payload) };
         node.halted_at = at.index;
-        node.raft.halted = true;
+        node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .build = node.raft.build };
         if (self.halt) |first| {
             if (first.index != at.index or first.term != at.term or first.hash != at.hash) self.checker.fail(.{
                 .invariant = .halt_agreement,
@@ -962,7 +962,7 @@ pub const Simulator = struct {
         if (self.halt) |h| if (node.raft.log.getEntryCopy(h.index, self.apply_buf)) |e| {
             if (e.header.term == h.term and std.hash.Wyhash.hash(HASH_SEED, e.payload) == h.hash) {
                 node.halted_at = h.index;
-                node.raft.halted = true;
+                node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .build = node.raft.build };
             }
         };
         if (node.raft.current_term < prev_term) {
@@ -1119,6 +1119,16 @@ pub const Simulator = struct {
     /// that entry left its sender, one network delay before this node
     /// applied it, could have erased it.
     fn onDiverged(self: *Simulator, node: *SimNode) void {
+        // A leader said it applied the entry this node halted at. Every
+        // replica here halts at the same entry on the same build, so none
+        // ever does.
+        if (node.replica.halted_alone) return self.checker.fail(.{
+            .invariant = .halt_agreement,
+            .node = node.id,
+            .index = node.halted_at,
+            .tick = self.now,
+            .detail = "a halted node was told a leader applied the entry it halted at",
+        });
         const contradicted = node.raft.commit_index + 1;
         const applied_at: ?u64 = if (contradicted <= node.applied_ticks.items.len) node.applied_ticks.items[contradicted - 1] else null;
         const erasable = self.scenario.durability == .async_flush and self.crashes > 0 and
