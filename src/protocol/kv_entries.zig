@@ -53,6 +53,14 @@ pub const Expire = Record(&.{
     .{ .name = "ttl_ms", .T = TtlMs },
 });
 pub const Batch = Record(&.{.{ .name = "ops", .T = BatchOps }});
+/// A JSON document's change at `path`: set to `document`, or deleted when
+/// there is none. Merged with the key's value at apply, so a write that
+/// lands in between is not lost.
+pub const JsonPatch = Record(&.{
+    .{ .name = "key", .T = Key },
+    .{ .name = "path", .T = schema.String(kv_ops.MAX_PATH) },
+    .{ .name = "document", .T = Optional(Bytes(kv_ops.MAX_DOCUMENT)) },
+});
 
 pub const table = [_]entries.Entry{
     .{ .name = "kv.put", .type_code = 0x01, .payload = Put, .max_payload = Put.max_size, .doc = "A key's new value, with its TTL if it has one." },
@@ -60,6 +68,7 @@ pub const table = [_]entries.Entry{
     .{ .name = "kv.batch", .type_code = 0x03, .payload = Batch, .max_payload = Batch.max_size, .doc = "A transaction's writes, applied as one." },
     .{ .name = "kv.incr", .type_code = 0x04, .payload = Incr, .max_payload = Incr.max_size, .doc = "A counter's delta." },
     .{ .name = "kv.expire", .type_code = 0x05, .payload = Expire, .max_payload = Expire.max_size, .doc = "A key's TTL set, or cleared with 0." },
+    .{ .name = "kv.json_patch", .type_code = 0x06, .payload = JsonPatch, .max_payload = JsonPatch.max_size, .doc = "A JSON document set or deleted at a path, merged with the key's value at apply." },
 };
 
 /// The payload schema of the KV entry with UAL type `type_code`.
@@ -94,7 +103,7 @@ comptime {
     std.debug.assert(MAX_PAYLOAD == limits.MAX_LOG_ENTRY_PAYLOAD);
     // A single-key entry leads with its key, so waiters and metrics read
     // it without knowing which entry it is.
-    for (.{ Put, Delete, Incr, Expire }) |P| std.debug.assert(std.mem.eql(u8, P.field_list[0].name, "key") and P.field_list[0].T == Key);
+    for (.{ Put, Delete, Incr, Expire, JsonPatch }) |P| std.debug.assert(std.mem.eql(u8, P.field_list[0].name, "key") and P.field_list[0].T == Key);
     for (table) |e| std.debug.assert(e.max_payload <= limits.MAX_LOG_ENTRY_PAYLOAD);
 }
 

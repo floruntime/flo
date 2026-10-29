@@ -250,6 +250,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .kv_delete => try declare(out, (kv_entries.Delete.decodeAll(e.payload, &diag) catch return).key),
         .kv_incr => try declare(out, (kv_entries.Incr.decodeAll(e.payload, &diag) catch return).key),
         .kv_expire => try declare(out, (kv_entries.Expire.decodeAll(e.payload, &diag) catch return).key),
+        .kv_json_patch => try declare(out, (kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return).key),
         .kv_batch => {
             const batch = kv_entries.Batch.decodeAll(e.payload, &diag) catch return;
             var it = batch.ops.iterator();
@@ -285,7 +286,8 @@ fn split(qkey: []const u8) ApplyError!Qualified {
 
 /// Answers: put, the key's version; delete, whether the key was there
 /// (u8); incr, its version and value; expire, nothing; batch, its op
-/// count (u16). A payload that won't decode is a bug in the proposer, and
+/// count (u16); a JSON patch, the key's new version, 0 when it deleted the
+/// key. A payload that won't decode is a bug in the proposer, and
 /// halts. An incr that overflows or meets a non-counter, and an expire of a
 /// key that's gone, are refused; inside a batch they refuse the whole
 /// batch, so a transaction applies whole or not at all.
@@ -311,6 +313,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .kv_expire => {
             const p = kv_entries.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
             expire(view, try split(p.key), time_units.expiryAfter(at.ns, p.ttl_ms), at) catch |err| return refused(out, err, "");
+        },
+        .kv_json_patch => {
+            const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return error.Halt;
+            out.putInt(u64, try jsonPatch(view, try split(p.key), p.path, p.document, at, out));
         },
         .kv_batch => {
             // Decoded and checked whole before any op applies.
@@ -468,6 +474,53 @@ fn incr(view: *View, q: Qualified, delta: i64, at: Stamp) (ApplyError || error{ 
     return .{ .version = try put(view, q, &buf, .counter, at, 0), .value = result };
 }
 
+/// Set (`document`) or delete (none) the JSON at `path` in `q`'s document,
+/// merged with its value as this entry finds it. `$` on a missing key
+/// writes the whole document; `$` with none deletes the key. As any whole
+/// write, it clears the key's TTL. Returns the new version, 0 when the key
+/// was deleted; a path or document the merge can't take is refused, and
+/// answers nothing.
+fn jsonPatch(view: *View, q: Qualified, path: []const u8, document: ?[]const u8, at: Stamp, out: *Result) ApplyError!u64 {
+    const json_path = @import("../util/json_path.zig");
+    const handler = @import("handler.zig");
+    var kb: [MAX_KEY]u8 = undefined;
+    const cur = try view.get(Values, valueKey(&kb, q));
+    const live = if (cur) |c| !c.tombstone and !c.expiredAt(at.ns) else false;
+    const whole = std.mem.eql(u8, path, "$");
+    const refuse = struct {
+        fn f(o: *Result, err: anyerror) u64 {
+            const r = handler.KVHandler.refusal(switch (err) {
+                error.NotFound => error.NotFound,
+                error.TooLarge => error.TooLarge,
+                else => handler.KVHandler.jsonError(@errorCast(err)),
+            });
+            o.refuse(r.status, r.refusal.reason, r.refusal.message);
+            return 0;
+        }
+    }.f;
+    if (document) |doc| {
+        const merged = if (live)
+            json_path.jsonPathSet(view.arena, cur.?.value, path, doc) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return refuse(out, err),
+            }
+        else if (whole) doc else return refuse(out, error.NotFound);
+        // The merge may grow the document past what a key holds.
+        if (merged.len > kv_ops.MAX_VALUE) return refuse(out, error.TooLarge);
+        return put(view, q, merged, .json, at, 0);
+    }
+    if (!live) return refuse(out, error.NotFound);
+    if (whole) {
+        _ = try delete(view, q, at);
+        return 0;
+    }
+    const rest = json_path.jsonPathDel(view.arena, cur.?.value, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return refuse(out, err),
+    };
+    return put(view, q, rest, .json, at, 0);
+}
+
 /// Set `q`'s TTL without a new version: a TTL isn't a value. 0 clears it.
 fn expire(view: *View, q: Qualified, expiry_ns: u64, at: Stamp) (ApplyError || error{NotFound})!void {
     var kb: [MAX_KEY]u8 = undefined;
@@ -489,7 +542,7 @@ pub fn owns(t: entry_mod.EntryType) bool {
 
 pub const machine: machine_mod.Machine = .{
     .name = "kv",
-    .entry_types = &.{ .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire },
+    .entry_types = &.{ .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch },
     .families = &.{ machine_mod.info(Values), machine_mod.info(History), machine_mod.info(NsCounts) },
     .keys = keys,
     .apply = apply,

@@ -63,9 +63,9 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const RaftNetwork = network_mode.RaftNetwork;
 
-/// The largest single-key KV entry, a put: what `proposeKV` borrows
-/// scratch for. A transaction's batch is larger and allocated.
-pub const MAX_KEY_ENTRY_PAYLOAD: usize = kv_entries.Put.max_size;
+/// The largest single-key KV entry: what `proposeKV` borrows scratch for.
+/// A transaction's batch is larger and allocated.
+pub const MAX_KEY_ENTRY_PAYLOAD: usize = @max(kv_entries.Put.max_size, kv_entries.JsonPatch.max_size);
 
 /// Re-export from centralized namespace module for local convenience.
 const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
@@ -728,14 +728,9 @@ pub const KVHandler = struct {
         const self = shard.kv_handler;
         if (!json_depth.within(document)) return error.TooDeep;
         if (!(std.json.validate(self.allocator, document) catch return error.Internal)) return error.NotJson;
-        const merged: []u8 = if (self.kv.get(qkey)) |e|
-            json_path.jsonPathSet(self.allocator, e.value, path, document) catch |err| return jsonError(err)
-        else if (std.mem.eql(u8, path, "$"))
-            self.allocator.dupe(u8, document) catch return error.Internal
-        else
-            return error.NotFound;
-        defer self.allocator.free(merged);
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = merged, .ttl_ms = null }) catch |err| return proposeError(err);
+        // Merged with the key's value at apply, not here: a write between
+        // this read and the apply would otherwise be lost.
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = document }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerJsonSet } };
     }
@@ -756,29 +751,20 @@ pub const KVHandler = struct {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
         const self = shard.kv_handler;
-        const e = self.kv.get(qkey) orelse return error.NotFound;
-        if (std.mem.eql(u8, path, "$")) {
-            const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
-            return .{ .park = .{ .proposed = proposed, .answer = answerJsonDeleted } };
-        }
-        const rest = json_path.jsonPathDel(self.allocator, e.value, path) catch |err| return jsonError(err);
-        defer self.allocator.free(rest);
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = rest, .ttl_ms = null }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .answer = answerJsonPut } };
+        _ = self;
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = null }) catch |err| return proposeError(err);
+        return .{ .park = .{ .proposed = proposed, .answer = answerJsonDel } };
     }
 
-    /// The path was deleted from the document: its version now.
-    fn answerJsonPut(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+    /// The path was deleted: the document's version now, or none when `$`
+    /// deleted the key.
+    fn answerJsonDel(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
         var r = result.reader();
-        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
+        const version = r.int(u64) orelse 0;
+        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = if (version == 0) null else version });
     }
 
-    /// `$` was deleted: the key went with it, and has no version.
-    fn answerJsonDeleted(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
-        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = null });
-    }
-
-    fn jsonError(err: json_path.PathError) Error {
+    pub fn jsonError(err: json_path.PathError) Error {
         return switch (err) {
             error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => error.PathNotFound,
             error.InvalidPath => error.BadPath,

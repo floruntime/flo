@@ -404,7 +404,7 @@ test "kv machine: keys of one namespace never reach another's, and the default n
     try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", &names));
 }
 
-test "kv machine: a key with no namespace halts its entry, a put's or a transaction's, before anything changes" {
+test "kv machine: a key with no namespace halts its entry, a put's, a patch's or a transaction's, before anything changes" {
     var kv = TestKv.init(testing.allocator);
     defer kv.deinit();
     try kv.put("k", "v", 0);
@@ -418,6 +418,7 @@ test "kv machine: a key with no namespace halts its entry, a put's or a transact
     }, 3, 0);
     defer testing.allocator.free(b.payload);
     try testing.expectError(error.Halt, kv.apply(&b.entry));
+    try testing.expectError(error.Halt, patch(&kv, "\x00k", "$", "{}"));
     try testing.expectEqual(before, store_mod.checksum(&kv.store, machine.Values.ID));
     try testing.expectEqual(@as(u64, 0), kv.store.undeclared_keys);
 }
@@ -485,4 +486,54 @@ test "kv machine: random entries keep every namespace's counts equal to a recoun
             }
         }
     }
+}
+
+fn patch(kv: *TestKv, key: []const u8, path: []const u8, document: ?[]const u8) !@import("../storage/persistence.zig").Result {
+    var buf: [512]u8 = undefined;
+    return kv.apply(&testEntry(&buf, .kv_json_patch, .{ .key = key, .path = path, .document = document }, kv.index + 1, STAMP));
+}
+
+test "kv machine: JSON patches merge at apply, so two built from the same document both land" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    _ = try patch(&kv, "doc", "$", "{\"a\":0,\"b\":0}");
+    // Both clients read version 1 and proposed: each change merges with
+    // what the entry before it left.
+    _ = try patch(&kv, "doc", "$.a", "1");
+    var r = try patch(&kv, "doc", "$.b", "2");
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u64, 3), rd.int(u64));
+    const json_path = @import("../util/json_path.zig");
+    for ([_][2][]const u8{ .{ "$.a", "1" }, .{ "$.b", "2" } }) |want| {
+        const got = try json_path.jsonPathGet(testing.allocator, kv.state().get("doc").?.value, want[0]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want[1], got);
+    }
+    try testing.expectEqual(machine.ValueType.json, kv.state().get("doc").?.value_type);
+}
+
+test "kv machine: a JSON patch sets $ on a missing key, deletes the key at $, and refuses what the merge can't take" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    // Not there: only the whole document can be set.
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$.a", "1")).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$", null)).refused().?.refusal.reason);
+    try testing.expect(kv.state().getRaw("doc") == null);
+    _ = try patch(&kv, "doc", "$", "{\"a\":{\"x\":1}}");
+    // A path with nothing at it, or a value that isn't JSON: refused, unchanged.
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$.nope.deeper", "1")).refused().?.refusal.reason);
+    try kv.put("text", "not json", STAMP);
+    try testing.expectEqual(proto.Reason.wrong_type, (try patch(&kv, "text", "$.a", "1")).refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 1), kv.state().get("doc").?.version);
+    // A path deleted leaves the rest; $ deleted takes the key, answering 0.
+    var r = try patch(&kv, "doc", "$.a.x", null);
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u64, 2), rd.int(u64));
+    try testing.expectEqualStrings("{\"a\":{}}", kv.state().get("doc").?.value);
+    r = try patch(&kv, "doc", "$", null);
+    rd = r.reader();
+    try testing.expectEqual(@as(?u64, 0), rd.int(u64));
+    try testing.expect(kv.state().get("doc") == null);
+    // "text" is the one live key left.
+    try testing.expectEqual(@as(u64, 1), kv.state().liveKeys("default"));
 }
