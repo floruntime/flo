@@ -48,8 +48,16 @@ pub const SystemManifest = struct {
 
         const content = try @import("stdx").fs.readToEndAlloc(file, allocator, 4096);
         defer allocator.free(content);
+        return try parse(allocator, content);
+    }
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    /// A SYSTEM file's content, or `error.InvalidManifest` for anything
+    /// that isn't one.
+    pub fn parse(allocator: Allocator, content: []const u8) !SystemManifest {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidManifest,
+        };
         defer parsed.deinit();
 
         // A hand-edited file is refused, never cast into a wrong topology.

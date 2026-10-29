@@ -71,8 +71,8 @@ test "e2e/data-dir: a non-empty directory that isn't Flo's refuses to start, exi
     try testing.expect(!try server.logsContain("wipe"));
     const left = try listing(allocator, server.data_dir);
     defer allocator.free(left);
-    // The lock is all the refused start added.
-    try testing.expectEqualStrings("flo.lock notes.txt", left);
+    // Not even its lock file is left behind.
+    try testing.expectEqualStrings("notes.txt", left);
 }
 
 test "e2e/data-dir: a Flo directory without FORMAT refuses to start, exit 78, naming wipe; after wipe the server starts on it afresh" {
@@ -228,11 +228,11 @@ test "e2e/data-dir: wipe --keep-as moves the contents aside, where the next star
     const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
     defer cli.deinit();
 
-    for ([_][]const u8{ "a/b", "..", "." }) |bad| {
+    for ([_][]const u8{ "", "a/b", "..", "." }) |bad| {
         var refused = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir, "--keep-as", bad, "--yes" });
         defer refused.deinit();
         try testing.expectEqual(@as(u8, 2), refused.exit_code);
-        try testing.expect(refused.stderrContains("Error: --keep-as must be"));
+        try testing.expect(refused.stderrContains(if (bad.len == 0) "Error: --keep-as needs a name" else "Error: --keep-as must be"));
     }
     const untouched = try listing(allocator, server.data_dir);
     defer allocator.free(untouched);
@@ -275,8 +275,158 @@ test "e2e/data-dir: wipe refuses a directory that holds no Flo data, and deletes
     var refused = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir, "--yes" });
     defer refused.deinit();
     try testing.expectEqual(@as(u8, 3), refused.exit_code);
-    const want = try std.fmt.allocPrint(allocator, "Error: {s} holds no Flo data (no FORMAT, SYSTEM or shard directory); wipe deletes only a Flo data directory's contents", .{server.data_dir});
+    const want = try std.fmt.allocPrint(allocator, "Error: {s} holds no Flo data (no FORMAT or SYSTEM Flo wrote, no shard directory); wipe deletes only a Flo data directory's contents", .{server.data_dir});
     defer allocator.free(want);
     try testing.expectEqualStrings(want, std.mem.trim(u8, refused.stderr, &std.ascii.whitespace));
     try testing.expect(exists(notes));
+}
+
+test "e2e/data-dir: wipe needs the directory named, and never deletes a default one" {
+    const allocator = testing.allocator;
+    const server = try ranOnce(allocator);
+    defer server.deinit();
+    const before = try listing(allocator, server.data_dir);
+    defer allocator.free(before);
+    const root = std.fs.path.dirname(server.data_dir).?;
+    // A config that names no data_dir: the default would be ~/.flo/data.
+    const bare = try std.fmt.allocPrint(allocator, "{s}/bare.toml", .{root});
+    defer allocator.free(bare);
+    try writeFile(bare, "[server]\nport = 9000\n");
+
+    const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+    for ([_]struct { args: []const []const u8, says: []const u8 }{
+        .{ .args = &.{ "server", "wipe", "--yes" }, .says = "Error: wipe needs --data-dir, or -c with a config that sets data_dir: it never deletes a default directory\n" },
+        .{ .args = &.{ "server", "wipe", "--data-dir", "", "--yes" }, .says = "Error: --data-dir is empty; wipe needs the directory it deletes named\n" },
+        .{ .args = &.{ "server", "wipe", "-c", "", "--yes" }, .says = "Error: wipe needs --data-dir, or -c with a config that sets data_dir: it never deletes a default directory\n" },
+        .{ .args = &.{ "server", "wipe", "-c", bare, "--yes" }, .says = "sets no data_dir, and wipe never deletes a default directory; give --data-dir\n" },
+    }) |c| {
+        var r = try cli.runRaw(c.args);
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 2), r.exit_code);
+        try testing.expect(std.mem.endsWith(u8, r.stderr, c.says));
+    }
+    // A config that names it is enough.
+    const named = try std.fmt.allocPrint(allocator, "{s}/named.toml", .{root});
+    defer allocator.free(named);
+    const named_text = try std.fmt.allocPrint(allocator, "[server]\ndata_dir = \"{s}\"\n", .{server.data_dir});
+    defer allocator.free(named_text);
+    try writeFile(named, named_text);
+    var by_config = try cli.runRaw(&.{ "server", "wipe", "-c", named });
+    defer by_config.deinit();
+    try testing.expectEqual(@as(u8, 0), by_config.exit_code);
+    try testing.expect(by_config.stdoutContains(server.data_dir));
+    const after = try listing(allocator, server.data_dir);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "e2e/data-dir: names that only look like Flo's markers are no Flo data: boot refuses, wipe refuses, nothing goes" {
+    const allocator = testing.allocator;
+    const server = try ServerProcess.initWithConfig(allocator, .{ .shards = 1 });
+    defer server.deinit();
+    const d = server.data_dir;
+    const root = std.fs.path.dirname(d).?;
+    // A SYSTEM that isn't one, a directory named FORMAT, a shard-named
+    // directory with no log, and a SYSTEM link to a real one elsewhere.
+    const real = try std.fmt.allocPrint(allocator, "{s}/real-SYSTEM", .{root});
+    defer allocator.free(real);
+    try writeFile(real, "{\"shards\": 1}");
+    for ([_][]const u8{ "FORMAT", "94110" }) |n| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ d, n });
+        defer allocator.free(p);
+        try stdx.fs.makePath(p);
+    }
+    const resume_path = try std.fmt.allocPrint(allocator, "{s}/resume.txt", .{d});
+    defer allocator.free(resume_path);
+    try writeFile(resume_path, "mine\n");
+    const link = try std.fmt.allocPrintSentinel(allocator, "{s}/SYSTEM", .{d}, 0);
+    defer allocator.free(link);
+    const real_z = try allocator.dupeSentinel(u8, real, 0);
+    defer allocator.free(real_z);
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(real_z, link));
+    const before = try listing(allocator, d);
+    defer allocator.free(before);
+
+    const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+    var wiped = try cli.runRaw(&.{ "server", "wipe", "--data-dir", d, "--yes" });
+    defer wiped.deinit();
+    try testing.expectEqual(@as(u8, 3), wiped.exit_code);
+    try testing.expect(wiped.stderrContains("holds no Flo data"));
+    server.dump_log_on_failure = false;
+    try testing.expectError(error.ServerNotReady, server.startWithTimeout(3000));
+    var why: [64]u8 = undefined;
+    try testing.expectEqualStrings("exited with code 78", server.abnormalExit(&why).?);
+    try testing.expect(try server.logsContain("FORMAT doesn't hold a data directory format"));
+    const after = try listing(allocator, d);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "e2e/data-dir: wipe names what Flo never wrote before deleting it, in the dry run and with --yes" {
+    const allocator = testing.allocator;
+    const server = try ranOnce(allocator);
+    defer server.deinit();
+    const stray = try std.fmt.allocPrint(allocator, "{s}/resume.txt", .{server.data_dir});
+    defer allocator.free(stray);
+    try writeFile(stray, "mine\n");
+
+    const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+    var dry = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir });
+    defer dry.deinit();
+    try testing.expectEqual(@as(u8, 0), dry.exit_code);
+    const want = try std.fmt.allocPrint(allocator, "Would delete 5 entries from {s}:\n  FORMAT\n  SYSTEM\n  resume.txt\n  00000\n  00001\n1 of them Flo never writes, and would go too:\n  resume.txt\nEverything in them is gone for good. Run again with --yes to do it.\n", .{server.data_dir});
+    defer allocator.free(want);
+    try testing.expectEqualStrings(want, dry.stdout);
+    try testing.expect(exists(stray));
+
+    var yes = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir, "--yes" });
+    defer yes.deinit();
+    try testing.expectEqual(@as(u8, 0), yes.exit_code);
+    const warned = try std.fmt.allocPrint(allocator, "Warning: 1 entries in {s} are not Flo's, and go with the rest:\n  resume.txt\n", .{server.data_dir});
+    defer allocator.free(warned);
+    try testing.expectEqualStrings(warned, yes.stderr);
+    try testing.expect(!exists(stray));
+}
+
+test "e2e/data-dir: a wipe cut short leaves a directory the server refuses, naming wipe, and a second wipe finishes" {
+    const allocator = testing.allocator;
+    const server = try ranOnce(allocator);
+    defer server.deinit();
+    // A stray directory whose contents can't be deleted: the wipe stops
+    // there, after FORMAT and SYSTEM and before the shards.
+    const stuck = try std.fmt.allocPrint(allocator, "{s}/stray/inner", .{server.data_dir});
+    defer allocator.free(stuck);
+    try stdx.fs.makePath(stuck);
+    const stray_z = try std.fmt.allocPrintSentinel(allocator, "{s}/stray", .{server.data_dir}, 0);
+    defer allocator.free(stray_z);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(stray_z, 0o500));
+    defer _ = std.c.chmod(stray_z, 0o700);
+
+    const cli = try CliRunner.init(allocator, server.flo_binary, "127.0.0.1:1");
+    defer cli.deinit();
+    var cut = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir, "--yes" });
+    defer cut.deinit();
+    try testing.expectEqual(@as(u8, 3), cut.exit_code);
+    try testing.expect(cut.stderrContains("/stray: "));
+    try testing.expect(cut.stderrContains("run wipe again to finish"));
+    const left = try listing(allocator, server.data_dir);
+    defer allocator.free(left);
+    try testing.expectEqualStrings("00000 00001 flo.lock stray", left);
+
+    const says = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (before format gating); this server needs format 1. There is no migration: run flo server wipe --data-dir {s}", .{ server.data_dir, server.data_dir });
+    defer allocator.free(says);
+    const again = try ServerProcess.initWithConfig(allocator, .{ .shards = 2, .data_dir_of = server.data_dir });
+    defer again.deinit();
+    try expectRefused(again, says);
+
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(stray_z, 0o700));
+    var done = try cli.runRaw(&.{ "server", "wipe", "--data-dir", server.data_dir, "--yes" });
+    defer done.deinit();
+    try testing.expectEqual(@as(u8, 0), done.exit_code);
+    const empty = try listing(allocator, server.data_dir);
+    defer allocator.free(empty);
+    try testing.expectEqualStrings("flo.lock", empty);
 }

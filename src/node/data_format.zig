@@ -66,42 +66,75 @@ pub fn isRefusal(err: anyerror) bool {
     };
 }
 
-/// What a directory's names say it is.
+/// What one entry of a data directory is.
+pub const Kind = enum {
+    /// Only Flo writes it, and it holds what Flo writes: a `FORMAT` that
+    /// parses, a `SYSTEM` that loads, a shard directory holding `segs/`.
+    marker,
+    /// What a directory may hold and still be empty (`emptyAllows`).
+    allowed,
+    /// Anything else, a name Flo uses holding something else among them.
+    other,
+};
+
+/// What the entry `name` of `dir` is, read through `dir`, never following
+/// a link: a link named like a marker is `other`.
+pub fn classify(allocator: Allocator, dir: stdx.fs.Dir, name: []const u8, kind: stdx.fs.File.Kind) Kind {
+    if (emptyAllows(name)) return .allowed;
+    return if (isMarker(allocator, dir, name, kind)) .marker else .other;
+}
+
+fn isMarker(allocator: Allocator, dir: stdx.fs.Dir, name: []const u8, kind: stdx.fs.File.Kind) bool {
+    const io = stdx.io.instance();
+    if (std.mem.eql(u8, name, FILENAME)) {
+        if (kind != .file) return false;
+        var buf: [64]u8 = undefined;
+        const text = dir.readFile(io, name, &buf) catch return false;
+        return parse(text) != null;
+    }
+    if (std.mem.eql(u8, name, SYSTEM_FILENAME)) {
+        if (kind != .file) return false;
+        var buf: [4096]u8 = undefined;
+        const text = dir.readFile(io, name, &buf) catch return false;
+        _ = @import("manifest.zig").SystemManifest.parse(allocator, text) catch return false;
+        return true;
+    }
+    if (kind != .directory or !isShardDir(name)) return false;
+    var path_buf: [16]u8 = undefined;
+    const segs = std.fmt.bufPrint(&path_buf, "{s}/segs", .{name}) catch return false;
+    const st = dir.statFile(io, segs, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .directory;
+}
+
+/// What a directory's entries say it is.
 pub const Contents = struct {
-    /// `FORMAT`, `SYSTEM` or a shard directory: Flo wrote here.
+    /// It holds one of Flo's markers: Flo wrote here.
     flo: bool = false,
-    /// The first name that is neither Flo's nor allowed in an empty directory.
+    /// The first entry that is neither a marker nor allowed in an empty one.
     other: ?[]const u8 = null,
     other_buf: [std.fs.max_name_bytes]u8 = undefined,
 };
 
-/// Reads the names in `data_path`, not following any.
-pub fn scan(data_path: []const u8) !Contents {
+/// Reads the entries of `dir`, opened by the caller, not following any.
+pub fn scan(allocator: Allocator, dir: stdx.fs.Dir) !Contents {
     var c: Contents = .{};
-    const io = stdx.io.instance();
-    const dir = try stdx.fs.openDir(data_path, .{ .iterate = true });
-    defer stdx.fs.closeDir(dir);
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (isMarker(entry.name, entry.kind)) {
-            c.flo = true;
-        } else if (!emptyAllows(entry.name) and c.other == null) {
-            const n = @min(entry.name.len, c.other_buf.len);
-            @memcpy(c.other_buf[0..n], entry.name[0..n]);
-            c.other = c.other_buf[0..n];
+    while (try it.next(stdx.io.instance())) |entry| {
+        switch (classify(allocator, dir, entry.name, entry.kind)) {
+            .marker => c.flo = true,
+            .allowed => {},
+            .other => if (c.other == null) {
+                const n = @min(entry.name.len, c.other_buf.len);
+                @memcpy(c.other_buf[0..n], entry.name[0..n]);
+                c.other = c.other_buf[0..n];
+            },
         }
     }
     return c;
 }
 
-/// A name only Flo writes in a data directory.
-fn isMarker(name: []const u8, kind: stdx.fs.File.Kind) bool {
-    if (std.mem.eql(u8, name, FILENAME) or std.mem.eql(u8, name, SYSTEM_FILENAME)) return true;
-    return kind == .directory and isShardDir(name);
-}
-
-/// A shard's directory: its number in five digits.
-fn isShardDir(name: []const u8) bool {
+/// A shard's directory name: its number in five digits.
+pub fn isShardDir(name: []const u8) bool {
     if (name.len != 5) return false;
     for (name) |ch| if (!std.ascii.isDigit(ch)) return false;
     return true;
@@ -110,10 +143,10 @@ fn isShardDir(name: []const u8) bool {
 /// What a directory may hold and still be empty: what a mount point brings
 /// (`lost+found`), dotfiles (a wipe's kept copy among them), and what a
 /// server leaves before it writes `FORMAT`: its lock and PID file, its admin
-/// socket, and a `FORMAT` write a crash cut short.
+/// socket, and a `FORMAT` or `SYSTEM` write a crash cut short.
 pub fn emptyAllows(name: []const u8) bool {
     if (name.len > 0 and name[0] == '.') return true;
-    for ([_][]const u8{ "lost+found", LOCK_FILENAME, PID_FILENAME, ADMIN_SOCKET_FILENAME, FILENAME ++ ".tmp" }) |n| {
+    for ([_][]const u8{ "lost+found", LOCK_FILENAME, PID_FILENAME, ADMIN_SOCKET_FILENAME, FILENAME ++ ".tmp", SYSTEM_FILENAME ++ ".tmp" }) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
@@ -125,8 +158,10 @@ fn read(allocator: Allocator, data_path: []const u8, buf: *[MESSAGE_MAX]u8) !Fou
     const path = try std.fs.path.join(allocator, &.{ data_path, FILENAME });
     defer allocator.free(path);
     const text = stdx.fs.readFileAlloc(allocator, path, 64) catch |err| switch (err) {
-        error.FileNotFound => return unformatted(data_path, buf),
-        error.FileTooBig => return .{ .refusal = unreadable(buf, path, null) },
+        error.FileNotFound => return unformatted(allocator, data_path, buf),
+        // Not a file of a number: refused as not holding a format, the same
+        // as one holding something else.
+        error.FileTooBig, error.IsDir => return .{ .refusal = unreadable(buf, path, null) },
         else => return err,
     };
     defer allocator.free(text);
@@ -143,8 +178,10 @@ fn read(allocator: Allocator, data_path: []const u8, buf: *[MESSAGE_MAX]u8) !Fou
 }
 
 /// A directory without `FORMAT`: empty, an older Flo's, or not Flo's.
-fn unformatted(data_path: []const u8, buf: *[MESSAGE_MAX]u8) !Found {
-    const c = try scan(data_path);
+fn unformatted(allocator: Allocator, data_path: []const u8, buf: *[MESSAGE_MAX]u8) !Found {
+    const dir = try stdx.fs.openDir(data_path, .{ .iterate = true });
+    defer stdx.fs.closeDir(dir);
+    const c = try scan(allocator, dir);
     if (c.flo) return .{ .refusal = .{
         .err = error.DataFormatMissing,
         .message = std.fmt.bufPrint(buf, "data directory {s} was written by an older Flo (before format gating); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ data_path, CURRENT, data_path }) catch "data directory written before format gating",
@@ -187,8 +224,11 @@ fn unreadable(buf: *[MESSAGE_MAX]u8, path: []const u8, text: ?[]const u8) Refusa
 fn write(allocator: Allocator, data_path: []const u8, path: []const u8) !void {
     const tmp = try std.fs.path.join(allocator, &.{ data_path, FILENAME ++ ".tmp" });
     defer allocator.free(tmp);
+    // Exclusive, so the temporary is this write's own file, never one a
+    // link named: a crash's leftover goes first.
+    stdx.fs.deleteFile(tmp) catch |err| if (err != error.FileNotFound) return err;
     {
-        const file = try stdx.fs.createFile(tmp, .{});
+        const file = try stdx.fs.createFile(tmp, .{ .exclusive = true });
         defer stdx.fs.closeFile(file);
         var buf: [16]u8 = undefined;
         try stdx.fs.writeAll(file, std.fmt.bufPrint(&buf, "{d}\n", .{CURRENT}) catch unreachable);
@@ -240,8 +280,8 @@ test "data format: a Flo directory without FORMAT is an older Flo's, refused wit
         const dir = try tmpDataDir(&tmp);
         defer testing.allocator.free(dir);
         switch (marker) {
-            .system => stdx.fs.closeFile(try tmp.dir.createFile(io, SYSTEM_FILENAME, .{})),
-            .shard => try tmp.dir.createDir(io, "00003", .default_dir),
+            .system => try tmp.dir.writeFile(io, .{ .sub_path = SYSTEM_FILENAME, .data = "{\"shards\": 2}" }),
+            .shard => try tmp.dir.createDirPath(io, "00003/segs"),
         }
         try testing.expectError(error.DataFormatMissing, check(testing.allocator, dir));
         var buf: [MESSAGE_MAX]u8 = undefined;
@@ -277,6 +317,57 @@ test "data format: a non-empty directory that isn't Flo's is refused, without su
         try testing.expect(std.mem.indexOf(u8, r.message, "wipe") == null);
         try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, FILENAME, .{}));
     }
+}
+
+test "data format: a marker is what Flo writes, not only its name" {
+    const io = stdx.io.instance();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    // Each of these names a marker and holds something else.
+    try tmp.dir.createDirPath(io, "fake/FORMAT"); // a directory named FORMAT
+    try tmp.dir.createDirPath(io, "junk");
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk/SYSTEM", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk/FORMAT", .data = "two\n" });
+    try tmp.dir.createDirPath(io, "junk/94110"); // a shard's name, no segs/
+    try tmp.dir.createDirPath(io, "real/00000/segs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/SYSTEM", .data = "{\"shards\": 1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/FORMAT", .data = "1\n" });
+    try tmp.dir.createDirPath(io, "links");
+    try tmp.dir.symLink(io, "../real/SYSTEM", "links/SYSTEM", .{});
+    try tmp.dir.symLink(io, "../real/00000", "links/00001", .{ .is_directory = true });
+
+    for ([_][]const u8{ "fake", "junk", "links" }) |sub| {
+        const d = try tmp.dir.openDir(io, sub, .{ .iterate = true });
+        defer stdx.fs.closeDir(d);
+        const c = try scan(a, d);
+        if (c.flo) std.debug.print("{s} read as Flo's\n", .{sub});
+        try testing.expect(!c.flo);
+        try testing.expect(c.other != null);
+    }
+    const real = try tmp.dir.openDir(io, "real", .{ .iterate = true });
+    defer stdx.fs.closeDir(real);
+    for ([_]struct { name: []const u8, kind: stdx.fs.File.Kind }{ .{ .name = "00000", .kind = .directory }, .{ .name = "SYSTEM", .kind = .file }, .{ .name = "FORMAT", .kind = .file } }) |e| {
+        try testing.expectEqual(Kind.marker, classify(a, real, e.name, e.kind));
+    }
+}
+
+test "data format: FORMAT is written through no link a crash or anyone left in its place" {
+    const io = stdx.io.instance();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpDataDir(&tmp);
+    defer testing.allocator.free(dir);
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/target", .data = "keep" });
+    try tmp.dir.createDirPath(io, "data");
+    try tmp.dir.symLink(io, "../elsewhere/target", "data/" ++ FILENAME ++ ".tmp", .{});
+    const data = try std.fs.path.join(testing.allocator, &.{ dir, "data" });
+    defer testing.allocator.free(data);
+    try check(testing.allocator, data);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "elsewhere/target", &buf));
+    try testing.expectEqualStrings("1\n", try tmp.dir.readFile(io, "data/" ++ FILENAME, &buf));
 }
 
 test "data format: every refusal is one, and nothing else is" {
@@ -326,7 +417,7 @@ test "data format: the offline check refuses what boot refuses, and writes nothi
     try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s} holds \"two\", not a data directory format; it should hold a number such as 1", .{path}), garbage.message);
 }
 
-test "data format: a FORMAT that can't be read fails both checks, rather than reading as missing" {
+test "data format: a FORMAT that is a directory is refused by both checks, rather than read as missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmpDataDir(&tmp);
@@ -335,6 +426,6 @@ test "data format: a FORMAT that can't be read fails both checks, rather than re
     defer testing.allocator.free(path);
     try stdx.fs.makePath(path);
     var buf: [MESSAGE_MAX]u8 = undefined;
-    try testing.expectError(error.IsDir, check(testing.allocator, dir));
-    try testing.expectError(error.IsDir, checkReadOnly(testing.allocator, dir, &buf));
+    try testing.expectError(error.DataFormatUnreadable, check(testing.allocator, dir));
+    try testing.expectEqual(error.DataFormatUnreadable, (try checkReadOnly(testing.allocator, dir, &buf)).?.err);
 }

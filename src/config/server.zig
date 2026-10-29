@@ -57,6 +57,9 @@ pub const ServerConfig = struct {
     port: u16 = 9000,
     bind: []const u8 = "0.0.0.0",
     data_dir: []const u8 = "~/.flo/data",
+    /// Whether the config file set `data_dir`, rather than leaving the
+    /// default: what a command that deletes the directory insists on.
+    data_dir_set: bool = false,
     shards: u16 = 0, // 0 = auto-detect CPU count; defines data topology (permanent!)
     partition_count: u32 = 0, // 0 = auto (max(4096, shards × 32)); virtual partitions for rebalancing
 
@@ -379,6 +382,7 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
         }
         if (server.getString("data_dir")) |d| {
             config.data_dir = try config.dupeString(d);
+            config.data_dir_set = true;
         }
         if (server.getInt("shards")) |s| {
             if (s < 0 or s > MAX_SHARDS) {

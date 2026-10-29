@@ -241,9 +241,12 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                     \\--keep-as NAME moves the contents into <data-dir>/.flo-kept-NAME instead,
                     \\where the next start leaves them alone.
                     \\
-                    \\It refuses a directory that holds no Flo data (no FORMAT, SYSTEM or shard
-                    \\directory), and a running server's. It never follows a symlink: a link in
-                    \\the directory is removed, not what it points at.
+                    \\It needs the directory named: --data-dir, or a config that sets data_dir;
+                    \\it never falls back to a default. It refuses a directory that holds no
+                    \\Flo data (no FORMAT or SYSTEM Flo wrote, no shard directory), a running
+                    \\server's, and one with another file system mounted inside it. It lists
+                    \\the entries Flo never writes before deleting them. It never follows a
+                    \\symlink: a link in the directory is removed, not what it points at.
                     \\
                     \\Without --yes it prints what it would delete and stops.
                 )
@@ -731,6 +734,7 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
 /// Lock the data dir, refusing a running server's and a format this binary
 /// doesn't read.
 fn lockOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.File) commander.Error!void {
+    const lock_was_there = runtime_mod.lockFileExists(data_dir);
     lock.* = runtime_mod.lockExistingDataDir(data_dir) catch |err| return switch (err) {
         error.DataDirMissing => outcome.usage(ctx, "data directory {s} does not exist", .{data_dir}),
         error.DataDirInUse => outcome.localRefusal(ctx, "data directory {s} is in use by a running flo server; stop it first", .{data_dir}),
@@ -743,6 +747,7 @@ fn lockOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
         return outcome.localRefusal(ctx, "cannot read {s}/{s}: {}", .{ data_dir, data_format.FILENAME, err });
     };
     if (refusal) |r| {
+        if (!lock_was_there) runtime_mod.removeLockFile(data_dir);
         stdx.fs.closeFile(lock.*);
         return outcome.unusable(ctx, "{s}", .{r.message});
     }
@@ -979,18 +984,17 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
 /// listeners are up and before the shards replay, so a booting node with
 /// port 0 can be probed. Clients connect only after the ready line.
 fn runWipe(ctx: *commander.Context) commander.Error!void {
-    const keep_as = ctx.getString("keep-as") orelse "";
-    if (keep_as.len > 0) {
+    const keep_as = ctx.getChangedString("keep-as") orelse "";
+    if (ctx.getChangedString("keep-as") != null) {
+        if (keep_as.len == 0) return outcome.usage(ctx, "--keep-as needs a name", .{});
         if (keepAsRefusal(keep_as)) |why| return outcome.usage(ctx, "--keep-as {s}", .{why});
     }
-    var config = try offlineConfig(ctx);
-    defer config.deinit();
-    const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
-        return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
+    const data_dir = try wipeDataDir(ctx);
     defer ctx.allocator.free(data_dir);
 
     // Not lockOffline: its format check refuses exactly the directories a
     // wipe is for.
+    const lock_was_there = runtime_mod.lockFileExists(data_dir);
     const lock = runtime_mod.lockExistingDataDir(data_dir) catch |err| return switch (err) {
         error.DataDirMissing => outcome.usage(ctx, "data directory {s} does not exist", .{data_dir}),
         error.DataDirInUse => outcome.localRefusal(ctx, "data directory {s} is in use by a running flo server; stop it first", .{data_dir}),
@@ -998,22 +1002,26 @@ fn runWipe(ctx: *commander.Context) commander.Error!void {
     };
     defer stdx.fs.closeFile(lock);
 
-    const contents = data_format.scan(data_dir) catch |err|
-        return outcome.localRefusal(ctx, "cannot read data directory {s}: {}", .{ data_dir, err });
-    if (!contents.flo) {
-        return outcome.localRefusal(ctx, "{s} holds no Flo data (no {s}, {s} or shard directory); wipe deletes only a Flo data directory's contents", .{ data_dir, data_format.FILENAME, data_format.SYSTEM_FILENAME });
-    }
-
+    // Opened once: everything below reads and deletes through this handle.
     const io = stdx.io.instance();
     const dir = stdx.fs.openDir(data_dir, .{ .iterate = true }) catch |err|
         return outcome.localRefusal(ctx, "cannot open data directory {s}: {}", .{ data_dir, err });
     defer stdx.fs.closeDir(dir);
-    var names = wipeList(ctx.allocator, dir) catch |err|
+
+    const contents = data_format.scan(ctx.allocator, dir) catch |err|
         return outcome.localRefusal(ctx, "cannot read data directory {s}: {}", .{ data_dir, err });
-    defer {
-        for (names.items) |n| ctx.allocator.free(n);
-        names.deinit(ctx.allocator);
+    if (!contents.flo) {
+        if (!lock_was_there) runtime_mod.removeLockFile(data_dir);
+        return outcome.localRefusal(ctx, "{s} holds no Flo data (no {s} or {s} Flo wrote, no shard directory); wipe deletes only a Flo data directory's contents", .{ data_dir, data_format.FILENAME, data_format.SYSTEM_FILENAME });
     }
+
+    var list = wipeList(ctx.allocator, dir) catch |err|
+        return outcome.localRefusal(ctx, "cannot read data directory {s}: {}", .{ data_dir, err });
+    defer list.deinit(ctx.allocator);
+
+    // A file system mounted inside the directory is someone else's data.
+    if (try mountedInside(ctx, data_dir, list.names.items)) |name|
+        return outcome.localRefusal(ctx, "{s}/{s} is another file system mounted inside the data directory; unmount it first", .{ data_dir, name });
 
     var kept_buf: [std.fs.max_name_bytes]u8 = undefined;
     const kept = std.fmt.bufPrint(&kept_buf, "{s}{s}", .{ data_format.KEPT_PREFIX, keep_as }) catch
@@ -1026,10 +1034,18 @@ fn runWipe(ctx: *commander.Context) commander.Error!void {
 
     if (!ctx.getBool("yes")) {
         const verb = if (keep_as.len > 0) "move" else "delete";
-        ctx.print("Would {s} {d} entries from {s}:\n", .{ verb, names.items.len, data_dir });
-        for (names.items) |n| ctx.print("  {s}\n", .{n});
+        ctx.print("Would {s} {d} entries from {s}:\n", .{ verb, list.names.items.len, data_dir });
+        for (list.names.items) |n| ctx.print("  {s}\n", .{n});
+        if (list.strays.items.len > 0) {
+            ctx.print("{d} of them Flo never writes, and would go too:\n", .{list.strays.items.len});
+            for (list.strays.items) |n| ctx.print("  {s}\n", .{n});
+        }
         if (keep_as.len > 0) ctx.print("into {s}/{s}. Run again with --yes to do it.\n", .{ data_dir, kept }) else ctx.print("Everything in them is gone for good. Run again with --yes to do it.\n", .{});
         return;
+    }
+    if (list.strays.items.len > 0) {
+        ctx.printErr("Warning: {d} entries in {s} are not Flo's, and go with the rest:\n", .{ list.strays.items.len, data_dir });
+        for (list.strays.items) |n| ctx.printErr("  {s}\n", .{n});
     }
 
     if (keep_as.len > 0) {
@@ -1038,57 +1054,107 @@ fn runWipe(ctx: *commander.Context) commander.Error!void {
         const into = dir.openDir(io, kept, .{ .follow_symlinks = false }) catch |err|
             return outcome.localRefusal(ctx, "cannot open {s}/{s}: {}", .{ data_dir, kept, err });
         defer stdx.fs.closeDir(into);
-        for (names.items) |n| {
+        for (list.names.items) |n| {
             dir.rename(n, into, n, io) catch |err|
-                return outcome.localRefusal(ctx, "cannot move {s}/{s}: {} (the entries before it were moved)", .{ data_dir, n, err });
+                return outcome.localRefusal(ctx, "cannot move {s}/{s}: {} (the entries before it were moved; run wipe again to finish)", .{ data_dir, n, err });
         }
         stdx.fs.syncDirHandle(into) catch |err| return outcome.localRefusal(ctx, "cannot sync {s}/{s}: {}", .{ data_dir, kept, err });
     } else {
-        for (names.items) |n| {
+        for (list.names.items) |n| {
             // Relative to the directory's handle and never following a link:
             // a symlink is unlinked, not what it names.
             dir.deleteTree(io, n) catch |err|
-                return outcome.localRefusal(ctx, "cannot delete {s}/{s}: {} (the entries before it were deleted)", .{ data_dir, n, err });
+                return outcome.localRefusal(ctx, "cannot delete {s}/{s}: {} (the entries before it were deleted; run wipe again to finish)", .{ data_dir, n, err });
         }
     }
     stdx.fs.syncDirHandle(dir) catch |err| return outcome.localRefusal(ctx, "cannot sync {s}: {}", .{ data_dir, err });
     if (keep_as.len > 0) {
-        ctx.print("Moved {d} entries into {s}/{s}. The next start begins with an empty data directory.\n", .{ names.items.len, data_dir, kept });
+        ctx.print("Moved {d} entries into {s}/{s}. The next start begins with an empty data directory.\n", .{ list.names.items.len, data_dir, kept });
     } else {
-        ctx.print("Deleted {d} entries from {s}. The next start begins with an empty data directory.\n", .{ names.items.len, data_dir });
+        ctx.print("Deleted {d} entries from {s}. The next start begins with an empty data directory.\n", .{ list.names.items.len, data_dir });
     }
 }
 
+/// The directory to wipe, named on purpose: `--data-dir`, or a config file
+/// that sets `data_dir`. Never a default: the one command that deletes
+/// must not delete whatever an unset variable falls back to.
+fn wipeDataDir(ctx: *commander.Context) commander.Error![]const u8 {
+    const named = ctx.getChangedString("data-dir");
+    if (named) |d| if (d.len == 0) return outcome.usage(ctx, "--data-dir is empty; wipe needs the directory it deletes named", .{});
+    const config_path = ctx.getChangedString("config") orelse "";
+    if (named == null and config_path.len == 0)
+        return outcome.usage(ctx, "wipe needs --data-dir, or -c with a config that sets data_dir: it never deletes a default directory", .{});
+    var config = try offlineConfig(ctx);
+    defer config.deinit();
+    if (named == null and !config.data_dir_set)
+        return outcome.usage(ctx, "{s} sets no data_dir, and wipe never deletes a default directory; give --data-dir", .{config_path});
+    return expandTilde(ctx.allocator, config.data_dir) catch |err|
+        outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
+}
+
+/// The first of `names` (entries of `data_dir`) on another file system
+/// than the directory's own, or null.
+fn mountedInside(ctx: *commander.Context, data_dir: []const u8, names: []const []const u8) commander.Error!?[]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const own_path = std.fmt.bufPrintSentinel(&buf, "{s}/.", .{data_dir}, 0) catch return outcome.usage(ctx, "data directory path too long", .{});
+    const own = (stdx.fs.lstatMeta(own_path) catch null) orelse return outcome.localRefusal(ctx, "cannot stat {s}", .{data_dir});
+    for (names) |n| {
+        const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ data_dir, n }, 0) catch return outcome.usage(ctx, "data directory path too long", .{});
+        const m = (stdx.fs.lstatMeta(path) catch null) orelse continue;
+        if (m.dev != own.dev) return n;
+    }
+    return null;
+}
+
+const WipeList = struct {
+    /// What goes, in the order it goes.
+    names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Those of them Flo never writes.
+    strays: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *WipeList, allocator: Allocator) void {
+        for (self.names.items) |n| allocator.free(n);
+        self.names.deinit(allocator);
+        self.strays.deinit(allocator);
+    }
+};
+
 /// What a wipe removes: everything but what an empty directory may hold
 /// and keep (a mount point's lost+found, dotfiles, and the lock this
-/// command holds). FORMAT goes first, then SYSTEM: a wipe cut short leaves
-/// shard data without them, which the server refuses as an older Flo's
-/// instead of starting on part of it.
-fn wipeList(allocator: Allocator, dir: stdx.fs.Dir) !std.ArrayListUnmanaged([]const u8) {
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (names.items) |n| allocator.free(n);
-        names.deinit(allocator);
-    }
+/// command holds). FORMAT goes first, then SYSTEM, then the rest, and
+/// shard directories last: a wipe cut short leaves shard data without
+/// FORMAT, which the server refuses as an older Flo's, naming wipe, and
+/// which a second wipe finishes.
+fn wipeList(allocator: Allocator, dir: stdx.fs.Dir) !WipeList {
+    var list: WipeList = .{};
+    errdefer list.deinit(allocator);
     var it = dir.iterate();
     while (try it.next(stdx.io.instance())) |entry| {
         const n = entry.name;
         if (n[0] == '.' or std.mem.eql(u8, n, "lost+found") or std.mem.eql(u8, n, data_format.LOCK_FILENAME)) continue;
-        try names.append(allocator, try allocator.dupe(u8, n));
+        const owned = try allocator.dupe(u8, n);
+        list.names.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+        if (data_format.classify(allocator, dir, n, entry.kind) == .other) try list.strays.append(allocator, owned);
     }
-    const first = [_][]const u8{ data_format.FILENAME, data_format.SYSTEM_FILENAME };
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn rank(n: []const u8) usize {
-            for (first, 0..) |f, i| if (std.mem.eql(u8, n, f)) return i;
-            return first.len;
+    const Order = struct {
+        fn rank(n: []const u8) u8 {
+            if (std.mem.eql(u8, n, data_format.FILENAME)) return 0;
+            if (std.mem.eql(u8, n, data_format.SYSTEM_FILENAME)) return 1;
+            if (data_format.isShardDir(n)) return 3;
+            return 2;
         }
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             const ra = rank(a);
             const rb = rank(b);
             return if (ra != rb) ra < rb else std.mem.lessThan(u8, a, b);
         }
-    }.lessThan);
-    return names;
+    };
+    std.mem.sort([]const u8, list.names.items, {}, Order.lessThan);
+    std.mem.sort([]const u8, list.strays.items, {}, Order.lessThan);
+    return list;
 }
 
 /// Why `name` can't be a kept copy's name: it must be one path component.

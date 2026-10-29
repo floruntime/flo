@@ -178,6 +178,23 @@ pub fn lockDataDir(data_dir: []const u8) !stdx.fs.File {
     return lockMade(data_dir);
 }
 
+/// Whether `data_dir` holds a lock file, held or not.
+pub fn lockFileExists(data_dir: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME }) catch return false;
+    stdx.fs.access(path, .{}) catch return false;
+    return true;
+}
+
+/// Removes `data_dir`'s lock file: for a command that made it and then
+/// refused the directory, so a refusal leaves nothing behind. The lock
+/// itself goes when its holder closes it.
+pub fn removeLockFile(data_dir: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, LOCK_FILENAME }) catch return;
+    stdx.fs.deleteFile(path) catch {};
+}
+
 /// The same lock for an offline tool, which must not create a data dir a
 /// mistyped path names.
 pub fn lockExistingDataDir(data_dir: []const u8) !stdx.fs.File {
@@ -595,6 +612,9 @@ pub const Runtime = struct {
             return error.InvalidBindAddress;
         };
 
+        // A directory refused for its format, or as not Flo's, is left as
+        // it was found: without the lock file, if this start made it.
+        const lock_was_there = lockFileExists(data_dir);
         self.data_dir_lock = try lockDataDir(data_dir);
 
         log.debug("Runtime.start: shard_count={d} listen_port={d} data_dir={s}", .{
@@ -605,7 +625,10 @@ pub const Runtime = struct {
 
         // 0. The data directory's format, then its topology: a newer format
         // is refused before anything in it is read.
-        try data_format.check(self.allocator, data_dir);
+        data_format.check(self.allocator, data_dir) catch |err| {
+            if (data_format.isRefusal(err) and !lock_was_there) removeLockFile(data_dir);
+            return err;
+        };
         try manifest.ensureTopology(
             self.allocator,
             data_dir,
