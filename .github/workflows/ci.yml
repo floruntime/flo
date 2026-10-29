@@ -197,9 +197,10 @@ jobs:
       - name: Build (ReleaseSafe)
         run: zig build -Drelease
       - name: The binary carries no test faults
-        # A -Dtest-faults build halts a shard on a kv set of this key.
+        # A -Dtest-faults build halts a shard, or crashes it in apply, on a
+        # kv set of a key with this prefix.
         run: |
-          if grep -qa 'flo-test-fault-halt' zig-out/bin/flo; then
+          if grep -qa 'flo-test-fault-' zig-out/bin/flo; then
             echo "::error::a build without -Dtest-faults carries the test faults"; exit 1
           fi
       - name: Release allocator

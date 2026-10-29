@@ -133,5 +133,7 @@ test "e2e/cluster: a raft port already in use is a clean refusal, not a crash" {
     defer second.deinit();
     try testing.expectError(error.ServerNotReady, second.startWithTimeout(5000));
     try testing.expect(try second.logsContain("BindFailed"));
-    try testing.expect(!try second.logsContain("CRASH SIGNAL"));
+    // std's handlers say "panic:" or name the fault.
+    try testing.expect(!try second.logsContain("panic:"));
+    try testing.expect(!try second.logsContain("Segmentation fault"));
 }

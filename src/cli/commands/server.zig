@@ -222,19 +222,15 @@ fn setupSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.PIPE, &ignore_act, null);
 
-    // DEBUG: Add handlers for crash signals to see what kills the process
+    // A hangup says so before it ends the process. The faults (SEGV, BUS,
+    // ILL, FPE) are std's handler's, set at start: it runs on the thread's
+    // signal stack, prints the trace, and lets the root's
+    // `debug.handleSegfault` record a crash in apply. Replacing it here
+    // would lose both.
     const crash_handler = struct {
         fn handle(sig: std.c.SIG) callconv(.c) noreturn {
             const pid = std.c.getpid();
-            const sig_name = switch (sig) {
-                std.posix.SIG.SEGV => "SIGSEGV",
-                std.posix.SIG.BUS => "SIGBUS",
-                std.posix.SIG.ABRT => "SIGABRT",
-                std.posix.SIG.ILL => "SIGILL",
-                std.posix.SIG.FPE => "SIGFPE",
-                std.posix.SIG.HUP => "SIGHUP",
-                else => "UNKNOWN",
-            };
+            const sig_name = if (sig == std.posix.SIG.HUP) "SIGHUP" else "UNKNOWN";
             std.debug.print("\n=== CRASH SIGNAL {s} (sig={d}) received by PID {d} ===\n", .{ sig_name, @backingInt(sig), pid });
             // Re-raise the signal to get core dump/default behavior
             const default_act = std.posix.Sigaction{
@@ -255,11 +251,6 @@ fn setupSignalHandlers() void {
         .flags = 0,
     };
 
-    std.posix.sigaction(std.posix.SIG.SEGV, &crash_act, null);
-    std.posix.sigaction(std.posix.SIG.BUS, &crash_act, null);
-    std.posix.sigaction(std.posix.SIG.ABRT, &crash_act, null);
-    std.posix.sigaction(std.posix.SIG.ILL, &crash_act, null);
-    std.posix.sigaction(std.posix.SIG.FPE, &crash_act, null);
     std.posix.sigaction(std.posix.SIG.HUP, &crash_act, null);
 }
 

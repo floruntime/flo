@@ -70,6 +70,7 @@ const KVHandler = @import("../kv/handler.zig").KVHandler;
 const kv_handler_mod = @import("../kv/handler.zig");
 const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
+const apply_marker = @import("apply_marker.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
 const build_options = @import("build_options");
@@ -442,6 +443,9 @@ pub const Shard = struct {
     /// The entry this shard halted at, on every replica alike: it applies
     /// nothing from it on and takes no writes until a repair.
     halted: ?Halt = null,
+    /// Where a crash in apply is recorded, and the entry the last one, on
+    /// this build, crashed on: it halts there rather than crash again.
+    marker: apply_marker.Marker = .{},
     /// The shard's own writes (checkpoints, acks, run steps) refused since
     /// the last line saying so, and when the next line may go out.
     halted_refusals: u64 = 0,
@@ -757,6 +761,8 @@ pub const Shard = struct {
         var losses: silent_loss.Counts = .{};
         var boot_damage: ?silent_loss.Damage = null;
         var boot_halt: ?Halt = null;
+        var marker: apply_marker.Marker = .{};
+        errdefer marker.close();
         errdefer if (hard_state_store) |store| allocator.destroy(store);
         var durable_log: ?*DurableLog = null;
         errdefer if (durable_log) |dl| {
@@ -800,6 +806,11 @@ pub const Shard = struct {
             @import("stdx").fs.makePathDurable(shard_dir) catch |err| {
                 log.err("shard {d}: cannot create or sync {s}: {s}", .{ shard_id, shard_dir, @errorName(err) });
                 return err;
+            };
+
+            marker = apply_marker.Marker.open(shard_dir, shard_id) catch |err| m: {
+                log.warn("shard {d}: cannot open {s}/{s} ({s}); a crash in apply will not be recorded", .{ shard_id, shard_dir, apply_marker.FILENAME, @errorName(err) });
+                break :m .{};
             };
 
             const segs_dir_path = try std.fmt.allocPrint(allocator, "{s}/segs", .{shard_dir});
@@ -859,7 +870,7 @@ pub const Shard = struct {
                 const log_files = durable_log.?;
                 if (listDurable(log_files)) |files| {
                     for (files) |f| watermark = @max(watermark, f.commit_index_at_seal);
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, boot);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, &marker, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
                     boot_halt = replayed.halt;
@@ -869,6 +880,10 @@ pub const Shard = struct {
                     boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
                 }
             }
+            // Replay clears a crash on an entry it found replaced; one past
+            // what it applied is still ahead.
+            marker.dropBelow(raft_node.log.start());
+            if (marker.crashed) |*c| log.err("shard {d}: applying entry {d} crashed this node before the restart; it halts there instead of applying it again", .{ shard_id, c.index });
             if (watermark == 0 and !raft_node.log.isEmpty()) {
                 log.warn("shard {d}: no segment carries a commit watermark; everything is applied at boot through the log instead of replay", .{shard_id});
             }
@@ -986,6 +1001,7 @@ pub const Shard = struct {
             .offline = if (cluster_role == .single) boot_damage else null,
             .diverged_damage = if (cluster_role != .single) boot_damage else null,
             .halted = boot_halt,
+            .marker = marker,
             .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
             .health = boot.health,
@@ -1183,6 +1199,7 @@ pub const Shard = struct {
     }
 
     pub fn deinit(self: *Shard) void {
+        self.marker.close();
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
         self.waiting_fds.deinit(self.allocator);
@@ -3466,7 +3483,14 @@ pub const Shard = struct {
 
     /// Apply one committed entry and, when it applied, tell its waiters.
     fn applyOne(self: *Shard, entry: *const entry_mod.Entry, out: *persistence_mod.Result) Verdict {
-        const verdict = verdictOf(&self.losses, self.id, nowMs(), entry, applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out));
+        if (self.marker.crashedOn(entry)) return .{ .halt = CRASHED };
+        // Only a step every replica repeats names the entry; `afterApply`
+        // scopes its own.
+        const verdict = v: {
+            const prev = apply_marker.begin(&self.marker, entry);
+            defer apply_marker.end(prev);
+            break :v verdictOf(&self.losses, self.id, nowMs(), entry, applyEntryCore(self.defaultPartition(), &self.replay_registry, entry, out));
+        };
         if (verdict == .applied) self.afterApply(entry, out);
         return verdict;
     }
@@ -3588,19 +3612,36 @@ pub const Shard = struct {
     }
 
     /// What follows an entry's apply on the live paths, from the entry and
-    /// its result alone: the waiters, triggers and metrics, and the first
-    /// step of a run its start created. Not at boot: nothing waits on a
-    /// replayed entry, and a run started before the restart stays at its
+    /// its result alone. Replay skips it, but boot's apply of the entries
+    /// above the replay watermark takes it.
+    ///
+    /// Triggers and metrics come from the entry on every replica, so a
+    /// crash in them recurs and names the entry. The rest depends on this
+    /// node: the reads waiting here, and the leader's own steps for its
+    /// term (its workers, a started run's first step). A crash there
+    /// doesn't recur at boot, where nothing waits and nothing leads yet, so
+    /// it names nothing. A run started before the restart stays at its
     /// start, as it does when leadership moves (`dropStartedRuns`).
     fn afterApply(self: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) void {
-        self.notifyApplied(entry);
+        {
+            const prev = apply_marker.begin(&self.marker, entry);
+            defer apply_marker.end(prev);
+            if (comptime build_options.test_faults) {
+                if (@import("test_faults.zig").of(entry) == .panic_after_apply) @panic("test fault: panic after apply");
+            }
+            self.recordApplied(entry);
+        }
+        self.wakeApplied(entry);
+        if (comptime build_options.test_faults) {
+            const leads = self.raft_node.role == .leader and entry.header.term == self.raft_node.current_term;
+            if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
+        }
         self.workflow_handler.startApplied(self, entry, result);
     }
 
-    /// Waiters, triggers and per-namespace metrics for an entry that just
-    /// applied. Keyed from the entry itself, never from the request, so a
-    /// follower's blocking read wakes on the same event a leader's does.
-    fn notifyApplied(self: *Shard, entry: *const entry_mod.Entry) void {
+    /// Triggers and per-namespace metrics for an entry that just applied:
+    /// from the entry alone, so every replica that applies it does the same.
+    fn recordApplied(self: *Shard, entry: *const entry_mod.Entry) void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .kv_put, .kv_delete, .kv_incr, .kv_expire => {
@@ -3608,7 +3649,6 @@ pub const Shard = struct {
                 var diag: schema.Diagnostic = .{};
                 var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
                 const key = kv_entries.Key.decode(&r, "key") catch return;
-                self.waiter_pool.notify(.kv_get, key, resolveKVWaiter, @ptrCast(self));
                 if (self.metrics_registry) |mr| {
                     if (mr.registerKVNamespace(KVProjection.namespaceOf(key))) |km| switch (etype) {
                         .kv_put => {
@@ -3620,19 +3660,9 @@ pub const Shard = struct {
                     } else |_| {}
                 }
             },
-            .kv_batch => {
-                var diag: schema.Diagnostic = .{};
-                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return;
-                var it = batch.ops.iterator();
-                while (it.next() catch return) |op| {
-                    self.waiter_pool.notify(.kv_get, op.key, resolveKVWaiter, @ptrCast(self));
-                }
-            },
             .stream_append => {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (cmd.key.len == 0) return;
-                self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
-                self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
                 self.notifyStreamTriggers();
                 if (self.metrics_registry) |mr| {
                     const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
@@ -3650,6 +3680,48 @@ pub const Shard = struct {
                     const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
                     mr.unregisterStream(ns, cmd.key, 0);
                 }
+            },
+            .queue_enqueue => {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (cmd.key.len == 0) return;
+                if (self.metrics_registry) |mr| {
+                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
+                    // The value carries a 4-byte priority before the message.
+                    const body_len = cmd.value.len -| 4;
+                    if (mr.registerQueue(ns, cmd.key)) |qm| {
+                        qm.recordEnqueue(1, body_len);
+                    } else |_| {}
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// The reads waiting on an entry that just applied, and a leader's
+    /// workers. Keyed from the entry itself, never from the request, so a
+    /// follower's blocking read wakes on the same event a leader's does.
+    fn wakeApplied(self: *Shard, entry: *const entry_mod.Entry) void {
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+        switch (etype) {
+            .kv_put, .kv_delete, .kv_incr, .kv_expire => {
+                var diag: schema.Diagnostic = .{};
+                var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
+                const key = kv_entries.Key.decode(&r, "key") catch return;
+                self.waiter_pool.notify(.kv_get, key, resolveKVWaiter, @ptrCast(self));
+            },
+            .kv_batch => {
+                var diag: schema.Diagnostic = .{};
+                const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return;
+                var it = batch.ops.iterator();
+                while (it.next() catch return) |op| {
+                    self.waiter_pool.notify(.kv_get, op.key, resolveKVWaiter, @ptrCast(self));
+                }
+            },
+            .stream_append => {
+                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+                if (cmd.key.len == 0) return;
+                self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
+                self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
             },
             // A run exists from here. Only a leader wakes waiting workers: a
             // claim is not in the log, so a worker woken here on a follower
@@ -3670,14 +3742,6 @@ pub const Shard = struct {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (cmd.key.len == 0) return;
                 self.waiter_pool.notify(.queue_dequeue, cmd.key, resolveQueueWaiter, @ptrCast(self));
-                if (self.metrics_registry) |mr| {
-                    const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
-                    // The value carries a 4-byte priority before the message.
-                    const body_len = cmd.value.len -| 4;
-                    if (mr.registerQueue(ns, cmd.key)) |qm| {
-                        qm.recordEnqueue(1, body_len);
-                    } else |_| {}
-                }
             },
             else => {},
         }
@@ -5587,6 +5651,9 @@ pub fn resolveKVWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 
 /// Answers a waiting `kv.get`.
 fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, entry: *const KVEntry) void {
+    if (comptime build_options.test_faults) {
+        if (@import("test_faults.zig").ofKey(waiter.key()) == .panic_answering_waiter) @panic("test fault: panic answering a waiting read");
+    }
     const Response = KVHandler.GetResponse;
     const answer = KVHandler.getAnswer(entry);
     // This shard's own client: written in place.
@@ -6065,6 +6132,9 @@ const Verdict = union(enum) {
     local: silent_loss.Damage,
 };
 
+/// Why a shard halts at an entry whose apply crashed the node.
+const CRASHED = "applying it crashed this node";
+
 /// Judge one apply. Duplicates are counted here; losses are counted by
 /// whoever acts on `local` (`Shard.damaged`, or boot's damage).
 fn verdictOf(counts: *silent_loss.Counts, shard_id: u16, now_ms: u64, entry: *const entry_mod.Entry, result: ApplyResult) Verdict {
@@ -6123,7 +6193,10 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 /// other entry type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
-        if (@import("test_faults.zig").halts(entry)) return .{ .applier_failed = error.Halt };
+        if (@import("test_faults.zig").of(entry)) |f| {
+            if (f == .halt) return .{ .applier_failed = error.Halt };
+            @import("test_faults.zig").crash(f);
+        }
     }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
@@ -6232,6 +6305,7 @@ fn replaySegments(
     raft_log: *RaftLog,
     shard_id: u16,
     losses: *silent_loss.Counts,
+    marker: *apply_marker.Marker,
     boot: Shard.Boot,
 ) ReplayOutcome {
     // Listed in Raft index order so the projection router's applied_index
@@ -6247,7 +6321,7 @@ fn replaySegments(
             out.cancelled = true;
             break;
         }
-        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, boot, last, &out);
+        replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, marker, boot, last, &out);
         if (out.damage != null or out.cancelled) break;
     }
     if (out.entries > 0 and !out.cancelled) {
@@ -6265,6 +6339,7 @@ fn replaySegmentFile(
     raft_log: *RaftLog,
     shard_id: u16,
     losses: *silent_loss.Counts,
+    marker: *apply_marker.Marker,
     boot: Shard.Boot,
     last: u64,
     out: *ReplayOutcome,
@@ -6327,7 +6402,12 @@ fn replaySegmentFile(
         }
         // Nobody waits on a replayed entry's answer.
         replay_result.reset(&seg_entry);
-        switch (verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result))) {
+        const verdict: Verdict = if (marker.crashedOn(&seg_entry)) .{ .halt = CRASHED } else v: {
+            const prev = apply_marker.begin(marker, &seg_entry);
+            defer apply_marker.end(prev);
+            break :v verdictOf(losses, shard_id, Shard.nowMs(), &seg_entry, applyEntryCore(partition, replay_registry, &seg_entry, &replay_result));
+        };
+        switch (verdict) {
             .applied, .duplicate => {},
             .halt => |why| {
                 const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(seg_entry.header.entry_type))) orelse "unknown";
@@ -12269,7 +12349,7 @@ test "Shard: only a run update to pending, applied on a leader, wakes workers" {
         shard.wake_workers = false;
         const value = [_]u8{ @backingInt(c.status), 0, 0, 0, 0, 0 };
         const entry = entry_mod.buildCommandEntry(.action_update_run, 0, 1, 1, 0, 0, "act-1", &value, &pbuf).?;
-        shard.notifyApplied(&entry);
+        shard.wakeApplied(&entry);
         try std.testing.expectEqual(c.wakes, shard.wake_workers);
     }
 }
@@ -13204,6 +13284,71 @@ test "replay halts at an entry stamped no later than the one applied before it" 
     try std.testing.expectEqual(idx, h.index);
     try std.testing.expect(std.mem.indexOf(u8, h.reason(), "stamp") != null);
     try std.testing.expectEqual(idx - 1, shard.raft_node.last_applied);
+}
+
+test "a shard whose apply crashed on an entry comes up halted at it, with nothing from it on applied" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var e_buf: [256]u8 = undefined;
+    var crashed: entry_mod.Entry = undefined;
+    {
+        var shard = try t.open();
+        defer shard.deinit();
+        // The second enqueue's entry.
+        crashed = shard.raft_node.log.getEntryCopy(shard.raft_node.last_applied - 2, &e_buf).?;
+    }
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try apply_marker.writeCrashForTest(shard_dir, 0, &crashed, apply_marker.build_name);
+    for (0..2) |_| {
+        var shard = try t.open();
+        defer shard.deinit();
+        const h = shard.halted orelse return error.NotHalted;
+        try std.testing.expectEqual(crashed.header.index, h.index);
+        try std.testing.expect(std.mem.indexOf(u8, h.reason(), "applying it crashed this node") != null);
+        try std.testing.expectEqual(crashed.header.index - 1, shard.raft_node.last_applied);
+        try std.testing.expectEqual(@as(u64, 1), DamageTest.queued(&shard));
+    }
+}
+
+test "a crash marker past the log's end halts the entry that arrives at its index, and another entry there clears it" {
+    try crashMarkerArrives(false);
+    try crashMarkerArrives(true);
+}
+
+/// A marker names entry `next` before this node's log holds it; then the
+/// same entry arrives, or (`replaced`) another a later leader wrote there.
+fn crashMarkerArrives(replaced: bool) !void {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{t.data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    var shard = try t.open();
+    defer shard.deinit();
+    const r = shard.raft_node;
+    const next = r.log.lastIndex() + 1;
+    var crashed = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, r.current_term, next, r.log.last_stamp + 1, "a");
+    crashed.header.crc32c = crashed.computeCrc();
+    var other = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, r.current_term, next, r.log.last_stamp + 1, "b");
+    other.header.crc32c = other.computeCrc();
+    // Read back as boot reads it.
+    try apply_marker.writeCrashForTest(shard_dir, 0, &crashed, apply_marker.build_name);
+    shard.marker.close();
+    shard.marker = try apply_marker.Marker.open(shard_dir, 0);
+    try std.testing.expect(shard.marker.crashed != null);
+    _ = try r.log.append(if (replaced) &other else &crashed);
+    r.commit_index = next;
+    if (replaced) {
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(shard.halted == null);
+        try std.testing.expect(shard.marker.crashed == null);
+    } else {
+        try std.testing.expect(!shard.applyCommitted());
+        try std.testing.expectEqual(next, shard.halted.?.index);
+        try std.testing.expect(std.mem.indexOf(u8, shard.halted.?.reason(), "applying it crashed this node") != null);
+    }
 }
 
 test "a shard halted before a restart comes up halted at the same entry, with nothing past it applied" {
