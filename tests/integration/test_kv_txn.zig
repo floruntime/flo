@@ -3,14 +3,14 @@
 //! Covers the in-memory side of the BEGIN→stage-ops→COMMIT cycle:
 //!   1. TxnTable: open, append several mixed ops, drop.
 //!   2. Codec: a buffered transaction encodes to the batch entry and decodes back.
-//!   3. Projection: apply a synthetic kv_batch UAL entry and verify state.
+//!   3. State: apply a synthetic kv_batch UAL entry and verify state.
 
 const std = @import("std");
 const testing = std.testing;
 const src = @import("src");
 
 const txn_mod = src.kv.txn;
-const KVProjection = src.projection.kv.KVProjection;
+const TestKv = src.kv.machine.TestKv;
 const ual_entry = src.storage.ual.entry;
 const kv_entries = src.protocol.kv_entries;
 const schema = src.protocol.schema;
@@ -85,13 +85,14 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     try testing.expectEqual(@as(usize, 3), seen);
 }
 
-test "integration: kv_txn — projection applies kv_batch atomically" {
-    var kv = KVProjection.init(testing.allocator);
-    defer kv.deinit();
+test "integration: kv_txn — state applies kv_batch atomically" {
+    var t = TestKv.init(testing.allocator);
+    defer t.deinit();
+    const kv = t.state();
 
     // Pre-existing state: a key that will be deleted, and a counter to incr.
-    try kv.put("doomed", "old", 1, 1, 0, 0);
-    try kv.put("counter", &counterBytes(10), 2, 1, 0, 0);
+    try t.put("doomed", "old", 0);
+    try t.put("counter", &counterBytes(10), 0);
 
     // Stage a 4-op batch: put, delete, incr, put-with-ttl.
     var ops: [4]txn_mod.TxnOp = undefined;
@@ -108,8 +109,7 @@ test "integration: kv_txn — projection applies kv_batch atomically" {
     defer testing.allocator.free(payload);
 
     const entry = ual_entry.buildEntry(.kv_batch, 0, 1, 100, 12345, payload);
-    var result = src.projection.kv.Result.start(&entry);
-    try kv.applyEntry(&entry, &result);
+    var result = try t.apply(&entry);
     // The batch answers with its op count.
     var r = result.reader();
     try testing.expectEqual(@as(?u16, 4), r.int(u16));

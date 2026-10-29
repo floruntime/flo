@@ -539,7 +539,7 @@ test "kv ops: scan pages names by limit and cursor, under a prefix, without rese
     for ([_][]const u8{ "a1", "a2", "a3", "a4", "a5", "b1" }) |k| try expectSet(try h.set(k, setBody("v", .{})), 1);
     // Reserved keys only come from the server itself.
     var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    try h.shard.defaultPartition().kv.put(qualified(&qbuf, "_flo:x"), "v", 1, 0, 0, 0);
+    try h.shard.defaultPartition().kv.putForTest(qualified(&qbuf, "_flo:x"), "v");
 
     var seen: [5][2]u8 = undefined;
     var n: usize = 0;

@@ -1,15 +1,13 @@
-//! Benchmark: the contract's apply path against today's KV projection.
+//! Benchmark: the contract's apply path alone.
 //!
-//! The same puts, gets and 100-key prefix reads, through `KVProjection`
-//! and through a machine whose apply stages one put on a `View` and
-//! commits it: the cost of staging, the ordered map and the commit, on
-//! one allocator.
+//! Puts, gets and 100-key prefix reads through a machine whose apply
+//! stages one put on a `View` and commits it: the cost of staging, the
+//! ordered map and the commit, with no family logic of its own.
 
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
 
-const KVProjection = src.projection.kv.KVProjection;
 const contract = src.contract;
 const entry_mod = src.storage.ual.entry;
 const persistence = src.storage.persistence;
@@ -53,33 +51,7 @@ fn report(name: []const u8, n: u64, start: i128) void {
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     var kbuf: [32]u8 = undefined;
-    var vbuf: [64]u8 = undefined;
-    std.debug.print("\n=== Contract apply vs KVProjection ===\n\n", .{});
-
-    {
-        var kv = KVProjection.init(allocator);
-        defer kv.deinit();
-        var start = stdx.time.nanoTimestamp();
-        for (0..ITERS) |i| {
-            const k = std.fmt.bufPrint(&kbuf, "default\x00key-{d:0>8}", .{(i * 7919) % ITERS}) catch unreachable;
-            const v = std.fmt.bufPrint(&vbuf, "value-{d:0>8}-padding-data", .{i}) catch unreachable;
-            try kv.put(k, v, i + 1, 1, 0, 0);
-        }
-        report("KVProjection put", ITERS, start);
-        start = stdx.time.nanoTimestamp();
-        var found: usize = 0;
-        for (0..ITERS) |i| {
-            const k = std.fmt.bufPrint(&kbuf, "default\x00key-{d:0>8}", .{i}) catch unreachable;
-            found += @intFromBool(kv.get(k) != null);
-        }
-        std.mem.doNotOptimizeAway(found);
-        report("KVProjection get", ITERS, start);
-        var results: [100]src.projection.kv.ScanEntry = undefined;
-        start = stdx.time.nanoTimestamp();
-        for (0..READS) |_| found += kv.scanPrefix("default\x00key-0000", &results);
-        std.mem.doNotOptimizeAway(found);
-        report("KVProjection 100-key prefix", READS, start);
-    }
+    std.debug.print("\n=== Contract apply ===\n\n", .{});
 
     {
         var store = contract.store.Store.init(allocator);

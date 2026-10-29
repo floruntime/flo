@@ -54,6 +54,8 @@ pub const contract = struct {
 pub const kv = struct {
     pub const handler = @import("kv/handler.zig");
     pub const txn = @import("kv/txn.zig");
+    pub const machine = @import("kv/machine.zig");
+    pub const state = @import("kv/state.zig");
 };
 
 // =============================================================================

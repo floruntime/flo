@@ -40,6 +40,7 @@ pub const Tag = enum(u8) {
     shutdown, // Graceful shutdown signal
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
+    kv_sink_put, // a processing KV sink's write of a key this shard owns: payload from KVHandler.SinkPut.encode
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.
