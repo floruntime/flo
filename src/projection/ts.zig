@@ -1085,7 +1085,6 @@ pub const TSProjection = struct {
             .ctx = @ptrCast(self),
             .vtable = .{
                 .applyFn = vtableApply,
-                .memoryUsageFn = vtableMemory,
             },
         };
     }
@@ -1093,29 +1092,6 @@ pub const TSProjection = struct {
     fn vtableApply(ctx: *anyopaque, ual_entry: *const Entry, out: *Result) router_mod.ApplyError!void {
         const self: *TSProjection = @ptrCast(@alignCast(ctx));
         return self.applyEntry(ual_entry, out);
-    }
-
-    fn vtableMemory(ctx: *anyopaque) usize {
-        const self: *TSProjection = @ptrCast(@alignCast(ctx));
-        return self.memoryUsage();
-    }
-
-    pub fn memoryUsage(self: *const TSProjection) usize {
-        var mem: usize = @sizeOf(TSProjection);
-
-        var bit = self.buffers.iterator();
-        while (bit.next()) |kv| {
-            mem += kv.key_ptr.len;
-            mem += kv.value_ptr.points.items.len * @sizeOf(StoredPoint);
-        }
-
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            mem += kv.key_ptr.len;
-            mem += kv.value_ptr.items.len * @sizeOf(Block);
-        }
-
-        return mem;
     }
 
     /// Clear all state, freeing owned memory.
@@ -1290,14 +1266,6 @@ test "ts: query nonexistent series" {
     try testing.expectEqual(@as(usize, 0), result.blocks_matched);
 }
 
-test "ts: memory usage estimate" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
-    defer ts.deinit();
-
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
-    try testing.expect(ts.memoryUsage() > 0);
-}
-
 test "ts: a write's answer carries the longest measurement name an entry can hold, whole" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
@@ -1325,14 +1293,6 @@ test "ts: apply entry for ts_write" {
     try applyTest(&ts, &ual_entry);
 
     try testing.expectEqual(@as(u64, 1), ts.stats.points_inserted);
-}
-
-test "ts: projection handle vtable" {
-    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
-    defer ts.deinit();
-
-    const handle = ts.projectionHandle();
-    try testing.expect(handle.memoryUsage() > 0);
 }
 
 // ─── Tags as a series dimension (issue #24) ────────────────────────────────

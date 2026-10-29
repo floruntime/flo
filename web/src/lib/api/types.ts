@@ -102,6 +102,8 @@ export interface KVHistoryResponse {
   namespace: string
   versions: KVHistoryEntry[]
   version_count: number
+  /** Older kept versions follow: ask again with before_version. */
+  more: boolean
 }
 export interface KVPutBody {
   value: string

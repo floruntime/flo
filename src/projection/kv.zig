@@ -4,8 +4,8 @@
 //! Supports put, get, delete, scan, and TTL expiry.
 //! Consumer group state is also stored here as regular KV entries.
 //!
-//! Bounded by a configurable memory limit. When the limit is approached,
-//! old MVCC versions are pruned first.
+//! Each key keeps its older versions, bounded by count and by bytes
+//! (kv_ops.HISTORY_*): the oldest go first.
 //!
 //! applied via ProjectionRouter from committed UAL entries:
 //!   kv_put    → insert or update key
@@ -20,6 +20,7 @@ const router_mod = @import("router.zig");
 const time_units = @import("../util/time_units.zig");
 const schema = @import("../protocol/schema.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const kv_ops = @import("../protocol/kv_ops.zig");
 
 // Each KV entry's code is its UAL type's: `kv.put` is `kv_put`, so a
 // renumbering on either side fails the build instead of mis-mapping.
@@ -83,9 +84,6 @@ pub const ScanEntry = struct {
 // KV Projection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Version chain length per key; nothing overrides it yet.
-pub const DEFAULT_VERSION_CHAIN_LEN: usize = 64;
-
 /// A historical version entry — stores previous value and metadata.
 pub const VersionEntry = struct {
     value: []const u8,
@@ -94,42 +92,65 @@ pub const VersionEntry = struct {
     term: u64,
     timestamp_ns: u64,
     tombstone: bool,
+
+    /// What it counts against its key's history bytes.
+    fn charge(v: VersionEntry) u64 {
+        return v.value.len + kv_ops.HISTORY_ENTRY_COST;
+    }
+};
+
+comptime {
+    if (kv_ops.HISTORY_ENTRY_COST < @sizeOf(VersionEntry)) @compileError("HISTORY_ENTRY_COST must cover a VersionEntry");
+}
+
+/// A key's older versions, oldest first, and what they are charged.
+const Chain = struct {
+    items: std.ArrayListUnmanaged(VersionEntry) = .empty,
+    bytes: u64 = 0,
 };
 
 pub const KVProjection = struct {
     allocator: Allocator,
     /// Main hash map: key → KVEntry.
     map: std.StringHashMap(KVEntry),
-    /// Version chains: key → previous versions (newest first, bounded).
-    version_chains: std.StringHashMap(std.ArrayListUnmanaged(VersionEntry)),
-    /// Memory limit in bytes (0 = unlimited).
-    memory_limit: usize,
-    /// Approximate current memory usage.
-    memory_used: usize,
+    /// Version chains: key → its older versions, keyed by the map entry's
+    /// own key bytes.
+    version_chains: std.StringHashMap(Chain),
     /// Last applied UAL index.
     applied_index: u64,
-    /// Max versions per key in the hot chain. 0 = unlimited.
-    max_version_chain_len: usize,
 
     /// Stats.
     stats: Stats,
     /// What "now" is when a read judges expiry.
     read_clock: ReadClock = .{},
-    /// Live (non-tombstone) keys per namespace, changed only where apply
-    /// makes a key live or a tombstone, so every replica and every restart
-    /// counts the same. A key past its TTL counts until it is deleted or
-    /// overwritten: nothing removes it before then.
+    /// Per namespace: its live keys, the bytes it stores and its history,
+    /// changed only in apply and in `removeKey`, so every replica and every
+    /// restart counts the same. A key past its TTL counts until it is
+    /// deleted, overwritten or removed: nothing removes it before then.
     live_keys: std.StringHashMapUnmanaged(LiveKeys) = .empty,
-    /// Some namespace's count changed since the shard last published.
+    /// Some namespace's counts changed since the shard last published.
     live_keys_changed: bool = false,
 
     pub const LiveKeys = struct {
-        count: u64 = 0,
+        counts: Counts = .{},
         /// What the shard last published for this namespace.
-        published: u64 = 0,
+        published: Counts = .{},
         /// Where the shard publishes it, once it has looked it up; the
         /// projection never reads it.
         publish_to: ?*anyopaque = null,
+
+        pub const Counts = struct {
+            /// Keys written and not deleted.
+            live: u64 = 0,
+            /// Key and current value bytes, tombstones and expired values
+            /// included; history excluded.
+            bytes: u64 = 0,
+            /// Older versions' charge: value bytes plus HISTORY_ENTRY_COST each.
+            history_bytes: u64 = 0,
+            /// Older versions evicted by either bound. Replay evicts them
+            /// again, so it counts from this process's start.
+            history_evicted: u64 = 0,
+        };
     };
 
     /// The shard points this at its Raft node, so a read judges expiry by
@@ -160,18 +181,14 @@ pub const KVProjection = struct {
         gets: u64 = 0,
         scans: u64 = 0,
         expired: u64 = 0,
-        evicted: u64 = 0,
     };
 
-    pub fn init(allocator: Allocator, memory_limit: usize) KVProjection {
+    pub fn init(allocator: Allocator) KVProjection {
         return .{
             .allocator = allocator,
             .map = std.StringHashMap(KVEntry).init(allocator),
-            .version_chains = std.StringHashMap(std.ArrayListUnmanaged(VersionEntry)).init(allocator),
-            .memory_limit = memory_limit,
-            .memory_used = 0,
+            .version_chains = std.StringHashMap(Chain).init(allocator),
             .applied_index = 0,
-            .max_version_chain_len = DEFAULT_VERSION_CHAIN_LEN,
             .stats = .{},
         };
     }
@@ -183,14 +200,8 @@ pub const KVProjection = struct {
         }
         self.map.deinit();
 
-        // Free version chains
-        var vc_it = self.version_chains.iterator();
-        while (vc_it.next()) |entry| {
-            for (entry.value_ptr.items) |ver| {
-                if (ver.value.len > 0) self.allocator.free(@constCast(ver.value));
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
+        // freeEntry took every key's chain.
+        std.debug.assert(self.version_chains.count() == 0);
         self.version_chains.deinit();
 
         var ns_it = self.live_keys.keyIterator();
@@ -223,20 +234,24 @@ pub const KVProjection = struct {
     }
 
     fn noteLive(self: *KVProjection, counter: *LiveKeys) void {
-        counter.count += 1;
+        counter.counts.live += 1;
         self.live_keys_changed = true;
     }
 
-    /// A live key in `key`'s namespace became a tombstone or went.
-    fn noteGone(self: *KVProjection, key: []const u8) void {
-        const counter = self.live_keys.getPtr(namespaceOf(key)) orelse return;
-        counter.count -|= 1;
+    /// A live key in `counter`'s namespace became a tombstone or went.
+    fn noteGone(self: *KVProjection, counter: *LiveKeys) void {
+        counter.counts.live -|= 1;
         self.live_keys_changed = true;
     }
 
     /// Live keys in `namespace` on this projection.
     pub fn liveKeys(self: *const KVProjection, namespace: []const u8) u64 {
-        return if (self.live_keys.get(namespace)) |c| c.count else 0;
+        return if (self.live_keys.get(namespace)) |c| c.counts.live else 0;
+    }
+
+    /// `namespace`'s counts on this projection.
+    pub fn namespaceCounts(self: *const KVProjection, namespace: []const u8) LiveKeys.Counts {
+        return if (self.live_keys.get(namespace)) |c| c.counts else .{};
     }
 
     /// Number of live (non-tombstone) entries.
@@ -261,23 +276,19 @@ pub const KVProjection = struct {
         return self.putWithType(key, value, lsn, term, timestamp_ns, expiry_ns, .string);
     }
 
-    /// Put a key-value pair, specifying the logical value type.
+    /// Put a key-value pair, specifying the logical value type. Every step
+    /// that can fail comes before the first change, so an allocation
+    /// failure leaves the key, its history and every count as they were.
     pub fn putWithType(self: *KVProjection, key: []const u8, value: []const u8, lsn: u64, term: u64, timestamp_ns: u64, expiry_ns: u64, value_type: ValueType) !void {
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
+        const counter = try self.liveCounter(key);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
-        const counter = try self.liveCounter(key);
 
         if (self.map.getPtr(key)) |existing| {
+            const chain = try self.reserveHistory(existing.key);
+            // Nothing below fails.
             if (existing.tombstone) self.noteLive(counter);
-            // Save current version to history before overwriting
-            self.pushVersionChain(existing) catch {};
-
-            // Key already in map — don't replace it (map references old key ptr).
-            // Free the newly allocated key since we don't need it.
-            self.allocator.free(owned_key);
-            // Old value was moved to version chain (or freed if chain full)
+            self.pushVersion(chain, existing, counter);
             existing.value = owned_value;
             existing.lsn = lsn;
             existing.version += 1;
@@ -286,8 +297,10 @@ pub const KVProjection = struct {
             existing.expiry_ns = expiry_ns;
             existing.tombstone = false;
             existing.value_type = value_type;
-            self.memory_used += owned_value.len;
+            counter.counts.bytes += owned_value.len;
         } else {
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
             try self.map.put(owned_key, .{
                 .key = owned_key,
                 .value = owned_value,
@@ -300,8 +313,9 @@ pub const KVProjection = struct {
                 .value_type = value_type,
             });
             self.noteLive(counter);
-            self.memory_used += owned_key.len + owned_value.len;
+            counter.counts.bytes += owned_key.len + owned_value.len;
         }
+        self.live_keys_changed = true;
         self.stats.puts += 1;
     }
 
@@ -323,14 +337,16 @@ pub const KVProjection = struct {
         return self.map.getPtr(key);
     }
 
-    /// Delete a key (mark as tombstone).
+    /// Delete a key (mark as tombstone). Its history stays: a tombstone
+    /// keeps its chain until the key is removed. As in `putWithType`, every
+    /// step that can fail comes first.
     pub fn delete(self: *KVProjection, key: []const u8, lsn: u64, term: u64, timestamp_ns: u64) !void {
+        const counter = try self.liveCounter(key);
         if (self.map.getPtr(key)) |existing| {
-            // Save current version to history before overwriting
-            self.pushVersionChain(existing) catch {};
-
-            // Old value was moved to version chain (or freed if chain full)
-            if (!existing.tombstone) self.noteGone(key);
+            const chain = try self.reserveHistory(existing.key);
+            // Nothing below fails.
+            if (!existing.tombstone) self.noteGone(counter);
+            self.pushVersion(chain, existing, counter);
             existing.value = "";
             existing.lsn = lsn;
             existing.version += 1;
@@ -338,9 +354,10 @@ pub const KVProjection = struct {
             existing.timestamp_ns = timestamp_ns;
             existing.tombstone = true;
         } else {
-            // Insert a tombstone for a key we never saw (possible after snapshot)
+            // A tombstone for a key this projection never saw.
             const owned_key = try self.allocator.dupe(u8, key);
-            const entry = KVEntry{
+            errdefer self.allocator.free(owned_key);
+            try self.map.put(owned_key, .{
                 .key = owned_key,
                 .value = "",
                 .lsn = lsn,
@@ -349,10 +366,10 @@ pub const KVProjection = struct {
                 .timestamp_ns = timestamp_ns,
                 .expiry_ns = 0,
                 .tombstone = true,
-            };
-            try self.map.put(owned_key, entry);
-            self.memory_used += owned_key.len;
+            });
+            counter.counts.bytes += owned_key.len;
         }
+        self.live_keys_changed = true;
         self.stats.deletes += 1;
     }
 
@@ -468,7 +485,7 @@ pub const KVProjection = struct {
         return n_found;
     }
 
-    /// Remove all entries whose key starts with `prefix`.
+    /// Remove all entries whose key starts with `prefix`, history and all.
     /// Used for namespace force-delete: pass "namespace\x00" to clear all keys in that namespace.
     /// Returns the number of entries removed.
     pub fn clearByPrefix(self: *KVProjection, prefix: []const u8) usize {
@@ -493,123 +510,118 @@ pub const KVProjection = struct {
 
             if (remove_count == 0) break;
 
-            for (to_remove_buf[0..remove_count]) |key| {
-                if (self.map.fetchRemove(key)) |removed| {
-                    if (!removed.value.tombstone) self.noteGone(removed.value.key);
-                    self.memory_used -|= removed.value.key.len + removed.value.value.len;
-                    self.allocator.free(@constCast(removed.value.key));
-                    if (removed.value.value.len > 0) {
-                        self.allocator.free(@constCast(removed.value.value));
-                    }
-                }
-            }
+            for (to_remove_buf[0..remove_count]) |key| self.removeKey(key);
             total_removed += remove_count;
         }
 
         return total_removed;
     }
 
+    /// Remove `key` from the map with its history, freeing both and taking
+    /// them out of its namespace's counts. The one way a key leaves the map.
+    pub fn removeKey(self: *KVProjection, key: []const u8) void {
+        const removed = self.map.fetchRemove(key) orelse return;
+        var entry = removed.value;
+        if (self.live_keys.getPtr(namespaceOf(entry.key))) |counter| {
+            if (!entry.tombstone) self.noteGone(counter);
+            counter.counts.bytes -|= entry.key.len + entry.value.len;
+            if (self.version_chains.get(entry.key)) |chain| counter.counts.history_bytes -|= chain.bytes;
+            self.live_keys_changed = true;
+        }
+        self.freeEntry(&entry);
+    }
+
     // ─── Version Chain (MVCC History) ──────────────────────────────────────
 
-    /// Push the current entry's state onto the version chain.
-    /// Evicts the oldest version if chain exceeds max_version_chain_len.
-    fn pushVersionChain(self: *KVProjection, existing: *KVEntry) !void {
-        // Duplicate value for the historical entry
-        const hist_value = if (existing.value.len > 0 and !existing.tombstone)
-            existing.value // transfer ownership — caller must NOT free
-        else
-            @as([]const u8, "");
+    /// `key`'s chain, with room for one more version, so the push that
+    /// follows can't fail. `key` is the map entry's own key bytes.
+    fn reserveHistory(self: *KVProjection, key: []const u8) !*Chain {
+        const gop = try self.version_chains.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        // A failure leaves the chains as they were, not with an empty one.
+        errdefer if (!gop.found_existing) self.version_chains.removeByPtr(gop.key_ptr);
+        try gop.value_ptr.items.ensureUnusedCapacity(self.allocator, 1);
+        return gop.value_ptr;
+    }
 
-        const hist = VersionEntry{
-            .value = hist_value,
+    /// Move `existing`'s current state onto `chain`, which `reserveHistory`
+    /// made room in, then evict the oldest versions while either bound is
+    /// exceeded, keeping the newest. The caller overwrites `existing` next.
+    fn pushVersion(self: *KVProjection, chain: *Chain, existing: *const KVEntry, counter: *LiveKeys) void {
+        const version = VersionEntry{
+            // A tombstone's "" isn't owned; a live value moves here.
+            .value = if (existing.tombstone) "" else existing.value,
             .version = existing.version,
             .lsn = existing.lsn,
             .term = existing.term,
             .timestamp_ns = existing.timestamp_ns,
             .tombstone = existing.tombstone,
         };
+        chain.items.appendAssumeCapacity(version);
+        chain.bytes += version.charge();
+        counter.counts.bytes -|= version.value.len;
+        counter.counts.history_bytes += version.charge();
 
-        // Update memory accounting: value moved from current to chain
-        // (no net change yet — will be freed if evicted below)
-        // A chain that can't take it drops it: the caller overwrites the
-        // value either way.
-        errdefer if (hist_value.len > 0) {
-            self.memory_used -|= hist_value.len;
-            self.allocator.free(@constCast(hist_value));
-        };
-
-        const gop = try self.version_chains.getOrPut(existing.key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
+        var drop: usize = 0;
+        const items = chain.items.items;
+        while (items.len - drop > 1 and
+            (items.len - drop > kv_ops.HISTORY_MAX_VERSIONS or chain.bytes > kv_ops.HISTORY_MAX_BYTES)) : (drop += 1)
+        {
+            const old = items[drop];
+            chain.bytes -= old.charge();
+            counter.counts.history_bytes -|= old.charge();
+            if (old.value.len > 0) self.allocator.free(@constCast(old.value));
         }
-        var chain = gop.value_ptr;
-
-        // Evict oldest if at capacity (0 = unlimited)
-        if (self.max_version_chain_len > 0 and chain.items.len >= self.max_version_chain_len) {
-            const oldest = chain.orderedRemove(0);
-            if (oldest.value.len > 0) {
-                self.memory_used -|= oldest.value.len;
-                self.allocator.free(@constCast(oldest.value));
-            }
+        if (drop > 0) {
+            std.mem.copyForwards(VersionEntry, items[0 .. items.len - drop], items[drop..]);
+            chain.items.shrinkRetainingCapacity(items.len - drop);
+            counter.counts.history_evicted += drop;
         }
-
-        try chain.append(self.allocator, hist);
     }
 
-    /// Get version history for a key (newest first).
-    /// Returns current entry + previous versions from the chain.
-    /// Caller does NOT own the returned data — references are borrowed.
-    pub fn getHistory(self: *KVProjection, key: []const u8, out: []VersionEntry) usize {
-        var n: usize = 0;
+    /// A key's versions, newest first, from below `before` (exclusive)
+    /// when given. It borrows the projection's memory: valid only on the
+    /// shard thread within one handler call, and any apply invalidates it.
+    pub const History = struct {
+        current: ?*const KVEntry,
+        chain: []const VersionEntry,
+        before: ?u64,
+        /// Next chain index to give, counting down; the current comes first.
+        next_index: usize,
+        gave_current: bool = false,
 
-        // Current version first
-        if (self.map.getPtr(key)) |entry| {
-            if (n < out.len) {
-                out[n] = .{
-                    .value = entry.value,
-                    .version = entry.version,
-                    .lsn = entry.lsn,
-                    .term = entry.term,
-                    .timestamp_ns = entry.timestamp_ns,
-                    .tombstone = entry.tombstone,
+        /// Whether the key has any history at all.
+        pub fn exists(h: *const History) bool {
+            return h.current != null or h.chain.len > 0;
+        }
+
+        pub fn next(h: *History) ?VersionEntry {
+            if (!h.gave_current) {
+                h.gave_current = true;
+                if (h.current) |e| if (h.before == null or e.version < h.before.?) return .{
+                    .value = e.value,
+                    .version = e.version,
+                    .lsn = e.lsn,
+                    .term = e.term,
+                    .timestamp_ns = e.timestamp_ns,
+                    .tombstone = e.tombstone,
                 };
-                n += 1;
             }
-        }
-
-        // Historical versions (newest to oldest = reverse iteration)
-        if (self.version_chains.getPtr(key)) |chain| {
-            var i: usize = chain.items.len;
-            while (i > 0 and n < out.len) {
-                i -= 1;
-                out[n] = chain.items[i];
-                n += 1;
+            while (h.next_index > 0) {
+                h.next_index -= 1;
+                const v = h.chain[h.next_index];
+                if (h.before == null or v.version < h.before.?) return v;
             }
+            return null;
         }
+    };
 
-        return n;
+    pub fn history(self: *KVProjection, key: []const u8, before: ?u64) History {
+        const chain: []const VersionEntry = if (self.version_chains.getPtr(key)) |c| c.items.items else &.{};
+        return .{ .current = self.map.getPtr(key), .chain = chain, .before = before, .next_index = chain.len };
     }
 
-    /// Prune all version chains, freeing historical entries.
-    /// Returns the number of historical versions freed.
-    pub fn pruneVersionChains(self: *KVProjection) usize {
-        var freed: usize = 0;
-        var vc_it = self.version_chains.iterator();
-        while (vc_it.next()) |entry| {
-            for (entry.value_ptr.items) |ver| {
-                if (ver.value.len > 0) {
-                    self.memory_used -|= ver.value.len;
-                    self.allocator.free(@constCast(ver.value));
-                }
-                freed += 1;
-            }
-            entry.value_ptr.deinit(self.allocator);
-            entry.value_ptr.* = .empty;
-        }
-        return freed;
-    }
-
-    /// Remove all tombstones and expired entries. Returns number purged.
+    /// Remove all tombstones, history and all. Returns number purged.
     pub fn compact(self: *KVProjection) usize {
         var to_remove: [256][]const u8 = undefined;
         var remove_count: usize = 0;
@@ -624,17 +636,7 @@ pub const KVProjection = struct {
             }
         }
 
-        for (to_remove[0..remove_count]) |key| {
-            if (self.map.fetchRemove(key)) |removed| {
-                self.memory_used -= removed.value.key.len + removed.value.value.len;
-                self.allocator.free(@constCast(removed.value.key));
-                if (removed.value.value.len > 0) {
-                    self.allocator.free(@constCast(removed.value.value));
-                }
-            }
-        }
-
-        self.stats.evicted += @intCast(remove_count);
+        for (to_remove[0..remove_count]) |key| self.removeKey(key);
         return remove_count;
     }
 
@@ -721,10 +723,7 @@ pub const KVProjection = struct {
     pub fn projectionHandle(self: *KVProjection) router_mod.ProjectionHandle {
         return .{
             .ctx = @ptrCast(self),
-            .vtable = .{
-                .applyFn = vtableApply,
-                .memoryUsageFn = vtableMemory,
-            },
+            .vtable = .{ .applyFn = vtableApply },
         };
     }
 
@@ -733,28 +732,16 @@ pub const KVProjection = struct {
         return self.applyEntry(entry, out);
     }
 
-    fn vtableMemory(ctx: *anyopaque) usize {
-        const self: *KVProjection = @ptrCast(@alignCast(ctx));
-        return self.memoryUsage();
-    }
-
-    // ─── Memory ────────────────────────────────────────────────────────────
-
-    pub fn memoryUsage(self: *const KVProjection) usize {
-        // Approximate: tracked key+value bytes + per-entry overhead
-        return self.memory_used + self.map.count() * @sizeOf(KVEntry);
-    }
-
     // ─── Internal ──────────────────────────────────────────────────────────
 
     fn freeEntry(self: *KVProjection, entry: *KVEntry) void {
         // Free version chain for this key
         if (self.version_chains.fetchRemove(entry.key)) |chain_kv| {
             var chain = chain_kv.value;
-            for (chain.items) |ver| {
+            for (chain.items.items) |ver| {
                 if (ver.value.len > 0) self.allocator.free(@constCast(ver.value));
             }
-            chain.deinit(self.allocator);
+            chain.items.deinit(self.allocator);
         }
         self.allocator.free(@constCast(entry.key));
         if (entry.value.len > 0 and !entry.tombstone) {
@@ -782,7 +769,7 @@ fn applyFor(kv: *KVProjection, e: *const Entry) router_mod.ApplyError!Result {
 }
 
 test "kv: an apply answers from what it did: the version set, whether a delete found the key, a refused incr" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     var buf: [256]u8 = undefined;
     const stamp: u64 = 1_000 * std.time.ns_per_s;
@@ -832,7 +819,7 @@ test "kv: an apply answers from what it did: the version set, whether a delete f
 const proto_status = @import("../protocol/proto.zig").StatusCode;
 
 test "kv: basic put and get" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("key1", "value1", 1, 1, 1000, 0);
@@ -850,7 +837,7 @@ test "kv: basic put and get" {
 }
 
 test "kv: put overwrites" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("key1", "old", 1, 1, 1000, 0);
@@ -863,7 +850,7 @@ test "kv: put overwrites" {
 }
 
 test "kv: delete creates tombstone" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("key1", "value1", 1, 1, 1000, 0);
@@ -881,7 +868,7 @@ test "kv: delete creates tombstone" {
 }
 
 test "kv: delete nonexistent key creates tombstone" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.delete("ghost", 1, 1, 1000);
@@ -891,7 +878,7 @@ test "kv: delete nonexistent key creates tombstone" {
 }
 
 test "kv: scan returns live entries" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("a", "1", 1, 1, 1000, 0);
@@ -905,7 +892,7 @@ test "kv: scan returns live entries" {
 }
 
 test "kv: scan with prefix" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("user:1", "alice", 1, 1, 1000, 0);
@@ -918,7 +905,7 @@ test "kv: scan with prefix" {
 }
 
 test "kv: compact removes tombstones" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("a", "1", 1, 1, 1000, 0);
@@ -933,7 +920,7 @@ test "kv: compact removes tombstones" {
 }
 
 test "kv: apply UAL entry for kv_put" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     var buf: [256]u8 = undefined;
     try applyTest(&kv, &putEntry(&buf, "mykey", "myval", 1, 1000, 0));
@@ -943,7 +930,7 @@ test "kv: apply UAL entry for kv_put" {
 }
 
 test "kv: apply UAL entry for kv_delete" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     var buf: [256]u8 = undefined;
     try applyTest(&kv, &putEntry(&buf, "delme", "v", 1, 1000, 0));
@@ -953,7 +940,7 @@ test "kv: apply UAL entry for kv_delete" {
 }
 
 test "kv: projection handle integrates with router" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     var router = router_mod.ProjectionRouter.init();
@@ -972,7 +959,7 @@ test "kv: projection handle integrates with router" {
 }
 
 test "kv: stats tracking" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("k", "v", 1, 1, 0, 0);
@@ -985,25 +972,18 @@ test "kv: stats tracking" {
     try testing.expectEqual(@as(u64, 1), kv.stats.deletes);
 }
 
-test "kv: memory tracking" {
-    var kv = KVProjection.init(testing.allocator, 0);
-    defer kv.deinit();
-
-    try kv.put("abc", "123456", 1, 1, 0, 0);
-    // key(3) + value(6) = 9 bytes tracked
-    try testing.expectEqual(@as(usize, 9), kv.memory_used);
-
-    try kv.put("abc", "x", 2, 1, 0, 0);
-    // key(3) + new_value(1) + chain_value(6) = 10 bytes (old value retained in version chain)
-    try testing.expectEqual(@as(usize, 10), kv.memory_used);
-
-    // After pruning version chains, only current entry remains
-    _ = kv.pruneVersionChains();
-    try testing.expectEqual(@as(usize, 4), kv.memory_used);
+fn historyOf(kv: *KVProjection, key: []const u8, before: ?u64, out: []VersionEntry) usize {
+    var it = kv.history(key, before);
+    var n: usize = 0;
+    while (it.next()) |v| : (n += 1) {
+        if (n == out.len) break;
+        out[n] = v;
+    }
+    return n;
 }
 
-test "kv: version chain basic" {
-    var kv = KVProjection.init(testing.allocator, 0);
+test "kv: history is the current version, then the older ones newest first, from below a version when given" {
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("k", "v1", 1, 1, 100, 0);
@@ -1011,87 +991,136 @@ test "kv: version chain basic" {
     try kv.put("k", "v3", 3, 1, 300, 0);
 
     var hist: [10]VersionEntry = undefined;
-    const n = kv.getHistory("k", &hist);
-    try testing.expectEqual(@as(usize, 3), n);
-
-    // Current version first
-    try testing.expectEqualSlices(u8, "v3", hist[0].value);
-    try testing.expectEqual(@as(u64, 3), hist[0].version);
-
-    // Then historical (newest to oldest)
-    try testing.expectEqualSlices(u8, "v2", hist[1].value);
-    try testing.expectEqual(@as(u64, 2), hist[1].version);
-    try testing.expectEqualSlices(u8, "v1", hist[2].value);
-    try testing.expectEqual(@as(u64, 1), hist[2].version);
+    try testing.expectEqual(@as(usize, 3), historyOf(&kv, "k", null, &hist));
+    for (hist[0..3], [_][]const u8{ "v3", "v2", "v1" }, [_]u64{ 3, 2, 1 }) |v, value, version| {
+        try testing.expectEqualStrings(value, v.value);
+        try testing.expectEqual(version, v.version);
+    }
+    try testing.expectEqual(@as(usize, 2), historyOf(&kv, "k", 3, &hist));
+    try testing.expectEqual(@as(u64, 2), hist[0].version);
+    try testing.expectEqual(@as(usize, 0), historyOf(&kv, "k", 1, &hist));
+    try testing.expect(kv.history("k", 1).exists());
+    try testing.expect(!kv.history("missing", null).exists());
 }
 
-test "kv: version chain preserves history on delete" {
-    var kv = KVProjection.init(testing.allocator, 0);
+test "kv: a delete keeps the history, the live value before it included" {
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("k", "v1", 1, 1, 100, 0);
     try kv.delete("k", 2, 1, 200);
 
     var hist: [10]VersionEntry = undefined;
-    const n = kv.getHistory("k", &hist);
-    try testing.expectEqual(@as(usize, 2), n);
-
-    // Current is tombstone
+    try testing.expectEqual(@as(usize, 2), historyOf(&kv, "k", null, &hist));
     try testing.expect(hist[0].tombstone);
     try testing.expectEqual(@as(u64, 2), hist[0].version);
-
-    // Previous was the live value
-    try testing.expectEqualSlices(u8, "v1", hist[1].value);
+    try testing.expectEqualStrings("v1", hist[1].value);
     try testing.expect(!hist[1].tombstone);
 }
 
-test "kv: version chain bounded at max length" {
-    var kv = KVProjection.init(testing.allocator, 0);
+test "kv: history keeps at most HISTORY_MAX_VERSIONS older versions, oldest evicted first" {
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
-    // Write DEFAULT_VERSION_CHAIN_LEN + 2 versions (current + chain)
-    const total = DEFAULT_VERSION_CHAIN_LEN + 2;
+    const total = kv_ops.HISTORY_MAX_VERSIONS + 3;
     for (0..total) |i| {
         var buf: [8]u8 = undefined;
-        const val = std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable;
-        try kv.put("k", val, @intCast(i + 1), 1, @intCast((i + 1) * 100), 0);
+        try kv.put("k", std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable, @intCast(i + 1), 1, @intCast((i + 1) * 100), 0);
     }
-
-    var hist: [DEFAULT_VERSION_CHAIN_LEN + 1]VersionEntry = undefined;
-    const n = kv.getHistory("k", &hist);
-    // Current + DEFAULT_VERSION_CHAIN_LEN historical
-    try testing.expectEqual(DEFAULT_VERSION_CHAIN_LEN + 1, n);
-
-    // Oldest versions should have been evicted
-    try testing.expectEqual(@as(u64, total), hist[0].version); // current
-    try testing.expectEqual(@as(u64, total - 1), hist[1].version); // most recent historical
+    var hist: [kv_ops.MAX_HISTORY + 1]VersionEntry = undefined;
+    try testing.expectEqual(@as(usize, kv_ops.MAX_HISTORY), historyOf(&kv, "k", null, &hist));
+    try testing.expectEqual(@as(u64, total), hist[0].version);
+    // The oldest kept: versions 1 and 2 are gone.
+    try testing.expectEqual(@as(u64, total - kv_ops.HISTORY_MAX_VERSIONS), hist[kv_ops.MAX_HISTORY - 1].version);
+    const counts = kv.namespaceCounts("default");
+    try testing.expectEqual(@as(u64, 2), counts.history_evicted);
+    var charged: u64 = 0;
+    for (hist[1..kv_ops.MAX_HISTORY]) |v| charged += v.value.len + kv_ops.HISTORY_ENTRY_COST;
+    try testing.expectEqual(charged, counts.history_bytes);
 }
 
-test "kv: version chain non-existent key returns 0" {
-    var kv = KVProjection.init(testing.allocator, 0);
+test "kv: history keeps at most HISTORY_MAX_BYTES, but always the newest older version" {
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
-    var hist: [10]VersionEntry = undefined;
-    const n = kv.getHistory("missing", &hist);
-    try testing.expectEqual(@as(usize, 0), n);
+    // 4 KiB values: 15 fit under 64 KiB with their 64-byte charges.
+    const value: [4096]u8 = @splat('s');
+    for (0..20) |i| try kv.put("k", &value, @intCast(i + 1), 1, 0, 0);
+    var hist: [kv_ops.MAX_HISTORY]VersionEntry = undefined;
+    const per = value.len + kv_ops.HISTORY_ENTRY_COST;
+    const kept = kv_ops.HISTORY_MAX_BYTES / per;
+    try testing.expectEqual(1 + kept, historyOf(&kv, "k", null, &hist));
+    try testing.expectEqual(@as(u64, kept * per), kv.namespaceCounts("default").history_bytes);
+    try testing.expectEqual(@as(u64, 19 - kept), kv.namespaceCounts("default").history_evicted);
+
+    // One value larger than the whole budget evicts everything older, and
+    // is itself kept once something overwrites it.
+    const big = try testing.allocator.alloc(u8, kv_ops.HISTORY_MAX_BYTES + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    try kv.put("k", big, 21, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 20 - kept), kv.namespaceCounts("default").history_evicted);
+    // Overwriting it pushes it into history, which evicts all the others in one write.
+    try kv.put("k", "after", 22, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 20), kv.namespaceCounts("default").history_evicted);
+    try testing.expectEqual(@as(usize, 2), historyOf(&kv, "k", null, &hist));
+    try testing.expectEqual(big.len, hist[1].value.len);
+    try testing.expectEqual(@as(u64, big.len + kv_ops.HISTORY_ENTRY_COST), kv.namespaceCounts("default").history_bytes);
 }
 
-test "kv: prune version chains" {
-    var kv = KVProjection.init(testing.allocator, 0);
+test "kv: a namespace's counts follow its keys: bytes, history, and removal frees both" {
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
-    try kv.put("a", "a1", 1, 1, 0, 0);
-    try kv.put("a", "a2", 2, 1, 0, 0);
-    try kv.put("b", "b1", 3, 1, 0, 0);
-    try kv.put("b", "b2", 4, 1, 0, 0);
+    try kv.put("ns\x00a", "123456", 1, 1, 0, 0);
+    try testing.expectEqual(KVProjection.LiveKeys.Counts{ .live = 1, .bytes = 10 }, kv.namespaceCounts("ns"));
+    try kv.put("ns\x00a", "x", 2, 1, 0, 0);
+    try testing.expectEqual(KVProjection.LiveKeys.Counts{ .live = 1, .bytes = 5, .history_bytes = 6 + kv_ops.HISTORY_ENTRY_COST }, kv.namespaceCounts("ns"));
+    try kv.delete("ns\x00a", 3, 1, 0);
+    try testing.expectEqual(KVProjection.LiveKeys.Counts{ .live = 0, .bytes = 4, .history_bytes = 7 + 2 * kv_ops.HISTORY_ENTRY_COST }, kv.namespaceCounts("ns"));
+    try kv.put("ns\x00b", "y", 4, 1, 0, 0);
 
-    const freed = kv.pruneVersionChains();
-    try testing.expectEqual(@as(usize, 2), freed); // one old version per key
+    try testing.expectEqual(@as(usize, 1), kv.compact());
+    try testing.expectEqual(KVProjection.LiveKeys.Counts{ .live = 1, .bytes = 5 }, kv.namespaceCounts("ns"));
+    try testing.expectEqual(@as(usize, 1), kv.clearByPrefix("ns\x00"));
+    try testing.expectEqual(KVProjection.LiveKeys.Counts{}, kv.namespaceCounts("ns"));
+    try testing.expect(!kv.history("ns\x00a", null).exists());
+}
 
-    // History should now only have current versions
-    var hist: [10]VersionEntry = undefined;
-    try testing.expectEqual(@as(usize, 1), kv.getHistory("a", &hist));
-    try testing.expectEqual(@as(usize, 1), kv.getHistory("b", &hist));
+test "kv: an allocation failure in put or delete changes nothing" {
+    // Every allocation each op makes fails in turn; each time the key, its
+    // history and its namespace's counts are as they were, and nothing leaks.
+    const Case = struct {
+        fn run(allocator: Allocator, op: enum { put_new, put_over, put_over_tombstone, delete_over, delete_new }) !void {
+            var kv = KVProjection.init(allocator);
+            defer kv.deinit();
+            // A seeded key and namespace, made before the op under test fails.
+            try kv.put("ns\x00k", "old", 1, 1, 0, 0);
+            // A tombstone with no chain yet, so a put over it must reserve one.
+            try kv.delete("ns\x00d", 1, 1, 0);
+            const before = kv.namespaceCounts("ns");
+            const result = switch (op) {
+                .put_new => kv.put("ns\x00n", "new", 2, 1, 0, 0),
+                .put_over => kv.put("ns\x00k", "new", 2, 1, 0, 0),
+                .put_over_tombstone => kv.put("ns\x00d", "back", 3, 1, 0, 0),
+                .delete_over => kv.delete("ns\x00k", 2, 1, 0),
+                .delete_new => kv.delete("ns\x00n", 2, 1, 0),
+            };
+            result catch |err| {
+                try testing.expectEqual(before, kv.namespaceCounts("ns"));
+                try testing.expectEqual(@as(u64, 1), kv.getRaw("ns\x00k").?.version);
+                try testing.expectEqualStrings("old", kv.getRaw("ns\x00k").?.value);
+                try testing.expect(kv.getRaw("ns\x00n") == null);
+                try testing.expect(kv.getRaw("ns\x00d").?.tombstone);
+                try testing.expectEqual(@as(u64, 1), kv.getRaw("ns\x00d").?.version);
+                try testing.expect(kv.version_chains.get("ns\x00d") == null);
+                return err;
+            };
+        }
+    };
+    inline for (.{ .put_new, .put_over, .put_over_tombstone, .delete_over, .delete_new }) |op| {
+        try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{op});
+    }
 }
 
 // ── Time: TTLs count from the entry's stamp ──────────────────────────────
@@ -1118,7 +1147,7 @@ fn putEntry(buf: []u8, key: []const u8, value: []const u8, index: u64, stamp: u6
 }
 
 test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on every replica alike, and reads judge it by the read clock" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     var clock: TestReadClock = .{ .ns = 0 };
     kv.read_clock = .{ .ctx = &clock, .now_ns = TestReadClock.read };
@@ -1147,7 +1176,7 @@ test "kv: a TTL runs out a TTL after the stamp of the entry that set it, on ever
 }
 
 test "kv: a key whose TTL ran out by an entry's stamp is gone to that entry: incr starts again from zero and touch finds nothing" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var buf: [128]u8 = undefined;
@@ -1170,7 +1199,7 @@ test "kv: a key whose TTL ran out by an entry's stamp is gone to that entry: inc
 
 test "kv: a transaction's TTLs count from its batch's stamp" {
     const txn = @import("../kv/txn.zig");
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var eb: [64]u8 = undefined;
@@ -1189,7 +1218,7 @@ test "kv: a transaction's TTLs count from its batch's stamp" {
 
 test "kv: a batch that doesn't decode whole, or breaks a kind's rule, applies nothing" {
     const txn = @import("../kv/txn.zig");
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     const ops = [_]txn.TxnOp{
         .{ .kind = .put, .key = @constCast("a"), .value = @constCast("1"), .ttl_ms = 0 },
@@ -1226,7 +1255,7 @@ fn recountLive(kv: *const KVProjection, namespace: []const u8) u64 {
 
 test "kv: live keys are counted per namespace as apply makes and removes them, and a replay counts the same" {
     const txn = @import("../kv/txn.zig");
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     var bufs: [12][96]u8 = undefined;
@@ -1264,7 +1293,7 @@ test "kv: live keys are counted per namespace as apply makes and removes them, a
     try testing.expect(kv.live_keys_changed);
 
     // The same log applied again, as at boot or on a follower, counts the same.
-    var replay = KVProjection.init(testing.allocator, 0);
+    var replay = KVProjection.init(testing.allocator);
     defer replay.deinit();
     for (steps) |step| try applyTest(&replay, &step.entry);
     try testing.expectEqual(kv.liveKeys("orders"), replay.liveKeys("orders"));
@@ -1279,7 +1308,7 @@ test "kv: live keys are counted per namespace as apply makes and removes them, a
 test "kv: a put short of memory at any point leaves the count agreeing with the keys" {
     const run = struct {
         fn f(allocator: Allocator) !void {
-            var kv = KVProjection.init(allocator, 0);
+            var kv = KVProjection.init(allocator);
             defer kv.deinit();
             const stamp: u64 = 1_000 * std.time.ns_per_s;
             defer {

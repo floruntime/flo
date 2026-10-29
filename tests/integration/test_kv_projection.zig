@@ -6,7 +6,7 @@ const KVProjection = src.projection.kv.KVProjection;
 const ScanEntry = src.projection.kv.ScanEntry;
 
 test "integration: KV projection 10000 operations" {
-    var kv = KVProjection.init(testing.allocator, 0); // 0 = unlimited memory
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     // Put 10000 keys
@@ -73,7 +73,7 @@ test "integration: KV projection 10000 operations" {
 }
 
 test "integration: KV projection TTL expiry" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     // Put a key with a very short TTL (expires 1 ns in the future)
@@ -96,7 +96,7 @@ test "integration: KV projection TTL expiry" {
 }
 
 test "integration: KV projection scan with prefix" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     // Put keys with "user:" prefix
@@ -147,7 +147,7 @@ test "integration: KV projection scan with prefix" {
 }
 
 test "integration: KV INCR creates counter and increments" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     const v1 = try kv.applyIncr("counter", 1, 1, 1, 0);
@@ -165,7 +165,7 @@ test "integration: KV INCR creates counter and increments" {
 }
 
 test "integration: KV INCR rejects non-counter values" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("notcounter", "hello", 1, 1, 0, 0);
@@ -173,7 +173,7 @@ test "integration: KV INCR rejects non-counter values" {
 }
 
 test "integration: KV INCR overflow detection" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     var max_buf: [8]u8 = undefined;
@@ -184,7 +184,7 @@ test "integration: KV INCR overflow detection" {
 }
 
 test "integration: KV TOUCH updates expiry" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
@@ -201,7 +201,7 @@ test "integration: KV TOUCH updates expiry" {
 }
 
 test "integration: KV TOUCH on missing key" {
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
     try testing.expectError(error.NotFound, kv.applyTouch("nope", 0, 1, 1, 0));
 }
@@ -214,7 +214,7 @@ test "integration: KV TOUCH on missing key" {
 
 test "integration: JSON.GET reads root and field via json_path" {
     const json_path = src.util.json_path;
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     const initial = "{\"name\":\"alice\",\"age\":30}";
@@ -231,7 +231,7 @@ test "integration: JSON.GET reads root and field via json_path" {
 
 test "integration: JSON.SET nested field updates document" {
     const json_path = src.util.json_path;
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     const initial = "{\"profile\":{\"name\":\"alice\",\"age\":30}}";
@@ -248,7 +248,7 @@ test "integration: JSON.SET nested field updates document" {
 
 test "integration: JSON.DEL removes field, leaves rest intact" {
     const json_path = src.util.json_path;
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("doc", "{\"a\":1,\"b\":2,\"c\":3}", 1, 1, 0, 0);
@@ -265,7 +265,7 @@ test "integration: JSON.DEL removes field, leaves rest intact" {
 
 test "integration: JSON path errors propagate" {
     const json_path = src.util.json_path;
-    var kv = KVProjection.init(testing.allocator, 0);
+    var kv = KVProjection.init(testing.allocator);
     defer kv.deinit();
 
     try kv.put("doc", "{\"a\":1}", 1, 1, 0, 0);

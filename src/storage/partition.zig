@@ -71,7 +71,7 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
-        const kv = kv_mod.KVProjection.init(allocator, 0); // 0 = no memory limit
+        const kv = kv_mod.KVProjection.init(allocator);
         const queue = queue_mod.QueueProjection.init(allocator, .{});
         const stream = stream_mod.StreamProjection.init(allocator);
         const ts = ts_mod.TSProjection.init(allocator, .{});
@@ -293,11 +293,6 @@ pub const Partition = struct {
     pub fn warmCount(self: *const Partition) usize {
         return self.warm_store.count();
     }
-
-    /// Total memory across all projections.
-    pub fn projectionMemory(self: *Partition) usize {
-        return self.router.totalMemoryUsage();
-    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -453,20 +448,6 @@ test "partition: contains check" {
 
     try testing.expect(part.contains(1));
     try testing.expect(!part.contains(2));
-}
-
-test "partition: projection memory tracking" {
-    const allocator = testing.allocator;
-
-    var part = try Partition.init(allocator, 0, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    var buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&buf, .kv_put, .{ .key = "key", .value = "val", .ttl_ms = null }, 1, 1000);
-    _ = try part.apply(&e1);
-
-    try testing.expect(part.projectionMemory() > 0);
 }
 
 test "partition: warm store byte tracking" {

@@ -16,17 +16,18 @@ pub const QueueMetrics = @import("../queue/metrics.zig").Metrics;
 
 /// KV namespace-level metrics for observability
 pub const KVMetrics = struct {
-    /// Live keys in this namespace, as each shard last published from its
-    /// projection; indexed by shard id. The gauge is their sum.
+    /// This namespace's counts as each shard last published them from its
+    /// projection, indexed by shard id; each gauge is their sum.
     live_keys: [MAX_SHARDS]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    bytes_stored: [MAX_SHARDS]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    history_bytes: [MAX_SHARDS]Atomic(u64) = @splat(Atomic(u64).init(0)),
+    history_evicted: [MAX_SHARDS]Atomic(u64) = @splat(Atomic(u64).init(0)),
     /// Total GET operations
     get_ops_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total SET operations
     set_ops_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total DELETE operations
     delete_ops_total: Atomic(u64) = Atomic(u64).init(0),
-    /// Total bytes stored (approximate)
-    bytes_stored: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() KVMetrics {
         return .{};
@@ -36,18 +37,26 @@ pub const KVMetrics = struct {
         _ = self.get_ops_total.fetchAdd(1, .monotonic);
     }
 
-    pub fn recordSet(self: *KVMetrics, bytes: u64) void {
+    pub fn recordSet(self: *KVMetrics) void {
         _ = self.set_ops_total.fetchAdd(1, .monotonic);
-        _ = self.bytes_stored.fetchAdd(bytes, .monotonic);
     }
 
     pub fn recordDelete(self: *KVMetrics) void {
         _ = self.delete_ops_total.fetchAdd(1, .monotonic);
     }
 
-    /// Shard `shard_id`'s live key count for this namespace.
-    pub fn publishLiveKeys(self: *KVMetrics, shard_id: u16, count: u64) void {
-        self.live_keys[shard_id].store(count, .monotonic);
+    /// Shard `shard_id`'s counts for this namespace.
+    pub fn publishCounts(self: *KVMetrics, shard_id: u16, live: u64, bytes: u64, history_bytes: u64, history_evicted: u64) void {
+        self.live_keys[shard_id].store(live, .monotonic);
+        self.bytes_stored[shard_id].store(bytes, .monotonic);
+        self.history_bytes[shard_id].store(history_bytes, .monotonic);
+        self.history_evicted[shard_id].store(history_evicted, .monotonic);
+    }
+
+    fn sum(slots: *const [MAX_SHARDS]Atomic(u64)) u64 {
+        var total: u64 = 0;
+        for (slots) |*n| total += n.load(.monotonic);
+        return total;
     }
 
     pub const Snapshot = struct {
@@ -56,19 +65,19 @@ pub const KVMetrics = struct {
         set_ops_total: u64,
         delete_ops_total: u64,
         bytes_stored: u64,
+        history_bytes: u64,
+        history_evicted_total: u64,
     };
 
     pub fn snapshot(self: *const KVMetrics) Snapshot {
         return .{
-            .key_count = blk: {
-                var sum: u64 = 0;
-                for (&self.live_keys) |*n| sum += n.load(.monotonic);
-                break :blk sum;
-            },
+            .key_count = sum(&self.live_keys),
             .get_ops_total = self.get_ops_total.load(.monotonic),
             .set_ops_total = self.set_ops_total.load(.monotonic),
             .delete_ops_total = self.delete_ops_total.load(.monotonic),
-            .bytes_stored = self.bytes_stored.load(.monotonic),
+            .bytes_stored = sum(&self.bytes_stored),
+            .history_bytes = sum(&self.history_bytes),
+            .history_evicted_total = sum(&self.history_evicted),
         };
     }
 };
@@ -1383,9 +1392,19 @@ fn writeKVMetrics(
     try writer.print("# TYPE flo_kv_delete_ops_total counter\n", .{});
     try writer.print("flo_kv_delete_ops_total{{{s}}} {d}\n", .{ labels, snapshot.delete_ops_total });
 
-    try writer.print("# HELP flo_kv_bytes_stored Approximate bytes stored in this namespace\n", .{});
+    // Each node reports its own full copy: across a cluster, take the max
+    // of these, not the sum.
+    try writer.print("# HELP flo_kv_bytes_stored Key and current value bytes in this namespace on this node, tombstones and expired values included, history excluded; a lower bound on memory. Across nodes, take the max\n", .{});
     try writer.print("# TYPE flo_kv_bytes_stored gauge\n", .{});
     try writer.print("flo_kv_bytes_stored{{{s}}} {d}\n", .{ labels, snapshot.bytes_stored });
+
+    try writer.print("# HELP flo_kv_history_bytes Older versions kept in this namespace on this node, charged value bytes + 64 per version; a lower bound on the memory history uses. Across nodes, take the max\n", .{});
+    try writer.print("# TYPE flo_kv_history_bytes gauge\n", .{});
+    try writer.print("flo_kv_history_bytes{{{s}}} {d}\n", .{ labels, snapshot.history_bytes });
+
+    try writer.print("# HELP flo_kv_history_evicted_total Older versions this node evicted from this namespace's history since it started, replay included\n", .{});
+    try writer.print("# TYPE flo_kv_history_evicted_total counter\n", .{});
+    try writer.print("flo_kv_history_evicted_total{{{s}}} {d}\n", .{ labels, snapshot.history_evicted_total });
 }
 
 fn writeTieredLogMetrics(

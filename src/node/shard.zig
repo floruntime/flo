@@ -3234,10 +3234,10 @@ pub const Shard = struct {
         return .ok;
     }
 
-    /// Publish each namespace's live key count that changed since the last
-    /// time, for /metrics and the dashboard: they read it from another
-    /// thread, never the projection. A namespace whose metrics can't be
-    /// registered is tried again next time.
+    /// Publish each namespace's counts that changed since the last time,
+    /// for /metrics and the dashboard: they read them from another thread,
+    /// never the projection. A namespace whose metrics can't be registered
+    /// is tried again next time.
     fn publishLiveKeys(self: *Shard) void {
         const kv = self.kv_handler.kv;
         if (!kv.live_keys_changed) return;
@@ -3245,15 +3245,16 @@ pub const Shard = struct {
         var all = true;
         var it = kv.live_keys.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.count == e.value_ptr.published) continue;
+            const c = e.value_ptr.counts;
+            if (std.meta.eql(c, e.value_ptr.published)) continue;
             // Looked up once: a namespace's metrics never move.
             const km: *KVMetrics = if (e.value_ptr.publish_to) |p| @ptrCast(@alignCast(p)) else registry.registerKVNamespace(e.key_ptr.*) catch {
                 all = false;
                 continue;
             };
             e.value_ptr.publish_to = km;
-            km.publishLiveKeys(self.id, e.value_ptr.count);
-            e.value_ptr.published = e.value_ptr.count;
+            km.publishCounts(self.id, c.live, c.bytes, c.history_bytes, c.history_evicted);
+            e.value_ptr.published = c;
         }
         if (all) kv.live_keys_changed = false;
     }
@@ -3651,10 +3652,7 @@ pub const Shard = struct {
                 const key = kv_entries.Key.decode(&r, "key") catch return;
                 if (self.metrics_registry) |mr| {
                     if (mr.registerKVNamespace(KVProjection.namespaceOf(key))) |km| switch (etype) {
-                        .kv_put => {
-                            const put = kv_entries.Put.decodeAll(entry.payload, &diag) catch return;
-                            km.recordSet(put.value.len);
-                        },
+                        .kv_put => km.recordSet(),
                         .kv_delete => km.recordDelete(),
                         else => {},
                     } else |_| {}
@@ -6798,6 +6796,9 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     const present = try handler_mod.qualifyKey(&qbuf, "", "w");
     const version = shard.defaultPartition().kv.get(present).?.version;
+    // A TTL far off, so the timeout's answer must carry it.
+    const expires_at_ms: i64 = 4_000_000_000_000;
+    shard.defaultPartition().kv.map.getPtr(present).?.expiry_ns = @as(u64, @intCast(expires_at_ms)) * std.time.ns_per_ms;
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 7, .key = present, .min_version = version, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
@@ -6808,6 +6809,7 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     var diag: schema.Diagnostic = .{};
     const got = try KVHandler.GetResponse.decodeAll(resp.data, &diag);
     try std.testing.expectEqualStrings("v1", got.value);
+    try std.testing.expectEqual(@as(?i64, expires_at_ms), got.expires_at_ms);
     try std.testing.expectEqual(version, got.version);
 
     var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
