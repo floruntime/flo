@@ -508,7 +508,11 @@ pub const ServerProcess = struct {
             // startup failure surfaces only as this harness's timeout and the
             // real bind error or panic never reaches the test output.
             if (self.dump_log_on_failure) {
-                std.debug.print("[server] port {d}: not ready within {d} ms\n", .{ self.port, timeout_ms });
+                if (self.reaped) {
+                    std.debug.print("[server] port {d}: exited before it was ready\n", .{self.port});
+                } else {
+                    std.debug.print("[server] port {d}: not ready within {d} ms\n", .{ self.port, timeout_ms });
+                }
                 self.dumpLogTail();
             }
             self.forceKill();
@@ -787,6 +791,9 @@ pub const ServerProcess = struct {
             if (main_ready and dashboard_ready) {
                 return;
             }
+            // A server that refused its config has already exited; waiting
+            // out the timeout for it cost each refused-start test the bound.
+            if (self.process) |*proc| if (self.tryReap(proc.id)) return error.ServerNotReady;
 
             stdx.time.sleep(READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
         }
