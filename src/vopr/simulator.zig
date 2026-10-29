@@ -276,6 +276,8 @@ const SimNode = struct {
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
     /// The toy family it applies, and the index it last applied it at.
     counter: families.Counter = .{},
+    /// The server's KV machine on this replica's own store.
+    kv: families.Kv,
     families_index: u64 = 0,
     /// Its apply rewound without a restart, so the family holds entries
     /// the log no longer does and cannot roll them back: the checker
@@ -409,7 +411,19 @@ const SimIo = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
-const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool };
+const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, kv: ?[families.Kv.FAMILIES.len]u64 };
+
+/// KV's families are compared at every index this divides: a checksum walks
+/// a whole family, so one at every index would cost the run's square. The
+/// indices are the same on every replica.
+const KV_SAMPLE = 16;
+
+/// What a KV checksum mismatch names, by family.
+const KV_MISMATCH = [families.Kv.FAMILIES.len][2][]const u8{
+    .{ "two replicas hold different kv.value after the same history", "a replica rebuilt by replay holds other kv.value than one that applied live" },
+    .{ "two replicas hold different kv.history after the same history", "a replica rebuilt by replay holds other kv.history than one that applied live" },
+    .{ "two replicas hold different kv.ns_counts after the same history", "a replica rebuilt by replay holds other kv.ns_counts than one that applied live" },
+};
 
 const Checker = struct {
     allocator: Allocator,
@@ -450,6 +464,8 @@ const Checker = struct {
     /// a rebuilt replica against a live one.
     state_checks: u64 = 0,
     rebuilt_checks: u64 = 0,
+    /// Of those, the ones that compared KV's families too.
+    kv_checks: u64 = 0,
 
     fn deinit(self: *Checker) void {
         self.canonical.deinit(self.allocator);
@@ -501,22 +517,35 @@ const Checker = struct {
         }
     }
 
-    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, rebuilt: bool, tick: u64) void {
+    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, kv: ?[families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
         while (self.states.items.len < idx) self.states.append(self.allocator, null) catch @panic("checker OOM");
         const slot = &self.states.items[idx - 1];
+        const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .kv = kv };
         const canon = slot.* orelse {
-            slot.* = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt };
+            slot.* = here;
             return;
         };
         // Another history reached this index: async mode can erase applied
         // history, and the log's own checks judge whether it was legal.
         // States after it are compared from here on.
         if (canon.history != history) {
-            slot.* = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt };
+            slot.* = here;
             return;
         }
         self.state_checks += 1;
         if (canon.rebuilt != rebuilt) self.rebuilt_checks += 1;
+        if (canon.kv != null and kv != null) {
+            self.kv_checks += 1;
+            for (canon.kv.?, kv.?, KV_MISMATCH) |want, got, why| {
+                if (want != got) self.fail(.{
+                    .invariant = .state_checksum,
+                    .node = node,
+                    .index = idx,
+                    .tick = tick,
+                    .detail = why[@intFromBool(canon.rebuilt != rebuilt)],
+                });
+            }
+        }
         if (canon.checksum == checksum) return;
         self.fail(.{
             .invariant = .state_checksum,
@@ -536,13 +565,14 @@ const Checker = struct {
         node: NodeId,
         idx: u64,
         term: u64,
+        entry_type: u8,
         payload: []const u8,
         is_op: bool,
         tick: u64,
         latest_crash: u64,
     ) void {
         const hash = std.hash.Wyhash.hash(HASH_SEED, payload);
-        const op_id = if (is_op) Workload.opIdFromPayload(payload) else null;
+        const op_id = if (is_op) Workload.opIdFromPayload(entry_type, payload) else null;
         while (self.canonical.items.len < idx) {
             self.canonical.append(self.allocator, null) catch @panic("checker OOM");
         }
@@ -652,6 +682,7 @@ pub const Summary = struct {
     /// replica rebuilt by replay against one that applied live.
     state_checks: u64,
     rebuilt_checks: u64,
+    kv_checks: u64,
     violation_count: usize,
 };
 
@@ -758,6 +789,7 @@ pub const Simulator = struct {
                 .replica = try newReplica(allocator, &scenario),
                 .disk = .{ .allocator = allocator },
                 .max_term_seen = 0,
+                .kv = families.Kv.init(allocator),
             };
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
@@ -786,6 +818,7 @@ pub const Simulator = struct {
             node.disk.deinit();
             node.applied_ticks.deinit(self.allocator);
             node.counter.deinit(self.allocator);
+            node.kv.deinit();
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
             self.allocator.free(node.replica.rpc_out);
@@ -1031,6 +1064,7 @@ pub const Simulator = struct {
         node.applied_config = .{};
         node.replay_through = node.applied_ticks.items.len;
         node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
+        node.kv.reset();
         node.families_index = 0;
         node.families_stale = false;
         node.history = 0;
@@ -1544,7 +1578,7 @@ pub const Simulator = struct {
                 // An entry a repair skips is passed over: it applies nothing.
                 const passed_over = node.skipped and self.halt != null and idx == self.halt.?.index;
                 const is_op = !passed_over and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config) and e.header.entry_type != @backingInt(entry_mod.EntryType.repair_skip);
-                if (is_op and self.scenario.halt_op != 0 and Workload.opIdFromPayload(e.payload) == self.scenario.halt_op - 1) {
+                if (is_op and self.scenario.halt_op != 0 and Workload.opIdFromPayload(e.header.entry_type, e.payload) == self.scenario.halt_op - 1) {
                     self.haltNode(node, &e);
                     break;
                 }
@@ -1560,7 +1594,7 @@ pub const Simulator = struct {
                 while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
                 node.applied_ticks.items[idx - 1] = self.now;
                 node.raft.noteApplied(e.header.timestamp_ns);
-                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.payload, is_op, self.now, self.latest_crash_at);
+                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, self.latest_crash_at);
                 // A config applied is committed, as production's applier
                 // records it.
                 if (e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
@@ -1594,7 +1628,7 @@ pub const Simulator = struct {
         }
     }
 
-    /// The toy family's apply, then its state for the checker.
+    /// The families' apply, then their state for the checker.
     fn applyFamilies(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, is_op: bool) void {
         if (idx <= node.families_index) node.families_stale = true;
         node.families_index = idx;
@@ -1603,13 +1637,22 @@ pub const Simulator = struct {
         node.history = std.hash.Wyhash.hash(node.history, std.mem.asBytes(&step));
         const live = idx > node.replay_through;
         const mutant = self.options.family_mutant;
-        if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, .{
+        const replica: families.Replica = .{
             .mutant = mutant,
             .node_now = self.nodeNow(node),
             .leader = node.raft.role == .leader,
             .live = live,
+        };
+        if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
+        if (is_op and families.Kv.owns(e.header.entry_type)) node.kv.apply(e, replica) catch self.checker.fail(.{
+            .invariant = .applied_integrity,
+            .node = node.id,
+            .index = idx,
+            .tick = self.now,
+            .detail = "the KV machine failed a workload entry it should apply",
         });
-        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), !live, self.now);
+        const kv_sums = if (idx % KV_SAMPLE == 0) node.kv.checksums() else null;
+        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), kv_sums, !live, self.now);
     }
 
     // ── Log durability (runs before fault injection) ───────────────────
@@ -1926,6 +1969,7 @@ pub const Simulator = struct {
             .canonical_hash = h.final(),
             .state_checks = self.checker.state_checks,
             .rebuilt_checks = self.checker.rebuilt_checks,
+            .kv_checks = self.checker.kv_checks,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2083,6 +2127,7 @@ fn restartingScenario(seed: u64) Scenario {
 test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family state after the same history" {
     var checks: u64 = 0;
     var rebuilt: u64 = 0;
+    var kv_checks: u64 = 0;
     for ([_]u64{ 77, 78, 79 }) |seed| {
         for ([_]scenario_mod.DurabilityMode{ .sync, .async_flush }) |durability| {
             var scenario = restartingScenario(seed);
@@ -2099,15 +2144,20 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
             try testing.expect(s.ok);
             checks += s.state_checks;
             rebuilt += s.rebuilt_checks;
+            kv_checks += s.kv_checks;
+            // Every replica's KV store fails an undeclared key, restarted
+            // ones too.
+            for (sim.nodes) |*node| try testing.expect(node.kv.store.strict_keys);
         }
     }
     try testing.expect(checks >= 1000);
     try testing.expect(rebuilt >= 500);
+    try testing.expect(kv_checks >= 50);
 }
 
 /// What `state_checksum` found under a mutant: any violation, and one
 /// that set a replica rebuilt by replay against one that applied live.
-const Caught = struct { any: bool = false, rebuilt_vs_live: bool = false };
+const Caught = struct { any: bool = false, rebuilt_vs_live: bool = false, kv: bool = false };
 
 fn stateChecksumUnder(mutant: families.Mutant) !Caught {
     var sim = try Simulator.init(testing.allocator, restartingScenario(77), .{ .family_mutant = mutant });
@@ -2118,6 +2168,7 @@ fn stateChecksumUnder(mutant: families.Mutant) !Caught {
         if (v.invariant != .state_checksum) continue;
         found.any = true;
         if (std.mem.startsWith(u8, v.detail, "a replica rebuilt by replay")) found.rebuilt_vs_live = true;
+        if (std.mem.indexOf(u8, v.detail, " kv.") != null) found.kv = true;
     }
     return found;
 }
@@ -2136,6 +2187,11 @@ test "vopr sim: a checksum in map order fails state_checksum between a rebuilt r
 
 test "vopr sim: an effect only live apply runs fails state_checksum between a rebuilt replica and a live one" {
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
+}
+
+test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
+    const caught = try stateChecksumUnder(.kv_replay_skips_batches);
+    try testing.expect(caught.rebuilt_vs_live and caught.kv);
 }
 
 fn runTicks(sim: *Simulator, n: u64) !void {

@@ -16,14 +16,29 @@
 const std = @import("std");
 const PRNG = @import("stdx").PRNG;
 const entry_mod = @import("../storage/ual/entry.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
+const schema = @import("../protocol/schema.zig");
 const Scenario = @import("scenario.zig").Scenario;
 
 const Allocator = std.mem.Allocator;
 pub const EntryType = entry_mod.EntryType;
 
 /// Op kinds the workload synthesizes — opaque bytes to Raft, but a
-/// realistic mix of entry types rather than a uniform one.
-const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_delete };
+/// realistic mix of entry types rather than a uniform one. KV ops decode as
+/// their entries do, since replicas apply them through the KV machine: a
+/// put's value starts with the op id, and a delete is a batch that deletes
+/// a slot's key and tombstones a key naming the op, so every op is still
+/// attributable from its payload alone.
+const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_batch };
+
+/// KV ops write a few keys over and over, across two namespaces, so
+/// overwrites, deletes and history all happen.
+const KV_SLOTS = 32;
+/// Where a delete's marker key lives: `del\0d` and the op id in hex.
+const MARKER_PREFIX = "del\x00d";
+/// The largest payload a scenario draws: the size of the KV encoder's
+/// scratch.
+pub const MAX_PAYLOAD = 4096;
 
 pub const OpState = enum {
     /// Proposed to a leader; commit outcome not yet observed.
@@ -97,15 +112,70 @@ pub const Workload = struct {
         // streams from the xorshift state.
         var prng = PRNG.init(seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
-        const entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
+        std.debug.assert(payload_max <= MAX_PAYLOAD);
+        var entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
         const len = r.intRangeAtMost(u32, payload_min, payload_max);
-        const payload = buf[0..len];
-        // First 8 bytes carry the op id so a committed entry is
-        // attributable from its payload alone.
-        std.mem.writeInt(u64, payload[0..8], op_id, .little);
-        r.bytes(payload[8..]);
+        const kv: ?[]u8 = switch (entry_type) {
+            .kv_put => kvPut(buf[0..payload_max], op_id, len, r),
+            .kv_batch => kvDelete(buf[0..payload_max], op_id, r),
+            else => null,
+        };
+        const payload = kv orelse raw: {
+            // A KV op too large for this scenario's payloads goes as raw bytes.
+            if (entry_type == .kv_put or entry_type == .kv_batch) entry_type = .stream_append;
+            const p = buf[0..len];
+            // First 8 bytes carry the op id so a committed entry is
+            // attributable from its payload alone.
+            std.mem.writeInt(u64, p[0..8], op_id, .little);
+            r.bytes(p[8..]);
+            break :raw p;
+        };
         const hash = std.hash.Wyhash.hash(0x5EED, payload);
         return .{ .entry_type = entry_type, .payload = payload, .hash = hash };
+    }
+
+    /// A put of a slot's key, `len` bytes long where the encoding allows:
+    /// its value is the op id, then random bytes. A quarter carry a TTL.
+    /// Null when it can't fit in `buf`.
+    fn kvPut(buf: []u8, op_id: u64, len: u32, r: std.Random) ?[]u8 {
+        var key_buf: [16]u8 = undefined;
+        const key = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
+        const ttl_ms: ?u64 = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null;
+        var value_buf: [MAX_PAYLOAD]u8 = undefined;
+        // The value that brings the payload to `len`, but at least the op id.
+        var value_len: usize = 8;
+        const base = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..8], .ttl_ms = ttl_ms }) catch return null;
+        if (len > base) value_len += len - base;
+        while (value_len > 8) : (value_len -= 1) {
+            const size = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..value_len], .ttl_ms = ttl_ms }) catch return null;
+            if (size <= len) break;
+        }
+        const value = value_buf[0..value_len];
+        std.mem.writeInt(u64, value[0..8], op_id, .little);
+        r.bytes(value[8..]);
+        const body: kv_entries.Put.Value = .{ .key = key, .value = value, .ttl_ms = ttl_ms };
+        if ((kv_entries.Put.encodedSize(body) catch return null) > buf.len) return null;
+        const out = kv_entries.Put.encodeInto(buf, body) catch return null;
+        return buf[0..out.len];
+    }
+
+    /// A batch deleting a slot's key and tombstoning the op's marker key.
+    fn kvDelete(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
+        var key_buf: [16]u8 = undefined;
+        var marker_buf: [MARKER_PREFIX.len + 16]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
+        const ops = [_]kv_entries.BatchOp.Value{
+            .{ .kind = .delete, .key = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = null },
+            .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null },
+        };
+        var w: schema.Writer = .{ .buf = buf };
+        kv_entries.BatchOps.encodeSlice(&w, &ops) catch return null;
+        return buf[0..w.written().len];
+    }
+
+    /// A slot's key: every third slot in a namespace of its own.
+    fn slotKey(buf: *[16]u8, slot: u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}k{d:0>2}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
     }
 
     /// Generate the next op. The payload points into the workload's
@@ -160,10 +230,25 @@ pub const Workload = struct {
         return synthesize(self.seed, self.payload_min, self.payload_max, op_id, self.scratch).hash;
     }
 
-    /// Recover an op id from a committed payload (the checker's side of
-    /// the first-8-bytes convention). Null for payloads too short to be
-    /// workload ops (e.g. raft_noop).
-    pub fn opIdFromPayload(payload: []const u8) ?u64 {
+    /// Recover an op id from a committed payload: a KV put's value, a KV
+    /// delete's marker key, otherwise the first 8 bytes. Null for payloads
+    /// no workload op has (e.g. raft_noop).
+    pub fn opIdFromPayload(entry_type: u8, payload: []const u8) ?u64 {
+        var diag: schema.Diagnostic = .{};
+        if (entry_type == @backingInt(EntryType.kv_put)) {
+            const p = kv_entries.Put.decodeAll(payload, &diag) catch return null;
+            if (p.value.len < 8) return null;
+            return std.mem.readInt(u64, p.value[0..8], .little);
+        }
+        if (entry_type == @backingInt(EntryType.kv_batch)) {
+            const b = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
+            var it = b.ops.iterator();
+            while (it.next() catch return null) |op| {
+                if (!std.mem.startsWith(u8, op.key, MARKER_PREFIX)) continue;
+                return std.fmt.parseInt(u64, op.key[MARKER_PREFIX.len..], 16) catch null;
+            }
+            return null;
+        }
         if (payload.len < 8) return null;
         return std.mem.readInt(u64, payload[0..8], .little);
     }
@@ -184,7 +269,7 @@ test "vopr workload: synthesis is deterministic and self-verifying" {
         try testing.expectEqual(a.hash, b.hash);
         try testing.expectEqual(a.entry_type, b.entry_type);
         try testing.expectEqualSlices(u8, a.payload, b.payload);
-        try testing.expectEqual(@as(u64, id), Workload.opIdFromPayload(a.payload).?);
+        try testing.expectEqual(@as(u64, id), Workload.opIdFromPayload(@backingInt(a.entry_type), a.payload).?);
     }
 }
 
@@ -200,8 +285,32 @@ test "vopr workload: payload length respects bounds" {
     var buf: [4096]u8 = undefined;
     for (0..200) |id| {
         const gen = Workload.synthesize(7, 16, 100, id, &buf);
-        try testing.expect(gen.payload.len >= 16 and gen.payload.len <= 100);
+        try testing.expect(gen.payload.len <= 100);
+        // A KV delete is as long as its encoding.
+        if (gen.entry_type != .kv_batch) try testing.expect(gen.payload.len >= 16);
     }
+}
+
+test "vopr workload: KV ops decode as their entries, with every kind in the mix" {
+    var buf: [4096]u8 = undefined;
+    var puts: usize = 0;
+    var deletes: usize = 0;
+    var diag: schema.Diagnostic = .{};
+    for (0..400) |id| {
+        const gen = Workload.synthesize(5, 16, 2048, id, &buf);
+        switch (gen.entry_type) {
+            .kv_put => {
+                _ = try kv_entries.Put.decodeAll(gen.payload, &diag);
+                puts += 1;
+            },
+            .kv_batch => {
+                _ = try kv_entries.Batch.decodeAll(gen.payload, &diag);
+                deletes += 1;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(puts > 40 and deletes > 40);
 }
 
 test "vopr workload: op lifecycle and idempotent transitions" {
