@@ -190,3 +190,69 @@ test "e2e/salvage: a cut that drops a repair of an entry it keeps is refused unl
     try ctx.restartServer();
     try testing.expectEqualStrings("halted", try shardState(ctx.server.metrics_port, &state_buf));
 }
+
+/// Spoil the header of shard 0's second-to-last segment; returns the first
+/// index it held.
+fn spoilSecondLast(ctx: *stdx.testing.TestContext) !u64 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    const segs = try segments(ctx, &names);
+    defer testing.allocator.free(segs);
+    const damaged = names.items[names.items.len - 2];
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ segs, damaged });
+    defer testing.allocator.free(path);
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(bytes);
+    @memcpy(bytes[0..4], "XXXX");
+    const file = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(file);
+    try stdx.fs.writeAll(file, bytes);
+    return std.fmt.parseInt(u64, damaged[0 .. damaged.len - ".flseg".len], 10);
+}
+
+test "e2e/salvage: a cluster founder's data directory is refused, whatever its damage" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true, .cluster_enabled = true },
+    });
+    defer ctx.deinit();
+    for ([_][]const u8{ "a", "b", "c" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
+    ctx.server.stop();
+    const first_lost = try spoilSecondLast(ctx);
+    var keep_buf: [24]u8 = undefined;
+    var refused = try salvage(ctx, try std.fmt.bufPrint(&keep_buf, "{d}", .{first_lost - 1}), true);
+    defer refused.deinit();
+    try testing.expect(refused.exit_code != 0);
+    try testing.expect(refused.contains("belonged to a cluster"));
+    try testing.expect(!refused.stdoutContains("now ends at entry"));
+}
+
+test "e2e/salvage: a cut recorded before a crash is finished by the next start, damaged file and all" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    for ([_][]const u8{ "kept1", "kept2", "lost1", "lost2" }) |k| try ctx.exec(&.{ "kv", "set", k, "v" });
+    ctx.server.stop();
+    const first_lost = try spoilSecondLast(ctx);
+    // What salvage leaves if it dies after recording the cut, before the
+    // cut touches a file.
+    const intent = try std.fmt.allocPrint(testing.allocator, "{s}/00000/segs/TRUNCATE", .{ctx.server.getDataDir()});
+    defer testing.allocator.free(intent);
+    {
+        const file = try stdx.fs.createFile(intent, .{});
+        defer stdx.fs.closeFile(file);
+        var line_buf: [24]u8 = undefined;
+        try stdx.fs.writeAll(file, try std.fmt.bufPrint(&line_buf, "{d}\n", .{first_lost - 1}));
+    }
+    try ctx.restartServer();
+    var state_buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("ok", try shardState(ctx.server.metrics_port, &state_buf));
+    try testing.expectEqualStrings("v", try ctx.execCapture(&.{ "kv", "get", "kept2" }));
+    var r = try ctx.execResult(&.{ "kv", "get", "lost1" });
+    defer r.deinit();
+    try testing.expectEqual(@as(u8, 1), r.exit_code);
+    try testing.expect(stdx.fs.openFile(intent, .{}) == error.FileNotFound);
+}

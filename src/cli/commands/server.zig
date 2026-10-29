@@ -847,21 +847,29 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     const data_dir = expandTilde(ctx.allocator, config.data_dir) catch |err|
         return outcome.usage(ctx, "cannot expand data directory path: {}", .{err});
     defer ctx.allocator.free(data_dir);
+    // A member's copy is replaced by rejoining: cut here, it could drop the
+    // configs that name the others, and then lead alone beside them.
+    if (config.cluster.enabled or config.cluster.seeds.len > 0) {
+        return outcome.localRefusal(ctx, "the config names a cluster ([cluster] enabled or seeds); a member's damaged shard is recovered by rejoining (move the data directory aside and start with --join), not by salvage", .{});
+    }
     var lock: stdx.fs.File = undefined;
     try lockOffline(ctx, data_dir, &lock);
     defer stdx.fs.closeFile(lock);
+    // The damage is reported below, once; the readers' own lines repeat it.
+    const level = stdx.log.getLevel();
+    stdx.log.setLevel(.fatal);
+    defer stdx.log.setLevel(level);
 
-    // The group's log may be the damaged one, so it is read only as far as
-    // it reads.
+    // A single node never writes a config entry, so any one in the group's
+    // log, read as far as it reads, means a cluster.
     var group_buf: [std.fs.max_path_bytes]u8 = undefined;
     const group_dir = offline.groupDir(&group_buf, data_dir) catch return outcome.usage(ctx, "data directory path too long", .{});
-    const group = offline.readable(ctx.allocator, group_dir) catch |err| {
+    var group = offline.readable(ctx.allocator, group_dir) catch |err| {
         return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
     };
-    // A member's copy is replaced by rejoining; cut here, it would hold
-    // less than the group says it does.
-    if (group.member_count > 1) {
-        return outcome.localRefusal(ctx, "this data directory belongs to a cluster of {d}; a member's damaged shard is recovered by rejoining (move the data directory aside and start with --join), not by salvage", .{group.member_count});
+    defer group.deinit(ctx.allocator);
+    if (group.saw_config) {
+        return outcome.localRefusal(ctx, "this data directory belonged to a cluster (its log holds a member list); a member's damaged shard is recovered by rejoining (move the data directory aside and start with --join), not by salvage", .{});
     }
 
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -869,19 +877,22 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     if (stdx.fs.openDir(dir, .{})) |d| stdx.fs.closeDir(d) else |_| {
         return outcome.localRefusal(ctx, "{s} has no shard {d}", .{ data_dir, shard });
     }
-    const r = offline.readable(ctx.allocator, dir) catch |err| return switch (err) {
+    var r = offline.readable(ctx.allocator, dir) catch |err| return switch (err) {
         error.LogStartsAfterOne => outcome.localRefusal(ctx, "shard {d}'s log doesn't start at entry 1, and salvage only cuts a log that holds its whole history", .{shard}),
         error.OverlappingSegments => outcome.localRefusal(ctx, "two of shard {d}'s segments hold the same entry with no cut pending, so nothing says which is the log", .{shard}),
         else => outcome.localRefusal(ctx, "cannot read shard {d}'s log: {}", .{ shard, err }),
     };
+    defer r.deinit(ctx.allocator);
     ctx.print("data dir:    {s}, shard {d}\n", .{ data_dir, shard });
     ctx.print("log:         indices {d}..{d}{s}, reads through {d}\n", .{ r.first_index, r.last_index, if (r.unreadable_headers > 0) " or more" else "", r.through });
     if (r.damage()) |why| ctx.print("damage:      {s}\n", .{why});
     ctx.print("committed:   through {d} (as last flushed)\n", .{r.commit});
     if (r.pending_cut) |j| ctx.print("note:        a cut after {d} is pending\n", .{j});
+    if (group.config_unknown) ctx.print("note:        past the damage, the cluster group's log may hold a member list this can't read; if this node was ever a cluster member, rejoin it instead\n", .{});
 
     offline.checkSalvage(&r, after) catch |err| return switch (err) {
         error.NoLog => outcome.localRefusal(ctx, "shard {d} has no log; there is nothing to salvage", .{shard}),
+        error.KeepsNothing => outcome.localRefusal(ctx, "--truncate-after 0 keeps nothing; salvage keeps entry 1 at least. With nothing worth keeping, move the data directory aside instead", .{}),
         error.PendingCutLower => outcome.localRefusal(ctx, "a cut after entry {d} is already pending on shard {d}, and it drops more than this would: run salvage with --truncate-after {d} or lower, or start and stop the server once to finish it", .{ r.pending_cut.?, shard, r.pending_cut.? }),
         error.PastReadable => if (r.damage() != null)
             outcome.localRefusal(ctx, "entry {d} is past the damage: the highest entry shard {d} can keep is {d}. Run again with --truncate-after {d}", .{ after, shard, r.through, r.through })
@@ -889,12 +900,14 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
             outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
         error.NothingToCut => outcome.localRefusal(ctx, "shard {d}'s log ends at entry {d}; there is nothing after {d} to drop", .{ shard, r.last_index, after }),
     };
-    var undone_buf: [offline.Readable.MAX_SKIPS]offline.Readable.SkipAt = undefined;
-    const undone = undone_buf[0..r.undone(after, &undone_buf)];
+    const undone_buf = ctx.allocator.alloc(offline.Readable.SkipAt, r.skips.items.len) catch return outcome.localRefusal(ctx, "out of memory", .{});
+    defer ctx.allocator.free(undone_buf);
+    const undone = r.undone(after, undone_buf);
     for (undone) |sk| ctx.print("repair:      the cut drops the repair at entry {d}, which skips entry {d}: entry {d} applies again at the next start, or the shard halts on it\n", .{ sk.at, sk.skipped, sk.skipped });
-    if (r.skips_unknown) ctx.print("repair:      past the damage, a repair may be dropped that this can't read; the entry it skips would apply again\n", .{});
-    if (undone.len > 0 and !ctx.getBool("undo-repairs")) {
-        return outcome.localRefusal(ctx, "the cut would undo {d} repair(s) (above); run again with --undo-repairs to cut anyway, or keep more with a higher --truncate-after", .{undone.len});
+    if (r.skips_unread) ctx.print("repair:      past the damage, a segment that holds a repair won't read: the cut drops it, and the entry it skips may apply again\n", .{});
+    if (r.unreadable_headers > 0 and !r.skips_unread) ctx.print("note:        a segment whose header won't read may hold a repair this can't name\n", .{});
+    if ((undone.len > 0 or r.skips_unread) and !ctx.getBool("undo-repairs")) {
+        return outcome.localRefusal(ctx, "the cut would undo a repair (above); run again with --undo-repairs to cut anyway, or keep more with a higher --truncate-after", .{});
     }
     const lost = offline.lostAfter(&r, after);
     const more = if (lost.at_least) "at least " else "";
