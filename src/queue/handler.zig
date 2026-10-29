@@ -174,7 +174,7 @@ pub const QueueHandler = struct {
         // followers and on replay, so a namespace nobody created is created
         // first. Here, on the owning thread: a pipeline's queue sink reaches
         // `handleCommand` from another shard's.
-        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
         const result = shard.queue_handler.handleCommand(req);
         defer shard.queue_handler.freeResult(result);
         if (result == .parked) return parkQueue(shard, conn, req, result.parked);

@@ -78,16 +78,24 @@ test "e2e/decode: requests whose lengths or types don't fit are answered, and th
     try alive(ctx);
 }
 
-test "e2e/decode: namespace settings are refused with their reason, and the node keeps serving" {
+test "e2e/decode: the retired namespace settings codes and an internal op are unknown to a client, and the node keeps serving" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
     var out: [512]u8 = undefined;
-    // A block the old settings format would have applied: queue_max_lease_s=60.
-    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }) |op| {
-        const r = try rawCall(ctx, op, "", "default", &.{ 1, 6, 60, 0, 0, 0 }, &out);
+    // A block the old settings format would have applied, then namespace.ensure,
+    // which only another shard sends.
+    for ([_]struct { code: u16, says: []const u8 }{
+        .{ .code = 0x014, .says = "unknown op 0x14" },
+        .{ .code = 0x015, .says = "unknown op 0x15" },
+        .{ .code = @backingInt(proto.OpCode.namespace_ensure), .says = "unknown op 0x16" },
+    }) |c| {
+        const r = try rawCall(ctx, @fromBackingInt(c.code), "fresh", "default", &.{ 1, 6, 60, 0, 0, 0 }, &out);
         try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), r.status);
-        try testing.expectEqualStrings("namespace settings aren't supported yet: none would take effect", r.data);
+        try testing.expectEqualStrings(c.says, r.data);
     }
+    var info = try ctx.cli.run(&.{ "ns", "info", "fresh" });
+    defer info.deinit();
+    try testing.expectEqual(@as(u8, 1), info.exit_code);
     try alive(ctx);
 }

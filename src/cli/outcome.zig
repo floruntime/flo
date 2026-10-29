@@ -52,7 +52,7 @@ pub fn exitCode(result: Error!void) u8 {
 /// The outcome a response status stands for.
 pub fn ofStatus(status: proto.StatusCode) Error {
     return switch (status) {
-        .not_found => error.NotFound,
+        .not_found, .no_namespace => error.NotFound,
         .overloaded, .rate_limited, .unavailable => error.Retryable,
         .outcome_pending => error.Pending,
         .ok,
@@ -372,6 +372,7 @@ fn statusName(status: proto.StatusCode) []const u8 {
 
 test "outcome: each status has its exit code" {
     try std.testing.expectEqual(@as(u8, 1), exitCode(ofStatus(.not_found)));
+    try std.testing.expectEqual(@as(u8, 1), exitCode(ofStatus(.no_namespace)));
     inline for (.{ .bad_request, .conflict, .unauthorized, .group_locked, .internal_error, .error_generic }) |s|
         try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(s)));
     inline for (.{ .overloaded, .rate_limited, .unavailable }) |s|

@@ -255,7 +255,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // Registry-owned: applied by the owning handler's callback, never by
         // this router (Shard.assertOneApplier enforces it).
         .workflow_create, .workflow_start, .workflow_complete => .none,
-        .namespace_create, .namespace_delete, .namespace_config => .none,
+        .namespace_create, .namespace_bind => .none,
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
         .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => .none,
     };

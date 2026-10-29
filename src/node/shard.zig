@@ -706,8 +706,8 @@ pub const Shard = struct {
         // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
         // namespace handler. Done HERE — before replaySegments runs below — so that
         // queues re-registered during replay resolve their real namespace instead of
-        // falling back to "default". (namespace_create entries replay before the
-        // queue_enqueue entries that reference them, so the registry is populated in time.)
+        // falling back to "default". (A namespace's create or bind replays before the
+        // queue_enqueue entries that reference it, so the registry is populated in time.)
         queue_handler.queue.ns_resolver = resolveQueueNamespace;
         queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
         stream_handler.stream.ns_resolver = resolveQueueNamespace;
@@ -1734,7 +1734,7 @@ pub const Shard = struct {
                 self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
                 return;
             }
-            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
+            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self);
         }
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
     }
@@ -5492,9 +5492,8 @@ pub const Shard = struct {
     fn answerUnknownOp(shard_ptr: *anyopaque, conn_ptr: *anyopaque, request_id: u64, op: u16) void {
         const self: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var buf: [32]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, "unknown op 0x{x}", .{op}) catch unreachable;
-        self.sendRefusal(conn, request_id, .bad_request, .{ .reason = .unknown_op, .ran = .no, .message = message });
+        const r = run_mod.unknownOp(op);
+        self.sendRefusal(conn, request_id, r.status, r.refusal);
     }
 
     // ─── Built-in handlers ───────────────────────────────────────────────
@@ -7273,6 +7272,8 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             w.put(&.{ 0, 0 }) catch unreachable; // no routing key, no txn
             return w.written();
         },
+        // The namespace ops' bodies are empty records.
+        .namespace_create, .namespace_delete, .namespace_info, .namespace_ensure => return "",
         else => unreachable,
     }
 }
@@ -11028,7 +11029,7 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
     }
 }
 
-test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
+test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -11048,14 +11049,15 @@ test "Shard: namespace settings are refused with their reason, and nothing is pr
     var one: [1]proto.Response = undefined;
 
     const last = shard.raft_node.log.lastIndex();
-    // A well-formed block that the old settings format would have applied.
-    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }, 0..) |op, i| {
-        try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
-        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
-        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, (try one[0].refused()).message);
-    }
+    // namespace.ensure would create the namespace; from a client it is no op at all.
+    try ParkTest.send(&shard, conn, .namespace_ensure, 1, "fresh", "");
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    const r = try one[0].refused();
+    try std.testing.expectEqual(proto.Reason.unknown_op, r.reason);
+    try std.testing.expectEqualStrings("unknown op 0x16", r.message);
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expect(!shard.namespace_handler.namespaces.contains("fresh"));
 }
 
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
@@ -11355,7 +11357,7 @@ test "Shard: a parked request leaves the pending table before it is answered, so
         }
     };
     // Any entry will do: the answer under test never reads it.
-    const proposed = try persistence_mod.proposeEntry(&shard, .namespace_create, entry_mod.Flags.NONE, "", "k", "");
+    const proposed = try KVHandler.testProposePut(&shard, "k", "");
     shard.park(conn, try ParkTest.request(.kv_put, 30, "", "k", "v", ""), proposed, Sweep.respond);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
@@ -11370,7 +11372,7 @@ test "Shard: a parked request leaves the pending table before it is answered, so
     try std.testing.expectEqualStrings("answered", one[0].data);
 }
 
-test "Shard: a burst of first writes to a new namespace proposes one implicit create, and a write after it applied proposes another if the namespace is gone" {
+test "Shard: a burst of first writes to a new namespace proposes one implicit create, and none once it applied" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -11398,17 +11400,12 @@ test "Shard: a burst of first writes to a new namespace proposes one implicit cr
     for (0..3) |_| ns.markNamespaceHasData("fresh", &shard);
     try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, first));
 
-    // Once it applies the namespace exists, counted once however many
-    // writes the burst held.
+    // Once it applies the namespace exists, and its next write proposes nothing.
     try ParkTest.ack(&shard);
-    try std.testing.expectEqual(@as(u32, 1), ns.namespaces.get("fresh").?.data_count);
-
-    // Applied, it no longer stands in the way: a namespace removed since
-    // is created again by its next write.
-    ns.applyDelete("fresh");
+    try std.testing.expect(ns.namespaces.contains("fresh"));
     const again = raft.log.lastIndex() + 1;
     ns.markNamespaceHasData("fresh", &shard);
-    try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, again));
+    try std.testing.expectEqual(@as(u32, 0), Count.creates(raft, again));
 }
 
 test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {

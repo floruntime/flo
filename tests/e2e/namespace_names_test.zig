@@ -123,10 +123,10 @@ test "e2e/namespace: writes cannot create namespaces past the limit, and the ref
     var create = try ctx.cli.run(&.{ "ns", "create", "one-more" });
     defer create.deinit();
     try stdx.testing.assertStderrContains(create, "namespace limit reached (1024 per shard)");
-    // The listing shows at most 256 per shard, so ask for it by name.
     var info = try ctx.cli.run(&.{ "ns", "info", "one-more" });
     defer info.deinit();
-    try stdx.testing.assertStdoutContains(info, "Namespace 'one-more' does not exist");
+    try testing.expectEqual(@as(u8, 1), info.exit_code);
+    try stdx.testing.assertStderrContains(info, "Error: namespace not found [no_namespace/not_found]");
     // A namespace that exists still takes writes.
     try ctx.exec(&.{ "kv", "set", "k2", "v", "-n", "ns7" });
 }
@@ -168,7 +168,7 @@ test "e2e/namespace: a write that brings no data, to a namespace never seen, cre
     for ([_][]const u8{ "typo-a", "typo-b", "typo-c" }) |name| {
         var info = try ctx.cli.run(&.{ "ns", "info", name });
         defer info.deinit();
-        var buf: [64]u8 = undefined;
-        try stdx.testing.assertStdoutContains(info, try std.fmt.bufPrint(&buf, "Namespace '{s}' does not exist", .{name}));
+        try testing.expectEqual(@as(u8, 1), info.exit_code);
+        try stdx.testing.assertStderrContains(info, "Error: namespace not found [no_namespace/not_found]");
     }
 }

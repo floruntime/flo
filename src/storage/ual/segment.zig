@@ -25,7 +25,7 @@ pub const FOOTER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'E', 'N', 'D', 0 };
 /// Bumped with any change to a stored entry's layout (the entry table), so
 /// a data directory written before it is refused at open, not misread.
 /// protocol/table.zig pins the entry layouts this version stores.
-pub const SEGMENT_VERSION: u16 = 2;
+pub const SEGMENT_VERSION: u16 = 3;
 pub const HEADER_SIZE: usize = 64;
 pub const FOOTER_SIZE: usize = 32;
 pub const SPARSE_INDEX_INTERVAL: u32 = 256;
@@ -206,7 +206,7 @@ test "segment: the version moves with the stored entry layouts" {
     // SEGMENT_VERSION, so data written before it is refused at open, and
     // pin the new hash beside it. Refusal reasons and ops are never stored,
     // so they are left out and don't force a bump.
-    const pinned = .{ .version = 2, .entries = 0x69be2cbe871ae8d3 };
+    const pinned = .{ .version = 3, .entries = 0x2bef332533330bdf };
     const entries_hash = comptime @import("../../protocol/ops.zig").entryTableHash(&@import("../../protocol/table.zig").entry_table);
     try std.testing.expectEqual(@as(u16, pinned.version), SEGMENT_VERSION);
     try std.testing.expectEqual(@as(u64, pinned.entries), entries_hash);
