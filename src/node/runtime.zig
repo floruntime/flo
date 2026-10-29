@@ -160,9 +160,9 @@ pub const RuntimeConfig = struct {
 };
 
 /// Node runtime — manages shard threads, acceptor thread, and lifecycle.
-pub const LOCK_FILENAME = "flo.lock";
+pub const LOCK_FILENAME = data_format.LOCK_FILENAME;
 
-pub const ADMIN_SOCKET_FILENAME = "admin.sock";
+pub const ADMIN_SOCKET_FILENAME = data_format.ADMIN_SOCKET_FILENAME;
 
 /// The admin socket's path: `configured`, else admin.sock in `data_dir`.
 /// Both are expanded already. The server and the CLI agree through this.
@@ -1549,6 +1549,15 @@ test "Runtime: boot 2 shards and shutdown" {
     try std.testing.expect(!runtime.started);
 }
 
+/// A FORMAT in `data_dir`, as a server that ran there wrote it: what a
+/// test that builds a data directory by hand needs before a start reads it.
+fn writeFormatFile(data_dir: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const f = try stdx.fs.createFileAbsolute(try std.fmt.bufPrint(&buf, "{s}/{s}", .{ data_dir, data_format.FILENAME }), .{});
+    defer stdx.fs.closeFile(f);
+    try stdx.fs.writeAll(f, std.fmt.comptimePrint("{d}\n", .{data_format.CURRENT}));
+}
+
 test "Runtime: a shard that cannot boot fails the start with its own error, and nothing is left behind" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1556,6 +1565,7 @@ test "Runtime: a shard that cannot boot fails the start with its own error, and 
     defer std.testing.allocator.free(data_dir);
     // Shard 2's directory is a file, so its init fails; the others boot,
     // or stop early, and are freed.
+    try writeFormatFile(data_dir);
     {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
         defer std.testing.allocator.free(path);
@@ -1639,6 +1649,7 @@ test "Runtime: a shard that cannot boot stops the others' replays before they fi
     const data_dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
     defer std.testing.allocator.free(data_dir);
     for ([_]u16{ 0, 1, 3 }) |id| try writeShardLog(data_dir, id, 4, 20_000);
+    try writeFormatFile(data_dir);
     {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/00002", .{data_dir});
         defer std.testing.allocator.free(path);

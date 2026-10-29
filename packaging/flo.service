@@ -16,6 +16,9 @@ User=flo
 Group=flo
 ExecStart=/usr/bin/flo server start --config /etc/flo/flo.toml
 Restart=on-failure
+# Exit 78 means the data directory can't be used (another format, or not
+# Flo's): restarting never helps, so systemd stops and shows why.
+RestartPreventExitStatus=78
 # Back off from 5 s to 2 min between attempts. systemd before 254 (Rocky 9
 # has 252) warns that it doesn't know these two keys, ignores them and
 # keeps the flat 5 s.

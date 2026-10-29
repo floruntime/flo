@@ -271,20 +271,25 @@ pub const ServerProcess = struct {
         self.tmp_dir = testing.tmpDir(.{});
         errdefer self.tmp_dir.cleanup();
 
-        // Get absolute path to temp directory
-        self.data_dir = try stdx.fs.dirRealpathAlloc(self.tmp_dir.dir, allocator, ".");
+        // The data directory is a subdirectory, with the config file and the
+        // log beside it: a server refuses a data directory holding files that
+        // aren't Flo's.
+        const root = try stdx.fs.dirRealpathAlloc(self.tmp_dir.dir, allocator, ".");
+        defer allocator.free(root);
+        try self.tmp_dir.dir.createDir(stdx.io.instance(), "data", .default_dir);
+        self.data_dir = try std.fmt.allocPrint(allocator, "{s}/data", .{root});
         errdefer allocator.free(self.data_dir);
 
         // Create config file path (content written at start time when we know ports)
-        const config_path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{self.data_dir});
+        const config_path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{root});
         errdefer allocator.free(config_path);
         self.config_file = config_path;
 
-        self.admin_socket = try std.fmt.allocPrint(allocator, "/tmp/flo-e2e-{s}.sock", .{std.fs.path.basename(self.data_dir)});
+        self.admin_socket = try std.fmt.allocPrint(allocator, "/tmp/flo-e2e-{s}.sock", .{std.fs.path.basename(root)});
         errdefer allocator.free(self.admin_socket);
 
         // Create log file path
-        const log_path = try std.fmt.allocPrint(allocator, "{s}/server.log", .{self.data_dir});
+        const log_path = try std.fmt.allocPrint(allocator, "{s}/server.log", .{root});
         errdefer allocator.free(log_path);
         self.log_file_path = log_path;
 

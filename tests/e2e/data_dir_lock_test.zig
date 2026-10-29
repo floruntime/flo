@@ -48,7 +48,7 @@ test "e2e/data-dir: a data dir of a newer format, or a FORMAT that isn't one, re
 
     const path = try std.fs.path.join(allocator, &.{ first.data_dir, "FORMAT" });
     defer allocator.free(path);
-    const newer = try std.fmt.allocPrint(allocator, "data directory format 2, this binary reads up to 1 ({s}); start a flo that reads format 2", .{path});
+    const newer = try std.fmt.allocPrint(allocator, "data directory format 2, this binary reads format 1 ({s}); start a flo that reads format 2", .{path});
     defer allocator.free(newer);
     const garbage = try std.fmt.allocPrint(allocator, "{s} holds \"two\", not a data directory format; it should hold a number such as 1", .{path});
     defer allocator.free(garbage);
@@ -65,7 +65,7 @@ test "e2e/data-dir: a data dir of a newer format, or a FORMAT that isn't one, re
         second.dump_log_on_failure = false;
         try testing.expectError(error.ServerNotReady, second.startWithTimeout(3000));
         var why: [64]u8 = undefined;
-        try testing.expectEqualStrings("exited with code 3", second.abnormalExit(&why).?);
+        try testing.expectEqualStrings("exited with code 78", second.abnormalExit(&why).?);
         try testing.expect(try second.logsContain(case.says));
     }
 }

@@ -40,7 +40,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     result catch |err| switch (err) {
         // Each of these already said why.
         error.HelpRequested, error.VersionRequested => {},
-        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Pending, error.Transport => {},
+        error.NotFound, error.Usage, error.Refused, error.Retryable, error.Pending, error.Unusable, error.Transport => {},
         // The commander names the word or flag it couldn't use.
         error.UnknownCommand, error.UnknownFlag, error.MissingFlagValue, error.InvalidFlagValue => {},
         error.MissingRequiredFlag, error.MissingRequiredArg, error.TooManyArgs => {},
@@ -97,9 +97,11 @@ fn buildRoot(allocator: std.mem.Allocator) !*commander.Command {
                 \\0  ok
                 \\1  not found: something named is absent
                 \\2  usage: a flag, an argument, or a file or stdin to read
-                \\3  refused by the server (bad request, conflict, unauthorized, a server bug)
+                \\3  refused by the server (bad request, conflict, unauthorized, a halted shard, a server bug)
                 \\4  retryable: the server is overloaded or has no leader; try again
                 \\5  transport failure, timeout, version mismatch, a cut-off answer, or the CLI out of memory
+                \\6  pending: the write committed but hasn't applied; never resend it unchanged
+                \\78 the data directory can't be used: another format (see flo server wipe), or not Flo's
                 ,
             },
         })

@@ -32,7 +32,7 @@ pub const SystemManifest = struct {
     /// Flo version that created this manifest
     version: []const u8,
 
-    const FILENAME = "SYSTEM";
+    const FILENAME = @import("data_format.zig").SYSTEM_FILENAME;
     const CURRENT_VERSION = "1.0.0";
 
     /// Load manifest from data directory. Returns null if SYSTEM file not found.

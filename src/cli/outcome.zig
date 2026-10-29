@@ -1,4 +1,4 @@
-//! How a command ends. Every failure is one of six outcomes, each with its
+//! How a command ends. Every failure is one of seven outcomes, each with its
 //! own exit code, so a script can tell "absent" from "fix your command" from
 //! "refused" from "retry" from "can't reach" from "wait":
 //!
@@ -6,7 +6,9 @@
 //!   4 retryable · 5 transport
 //!   (or a cut-off answer, or the CLI out of memory) · 6 pending (the write
 //!   committed, not applied: it applies on resume, or a repair skips it, as
-//!   the message says; never resend it unchanged)
+//!   the message says; never resend it unchanged) · 78 the data directory
+//!   can't be used (another format, or not Flo's): sysexits' EX_CONFIG, so a
+//!   service manager told to can stop restarting a server that never starts
 //!
 //! Commands report through these helpers rather than printing and choosing
 //! an error themselves.
@@ -39,6 +41,7 @@ pub fn exitCode(result: Error!void) u8 {
         error.Refused => 3,
         error.Retryable => 4,
         error.Pending => 6,
+        error.Unusable => 78,
         // The CLI couldn't finish for a reason outside the command and the
         // server's answer, like a lost connection.
         error.Transport, error.OutOfMemory => 5,
@@ -165,6 +168,13 @@ pub fn notFound(ctx: *Context, comptime fmt: []const u8, args: anytype) Error {
 pub fn localRefusal(ctx: *Context, comptime fmt: []const u8, args: anytype) Error {
     ctx.printErr("Error: " ++ fmt ++ "\n", args);
     return error.Refused;
+}
+
+/// The data directory can't be used by this binary: written in another
+/// format, or not Flo's. Restarting never helps.
+pub fn unusable(ctx: *Context, comptime fmt: []const u8, args: anytype) Error {
+    ctx.printErr("Error: " ++ fmt ++ "\n", args);
+    return error.Unusable;
 }
 
 /// A Context whose output goes nowhere, for testing printers.
@@ -377,6 +387,7 @@ test "outcome: each status has its exit code" {
     try std.testing.expectEqual(@as(u8, 2), exitCode(error.UnknownFlag));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.Transport));
     try std.testing.expectEqual(@as(u8, 5), exitCode(error.OutOfMemory));
+    try std.testing.expectEqual(@as(u8, 78), exitCode(unusable(&q.ctx, "wrong format", .{})));
 }
 
 test "outcome: an answer from another op table is refused unread, exit 5" {

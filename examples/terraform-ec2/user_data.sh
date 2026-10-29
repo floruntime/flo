@@ -91,6 +91,8 @@ Group=flo
 ExecStart=/usr/local/bin/flo server start -c /etc/flo/flo.toml
 Restart=on-failure
 RestartSec=5
+# 78: the data directory can't be used; restarting never helps.
+RestartPreventExitStatus=78
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
 

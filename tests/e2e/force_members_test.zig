@@ -78,7 +78,7 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     try testing.expect(after.stdoutContains("force"));
 }
 
-test "e2e/cluster: inspect and force-members refuse a data dir of a newer format, and inspect writes no FORMAT" {
+test "e2e/cluster: inspect and force-members refuse a data dir of another format, exit 78, and inspect writes no FORMAT" {
     const allocator = testing.allocator;
     const node = try ServerProcess.initWithConfig(allocator, .{ .cluster_enabled = true, .shards = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("5", 64) });
     defer node.deinit();
@@ -90,18 +90,21 @@ test "e2e/cluster: inspect and force-members refuse a data dir of a newer format
     const path = try std.fs.path.join(allocator, &.{ node.data_dir, "FORMAT" });
     defer allocator.free(path);
 
-    // No FORMAT: read as format 1, and left without one.
+    // No FORMAT: an older Flo's directory, refused, and left without one.
     try stdx.fs.deleteFile(path);
-    var plain = try offline.runRaw(&.{ "server", "inspect", "--config", node.config_file, "--data-dir", node.data_dir });
-    defer plain.deinit();
-    try testing.expectEqual(@as(u8, 0), plain.exit_code);
+    var older = try offline.runRaw(&.{ "server", "inspect", "--config", node.config_file, "--data-dir", node.data_dir });
+    defer older.deinit();
+    try testing.expectEqual(@as(u8, 78), older.exit_code);
+    const before_gating = try std.fmt.allocPrint(allocator, "Error: data directory {s} was written by an older Flo (before format gating); this server needs format 1. There is no migration: run flo server wipe --data-dir {s}", .{ node.data_dir, node.data_dir });
+    defer allocator.free(before_gating);
+    try testing.expectEqualStrings(before_gating, std.mem.trim(u8, older.stderr, &std.ascii.whitespace));
     try testing.expectError(error.FileNotFound, stdx.fs.openFile(path, .{}));
 
     // A newer flo wrote it.
     const f = try stdx.fs.createFile(path, .{ .truncate = true });
     try stdx.fs.writeAll(f, "2\n");
     stdx.fs.closeFile(f);
-    const want = try std.fmt.allocPrint(allocator, "Error: data directory format 2, this binary reads up to 1 ({s}); start a flo that reads format 2", .{path});
+    const want = try std.fmt.allocPrint(allocator, "Error: data directory format 2, this binary reads format 1 ({s}); start a flo that reads format 2", .{path});
     defer allocator.free(want);
     for ([_][]const []const u8{
         &.{ "server", "inspect", "--config", node.config_file, "--data-dir", node.data_dir },
@@ -109,7 +112,7 @@ test "e2e/cluster: inspect and force-members refuse a data dir of a newer format
     }) |args| {
         var refused = try offline.runRaw(args);
         defer refused.deinit();
-        try testing.expectEqual(@as(u8, 3), refused.exit_code);
+        try testing.expectEqual(@as(u8, 78), refused.exit_code);
         try testing.expectEqualStrings(want, std.mem.trim(u8, refused.stderr, &std.ascii.whitespace));
     }
 }
