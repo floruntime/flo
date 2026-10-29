@@ -23,7 +23,8 @@
 #     doesn't carry flock between processes on a folder shared from the Mac,
 #     so on the bind mount a second server would take a data dir in use. The
 #     tmpfs goes with the container. A fresh volume would be root-owned and
-#     unwritable as --user.
+#     unwritable as --user. It needs exec: some tests run scripts from there,
+#     and a tmpfs mount is noexec by default.
 set -euo pipefail
 
 ZIG_VERSION=$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build.zig.zon")
@@ -58,5 +59,5 @@ exec docker run --rm ${TTY[@]+"${TTY[@]}"} \
   --security-opt seccomp=unconfined \
   --user "$(id -u):$(id -g)" \
   -v "$REPO_ROOT:/w" -v "$VOLUME:/zigcache" -w /w \
-  --mount type=tmpfs,dst=/w/.zig-cache/tmp,tmpfs-mode=1777 \
+  --tmpfs /w/.zig-cache/tmp:rw,exec,mode=1777 \
   "$IMAGE" "${CMD[@]}"
