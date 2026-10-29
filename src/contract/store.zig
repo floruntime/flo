@@ -5,6 +5,8 @@
 //! snapshot does.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 
 /// Family ids are below this; a family's state is a slot of its own.
@@ -46,23 +48,37 @@ pub const FamilyState = struct {
 pub const Store = struct {
     allocator: Allocator,
     families: [MAX_FAMILIES]FamilyState = @splat(.{}),
-    /// Keys an entry touched without declaring them, counted where a debug
-    /// build would fail.
+    /// An undeclared key fails the apply rather than being counted. Debug
+    /// builds set it, and so must VOPR, which builds ReleaseSafe and shares
+    /// this module with the server, when it hosts families.
+    strict_keys: bool = builtin.mode == .debug,
+    /// Keys an entry touched without declaring them, where `strict_keys`
+    /// is off; each power of two is logged.
     undeclared_keys: u64 = 0,
 
     pub fn init(allocator: Allocator) Store {
         var store: Store = .{ .allocator = allocator };
-        // A treap seeds its priorities from the first node's address unless
-        // seeded first, so its shape would follow the allocator. Seeded, the
-        // shape is a function of the writes alone, the same on every replica
-        // and in every VOPR run from its seed; so is each write's cost.
-        for (&store.families, 0..) |*f, i| f.tree.prng.xorshift = PRIORITY_SEED +% i;
+        store.seed();
         return store;
+    }
+
+    /// A treap seeds its priorities from the first node's address unless
+    /// seeded first, so its shape would follow the allocator. Seeded, the
+    /// shape is a function of the writes alone, the same on every replica
+    /// and in every VOPR run from its seed; so is each write's cost.
+    fn seed(self: *Store) void {
+        for (&self.families, 0..) |*f, i| f.tree.prng.xorshift = PRIORITY_SEED +% i;
     }
 
     const PRIORITY_SEED: usize = 0x9E37_79B9_7F4A_7C15 & std.math.maxInt(usize);
 
     pub fn deinit(self: *Store) void {
+        self.clear();
+    }
+
+    /// Empty every family, seeded again: a store loaded afresh (from a
+    /// snapshot, say) builds the trees a new one would.
+    pub fn clear(self: *Store) void {
         for (&self.families) |*f| {
             while (f.tree.getMin()) |node| {
                 var entry = f.tree.getEntryForExisting(node);
@@ -71,6 +87,7 @@ pub const Store = struct {
             }
             f.* = .{};
         }
+        self.seed();
     }
 
     pub fn get(self: *Store, fam: u16, key: []const u8) ?[]const u8 {

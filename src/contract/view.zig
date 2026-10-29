@@ -5,9 +5,9 @@
 //! committed state alone.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const store_mod = @import("store.zig");
 const ApplyError = @import("../storage/persistence.zig").ApplyError;
+const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -91,12 +91,15 @@ pub const View = struct {
     /// the next entry.
     arena: Allocator,
     declared: *const KeySet,
+    /// The entry's writes in the order made. Lookups scan them, so an
+    /// entry's cost grows with the square of its writes: fine for one
+    /// request's, worth an index for a large batch.
     ops: std.ArrayListUnmanaged(Op) = .empty,
-    /// Fail on an undeclared key rather than count it.
-    strict: bool = builtin.mode == .debug,
+    /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
+    strict: bool,
 
     pub fn init(store: *Store, arena: Allocator, declared: *const KeySet) View {
-        return .{ .store = store, .arena = arena, .declared = declared };
+        return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys };
     }
 
     pub fn get(self: *View, comptime F: type, k: []const u8) ApplyError!?F.Value {
@@ -119,7 +122,9 @@ pub const View = struct {
     }
 
     /// The family's keys starting with `prefix`, in key order, as this
-    /// entry sees them: its own staged writes over committed state.
+    /// entry sees them: its own staged writes over committed state. The
+    /// prefix must lie in a declared range, as `KeySet.addRange` builds one
+    /// (namespace first); one that doesn't is undeclared.
     pub fn range(self: *View, comptime F: type, prefix: []const u8) ApplyError!ViewRange(F) {
         if (!self.declared.coversRange(F.ID, prefix)) self.undeclared();
         // This entry's writes under the prefix, the last per key, in order.
@@ -153,13 +158,16 @@ pub const View = struct {
     fn undeclared(self: *View) void {
         if (self.strict) @panic("an applier touched a key its entry didn't declare");
         self.store.undeclared_keys += 1;
+        const n = self.store.undeclared_keys;
+        if (n & (n - 1) == 0) log.err("an applier touched a key its entry didn't declare ({d} so far); this is a bug in this build", .{n});
     }
 
     /// Make the staged writes state. Everything they need is allocated
     /// first; only then is anything linked, which can't fail. Out of
     /// memory, state is as it was.
     pub fn commit(self: *View) ApplyError!void {
-        // The last write per key, in the order first written.
+        // The last write per key. Each key is written once, so their order
+        // doesn't matter.
         var plan: std.ArrayListUnmanaged(Step) = .empty;
         var i = self.ops.items.len;
         while (i > 0) {

@@ -238,8 +238,11 @@ test "contract: a range names its namespace, and a key the entry didn't declare 
     var keys = view_mod.KeySet.init(f.scratch.allocator());
     try testing.expectError(error.NoNamespace, keys.addRange(Counters.ID, "", "x"));
     try keys.add(Counters.ID, NS, "a");
+    // A strict store fails instead (debug builds, and VOPR); this one counts.
+    f.store.strict_keys = true;
+    try testing.expect(View.init(&f.store, f.scratch.allocator(), &keys).strict);
+    f.store.strict_keys = false;
     var view = View.init(&f.store, f.scratch.allocator(), &keys);
-    view.strict = false;
     var kb: [64]u8 = undefined;
     _ = try view.get(Counters, keyOf(&kb, "a"));
     try testing.expectEqual(@as(u64, 0), f.store.undeclared_keys);
@@ -346,4 +349,25 @@ test "contract: the same writes build the same tree, whatever the allocator hand
     try testing.expectEqualSlices(u64, xs.items, ys.items);
     try testing.expect(x.store.families[Counters.ID].tree.root.?.key.ptr != y.store.families[Counters.ID].tree.root.?.key.ptr);
     try testing.expectEqualStrings(x.store.families[Counters.ID].tree.root.?.key, y.store.families[Counters.ID].tree.root.?.key);
+}
+
+test "contract: a cleared store builds the trees a new one would" {
+    var x = Fixture.init(testing.allocator);
+    defer x.deinit();
+    var y = Fixture.init(testing.allocator);
+    defer y.deinit();
+    _ = try y.run(.incr, "p,q,r,s");
+    y.store.clear();
+    try testing.expectEqual(@as(u64, 0), y.store.family(Counters.ID).count);
+    for ([_][]const u8{ "m,a,z", "q,a", "b,c,d,e" }) |list| {
+        _ = try x.run(.incr, list);
+        _ = try y.run(.incr, list);
+    }
+    var xs: std.ArrayListUnmanaged(u64) = .empty;
+    defer xs.deinit(testing.allocator);
+    var ys: std.ArrayListUnmanaged(u64) = .empty;
+    defer ys.deinit(testing.allocator);
+    try shape(&x.store, Counters.ID, &xs);
+    try shape(&y.store, Counters.ID, &ys);
+    try testing.expectEqualSlices(u64, xs.items, ys.items);
 }
