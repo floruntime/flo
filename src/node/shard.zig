@@ -74,6 +74,8 @@ const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
 const apply_marker = @import("apply_marker.zig");
 const offline_mod = @import("offline.zig");
+const contract_machine = @import("../contract/machine.zig");
+const contract_machines = @import("../contract/machines.zig");
 const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
@@ -6433,6 +6435,10 @@ pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, en
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
+    if (contract_machine.ownerOf(&contract_machines.list, etype)) |m| {
+        contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
+        return .applied;
+    }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
     return .applied;
@@ -6446,12 +6452,16 @@ fn applyErrorName(err: persistence_mod.ApplyError) []const u8 {
     };
 }
 
-/// Every entry type has exactly one applier, the projection router or one
-/// registry callback, or is listed as needing none. Two appliers is how a
+/// Every entry type has exactly one applier (a contract machine, the
+/// projection router or one registry callback) or is listed as needing none. Two appliers is how a
 /// replayed entry gets inserted twice; none, how it is dropped; a second
 /// registration, how one handler's applier never runs. Each is a bug in
 /// this build, not in the data directory.
 fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
+    return checkAppliersWith(&contract_machines.list, shard_id, registry);
+}
+
+fn checkAppliersWith(comptime machines: []const contract_machine.Machine, shard_id: u16, registry: *const ReplayRegistry) !void {
     if (registry.duplicate) |etype| {
         log.err("shard {d}: entry type {s} was registered twice; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, @tagName(etype) });
         return error.EntryTypeRegisteredTwice;
@@ -6460,11 +6470,17 @@ fn checkAppliers(shard_id: u16, registry: *const ReplayRegistry) !void {
     inline for (einfo.field_names, einfo.field_values) |fname, fvalue| {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(fvalue));
         const routed = routedToProjection(etype);
-        if (routed and registry.has(etype)) {
+        // A machine's type has no other applier.
+        const owner = contract_machine.ownerOf(machines, etype);
+        if (owner) |m| if (routed or registry.has(etype)) {
+            log.err("shard {d}: entry type {s} is owned by the {s} machine and has another applier too; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname, m.name });
+            return error.EntryTypeHasTwoAppliers;
+        };
+        if (owner == null and routed and registry.has(etype)) {
             log.err("shard {d}: entry type {s} has two appliers (the projection router and a registry callback); this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasTwoAppliers;
         }
-        if (!routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
+        if (owner == null and !routed and !registry.has(etype) and !listed(&APPLIES_NOTHING, etype) and !listed(&NEVER_WRITTEN, etype)) {
             log.err("shard {d}: entry type {s} has no applier; this is a bug in this build, not in the data directory — refusing to start", .{ shard_id, fname });
             return error.EntryTypeHasNoApplier;
         }
@@ -15159,4 +15175,25 @@ test "Shard: a replica carries a repair from its admin socket to the leader rath
     // Held for the leader, unanswered here: not a redirect to its client port.
     try std.testing.expect((try t.repairSkip(.admin, 5, false, &buf)) == null);
     try std.testing.expectEqual(held + 1, t.shard.forward_count);
+}
+
+test "checkAppliers: a type a contract machine owns may have no other applier, and needs none" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    const Toy = struct {
+        fn keys(_: *const entry_mod.Entry, _: *@import("../contract/view.zig").KeySet) error{OutOfMemory}!void {}
+        fn apply(_: *@import("../contract/view.zig").View, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {}
+        fn owning(comptime t: entry_mod.EntryType) contract_machine.Machine {
+            return .{ .name = "toy", .entry_types = &.{t}, .families = &.{}, .keys = keys, .apply = apply };
+        }
+    };
+    try checkAppliersWith(&.{}, 0, &shard.replay_registry);
+    // A type nothing else applies: the machine is its applier.
+    try checkAppliersWith(&.{Toy.owning(.raft_snapshot)}, 0, &shard.replay_registry);
+    // Routed to a projection, or registered by a handler, too: refused.
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&.{Toy.owning(.kv_put)}, 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&.{Toy.owning(.stream_append)}, 0, &shard.replay_registry));
 }
