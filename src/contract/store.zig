@@ -43,6 +43,9 @@ pub const FamilyState = struct {
     /// The family's encoded size: every record's key, value and
     /// `RECORD_OVERHEAD`. Kept by commits, so nothing serializes to know it.
     encoded_bytes: u64 = 0,
+    /// Records linked, replaced or unlinked, ever: a reader that published
+    /// what the family holds knows from it whether there is more to say.
+    commits: u64 = 0,
 };
 
 pub const Store = struct {
@@ -135,6 +138,7 @@ pub const Store = struct {
         rec.value = value;
         entry.set(&rec.node);
         f.count += 1;
+        f.commits += 1;
         f.encoded_bytes += RECORD_OVERHEAD + rec.node.key.len + value.len;
     }
 
@@ -143,6 +147,7 @@ pub const Store = struct {
         const f = &self.families[fam];
         const rec = Record.of(node);
         f.encoded_bytes = f.encoded_bytes - rec.value.len + value.len;
+        f.commits += 1;
         self.allocator.free(rec.value);
         rec.value = value;
     }
@@ -153,6 +158,7 @@ pub const Store = struct {
         var entry = f.tree.getEntryForExisting(node);
         entry.set(null);
         f.count -= 1;
+        f.commits += 1;
         f.encoded_bytes -= RECORD_OVERHEAD + rec.node.key.len + rec.value.len;
         self.freeRecord(rec);
     }

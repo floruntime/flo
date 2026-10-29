@@ -264,6 +264,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-inbox", .source = "bench/bench_inbox.zig" },
         .{ .name = "bench-write-path", .source = "bench/bench_write_path.zig" },
         .{ .name = "bench-contract", .source = "bench/bench_contract.zig" },
+        .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
     };
 
     for (bench_sources) |def| {

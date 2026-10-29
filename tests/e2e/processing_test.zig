@@ -2790,6 +2790,13 @@ test "e2e/processing: kv sink routes to the owning shard (multi-shard)" {
     }
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "xshard" });
+    // Each write went through its owning shard's log, so a restart replays it.
+    try ctx.restartServer();
+    inline for (ids) |id| {
+        const out = try ctx.execCapture(&.{ "kv", "get", "u:" ++ id, "-n", "xshard" });
+        // The sink stores the whole record.
+        try testing.expectEqualStrings("{\"id\":\"" ++ id ++ "\",\"v\":\"val-" ++ id ++ "\"}", std.mem.trim(u8, out, &std.ascii.whitespace));
+    }
 }
 
 test "e2e/processing: a source reads every record of a batch over 100" {

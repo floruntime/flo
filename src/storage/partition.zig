@@ -14,7 +14,8 @@ const kv_entries = @import("../protocol/kv_entries.zig");
 const ual_mod = @import("ual/ual.zig");
 const tombstones = @import("tombstones.zig");
 const router_mod = @import("../projection/router.zig");
-const kv_mod = @import("../projection/kv.zig");
+const kv_state = @import("../kv/state.zig");
+const kv_machine = @import("../kv/machine.zig");
 const queue_mod = @import("../projection/queue.zig");
 const stream_mod = @import("../projection/stream.zig");
 const ts_mod = @import("../projection/ts.zig");
@@ -39,7 +40,8 @@ pub const Partition = struct {
     router: ProjectionRouter,
 
     /// Projections (owned by partition).
-    kv: kv_mod.KVProjection,
+    /// KV's state as reads see it: the KV machine's families in `store`.
+    kv: kv_state.KvState,
     queue: queue_mod.QueueProjection,
     stream: stream_mod.StreamProjection,
     ts: ts_mod.TSProjection,
@@ -77,7 +79,6 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
-        const kv = kv_mod.KVProjection.init(allocator);
         const queue = queue_mod.QueueProjection.init(allocator, .{});
         const stream = stream_mod.StreamProjection.init(allocator);
         const ts = ts_mod.TSProjection.init(allocator, .{});
@@ -87,7 +88,8 @@ pub const Partition = struct {
             .group_id = partition_id + DEFAULT_GROUP_OFFSET,
             .ual = ual,
             .router = ProjectionRouter.init(),
-            .kv = kv,
+            // Pointed at `store` once the partition is where it stays.
+            .kv = .{ .store = undefined },
             .queue = queue,
             .stream = stream,
             .ts = ts,
@@ -112,7 +114,7 @@ pub const Partition = struct {
     /// Register projection handles with the router.
     /// MUST be called after init(), once the Partition is at its final address.
     pub fn wireProjections(self: *Partition) void {
-        self.router.registerKV(self.kv.projectionHandle());
+        self.kv.store = &self.store;
         self.router.registerQueue(self.queue.projectionHandle());
         self.router.registerTS(self.ts.projectionHandle());
     }
@@ -130,12 +132,12 @@ pub const Partition = struct {
         }
         self.warm_store.deinit(self.allocator);
 
+        self.kv.deinit(self.allocator);
         self.apply_scratch.deinit();
         self.store.deinit();
         self.ts.deinit();
         self.stream.deinit();
         self.queue.deinit();
-        self.kv.deinit();
         self.ual.deinit();
     }
 
@@ -174,10 +176,10 @@ pub const Partition = struct {
 
     fn take(self: *Partition, e: *const Entry, out: *router_mod.Result, how: enum { apply, pass_over }) !Applied {
         // The hot ring and the warm store exist for the stream read path,
-        // which fetches record payloads by index. The KV projection holds its
-        // own values and nothing reads a KV payload back from the partition
+        // which fetches record payloads by index. KV's families hold its
+        // values and nothing reads a KV payload back from the partition
         // log, so KV entries skip both copies.
-        const is_kv = router_mod.routeTarget(@fromBackingInt(@intCast(e.header.entry_type))) == .kv;
+        const is_kv = kv_machine.owns(@fromBackingInt(@intCast(e.header.entry_type)));
         const index = if (is_kv) e.header.index else try self.ual.append(e);
 
         // Route to projections via the real router (idempotent)
@@ -279,7 +281,7 @@ pub const Partition = struct {
 
     // ── Projection accessors ────────────────────────────────────────────
 
-    /// Get a value from the KV projection.
+    /// A KV key's live value.
     pub fn kvGet(self: *Partition, key: []const u8) ?[]const u8 {
         const entry = self.kv.get(key) orelse return null;
         return entry.value;
@@ -392,44 +394,6 @@ test "partition: apply and read entries" {
     try testing.expectEqual(@as(u64, 2), part.committed_index);
 }
 
-test "partition: KV projection wired through router" {
-    const allocator = testing.allocator;
-
-    var part = try Partition.init(allocator, 0, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    // Apply a KV put
-    var payload_buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "mykey", .value = "myvalue", .ttl_ms = null }, 1, 1000);
-    _ = try part.apply(&e1);
-
-    // Verify the KV projection received the entry
-    const val = part.kvGet("mykey");
-    try testing.expect(val != null);
-    try testing.expectEqualStrings("myvalue", val.?);
-}
-
-test "partition: KV put then delete" {
-    const allocator = testing.allocator;
-
-    var part = try Partition.init(allocator, 0, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    // Put
-    var buf1: [128]u8 = undefined;
-    const e1 = kvTestEntry(&buf1, .kv_put, .{ .key = "k", .value = "v", .ttl_ms = null }, 1, 1000);
-    _ = try part.apply(&e1);
-    try testing.expect(part.kvGet("k") != null);
-
-    // Delete
-    var buf2: [128]u8 = undefined;
-    const e2 = kvTestEntry(&buf2, .kv_delete, .{ .key = "k" }, 2, 2000);
-    _ = try part.apply(&e2);
-    try testing.expect(part.kvGet("k") == null);
-}
-
 test "partition: queue projection wired through router" {
     const allocator = testing.allocator;
 
@@ -443,24 +407,6 @@ test "partition: queue projection wired through router" {
     _ = try part.apply(&e1);
 
     try testing.expectEqual(@as(u64, 1), part.queue.stats.enqueued);
-}
-
-test "partition: idempotent apply" {
-    const allocator = testing.allocator;
-
-    var part = try Partition.init(allocator, 0, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    var buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&buf, .kv_put, .{ .key = "k", .value = "v", .ttl_ms = null }, 1, 1000);
-    _ = try part.apply(&e1);
-
-    // Apply same entry again — projection router should skip it
-    _ = try part.apply(&e1);
-
-    // Router stats should show 1 applied, 1 skipped
-    try testing.expectEqual(@as(u64, 1), part.router.stats.entries_applied);
 }
 
 test "partition: contains check" {
