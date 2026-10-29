@@ -28,7 +28,9 @@ pub const EntryType = entry_mod.EntryType;
 /// their entries do, since replicas apply them through the KV machine: a
 /// put's value starts with the op id, and a delete is a batch that deletes
 /// a slot's key and tombstones a key naming the op, so every op is still
-/// attributable from its payload alone.
+/// attributable from its payload alone. The marker key is the simulator's
+/// own bookkeeping, there only so an oracle can name the op; no client
+/// writes a delete this way.
 const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_batch };
 
 /// KV ops write a few keys over and over, across two namespaces, so

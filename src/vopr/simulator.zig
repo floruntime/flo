@@ -559,6 +559,29 @@ const Checker = struct {
         });
     }
 
+    /// Like `onState` for KV's families alone, at an index sampling passed
+    /// over: the first node there records them, later ones compare.
+    fn onFinalKv(self: *Checker, node: NodeId, idx: u64, history: u64, kv: [families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
+        if (idx > self.states.items.len) return;
+        const slot = &(self.states.items[idx - 1] orelse return);
+        if (slot.history != history) return;
+        const want = slot.kv orelse {
+            slot.kv = kv;
+            slot.rebuilt = rebuilt;
+            return;
+        };
+        self.kv_checks += 1;
+        for (want, kv, KV_MISMATCH) |w, got, why| {
+            if (w != got) self.fail(.{
+                .invariant = .state_checksum,
+                .node = node,
+                .index = idx,
+                .tick = tick,
+                .detail = why[@intFromBool(slot.rebuilt != rebuilt)],
+            });
+        }
+    }
+
     fn onApply(
         self: *Checker,
         workload: *const Workload,
@@ -1919,7 +1942,19 @@ pub const Simulator = struct {
             }
         }
         self.finalDurabilityCheck();
+        self.finalKvCheck();
         return self.summary();
+    }
+
+    /// KV's families at the last index each node applied, which sampling
+    /// may have passed over: a divergence in a run's last entries is caught
+    /// too.
+    fn finalKvCheck(self: *Simulator) void {
+        for (self.nodes) |*node| {
+            if (!node.up or node.families_stale or node.families_index == 0) continue;
+            if (node.families_index % KV_SAMPLE == 0) continue;
+            self.checker.onFinalKv(node.id, node.families_index, node.history, node.kv.checksums(), node.families_index <= node.replay_through, self.now);
+        }
     }
 
     fn summary(self: *Simulator) Summary {
@@ -2187,6 +2222,25 @@ test "vopr sim: a checksum in map order fails state_checksum between a rebuilt r
 
 test "vopr sim: an effect only live apply runs fails state_checksum between a rebuilt replica and a live one" {
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
+}
+
+test "vopr sim: KV's families are compared at a run's last index even when sampling passed over it" {
+    var checker: Checker = .{ .allocator = testing.allocator };
+    defer checker.deinit();
+    const idx = KV_SAMPLE + 3;
+    // Applied at an unsampled index: no KV checksums yet.
+    checker.onState(1, idx, 42, 7, null, false, 0);
+    checker.onState(2, idx, 42, 7, null, false, 0);
+    // The first final records them, the next compares.
+    checker.onFinalKv(1, idx, 42, .{ 1, 2, 3 }, false, 0);
+    checker.onFinalKv(2, idx, 42, .{ 1, 2, 3 }, false, 0);
+    try testing.expectEqual(@as(usize, 0), checker.violations.items.len);
+    checker.onFinalKv(3, idx, 42, .{ 1, 9, 3 }, true, 0);
+    try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
+    try testing.expectEqualStrings("a replica rebuilt by replay holds other kv.history than one that applied live", checker.violations.items[0].detail);
+    // Another history at that index is not compared.
+    checker.onFinalKv(4, idx, 43, .{ 0, 0, 0 }, false, 0);
+    try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
