@@ -67,7 +67,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .arg("stream", "Stream name")
                 .variadicArg("payloads", "Record payload(s) - can specify multiple")
                 .stringFlag("header", 'H', "", "Headers as key=value pairs, comma-separated")
-                .uintFlag("partition", 'p', 0, "Target partition")
+                .uintFlag("partition", 0, 0, "Target partition")
                 .stringFlag("partition-key", 'k', "", "Partition key for routing")
                 .action(wrapHandler(runAppend)),
         )
@@ -85,7 +85,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("stream", "Stream name")
                 .stringFlag("start", 's', "0-0", "Read records after this StreamID (exclusive; timestamp-sequence, 0-0=beginning, $=latest)")
-                .stringFlag("end", 'e', "", "Ending StreamID (timestamp-sequence, inclusive)")
+                .stringFlag("end", 0, "", "Ending StreamID (timestamp-sequence, inclusive)")
                 .uintFlag("limit", 'l', 10, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
                 .boolFlag("follow", 'f', "Keep reading new records (like tail -f); Ctrl-C ends it (exit 0), a retryable answer exits 4")
                 .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait). Single read unlike --follow.")
@@ -102,7 +102,7 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     "flo stream create logs --partitions 4",
                 })
                 .arg("stream", "Stream name")
-                .uintFlag("partitions", 'p', 1, "Number of partitions")
+                .uintFlag("partitions", 0, 1, "Number of partitions")
                 .uintFlag("retention", 'r', 0, "Retention period (hours, 0=forever)")
                 .uint64Flag("retention-count", 0, 0, "Keep at most this many records (0 = no count bound)")
                 .action(wrapHandler(runCreate)),

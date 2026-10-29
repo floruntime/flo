@@ -93,7 +93,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("bind", 0, "", "Address to listen on (default: 0.0.0.0)")
                 .boolFlag("cluster", 0, "Start as the first member of a cluster: listen for peers, lead a group of one until others join")
                 .stringFlag("join", 'j', "", "Join existing cluster (host:port[,host:port,...])")
-                .uintFlag("node-id", 'n', 0, "Node ID (0=auto-generate from hostname:port)")
+                .uintFlag("node-id", 0, 0, "Node ID (0=auto-generate from hostname:port)")
                 .uintFlag("raft-port", 0, 0, "Peer port, with --cluster or --join (default: listen_port + 500)")
                 .uintFlag("metrics-port", 0, 0, "Metrics HTTP port (default: listen_port + 1)")
                 .uintFlag("dashboard-port", 0, 0, "Dashboard HTTP port (default: listen_port + 2)")

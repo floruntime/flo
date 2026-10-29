@@ -52,7 +52,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                     "flo action register process --owner myteam --retries 3",
                 })
                 .arg("name", "Action name")
-                .stringFlag("owner", 'o', "cli", "Owner/team name")
+                .stringFlag("owner", 0, "cli", "Owner/team name")
                 .uintFlag("timeout", 0, 30000, "Execution timeout (ms)")
                 .uintFlag("retries", 'r', 0, "Max retry attempts")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")

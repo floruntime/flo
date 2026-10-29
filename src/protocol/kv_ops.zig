@@ -321,7 +321,7 @@ pub const table = [_]ops.Op{
         .cli = .{
             .render = .raw,
             .show = "document",
-            .short = &.{ .{ .field = "path", .letter = 'p' }, rk_short },
+            .short = &.{rk_short},
             .examples = &.{ "flo kv json get user:123", "flo kv json get user:123 --path '$.addresses[0].city'" },
         },
         .doc = "Read the JSON at a path in a key's document.",
@@ -339,7 +339,7 @@ pub const table = [_]ops.Op{
         .response = Record(&.{.{ .name = "version", .T = Version, .doc = "The key's new version" }}),
         .cli = .{
             .args = &.{"document"},
-            .short = &.{ .{ .field = "path", .letter = 'p' }, rk_short },
+            .short = &.{rk_short},
             .examples = &.{ "flo kv json set user:123 '{\"name\":\"alice\"}'", "flo kv json set user:123 '\"bob\"' --path '$.name'" },
         },
         .doc = "Set the JSON at a path in a key's document; $ on a missing key writes the whole document.",
@@ -351,7 +351,7 @@ pub const table = [_]ops.Op{
         .request = Record(&.{ path_field, routing_key_field }),
         // Null when the path is the whole document, which deletes the key.
         .response = Record(&.{.{ .name = "version", .T = Optional(Version), .doc = "The key's new version; none when the key was deleted" }}),
-        .cli = .{ .short = &.{ .{ .field = "path", .letter = 'p' }, rk_short } },
+        .cli = .{ .short = &.{rk_short} },
         .doc = "Delete the JSON at a path; the path $ deletes the key.",
     },
     .{

@@ -60,7 +60,7 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 })
                 .optionalArg("measurement", "Measurement name (or omit for --batch)")
                 .stringFlag("tags", 't', "", "Tags as comma-separated key=value pairs")
-                .stringFlag("value", 'v', "", "Single metric value (e.g. 72.5)")
+                .stringFlag("value", 0, "", "Single metric value (e.g. 72.5)")
                 .stringFlag("fields", 0, "", "Named fields, one write each and not atomic: user=72.5,system=7.4")
                 .stringFlag("timestamp", 0, "", "Explicit timestamp in milliseconds")
                 .boolFlag("batch", 'b', "Read InfluxDB line protocol from stdin")
