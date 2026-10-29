@@ -127,10 +127,18 @@ pub fn build(b: *std.Build) void {
 
     // Each test root is generated from a walk of its directory, so a file
     // with tests can't be left out of a hand-kept list and never run.
-    const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filters);
-    const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filters);
-    const e2e_root = generateTestRoot(b, "tests/e2e", &.{"helpers"}, test_filters);
-    const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filters);
+    const e2e_shard = parseShard(b.option([]const u8, "e2e-shard", "Run e2e shard i of N (\"i/N\"): files split by the times in tests/e2e/shard_times.tsv"));
+    const unit_root = generateTestRoot(b, "src", &.{"stdx"}, test_filters, null);
+    const stdx_root = generateTestRoot(b, "src/stdx", &.{}, test_filters, null);
+    const e2e_root = generateTestRoot(b, "tests/e2e", &.{"helpers"}, test_filters, e2e_shard);
+    const integration_root = generateTestRoot(b, "tests/integration", &.{}, test_filters, null);
+    // CI's final e2e job sums these across shards: every shard ran, and their
+    // tests add up to the whole suite.
+    if (e2e_root.shard) |info| {
+        const wf = b.addWriteFiles();
+        const text = b.fmt("shard={d}/{d} declared={d} total={d}\n", .{ info.index, info.count, info.declared, info.total });
+        b.getInstallStep().dependOn(&b.addInstallFile(wf.add("e2e-shard.txt", text), "e2e-shard.txt").step);
+    }
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -170,6 +178,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .filters = test_filters,
+        .test_runner = .{ .path = b.path("tests/e2e/helpers/test_runner.zig"), .mode = .server },
     });
     e2e_tests.root_module.addImport("src", src_module);
     e2e_tests.root_module.addImport("stdx", stdx_module);
@@ -307,6 +316,86 @@ const TestRoot = struct {
     matched: usize,
     /// The directory, when this checkout doesn't have it.
     missing: ?[]const u8 = null,
+    /// For a shard: its place, and its test declarations against the whole
+    /// suite's (the sentinel, which every shard compiles, in neither).
+    shard: ?struct { index: usize, count: usize, declared: usize, total: usize } = null,
+};
+
+const Shard = struct { index: usize, count: usize };
+
+fn parseShard(arg: ?[]const u8) ?Shard {
+    const text = arg orelse return null;
+    const slash = std.mem.indexOfScalar(u8, text, '/') orelse
+        std.process.fatal("-De2e-shard={s}: expected i/N", .{text});
+    const i = std.fmt.parseUnsigned(usize, text[0..slash], 10) catch
+        std.process.fatal("-De2e-shard={s}: expected i/N", .{text});
+    const n = std.fmt.parseUnsigned(usize, text[slash + 1 ..], 10) catch
+        std.process.fatal("-De2e-shard={s}: expected i/N", .{text});
+    if (i < 1 or i > n) std.process.fatal("-De2e-shard={s}: i must be 1 to N", .{text});
+    return .{ .index = i, .count = n };
+}
+
+/// A file not in shard_times.tsv yet weighs this much per test: the measured
+/// mean, so a new file lands somewhere sensible until the times are refreshed.
+const default_ms_per_test = 900;
+
+/// The shard (0-based) of each of `files`: longest first, each to the
+/// least-loaded shard, ties to the lower shard and then by name, so every
+/// shard job computes the same split.
+fn assignShards(b: *std.Build, root_dir: std.Io.Dir, files: []const TestFile, count: usize) []usize {
+    const io = b.graph.io;
+    var times: std.StringHashMapUnmanaged(u64) = .empty;
+    if (root_dir.readFileAlloc(io, "shard_times.tsv", b.allocator, .unlimited)) |content| {
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 or line[0] == '#') continue;
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse
+                std.process.fatal("tests/e2e/shard_times.tsv: expected <ms>\\t<file>, got {s}", .{line});
+            const ms = std.fmt.parseUnsigned(u64, line[0..tab], 10) catch
+                std.process.fatal("tests/e2e/shard_times.tsv: bad milliseconds in {s}", .{line});
+            times.put(b.allocator, line[tab + 1 ..], ms) catch @panic("out of memory");
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.debug.panic("cannot read tests/e2e/shard_times.tsv: {t}", .{err}),
+    }
+
+    const order = b.allocator.alloc(usize, files.len) catch @panic("out of memory");
+    const weight = b.allocator.alloc(u64, files.len) catch @panic("out of memory");
+    for (files, 0..) |f, i| {
+        order[i] = i;
+        weight[i] = times.get(f.stem) orelse default_ms_per_test * f.declared;
+    }
+    const Ctx = struct {
+        files: []const TestFile,
+        weight: []const u64,
+        fn lessThan(c: @This(), a: usize, z: usize) bool {
+            if (c.weight[a] != c.weight[z]) return c.weight[a] > c.weight[z];
+            return std.mem.lessThan(u8, c.files[a].path, c.files[z].path);
+        }
+    };
+    std.mem.sort(usize, order, Ctx{ .files = files, .weight = weight }, Ctx.lessThan);
+
+    const load = b.allocator.alloc(u64, count) catch @panic("out of memory");
+    @memset(load, 0);
+    const shard_of = b.allocator.alloc(usize, files.len) catch @panic("out of memory");
+    for (order) |i| {
+        var best: usize = 0;
+        for (load, 0..) |l, s| if (l < load[best]) {
+            best = s;
+        };
+        shard_of[i] = best;
+        load[best] += weight[i];
+    }
+    return shard_of;
+}
+
+const TestFile = struct {
+    path: []const u8,
+    /// The path as Zig names its tests: no .zig, dots for slashes.
+    stem: []const u8,
+    declared: usize,
+    matched: usize,
 };
 
 /// A checkout without a test directory (a source tarball, an image build)
@@ -344,7 +433,7 @@ fn failIfNoTestMatched(b: *std.Build, step: *std.Build.Step, name: []const u8, f
 /// and at least as many tests as the walk counted at the top level.
 /// Called at configure time, like the dashboard assets; the file is
 /// gitignored. A missing `dir` gives an empty root marked `missing`.
-fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filters: []const []const u8) TestRoot {
+fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, filters: []const []const u8, shard: ?Shard) TestRoot {
     const io = b.graph.io;
     const out_name = "all_tests.zig";
     var root_dir = b.root.root_dir.handle.openDir(io, dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -356,9 +445,7 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     };
     defer root_dir.close(io);
 
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
-    var declared: usize = 0;
-    var matched: usize = 0;
+    var found: std.ArrayListUnmanaged(TestFile) = .empty;
     var walker = root_dir.walkSelectively(b.allocator) catch @panic("out of memory");
     defer walker.deinit();
     while (walker.next(io) catch |err| std.debug.panic("cannot walk {s}: {t}", .{ dir, err })) |entry| {
@@ -379,18 +466,53 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
                     std.debug.panic("cannot read {s}/{s} to find its tests: {t}", .{ dir, entry.path, err });
                 if (!hasTestDecl(content)) continue;
                 refuseUnpredictableTests(dir, entry.path, content);
-                declared += countTopLevelTestDecls(content);
-                matched += countMatchingTests(b, entry.path, content, filters);
-                files.append(b.allocator, b.dupe(entry.path)) catch @panic("out of memory");
+                const path = b.dupe(entry.path);
+                const stem = b.allocator.dupe(u8, path[0 .. path.len - ".zig".len]) catch @panic("out of memory");
+                std.mem.replaceScalar(u8, stem, '/', '.');
+                found.append(b.allocator, .{
+                    .path = path,
+                    .stem = stem,
+                    .declared = countTopLevelTestDecls(content),
+                    .matched = countMatchingTests(b, entry.path, content, filters),
+                }) catch @panic("out of memory");
             },
             else => {},
         }
     }
-    std.mem.sort([]const u8, files.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
-            return std.mem.lessThan(u8, a, c);
+    std.mem.sort(TestFile, found.items, {}, struct {
+        fn lessThan(_: void, a: TestFile, c: TestFile) bool {
+            return std.mem.lessThan(u8, a.path, c.path);
         }
     }.lessThan);
+
+    // A shard compiles its share of the files, plus the sentinel the root's
+    // own check looks for.
+    const sentinel = "test_root_sentinel/nested/sentinel.zig";
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var declared: usize = 0;
+    var matched: usize = 0;
+    var shard_declared: usize = 0;
+    var total_declared: usize = 0;
+    var spread: std.ArrayListUnmanaged(TestFile) = .empty;
+    for (found.items) |f| if (!std.mem.eql(u8, f.path, sentinel)) {
+        spread.append(b.allocator, f) catch @panic("out of memory");
+    };
+    const shard_of = if (shard) |s| assignShards(b, root_dir, spread.items, s.count) else null;
+    var next_spread: usize = 0;
+    for (found.items) |f| {
+        const is_sentinel = std.mem.eql(u8, f.path, sentinel);
+        if (!is_sentinel) {
+            defer next_spread += 1;
+            total_declared += f.declared;
+            if (shard_of) |so| if (so[next_spread] != shard.?.index - 1) continue;
+            shard_declared += f.declared;
+        }
+        declared += f.declared;
+        matched += f.matched;
+        files.append(b.allocator, f.path) catch @panic("out of memory");
+    }
+    if (shard) |s| if (shard_declared == 0)
+        std.process.fatal("-De2e-shard={d}/{d}: this shard has no tests; use fewer shards", .{ s.index, s.count });
 
     var aw: std.Io.Writer.Allocating = .init(b.allocator);
     const w = &aw.writer;
@@ -451,7 +573,12 @@ fn generateTestRoot(b: *std.Build, dir: []const u8, skip: []const []const u8, fi
     // The root's own named test is compiled when a filter matches its name.
     matched += countMatchingTests(b, out_name, "test \"every test declared under this directory is compiled\" {", filters);
     options.addOption(usize, "matched", matched);
-    return .{ .source = b.path(b.fmt("{s}/{s}", .{ dir, out_name })), .options = options, .matched = matched };
+    return .{
+        .source = b.path(b.fmt("{s}/{s}", .{ dir, out_name })),
+        .options = options,
+        .matched = matched,
+        .shard = if (shard) |s| .{ .index = s.index, .count = s.count, .declared = shard_declared, .total = total_declared } else null,
+    };
 }
 
 /// `countMatchingTests` reads a test's full name off its line, which holds
