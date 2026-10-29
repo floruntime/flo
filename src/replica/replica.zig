@@ -51,10 +51,9 @@ pub fn Replica(comptime Io: type) type {
         /// Why, for `/status`: where the leader's log disagreed.
         diverged_reason_buf: [160]u8 = undefined,
         diverged_reason_len: u8 = 0,
-        /// The leader, on another build, applied the entry this node is
-        /// halted at: the build is what halts, and upgrading this node
-        /// applies it. Cleared once the halt is gone.
-        halt_applied_elsewhere: ?raft_node_mod.HaltAt = null,
+        /// The leader applied the entry this node is halted at, on a build
+        /// not known to be this one. Said of that halt only.
+        halt_applied_elsewhere: ?AppliedElsewhere = null,
         /// Diverged because the leader applied the entry this node halted at.
         halted_alone: bool = false,
         conflicts_seen: u64 = 0,
@@ -238,14 +237,7 @@ pub fn Replica(comptime Io: type) type {
                         self.conflicts_seen = raft.committed_conflicts;
                         return self.markDiverged(hdr.leader_id, hdr.term);
                     }
-                    if (hdr.term == raft.current_term) if (raft.halt_at) |h| if (hdr.halt_verdict.about(h)) switch (hdr.halt_verdict.kind) {
-                        .alone => return self.markHaltedAlone(hdr.leader_id, hdr.term, h),
-                        .other_build => if (!self.haltAppliedElsewhere()) {
-                            self.halt_applied_elsewhere = h;
-                            log.warn("shard {d}: leader {d} applied entry {d}, which this node halted at; it runs another build. Upgrade this node to the leader's build and it applies the entry", .{ self.id, hdr.leader_id, h.index });
-                        },
-                        else => {},
-                    };
+                    if (hdr.term == raft.current_term) if (raft.halt_at) |h| if (hdr.halt_verdict.about(h)) self.takeHaltVerdict(hdr.leader_id, h, hdr.halt_verdict.build);
                     if (was == .leader and raft.role != .leader) self.leadershipLost("a leader with a newer term spoke");
                     if (raft.leader_id != led_by and raft.leader_id != 0) log.info("shard {d}: following node {d} (term {d})", .{ self.id, raft.leader_id, raft.current_term });
                     // A leader of this term still sends to this node as a member.
@@ -501,6 +493,25 @@ pub fn Replica(comptime Io: type) type {
             self.stopTakingPart(DIVERGED_MESSAGE);
         }
 
+        /// The leader applied `h`, on `build`. A committed repair that
+        /// skips `h` means it passed over it, as this node will. Otherwise,
+        /// on this node's own build, the halt is this node's alone. A build
+        /// with no version can't be told apart from another of its name, so
+        /// it is never taken to be this one, nor another.
+        fn takeHaltVerdict(self: *Self, leader: u32, h: raft_node_mod.HaltAt, build: u64) void {
+            const raft = self.raftNode();
+            if (raft.repaired.of(h)) return;
+            const known = build != 0 and raft.build != 0;
+            if (known and build == raft.build) return self.markHaltedAlone(leader, raft.current_term, h);
+            if (self.haltAppliedElsewhere() != null) return;
+            self.halt_applied_elsewhere = .{ .halt = h, .builds_known = known };
+            if (known) {
+                log.warn("shard {d}: leader {d} applied entry {d}, which this node halted at, on another build. Upgrade this node to the leader's build and it applies the entry", .{ self.id, leader, h.index });
+            } else {
+                log.warn("shard {d}: leader {d} applied entry {d}, which this node halted at; one of the two builds has no version, so which build applies it is unknown. On the same build this node halted alone: move its data directory aside and rejoin. On another, upgrade it", .{ self.id, leader, h.index });
+            }
+        }
+
         /// The leader applied the entry this node halted at, on the same
         /// build: the halt is this node's alone, so what it holds is no
         /// other replica's, and only a wipe and rejoin brings it back.
@@ -514,12 +525,18 @@ pub fn Replica(comptime Io: type) type {
             self.stopTakingPart(DIVERGED_MESSAGE);
         }
 
-        /// Whether the leader, on another build, applied the entry this
-        /// node is halted at now.
-        pub fn haltAppliedElsewhere(self: *Self) bool {
-            const e = self.halt_applied_elsewhere orelse return false;
-            const h = self.raftNode().halt_at orelse return false;
-            return std.meta.eql(e, h);
+        pub const AppliedElsewhere = struct {
+            halt: raft_node_mod.HaltAt,
+            /// Both builds have a version, and they differ.
+            builds_known: bool,
+        };
+
+        /// Whether the leader applied the entry this node is halted at now,
+        /// on a build not known to be this one.
+        pub fn haltAppliedElsewhere(self: *Self) ?AppliedElsewhere {
+            const e = self.halt_applied_elsewhere orelse return null;
+            const h = self.raftNode().halt_at orelse return null;
+            return if (std.meta.eql(e.halt, h)) e else null;
         }
 
         /// Why the leader's log made this node diverged; null when it didn't.
@@ -846,45 +863,71 @@ test "replica: a leader that applied the entry a follower halted at tells that f
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
+    h.raft.build = 9;
     const at = (try h.raft.propose(.kv_put, 0, "h")).index;
     var buf: [64]u8 = undefined;
     const own = h.raft.log.getEntryCopy(at, &buf).?;
-    const halt: raft_node_mod.HaltAt = .{ .index = at, .term = own.header.term, .crc = own.header.crc32c, .build = h.raft.build };
+    const halt: raft_node_mod.HaltAt = .{ .index = at, .term = own.header.term, .crc = own.header.crc32c };
     var rbuf: [transport.APPEND_RESP_SIZE]u8 = undefined;
     const n = transport.serializeAppendResponse(.{ .term = h.raft.current_term, .success = true, .match_index = at, .from = 2, .halt = halt }, &rbuf).?;
     h.replica.handleRaftFrame(.{ .source_node = 2, .group_id = 1, .msg_type = .append_entries_response, .payload = rbuf[0..n] });
     h.raft.last_applied = at;
     h.now += h.raft.config.heartbeat_interval_ms;
     h.replica.pump(h.now);
-    try testing.expectEqual(raft_node_mod.HaltVerdict{ .index = at, .term = halt.term, .kind = .alone }, h.lastVerdictTo(2));
+    try testing.expectEqual(raft_node_mod.HaltVerdict{ .index = at, .term = halt.term, .build = 9 }, h.lastVerdictTo(2));
     try testing.expectEqual(raft_node_mod.HaltVerdict{}, h.lastVerdictTo(3));
 }
 
-test "replica: a follower told it halted alone is diverged; told another build applied it, it says so and stays halted" {
+/// A repair skips every entry.
+fn alwaysRepaired(_: ?*anyopaque, _: raft_node_mod.HaltAt) bool {
+    return true;
+}
+
+test "replica: a follower told its leader applied its halt on its own build is diverged; on another or an unversioned one it says so and stays halted" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const halt: raft_node_mod.HaltAt = .{ .index = 2, .term = 1, .crc = 5, .build = h.raft.build };
+    h.raft.build = 9;
+    const halt: raft_node_mod.HaltAt = .{ .index = 2, .term = 1, .crc = 5 };
     h.raft.halt_at = halt;
     const term = h.raft.current_term + 1;
     // About another halt, or with no verdict: nothing.
-    h.appendFrom(2, term, .{ .index = 3, .term = 1, .kind = .alone });
-    h.appendFrom(2, term, .{ .index = 2, .term = 2, .kind = .alone });
+    h.appendFrom(2, term, .{ .index = 3, .term = 1, .build = 9 });
+    h.appendFrom(2, term, .{ .index = 2, .term = 2, .build = 9 });
     h.appendFrom(2, term, .{});
-    try testing.expect(!h.replica.diverged);
+    try testing.expect(!h.replica.diverged and h.replica.haltAppliedElsewhere() == null);
     // A leader of an older term says nothing.
-    h.appendFrom(3, term - 1, .{ .index = 2, .term = 1, .kind = .alone });
+    h.appendFrom(3, term - 1, .{ .index = 2, .term = 1, .build = 9 });
     try testing.expect(!h.replica.diverged);
 
-    h.appendFrom(2, term, .{ .index = 2, .term = 1, .kind = .other_build });
+    // Another build, and one with no version on either side: halted still.
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 8 });
     try testing.expect(!h.replica.diverged);
-    try testing.expect(h.replica.haltAppliedElsewhere());
+    try testing.expect(h.replica.haltAppliedElsewhere().?.builds_known);
+    h.replica.halt_applied_elsewhere = null;
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 0 });
+    try testing.expect(!h.replica.diverged);
+    try testing.expect(!h.replica.haltAppliedElsewhere().?.builds_known);
+    h.replica.halt_applied_elsewhere = null;
+    h.raft.build = 0;
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 0 });
+    try testing.expect(!h.replica.diverged);
+    try testing.expect(!h.replica.haltAppliedElsewhere().?.builds_known);
+    h.raft.build = 9;
     // Said of the halt it was about only.
-    h.raft.halt_at = .{ .index = 2, .term = 1, .crc = 6, .build = h.raft.build };
-    try testing.expect(!h.replica.haltAppliedElsewhere());
+    h.raft.halt_at = .{ .index = 2, .term = 1, .crc = 6 };
+    try testing.expect(h.replica.haltAppliedElsewhere() == null);
     h.raft.halt_at = halt;
+    h.replica.halt_applied_elsewhere = null;
 
-    h.appendFrom(2, term, .{ .index = 2, .term = 1, .kind = .alone });
+    // A committed repair skips it: the leader passed over it, as this node will.
+    h.raft.repaired = .{ .check = alwaysRepaired };
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 9 });
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 8 });
+    try testing.expect(!h.replica.diverged and h.replica.haltAppliedElsewhere() == null);
+    h.raft.repaired = .{};
+
+    h.appendFrom(2, term, .{ .index = 2, .term = 1, .build = 9 });
     try testing.expect(h.replica.diverged and h.replica.halted_alone);
     try testing.expect(std.mem.indexOf(u8, h.replica.divergedReason().?, "halted alone") != null);
 }

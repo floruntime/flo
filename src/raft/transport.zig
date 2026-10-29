@@ -245,12 +245,12 @@ pub fn deserializeVoteResponse(data: []const u8) ?VoteResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization — AppendResponse (75 bytes): term, success, match, from,
+// Serialization — AppendResponse (67 bytes): term, success, match, from,
 //   hint, guarded, leader_commit, clock, then the halt: flag u8, index u64,
-//   term u64, crc u32, build u64 (zero when not halted)
+//   term u64, crc u32 (zero when not halted)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_RESP_SIZE: usize = 75;
+pub const APPEND_RESP_SIZE: usize = 67;
 
 pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     if (buf.len < APPEND_RESP_SIZE) return null;
@@ -271,7 +271,7 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u64, buf[off..][0..8], resp.clock_ns, .little);
     off += 8;
-    const h = resp.halt orelse node_mod.HaltAt{ .index = 0, .term = 0, .crc = 0, .build = 0 };
+    const h = resp.halt orelse node_mod.HaltAt{ .index = 0, .term = 0, .crc = 0 };
     buf[off] = @intFromBool(resp.halt != null);
     off += 1;
     std.mem.writeInt(u64, buf[off..][0..8], h.index, .little);
@@ -280,8 +280,6 @@ pub fn serializeAppendResponse(resp: AppendResponse, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u32, buf[off..][0..4], h.crc, .little);
     off += 4;
-    std.mem.writeInt(u64, buf[off..][0..8], h.build, .little);
-    off += 8;
     return off;
 }
 
@@ -311,7 +309,6 @@ pub fn deserializeAppendResponse(data: []const u8) ?AppendResponse {
             .index = std.mem.readInt(u64, data[off + 18 ..][0..8], .little),
             .term = std.mem.readInt(u64, data[off + 26 ..][0..8], .little),
             .crc = std.mem.readInt(u32, data[off + 34 ..][0..4], .little),
-            .build = std.mem.readInt(u64, data[off + 38 ..][0..8], .little),
         },
     };
 }
@@ -391,13 +388,13 @@ pub fn deserializeTermCheckResponse(data: []const u8) ?TermCheckResponse {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Serialization — AppendRequest (variable size)
-//   Fixed prefix: 57 bytes (term, leader_id, prev_log_index, prev_log_term,
+//   Fixed prefix: 64 bytes (term, leader_id, prev_log_index, prev_log_term,
 //                           leader_commit, entry_count, then the halt
-//                           verdict: index u64, term u64, kind u8)
+//                           verdict: index u64, term u64, build u64)
 //   Then N entries, each: 40-byte header + payload_len payload bytes.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const APPEND_REQ_PREFIX: usize = 57;
+pub const APPEND_REQ_PREFIX: usize = 64;
 
 /// Compute the serialized size for an AppendRequest.
 pub fn appendRequestSize(req: AppendRequest) usize {
@@ -429,8 +426,8 @@ pub fn serializeAppendRequest(req: AppendRequest, buf: []u8) ?usize {
     off += 8;
     std.mem.writeInt(u64, buf[off..][0..8], req.halt_verdict.term, .little);
     off += 8;
-    buf[off] = @backingInt(req.halt_verdict.kind);
-    off += 1;
+    std.mem.writeInt(u64, buf[off..][0..8], req.halt_verdict.build, .little);
+    off += 8;
 
     // Serialize each entry
     for (req.entries) |*e| {
@@ -473,9 +470,9 @@ pub fn deserializeAppendRequestHeader(data: []const u8) ?AppendRequestHeader {
     const verdict: node_mod.HaltVerdict = .{
         .index = std.mem.readInt(u64, data[off..][0..8], .little),
         .term = std.mem.readInt(u64, data[off + 8 ..][0..8], .little),
-        .kind = @fromBackingInt(data[off + 16]),
+        .build = std.mem.readInt(u64, data[off + 16 ..][0..8], .little),
     };
-    off += 17;
+    off += 24;
 
     return .{
         .term = term,
@@ -685,7 +682,7 @@ test "transport: AppendRequest roundtrip with entries" {
         .prev_log_term = 0,
         .entries = &entries,
         .leader_commit = 0,
-        .halt_verdict = .{ .index = 41, .term = 3, .kind = .other_build },
+        .halt_verdict = .{ .index = 41, .term = 3, .build = 0x0123456789abcdef },
     };
 
     var buf: [4096]u8 = undefined;

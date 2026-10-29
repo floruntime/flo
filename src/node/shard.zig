@@ -912,7 +912,7 @@ pub const Shard = struct {
             // keeps the stamp of the entry before.
             raft_node.noteApplied(replayed_stamp);
             if (boot_halt) |*h| {
-                raft_node.halt_at = .{ .index = h.index, .term = h.term, .crc = h.crc, .build = raft_node.build };
+                raft_node.halt_at = .{ .index = h.index, .term = h.term, .crc = h.crc };
                 marker.halted(h.index, h.term, h.crc);
                 log.err("shard {d} comes up halted at {s}, as it was before the restart. It applies nothing past it and takes no writes until a repair", .{ shard_id, h.reason() });
             }
@@ -1082,6 +1082,7 @@ pub const Shard = struct {
     /// Must be called after shards are at their final heap addresses.
     pub fn wireHandlerShardPtrs(self: *Shard) void {
         self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
+        self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
@@ -3130,7 +3131,7 @@ pub const Shard = struct {
         const type_name = std.enums.tagName(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type))) orelse "unknown";
         self.halted = Halt.init(e, "entry {d} ({s}): " ++ fmt, .{ e.header.index, type_name } ++ args);
         const raft = self.raft_node;
-        raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c, .build = raft.build };
+        raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
         raft.last_applied = e.header.index - 1;
         self.last_entry_applied = false;
         self.skip_scan_from = e.header.index + 1;
@@ -3167,6 +3168,17 @@ pub const Shard = struct {
         }
         self.skip_scan_from = raft.commit_index + 1;
         return false;
+    }
+
+    /// Whether a committed repair skips `h`: one this shard took, or, for
+    /// the entry it is halted at, one committed since it last looked, which
+    /// it takes now and goes on past.
+    fn repairedOpaque(ctx: ?*anyopaque, h: raft_node_mod.HaltAt) bool {
+        const self: *Shard = @ptrCast(@alignCast(ctx.?));
+        if (self.skips.holds(&.{ .index = h.index, .term = h.term, .crc = h.crc })) return true;
+        const halted = self.halted orelse return false;
+        if (halted.index != h.index or halted.term != h.term or halted.crc != h.crc) return false;
+        return self.resumePastSkip() and self.halted == null;
     }
 
     /// A repair skip applied. Where its entry was skipped, or lies below
@@ -3379,11 +3391,16 @@ pub const Shard = struct {
         } else if (self.offline) |*damage| {
             slot.setReason(damage.reason());
         } else if (self.halted) |*h| {
-            var buf: [health_mod.REASON_MAX]u8 = undefined;
-            slot.setReason(if (self.replica.haltAppliedElsewhere())
-                std.fmt.bufPrint(&buf, "{s}; the leader's build applies this entry: upgrade this node", .{h.reason()}) catch h.reason()
-            else
-                h.reason());
+            // Room for both; the slot keeps what fits.
+            var buf: [2 * health_mod.REASON_MAX]u8 = undefined;
+            // The note first: a long halt reason is cut short, the way out isn't.
+            slot.setReason(if (self.replica.haltAppliedElsewhere()) |e| blk: {
+                const note = if (e.builds_known)
+                    "the leader's build applies this entry: upgrade this node"
+                else
+                    "the leader applied this entry; a build with no version can't be told apart: on the same build this node halted alone (wipe and rejoin), on another upgrade it";
+                break :blk std.fmt.bufPrint(&buf, "{s}; {s}", .{ note, h.reason() }) catch note;
+            } else h.reason());
         }
         const raft = self.raft_node;
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
@@ -13179,7 +13196,7 @@ fn haltForTest(shard: *Shard, index: u64) void {
     var e = entry_mod.buildEntry(.cg_create, entry_mod.Flags.NONE, 1, index, 0, "");
     e.header.crc32c = e.computeCrc();
     shard.halted = Halt.init(&e, "entry {d}: halted for a test", .{index});
-    shard.raft_node.halt_at = .{ .index = index, .term = 1, .crc = e.header.crc32c, .build = shard.raft_node.build };
+    shard.raft_node.halt_at = .{ .index = index, .term = 1, .crc = e.header.crc32c };
 }
 
 test "a halted shard refuses a client's write, saying where it halted and why, and serves its reads marked stale" {
@@ -13864,6 +13881,34 @@ test "Shard: a skip naming the halted index in another term leaves the shard hal
     try std.testing.expectEqual(h, shard.halted.?.index);
 }
 
+test "Shard: Raft learns an entry a repair skips is not one the shard applied, from the skip it took or one committed since" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var shard = try t.open();
+    defer shard.deinit();
+    // Its hooks point at this copy.
+    shard.wireHandlerShardPtrs();
+    const r = shard.raft_node;
+    const h = try HaltCase.no_applier.propose(&shard);
+    try std.testing.expect(!shard.applyCommitted());
+    const at = r.halt_at.?;
+    try std.testing.expectEqual(h, at.index);
+    try std.testing.expect(!r.repaired.of(at));
+    // Committed, not yet applied: asked, the shard takes it and goes on.
+    const skip = try proposeSkip(&shard, h);
+    try shard.flushSegmentToDisk();
+    r.markDurable(skip);
+    try std.testing.expect(r.commit_index >= skip and shard.halted != null);
+    try std.testing.expect(r.repaired.of(at));
+    try std.testing.expect(shard.halted == null and r.halt_at == null);
+    // Applied past it: the skip it took says so, as a leader's must.
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expect(r.last_applied > h);
+    try std.testing.expect(r.repaired.of(at));
+    try std.testing.expect(!r.repaired.of(.{ .index = h, .term = at.term, .crc = at.crc +% 1 }));
+}
+
 test "Shard: a skip never halts, even stamped out of order" {
     var t: DamageTest = undefined;
     try t.init();
@@ -14003,7 +14048,7 @@ test "Shard: a halted member whose leader applied its entry on another build say
     try std.testing.expectEqual(h.term, slot.halt_term.load(.monotonic));
     try std.testing.expectEqual(h.crc, slot.halt_crc.load(.monotonic));
     try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "upgrade") == null);
-    shard.replica.halt_applied_elsewhere = h;
+    shard.replica.halt_applied_elsewhere = .{ .halt = h, .builds_known = true };
     shard.publishHealth();
     try std.testing.expectEqual(health_mod.ShardState.halted, slot.get());
     try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "the leader's build applies this entry: upgrade this node") != null);
