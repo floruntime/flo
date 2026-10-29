@@ -28,7 +28,7 @@
 4207	kv_key_nul_test
 173035	kv_test
 214	large_request_test
-38739	list_paging_test
+4207	list_paging_test
 35531	membership_test
 768	metrics_test
 4597	metrics_values_test

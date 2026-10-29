@@ -92,15 +92,21 @@ fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, ou
     const frame = try req.serialize(&frame_buf);
 
     if (std.c.write(fd, frame.ptr, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
+    // Wait on the socket rather than a fixed sleep: the big-shard test makes
+    // 3300 calls, and a 10 ms sleep after each was most of its 34 s.
+    const deadline = stdx.time.monotonicMs() + 3000;
     var got: usize = 0;
-    for (0..300) |_| {
+    while (true) {
         const rc = std.c.read(fd, out[got..].ptr, out.len - got);
         if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
         if (proto.Response.parse(out[0..got])) |r| {
             try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
             return r.data;
         } else |_| {}
-        stdx.time.sleep(10 * std.time.ns_per_ms);
+        const now = stdx.time.monotonicMs();
+        if (now >= deadline) break;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        _ = std.posix.poll(&fds, @intCast(deadline - now)) catch break;
     }
     return error.NoResponse;
 }
