@@ -76,7 +76,7 @@ pub fn main() !void {
 
     // ── Put Benchmark ──
     {
-        var kv = KVProjection.init(allocator, 0);
+        var kv = KVProjection.init(allocator);
         defer kv.deinit();
 
         const start = stdx.time.nanoTimestamp();

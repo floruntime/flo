@@ -11,6 +11,8 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const proto = @import("src").protocol.proto;
+const kv_ops = @import("src").protocol.kv_ops;
 
 // =============================================================================
 // Helper: Parse version from JSON output
@@ -1493,12 +1495,13 @@ test "e2e/kv: history pages with --before-version, and follows more across answe
     try testing.expectEqualStrings("", older.stderr);
 
     // Two 130 KiB versions don't fit one answer: the CLI asks again and
-    // prints both, as one list.
+    // prints both, as one list. Written over the wire, since Linux refuses
+    // a single argument over 128 KiB.
     const big = try testing.allocator.alloc(u8, 130 * 1024);
     defer testing.allocator.free(big);
     for ("abc") |c| {
         @memset(big, c);
-        try ctx.exec(&.{ "kv", "set", "large", big });
+        try setOverWire(ctx, "large", big);
     }
     var large = try ctx.cli.run(&.{ "kv", "history", "large", "-o", "raw" });
     defer large.deinit();
@@ -1507,6 +1510,38 @@ test "e2e/kv: history pages with --before-version, and follows more across answe
     // The newest older version is kept past the byte bound; the oldest went.
     for ([_][]const u8{ "3\t", "2\t" }) |want| try testing.expect(std.mem.startsWith(u8, lines.next() orelse return error.TooFewVersions, want));
     try testing.expect(lines.next() == null);
+}
+
+/// A plain kv.set of `value` sent as one frame, for values too large to
+/// pass the CLI as an argument.
+fn setOverWire(ctx: *stdx.testing.TestContext, key: []const u8, value: []const u8) !void {
+    const body_buf = try testing.allocator.alloc(u8, value.len + 64);
+    defer testing.allocator.free(body_buf);
+    const body = try kv_ops.plainSetBody(body_buf, value);
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "default", .key = key, .value = body, .options = "" };
+    const frame_buf = try testing.allocator.alloc(u8, @sizeOf(proto.RequestHeader) + 64 + key.len + body.len);
+    defer testing.allocator.free(frame_buf);
+    const frame = try req.serialize(frame_buf);
+
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    var sent: usize = 0;
+    while (sent < frame.len) {
+        const rc = std.c.write(fd, frame[sent..].ptr, frame.len - sent);
+        if (rc <= 0) return error.ShortWrite;
+        sent += @intCast(rc);
+    }
+    var out: [1024]u8 = undefined;
+    var got: usize = 0;
+    for (0..300) |_| {
+        const rc = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (rc > 0) got += @intCast(rc) else if (rc == 0) break;
+        if (proto.Response.parse(out[0..got])) |r| {
+            return testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        } else |_| {}
+        stdx.time.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.NoResponse;
 }
 
 test "e2e/kv: history for non-existent key fails" {
