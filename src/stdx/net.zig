@@ -292,8 +292,16 @@ test "net: a Unix socket replaces only a dead socket of its owner's, and unlinks
     // Dead: nothing answers, so a new server takes the path.
     const second = try unixListen(path_z);
     defer _ = std.c.close(second.fd);
-    // The first one's stop doesn't remove the second's file.
-    unixUnlink(path_z, first.file);
+    // A stop removes the file only if it is still the one that stop bound.
+    // A file system may hand the new file the old one's inode number, so
+    // the identity is tried here as a recycled inode would present it,
+    // rather than by racing the file system's clock.
+    var older = second.file;
+    older.ctime_ns -= 1;
+    unixUnlink(path_z, older);
+    var other = second.file;
+    other.ino +%= 1;
+    unixUnlink(path_z, other);
     try std.testing.expect((try @import("fs.zig").lstatMeta(path_z)) != null);
     unixUnlink(path_z, second.file);
     try std.testing.expect((try @import("fs.zig").lstatMeta(path_z)) == null);
