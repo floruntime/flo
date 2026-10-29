@@ -49,12 +49,16 @@ COPY --from=web-builder /build/web/dist/ ./src/node/dashboard/dist/
 ARG TARGETPLATFORM
 ARG FLO_VERSION=dev
 # The CPU floor is hardware CRC32C: x86-64-v2, ARMv8 with CRC.
+# A -Dtest-faults build halts or crashes a shard on a kv set of a key with
+# the prefix grepped for; no image carries one. The binary may be for
+# another platform, so it is read, not run.
 RUN case "${TARGETPLATFORM}" in \
       linux/arm64)  ZIG_TARGET="aarch64-linux-musl"; ZIG_CPU="generic+crc" ;; \
       linux/amd64)  ZIG_TARGET="x86_64-linux-musl";  ZIG_CPU="x86_64_v2" ;; \
       *)            echo "unsupported platform ${TARGETPLATFORM}" >&2; exit 1 ;; \
     esac && \
-    zig build -Drelease -Dtarget=${ZIG_TARGET} -Dcpu=${ZIG_CPU} -Drequire-hw-crc -Dversion=${FLO_VERSION}
+    zig build -Drelease -Dtarget=${ZIG_TARGET} -Dcpu=${ZIG_CPU} -Drequire-hw-crc -Dversion=${FLO_VERSION} && \
+    if grep -qa 'flo-test-fault-' zig-out/bin/flo; then echo "the image's flo carries the test faults" >&2; exit 1; fi
 
 # Stage 3: Runtime image
 FROM alpine:3.19
