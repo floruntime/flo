@@ -6,6 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const cli = @import("src").cli_client;
 
 fn listed(ctx: *stdx.testing.TestContext, name: []const u8) !bool {
     const list = try ctx.execCapture(&.{ "ns", "ls" });
@@ -103,11 +104,18 @@ test "e2e/namespace: the dashboard refuses an invalid namespace name, and the no
 test "e2e/namespace: writes cannot create namespaces past the limit, and the refusal says so" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    // "default" is one of the 1024.
-    try ctx.exec(&.{ "kv", "set", "k", "v" });
+    // "default" is one of the 1024. The other 1023 go over one connection:
+    // a CLI process per write was most of this test's 28 s.
+    var ep: [32]u8 = undefined;
+    var client = cli.Client.init(testing.allocator, try std.fmt.bufPrint(&ep, "127.0.0.1:{d}", .{ctx.getPort()}));
+    defer client.deinit();
+    try client.connect();
     var buf: [16]u8 = undefined;
-    for (1..1024) |i| {
-        try ctx.exec(&.{ "kv", "set", "k", "v", "-n", try std.fmt.bufPrint(&buf, "ns{d}", .{i}) });
+    for (0..1024) |i| {
+        const ns = if (i == 0) "default" else try std.fmt.bufPrint(&buf, "ns{d}", .{i});
+        var resp = try cli.kv.set(&client, ns, "k", .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        defer resp.deinit();
+        try testing.expectEqual(.ok, resp.status);
     }
     var over = try ctx.cli.run(&.{ "kv", "set", "k", "v", "-n", "one-more" });
     defer over.deinit();
