@@ -705,8 +705,13 @@ pub const NamespaceHandler = struct {
                 }
                 break :publish;
             };
-            for (self.unpublished.items) |u| {
-                self.table.publish(u.id, u.name, u.index) catch break :publish;
+            for (self.unpublished.items, 0..) |u, i| {
+                self.table.publish(u.id, u.name, u.index) catch {
+                    // What was published stays published: drop it, and
+                    // try the rest next tick.
+                    self.unpublished.replaceRangeAssumeCapacity(0, i, &.{});
+                    break :publish;
+                };
                 self.answerWaiters(shard, u.name, .published);
             }
             self.unpublished.clearRetainingCapacity();

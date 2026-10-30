@@ -135,14 +135,6 @@ test "e2e/namespace: kv isolation between namespaces" {
 
 // =============================================================================
 // Cluster Tests (Multi-Node)
-//
-// NOTE: Currently namespace metadata is NOT replicated across cluster nodes.
-// Each node maintains its own MetadataCache for namespaces.
-// These tests verify basic cluster operations by creating namespaces on
-// the node that needs them. Full cluster-wide namespace replication via
-// Raft is planned for a future release.
-//
-// TODO: Implement namespace replication via Raft log
 // =============================================================================
 
 const ClusterContext = stdx.testing.ClusterContext;
@@ -150,10 +142,6 @@ const ClusterContext = stdx.testing.ClusterContext;
 test "e2e/namespace/cluster: kv operations work across cluster with namespaces" {
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
-
-    // In current architecture, namespaces are node-local
-    // KV operations auto-create "default" namespace on each node
-    // So we can test KV cluster operations which implicitly use namespaces
 
     // Write from node 0
     try cluster.execOn(0, &.{ "kv", "set", "cluster_key", "from_node_0" });

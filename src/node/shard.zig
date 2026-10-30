@@ -2919,14 +2919,21 @@ pub const Shard = struct {
         };
         // A namespace the forwarder resolved is admitted only as this node's
         // table has it, under the same name: an id it doesn't know yet, or
-        // one that names another namespace, never reaches the handler.
+        // one that names another namespace, never reaches the handler. The
+        // table only grows, so an id it has under this name is admitted
+        // however far behind the forwarder's it is; only an unknown id
+        // waits for it to catch up.
         if (ns_id != 0) {
             var err_buf: [256]u8 = undefined;
             const t = self.namespace_handler.table;
             const want = if (req.namespace.len == 0) "default" else req.namespace;
-            const refusal: ?struct { proto.StatusCode, proto.Refusal } = if (t.publishedIndex() < published)
+            const not_found: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" };
+            const refusal: ?struct { proto.StatusCode, proto.Refusal } = if (t.nameOf(ns_id)) |name|
+                (if (std.mem.eql(u8, name, want)) null else .{ .no_namespace, not_found })
+            else if (t.publishedIndex() < published)
                 .{ .unavailable, proto.notRun("unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry") }
-            else if (t.nameOf(ns_id)) |name| (if (std.mem.eql(u8, name, want)) null else .{ .no_namespace, .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } }) else .{ .no_namespace, .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } };
+            else
+                .{ .no_namespace, not_found };
             if (refusal) |r| return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(r[0], req.header.request_id, r[1], &err_buf));
         }
         const proxy = self.forward_proxy;
@@ -9732,7 +9739,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     try std.testing.expectEqualStrings("internal error: the leader cannot read this forwarded request — are all nodes on the same version?", (try resp.refused()).message);
 }
 
-test "Shard: a forwarded write's namespace is admitted only as this node's table has it, under its name" {
+test "Shard: a forwarded write's namespace is admitted only as this node's table has it, under its name, however far ahead the forwarder is" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -9762,20 +9769,56 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
         .{ .id = 4000, .published = 0, .status = .no_namespace, .says = "namespace not found" },
         // Another namespace's id under this request's name.
         .{ .id = ledger, .published = 0, .status = .no_namespace, .says = "namespace not found" },
-        // The forwarder's table is ahead of this one.
-        .{ .id = orders, .published = 1 << 40, .status = .unavailable, .says = "unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry" },
+        // An id this node doesn't know yet, from a forwarder whose table is ahead.
+        .{ .id = 4000, .published = 1 << 40, .status = .unavailable, .says = "unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry" },
     }, 0..) |c, i| {
         std.mem.writeInt(u32, frame[0..4], @intCast(100 + i), .little);
         std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], c.id, .little);
         std.mem.writeInt(u64, frame[FORWARD_PREFIX + 4 ..][0..8], c.published, .little);
-        const dispatched = shard.requests_dispatched;
+        const last = shard.raft_node.log.lastIndex();
         shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
-        try std.testing.expectEqual(dispatched, shard.requests_dispatched);
+        try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
         const reply = rn.outbound.items[rn.outbound.items.len - 1].frame[transport.HEADER_SIZE..];
         const resp = try proto.Response.parse(reply[12..]);
         try std.testing.expectEqual(@backingInt(c.status), resp.header.status);
         try std.testing.expectEqualStrings(c.says, (try resp.refused()).message);
     }
+    // An id this node has under the request's name runs, whether or not
+    // the forwarder's table is ahead.
+    for ([_]u64{ 0, 1 << 40 }, 0..) |published, i| {
+        std.mem.writeInt(u32, frame[0..4], @intCast(200 + i), .little);
+        std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], orders, .little);
+        std.mem.writeInt(u64, frame[FORWARD_PREFIX + 4 ..][0..8], published, .little);
+        const last = shard.raft_node.log.lastIndex();
+        shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
+        try std.testing.expectEqual(last + 1, shard.raft_node.log.lastIndex());
+    }
+}
+
+test "Shard: a publish that fails partway publishes the rest next tick, and none twice" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    try std.testing.expect(shard.applyCommitted());
+    const nh = shard.namespace_handler;
+    const first = nh.next_id;
+    try std.testing.expectEqual(.created, nh.applyCreateAt("orders", first, 0, 1));
+    try std.testing.expectEqual(.created, nh.applyCreateAt("ledger", first + 1, 0, 2));
+
+    // The table can copy one name, not the second.
+    const table_allocator = nh.table.allocator;
+    var failing = std.testing.FailingAllocator.init(table_allocator, .{ .fail_index = 1 });
+    nh.table.allocator = failing.allocator();
+    nh.settle(&shard);
+    nh.table.allocator = table_allocator;
+    try std.testing.expectEqualStrings("orders", nh.table.nameOf(first).?);
+    try std.testing.expect(nh.table.nameOf(first + 1) == null);
+
+    nh.settle(&shard);
+    try std.testing.expectEqualStrings("ledger", nh.table.nameOf(first + 1).?);
+    try std.testing.expectEqual(@as(usize, 0), nh.unpublished.items.len);
 }
 
 test "Shard: a diverged node refuses writes even if it led" {
