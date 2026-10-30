@@ -48,12 +48,12 @@ pub fn main() !void {
 
     var names: [100][]const u8 = undefined;
     start = stdx.time.nanoTimestamp();
-    for (0..10_000) |_| found += st.scanKeyNames("default", "", &names);
+    for (0..10_000) |_| found += st.scanKeyNames("default", "", null, &names);
     std.mem.doNotOptimizeAway(found);
     report("KV Scan:", 10_000, start, ", batch=100");
 
     start = stdx.time.nanoTimestamp();
-    for (0..10_000) |_| found += st.scanKeyNames("default", "bench-key-0000", &names);
+    for (0..10_000) |_| found += st.scanKeyNames("default", "bench-key-0000", null, &names);
     std.mem.doNotOptimizeAway(found);
     report("KV ScanPfx:", 10_000, start, ", prefix=14B");
 

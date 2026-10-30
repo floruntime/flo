@@ -432,7 +432,7 @@ pub const KVHandler = struct {
         const self = shard.kv_handler;
         const local = [_]*anyopaque{@ptrCast(self.kv)};
         const contexts = shard.dispatcher.walk_contexts[@backingInt(OpCode.kv_scan)] orelse &local;
-        const walker = NameWalker.init(localScanKeys, @intCast(contexts.len));
+        const walker = NameWalker.initPaged(localScanKeys, @intCast(contexts.len));
         var found: [NameWalker.MAX_BATCH][]const u8 = undefined;
         const from = if (cursor.len == 0) null else cursor;
         var want: u32 = @min(limit, NameWalker.MAX_BATCH);
@@ -842,30 +842,42 @@ pub const KVHandler = struct {
     /// KV state. Returns borrowed references (zero allocation).
     /// Filters reserved keys and strips namespace prefix.
     /// When filter is non-empty, only returns keys matching the prefix filter.
+    /// Pages by key: a page starts after `local_cursor`, the last key the
+    /// one before it returned, so a key written or deleted between pages
+    /// moves no other key in or out of the walk.
     fn localScanKeys(
         ctx: *anyopaque,
         namespace: []const u8,
         filter: []const u8,
-        _: ?[]const u8,
+        local_cursor: ?[]const u8,
         limit: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const kv: *KvState = @ptrCast(@alignCast(ctx));
-        const key_buf = dispatcher_mod.scanScratch(kv.totalEntries());
         // A key can't hold the separator, so a filter that does names nothing.
         if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
         // Keys come back in key order and without their namespace.
         const ns = if (namespace.len == 0) "default" else namespace;
-        const raw_count = kv.scanKeyNames(ns, filter, key_buf);
+        // One past the page shows whether more follow.
+        const cap: usize = @min(limit, dispatcher_mod.NameWalker.MAX_BATCH);
+        if (cap == 0) return .{ .items = &.{}, .next_cursor = local_cursor };
+        const key_buf = dispatcher_mod.scanScratch(cap + 1);
+        var after = local_cursor;
         var count: usize = 0;
-        const cap: usize = if (limit > 0) @intCast(limit) else key_buf.len;
-        for (key_buf[0..raw_count]) |key| {
-            if (count >= cap) break;
-            if (!isReservedKey(key)) {
-                key_buf[count] = key;
-                count += 1;
+        while (count < key_buf.len) {
+            const raw = kv.scanKeyNames(ns, filter, after, key_buf[count..]);
+            if (raw == 0) break;
+            // The scan resumes after the last key it read, reserved or not.
+            after = key_buf[count + raw - 1];
+            const asked = key_buf.len - count;
+            for (key_buf[count .. count + raw]) |key| {
+                if (!isReservedKey(key)) {
+                    key_buf[count] = key;
+                    count += 1;
+                }
             }
+            if (raw < asked) break;
         }
-
+        if (count > cap) return .{ .items = key_buf[0..cap], .next_cursor = key_buf[cap - 1] };
         return .{ .items = key_buf[0..count], .next_cursor = null };
     }
 
@@ -1042,11 +1054,11 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
         try @import("../contract/machine.zig").applyEntry(&@import("machine.zig").machine, &store, &scratch, &e, &out);
     }
 
-    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, "default", "b\x00", null, 0).items.len);
-    const all = KVHandler.localScanKeys(&kv, "default", "", null, 0).items;
+    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, "default", "b\x00", null, 10).items.len);
+    const all = KVHandler.localScanKeys(&kv, "default", "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), all.len);
     try testing.expectEqualStrings("mine", all[0]);
-    const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 0).items;
+    const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), b_keys.len);
     try testing.expectEqualStrings("k", b_keys[0]);
 }

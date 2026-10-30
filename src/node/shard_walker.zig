@@ -118,11 +118,25 @@ pub fn ShardWalker(comptime ResultT: type) type {
 
         local_scan: LocalScanFn,
         shard_count: u16,
+        /// The scan returns at most the limit asked and a cursor after the
+        /// last item while more follow, so a page resumes where the last
+        /// one stopped however the shard changed between them. Without it,
+        /// the walker pages a shard by offset into its whole scan.
+        pages_itself: bool = false,
 
         pub fn init(local_scan: LocalScanFn, shard_count: u16) Self {
             return .{
                 .local_scan = local_scan,
                 .shard_count = shard_count,
+            };
+        }
+
+        /// A walker over a scan that pages by its own cursor.
+        pub fn initPaged(local_scan: LocalScanFn, shard_count: u16) Self {
+            return .{
+                .local_scan = local_scan,
+                .shard_count = shard_count,
+                .pages_itself = true,
             };
         }
 
@@ -171,7 +185,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
                 // From a shard's start, one more than fits past any skipped: a
                 // scan that stops at its limit without a cursor still shows
                 // there's more. A scan resuming from its own cursor pages itself.
-                const ask: u32 = if (local_cursor != null) remaining else @intCast(@min(@as(u64, skip) + remaining + 1, std.math.maxInt(u32)));
+                const ask: u32 = if (local_cursor != null or self.pages_itself) remaining else @intCast(@min(@as(u64, skip) + remaining + 1, std.math.maxInt(u32)));
                 const scan = self.local_scan(ctx, namespace, filter, local_cursor, ask);
                 const items = scan.items[@min(skip, scan.items.len)..];
 
@@ -183,6 +197,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
                     remaining -= @intCast(to_copy);
                 }
 
+                std.debug.assert(!self.pages_itself or to_copy == items.len);
                 // More came back than fits: resume this shard by offset from its
                 // start, rather than lose the rest (or skip past it with the
                 // scan's own cursor, which counts what came back).

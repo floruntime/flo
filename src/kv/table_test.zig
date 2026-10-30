@@ -565,6 +565,47 @@ test "kv ops: scan pages names by limit and cursor, under a prefix, without rese
     try testing.expectEqual(@as(u32, 6), all.names.count);
 }
 
+test "kv ops: scan resumes after the last name it sent, so writes between pages move no other name in or out" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    for ([_][]const u8{ "a1", "a2", "a3", "a4", "a5", "a6" }) |k| try expectSet(try h.set(k, setBody("v", .{})), 1);
+    // Reserved keys only come from the server itself; one between names
+    // doesn't cut a page short.
+    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    try h.shard.defaultPartition().kv.putForTest(qualified(&qbuf, "_flo:x"), "v");
+    try expectSet(try h.set("_e", setBody("v", .{})), 1);
+    try expectSet(try h.set("_g", setBody("v", .{})), 1);
+    const first = try h.ok("kv.scan", "_", .{ .limit = 2, .cursor = "" });
+    try testing.expectEqual(@as(u32, 2), first.names.count);
+    try testing.expect(first.cursor == null);
+
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    var page = try h.ok("kv.scan", "a", .{ .limit = 2, .cursor = "" });
+    var got: [8][2]u8 = undefined;
+    var n: usize = 0;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        var it = page.names.iterator();
+        while (try it.next()) |name| {
+            @memcpy(&got[n], name[0..2]);
+            n += 1;
+        }
+        const next = page.cursor orelse break;
+        @memcpy(cursor_buf[0..next.len], next);
+        if (pages == 0) {
+            // Before the cursor: an offset into the scan would now send a2 again.
+            try expectSet(try h.set("a0", setBody("v", .{})), 1);
+            // After it: gone before its page.
+            try testing.expectEqual(@as(?bool, true), (try h.ok("kv.delete", "a4", .{ .cas_version = null, .routing_key = null, .txn = null })).existed);
+        }
+        page = try h.ok("kv.scan", "a", .{ .limit = 2, .cursor = cursor_buf[0..next.len] });
+    }
+    const want = [_][]const u8{ "a1", "a2", "a3", "a5", "a6" };
+    try testing.expectEqual(want.len, n);
+    for (want, got[0..n]) |w, g| try testing.expectEqualStrings(w, &g);
+}
+
 test "kv ops: scan pages long names without dropping any, though they overflow an answer" {
     var h: Harness = undefined;
     try h.init();

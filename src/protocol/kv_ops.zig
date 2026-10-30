@@ -56,7 +56,9 @@ pub const HISTORY_MAX_BYTES: u32 = 64 * 1024;
 pub const HISTORY_ENTRY_COST: u32 = 64;
 /// Versions one history answer can list: the current one and the chain.
 pub const MAX_HISTORY: u32 = HISTORY_MAX_VERSIONS + 1;
-pub const MAX_CURSOR: u32 = 64;
+/// A scan's cursor: the shard it stopped on (u16), then the last key it
+/// returned.
+pub const MAX_CURSOR: u32 = 2 + @as(u32, @intCast(ops.MAX_KEY));
 
 /// Room an answer's list has once its other fields are in.
 fn listRoom(comptime others: usize) u32 {
@@ -222,7 +224,7 @@ pub const table = [_]ops.Op{
             .examples = &.{
                 "flo kv scan",
                 "flo kv scan user: --limit 100",
-                "flo kv scan user: --cursor 0000016b6579",
+                "flo kv scan user: --cursor 0000757365723a3432",
             },
         },
         .doc = "List the names of keys starting with a prefix, a page at a time.",
