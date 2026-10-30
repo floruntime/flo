@@ -146,19 +146,37 @@ pub const Counter = struct {
 pub const Kv = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
-    /// What it applied, by outcome: every refusal; batches refused, which
-    /// have staged writes by then; JSON patches merged into a value; and
-    /// JSON patches that deleted a field.
-    counts: Counts = .{},
+    /// What an entry did, for a run's counts (`Counts`).
+    pub const Effect = enum {
+        other,
+        /// Refused before staging anything.
+        refused,
+        /// A batch refused, which has staged writes by then.
+        staged_refused,
+        /// A JSON patch merged into the value: a set below `$`.
+        merged,
+        /// A JSON patch that deleted a field.
+        field_deleted,
+    };
 
+    /// Entries by outcome, each counted once however many replicas apply it.
     pub const Counts = struct {
         refusals: u64 = 0,
         staged_refusals: u64 = 0,
         merges: u64 = 0,
         field_deletes: u64 = 0,
 
-        pub fn add(self: *Counts, other: Counts) void {
-            inline for (@typeInfo(Counts).@"struct".field_names) |f| @field(self, f) += @field(other, f);
+        pub fn count(self: *Counts, o: Effect) void {
+            switch (o) {
+                .other => {},
+                .refused => self.refusals += 1,
+                .staged_refused => {
+                    self.refusals += 1;
+                    self.staged_refusals += 1;
+                },
+                .merged => self.merges += 1,
+                .field_deleted => self.field_deletes += 1,
+            }
         }
     };
 
@@ -190,8 +208,8 @@ pub const Kv = struct {
     /// but it must leave every family as it was: `RefusalChangedState` if
     /// one moved. Any other error (a halt, out of memory) is one a workload
     /// entry must never meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!void {
-        if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return;
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
+        if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
         var out: persistence.Result = .{};
         out.reset(e);
         const before = self.commits();
@@ -200,23 +218,19 @@ pub const Kv = struct {
         } else {
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
         }
-        if (out.refused() == null) {
-            self.countPatch(e);
-            return;
-        }
-        self.counts.refusals += 1;
-        if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.counts.staged_refusals += 1;
+        if (out.refused() == null) return patchEffect(e);
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+        return if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) .staged_refused else .refused;
     }
 
     /// An applied JSON patch: merged into the value (a set below `$`), or a
     /// field deleted. A set at `$` writes the whole value and merges nothing.
-    fn countPatch(self: *Kv, e: *const entry_mod.Entry) void {
-        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_json_patch)) return;
+    fn patchEffect(e: *const entry_mod.Entry) Effect {
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_json_patch)) return .other;
         var diag: schema.Diagnostic = .{};
-        const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return;
-        if (std.mem.eql(u8, p.path, "$")) return;
-        if (p.document != null) self.counts.merges += 1 else self.counts.field_deletes += 1;
+        const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return .other;
+        if (std.mem.eql(u8, p.path, "$")) return .other;
+        return if (p.document != null) .merged else .field_deleted;
     }
 
     /// `machine.applyEntry` without its guard against committing a refused
@@ -293,7 +307,7 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
     e.header.crc32c = e.computeCrc();
     const empty = kv.checksums();
-    try kv.apply(&e, .{ .mutant = .none, .node_now = 0, .leader = false, .live = true });
+    try testing.expectEqual(Kv.Effect.other, try kv.apply(&e, .{ .mutant = .none, .node_now = 0, .leader = false, .live = true }));
     try testing.expect(kv.checksums()[0] != empty[0]);
     kv.reset();
     try testing.expect(kv.store.strict_keys);

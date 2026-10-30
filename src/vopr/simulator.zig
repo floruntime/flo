@@ -281,8 +281,6 @@ const SimNode = struct {
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
     kv: families.Kv,
-    /// What its earlier lives' KV machines counted.
-    kv_before_restart: families.Kv.Counts = .{},
     families_index: u64 = 0,
     /// Its apply rewound without a restart, so the family holds entries
     /// the log no longer does and cannot roll them back: the checker
@@ -711,8 +709,7 @@ pub const Summary = struct {
     state_checks: u64,
     rebuilt_checks: u64,
     kv_checks: u64,
-    /// What KV's machine did with the entries, over every replica's
-    /// applies (`families.Kv.Counts`).
+    /// What KV's machine did with the run's entries, each counted once.
     kv: families.Kv.Counts,
     violation_count: usize,
 };
@@ -764,6 +761,8 @@ pub const Simulator = struct {
     crashes: u64 = 0,
     restarts: u64 = 0,
     wipes: u64 = 0,
+    /// KV entries by outcome, counted at the first apply of each index.
+    kv_counts: families.Kv.Counts = .{},
     config_written: bool = false,
     /// What was acked when convergence began: every member must apply it.
     /// The probes acked after are the leader's to commit; the final
@@ -1095,8 +1094,6 @@ pub const Simulator = struct {
         node.applied_config = .{};
         node.replay_through = node.applied_ticks.items.len;
         node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
-        node.kv_before_restart.add(node.kv.counts);
-        node.kv.counts = .{};
         node.kv.reset();
         node.families_index = 0;
         node.families_stale = false;
@@ -1677,7 +1674,12 @@ pub const Simulator = struct {
             .live = live,
         };
         if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
-        if (is_op and families.Kv.owns(e.header.entry_type)) node.kv.apply(e, replica) catch |err| self.checker.fail(switch (err) {
+        // Counted where the first replica reaches the index, so an entry
+        // counts once, not once per replica and replay.
+        const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
+        if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
+            if (first) self.kv_counts.count(effect);
+        } else |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{
                 .invariant = .refusal_wrote,
                 .node = node.id,
@@ -2024,14 +2026,7 @@ pub const Simulator = struct {
             .state_checks = self.checker.state_checks,
             .rebuilt_checks = self.checker.rebuilt_checks,
             .kv_checks = self.checker.kv_checks,
-            .kv = blk: {
-                var n: families.Kv.Counts = .{};
-                for (self.nodes) |*node| {
-                    n.add(node.kv_before_restart);
-                    n.add(node.kv.counts);
-                }
-                break :blk n;
-            },
+            .kv = self.kv_counts,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2254,16 +2249,17 @@ test "vopr sim: an effect only live apply runs fails state_checksum between a re
 
 test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuses batches after staging" {
     // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
-    // run is checked on its own, not summed.
+    // run is checked on its own, not summed, and each entry counts once
+    // however many replicas apply it.
     for ([_]u64{ 1, 3, 7, 9, 10, 13, 15, 16 }) |seed| {
         var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(seed), .{});
         defer sim.deinit();
         const s = try sim.run();
         try testing.expect(s.ok);
         errdefer std.debug.print("seed {d}: {any}\n", .{ seed, s.kv });
-        try testing.expect(s.kv.merges >= 10);
-        try testing.expect(s.kv.field_deletes >= 5);
-        try testing.expect(s.kv.staged_refusals >= 10);
+        try testing.expect(s.kv.merges >= 5);
+        try testing.expect(s.kv.field_deletes >= 2);
+        try testing.expect(s.kv.staged_refusals >= 5);
     }
 }
 
