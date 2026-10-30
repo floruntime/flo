@@ -10,6 +10,9 @@
 //! `Kv` is the server's own KV machine on a store of its own, compared by
 //! the contract's canonical checksum of each of its families.
 //!
+//! `Namespaces` is shard 0's own namespace handler, its creates applied
+//! through the handler's replay path.
+//!
 //! `Mutant` plants the bugs this check exists to catch, one at a time.
 
 const std = @import("std");
@@ -21,6 +24,7 @@ const kv_machine = @import("../kv/machine.zig");
 const view_mod = @import("../contract/view.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const schema = @import("../protocol/schema.zig");
+const ns_handler = @import("../namespace/handler.zig");
 
 const Allocator = std.mem.Allocator;
 const HASH_SEED: u64 = 0xFA81_17E5;
@@ -45,6 +49,14 @@ pub const Mutant = enum {
     /// every replica: no comparison sees it, so `Kv.apply` checks refusals
     /// itself.
     kv_refused_commits,
+    /// Shard 0's leader proposes a create before it has applied every
+    /// earlier term's entry, so it may choose an id an earlier leader's
+    /// create already took.
+    ns_ungated,
+    /// The same, once the leader's commit index has passed every earlier
+    /// term's entry, applied or not: what only a leader with an unapplied
+    /// committed tail can show.
+    ns_ready_on_commit,
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -259,6 +271,79 @@ pub const Kv = struct {
     }
 };
 
+/// Shard 0's namespace registry: the server's handler, on a table of its
+/// own. The simulator proposes creates through it as shard 0's leader does
+/// (`proposeCreateOn`) and applies them through its replay path. Nothing
+/// is published: shard 0's create path reads its registry, never the table.
+pub const Namespaces = struct {
+    handler: ns_handler.NamespaceHandler,
+
+    pub const Effect = enum { created, stale_id, refused };
+
+    /// Creates by outcome, each counted once however many replicas apply it.
+    pub const Counts = struct {
+        created: u64 = 0,
+        stale_ids: u64 = 0,
+        refusals: u64 = 0,
+
+        pub fn count(self: *Counts, e: Effect) void {
+            switch (e) {
+                .created => self.created += 1,
+                .stale_id => self.stale_ids += 1,
+                .refused => self.refusals += 1,
+            }
+        }
+    };
+
+    pub fn init(allocator: Allocator) Namespaces {
+        return .{ .handler = ns_handler.NamespaceHandler.init(allocator) catch @panic("sim OOM") };
+    }
+
+    pub fn deinit(self: *Namespaces) void {
+        self.handler.deinit();
+    }
+
+    /// Empty, as a restarted replica starts.
+    pub fn reset(self: *Namespaces) void {
+        const allocator = self.handler.allocator;
+        self.handler.deinit();
+        self.* = init(allocator);
+    }
+
+    pub fn owns(entry_type: u8) bool {
+        return entry_type == @backingInt(entry_mod.EntryType.namespace_create);
+    }
+
+    /// Apply `e` as shard 0 does. An error is one a workload create must
+    /// never meet.
+    pub fn apply(self: *Namespaces, e: *const entry_mod.Entry) persistence.ApplyError!Effect {
+        var out: persistence.Result = .{};
+        out.reset(e);
+        try self.handler.replayEntry(e, &out);
+        const r = out.refused() orelse return .created;
+        return if (std.mem.eql(u8, r.refusal.message, ns_handler.NamespaceHandler.STALE_ID_MESSAGE)) .stale_id else .refused;
+    }
+
+    /// The registry, the creates this log refused, and the next id, in no
+    /// order of the maps': each name and each refused hash is hashed alone
+    /// and the hashes summed.
+    pub fn checksum(self: *const Namespaces) u64 {
+        const h = &self.handler;
+        var sum: u64 = std.hash.Wyhash.hash(HASH_SEED, std.mem.asBytes(&h.next_id));
+        var it = h.namespaces.iterator();
+        while (it.next()) |kv| {
+            var hasher = std.hash.Wyhash.init(HASH_SEED);
+            hasher.update(kv.key_ptr.*);
+            const m = kv.value_ptr.*;
+            hasher.update(std.mem.asBytes(&[3]u64{ m.id, m.created_at_ns, m.created_index }));
+            sum +%= hasher.final();
+        }
+        var refused = h.refused_hashes.keyIterator();
+        while (refused.next()) |hash| sum +%= std.hash.Wyhash.hash(HASH_SEED +% 1, std.mem.asBytes(hash));
+        return sum;
+    }
+};
+
 const testing = std.testing;
 
 fn put(c: *Counter, payload: []const u8, stamp: u64, r: Replica) Outcome {
@@ -312,4 +397,34 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     kv.reset();
     try testing.expect(kv.store.strict_keys);
     try testing.expectEqual(empty, kv.checksums());
+}
+
+fn nsCreate(n: *Namespaces, index: u64, name: []const u8, id: u32) !Namespaces.Effect {
+    var buf: [256]u8 = undefined;
+    const p = try @import("../protocol/namespace_entries.zig").Create.encodeInto(&buf, .{ .name = name, .id = id });
+    var e = entry_mod.buildEntry(.namespace_create, 0, 1, index, index, p);
+    e.header.crc32c = e.computeCrc();
+    return n.apply(&e);
+}
+
+test "families: a namespace create refused for its id folds into the checksum, and resets" {
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+    var a = Namespaces.init(testing.allocator);
+    defer a.deinit();
+    var b = Namespaces.init(testing.allocator);
+    defer b.deinit();
+    const empty = a.checksum();
+    try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&a, 1, "orders", first));
+    try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&b, 1, "orders", first));
+    try testing.expectEqual(a.checksum(), b.checksum());
+    const created = a.checksum();
+    // "ledger" asks for the id "orders" took: refused on both alike, and
+    // the refusal is part of the state.
+    try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&a, 2, "ledger", first));
+    try testing.expect(a.checksum() != created);
+    try testing.expect(a.checksum() != b.checksum());
+    try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&b, 2, "ledger", first));
+    try testing.expectEqual(a.checksum(), b.checksum());
+    a.reset();
+    try testing.expectEqual(empty, a.checksum());
 }

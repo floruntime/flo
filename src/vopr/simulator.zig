@@ -29,6 +29,8 @@ const transport = @import("../raft/transport.zig");
 const RaftFrame = @import("../raft/raft_queue.zig").Frame;
 const replica_mod = @import("../replica/replica.zig");
 const families = @import("families.zig");
+const namespace_entries = @import("../protocol/namespace_entries.zig");
+const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
@@ -77,6 +79,10 @@ pub const Invariant = enum {
     /// An entry the KV machine refused changed a family anyway. Every
     /// replica would agree on it, so `state_checksum` can't see it.
     refusal_wrote,
+    /// A namespace create proposed by a leader that had applied every
+    /// earlier term's entry was refused because another create took its
+    /// id: the leader chose the id from state behind what was committed.
+    ns_ready_stale_id,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -281,6 +287,10 @@ const SimNode = struct {
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
     kv: families.Kv,
+    /// Shard 0's namespace handler, on this replica's own table.
+    ns: families.Namespaces,
+    /// It applies nothing before this tick (`apply_lag_permille`).
+    apply_paused_until: u64 = 0,
     families_index: u64 = 0,
     /// Its apply rewound without a restart, so the family holds entries
     /// the log no longer does and cannot roll them back: the checker
@@ -405,6 +415,7 @@ const SimIo = struct {
 
         pub fn stoppedLeading(r: *Replica, _: []const u8) void {
             of(r).sim.steps_down += 1;
+            of(r).ns.handler.stoppedLeading();
         }
     };
 };
@@ -414,18 +425,35 @@ const SimIo = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
-const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, kv: ?[families.Kv.FAMILIES.len]u64 };
+/// The sums sampled every `KV_SAMPLE` indices: KV's families, then the
+/// namespaces.
+const SAMPLED = families.Kv.FAMILIES.len + 1;
 
-/// KV's families are compared at every index this divides: a checksum walks
-/// a whole family, so one at every index would cost the run's square. The
-/// indices are the same on every replica.
+fn sampledSums(node: *SimNode) [SAMPLED]u64 {
+    return node.kv.checksums() ++ [1]u64{node.ns.checksum()};
+}
+
+/// What leaders did with the workload's namespace creates at submit.
+const NsSubmits = struct {
+    proposed: u64 = 0,
+    /// Refused while the leader applied an earlier term's entries.
+    catching_up: u64 = 0,
+    refused: u64 = 0,
+};
+
+const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, kv: ?[SAMPLED]u64 };
+
+/// KV's families and the namespaces are compared at every index this
+/// divides: a checksum walks a whole family, so one at every index would
+/// cost the run's square. The indices are the same on every replica.
 const KV_SAMPLE = 16;
 
-/// What a KV checksum mismatch names, by family.
-const KV_MISMATCH = [families.Kv.FAMILIES.len][2][]const u8{
+/// What a sampled sum's mismatch names, by sum.
+const KV_MISMATCH = [SAMPLED][2][]const u8{
     .{ "two replicas hold different kv.value after the same history", "a replica rebuilt by replay holds other kv.value than one that applied live" },
     .{ "two replicas hold different kv.history after the same history", "a replica rebuilt by replay holds other kv.history than one that applied live" },
     .{ "two replicas hold different kv.ns_counts after the same history", "a replica rebuilt by replay holds other kv.ns_counts than one that applied live" },
+    .{ "two replicas hold different namespaces after the same history", "a replica rebuilt by replay holds other namespaces than one that applied live" },
 };
 
 const Checker = struct {
@@ -467,7 +495,7 @@ const Checker = struct {
     /// a rebuilt replica against a live one.
     state_checks: u64 = 0,
     rebuilt_checks: u64 = 0,
-    /// Of those, the ones that compared KV's families too.
+    /// Of those, the ones that compared the sampled sums too.
     kv_checks: u64 = 0,
 
     fn deinit(self: *Checker) void {
@@ -520,7 +548,7 @@ const Checker = struct {
         }
     }
 
-    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, kv: ?[families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
+    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, kv: ?[SAMPLED]u64, rebuilt: bool, tick: u64) void {
         while (self.states.items.len < idx) self.states.append(self.allocator, null) catch @panic("checker OOM");
         const slot = &self.states.items[idx - 1];
         const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .kv = kv };
@@ -562,9 +590,9 @@ const Checker = struct {
         });
     }
 
-    /// Like `onState` for KV's families alone, at an index sampling passed
-    /// over: the first node there records them, later ones compare.
-    fn onFinalKv(self: *Checker, node: NodeId, idx: u64, history: u64, kv: [families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
+    /// Like `onState` for the sampled sums alone, at an index sampling
+    /// passed over: the first node there records them, later ones compare.
+    fn onFinalKv(self: *Checker, node: NodeId, idx: u64, history: u64, kv: [SAMPLED]u64, rebuilt: bool, tick: u64) void {
         if (idx > self.states.items.len) return;
         const slot = &(self.states.items[idx - 1] orelse return);
         if (slot.history != history) return;
@@ -711,6 +739,10 @@ pub const Summary = struct {
     kv_checks: u64,
     /// What KV's machine did with the run's entries, each counted once.
     kv: families.Kv.Counts,
+    /// What the workload's namespace creates came to: at submit, and at
+    /// apply, each counted once.
+    ns_submits: NsSubmits,
+    ns: families.Namespaces.Counts,
     violation_count: usize,
 };
 
@@ -763,6 +795,16 @@ pub const Simulator = struct {
     wipes: u64 = 0,
     /// KV entries by outcome, counted at the first apply of each index.
     kv_counts: families.Kv.Counts = .{},
+    /// Namespace creates by outcome at apply, counted the same way, and
+    /// what their leaders did with them at submit.
+    ns_counts: families.Namespaces.Counts = .{},
+    ns_submits: NsSubmits = .{},
+    /// Whether the leader that proposed the create at (term, index) said
+    /// it was ready (`leaderReady`).
+    ns_ready: std.AutoHashMapUnmanaged([2]u64, bool) = .empty,
+    /// Apply pauses draw from their own stream, so a scenario without them
+    /// replays as it did before they existed.
+    lag_prng: PRNG,
     config_written: bool = false,
     /// What was acked when convergence began: every member must apply it.
     /// The probes acked after are the leader's to commit; the final
@@ -790,6 +832,7 @@ pub const Simulator = struct {
             .prng = PRNG.init(scenario.seed ^ 0x51D0_2A7E),
             .clock_prng = PRNG.init(scenario.seed ^ 0xC10C_5EED),
             .outsider_prng = PRNG.init(scenario.seed ^ 0x0075_1DE7),
+            .lag_prng = PRNG.init(scenario.seed ^ 0x1A6_1A6),
             .nodes = try allocator.alloc(SimNode, scenario.node_count),
             .net = SimNetwork.init(allocator),
             .workload = try Workload.init(allocator, &scenario),
@@ -820,6 +863,7 @@ pub const Simulator = struct {
                 .disk = .{ .allocator = allocator },
                 .max_term_seen = 0,
                 .kv = families.Kv.init(allocator),
+                .ns = families.Namespaces.init(allocator),
             };
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
@@ -849,6 +893,7 @@ pub const Simulator = struct {
             node.applied_ticks.deinit(self.allocator);
             node.counter.deinit(self.allocator);
             node.kv.deinit();
+            node.ns.deinit();
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
             self.allocator.free(node.replica.rpc_out);
@@ -860,6 +905,7 @@ pub const Simulator = struct {
         self.pending_ops.deinit(self.allocator);
         self.acked_at.deinit(self.allocator);
         self.crash_ticks.deinit(self.allocator);
+        self.ns_ready.deinit(self.allocator);
         self.allocator.free(self.apply_buf);
         for (self.delivery.items) |*m| self.net.release(m);
         self.delivery.deinit(self.allocator);
@@ -1095,6 +1141,8 @@ pub const Simulator = struct {
         node.replay_through = node.applied_ticks.items.len;
         node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
         node.kv.reset();
+        node.ns.reset();
+        node.apply_paused_until = 0;
         node.families_index = 0;
         node.families_stale = false;
         node.history = 0;
@@ -1117,8 +1165,22 @@ pub const Simulator = struct {
         }
     }
 
+    /// An up node now and then stops applying for a while, as a busy
+    /// shard does, while Raft runs on: its commit index passes what it
+    /// has applied, and it can win an election that way.
+    fn injectApplyLag(self: *Simulator) void {
+        if (self.scenario.apply_lag_permille == 0) return;
+        const r = self.lag_prng.random();
+        for (self.nodes) |*node| {
+            if (!node.up or node.apply_paused_until > self.now) continue;
+            if (r.uintLessThan(u16, 1000) >= self.scenario.apply_lag_permille) continue;
+            node.apply_paused_until = self.now + r.intRangeAtMost(u64, 1, self.scenario.apply_lag_max_ms);
+        }
+    }
+
     fn injectFaults(self: *Simulator) !void {
         if (self.phase == .convergence) return;
+        self.injectApplyLag();
         const r = self.prng.random();
         for (self.nodes) |*node| {
             if (node.up) {
@@ -1529,9 +1591,52 @@ pub const Simulator = struct {
         if (n == 0) return;
         const target = self.node_(leaders[r.uintLessThan(usize, n)]);
         const op = try self.workload.nextOp();
+        if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         const res = target.raft.propose(op.entry_type, 0, op.payload) catch return;
         self.workload.recordProposal(op.id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, op.id);
+    }
+
+    /// A workload create, proposed as shard 0's leader proposes one: the
+    /// handler chooses its id, and refuses it while the leader is still
+    /// applying an earlier term's entries.
+    fn submitCreate(self: *Simulator, target: *SimNode, op_id: u64, synthesized: []const u8) !void {
+        var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+        const c = namespace_entries.Create.decodeAll(synthesized, &diag) catch unreachable;
+        var name_buf: [64]u8 = undefined;
+        const name = name_buf[0..c.name.len];
+        @memcpy(name, c.name);
+        // The mutants: Raft says ready whatever the leader has applied, or
+        // once it has committed every earlier term's entry.
+        const ready_index = target.raft.ready_index;
+        defer target.raft.ready_index = ready_index;
+        switch (self.options.family_mutant) {
+            .ns_ungated => target.raft.ready_index = 0,
+            .ns_ready_on_commit => if (target.raft.commit_index >= ready_index) {
+                target.raft.ready_index = 0;
+            },
+            else => {},
+        }
+        const ready = target.raft.leaderReady();
+        const res = switch (target.ns.handler.proposeCreateOn(&target.raft, name)) {
+            .proposed => |res| res,
+            .refused => |r| {
+                if (std.mem.eql(u8, r.message, NamespaceHandler.CATCHING_UP_MESSAGE)) self.ns_submits.catching_up += 1 else self.ns_submits.refused += 1;
+                self.workload.markRefused(op_id);
+                return;
+            },
+            .failed => {
+                self.ns_submits.refused += 1;
+                self.workload.markRefused(op_id);
+                return;
+            },
+        };
+        self.ns_submits.proposed += 1;
+        const e = target.raft.log.getEntryCopy(res.index, self.apply_buf).?;
+        self.workload.recordPayload(op_id, e.payload);
+        self.workload.recordProposal(op_id, target.id, res.term, res.index);
+        try self.ns_ready.put(self.allocator, .{ res.term, res.index }, ready);
+        try self.pending_ops.append(self.allocator, op_id);
     }
 
     fn isIsolated(self: *const Simulator, id: NodeId) bool {
@@ -1582,6 +1687,8 @@ pub const Simulator = struct {
             node.disk.flush();
             node.raft.markDurable(node.raft.log.lastIndex());
         }
+        // Paused only while faults run: convergence applies everything.
+        if (self.phase == .safety and node.apply_paused_until > self.now) return;
         node.disk.applying = true;
         defer node.disk.applying = false;
         if (node.halted_at != 0 and !self.resumeIfSkipped(node)) return;
@@ -1695,7 +1802,23 @@ pub const Simulator = struct {
                 .detail = "the KV machine failed a workload entry it should apply",
             },
         });
-        const kv_sums = if (idx % KV_SAMPLE == 0) node.kv.checksums() else null;
+        if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e)) |effect| {
+            if (first) self.ns_counts.count(effect);
+            if (effect == .stale_id and (self.ns_ready.get(.{ e.header.term, idx }) orelse false)) self.checker.fail(.{
+                .invariant = .ns_ready_stale_id,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "a namespace create its leader proposed once ready was refused for an id another create took",
+            });
+        } else |_| self.checker.fail(.{
+            .invariant = .applied_integrity,
+            .node = node.id,
+            .index = idx,
+            .tick = self.now,
+            .detail = "the namespace handler failed a workload create it should apply",
+        });
+        const kv_sums = if (idx % KV_SAMPLE == 0) sampledSums(node) else null;
         self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), kv_sums, !live, self.now);
     }
 
@@ -1974,7 +2097,7 @@ pub const Simulator = struct {
         for (self.nodes) |*node| {
             if (!node.up or node.families_stale or node.families_index == 0) continue;
             if (node.families_index % KV_SAMPLE == 0) continue;
-            self.checker.onFinalKv(node.id, node.families_index, node.history, node.kv.checksums(), node.families_index <= node.replay_through, self.now);
+            self.checker.onFinalKv(node.id, node.families_index, node.history, sampledSums(node), node.families_index <= node.replay_through, self.now);
         }
     }
 
@@ -2027,6 +2150,8 @@ pub const Simulator = struct {
             .rebuilt_checks = self.checker.rebuilt_checks,
             .kv_checks = self.checker.kv_checks,
             .kv = self.kv_counts,
+            .ns_submits = self.ns_submits,
+            .ns = self.ns_counts,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2271,15 +2396,17 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     checker.onState(1, idx, 42, 7, null, false, 0);
     checker.onState(2, idx, 42, 7, null, false, 0);
     // The first final records them, the next compares.
-    checker.onFinalKv(1, idx, 42, .{ 1, 2, 3 }, false, 0);
-    checker.onFinalKv(2, idx, 42, .{ 1, 2, 3 }, false, 0);
+    checker.onFinalKv(1, idx, 42, .{ 1, 2, 3, 4 }, false, 0);
+    checker.onFinalKv(2, idx, 42, .{ 1, 2, 3, 4 }, false, 0);
     try testing.expectEqual(@as(usize, 0), checker.violations.items.len);
-    checker.onFinalKv(3, idx, 42, .{ 1, 9, 3 }, true, 0);
+    checker.onFinalKv(3, idx, 42, .{ 1, 9, 3, 4 }, true, 0);
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
     try testing.expectEqualStrings("a replica rebuilt by replay holds other kv.history than one that applied live", checker.violations.items[0].detail);
     // Another history at that index is not compared.
-    checker.onFinalKv(4, idx, 43, .{ 0, 0, 0 }, false, 0);
+    checker.onFinalKv(4, idx, 43, .{ 0, 0, 0, 0 }, false, 0);
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
+    checker.onFinalKv(5, idx, 42, .{ 1, 2, 3, 5 }, false, 0);
+    try testing.expectEqualStrings("two replicas hold different namespaces after the same history", checker.violations.items[1].detail);
 }
 
 test "vopr sim: a contract that commits a refused entry's staged writes fails refusal_wrote, though every replica agrees" {
@@ -2745,4 +2872,43 @@ test "vopr sim: a truncated uncommitted config leaves the node with the members 
         std.debug.print("{s}\n", .{w.buffered()});
     }
     try testing.expect(s.ok);
+}
+
+/// Catching-up seeds that run long enough to create namespaces under every
+/// fault the swarm has.
+const CATCHING_UP_SEEDS = [_]u64{ 1, 2, 3, 4 };
+
+test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no ready leader's create loses its id" {
+    for (CATCHING_UP_SEEDS) |seed| {
+        var sim = try Simulator.init(testing.allocator, Scenario.catchingUp(seed), .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        errdefer std.debug.print("seed {d}: {any} {any}\n", .{ seed, s.ns_submits, s.ns });
+        try testing.expect(s.ok);
+        try testing.expect(s.ns.created >= 20);
+        try testing.expect(s.ns_submits.catching_up >= 5);
+        try testing.expectEqual(@as(u64, 0), s.ns.stale_ids);
+    }
+}
+
+fn staleIdUnder(mutant: families.Mutant) !void {
+    for (CATCHING_UP_SEEDS) |seed| {
+        var sim = try Simulator.init(testing.allocator, Scenario.catchingUp(seed), .{ .family_mutant = mutant });
+        defer sim.deinit();
+        _ = try sim.run();
+        var caught = false;
+        for (sim.checker.violations.items) |v| caught = caught or v.invariant == .ns_ready_stale_id;
+        errdefer std.debug.print("seed {d}: not caught\n", .{seed});
+        try testing.expect(caught);
+    }
+}
+
+test "vopr sim: a leader that creates namespaces before it is ready fails ns_ready_stale_id" {
+    try staleIdUnder(.ns_ungated);
+}
+
+test "vopr sim: a leader ready once it has committed, not applied, earlier terms fails ns_ready_stale_id" {
+    // Only an apply pause leaves a committed tail unapplied at election:
+    // without one these seeds never catch it.
+    try staleIdUnder(.ns_ready_on_commit);
 }

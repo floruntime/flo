@@ -344,6 +344,11 @@ jobs:
         # the same entry, and the group still elects and changes members.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-halts
         timeout-minutes: 20
+      - name: Swarm with namespace creates and lagging applies
+        # Nodes fall behind on applying and win elections that way; no
+        # namespace create a ready leader proposes may lose its id.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --catching-up --seed-timeout=120 --out-dir=/tmp/vopr-catching-up
+        timeout-minutes: 20
       - name: Regression seeds stay green
         # Each seed reaches a bug whose fix landed; it fails if the fix is
         # undone. A seed that fails here is a regression, not a flake.

@@ -45,6 +45,7 @@ const Result = persistence_mod.Result;
 const router = @import("../node/router.zig");
 const ns_table = @import("table.zig");
 const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
+const RaftNode = @import("../raft/node.zig").RaftNode;
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -469,13 +470,19 @@ pub const NamespaceHandler = struct {
     /// This node stopped leading: its implicit creates may have been
     /// dropped with the log's tail.
     pub fn forgetImplicitCreates(self: *NamespaceHandler, shard: *Shard) void {
-        self.next_alloc = 0;
         // What waited for a create this node proposed may never see it.
         while (self.waiters.items.len > 0) {
             const name = self.allocator.dupe(u8, self.waiters.items[0].name) catch break;
             defer self.allocator.free(name);
             self.answerWaiters(shard, name, .stopped_leading);
         }
+        self.stoppedLeading();
+    }
+
+    /// This node stopped leading: the ids and creates it had in flight
+    /// are no longer its own.
+    pub fn stoppedLeading(self: *NamespaceHandler) void {
+        self.next_alloc = 0;
         var it = self.pending_creates.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.pending_creates.clearRetainingCapacity();
@@ -646,10 +653,11 @@ pub const NamespaceHandler = struct {
             // "exists" is never said of a create that then fails.
             if (kind == .create) as = .joined;
         } else {
-            if (self.createRefusal(name)) |r| return .{ .refused = .{ .status = r.status, .refusal = proto.notRun(r.message) } };
-            if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = proto.notRun(CATCHING_UP_MESSAGE) } };
-            _ = proposeCreate(shard, name) catch |err| return proposeError(err);
-            self.notePending(name);
+            switch (self.proposeCreateOn(shard.raft_node, name)) {
+                .proposed => {},
+                .refused => |r| return .{ .refused = .{ .status = r.status, .refusal = proto.notRun(r.message) } },
+                .failed => |err| return err,
+            }
         }
         try self.addWaiter(name, as, conn.replyTo(), req.header.request_id);
         return .wait;
@@ -687,13 +695,11 @@ pub const NamespaceHandler = struct {
         std.debug.assert(!shard.applying);
         const name = if (name_or_empty.len == 0) "default" else name_or_empty;
         if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return .go;
-        if (self.owner) {
-            if (self.createRefusal(name)) |r| return .{ .refused = r };
-            if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .message = CATCHING_UP_MESSAGE } };
-            _ = proposeCreate(shard, name) catch |err| return .{ .refused = refusalOf(proposeError(err)) };
-            self.notePending(name);
-            return .go;
-        }
+        if (self.owner) return switch (self.proposeCreateOn(shard.raft_node, name)) {
+            .proposed => .go,
+            .refused => |r| .{ .refused = r },
+            .failed => |err| .{ .refused = refusalOf(err) },
+        };
         const id = self.table.lookup(name) orelse return .ensure;
         _ = proposeBind(shard, name, id) catch |err| return .{ .refused = refusalOf(proposeError(err)) };
         return .go;
@@ -714,7 +720,7 @@ pub const NamespaceHandler = struct {
             // A create that lost its id to a leader change is proposed
             // again, by the leader, with a fresh one.
             if (r.status == .unavailable and shard.raft_node.leaderReady() and self.hasWaiter(r.name)) {
-                if (proposeCreate(shard, r.name)) |_| {
+                if (self.proposeCreate(shard.raft_node, r.name)) |_| {
                     self.notePending(r.name);
                     continue;
                 } else |_| {}
@@ -851,18 +857,37 @@ pub const NamespaceHandler = struct {
 
     // ── UAL Persistence ─────────────────────────────────────────────────
 
+    /// What `proposeCreateOn` came to.
+    pub const CreateProposal = union(enum) {
+        proposed: persistence_mod.ProposeResult,
+        refused: Refusal,
+        failed: Error,
+    };
+
+    /// Shard 0's leader proposes a create of `name`, a name this node
+    /// doesn't know, unless the name, the room or its id refuses it, or
+    /// the leader hasn't applied every earlier term's entry: the id comes
+    /// from what it has applied, so until then it may be one an earlier
+    /// leader's create already took.
+    pub fn proposeCreateOn(self: *NamespaceHandler, raft: *RaftNode, name: []const u8) CreateProposal {
+        if (self.createRefusal(name)) |r| return .{ .refused = r };
+        if (!raft.leaderReady()) return .{ .refused = .{ .status = .unavailable, .message = CATCHING_UP_MESSAGE } };
+        const proposed = self.proposeCreate(raft, name) catch |err| return .{ .failed = proposeError(err) };
+        self.notePending(name);
+        return .{ .proposed = proposed };
+    }
+
     /// Shard 0's leader proposes `name`'s create with the next id: past
     /// every id applied and every create it has in flight. Replicas never
     /// choose an id; they check the one given (`applyCreateAt`).
-    fn proposeCreate(shard: *Shard, name: []const u8) !persistence_mod.ProposeResult {
-        const self = shard.namespace_handler;
+    fn proposeCreate(self: *NamespaceHandler, raft: *RaftNode, name: []const u8) !persistence_mod.ProposeResult {
         std.debug.assert(self.owner);
         const id = @max(self.next_id, self.next_alloc);
         if (id >= ns_table.CAPACITY) return error.NamespacesFull;
         const P = namespace_entries.Create;
         var buf: [P.max_size]u8 = undefined;
         const bytes = P.encodeInto(&buf, .{ .name = name, .id = id }) catch return error.PayloadTooLarge;
-        const proposed = try shard.raft_node.propose(.namespace_create, entry_mod.Flags.NONE, bytes);
+        const proposed = try raft.propose(.namespace_create, entry_mod.Flags.NONE, bytes);
         self.next_alloc = id + 1;
         return proposed;
     }
