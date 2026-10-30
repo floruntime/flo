@@ -259,6 +259,10 @@ test "contract: a machine list with a shared entry type, family id or family nam
     try testing.expect(comptime machine_mod.listRule(&.{ counter_machine, same_id }) != null);
     const same_name = machine_mod.Machine{ .name = "z", .entry_types = &.{}, .families = &.{.{ .id = 3, .name = "test.counters" }}, .keys = counterKeys, .apply = counterApply };
     try testing.expect(comptime machine_mod.listRule(&.{ counter_machine, same_name }) != null);
+    const twice = machine_mod.Machine{ .name = "w", .entry_types = &.{ .kv_batch, .kv_batch }, .families = &.{}, .keys = counterKeys, .apply = counterApply };
+    try testing.expectEqualStrings("w lists entry type kv_batch twice", comptime machine_mod.listRule(&.{ counter_machine, twice }).?);
+    const past = machine_mod.Machine{ .name = "v", .entry_types = &.{}, .families = &.{.{ .id = store_mod.MAX_FAMILIES, .name = "test.past" }}, .keys = counterKeys, .apply = counterApply };
+    try testing.expect(std.mem.startsWith(u8, comptime machine_mod.listRule(&.{ counter_machine, past }).?, "family test.past has id "));
     try testing.expectEqualStrings("other", machine_mod.ownerOf(&.{ counter_machine, other }, .kv_delete).?.name);
     try testing.expectEqual(null, machine_mod.ownerOf(&.{ counter_machine, other }, .kv_batch));
 }
