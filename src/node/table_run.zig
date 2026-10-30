@@ -214,6 +214,14 @@ pub fn writes(req: proto.Request) bool {
 /// name. A field missing here fails the build's tests, and so does a name
 /// no test has any more.
 pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []const []const u8 }{
+    .{ .op = "system.walk_page", .field = "op", .tests = &.{"Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order"} },
+    .{ .op = "system.walk_page", .field = "cursor", .tests = &.{"Shard: a list whose scan pages itself resumes each shard after the last name it sent"} },
+    .{ .op = "system.walk_page", .field = "skip", .tests = &.{"Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order"} },
+    .{ .op = "system.walk_page", .field = "limit", .tests = &.{"Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order"} },
+    .{ .op = "system.walk_page", .field = "room", .tests = &.{
+        "Shard: a shard's page of a list stops before its entries pass the room it was given",
+        "Shard: a list page holds what one answer does, its shards sharing the room, and the next page starts where it stopped",
+    } },
     .{ .op = "kv.get", .field = "wait_ms", .tests = &.{"kv table: wait_ms with wait_for exists answers at once when the key exists, else when it is written"} },
     .{ .op = "kv.get", .field = "wait_for", .tests = &.{"kv table: wait_for change waits for the version after the one there"} },
     .{ .op = "kv.get", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },

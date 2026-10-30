@@ -244,6 +244,80 @@ pub fn ShardWalker(comptime ResultT: type) type {
                 .next_cursor = null,
             };
         }
+
+        // ─── Asked walks ─────────────────────────────────────────────────
+        // A walk that never reads another shard's state: each owner pages
+        // its own (`localPage`, on its own thread) and the shard that took
+        // the request merges their pages in shard order (`mergePages`).
+
+        /// Where a page starts: a shard, and in it the scan's own cursor or
+        /// an offset into a scan paged by offset.
+        pub const Start = struct {
+            shard: u16,
+            local_cursor: ?[]const u8 = null,
+            skip: u32 = 0,
+        };
+
+        /// A walker cursor as a page's start; none, or one that won't
+        /// decode, starts at the first shard.
+        pub fn startOf(cursor: ?[]const u8) Start {
+            const c = Cursor.decode(cursor orelse return .{ .shard = 0 }) orelse return .{ .shard = 0 };
+            if (c.shard_id & OFFSET_FLAG == 0) return .{ .shard = c.shard_id, .local_cursor = c.local_cursor };
+            const lc = c.local_cursor orelse &[_]u8{};
+            return .{ .shard = c.shard_id & ~OFFSET_FLAG, .skip = if (lc.len == 4) std.mem.readInt(u32, lc[0..4], .little) else 0 };
+        }
+
+        /// One shard's page: at most the limit asked, and whether the shard
+        /// holds more past it.
+        pub const Page = struct {
+            items: []const ResultT,
+            more: bool,
+        };
+
+        /// The owner's page of its own scan, from `local_cursor` for a scan
+        /// that pages itself, else after the first `skip` items.
+        pub fn localPage(self: *const Self, ctx: *anyopaque, namespace: []const u8, filter: []const u8, local_cursor: ?[]const u8, skip: u32, limit: u32) Page {
+            if (self.pages_itself) {
+                const scan = self.local_scan(ctx, namespace, filter, local_cursor, limit);
+                return .{ .items = scan.items, .more = scan.next_cursor != null };
+            }
+            // One more than fits shows whether more follow.
+            const ask: u32 = @intCast(@min(@as(u64, skip) + limit + 1, std.math.maxInt(u32)));
+            const scan = self.local_scan(ctx, namespace, filter, null, ask);
+            const items = scan.items[@min(skip, scan.items.len)..];
+            return .{ .items = items[0..@min(items.len, limit)], .more = items.len > limit };
+        }
+
+        /// Pages from consecutive shards, the first resumed at `start`,
+        /// merged in shard order up to `limit`, with the cursor after the
+        /// last item taken. A page cut short resumes at its next item: by
+        /// offset, or for a scan that pages itself, after the item taken
+        /// last, which is its own cursor (`ResultT` is the name).
+        pub fn mergePages(self: *const Self, start: Start, pages: []const Page, limit: u32, result_buf: []ResultT, cursor_buf: []u8) WalkResult {
+            var collected: usize = 0;
+            for (pages, 0..) |page, i| {
+                const shard: u16 = start.shard + @as(u16, @intCast(i));
+                const room = @min(limit - collected, result_buf.len - collected);
+                if (room == 0) return .{ .items = result_buf[0..collected], .next_cursor = (Cursor{ .shard_id = shard, .local_cursor = null }).encode(cursor_buf) };
+                const take = @min(page.items.len, room);
+                @memcpy(result_buf[collected .. collected + take], page.items[0..take]);
+                collected += take;
+                if (take == page.items.len and !page.more) continue;
+                // The shard holds more than was taken: resume it.
+                if (comptime ResultT == []const u8) if (self.pages_itself) {
+                    const after: ?[]const u8 = if (take > 0) page.items[take - 1] else if (i == 0) start.local_cursor else null;
+                    return .{ .items = result_buf[0..collected], .next_cursor = (Cursor{ .shard_id = shard, .local_cursor = after }).encode(cursor_buf) };
+                };
+                std.debug.assert(!self.pages_itself);
+                var offset: [4]u8 = undefined;
+                const base: u32 = if (i == 0) start.skip else 0;
+                std.mem.writeInt(u32, &offset, base + @as(u32, @intCast(take)), .little);
+                return .{ .items = result_buf[0..collected], .next_cursor = (Cursor{ .shard_id = shard | OFFSET_FLAG, .local_cursor = &offset }).encode(cursor_buf) };
+            }
+            const next: u16 = start.shard + @as(u16, @intCast(pages.len));
+            if (next < self.shard_count) return .{ .items = result_buf[0..collected], .next_cursor = (Cursor{ .shard_id = next, .local_cursor = null }).encode(cursor_buf) };
+            return .{ .items = result_buf[0..collected], .next_cursor = null };
+        }
     };
 }
 
@@ -628,4 +702,83 @@ test "ShardWalker: a key cursor resumes only its own shard; the next shard start
     for (second.items, &got) |item, *g| g.* = std.mem.readInt(u32, item.key[0..4], .little);
     try std.testing.expectEqualSlices(u32, &.{ 40, 10, 30 }, &got);
     try std.testing.expect(second.next_cursor == null);
+}
+
+/// Names in key order on one shard, scanned by offset or after a key.
+const NameShard = struct { names: []const []const u8 };
+
+fn nameScanByOffset(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
+    const ctx: *const NameShard = @ptrCast(@alignCast(ctx_raw));
+    return .{ .items = ctx.names[0..@min(limit, ctx.names.len)], .next_cursor = null };
+}
+
+fn nameScanByKey(ctx_raw: *anyopaque, _: []const u8, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
+    const ctx: *const NameShard = @ptrCast(@alignCast(ctx_raw));
+    var start: usize = 0;
+    if (local_cursor) |after| {
+        while (start < ctx.names.len and std.mem.order(u8, ctx.names[start], after) != .gt) start += 1;
+    }
+    const end = @min(start + limit, ctx.names.len);
+    return .{ .items = ctx.names[start..end], .next_cursor = if (end < ctx.names.len) ctx.names[end - 1] else null };
+}
+
+test "ShardWalker: asked pages, merged a window of shards at a time, return every name once, in shard order, at any limit" {
+    const Walker = ShardWalker([]const u8);
+    var prng = std.Random.DefaultPrng.init(0x3a1c);
+    const rand = prng.random();
+    const all = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" };
+    for (0..200) |_| {
+        const shard_count = rand.intRangeAtMost(u16, 1, 6);
+        var shards: [6]NameShard = undefined;
+        var contexts: [6]*anyopaque = undefined;
+        var want: [6 * all.len][]const u8 = undefined;
+        var n_want: usize = 0;
+        for (0..shard_count) |s| {
+            // A run of names in key order, possibly none.
+            const lo = rand.uintLessThan(usize, all.len + 1);
+            const hi = rand.intRangeAtMost(usize, lo, all.len);
+            shards[s] = .{ .names = all[lo..hi] };
+            contexts[s] = @ptrCast(&shards[s]);
+            for (all[lo..hi]) |name| {
+                want[n_want] = name;
+                n_want += 1;
+            }
+        }
+        for ([_]bool{ false, true }) |by_key| {
+            const walker = if (by_key) Walker.initPaged(nameScanByKey, shard_count) else Walker.init(nameScanByOffset, shard_count);
+            const limit = rand.intRangeAtMost(u32, 1, 5);
+            const window = rand.intRangeAtMost(u16, 1, 3);
+            var got: [6 * all.len][]const u8 = undefined;
+            var n_got: usize = 0;
+            var cursor_buf: [64]u8 = undefined;
+            var cursor_copy: [64]u8 = undefined;
+            var cursor: ?[]const u8 = null;
+            var pages: usize = 0;
+            while (true) : (pages += 1) {
+                // Every page names something or moves to a later shard.
+                try std.testing.expect(pages <= n_want + shard_count + 1);
+                const start = Walker.startOf(cursor);
+                const last = @min(start.shard + window, shard_count);
+                var asked: [6]Walker.Page = undefined;
+                for (start.shard..last, 0..) |s, j| {
+                    asked[j] = if (j == 0)
+                        walker.localPage(contexts[s], "", "", start.local_cursor, start.skip, limit)
+                    else
+                        walker.localPage(contexts[s], "", "", null, 0, limit);
+                }
+                var result_buf: [16][]const u8 = undefined;
+                const r = walker.mergePages(start, asked[0 .. last - start.shard], limit, &result_buf, &cursor_buf);
+                try std.testing.expect(r.items.len <= limit);
+                for (r.items) |name| {
+                    got[n_got] = name;
+                    n_got += 1;
+                }
+                const next = r.next_cursor orelse break;
+                @memcpy(cursor_copy[0..next.len], next);
+                cursor = cursor_copy[0..next.len];
+            }
+            try std.testing.expectEqual(n_want, n_got);
+            for (want[0..n_want], got[0..n_got]) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+    }
 }

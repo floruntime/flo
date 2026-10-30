@@ -143,6 +143,7 @@ pub const Op = struct {
 
 /// The op-code families: each family's ops take codes inside its range.
 pub const Family = enum {
+    system,
     namespace,
     cluster,
     kv,
@@ -156,6 +157,7 @@ pub const Family = enum {
 
     pub fn range(f: Family) struct { lo: u16, hi: u16 } {
         return switch (f) {
+            .system => .{ .lo = 0x000, .hi = 0x00F },
             .namespace => .{ .lo = 0x010, .hi = 0x02F },
             .cluster => .{ .lo = 0x030, .hi = 0x04F },
             .kv => .{ .lo = 0x100, .hi = 0x12F },

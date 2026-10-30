@@ -44,6 +44,7 @@ const ReplyTo = @import("reply_to.zig").ReplyTo;
 const reply_pool_mod = @import("reply_pool.zig");
 const ReplyPool = reply_pool_mod.ReplyPool;
 const gather_mod = @import("gather.zig");
+const walk_mod = @import("walk.zig");
 const mget_mod = @import("../kv/mget.zig");
 const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
@@ -974,6 +975,7 @@ pub const Shard = struct {
         ActionsHandler.register(&dispatcher);
         WorkerHandler.register(&dispatcher);
         WorkflowHandler.register(&dispatcher);
+        dispatcher.register(.system_walk_page, walk_mod.handlePage);
         ProcessingHandler.register(&dispatcher);
         dispatcher.register(.cluster_status, dispatchClusterStatus);
         dispatcher.register(.cluster_members, dispatchClusterMembers);
@@ -2193,7 +2195,7 @@ pub const Shard = struct {
         const NameWalker = @import("dispatcher.zig").NameWalker;
         const op_idx = req.header.op_code;
 
-        const scan_fn = self.dispatcher.walk_fn[op_idx] orelse {
+        _ = self.dispatcher.walk_fn[op_idx] orelse {
             self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
         };
@@ -2201,8 +2203,8 @@ pub const Shard = struct {
             self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
         };
-        // A walk reads every shard's projections: one offline would leave
-        // its part missing or half-built in an answer that looks whole.
+        // A walk asks every shard: one offline would leave its part missing
+        // in an answer that looks whole.
         if (self.offlineShard()) |down| {
             var buf: [320]u8 = undefined;
             self.sendErrorResponse(conn, req.header.request_id, .unavailable, down.offlineMessage(&buf));
@@ -2211,13 +2213,8 @@ pub const Shard = struct {
         // A table op decodes its own page request and walks from its handler.
         if (table.isOp(op_idx)) return self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
 
-        // Drive ShardWalker — sequential shard scan with cursor pagination
-        const walker = NameWalker.init(scan_fn, @intCast(contexts.len));
-        var result_buf: [NameWalker.MAX_BATCH][]const u8 = undefined;
-        var cursor_buf: [64]u8 = undefined;
-
-        // Parse limit + cursor from value: [limit:u32][cursor...]
-        // All walk ops use the same wire format. limit=0 means server default.
+        // [limit:u32][cursor...], the same for every walk op; a limit of 0
+        // is the server's default.
         var limit: u32 = NameWalker.MAX_BATCH;
         var cursor: ?[]const u8 = null;
         if (req.value.len >= 4) {
@@ -2225,62 +2222,7 @@ pub const Shard = struct {
             if (parsed_limit > 0) limit = @min(parsed_limit, NameWalker.MAX_BATCH);
             if (req.value.len > 4) cursor = req.value[4..];
         }
-        const filter: []const u8 = req.key; // prefix filter (empty = no filter)
-
-        _ = dispatcher_mod.takeScanShort();
-        const result = walker.walk(
-            contexts,
-            req.namespace,
-            filter,
-            cursor,
-            limit,
-            &result_buf,
-            &cursor_buf,
-        );
-        if (dispatcher_mod.takeScanShort()) {
-            self.sendErrorResponse(conn, req.header.request_id, .overloaded, "overloaded: no memory to list this page; retry");
-            return;
-        }
-
-        // Dedup names (defensive — routing hashes should prevent duplicates,
-        // but edge cases during rebalance could produce them).
-        var deduped: [NameWalker.MAX_BATCH][]const u8 = undefined;
-        var dedup_count: usize = 0;
-        for (result.items) |name| {
-            var found = false;
-            for (deduped[0..dedup_count]) |existing| {
-                if (std.mem.eql(u8, existing, name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                deduped[dedup_count] = name;
-                dedup_count += 1;
-            }
-        }
-
-        // Serialize and send — select wire format based on opcode
-        const op_enum: proto.OpCode = @fromBackingInt(@intCast(op_idx));
-        const data = switch (op_enum) {
-            // stream_list uses stream wire format: [count:u32]([name_len:u32][name][partition_count:u32])*[has_more:u8][cursor_len:u16][cursor]
-            .stream_list => serializeWalkStreamNames(self.allocator, deduped[0..dedup_count], result.next_cursor, &self.defaultPartition().stream, req.namespace),
-            // queue_list uses rich binary format with per-queue stats
-            .queue_list => serializeWalkQueueEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
-            // processing_list and workflow_list_definitions use binary wire format with rich fields
-            .processing_list => ProcessingHandler.serializeWalkJobs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
-            .workflow_list_definitions => serializeWalkWorkflowDefs(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
-            // action_list uses scan wire format with action metadata
-            .action_list => serializeWalkActionEntries(self.allocator, deduped[0..dedup_count], result.next_cursor, contexts, req.namespace),
-            // Default: name-list format: [count:u32]([name_len:u16][name])*[has_more:u8][cursor_len:u16][cursor]
-            else => serializeWalkNames(self.allocator, deduped[0..dedup_count], result.next_cursor),
-        } catch {
-            self.sendErrorResponse(conn, req.header.request_id, .internal_error, "walk serialization failed");
-            return;
-        };
-        defer self.allocator.free(data);
-
-        self.sendOkResponse(conn, req.header.request_id, data);
+        walk_mod.start(self, conn, req, @intCast(contexts.len), limit, cursor);
     }
 
     // ─── Inbox draining ──────────────────────────────────────────────────
@@ -5684,312 +5626,6 @@ pub const Shard = struct {
 // Walk Serialization — standard list wire format
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Serialize a list of names into the standard list wire format.
-///
-/// Wire format: [count:u32] ([name_len:u16][name])* [has_more:u8] [cursor_len:u16] [cursor]
-///
-/// This is the generic format used by all list/scan walk operations
-/// (ts_list, stream_list, queue_list, action_list, workflow_list_definitions).
-/// When `next_cursor` is non-null, has_more=1 and the cursor bytes follow cursor_len.
-/// Serialize walk results in queue list wire format with per-queue stats.
-///
-/// Wire format: [count:u32] ([name_len:u32][name][ns_len:u32][ns]
-///   [pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*
-///   [has_more:u8] [cursor_len:u16][cursor]
-///
-/// Stats are looked up from the shard context that owns each queue.
-fn serializeWalkQueueEntries(
-    allocator: std.mem.Allocator,
-    names: []const []const u8,
-    next_cursor: ?[]const u8,
-    contexts: []const *anyopaque,
-    namespace: []const u8,
-) ![]u8 {
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-
-    const Meta = struct { name: []const u8, ns: []const u8, enqueued: u64, dequeued: u64, dlq: u64 };
-    var metas_buf: [512]Meta = undefined;
-    var count: usize = 0;
-
-    for (names) |name| {
-        if (count >= metas_buf.len) break;
-        var found = false;
-        for (contexts) |ctx| {
-            const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
-            var it = handler.queue.known_queues.iterator();
-            while (it.next()) |entry| {
-                const meta = entry.value_ptr;
-                if (std.mem.eql(u8, meta.name, name)) {
-                    metas_buf[count] = .{
-                        .name = meta.name,
-                        .ns = meta.namespace,
-                        .enqueued = meta.enqueued,
-                        .dequeued = meta.dequeued,
-                        .dlq = @intCast(handler.queue.deadLetters(entry.key_ptr.*).len),
-                    };
-                    found = true;
-                    break;
-                }
-            }
-            if (found) break;
-        }
-        if (!found) {
-            metas_buf[count] = .{ .name = name, .ns = namespace, .enqueued = 0, .dequeued = 0, .dlq = 0 };
-        }
-        count += 1;
-    }
-
-    const metas = metas_buf[0..count];
-    var total: usize = 4; // count header
-    for (metas) |m| {
-        total += 4 + m.name.len + 4 + m.ns.len + 5 * 8;
-    }
-    total += 1 + 2 + cursor_bytes.len;
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    std.mem.writeInt(u32, buf[0..4], @intCast(count), .little);
-    var pos: usize = 4;
-    for (metas) |m| {
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(m.name.len), .little);
-        pos += 4;
-        @memcpy(buf[pos..][0..m.name.len], m.name);
-        pos += m.name.len;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(m.ns.len), .little);
-        pos += 4;
-        @memcpy(buf[pos..][0..m.ns.len], m.ns);
-        pos += m.ns.len;
-        const pending = if (m.enqueued > m.dequeued) m.enqueued - m.dequeued else 0;
-        std.mem.writeInt(u64, buf[pos..][0..8], pending, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], pending, .little); // available ≈ pending
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], m.enqueued, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], m.dequeued, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], m.dlq, .little);
-        pos += 8;
-    }
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-    return buf;
-}
-
-/// Serialize walk results for action_list in scan wire format.
-///
-/// Produces: [count:u32]([key_len:u16][key][value_len:u32][value])*[has_more:u8][cursor_len:u16][cursor]?
-/// The CLI parses this format and extracts action names from the key field.
-fn serializeWalkActionEntries(
-    allocator: std.mem.Allocator,
-    names: []const []const u8,
-    next_cursor: ?[]const u8,
-    _: []const *anyopaque,
-    _: []const u8,
-) ![]u8 {
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-
-    // Calculate total buffer size
-    var total_size: usize = 4; // count:u32
-    for (names) |name| {
-        total_size += 2 + name.len + 4; // key_len:u16 + key + value_len:u32
-    }
-    total_size += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
-
-    const buf = try allocator.alloc(u8, total_size);
-    errdefer allocator.free(buf);
-    var pos: usize = 0;
-
-    // count
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(names.len), .little);
-    pos += 4;
-
-    // entries
-    for (names) |name| {
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(name.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..name.len], name);
-        pos += name.len;
-        std.mem.writeInt(u32, buf[pos..][0..4], 0, .little); // value_len = 0
-        pos += 4;
-    }
-
-    // pagination trailer
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-
-    return buf;
-}
-
-/// Serialize walk results as binary wire format for workflow definitions.
-///
-/// Wire format: [count:u32]([name_len:u16][name][version_len:u16][version][created_at:i64])*
-///              [has_more:u8][cursor_len:u16]
-fn serializeWalkWorkflowDefs(
-    allocator: std.mem.Allocator,
-    names: []const []const u8,
-    next_cursor: ?[]const u8,
-    contexts: []const *anyopaque,
-    namespace: []const u8,
-) ![]u8 {
-    // First pass: collect matching definitions and compute size
-    const DefInfo = struct { name: []const u8, version: []const u8, created_at: i64 };
-    var defs: std.ArrayListUnmanaged(DefInfo) = .empty;
-    defer defs.deinit(allocator);
-
-    for (names) |name| {
-        for (contexts) |ctx| {
-            const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-            var dit = handler.definitions.iterator();
-            while (dit.next()) |entry| {
-                const def = entry.value_ptr;
-                if (!std.mem.eql(u8, def.name_owned, name)) continue;
-                if (namespace.len > 0) {
-                    const map_key = entry.key_ptr.*;
-                    if (!std.mem.startsWith(u8, map_key, namespace)) continue;
-                    if (map_key.len <= namespace.len or map_key[namespace.len] != ':') continue;
-                }
-                try defs.append(allocator, .{
-                    .name = def.name_owned,
-                    .version = def.version_owned,
-                    .created_at = def.created_at_ms,
-                });
-                break;
-            }
-        }
-    }
-
-    // Calculate total size
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-    var total: usize = 4; // count: u32
-    for (defs.items) |d| {
-        total += 2 + d.name.len; // name_len:u16 + name
-        total += 2 + d.version.len; // version_len:u16 + version
-        total += 8; // created_at:i64
-    }
-    total += 1 + 2 + cursor_bytes.len; // has_more:u8 + cursor_len:u16 + cursor
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    // Write entries
-    std.mem.writeInt(u32, buf[0..4], @intCast(defs.items.len), .little);
-    var pos: usize = 4;
-    for (defs.items) |d| {
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.name.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..d.name.len], d.name);
-        pos += d.name.len;
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.version.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..d.version.len], d.version);
-        pos += d.version.len;
-        std.mem.writeInt(i64, buf[pos..][0..8], d.created_at, .little);
-        pos += 8;
-    }
-
-    // pagination trailer
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-    return buf;
-}
-
-fn serializeWalkNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8) ![]u8 {
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-
-    var total: usize = 4; // count: u32
-    for (names) |n| {
-        total += 2 + n.len; // name_len: u16 + name bytes
-    }
-    total += 1; // has_more: u8
-    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    std.mem.writeInt(u32, buf[0..4], @intCast(names.len), .little);
-    var pos: usize = 4;
-    for (names) |n| {
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(n.len), .little);
-        pos += 2;
-        @memcpy(buf[pos..][0..n.len], n);
-        pos += n.len;
-    }
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-    return buf;
-}
-
-/// Serialize walk results in stream list wire format.
-///
-/// Wire format: [count:u32] ([name_len:u32][name][partition_count:u32])* [has_more:u8] [cursor_len:u16][cursor]
-///
-/// The stream CLI expects u32 name lengths and a u32 partition_count per entry
-/// (distinct from the generic name-list format used by ts_list).
-/// `names` reach here namespace-STRIPPED, but stream metadata is keyed by the
-/// qualified name, so `ns` is needed to look each one back up.
-fn serializeWalkStreamNames(allocator: std.mem.Allocator, names: []const []const u8, next_cursor: ?[]const u8, stream: *const StreamProjection, ns: []const u8) ![]u8 {
-    const cursor_bytes = next_cursor orelse &[_]u8{};
-    const has_more: u8 = if (next_cursor != null) 1 else 0;
-
-    var total: usize = 4; // count: u32
-    for (names) |n| {
-        total += 4 + n.len + 4; // name_len: u32 + name bytes + partition_count: u32
-    }
-    total += 1; // has_more: u8
-    total += 2 + cursor_bytes.len; // cursor_len: u16 + cursor bytes
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    std.mem.writeInt(u32, buf[0..4], @intCast(names.len), .little);
-    var pos: usize = 4;
-    for (names) |n| {
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(n.len), .little);
-        pos += 4;
-        @memcpy(buf[pos..][0..n.len], n);
-        pos += n.len;
-        // partition_count from stream metadata, keyed by the qualified name
-        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-        const pc = if (handler_mod.qualifyKey(&qbuf, ns, n)) |q| stream.getPartitionCount(q) else |_| 1;
-        std.mem.writeInt(u32, buf[pos..][0..4], pc, .little);
-        pos += 4;
-    }
-    buf[pos] = has_more;
-    pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(cursor_bytes.len), .little);
-    pos += 2;
-    if (cursor_bytes.len > 0) {
-        @memcpy(buf[pos..][0..cursor_bytes.len], cursor_bytes);
-    }
-    return buf;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Waiter Callbacks — used by WaiterPool for timeout and resolution
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7982,6 +7618,192 @@ test "Shard: a gathered kv.mget too large for one answer stops at the first key 
     var it = got.entries.iterator();
     for (0..next) |n| try std.testing.expectEqual(@as(u8, @intCast('a' + n)), (try it.next()).?.value[0]);
     try f.expectSettled(0);
+}
+
+/// Two shards each holding a list of names, under a walk op, and a client
+/// on shard 0 asking for pages.
+const WalkFixture = struct {
+    two: TwoShards,
+    client: TestClient,
+    lists: [2]NameList,
+    contexts: [2]*anyopaque,
+    out: []u8,
+
+    const NameList = struct {
+        names: []const []const u8,
+        refuse: bool = false,
+
+        fn byOffset(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
+            const self: *const NameList = @ptrCast(@alignCast(ctx));
+            if (self.refuse) dispatcher_mod.noteScanShort();
+            return .{ .items = self.names[0..@min(limit, self.names.len)], .next_cursor = null };
+        }
+
+        fn byKey(ctx: *anyopaque, _: []const u8, _: []const u8, after: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
+            const self: *const NameList = @ptrCast(@alignCast(ctx));
+            var from: usize = 0;
+            if (after) |a| {
+                while (from < self.names.len and std.mem.order(u8, self.names[from], a) != .gt) from += 1;
+            }
+            const end = @min(from + limit, self.names.len);
+            return .{ .items = self.names[from..end], .next_cursor = if (end < self.names.len) self.names[end - 1] else null };
+        }
+
+        fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
+    };
+
+    fn init(self: *WalkFixture, a: []const []const u8, b: []const []const u8, paged: bool) !void {
+        try self.two.init();
+        errdefer self.two.deinit();
+        self.lists = .{ .{ .names = a }, .{ .names = b } };
+        self.contexts = .{ @ptrCast(&self.lists[0]), @ptrCast(&self.lists[1]) };
+        for (&self.two.shards) |*s| {
+            if (paged)
+                s.dispatcher.registerPagedWalk(.ts_list, NameList.handle, NameList.byKey)
+            else
+                s.dispatcher.registerWalk(.ts_list, NameList.handle, NameList.byOffset);
+            s.dispatcher.setWalkContexts(.ts_list, &self.contexts);
+        }
+        self.client = try TestClient.open(&self.two.shards[0]);
+        self.out = try std.testing.allocator.alloc(u8, proto.MAX_ANSWER_BYTES);
+    }
+
+    fn deinit(self: *WalkFixture) void {
+        std.testing.allocator.free(self.out);
+        _ = std.c.close(self.client.pair[1]);
+        self.two.deinit();
+    }
+
+    /// One page: its names, appended to `names`, and its cursor, copied
+    /// into `cursor_buf`; null on the last page.
+    fn page(self: *WalkFixture, id: u64, limit: u32, cursor: []const u8, names: *std.ArrayListUnmanaged([]u8), cursor_buf: []u8) !?[]const u8 {
+        var body: [4 + 2 + kv_ops.MAX_CURSOR]u8 = undefined;
+        std.mem.writeInt(u32, body[0..4], limit, .little);
+        @memcpy(body[4..][0..cursor.len], cursor);
+        const a = &self.two.shards[0];
+        a.runRequest(self.client.conn, .{ .header = proto.RequestHeader.init(.ts_list, id), .namespace = "default", .key = "", .value = body[0 .. 4 + cursor.len] }, .client);
+        self.two.settle();
+        const head = @sizeOf(proto.ResponseHeader);
+        var got = try readAnswer(self.client.pair[1], a, self.client.conn.fd, self.out, head);
+        const header = @as(*align(1) const proto.ResponseHeader, @ptrCast(self.out.ptr)).*;
+        const total = head + header.data_len;
+        // A page is one answer, whatever its shards held.
+        try std.testing.expect(total <= proto.MAX_ANSWER_BYTES);
+        if (got < total) got += try readAnswer(self.client.pair[1], a, self.client.conn.fd, self.out[got..], total - got);
+        const resp = try proto.Response.parse(self.out[0..got]);
+        if (resp.header.status != @backingInt(proto.StatusCode.ok)) return error.Refused;
+        var r = @import("../util/wire.zig").WireReader.init(resp.data);
+        const count = r.readU32().?;
+        for (0..count) |_| try names.append(std.testing.allocator, try std.testing.allocator.dupe(u8, r.readLengthPrefixed(u16).?));
+        const more = r.readU8().? != 0;
+        const next = r.readLengthPrefixed(u16).?;
+        try std.testing.expectEqual(more, next.len > 0);
+        if (!more) return null;
+        @memcpy(cursor_buf[0..next.len], next);
+        return cursor_buf[0..next.len];
+    }
+
+    /// Every page at `limit`, in order: the names, and how many pages.
+    fn pageThrough(self: *WalkFixture, limit: u32, names: *std.ArrayListUnmanaged([]u8)) !usize {
+        var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+        var cursor: []const u8 = "";
+        var pages: usize = 0;
+        while (pages < 1000) {
+            pages += 1;
+            cursor = (try self.page(pages, limit, cursor, names, &cursor_buf)) orelse return pages;
+        }
+        return error.EndlessWalk;
+    }
+
+    fn freeNames(names: *std.ArrayListUnmanaged([]u8)) void {
+        for (names.items) |n| std.testing.allocator.free(n);
+        names.deinit(std.testing.allocator);
+    }
+};
+
+test "Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{ "a1", "a2", "a3", "a4", "a5" }, &.{ "b1", "b2", "b3" }, false);
+    defer f.deinit();
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer WalkFixture.freeNames(&names);
+    const pages = try f.pageThrough(2, &names);
+    try std.testing.expect(pages >= 4);
+    const want = [_][]const u8{ "a1", "a2", "a3", "a4", "a5", "b1", "b2", "b3" };
+    try std.testing.expectEqual(want.len, names.items.len);
+    for (want, names.items) |w, g| try std.testing.expectEqualStrings(w, g);
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].gathers.inUse());
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].reply_pool.taken());
+}
+
+test "Shard: a list whose scan pages itself resumes each shard after the last name it sent" {
+    var f: WalkFixture = undefined;
+    // Shard 1's names sort below where shard 0 stops.
+    try f.init(&.{ "m", "n", "o" }, &.{ "a", "b" }, true);
+    defer f.deinit();
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer WalkFixture.freeNames(&names);
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    const next = (try f.page(1, 2, "", &names, &cursor_buf)).?;
+    // The shard, then the last name sent.
+    try std.testing.expectEqualStrings("n", next[2..]);
+    _ = try f.pageThrough(2, &names);
+    const want = [_][]const u8{ "m", "n", "m", "n", "o", "a", "b" };
+    try std.testing.expectEqual(want.len, names.items.len);
+    for (want, names.items) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "Shard: a list page holds what one answer does, its shards sharing the room, and the next page starts where it stopped" {
+    const a = std.testing.allocator;
+    var store: [2][40][]u8 = undefined;
+    for (&store, 0..) |*list, s| for (list, 0..) |*name, i| {
+        name.* = try a.alloc(u8, 4000);
+        @memset(name.*, 'x');
+        _ = try std.fmt.bufPrint(name.*[0..4], "{c}{d:0>3}", .{ @as(u8, 'a' + @as(u8, @intCast(s))), i });
+    };
+    defer for (&store) |*list| for (list) |name| a.free(name);
+    var views: [2][40][]const u8 = undefined;
+    for (&views, store) |*v, list| for (v, list) |*x, name| {
+        x.* = name;
+    };
+    var f: WalkFixture = undefined;
+    try f.init(&views[0], &views[1], false);
+    defer f.deinit();
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer WalkFixture.freeNames(&names);
+    // 80 names of 4000 bytes: more than one answer holds, fewer than the limit.
+    const pages = try f.pageThrough(1024, &names);
+    try std.testing.expect(pages >= 2);
+    try std.testing.expectEqual(@as(usize, 80), names.items.len);
+    for (names.items, 0..) |n, i| {
+        try std.testing.expectEqual(@as(u8, if (i < 40) 'a' else 'b'), n[0]);
+        try std.testing.expectEqual(i % 40, try std.fmt.parseInt(usize, n[1..4], 10));
+    }
+}
+
+test "Shard: a shard's page of a list stops before its entries pass the room it was given" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{ "a1", "a2", "a3", "a4" }, &.{}, false);
+    defer f.deinit();
+    const buf = try std.testing.allocator.alloc(u8, @import("../protocol/system_ops.zig").Entries.max_size);
+    defer std.testing.allocator.free(buf);
+    // Each entry is [len:u16][name]: 4 bytes, so 10 bytes of room hold two.
+    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), "default", "", null, 0, 10, 10, buf);
+    try std.testing.expectEqual(@as(u32, 2), v.entries.count);
+    try std.testing.expect(v.more);
+}
+
+test "Shard: a list whose page one shard can't read is refused once, and nothing is left open" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{"a"}, &.{"b"}, false);
+    defer f.deinit();
+    f.lists[1].refuse = true;
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer WalkFixture.freeNames(&names);
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    try std.testing.expectError(error.Refused, f.page(1, 10, "", &names, &cursor_buf));
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].gathers.inUse());
+    try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].reply_pool.taken());
 }
 
 test "Shard: a gathered kv.mget whose part is refused answers with that refusal, once" {
