@@ -37,7 +37,7 @@ test "integration: KV state takes 10000 puts and 5000 deletes, and counts them" 
     try testing.expectEqualStrings("value-009999-payload", st.get("key-009999").?.value);
     // Scans see live keys only, in key order.
     var names: [8][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 8), st.scanKeyNames("default", "", &names));
+    try testing.expectEqual(@as(usize, 8), st.scanKeyNames("default", "", null, &names));
     try testing.expectEqualStrings("key-005000", names[0]);
     try testing.expectEqualStrings("key-005007", names[7]);
 }
@@ -48,11 +48,11 @@ test "integration: KV state scans by prefix, in key order" {
     for ([_][]const u8{ "user:charlie", "item:sword", "user:alice", "session:xyz", "user:bob", "item:shield", "config:max_conn" }) |k| try kv.put(k, "v", 0);
     const st = kv.state();
     var names: [10][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 3), st.scanKeyNames("default", "user:", &names));
+    try testing.expectEqual(@as(usize, 3), st.scanKeyNames("default", "user:", null, &names));
     for (names[0..3], [_][]const u8{ "user:alice", "user:bob", "user:charlie" }) |got, want| try testing.expectEqualStrings(want, got);
-    try testing.expectEqual(@as(usize, 2), st.scanKeyNames("default", "item:", &names));
-    try testing.expectEqual(@as(usize, 0), st.scanKeyNames("default", "nonexistent:", &names));
-    try testing.expectEqual(@as(usize, 7), st.scanKeyNames("default", "", &names));
+    try testing.expectEqual(@as(usize, 2), st.scanKeyNames("default", "item:", null, &names));
+    try testing.expectEqual(@as(usize, 0), st.scanKeyNames("default", "nonexistent:", null, &names));
+    try testing.expectEqual(@as(usize, 7), st.scanKeyNames("default", "", null, &names));
 }
 
 test "integration: KV incr makes a counter and adds to it, and refuses a value that isn't one or would overflow" {

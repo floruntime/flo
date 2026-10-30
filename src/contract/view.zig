@@ -283,6 +283,10 @@ pub const ReadView = struct {
     pub fn range(self: ReadView, comptime F: type, prefix: []const u8) ReadRange(F) {
         return .{ .inner = self.store.range(F.ID, prefix) };
     }
+
+    pub fn rangeAfter(self: ReadView, comptime F: type, prefix: []const u8, after: []const u8) ReadRange(F) {
+        return .{ .inner = self.store.rangeAfter(F.ID, prefix, after) };
+    }
 };
 
 pub fn ReadRange(comptime F: type) type {

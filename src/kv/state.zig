@@ -119,14 +119,16 @@ pub const KvState = struct {
     };
 
     /// The names of `ns`'s live, unexpired keys that start with `prefix`,
-    /// in key order, into `out`: borrowed, without the namespace. Returns
-    /// how many.
-    pub fn scanKeyNames(self: *const KvState, ns: []const u8, prefix: []const u8, out: [][]const u8) usize {
+    /// in key order, after `after` when given, into `out`: borrowed, without
+    /// the namespace. Returns how many.
+    pub fn scanKeyNames(self: *const KvState, ns: []const u8, prefix: []const u8, after: ?[]const u8, out: [][]const u8) usize {
         var pb: [machine.MAX_KEY]u8 = undefined;
         const p = view_mod.key(&pb, ns, prefix) catch return 0;
+        var ab: [machine.MAX_KEY]u8 = undefined;
+        const a = if (after) |k| view_mod.key(&ab, ns, k) catch return 0 else null;
         const head = 1 + ns.len;
         const now = self.readNow();
-        var r = self.read().range(machine.Values, p);
+        var r = if (a) |from| self.read().rangeAfter(machine.Values, p, from) else self.read().range(machine.Values, p);
         var n: usize = 0;
         while (n < out.len) {
             const item = (r.next() catch unreachable) orelse break;

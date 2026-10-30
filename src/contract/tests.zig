@@ -263,7 +263,7 @@ test "contract: a machine list with a shared entry type, family id or family nam
     try testing.expectEqual(null, machine_mod.ownerOf(&.{ counter_machine, other }, .kv_batch));
 }
 
-test "contract: a range by any prefix returns exactly the keys with it, in order, however the keys were inserted" {
+test "contract: a range by any prefix, from any key after, returns exactly the keys with it past that key, in order, however the keys were inserted" {
     var prng = std.Random.DefaultPrng.init(0xF10);
     const rand = prng.random();
     const alphabet = "abc";
@@ -306,6 +306,23 @@ test "contract: a range by any prefix returns exactly the keys with it, in order
                 try testing.expectEqualStrings(k, r.next().?.key());
             }
             try testing.expectEqual(null, r.next());
+            // From after every key of up to three letters, held or not.
+            for (0..40) |a| {
+                var ab: [3]u8 = undefined;
+                var n = a;
+                var len: usize = 0;
+                while (n > 0 and len < 3) : (len += 1) {
+                    ab[len] = alphabet[(n - 1) % alphabet.len];
+                    n = (n - 1) / alphabet.len;
+                }
+                const after = ab[0..len];
+                var ra = store.rangeAfter(Counters.ID, prefix, after);
+                for (all.items) |k| {
+                    if (!std.mem.startsWith(u8, k, prefix) or std.mem.order(u8, k, after) != .gt) continue;
+                    try testing.expectEqualStrings(k, ra.next().?.key());
+                }
+                try testing.expectEqual(null, ra.next());
+            }
         }
     }
 }

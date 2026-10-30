@@ -210,10 +210,10 @@ test "kv machine: a TTL runs out a TTL after the stamp of the entry that set it,
     var names: [4][]const u8 = undefined;
     clock.ns = STAMP + 5 * std.time.ns_per_s - 1;
     try testing.expect(st.get("k") != null);
-    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", &names));
+    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", null, &names));
     clock.ns += 1;
     try testing.expect(st.get("k") == null);
-    try testing.expectEqual(@as(usize, 0), st.scanKeyNames("default", "", &names));
+    try testing.expectEqual(@as(usize, 0), st.scanKeyNames("default", "", null, &names));
 
     // An expire counts from its own entry's stamp; a TTL of 0 clears it.
     _ = try kv.apply(&putEntry(&buf, "t", "v", 2, STAMP, 1_000));
@@ -399,9 +399,9 @@ test "kv machine: keys of one namespace never reach another's, and the default n
     try testing.expectEqualStrings("a-value", st.get("a\x00k").?.value);
     try testing.expectEqualStrings("default-value", st.get("k").?.value);
     var names: [4][]const u8 = undefined;
-    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("a", "", &names));
+    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("a", "", null, &names));
     try testing.expectEqualStrings("k", names[0]);
-    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", &names));
+    try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", null, &names));
 }
 
 test "kv machine: a key with no namespace halts its entry, a put's, a patch's or a transaction's, before anything changes" {
