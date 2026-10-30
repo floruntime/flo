@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const ReplyPool = @import("reply_pool.zig").ReplyPool;
 const Shard = @import("shard.zig").Shard;
 const Connection = @import("connection.zig").Connection;
+const ReplyTo = @import("reply_to.zig").ReplyTo;
 
 /// Gathers one shard may have under way: the room it keeps for fan-out.
 pub const GATHER_SLOTS: u16 = 256;
@@ -82,6 +83,9 @@ pub fn GatherTable(comptime Context: type) type {
             /// The client connection the answer is for, on this shard.
             fd: i32 = -1,
             conn_id: u32 = 0,
+            /// Where the answer goes instead, for a request another shard
+            /// forwarded here: its client is that shard's, not this one's.
+            reply_to: ?ReplyTo = null,
             request_id: u64 = 0,
             /// Each part's answer body, owned; null until it arrives.
             answers: []?[]u8 = &.{},

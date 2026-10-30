@@ -2012,7 +2012,10 @@ pub const Shard = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         owned_locals = false;
-        conn.forwards_in_flight += 1;
+        // A forwarded request is answered where it came from, and counts
+        // against that shard's client, not the proxy running it.
+        self.gathers.get(ticket).?.reply_to = conn.proxy_for;
+        if (conn.proxy_for == null) conn.forwards_in_flight += 1;
         // This shard's own part was read while it is halted.
         if (self.halted != null) for (parts) |p| {
             if (p.owner == self.id) self.gathers.get(ticket).?.stale = true;
@@ -2078,7 +2081,9 @@ pub const Shard = struct {
         const resp = proto.Response.parse(bytes) catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: another shard's answer did not read — retry" });
         if (resp.header.status != @backingInt(proto.StatusCode.ok)) {
-            if (self.gatherClient(e)) |conn| {
+            if (e.reply_to) |rt| {
+                self.deliverDeferred(rt, bytes);
+            } else if (self.gatherClient(e)) |conn| {
                 _ = conn.queueWrite(bytes);
                 self.flushToClient(conn.fd);
             }
@@ -2094,6 +2099,7 @@ pub const Shard = struct {
 
     /// Every part answered ok: the op writes the client's answer.
     fn completeGather(self: *Shard, e: *Gathers.Entry) void {
+        if (e.reply_to) |rt| return self.completeForwardedGather(e, rt);
         const conn = self.gatherClient(e) orelse return self.endGather(e);
         var bodies: [gather_mod.MAX_PARTS][]const u8 = undefined;
         for (e.answers, 0..) |a, i| bodies[i] = a.?;
@@ -2103,6 +2109,29 @@ pub const Shard = struct {
         e.context.op.merge(self, conn, e.request_id, e.context.state, bodies[0..e.answers.len]) catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
         self.flushToClient(conn.fd);
+        self.endGather(e);
+    }
+
+    /// A forwarded request's gather: the op answers on a proxy, as the
+    /// request first ran, and the answer goes back where it came from.
+    fn completeForwardedGather(self: *Shard, e: *Gathers.Entry, reply_to: ReplyTo) void {
+        var bodies: [gather_mod.MAX_PARTS][]const u8 = undefined;
+        for (e.answers, 0..) |a, i| bodies[i] = a.?;
+        const was_stale = proto.answering_stale;
+        proto.answering_stale = was_stale or e.stale;
+        defer proto.answering_stale = was_stale;
+        const proxy = self.forward_proxy;
+        loadProxy(proxy, reply_to);
+        proxy.protocol = .binary;
+        e.context.op.merge(self, proxy, e.request_id, e.context.state, bodies[0..e.answers.len]) catch
+            return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
+        var err_buf: [256]u8 = undefined;
+        if (self.takeProxyAnswer(proxy, e.request_id, &err_buf)) |answer| {
+            defer answer.free(self.allocator);
+            self.deliverDeferred(reply_to, answer.bytes());
+        } else if (!proxy.response_deferred) {
+            self.deliverDeferredRefusal(reply_to, e.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
+        }
         self.endGather(e);
     }
 
@@ -2117,7 +2146,9 @@ pub const Shard = struct {
     }
 
     fn failGather(self: *Shard, e: *Gathers.Entry, status: proto.StatusCode, r: proto.Refusal) void {
-        if (self.gatherClient(e)) |conn| {
+        if (e.reply_to) |rt| {
+            self.deliverDeferredRefusal(rt, e.request_id, status, r);
+        } else if (self.gatherClient(e)) |conn| {
             self.sendRefusal(conn, e.request_id, status, r);
             self.flushToClient(conn.fd);
         }
@@ -2126,6 +2157,7 @@ pub const Shard = struct {
 
     /// The client a gather answers, if still connected.
     fn gatherClient(self: *Shard, e: *const Gathers.Entry) ?*Connection {
+        if (e.reply_to != null) return null;
         const conn = self.getConnection(e.fd) orelse return null;
         return if (conn.id == e.conn_id) conn else null;
     }
@@ -7646,7 +7678,8 @@ const TwoShards = struct {
     fn settle(self: *TwoShards) void {
         while (true) {
             var n: usize = 0;
-            for (&self.shards) |*s| n += s.drainInbox();
+            // Replies count too: a gather completes on one.
+            for (&self.shards) |*s| n += s.mailbox.replies.pending() + s.drainInbox();
             for (&self.shards) |*s| {
                 const before = s.raft_node.last_applied;
                 _ = s.applyCommitted();
@@ -8194,6 +8227,40 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     // Answered once: nothing more on the socket, no slot or gather left.
     try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, b, &out));
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
+    try std.testing.expectEqual(@as(usize, 0), b.reply_pool.taken());
+}
+
+test "Shard: a write another shard forwards here, to a namespace nobody created, is answered once to that shard's client" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // The client is shard 0's; the writes are shard 1's.
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    var kbuf: [16]u8 = undefined;
+    // One answered as it runs, one once it commits.
+    const w = try keyOn(b, "wfresh", 1, &kbuf);
+    a.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.worker_register, 11), .namespace = "wfresh", .key = w, .value = "" }, .client);
+    two.settle();
+    var resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 11), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var k2buf: [16]u8 = undefined;
+    const k = try keyOn(b, "kfresh", 1, &k2buf);
+    const from = b.raft_node.log.lastIndex() + 1;
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 12, "kfresh", k, "v", ""), .client);
+    two.settle();
+    resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 12), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .kv_put, from));
+    // Once each, and nothing held on either shard.
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, a, &out));
+    try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
     try std.testing.expectEqual(@as(usize, 0), b.reply_pool.taken());
 }
 
