@@ -167,7 +167,8 @@ test "e2e/kv: scan follows its cursor across pages to every key, once each" {
         for (seen.items) |name| testing.allocator.free(name);
         seen.deinit(testing.allocator);
     }
-    var cursor: [128]u8 = undefined;
+    // The cursor in hex: the shard, then the last key sent.
+    var cursor: [2 * @import("src").protocol.kv_ops.MAX_CURSOR]u8 = undefined;
     var cursor_len: usize = 0;
     var pages: usize = 0;
     while (true) : (pages += 1) {

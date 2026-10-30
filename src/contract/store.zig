@@ -107,6 +107,16 @@ pub const Store = struct {
         return .{ .node = self.lowerBound(fam, prefix), .prefix = prefix };
     }
 
+    /// `range(fam, prefix)` from the first key after `after`.
+    pub fn rangeAfter(self: *Store, fam: u16, prefix: []const u8, after: []const u8) Range {
+        if (compareKeys(after, prefix) == .lt) return self.range(fam, prefix);
+        var node = self.lowerBound(fam, after);
+        if (node) |n| if (std.mem.eql(u8, n.key, after)) {
+            node = n.next();
+        };
+        return .{ .node = node, .prefix = prefix };
+    }
+
     /// The first record at or after `key`.
     fn lowerBound(self: *Store, fam: u16, key: []const u8) ?*Tree.Node {
         const entry = self.families[fam].tree.getEntryFor(key);
