@@ -44,6 +44,7 @@ const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const manifest = @import("manifest.zig");
 const data_format = @import("data_format.zig");
+const ns_table = @import("../namespace/table.zig");
 const DashboardServer = @import("dashboard/mod.zig").DashboardServer;
 const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig;
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
@@ -341,6 +342,8 @@ pub const Runtime = struct {
     /// Each shard's published state, for /ready and /status. Outlives both
     /// HTTP servers.
     health: ?*NodeHealth,
+    /// The node's namespace table: shard 0 publishes it, every shard reads it.
+    namespaces: ?*ns_table.Table = null,
 
     /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
     /// Each entry is a per-shard array of projection pointers for one walk opcode.
@@ -472,6 +475,10 @@ pub const Runtime = struct {
             h.deinit(self.allocator);
             self.allocator.destroy(h);
             self.health = null;
+        }
+        if (self.namespaces) |t| {
+            t.destroy();
+            self.namespaces = null;
         }
 
         // Clean up raft network, then the queue it fed (the shards that
@@ -751,10 +758,16 @@ pub const Runtime = struct {
             self.allocator.free(shards);
             self.stopHttp();
         };
+        // Before any shard boots, and afresh on each start: shard 0
+        // publishes into it as it replays.
+        if (self.namespaces) |t| t.destroy();
+        self.namespaces = null;
+        self.namespaces = try ns_table.Table.create(self.allocator);
         var boot: ShardBoot = .{
             .runtime = self,
             .shards = shards,
             .health = node_health,
+            .namespaces = self.namespaces.?,
             .data_dir = data_dir,
             .pipes = pipes,
             .cluster_node_id = cluster_node_id,
@@ -1079,10 +1092,8 @@ pub const Runtime = struct {
         }
         self.peer_stream_handlers_slice = handlers;
 
-        const partition_count = shards[0].router.partition_count;
-        const shard_count = shards[0].router.shard_count;
         for (0..n) |i| {
-            shards[i].processing_handler.setPeerStreamHandlers(handlers, partition_count, shard_count);
+            shards[i].processing_handler.setPeerStreamHandlers(handlers);
         }
     }
 
@@ -1096,7 +1107,7 @@ pub const Runtime = struct {
         self.peer_kv_handlers_slice = handlers;
 
         for (0..n) |i| {
-            shards[i].processing_handler.setPeerKvHandlers(handlers, shards[i].id);
+            shards[i].processing_handler.setPeerKvHandlers(handlers);
         }
     }
 
@@ -1325,6 +1336,7 @@ const ShardBoot = struct {
     runtime: *Runtime,
     shards: []Shard,
     health: *NodeHealth,
+    namespaces: *ns_table.Table,
     data_dir: []const u8,
     pipes: []const [2]i32,
     cluster_node_id: u32,
@@ -1373,7 +1385,7 @@ const ShardBoot = struct {
                 self.cluster_node_id,
                 if (i == 0) self.shard0_role else .single,
                 self.raft_config,
-                .{ .health = slot, .cancel = &self.cancel },
+                .{ .health = slot, .cancel = &self.cancel, .namespaces = self.namespaces },
             )) |shard| {
                 self.shards[i] = shard;
                 self.failed[i] = null;
@@ -1638,10 +1650,13 @@ test "Runtime: each shard says it is done replaying as soon as it is, not when e
     };
     var shards: [2]Shard = undefined;
     var failed: [2]?anyerror = .{ null, null };
+    const namespaces = try ns_table.Table.create(std.testing.allocator);
+    defer namespaces.destroy();
     var boot: ShardBoot = .{
         .runtime = &runtime,
         .shards = &shards,
         .health = &health,
+        .namespaces = namespaces,
         .data_dir = data_dir,
         .pipes = &pipes,
         .cluster_node_id = 1,

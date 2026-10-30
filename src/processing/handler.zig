@@ -263,17 +263,14 @@ pub const ProcessingHandler = struct {
 
     /// Wire cross-shard stream handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler, partition_count: u32, shard_count: u16) void {
+    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler) void {
         self.peer_stream_handlers = handlers;
-        self.peer_partition_count = partition_count;
-        self.peer_shard_count = shard_count;
     }
 
     /// Wire cross-shard KV handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler, own_shard: u16) void {
+    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
         self.peer_kv_handlers = handlers;
-        self.own_shard = own_shard;
     }
 
     /// Wire cross-shard TS handler references (for TS sinks).
@@ -304,6 +301,29 @@ pub const ProcessingHandler = struct {
         const hash = router.hashKeyWithNamespace(namespace, key);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
         return @intCast(partition_id % self.peer_shard_count);
+    }
+
+    /// A stream or queue sink proposes its write on the shard that owns its
+    /// target, from this shard's thread, without that shard's request gate.
+    /// Outside "default" that shard may never have bound the namespace, and
+    /// its log would then hold a write it cannot apply. Such a sink is
+    /// refused until sinks write through the shard that owns their target.
+    fn crossShardSink(self: *const ProcessingHandler, kind: definition.SinkKind, namespace: []const u8, target: []const u8) bool {
+        if (kind != .stream and kind != .queue) return false;
+        if (std.mem.eql(u8, namespace, "default")) return false;
+        if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) return false;
+        return self.peerShardId(namespace, target) != self.own_shard;
+    }
+
+    /// Why a job's sinks can't run here: one that `crossShardSink` refuses.
+    fn sinkShardRefusal(self: *const ProcessingHandler, def: *const definition.JobDefinition, buf: []u8) ?[]const u8 {
+        for (def.sinks.items) |snk| {
+            const namespace = if (snk.namespace.len > 0) snk.namespace else "default";
+            if (!self.crossShardSink(snk.kind, namespace, snk.target)) continue;
+            return std.fmt.bufPrint(buf, "sink '{s}': a {s} sink outside the default namespace must be on the job's shard, and '{s}' is on another; use the default namespace, or one shard (--shards 1)", .{ snk.name, @tagName(snk.kind), snk.target }) catch
+                "a stream or queue sink outside the default namespace must be on the job's shard; use the default namespace, or one shard (--shards 1)";
+        }
+        return null;
     }
 
     /// Resolve the TS handler that owns `measurement` in `namespace` (for TS sinks).
@@ -533,6 +553,10 @@ pub const ProcessingHandler = struct {
             return;
         }
         if (def.shardRefusal(self.peer_shard_count)) |why| {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
+            return;
+        }
+        if (self.sinkShardRefusal(&def, &why_buf)) |why| {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
@@ -1094,6 +1118,7 @@ pub const ProcessingHandler = struct {
         if (def.sinks.items.len == 0) return null;
         // The shard count is this node's: another replica may run it.
         if (def.shardRefusal(self.peer_shard_count)) |why| return .{ .held = why };
+        if (self.sinkShardRefusal(def, why_buf)) |why| return .{ .held = why };
 
         // The job's tags, from its sinks and classify operators: read while
         // operators are built (classify keeps only tag bits), so no pipeline
@@ -1660,8 +1685,8 @@ pub const ProcessingHandler = struct {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
-                    // from this thread; a sink on another shard is listed
-                    // by its bare name until the namespace exists there.
+                    // from this thread; a sink on another shard writes
+                    // only to "default" (`crossShardSink`).
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -1708,8 +1733,8 @@ pub const ProcessingHandler = struct {
                     const sink_handler = self.resolveStreamHandler(shard.stream_handler, snk.target, snk.namespace);
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
-                    // from this thread; a sink on another shard is listed
-                    // by its bare name until the namespace exists there.
+                    // from this thread; a sink on another shard writes
+                    // only to "default" (`crossShardSink`).
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -1839,7 +1864,8 @@ pub const ProcessingHandler = struct {
         };
         const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
         // The applier labels the queue by resolving its namespace; only
-        // this shard's handler may be touched from this thread.
+        // this shard's handler may be touched from this thread, and a sink
+        // on another shard writes only to "default" (`crossShardSink`).
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
@@ -2403,7 +2429,7 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
     defer handler.deinit();
     handler.peer_partition_count = 8;
     handler.peer_shard_count = 2;
-    handler.setPeerKvHandlers(&peers, 0);
+    handler.setPeerKvHandlers(&peers);
 
     // A key whose hash names shard 1, written here (as a routing key does).
     var elsewhere: []const u8 = "";
@@ -2567,6 +2593,53 @@ test "ProcessingHandler: a job reading two streams frees its tag registry once" 
 
     _ = handler.startPipelines("job-two", &def, &test_why_buf);
     try std.testing.expectEqual(@as(u32, 2), handler.pipelines.count());
+}
+
+test "ProcessingHandler: a stream or queue sink outside default on another shard is refused, on its own shard or in default it runs" {
+    const allocator = std.testing.allocator;
+    var handler = ProcessingHandler.init(allocator);
+    defer handler.deinit();
+    handler.peer_shard_count = 4;
+    handler.peer_partition_count = 256;
+    handler.own_shard = 0;
+    // A target on this shard and one on another, in "acme".
+    var here_buf: [16]u8 = undefined;
+    var there_buf: [16]u8 = undefined;
+    var here: ?[]const u8 = null;
+    var there: ?[]const u8 = null;
+    var i: usize = 0;
+    while (here == null or there == null) : (i += 1) {
+        const on_this = handler.peerShardId("acme", try std.fmt.bufPrint(&here_buf, "out{d}", .{i})) == 0;
+        if (on_this and here == null) here = try std.fmt.bufPrint(&here_buf, "out{d}", .{i});
+        if (!on_this and there == null) there = try std.fmt.bufPrint(&there_buf, "out{d}", .{i});
+    }
+    var yaml_buf: [512]u8 = undefined;
+    var why: [256]u8 = undefined;
+    const Case = struct { kind: []const u8, namespace: []const u8, target: []const u8, refused: bool };
+    for ([_]Case{
+        .{ .kind = "stream", .namespace = "acme", .target = there.?, .refused = true },
+        .{ .kind = "queue", .namespace = "acme", .target = there.?, .refused = true },
+        .{ .kind = "stream", .namespace = "acme", .target = here.?, .refused = false },
+        .{ .kind = "stream", .namespace = "default", .target = there.?, .refused = false },
+        .{ .kind = "kv", .namespace = "acme", .target = "", .refused = false },
+    }) |c| {
+        const yaml = try std.fmt.bufPrint(&yaml_buf,
+            \\kind: Processing
+            \\name: j
+            \\namespace: {s}
+            \\sources:
+            \\  - name: a
+            \\    stream: {{ name: in }}
+            \\sinks:
+            \\  - name: out
+            \\    {s}: {{ {s}{s} }}
+        , .{ c.namespace, c.kind, if (c.target.len > 0) "name: " else "key_prefix: p", c.target });
+        var def = try parser.parseJobDefinition(allocator, yaml, null);
+        defer def.deinit(allocator);
+        try std.testing.expectEqual(c.refused, handler.sinkShardRefusal(&def, &why) != null);
+        // The same on replay: the job's pipelines are held, not run.
+        if (c.refused) try std.testing.expect(handler.startPipelines("job-x", &def, &why).? == .held);
+    }
 }
 
 test "ProcessingHandler: a two-source job short of memory at any point leaves nothing behind" {

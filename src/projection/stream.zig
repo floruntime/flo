@@ -196,6 +196,11 @@ pub fn decodeAppendValue(value: []const u8) AppendValue {
 /// also the most a single append adds to one read.
 pub const MAX_BATCH_RECORDS: u32 = proto_limits.MAX_STREAM_BATCH_RECORDS;
 const proto_limits = @import("../protocol/proto.zig");
+
+/// What an entry is answered with when its namespace's create was refused
+/// earlier in the same log: shard 0 proposes a write right behind its
+/// namespace's create, and the create can lose its id or the room.
+pub const NOT_CREATED_MESSAGE = "unavailable: the namespace's create was refused; the write was not run — retry";
 /// Most records one read returns (whole appends, at least one).
 pub const MAX_READ_RECORDS: u32 = proto_limits.MAX_STREAM_READ_RECORDS;
 
@@ -1085,7 +1090,7 @@ pub const StreamProjection = struct {
     /// apply path cannot recover the namespace string on its own. Without it,
     /// recovered streams register under their bare name and are invisible to
     /// `stream list`, which filters on the namespace prefix.
-    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) ?[]const u8 = null,
+    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
 
     pub const Stats = struct {
@@ -1553,11 +1558,14 @@ pub const StreamProjection = struct {
     /// Register a stream name. No-op if already registered.
     /// Resolve a namespace hash to its name via the wired resolver, falling
     /// back to "default" (the implicit namespace, which is never registered).
-    pub fn resolveNamespace(self: *const StreamProjection, ns_hash: u32) []const u8 {
-        if (self.ns_resolver) |resolver| {
-            if (resolver(self.ns_resolver_ctx.?, ns_hash)) |name| return name;
-        }
-        return "default";
+    /// The namespace an entry's hash names, or null when the shard has
+    /// never bound it: the log is missing the namespace's create or bind, and
+    /// the applier halts rather than file the entry under another namespace.
+    /// Without a resolver (a projection on its own, in a test), every hash
+    /// is "default".
+    pub fn resolveNamespace(self: *const StreamProjection, ns_hash: u32) error{Refused}!?[]const u8 {
+        const resolver = self.ns_resolver orelse return "default";
+        return resolver(self.ns_resolver_ctx.?, ns_hash);
     }
 
     pub fn registerStream(self: *StreamProjection, name: []const u8) !void {

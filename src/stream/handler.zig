@@ -1774,6 +1774,13 @@ pub const StreamHandler = struct {
         switch (etype) {
             .stream_append => {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                // Before anything changes: a namespace this shard never bound
+                // halts here on every replica, never lands in "default".
+                // One whose create the log refused is refused here too.
+                const ns = (self.stream.resolveNamespace(cmd.namespace_hash) catch {
+                    out.refuse(.unavailable, .unclassified, stream_mod.NOT_CREATED_MESSAGE);
+                    return;
+                }) orelse return error.Halt;
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
@@ -1796,7 +1803,6 @@ pub const StreamHandler = struct {
                 // default namespace, whose qualified form is the bare name,
                 // is unaffected.
                 var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-                const ns = self.stream.resolveNamespace(cmd.namespace_hash);
                 // A name that cannot be qualified is not listed rather than
                 // listed bare, where it could pass for another namespace's.
                 if (ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key)) |ns_name| {

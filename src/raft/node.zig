@@ -429,6 +429,9 @@ pub const RaftNode = struct {
     build: u64 = 0,
     repaired: Repaired = .{},
     last_applied: u64,
+    /// The last entry of the terms before this leader's: until it has
+    /// applied them, its state may lack what an earlier leader committed.
+    ready_index: u64 = 0,
 
     // ── Election timer ─────────────────────────────────────────────────
     election_deadline_ms: u64,
@@ -854,6 +857,7 @@ pub const RaftNode = struct {
         self.leader_id = self.id;
         self.elections_won += 1;
         self.terms_seen += 1;
+        self.ready_index = self.log.lastIndex();
 
         // Append a noop entry to establish the leader's commit index
         var noop = entry_mod.buildEntry(
@@ -1892,6 +1896,13 @@ pub const RaftNode = struct {
         return false;
     }
 
+    /// Leading, and applied through every earlier term's entry. A write
+    /// needn't wait for this; a proposal chosen by reading this node's
+    /// state must, or it may contradict what an earlier leader committed.
+    pub fn leaderReady(self: *const RaftNode) bool {
+        return self.role == .leader and self.last_applied >= self.ready_index;
+    }
+
     fn becomeLeader(self: *RaftNode) void {
         log.debug("Raft: becoming leader, node_id={d}, term={d}", .{ self.id, self.current_term });
         self.role = .leader;
@@ -1901,6 +1912,7 @@ pub const RaftNode = struct {
         self.elections_won += 1;
         // Initialize peer tracking
         const next = self.log.lastIndex() + 1;
+        self.ready_index = next - 1;
         for (0..self.peer_count) |i| {
             self.peers[i].next_index = next;
             self.peers[i].match_index = 0;
@@ -3409,6 +3421,48 @@ test "raft node: a new leader's noop lets earlier terms' entries commit before a
     sentAll(&node);
     node.handleAppendResponse(.{ .term = 2, .success = true, .match_index = 2, .from = 2 });
     try testing.expectEqual(@as(u64, 2), node.commit_index);
+}
+
+test "raft node: a new leader is ready once it has applied every earlier term's entry, and not after stepping down" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 8192, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    var old = testEntry(1, 1, "old");
+    _ = try node.log.append(&old);
+    node.current_term = 1;
+    try testing.expect(!node.leaderReady());
+
+    _ = candidacy(&node).?;
+    try testing.expect(node.handleVoteResponse(.{ .term = 2, .vote_granted = true, .from = 2 }) == .won);
+    // Leading, but the earlier term's entry hasn't applied here.
+    try testing.expectEqual(@as(u64, 1), node.ready_index);
+    try testing.expect(!node.leaderReady());
+    sentAll(&node);
+    node.handleAppendResponse(.{ .term = 2, .success = true, .match_index = 2, .from = 2 });
+    node.last_applied = 1;
+    // Its own noop needn't have applied.
+    try testing.expect(node.leaderReady());
+
+    const vote = node.handleVoteRequest(.{ .term = 9, .candidate_id = 3, .last_log_index = 9, .last_log_term = 9 });
+    _ = vote;
+    try testing.expect(node.role != .leader);
+    try testing.expect(!node.leaderReady());
+}
+
+test "raft node: a lone member bootstrapped over a restored log is ready once that log has applied" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 8192, .{});
+    defer node.deinit();
+    for (1..4) |i| {
+        var e = testEntry(1, i, "old");
+        _ = try node.log.append(&e);
+    }
+    node.current_term = 1;
+    try node.bootstrap();
+    try testing.expectEqual(@as(u64, 3), node.ready_index);
+    try testing.expect(!node.leaderReady());
+    node.last_applied = 3;
+    try testing.expect(node.leaderReady());
 }
 
 test "raft node: a leader that hears from no majority for an election timeout steps down" {

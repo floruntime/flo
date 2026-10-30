@@ -17,7 +17,7 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Nodes speaking different versions cannot link; upgrading is stopping
 /// every node and starting them on the new version together.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 /// The op and entry tables a node serves: nodes built from other tables
 /// cannot link either, since they would misread each other's requests and
 /// log entries.
