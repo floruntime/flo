@@ -631,6 +631,7 @@ pub const NamespaceHandler = struct {
     /// for its publish; a new one is proposed, then waits. `kind` says how
     /// the waiter is answered.
     fn createOrWait(self: *NamespaceHandler, shard: *Shard, conn: *Connection, req: Request, kind: WaiterKind) Error!table_run.Outcome(Empty) {
+        std.debug.assert(!shard.applying); // as in prepareWrite
         const name = req.key;
         // The grammar first: a reserved name ("_flo") is in the table, but
         // is refused as reserved, not as existing.
@@ -681,6 +682,9 @@ pub const NamespaceHandler = struct {
     /// the node's table has published, ahead of its write in its own log;
     /// a name the table lacks needs shard 0 first.
     pub fn prepareWrite(self: *NamespaceHandler, shard: *Shard, name_or_empty: []const u8) Prepared {
+        // The apply loop advances last_applied before it applies an entry:
+        // from inside it, leaderReady would say ready mid-apply.
+        std.debug.assert(!shard.applying);
         const name = if (name_or_empty.len == 0) "default" else name_or_empty;
         if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return .go;
         if (self.owner) {
