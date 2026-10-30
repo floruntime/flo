@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const data_format = @import("src").node.data_format;
 const ServerProcess = stdx.testing.ServerProcess;
 const CliRunner = stdx.testing.CliRunner;
 
@@ -83,7 +84,7 @@ test "e2e/data-dir: a Flo directory without FORMAT refuses to start, exit 78, na
     defer allocator.free(format);
     try stdx.fs.deleteFile(format);
 
-    const says = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (before format gating); this server needs format 1. There is no migration: run flo server wipe --data-dir {s}", .{ server.data_dir, server.data_dir });
+    const says = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (before format gating); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ server.data_dir, data_format.CURRENT, server.data_dir });
     defer allocator.free(says);
     try expectRefused(server, says);
     try testing.expect(!exists(format));
@@ -110,11 +111,11 @@ test "e2e/data-dir: a Flo directory without FORMAT refuses to start, exit 78, na
     defer again.deinit();
     try again.start();
     var buf: [8]u8 = undefined;
-    try testing.expectEqualStrings("1\n", try stdx.fs.readFile(format, &buf));
+    try testing.expectEqualStrings(std.fmt.comptimePrint("{d}\n", .{data_format.CURRENT}), try stdx.fs.readFile(format, &buf));
     again.stop();
     var fresh = try cli.runRaw(&.{ "server", "status", "--data-dir", server.data_dir });
     defer fresh.deinit();
-    try testing.expect(fresh.stdoutContains("  Format:     1\n"));
+    try testing.expect(fresh.stdoutContains(std.fmt.comptimePrint("  Format:     {d}\n", .{data_format.CURRENT})));
 }
 
 test "e2e/data-dir: wipe refuses a running server's directory, and deletes nothing" {
@@ -416,7 +417,7 @@ test "e2e/data-dir: a wipe cut short leaves a directory the server refuses, nami
     defer allocator.free(left);
     try testing.expectEqualStrings("00000 00001 flo.lock stray", left);
 
-    const says = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (before format gating); this server needs format 1. There is no migration: run flo server wipe --data-dir {s}", .{ server.data_dir, server.data_dir });
+    const says = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (before format gating); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ server.data_dir, data_format.CURRENT, server.data_dir });
     defer allocator.free(says);
     const again = try ServerProcess.initWithConfig(allocator, .{ .shards = 2, .data_dir_of = server.data_dir });
     defer again.deinit();

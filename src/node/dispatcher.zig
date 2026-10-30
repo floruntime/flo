@@ -83,7 +83,6 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 /// the log is written.
 pub fn opWrites(op: proto.OpCode) bool {
     return switch (op) {
-        .namespace_create, .namespace_delete, .namespace_config_set => true,
         // Membership changes are made by the leader; a follower carries
         // them there like any write.
         .cluster_promote, .cluster_remove, .cluster_repair_skip => true,

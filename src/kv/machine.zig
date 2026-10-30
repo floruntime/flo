@@ -264,6 +264,11 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 
 pub const INCR_OVERFLOW = "bad request: delta would take the counter past an i64";
 pub const NOT_A_COUNTER = "bad request: the key's value isn't an 8-byte counter";
+pub const PATH_NOT_FOUND = "not found: nothing at that path in the document";
+pub const BAD_PATH = "bad request: path isn't a JSON path";
+pub const NOT_A_DOCUMENT = "bad request: the key's value isn't a JSON document";
+pub const TOO_DEEP = "bad request: " ++ @import("../util/json_depth.zig").TOO_DEEP_MESSAGE;
+pub const TOO_LARGE = std.fmt.comptimePrint("bad request: the value to write is more than a key holds: at most {d} bytes", .{kv_ops.MAX_VALUE});
 
 /// The entry's place in the log, which every write it makes records.
 const Stamp = struct {
@@ -361,6 +366,11 @@ fn refuseOp(out: *Result, err: anyerror, prefix: []const u8) ?ApplyError {
         error.Overflow => .{ .status = .bad_request, .reason = .out_of_range, .text = INCR_OVERFLOW },
         error.NotACounter => .{ .status = .bad_request, .reason = .wrong_type, .text = NOT_A_COUNTER },
         error.NotFound => .{ .status = .not_found, .reason = .not_found, .text = "not found" },
+        error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => .{ .status = .not_found, .reason = .not_found, .text = PATH_NOT_FOUND },
+        error.InvalidPath => .{ .status = .bad_request, .reason = .malformed, .text = BAD_PATH },
+        error.InvalidJson => .{ .status = .bad_request, .reason = .wrong_type, .text = NOT_A_DOCUMENT },
+        error.TooDeep => .{ .status = .bad_request, .reason = .field_too_long, .text = TOO_DEEP },
+        error.TooLarge => .{ .status = .bad_request, .reason = .field_too_long, .text = TOO_LARGE },
         else => return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
@@ -482,43 +492,38 @@ fn incr(view: *View, q: Qualified, delta: i64, at: Stamp) (ApplyError || error{ 
 /// answers nothing.
 fn jsonPatch(view: *View, q: Qualified, path: []const u8, document: ?[]const u8, at: Stamp, out: *Result) ApplyError!u64 {
     const json_path = @import("../util/json_path.zig");
-    const handler = @import("handler.zig");
     var kb: [MAX_KEY]u8 = undefined;
     const cur = try view.get(Values, valueKey(&kb, q));
     const live = if (cur) |c| !c.tombstone and !c.expiredAt(at.ns) else false;
     const whole = std.mem.eql(u8, path, "$");
-    const refuse = struct {
-        fn f(o: *Result, err: anyerror) u64 {
-            const r = handler.KVHandler.refusal(switch (err) {
-                error.NotFound => error.NotFound,
-                error.TooLarge => error.TooLarge,
-                else => handler.KVHandler.jsonError(@errorCast(err)),
-            });
-            o.refuse(r.status, r.refusal.reason, r.refusal.message);
-            return 0;
-        }
-    }.f;
     if (document) |doc| {
         const merged = if (live)
             json_path.jsonPathSet(view.arena, cur.?.value, path, doc) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return refuse(out, err),
+                else => return refusedPatch(out, err),
             }
-        else if (whole) doc else return refuse(out, error.NotFound);
+        else if (whole) doc else return refusedPatch(out, error.NotFound);
         // The merge may grow the document past what a key holds.
-        if (merged.len > kv_ops.MAX_VALUE) return refuse(out, error.TooLarge);
+        if (merged.len > kv_ops.MAX_VALUE) return refusedPatch(out, error.TooLarge);
         return put(view, q, merged, .json, at, 0);
     }
-    if (!live) return refuse(out, error.NotFound);
+    if (!live) return refusedPatch(out, error.NotFound);
     if (whole) {
         _ = try delete(view, q, at);
         return 0;
     }
     const rest = json_path.jsonPathDel(view.arena, cur.?.value, path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return refuse(out, err),
+        else => return refusedPatch(out, err),
     };
     return put(view, q, rest, .json, at, 0);
+}
+
+/// Refuse a patch for its own failure, answering 0; any other error is
+/// returned.
+fn refusedPatch(out: *Result, err: anyerror) ApplyError!u64 {
+    try refused(out, err, "");
+    return 0;
 }
 
 /// Set `q`'s TTL without a new version: a TTL isn't a value. 0 clears it.

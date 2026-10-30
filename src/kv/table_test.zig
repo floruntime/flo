@@ -783,3 +783,36 @@ test "kv ops: json_get, json_set and json_del work at a path, and $ is the whole
     try testing.expectEqual(@as(?u64, null), (try h.ok("kv.json.del", "doc", .{ .path = "$", .routing_key = null })).version);
     try h.no("kv.json.get", "doc", .{ .path = "$", .routing_key = null }, .not_found, .not_found);
 }
+
+test "kv ops: two json sets at different paths, both proposed before either applies, both land" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    _ = try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":0,\"b\":0}", .routing_key = null });
+    const op = table_run.op("kv.json.set");
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const p1 = try op.request.encodeInto(&b1, .{ .path = "$.a", .document = "1", .routing_key = null });
+    const p2 = try op.request.encodeInto(&b2, .{ .path = "$.b", .document = "2", .routing_key = null });
+    var hd1 = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 100);
+    hd1.payload_length = 0;
+    var hd2 = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 101);
+    hd2.payload_length = 0;
+    // Commit waits for the disk, as a sync-durability node's or a cluster
+    // leader's waits for a peer: both requests run before either applies.
+    h.shard.raft_node.config.self_counts_when_durable = true;
+    h.shard.raft_node.durable_index = h.shard.raft_node.log.lastIndex();
+    h.conn.response_deferred = false;
+    h.shard.runRequest(h.conn, .{ .header = hd1, .namespace = "", .key = "doc", .value = p1 }, .client);
+    h.conn.response_deferred = false;
+    h.shard.runRequest(h.conn, .{ .header = hd2, .namespace = "", .key = "doc", .value = p2 }, .client);
+    var rq: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    try testing.expectEqualStrings("{\"a\":0,\"b\":0}", h.shard.kv_handler.kv.get(qualified(&rq, "doc")).?.value);
+    h.shard.raft_node.markDurable(h.shard.raft_node.log.lastIndex());
+    _ = h.shard.applyCommitted();
+    h.shard.raft_node.config.self_counts_when_durable = false;
+    _ = try h.answer();
+    _ = try h.answer();
+    const got = try h.ok("kv.json.get", "doc", .{ .path = "$", .routing_key = null });
+    try testing.expectEqualStrings("{\"a\":1,\"b\":2}", got.document);
+}

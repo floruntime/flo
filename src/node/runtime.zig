@@ -1197,16 +1197,6 @@ pub const Runtime = struct {
         }
         self.walk_ctx_slices[2] = stream_ctxs;
 
-        // namespace_list → each shard's NamespaceHandler
-        const ns_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            ns_ctxs[i] = @ptrCast(shards[i].namespace_handler);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.namespace_list, ns_ctxs);
-        }
-        self.walk_ctx_slices[3] = ns_ctxs;
-
         // action_list → each shard's ActionsHandler
         const action_ctxs = try self.allocator.alloc(*anyopaque, n);
         for (0..n) |i| {

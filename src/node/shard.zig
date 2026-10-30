@@ -706,8 +706,8 @@ pub const Shard = struct {
         // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
         // namespace handler. Done HERE — before replaySegments runs below — so that
         // queues re-registered during replay resolve their real namespace instead of
-        // falling back to "default". (namespace_create entries replay before the
-        // queue_enqueue entries that reference them, so the registry is populated in time.)
+        // falling back to "default". (A namespace's create or bind replays before the
+        // queue_enqueue entries that reference it, so the registry is populated in time.)
         queue_handler.queue.ns_resolver = resolveQueueNamespace;
         queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
         stream_handler.stream.ns_resolver = resolveQueueNamespace;
@@ -1513,6 +1513,9 @@ pub const Shard = struct {
             }
         }
 
+        // An internal op from a client runs where an unknown op would: here.
+        if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
+
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
             .local => self.dispatchLocal(conn, req, auth),
@@ -1533,7 +1536,7 @@ pub const Shard = struct {
     /// routing, decided before anything runs.
     fn forwardTarget(self: *Shard, req: proto.Request) ?ForwardTo {
         const op = req.header.op_code;
-        if (op >= proto.MAX_OPCODES) return null;
+        if (op >= proto.MAX_OPCODES or table.isInternal(op)) return null;
         if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
             const single = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!single) return null;
@@ -1675,6 +1678,10 @@ pub const Shard = struct {
     /// group is led elsewhere, when it goes to the leader over the peer
     /// link and the answer comes back the same way.
     fn dispatchLocal(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
+        // Taken through every check below as an unknown op is, then answered
+        // as one, so nothing tells the two apart.
+        const internal_from_client = run_mod.internalFromClient(req.header.op_code, auth.origin);
+        const writes = !internal_from_client and requestWrites(req);
         const status_op = req.header.op_code == @backingInt(proto.OpCode.cluster_status) or req.header.op_code == @backingInt(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.removed_message));
@@ -1693,15 +1700,15 @@ pub const Shard = struct {
         const membership_op = req.header.op_code == @backingInt(proto.OpCode.cluster_promote) or req.header.op_code == @backingInt(proto.OpCode.cluster_remove);
         // And so is the repair that ends the halt.
         const repair_op = req.header.op_code == @backingInt(proto.OpCode.cluster_repair_skip);
-        if (self.halted != null and !status_op and !membership_op and !repair_op and requestWrites(req)) {
+        if (self.halted != null and !status_op and !membership_op and !repair_op and writes) {
             var buf: [400]u8 = undefined;
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .shard_halted, .ran = .no, .message = self.haltedMessage(&buf) });
             return;
         }
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !requestWrites(req));
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
-        if (self.raft_network != null and requestWrites(req) and (self.replica.diverged or self.raft_node.role != .leader)) {
+        if (self.raft_network != null and writes and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
                 const oom = if (self.diverged_damage) |d| d.out_of_memory else false;
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
@@ -1734,8 +1741,9 @@ pub const Shard = struct {
                 self.sendErrorResponse(conn, req.header.request_id, r.status, r.message);
                 return;
             }
-            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self, false);
+            if (req.key.len > 0) self.namespace_handler.proposeImplicitCreate(req.namespace, self);
         }
+        if (internal_from_client) return answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code);
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
     }
 
@@ -3805,7 +3813,7 @@ pub const Shard = struct {
             if (comptime build_options.test_faults) {
                 if (@import("test_faults.zig").of(entry) == .panic_after_apply) @panic("test fault: panic after apply");
             }
-            self.recordApplied(entry);
+            self.recordApplied(entry, result);
         }
         self.wakeApplied(entry);
         if (comptime build_options.test_faults) {
@@ -3817,7 +3825,7 @@ pub const Shard = struct {
 
     /// Triggers and per-namespace metrics for an entry that just applied:
     /// from the entry alone, so every replica that applies it does the same.
-    fn recordApplied(self: *Shard, entry: *const entry_mod.Entry) void {
+    fn recordApplied(self: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
             .kv_put, .kv_delete, .kv_incr, .kv_expire, .kv_json_patch => {
@@ -3830,8 +3838,8 @@ pub const Shard = struct {
                         .kv_put => km.recordSet(),
                         .kv_delete => km.recordDelete(),
                         // A whole document deleted is a delete; any other
-                        // change, a set.
-                        .kv_json_patch => if (kv_entries.JsonPatch.decodeAll(entry.payload, &diag)) |p| {
+                        // change, a set. A refused patch changed nothing.
+                        .kv_json_patch => if (result.refused() != null) {} else if (kv_entries.JsonPatch.decodeAll(entry.payload, &diag)) |p| {
                             if (p.document == null and std.mem.eql(u8, p.path, "$")) km.recordDelete() else km.recordSet();
                         } else |_| {},
                         else => {},
@@ -5510,9 +5518,8 @@ pub const Shard = struct {
     fn answerUnknownOp(shard_ptr: *anyopaque, conn_ptr: *anyopaque, request_id: u64, op: u16) void {
         const self: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        var buf: [32]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, "unknown op 0x{x}", .{op}) catch unreachable;
-        self.sendRefusal(conn, request_id, .bad_request, .{ .reason = .unknown_op, .ran = .no, .message = message });
+        const r = run_mod.unknownOp(op);
+        self.sendRefusal(conn, request_id, r.status, r.refusal);
     }
 
     // ─── Built-in handlers ───────────────────────────────────────────────
@@ -7294,6 +7301,8 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             w.put(&.{ 0, 0 }) catch unreachable; // no routing key, no txn
             return w.written();
         },
+        // The namespace ops' bodies are empty records.
+        .namespace_create, .namespace_delete, .namespace_info, .namespace_ensure => return "",
         else => unreachable,
     }
 }
@@ -11049,7 +11058,7 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
     }
 }
 
-test "Shard: namespace settings are refused with their reason, and nothing is proposed" {
+test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -11069,14 +11078,20 @@ test "Shard: namespace settings are refused with their reason, and nothing is pr
     var one: [1]proto.Response = undefined;
 
     const last = shard.raft_node.log.lastIndex();
-    // A well-formed block that the old settings format would have applied.
-    for ([_]proto.OpCode{ .namespace_config_set, .namespace_config_get }, 0..) |op, i| {
-        try ParkTest.send(&shard, conn, op, i + 1, "default", &.{ 1, 6, 60, 0, 0, 0 });
-        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-        try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
-        try std.testing.expectEqualStrings(NamespaceHandler.SETTINGS_REFUSAL, (try one[0].refused()).message);
-    }
+    // namespace.ensure would create the namespace; from a client it is no op at all.
+    try ParkTest.send(&shard, conn, .namespace_ensure, 1, "fresh", "");
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    const r = try one[0].refused();
+    try std.testing.expectEqual(proto.Reason.unknown_op, r.reason);
+    try std.testing.expectEqualStrings("unknown op 0x16", r.message);
+    // The admin socket is a client's socket too.
+    shard.runRequest(conn, try ParkTest.request(.namespace_ensure, 2, proto.DEFAULT_NAMESPACE, "fresh", "", ""), .admin);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqualStrings("unknown op 0x16", (try one[0].refused()).message);
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expect(!shard.namespace_handler.namespaces.contains("fresh"));
 }
 
 test "Shard: a stream's first append to a namespace nobody created is listed under that namespace" {
@@ -11376,7 +11391,7 @@ test "Shard: a parked request leaves the pending table before it is answered, so
         }
     };
     // Any entry will do: the answer under test never reads it.
-    const proposed = try persistence_mod.proposeEntry(&shard, .namespace_create, entry_mod.Flags.NONE, "", "k", "");
+    const proposed = try KVHandler.testProposePut(&shard, "k", "");
     shard.park(conn, try ParkTest.request(.kv_put, 30, "", "k", "v", ""), proposed, Sweep.respond);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
@@ -11391,7 +11406,7 @@ test "Shard: a parked request leaves the pending table before it is answered, so
     try std.testing.expectEqualStrings("answered", one[0].data);
 }
 
-test "Shard: a burst of first writes to a new namespace proposes one implicit create, and a write after it applied proposes another if the namespace is gone" {
+test "Shard: a burst of first writes to a new namespace proposes one implicit create, and none once it applied" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -11419,17 +11434,12 @@ test "Shard: a burst of first writes to a new namespace proposes one implicit cr
     for (0..3) |_| ns.markNamespaceHasData("fresh", &shard);
     try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, first));
 
-    // Once it applies the namespace exists, counted once however many
-    // writes the burst held.
+    // Once it applies the namespace exists, and its next write proposes nothing.
     try ParkTest.ack(&shard);
-    try std.testing.expectEqual(@as(u32, 1), ns.namespaces.get("fresh").?.data_count);
-
-    // Applied, it no longer stands in the way: a namespace removed since
-    // is created again by its next write.
-    ns.applyDelete("fresh");
+    try std.testing.expect(ns.namespaces.contains("fresh"));
     const again = raft.log.lastIndex() + 1;
     ns.markNamespaceHasData("fresh", &shard);
-    try std.testing.expectEqual(@as(u32, 1), Count.creates(raft, again));
+    try std.testing.expectEqual(@as(u32, 0), Count.creates(raft, again));
 }
 
 test "raftRingCapacity: a quarter of the hot buffer, floored and capped" {

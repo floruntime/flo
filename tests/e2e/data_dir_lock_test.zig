@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const data_format = @import("src").node.data_format;
 const ServerProcess = stdx.testing.ServerProcess;
 
 test "e2e/data-dir: a second server on a data dir in use refuses to start, and the first keeps serving" {
@@ -39,7 +40,7 @@ test "e2e/data-dir: a server takes over a data dir once its previous holder has 
     try second.start();
 }
 
-test "e2e/data-dir: a data dir of a newer format, or a FORMAT that isn't one, refuses to start, by name" {
+test "e2e/data-dir: a data dir of a newer or older format, or a FORMAT that isn't one, refuses to start, by name" {
     const allocator = testing.allocator;
     const first = try ServerProcess.initWithConfig(allocator, .{ .shards = 1 });
     defer first.deinit();
@@ -48,12 +49,15 @@ test "e2e/data-dir: a data dir of a newer format, or a FORMAT that isn't one, re
 
     const path = try std.fs.path.join(allocator, &.{ first.data_dir, "FORMAT" });
     defer allocator.free(path);
-    const newer = try std.fmt.allocPrint(allocator, "data directory format 2, this binary reads format 1 ({s}); start a flo that reads format 2", .{path});
+    const newer = try std.fmt.allocPrint(allocator, "data directory format {d}, this binary reads format {d} ({s}); start a flo that reads format {d}", .{ data_format.CURRENT + 1, data_format.CURRENT, path, data_format.CURRENT + 1 });
     defer allocator.free(newer);
-    const garbage = try std.fmt.allocPrint(allocator, "{s} holds \"two\", not a data directory format; it should hold a number such as 1", .{path});
+    const older = try std.fmt.allocPrint(allocator, "data directory {s} was written by an older Flo (format 1); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ first.data_dir, data_format.CURRENT, first.data_dir });
+    defer allocator.free(older);
+    const garbage = try std.fmt.allocPrint(allocator, "{s} holds \"two\", not a data directory format; it should hold a number such as {d}", .{ path, data_format.CURRENT });
     defer allocator.free(garbage);
     for ([_]struct { format: []const u8, says: []const u8 }{
-        .{ .format = "2\n", .says = newer }, // a newer flo wrote this directory
+        .{ .format = std.fmt.comptimePrint("{d}\n", .{data_format.CURRENT + 1}), .says = newer }, // a newer flo wrote this directory
+        .{ .format = "1\n", .says = older }, // an older flo did
         .{ .format = "two\n", .says = garbage },
     }) |case| {
         const f = try stdx.fs.createFile(path, .{ .truncate = true });

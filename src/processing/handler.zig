@@ -575,7 +575,7 @@ pub const ProcessingHandler = struct {
         // Persist through Raft; the applier builds the job record and its
         // pipelines from the entry — the same applier a restart uses.
         // Admitted at dispatch; the definition has now passed, so reserve.
-        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
         const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.batch_size, home, yaml) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "job not persisted"));
             return;
@@ -1662,7 +1662,7 @@ pub const ProcessingHandler = struct {
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard is listed
                     // by its bare name until the namespace exists there.
-                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
+                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
@@ -1710,7 +1710,7 @@ pub const ProcessingHandler = struct {
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard is listed
                     // by its bare name until the namespace exists there.
-                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
+                    if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
@@ -1840,7 +1840,7 @@ pub const ProcessingHandler = struct {
         const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
         // The applier labels the queue by resolving its namespace; only
         // this shard's handler may be touched from this thread.
-        if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard, false);
+        if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
         if (result == .err) self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, result.err.message);

@@ -38,26 +38,28 @@ fn vector(comptime op: proto.OpCode, comptime name: []const u8) Vector {
 /// bumped by hand. Remove an op as it gains a vector or moves onto the op
 /// table; never add one.
 pub const NO_VECTOR_YET = [_]proto.OpCode{
-    .ping,                    .namespace_create,     .namespace_delete,               .namespace_list,            .namespace_info,
-    .namespace_config_set,    .namespace_config_get, .stream_append,                  .stream_read,               .stream_trim,
-    .stream_info,             .stream_list,          .stream_create,                  .stream_alter,              .stream_delete,
-    .stream_group_create,     .stream_group_join,    .stream_group_leave,             .stream_group_read,         .stream_group_ack,
-    .stream_group_claim,      .stream_group_pending, .stream_group_configure_sweeper, .stream_group_nack,         .stream_group_touch,
-    .stream_group_info,       .stream_group_delete,  .queue_enqueue,                  .queue_dequeue,             .queue_complete,
-    .queue_fail,              .queue_dlq_list,       .queue_dlq_delete,               .queue_dlq_requeue,         .queue_stats,
-    .queue_peek,              .queue_purge,          .queue_list,                     .ts_write,                  .ts_read,
-    .ts_query,                .ts_floql,             .ts_list,                        .ts_delete,                 .ts_retention,
-    .action_register,         .action_invoke,        .action_list,                    .action_list_runs,          .action_delete,
-    .action_await,            .action_complete,      .action_fail,                    .action_touch,              .worker_register,
-    .worker_heartbeat,        .worker_deregister,    .worker_drain,                   .workflow_create,           .workflow_start,
-    .workflow_signal,         .workflow_cancel,      .workflow_status,                .workflow_history,          .workflow_list_runs,
-    .workflow_get_definition, .workflow_disable,     .workflow_enable,                .workflow_list_definitions, .processing_submit,
-    .processing_stop,         .processing_cancel,    .processing_status,              .processing_list,
+    .ping,                           .stream_append,       .stream_read,               .stream_trim,
+    .stream_info,                    .stream_list,         .stream_create,             .stream_alter,
+    .stream_delete,                  .stream_group_create, .stream_group_join,         .stream_group_leave,
+    .stream_group_read,              .stream_group_ack,    .stream_group_claim,        .stream_group_pending,
+    .stream_group_configure_sweeper, .stream_group_nack,   .stream_group_touch,        .stream_group_info,
+    .stream_group_delete,            .queue_enqueue,       .queue_dequeue,             .queue_complete,
+    .queue_fail,                     .queue_dlq_list,      .queue_dlq_delete,          .queue_dlq_requeue,
+    .queue_stats,                    .queue_peek,          .queue_purge,               .queue_list,
+    .ts_write,                       .ts_read,             .ts_query,                  .ts_floql,
+    .ts_list,                        .ts_delete,           .ts_retention,              .action_register,
+    .action_invoke,                  .action_list,         .action_list_runs,          .action_delete,
+    .action_await,                   .action_complete,     .action_fail,               .action_touch,
+    .worker_register,                .worker_heartbeat,    .worker_deregister,         .worker_drain,
+    .workflow_create,                .workflow_start,      .workflow_signal,           .workflow_cancel,
+    .workflow_status,                .workflow_history,    .workflow_list_runs,        .workflow_get_definition,
+    .workflow_disable,               .workflow_enable,     .workflow_list_definitions, .processing_submit,
+    .processing_stop,                .processing_cancel,   .processing_status,         .processing_list,
 };
 
 /// The most `NO_VECTOR_YET` may hold: lower it as the list shrinks, so an
 /// op added to the list fails the build.
-const NO_VECTOR_YET_CAP = 74;
+const NO_VECTOR_YET_CAP = 68;
 
 /// Every vector's name and bytes, for the table hash.
 pub fn hash(h: *std.hash.Wyhash) void {

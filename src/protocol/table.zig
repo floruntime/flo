@@ -8,15 +8,17 @@ const entries = @import("entries.zig");
 const kv_ops = @import("kv_ops.zig");
 const action_ops = @import("action_ops.zig");
 const worker_ops = @import("worker_ops.zig");
+const namespace_ops = @import("namespace_ops.zig");
 const kv_entries = @import("kv_entries.zig");
+const namespace_entries = @import("namespace_entries.zig");
 const golden = @import("golden.zig");
 const proto = @import("proto.zig");
 const EntryType = @import("../storage/ual/entry.zig").EntryType;
 
-pub const op_table = kv_ops.table ++ action_ops.table ++ worker_ops.table;
+pub const op_table = namespace_ops.table ++ kv_ops.table ++ action_ops.table ++ worker_ops.table;
 /// The groups the table's ops form under their families.
 pub const op_groups = kv_ops.groups;
-pub const entry_table = kv_entries.table;
+pub const entry_table = kv_entries.table ++ namespace_entries.table;
 
 comptime {
     ops.check(&op_table);
@@ -27,6 +29,12 @@ comptime {
 /// the body coded by its schema.
 pub fn isOp(code: u16) bool {
     inline for (op_table) |op| if (op.code == code) return true;
+    return false;
+}
+
+/// Whether table op `code` is sent only by another shard or node.
+pub fn isInternal(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return op.origin == .internal;
     return false;
 }
 

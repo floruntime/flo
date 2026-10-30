@@ -503,7 +503,7 @@ pub const StreamHandler = struct {
             defer self.allocator.free(stored_value);
             // The applier registers the stream's name by resolving the
             // namespace, so a namespace nobody created is created first.
-            shard.namespace_handler.proposeImplicitCreate(req.namespace, shard, false);
+            shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
             const proposed = persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "append not persisted") };
             };

@@ -105,9 +105,8 @@ pub const EntryType = enum(u8) {
 
     // ── Namespace ──
     namespace_create = 0x60,
-    namespace_delete = 0x61,
-    /// Not written: namespace settings aren't supported, and replay logs and skips one.
-    namespace_config = 0x62,
+    // 0x61 and 0x62 were a namespace delete and settings, never written; retired.
+    namespace_bind = 0x63,
 
     // ── Actions ──
     action_register = 0x70,
@@ -126,12 +125,12 @@ pub const EntryType = enum(u8) {
     pub fn hasKeyValue(self: EntryType) bool {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
+            .namespace_create, .namespace_bind => false,
             .stream_append, .stream_trim, .stream_delete => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start, .workflow_complete => true,
-            .namespace_create, .namespace_delete, .namespace_config => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => true,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,

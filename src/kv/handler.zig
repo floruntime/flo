@@ -48,6 +48,7 @@ const schema = @import("../protocol/schema.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const json_path = @import("../util/json_path.zig");
 const json_depth = @import("../util/json_depth.zig");
+const kv_machine = @import("machine.zig");
 const table_run = @import("../node/table_run.zig");
 const mget_mod = @import("mget.zig");
 const gather_mod = @import("../node/gather.zig");
@@ -203,14 +204,14 @@ pub const KVHandler = struct {
             error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
             error.AnswerTooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the JSON at that path is more than an answer holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
-            error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the value to write is more than a key holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
-            error.NotACounter => refused(.bad_request, .wrong_type, "bad request: the key's value isn't an 8-byte counter"),
-            error.CounterOverflow => refused(.bad_request, .out_of_range, "bad request: delta would take the counter past an i64"),
-            error.PathNotFound => refused(.not_found, .not_found, "not found: nothing at that path in the document"),
-            error.BadPath => refused(.bad_request, .malformed, "bad request: path isn't a JSON path"),
-            error.NotADocument => refused(.bad_request, .wrong_type, "bad request: the key's value isn't a JSON document"),
+            error.TooLarge => refused(.bad_request, .field_too_long, kv_machine.TOO_LARGE),
+            error.NotACounter => refused(.bad_request, .wrong_type, kv_machine.NOT_A_COUNTER),
+            error.CounterOverflow => refused(.bad_request, .out_of_range, kv_machine.INCR_OVERFLOW),
+            error.PathNotFound => refused(.not_found, .not_found, kv_machine.PATH_NOT_FOUND),
+            error.BadPath => refused(.bad_request, .malformed, kv_machine.BAD_PATH),
+            error.NotADocument => refused(.bad_request, .wrong_type, kv_machine.NOT_A_DOCUMENT),
             error.NotJson => refused(.bad_request, .malformed, "bad request: document isn't JSON"),
-            error.TooDeep => refused(.bad_request, .field_too_long, "bad request: " ++ json_depth.TOO_DEEP_MESSAGE),
+            error.TooDeep => refused(.bad_request, .field_too_long, kv_machine.TOO_DEEP),
             error.TooManyTransactions => refused(.overloaded, .too_many_transactions, "overloaded: too many open transactions on this shard — commit or roll some back, or retry"),
             error.ScanShort => refused(.overloaded, .shard_busy, "overloaded: no memory to list this page — retry"),
             error.GatherBusy => refused(.overloaded, .shard_busy, "overloaded: too many reads across shards are under way; this request was not run — retry"),
@@ -750,8 +751,6 @@ pub const KVHandler = struct {
     ) Error!table_run.Outcome(JsonDelResponse) {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        const self = shard.kv_handler;
-        _ = self;
         const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = null }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerJsonDel } };
     }
@@ -966,7 +965,7 @@ pub const KVHandler = struct {
     /// null. The caller counts a refusal as a dropped record.
     pub fn sinkPropose(shard: *Shard, namespace: []const u8, qkey: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
         if (isReservedKey(kv_state.Qualified.of(qkey).key)) return "access to reserved key denied";
-        shard.namespace_handler.proposeImplicitCreate(namespace, shard, false);
+        shard.namespace_handler.proposeImplicitCreate(namespace, shard);
         _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms }) catch |err| return switch (err) {
             error.NotLeader => "this node doesn't lead its group",
             error.WritesStopped => "the shard stopped taking writes",

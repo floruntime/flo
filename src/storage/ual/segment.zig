@@ -24,8 +24,9 @@ pub const HEADER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'S', 'E', 'G', 0 };
 pub const FOOTER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'E', 'N', 'D', 0 };
 /// Bumped with any change to a stored entry's layout (the entry table), so
 /// a data directory written before it is refused at open, not misread.
-/// protocol/table.zig pins the entry layouts this version stores.
-pub const SEGMENT_VERSION: u16 = 3;
+/// node/data_format.zig pins the entry layouts this version stores, and the
+/// data directory format that goes with it.
+pub const SEGMENT_VERSION: u16 = 4;
 pub const HEADER_SIZE: usize = 64;
 pub const FOOTER_SIZE: usize = 32;
 pub const SPARSE_INDEX_INTERVAL: u32 = 256;
@@ -199,15 +200,4 @@ test "segment: entry type bitmap" {
     try std.testing.expect(bitmapHas(bitmap, 0x01));
     try std.testing.expect(bitmapHas(bitmap, 0x10));
     try std.testing.expect(!bitmapHas(bitmap, 0x02)); // kv_delete not set
-}
-
-test "segment: the version moves with the stored entry layouts" {
-    // A change to the entry table changes this hash. Then bump
-    // SEGMENT_VERSION, so data written before it is refused at open, and
-    // pin the new hash beside it. Refusal reasons and ops are never stored,
-    // so they are left out and don't force a bump.
-    const pinned = .{ .version = 3, .entries = 0x6a65f04137a5ce6 };
-    const entries_hash = comptime @import("../../protocol/ops.zig").entryTableHash(&@import("../../protocol/table.zig").entry_table);
-    try std.testing.expectEqual(@as(u16, pinned.version), SEGMENT_VERSION);
-    try std.testing.expectEqual(@as(u64, pinned.entries), entries_hash);
 }
