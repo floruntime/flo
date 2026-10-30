@@ -18,6 +18,9 @@ const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("../contract/store.zig");
 const machine_mod = @import("../contract/machine.zig");
 const kv_machine = @import("../kv/machine.zig");
+const view_mod = @import("../contract/view.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
+const schema = @import("../protocol/schema.zig");
 
 const Allocator = std.mem.Allocator;
 const HASH_SEED: u64 = 0xFA81_17E5;
@@ -38,9 +41,10 @@ pub const Mutant = enum {
     live_only_effect,
     /// A replica rebuilding by replay skips KV's batches.
     kv_replay_skips_batches,
-    /// A refused KV entry writes anyway, the same on every replica: no
-    /// comparison sees it, so `Kv.apply` checks refusals itself.
-    kv_refusal_writes,
+    /// The contract commits a refused entry's staged writes, the same on
+    /// every replica: no comparison sees it, so `Kv.apply` checks refusals
+    /// itself.
+    kv_refused_commits,
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -142,9 +146,21 @@ pub const Counter = struct {
 pub const Kv = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
-    /// Entries the machine refused, and JSON patches it merged.
-    refusals: u64 = 0,
-    patches: u64 = 0,
+    /// What it applied, by outcome: every refusal; batches refused, which
+    /// have staged writes by then; JSON patches merged into a value; and
+    /// JSON patches that deleted a field.
+    counts: Counts = .{},
+
+    pub const Counts = struct {
+        refusals: u64 = 0,
+        staged_refusals: u64 = 0,
+        merges: u64 = 0,
+        field_deletes: u64 = 0,
+
+        pub fn add(self: *Counts, other: Counts) void {
+            inline for (@typeInfo(Counts).@"struct".field_names) |f| @field(self, f) += @field(other, f);
+        }
+    };
 
     /// The families compared, in the order `checksums` returns them.
     pub const FAMILIES = [_]u16{ kv_machine.Values.ID, kv_machine.History.ID, kv_machine.NsCounts.ID };
@@ -179,14 +195,40 @@ pub const Kv = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         const before = self.commits();
-        try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
-        if (r.mutant == .kv_refusal_writes and out.refused() != null) self.store.families[FAMILIES[0]].commits += 1;
+        if (r.mutant == .kv_refused_commits) {
+            try self.applyCommittingRefusals(e, &out);
+        } else {
+            try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
+        }
         if (out.refused() == null) {
-            if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_json_patch)) self.patches += 1;
+            self.countPatch(e);
             return;
         }
-        self.refusals += 1;
+        self.counts.refusals += 1;
+        if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.counts.staged_refusals += 1;
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+    }
+
+    /// An applied JSON patch: merged into the value (a set below `$`), or a
+    /// field deleted. A set at `$` writes the whole value and merges nothing.
+    fn countPatch(self: *Kv, e: *const entry_mod.Entry) void {
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_json_patch)) return;
+        var diag: schema.Diagnostic = .{};
+        const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return;
+        if (std.mem.eql(u8, p.path, "$")) return;
+        if (p.document != null) self.counts.merges += 1 else self.counts.field_deletes += 1;
+    }
+
+    /// `machine.applyEntry` without its guard against committing a refused
+    /// entry: the bug `kv_refused_commits` plants.
+    fn applyCommittingRefusals(self: *Kv, e: *const entry_mod.Entry, out: *persistence.Result) persistence.ApplyError!void {
+        _ = self.scratch.reset(.retain_capacity);
+        const arena = self.scratch.allocator();
+        var keys = view_mod.KeySet.init(arena);
+        try kv_machine.machine.keys(e, &keys);
+        var view = view_mod.View.init(&self.store, arena, &keys);
+        try kv_machine.machine.apply(&view, e, out);
+        try view.commit();
     }
 
     /// Each family's count of records linked, replaced or unlinked.

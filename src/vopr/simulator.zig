@@ -74,6 +74,9 @@ pub const Invariant = enum {
     /// that applied those entries live: apply read something besides the
     /// entry and the state.
     state_checksum,
+    /// An entry the KV machine refused changed a family anyway. Every
+    /// replica would agree on it, so `state_checksum` can't see it.
+    refusal_wrote,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -278,9 +281,8 @@ const SimNode = struct {
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
     kv: families.Kv,
-    /// Refusals and merged patches its earlier lives' stores counted.
-    kv_refusals_before_restart: u64 = 0,
-    kv_patches_before_restart: u64 = 0,
+    /// What its earlier lives' KV machines counted.
+    kv_before_restart: families.Kv.Counts = .{},
     families_index: u64 = 0,
     /// Its apply rewound without a restart, so the family holds entries
     /// the log no longer does and cannot roll them back: the checker
@@ -709,10 +711,9 @@ pub const Summary = struct {
     state_checks: u64,
     rebuilt_checks: u64,
     kv_checks: u64,
-    /// KV entries the machine refused, and JSON patches it merged, over
-    /// every replica's applies.
-    kv_refusals: u64,
-    kv_patches: u64,
+    /// What KV's machine did with the entries, over every replica's
+    /// applies (`families.Kv.Counts`).
+    kv: families.Kv.Counts,
     violation_count: usize,
 };
 
@@ -1094,10 +1095,8 @@ pub const Simulator = struct {
         node.applied_config = .{};
         node.replay_through = node.applied_ticks.items.len;
         node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
-        node.kv_refusals_before_restart += node.kv.refusals;
-        node.kv.refusals = 0;
-        node.kv_patches_before_restart += node.kv.patches;
-        node.kv.patches = 0;
+        node.kv_before_restart.add(node.kv.counts);
+        node.kv.counts = .{};
         node.kv.reset();
         node.families_index = 0;
         node.families_stale = false;
@@ -1680,7 +1679,7 @@ pub const Simulator = struct {
         if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
         if (is_op and families.Kv.owns(e.header.entry_type)) node.kv.apply(e, replica) catch |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{
-                .invariant = .state_checksum,
+                .invariant = .refusal_wrote,
                 .node = node.id,
                 .index = idx,
                 .tick = self.now,
@@ -2025,14 +2024,12 @@ pub const Simulator = struct {
             .state_checks = self.checker.state_checks,
             .rebuilt_checks = self.checker.rebuilt_checks,
             .kv_checks = self.checker.kv_checks,
-            .kv_refusals = blk: {
-                var n: u64 = 0;
-                for (self.nodes) |*node| n += node.kv_refusals_before_restart + node.kv.refusals;
-                break :blk n;
-            },
-            .kv_patches = blk: {
-                var n: u64 = 0;
-                for (self.nodes) |*node| n += node.kv_patches_before_restart + node.kv.patches;
+            .kv = blk: {
+                var n: families.Kv.Counts = .{};
+                for (self.nodes) |*node| {
+                    n.add(node.kv_before_restart);
+                    n.add(node.kv.counts);
+                }
                 break :blk n;
             },
             .violation_count = self.checker.violations.items.len,
@@ -2193,8 +2190,6 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
     var checks: u64 = 0;
     var rebuilt: u64 = 0;
     var kv_checks: u64 = 0;
-    var kv_refusals: u64 = 0;
-    var kv_patches: u64 = 0;
     for ([_]u64{ 77, 78, 79 }) |seed| {
         for ([_]scenario_mod.DurabilityMode{ .sync, .async_flush }) |durability| {
             var scenario = restartingScenario(seed);
@@ -2212,8 +2207,6 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
             checks += s.state_checks;
             rebuilt += s.rebuilt_checks;
             kv_checks += s.kv_checks;
-            kv_refusals += s.kv_refusals;
-            kv_patches += s.kv_patches;
             // Every replica's KV store fails an undeclared key, restarted
             // ones too.
             for (sim.nodes) |*node| try testing.expect(node.kv.store.strict_keys);
@@ -2222,11 +2215,6 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
     try testing.expect(checks >= 1000);
     try testing.expect(rebuilt >= 500);
     try testing.expect(kv_checks >= 50);
-    // JSON patches the key's value can't take are refused, and refusals
-    // were checked to leave every family as it was.
-    try testing.expect(kv_refusals >= 20);
-    // And patches the value can take merge.
-    try testing.expect(kv_patches >= 20);
 }
 
 /// What `state_checksum` found under a mutant: any violation, and one
@@ -2239,11 +2227,11 @@ fn stateChecksumUnder(mutant: families.Mutant) !Caught {
     _ = try sim.run();
     var found: Caught = .{};
     for (sim.checker.violations.items) |v| {
+        if (v.invariant == .refusal_wrote) found.refusal = true;
         if (v.invariant != .state_checksum) continue;
         found.any = true;
         if (std.mem.startsWith(u8, v.detail, "a replica rebuilt by replay")) found.rebuilt_vs_live = true;
         if (std.mem.indexOf(u8, v.detail, " kv.") != null) found.kv = true;
-        if (std.mem.eql(u8, v.detail, "a KV entry the machine refused changed a family")) found.refusal = true;
     }
     return found;
 }
@@ -2262,6 +2250,21 @@ test "vopr sim: a checksum in map order fails state_checksum between a rebuilt r
 
 test "vopr sim: an effect only live apply runs fails state_checksum between a rebuilt replica and a live one" {
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
+}
+
+test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuses batches after staging" {
+    // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
+    // run is checked on its own, not summed.
+    for ([_]u64{ 1, 3, 7, 9, 10, 13, 15, 16 }) |seed| {
+        var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(seed), .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        try testing.expect(s.ok);
+        errdefer std.debug.print("seed {d}: {any}\n", .{ seed, s.kv });
+        try testing.expect(s.kv.merges >= 10);
+        try testing.expect(s.kv.field_deletes >= 5);
+        try testing.expect(s.kv.staged_refusals >= 10);
+    }
 }
 
 test "vopr sim: KV's families are compared at a run's last index even when sampling passed over it" {
@@ -2283,8 +2286,8 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
 }
 
-test "vopr sim: a refused KV entry that writes anyway fails state_checksum, though every replica agrees" {
-    try testing.expect((try stateChecksumUnder(.kv_refusal_writes)).refusal);
+test "vopr sim: a contract that commits a refused entry's staged writes fails refusal_wrote, though every replica agrees" {
+    try testing.expect((try stateChecksumUnder(.kv_refused_commits)).refusal);
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
