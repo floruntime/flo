@@ -241,12 +241,17 @@ const Echo = struct {
     body_len: usize = 2,
     /// A pause before each body chunk, for a response that writes slowly.
     chunk_delay_ms: u64 = 0,
-    /// When the last answer was given up or finished.
+    /// When the last answer began, and when it was given up or finished.
+    begun_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     done_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// Body bytes the last answer wrote before it ended.
+    body_sent: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// What `responseMsLeft` said as the last answer began.
     left_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
     fn handle(self: *Echo, fd: posix.socket_t, bytes: []const u8) void {
         _ = self.served.fetchAdd(1, .monotonic);
+        self.begun_ms.store(nowMs(), .release);
+        self.body_sent.store(0, .release);
         self.left_ms.store(responseMsLeft() orelse -1, .release);
         defer self.done_ms.store(nowMs(), .release);
         const tail = bytes[bytes.len - @min(bytes.len, self.last.len) ..];
@@ -263,6 +268,7 @@ const Echo = struct {
             if (self.chunk_delay_ms > 0) stdx.time.sleep(self.chunk_delay_ms * std.time.ns_per_ms);
             writeAll(fd, chunk[0..n]) catch return;
             left -= n;
+            _ = self.body_sent.fetchAdd(n, .release);
         }
     }
 };
@@ -420,6 +426,22 @@ test "serve: a request past the limits is answered 413 or 431 and never handled,
     try testing.expect(std.mem.endsWith(u8, srv.echo.last[0..srv.echo.last_len], "\r\n\r\nabc"));
 }
 
+/// That the echo's last answer was given up at its deadline: its body cut
+/// short, ended no sooner than the deadline, and not long after it. Timed
+/// from when the handler began, which is when the deadline starts: on a
+/// loaded machine the request can wait well over a second to be read.
+fn expectCutAtDeadline(echo: *const Echo) !void {
+    const begun = echo.begun_ms.load(.acquire);
+    const done = echo.done_ms.load(.acquire);
+    const left = echo.left_ms.load(.acquire);
+    try testing.expect(begun != 0 and done != 0 and left > 0);
+    try testing.expect(echo.body_sent.load(.acquire) < echo.body_len);
+    try testing.expect(done - begun >= left);
+    // Well short of the uncut response, which takes twice the deadline
+    // or more in either test.
+    try testing.expect(done - begun < WRITE_TIMEOUT_MS + 2_500);
+}
+
 test "serve: a client that reads slowly is cut off at the response deadline, not held to it write by write" {
     var srv = Served{ .l = undefined };
     srv.echo.body_len = 16 << 20;
@@ -441,9 +463,7 @@ test "serve: a client that reads slowly is cut off at the response deadline, not
         if (rc > 0) got += @intCast(rc);
         stdx.time.sleep(20 * std.time.ns_per_ms);
     }
-    const done = srv.echo.done_ms.load(.acquire);
-    try testing.expect(done != 0);
-    try testing.expect(done - start < WRITE_TIMEOUT_MS + 1_500);
+    try expectCutAtDeadline(&srv.echo);
     try testing.expect(got > 0);
 }
 
@@ -472,9 +492,7 @@ test "serve: a response that writes slowly is cut off at its deadline even when 
             _ = posix.poll(&pfd, 100) catch {};
         }
     }
-    const done = srv.echo.done_ms.load(.acquire);
-    try testing.expect(done != 0);
-    try testing.expect(done - start < WRITE_TIMEOUT_MS + 1_500);
+    try expectCutAtDeadline(&srv.echo);
 }
 
 test "serve: a listener that takes no body is limited to its head" {
