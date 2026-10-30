@@ -117,7 +117,7 @@ fn call(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8, ou
 /// Pages `op` two at a time and checks each of `want` comes back once.
 fn expectPagesThrough(ctx: *stdx.testing.TestContext, op: proto.OpCode, entry: Entry, want: []const []const u8) !void {
     var seen = @as([16]usize, @splat(0));
-    var cursor_buf: [256]u8 = undefined;
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
     var cursor: []const u8 = "";
     var pages: usize = 0;
     var out: [16 * 1024]u8 = undefined;
@@ -227,7 +227,7 @@ fn expectBigShardListed(ctx: *stdx.testing.TestContext, write: proto.OpCode, val
     }
 
     var seen = @as([BIG]u8, @splat(0));
-    var cursor_buf: [256]u8 = undefined;
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
     var cursor: []const u8 = "";
     for (0..20) |_| {
         const d = try listPageOn(fd, list, 300, cursor, &out);
