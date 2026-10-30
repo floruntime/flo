@@ -44,6 +44,11 @@ pub const Op = struct {
 /// room is checked per part against that owner's whole share.
 pub const Part = struct {
     owner: u16,
+    /// For another shard, the op it runs and the key it names, when not the
+    /// client's: a part may ask a different question (a namespace's id)
+    /// than the client did.
+    op: ?u16 = null,
+    key: ?[]const u8 = null,
     /// For another shard, the body of the request it runs (the client's op
     /// with this body), copied at the send. For this shard, its own answer
     /// body, allocated by the caller and owned by the gather from the call.

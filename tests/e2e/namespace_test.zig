@@ -259,3 +259,81 @@ test "e2e/namespace: an empty namespace is the default namespace on every shard"
         try testing.expect(std.mem.indexOf(u8, out, "from-default") != null);
     }
 }
+
+// =============================================================================
+// One owner: shard 0 creates every namespace, every shard uses it
+// =============================================================================
+
+test "e2e/namespace: on 4 shards, a namespace made by a create or by a first write is usable on every shard, listed, and survives restarts" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [16]u8 = undefined;
+    // "made" by an explicit create, "first" by its first writes: 16 keys,
+    // queues and streams each, spread over every shard.
+    try ctx.exec(&.{ "ns", "create", "made" });
+    for ([_][]const u8{ "made", "first" }) |ns| {
+        for (0..16) |i| {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+            try ctx.exec(&.{ "kv", "set", k, try std.fmt.bufPrint(&vbuf, "{s}{d}", .{ ns, i }), "-n", ns });
+            try ctx.exec(&.{ "queue", "enqueue", k, "job", "-n", ns });
+            try ctx.exec(&.{ "stream", "append", k, "rec", "-n", ns });
+        }
+    }
+    const list = try ctx.execCapture(&.{ "ns", "ls" });
+    try testing.expect(std.mem.indexOf(u8, list, "made") != null);
+    try testing.expect(std.mem.indexOf(u8, list, "first") != null);
+
+    // Twice: a clean stop, then a kill -9 right after another create.
+    for (0..2) |round| {
+        if (round == 0) {
+            try ctx.restartServer();
+        } else {
+            try ctx.exec(&.{ "ns", "create", "late" });
+            ctx.server.sent_kill = true;
+            _ = std.c.kill(ctx.server.process.?.id, .KILL);
+            try ctx.restartServer();
+            // Acked, so on disk.
+            var info = try ctx.cli.run(&.{ "ns", "info", "late" });
+            defer info.deinit();
+            try testing.expectEqual(@as(u8, 0), info.exit_code);
+        }
+        for ([_][]const u8{ "made", "first" }) |ns| {
+            var info = try ctx.cli.run(&.{ "ns", "info", ns });
+            defer info.deinit();
+            try testing.expectEqual(@as(u8, 0), info.exit_code);
+            for (0..16) |i| {
+                const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+                const got = try ctx.execCapture(&.{ "kv", "get", k, "-n", ns });
+                try testing.expect(std.mem.indexOf(u8, got, try std.fmt.bufPrint(&vbuf, "{s}{d}", .{ ns, i })) != null);
+            }
+            // Every queue and stream replayed under its own namespace, none
+            // under "default".
+            const queues = try ctx.execCapture(&.{ "queue", "list", "-n", ns });
+            try testing.expect(std.mem.indexOf(u8, queues, "k15") != null);
+            const streams = try ctx.execCapture(&.{ "stream", "list", "-n", ns });
+            try testing.expect(std.mem.indexOf(u8, streams, "k15") != null);
+        }
+        const default_queues = try ctx.execCapture(&.{ "queue", "list" });
+        try testing.expect(std.mem.indexOf(u8, default_queues, "k15") == null);
+    }
+}
+
+test "e2e/namespace: on 4 shards, creates through connections on different shards give each name one id, and a second create is refused" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    var nbuf: [16]u8 = undefined;
+    // Each CLI call is a new connection, landing on any shard.
+    for (0..16) |i| try ctx.exec(&.{ "ns", "create", try std.fmt.bufPrint(&nbuf, "team{d}", .{i}) });
+    for (0..16) |i| {
+        var again = try ctx.cli.run(&.{ "ns", "create", try std.fmt.bufPrint(&nbuf, "team{d}", .{i}) });
+        defer again.deinit();
+        try testing.expectEqual(@as(u8, 3), again.exit_code);
+        try stdx.testing.assertStderrContains(again, "Error: namespace already exists [conflict]");
+    }
+    var json = try ctx.cli.run(&.{ "ns", "ls", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    // default and the 16, each once.
+    try testing.expectEqual(@as(usize, 17), std.mem.count(u8, json.stdout, "\"name\""));
+}

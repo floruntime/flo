@@ -1553,11 +1553,14 @@ pub const StreamProjection = struct {
     /// Register a stream name. No-op if already registered.
     /// Resolve a namespace hash to its name via the wired resolver, falling
     /// back to "default" (the implicit namespace, which is never registered).
-    pub fn resolveNamespace(self: *const StreamProjection, ns_hash: u32) []const u8 {
-        if (self.ns_resolver) |resolver| {
-            if (resolver(self.ns_resolver_ctx.?, ns_hash)) |name| return name;
-        }
-        return "default";
+    /// The namespace an entry's hash names, or null when the shard has
+    /// never bound it: the log is missing the namespace's create or bind, and
+    /// the applier halts rather than file the entry under another namespace.
+    /// Without a resolver (a projection on its own, in a test), every hash
+    /// is "default".
+    pub fn resolveNamespace(self: *const StreamProjection, ns_hash: u32) ?[]const u8 {
+        const resolver = self.ns_resolver orelse return "default";
+        return resolver(self.ns_resolver_ctx.?, ns_hash);
     }
 
     pub fn registerStream(self: *StreamProjection, name: []const u8) !void {

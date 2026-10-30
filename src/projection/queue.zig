@@ -360,11 +360,12 @@ pub const QueueProjection = struct {
     /// Register a queue name so it appears in `list` and stats are tracked per-queue.
     /// Resolve a namespace hash to its name via the wired resolver, falling back
     /// to "default" (the implicit namespace, which is never registered).
-    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) []const u8 {
-        if (self.ns_resolver) |resolver| {
-            if (resolver(self.ns_resolver_ctx.?, ns_hash)) |name| return name;
-        }
-        return "default";
+    /// The namespace an entry's hash names, or null when the shard has
+    /// never bound it (see `StreamProjection.resolveNamespace`). Without a
+    /// resolver, every hash is "default".
+    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) ?[]const u8 {
+        const resolver = self.ns_resolver orelse return "default";
+        return resolver(self.ns_resolver_ctx.?, ns_hash);
     }
 
     pub fn registerQueue(self: *QueueProjection, queue_name_hash: u64, name: []const u8, namespace: []const u8) !void {
@@ -590,13 +591,16 @@ pub const QueueProjection = struct {
                     payload = cmd.value[4..];
                 }
                 const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
+                // Before anything changes: a namespace this shard never bound
+                // halts here on every replica, never lands in "default".
+                const namespace = self.resolveNamespace(cmd.namespace_hash) orelse return error.Halt;
                 const seq = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
                 // Register queue during recovery so list works after restart. The entry
                 // only has the namespace hash; resolve the real namespace string when a
                 // resolver is wired (live enqueues already register the correct namespace
                 // before apply, so this primarily fixes restart/replay labeling).
                 if (cmd.key.len > 0) {
-                    self.registerQueue(q_name_hash, cmd.key, self.resolveNamespace(cmd.namespace_hash)) catch {};
+                    self.registerQueue(q_name_hash, cmd.key, namespace) catch {};
                 }
                 out.putInt(u64, seq);
             },
@@ -913,6 +917,32 @@ test "queue: projection handle with router" {
 
     try testing.expectEqual(router_mod.ApplyResult.applied, result);
     try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
+}
+
+test "queue: an enqueue in a namespace the shard never bound halts, and changes nothing" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
+    defer q.deinit();
+    const Bound = struct {
+        fn resolve(_: *anyopaque, ns_hash: u32) ?[]const u8 {
+            return if (ns_hash == 77) "orders" else null;
+        }
+    };
+    var ctx: u8 = 0;
+    q.ns_resolver = Bound.resolve;
+    q.ns_resolver_ctx = @ptrCast(&ctx);
+
+    var payload_buf: [64]u8 = undefined;
+    const bound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 77, "q", "\x00\x00\x00\x00one", &payload_buf).?;
+    var out = Result.start(&bound);
+    try q.applyEntry(&bound, &out);
+    try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
+
+    // Never refiled under "default": the log lacks the namespace's bind.
+    const unbound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 2, 2000, 78, "q", "\x00\x00\x00\x00two", &payload_buf).?;
+    var out2 = Result.start(&unbound);
+    try testing.expectError(error.Halt, q.applyEntry(&unbound, &out2));
+    try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
+    try testing.expectEqual(@as(usize, 1), q.readyCount());
 }
 
 test "queue: an ack or nack entry touches a message only in the queue it names" {

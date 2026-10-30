@@ -104,14 +104,14 @@ test "e2e/namespace: the dashboard refuses an invalid namespace name, and the no
 test "e2e/namespace: writes cannot create namespaces past the limit, and the refusal says so" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    // "default" is one of the 1024. The other 1023 go over one connection:
+    // "default" is one of the 4096. The other 4095 go over one connection:
     // a CLI process per write was most of this test's 28 s.
     var ep: [32]u8 = undefined;
     var client = cli.Client.init(testing.allocator, try std.fmt.bufPrint(&ep, "127.0.0.1:{d}", .{ctx.getPort()}));
     defer client.deinit();
     try client.connect();
     var buf: [16]u8 = undefined;
-    for (0..1024) |i| {
+    for (0..4096) |i| {
         const ns = if (i == 0) "default" else try std.fmt.bufPrint(&buf, "ns{d}", .{i});
         var resp = try cli.kv.set(&client, ns, "k", .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
         defer resp.deinit();
@@ -119,10 +119,10 @@ test "e2e/namespace: writes cannot create namespaces past the limit, and the ref
     }
     var over = try ctx.cli.run(&.{ "kv", "set", "k", "v", "-n", "one-more" });
     defer over.deinit();
-    try stdx.testing.assertStderrContains(over, "namespace limit reached (1024 per shard)");
+    try stdx.testing.assertStderrContains(over, "namespace limit reached (4096)");
     var create = try ctx.cli.run(&.{ "ns", "create", "one-more" });
     defer create.deinit();
-    try stdx.testing.assertStderrContains(create, "namespace limit reached (1024 per shard)");
+    try stdx.testing.assertStderrContains(create, "namespace limit reached (4096)");
     var info = try ctx.cli.run(&.{ "ns", "info", "one-more" });
     defer info.deinit();
     try testing.expectEqual(@as(u8, 1), info.exit_code);
