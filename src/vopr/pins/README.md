@@ -7,7 +7,7 @@ landed; CI checks that it still does.
 
 | Pin | Expected today | Why it exists |
 |---|---|---|
-| (none) | | |
+| `stale-member-wedge-catching-up.json` | convergence (`--catching-up` seed 117) | A wiped member restarts holding a config whose only voter has since been removed. It drops the leader's frames as a stranger's and stays stuck at the index it had: a restarted member can't vouch for the config it committed, because the committed config index isn't persisted. That fix makes it pass. |
 
 A pin is re-recorded from a fresh swarm when an unrelated fix shifts the interleaving
 enough that its seed no longer reaches the bug (`eviction-wedge.json` moved from seed

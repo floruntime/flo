@@ -218,7 +218,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.kv.field_deletes,
         },
     );
-    if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d}; applied created={d} stale_id={d} refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns.created, s.ns.stale_ids, s.ns.refusals });
+    if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
         var vbuf: [16384]u8 = undefined;

@@ -346,7 +346,7 @@ jobs:
         timeout-minutes: 20
       - name: Swarm with namespace creates and lagging applies
         # Nodes fall behind on applying and win elections that way; no
-        # namespace create a ready leader proposes may lose its id.
+        # namespace create may lose its id to another.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --catching-up --seed-timeout=120 --out-dir=/tmp/vopr-catching-up
         timeout-minutes: 20
       - name: Regression seeds stay green

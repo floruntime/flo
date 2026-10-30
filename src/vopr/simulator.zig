@@ -79,10 +79,10 @@ pub const Invariant = enum {
     /// An entry the KV machine refused changed a family anyway. Every
     /// replica would agree on it, so `state_checksum` can't see it.
     refusal_wrote,
-    /// A namespace create proposed by a leader that had applied every
-    /// earlier term's entry was refused because another create took its
-    /// id: the leader chose the id from state behind what was committed.
-    ns_ready_stale_id,
+    /// A namespace create was refused because another create took its id:
+    /// its leader chose the id from state behind what was committed, which
+    /// the readiness gate is there to prevent.
+    ns_stale_id,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -283,6 +283,10 @@ const SimNode = struct {
     /// The tick it applied each index at (index i at [i - 1]), for judging
     /// whether a crash could have erased what it applied.
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
+    /// When this node first saw each index committed: its apply can come
+    /// later, while it is paused.
+    learned_ticks: std.ArrayListUnmanaged(u64) = .empty,
+    learned_through: u64 = 0,
     /// The toy family it applies, and the index it last applied it at.
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
@@ -439,6 +443,10 @@ const NsSubmits = struct {
     /// Refused while the leader applied an earlier term's entries.
     catching_up: u64 = 0,
     refused: u64 = 0,
+    /// Not offered: the leader's families went stale in an apply rewind,
+    /// so its handler holds less than it applied. Production rebuilds the
+    /// shard instead.
+    stale_host: u64 = 0,
 };
 
 const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, kv: ?[SAMPLED]u64 };
@@ -742,6 +750,7 @@ pub const Summary = struct {
     /// What the workload's namespace creates came to: at submit, and at
     /// apply, each counted once.
     ns_submits: NsSubmits,
+    ns_stale_from_ready: u64,
     ns: families.Namespaces.Counts,
     violation_count: usize,
 };
@@ -799,9 +808,12 @@ pub const Simulator = struct {
     /// what their leaders did with them at submit.
     ns_counts: families.Namespaces.Counts = .{},
     ns_submits: NsSubmits = .{},
-    /// Whether the leader that proposed the create at (term, index) said
-    /// it was ready (`leaderReady`).
-    ns_ready: std.AutoHashMapUnmanaged([2]u64, bool) = .empty,
+    /// Of the stale-id refusals, those whose leader said it was ready.
+    ns_stale_from_ready: u64 = 0,
+    /// Whether the leader that proposed each create op said it was ready
+    /// (`leaderReady`). Keyed by op: under volatile hard state two leaders
+    /// can share a term, and so a (term, index).
+    ns_ready: std.AutoHashMapUnmanaged(u64, bool) = .empty,
     /// Apply pauses draw from their own stream, so a scenario without them
     /// replays as it did before they existed.
     lag_prng: PRNG,
@@ -891,6 +903,7 @@ pub const Simulator = struct {
             node.raft.deinit();
             node.disk.deinit();
             node.applied_ticks.deinit(self.allocator);
+            node.learned_ticks.deinit(self.allocator);
             node.counter.deinit(self.allocator);
             node.kv.deinit();
             node.ns.deinit();
@@ -1312,6 +1325,12 @@ pub const Simulator = struct {
         // commits: what the own-term gate is for, when an earlier term
         // left a change uncommitted.
         if (self.config_written and self.scenario.config_change_permille > 0 and self.prng.random().boolean()) self.randomChange(node);
+        // A create the moment a leader wins, while its earlier terms'
+        // tail is still unapplied: what the readiness gate is for.
+        if (self.scenario.namespace_creates) {
+            const op = self.workload.nextCreate() catch @panic("sim OOM");
+            self.submitCreate(node, op.id, op.payload) catch @panic("sim OOM");
+        }
     }
 
     /// A replica stopped taking part: its log contradicts history it
@@ -1320,7 +1339,7 @@ pub const Simulator = struct {
     /// The history it applied that the leader contradicts begins just
     /// past its rewound commit index. Only a crash at or after an ack for
     /// that entry left its sender, one network delay before this node
-    /// applied it, could have erased it.
+    /// learned it committed, could have erased it.
     fn onDiverged(self: *Simulator, node: *SimNode) void {
         // A leader said it applied the entry this node halted at. Every
         // replica here halts at the same entry on the same build, so none
@@ -1333,9 +1352,9 @@ pub const Simulator = struct {
             .detail = "a halted node was told a leader applied the entry it halted at",
         });
         const contradicted = node.raft.commit_index + 1;
-        const applied_at: ?u64 = if (contradicted <= node.applied_ticks.items.len) node.applied_ticks.items[contradicted - 1] else null;
+        const learned_at: ?u64 = if (contradicted <= node.learned_ticks.items.len) node.learned_ticks.items[contradicted - 1] else null;
         const erasable = self.scenario.durability == .async_flush and self.crashes > 0 and
-            (applied_at == null or self.latest_crash_at + self.scenario.msg_delay_max_ms >= applied_at.?);
+            (learned_at == null or self.latest_crash_at + self.scenario.msg_delay_max_ms >= learned_at.?);
         if (!erasable) self.checker.fail(.{
             .invariant = .divergence,
             .node = node.id,
@@ -1606,6 +1625,11 @@ pub const Simulator = struct {
         var name_buf: [64]u8 = undefined;
         const name = name_buf[0..c.name.len];
         @memcpy(name, c.name);
+        if (target.families_stale) {
+            self.ns_submits.stale_host += 1;
+            self.workload.markRefused(op_id);
+            return;
+        }
         // The mutants: Raft says ready whatever the leader has applied, or
         // once it has committed every earlier term's entry.
         const ready_index = target.raft.ready_index;
@@ -1635,7 +1659,7 @@ pub const Simulator = struct {
         const e = target.raft.log.getEntryCopy(res.index, self.apply_buf).?;
         self.workload.recordPayload(op_id, e.payload);
         self.workload.recordProposal(op_id, target.id, res.term, res.index);
-        try self.ns_ready.put(self.allocator, .{ res.term, res.index }, ready);
+        try self.ns_ready.put(self.allocator, op_id, ready);
         try self.pending_ops.append(self.allocator, op_id);
     }
 
@@ -1686,6 +1710,11 @@ pub const Simulator = struct {
         if (self.scenario.durability == .sync) {
             node.disk.flush();
             node.raft.markDurable(node.raft.log.lastIndex());
+        }
+        node.learned_through = @min(node.learned_through, node.raft.commit_index);
+        while (node.learned_through < node.raft.commit_index) : (node.learned_through += 1) {
+            if (node.learned_ticks.items.len <= node.learned_through) node.learned_ticks.append(self.allocator, 0) catch @panic("sim OOM");
+            node.learned_ticks.items[node.learned_through] = self.now;
         }
         // Paused only while faults run: convergence applies everything.
         if (self.phase == .safety and node.apply_paused_until > self.now) return;
@@ -1804,13 +1833,22 @@ pub const Simulator = struct {
         });
         if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e)) |effect| {
             if (first) self.ns_counts.count(effect);
-            if (effect == .stale_id and (self.ns_ready.get(.{ e.header.term, idx }) orelse false)) self.checker.fail(.{
-                .invariant = .ns_ready_stale_id,
-                .node = node.id,
-                .index = idx,
-                .tick = self.now,
-                .detail = "a namespace create its leader proposed once ready was refused for an id another create took",
-            });
+            // Every replica refuses it alike: once is enough.
+            if (first and effect == .stale_id) {
+                const op_id = Workload.opIdFromPayload(e.header.entry_type, e.payload);
+                const ready = if (op_id) |id| self.ns_ready.get(id) orelse false else false;
+                if (ready) self.ns_stale_from_ready += 1;
+                self.checker.fail(.{
+                    .invariant = .ns_stale_id,
+                    .node = node.id,
+                    .index = idx,
+                    .tick = self.now,
+                    .detail = if (ready)
+                        "a namespace create its leader proposed once ready was refused for an id another create took"
+                    else
+                        "a namespace create its leader proposed before it was ready was refused for an id another create took",
+                });
+            }
         } else |_| self.checker.fail(.{
             .invariant = .applied_integrity,
             .node = node.id,
@@ -2152,6 +2190,7 @@ pub const Simulator = struct {
             .kv = self.kv_counts,
             .ns_submits = self.ns_submits,
             .ns = self.ns_counts,
+            .ns_stale_from_ready = self.ns_stale_from_ready,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2878,7 +2917,7 @@ test "vopr sim: a truncated uncommitted config leaves the node with the members 
 /// fault the swarm has.
 const CATCHING_UP_SEEDS = [_]u64{ 1, 2, 3, 4 };
 
-test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no ready leader's create loses its id" {
+test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no create loses its id" {
     for (CATCHING_UP_SEEDS) |seed| {
         var sim = try Simulator.init(testing.allocator, Scenario.catchingUp(seed), .{});
         defer sim.deinit();
@@ -2897,17 +2936,17 @@ fn staleIdUnder(mutant: families.Mutant) !void {
         defer sim.deinit();
         _ = try sim.run();
         var caught = false;
-        for (sim.checker.violations.items) |v| caught = caught or v.invariant == .ns_ready_stale_id;
+        for (sim.checker.violations.items) |v| caught = caught or v.invariant == .ns_stale_id;
         errdefer std.debug.print("seed {d}: not caught\n", .{seed});
         try testing.expect(caught);
     }
 }
 
-test "vopr sim: a leader that creates namespaces before it is ready fails ns_ready_stale_id" {
+test "vopr sim: a leader that creates namespaces before it is ready fails ns_stale_id" {
     try staleIdUnder(.ns_ungated);
 }
 
-test "vopr sim: a leader ready once it has committed, not applied, earlier terms fails ns_ready_stale_id" {
+test "vopr sim: a leader ready once it has committed, not applied, earlier terms fails ns_stale_id" {
     // Only an apply pause leaves a committed tail unapplied at election:
     // without one these seeds never catch it.
     try staleIdUnder(.ns_ready_on_commit);

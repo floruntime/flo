@@ -126,6 +126,8 @@ pub const Workload = struct {
         self.allocator.free(self.scratch);
     }
 
+    pub const NewOp = struct { id: u64, entry_type: EntryType, payload: []const u8 };
+
     pub const Synthesized = struct {
         entry_type: EntryType,
         payload: []u8,
@@ -144,13 +146,7 @@ pub const Workload = struct {
         // Mix the op id so consecutive ids don't produce correlated
         // streams from the xorshift state.
         std.debug.assert(payload_max <= MAX_PAYLOAD);
-        if (d.creates and isCreate(seed, op_id)) {
-            // The leader chooses the id when it proposes the create, so the
-            // payload's hash is recorded then (`recordPayload`).
-            var name_buf: [17]u8 = undefined;
-            const out = namespace_entries.Create.encodeInto(buf[0..payload_max], .{ .name = createName(&name_buf, op_id), .id = 0 }) catch unreachable;
-            return .{ .entry_type = .namespace_create, .payload = buf[0..out.len], .hash = std.hash.Wyhash.hash(0x5EED, out) };
-        }
+        if (d.creates and isCreate(seed, op_id)) return createOf(buf[0..payload_max], op_id);
         var prng = PRNG.init(seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
         var entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
@@ -313,6 +309,14 @@ pub const Workload = struct {
     }
 
     /// Whether op `op_id` creates a namespace.
+    /// Op `op_id`'s create. The leader chooses the id when it proposes the
+    /// create, so the payload's hash is recorded then (`recordPayload`).
+    fn createOf(buf: []u8, op_id: u64) Synthesized {
+        var name_buf: [17]u8 = undefined;
+        const out = namespace_entries.Create.encodeInto(buf, .{ .name = createName(&name_buf, op_id), .id = 0 }) catch unreachable;
+        return .{ .entry_type = .namespace_create, .payload = buf[0..out.len], .hash = std.hash.Wyhash.hash(0x5EED, out) };
+    }
+
     pub fn isCreate(seed: u64, op_id: u64) bool {
         return std.hash.Wyhash.hash(seed ^ CREATE_SALT, std.mem.asBytes(&op_id)) % CREATE_EVERY == 0;
     }
@@ -335,10 +339,20 @@ pub const Workload = struct {
     /// Generate the next op. The payload points into the workload's
     /// scratch buffer — valid until the next `nextOp` or `expectedHash`
     /// call (both reuse `scratch`).
-    pub fn nextOp(self: *Workload) !struct { id: u64, entry_type: EntryType, payload: []const u8 } {
+    pub fn nextOp(self: *Workload) !NewOp {
+        return self.appendOp(synthesize(self.draws(), self.next_op_id, self.scratch));
+    }
+
+    /// The next op as a namespace create, whatever its id would draw: for
+    /// a leader that has just won. A JSON set before it may name a delete
+    /// this id would have drawn; that field just stays.
+    pub fn nextCreate(self: *Workload) !NewOp {
+        return self.appendOp(createOf(self.scratch, self.next_op_id));
+    }
+
+    fn appendOp(self: *Workload, gen: Synthesized) !NewOp {
         const id = self.next_op_id;
         self.next_op_id += 1;
-        const gen = synthesize(self.draws(), id, self.scratch);
         try self.ops.append(self.allocator, .{
             .id = id,
             .entry_type = gen.entry_type,
