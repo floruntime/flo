@@ -293,13 +293,17 @@ pub fn ShardWalker(comptime ResultT: type) type {
         /// last item taken. A page cut short resumes at its next item: by
         /// offset, or for a scan that pages itself, after the item taken
         /// last, which is its own cursor (`ResultT` is the name).
+        /// `result_buf` holds what the pages carry; only `limit` stops the
+        /// merge, so a page with nothing left moves on rather than resuming
+        /// the same shard forever.
         pub fn mergePages(self: *const Self, start: Start, pages: []const Page, limit: u32, result_buf: []ResultT, cursor_buf: []u8) WalkResult {
             var collected: usize = 0;
             for (pages, 0..) |page, i| {
                 const shard: u16 = start.shard + @as(u16, @intCast(i));
-                const room = @min(limit - collected, result_buf.len - collected);
+                const room = limit - collected;
                 if (room == 0) return .{ .items = result_buf[0..collected], .next_cursor = (Cursor{ .shard_id = shard, .local_cursor = null }).encode(cursor_buf) };
                 const take = @min(page.items.len, room);
+                std.debug.assert(collected + take <= result_buf.len);
                 @memcpy(result_buf[collected .. collected + take], page.items[0..take]);
                 collected += take;
                 if (take == page.items.len and !page.more) continue;
@@ -766,8 +770,11 @@ test "ShardWalker: asked pages, merged a window of shards at a time, return ever
                     else
                         walker.localPage(contexts[s], "", "", null, 0, limit);
                 }
+                // Sized to what the pages carry, as the shard's merge sizes it.
+                var carried: usize = 0;
+                for (asked[0 .. last - start.shard]) |p| carried += p.items.len;
                 var result_buf: [16][]const u8 = undefined;
-                const r = walker.mergePages(start, asked[0 .. last - start.shard], limit, &result_buf, &cursor_buf);
+                const r = walker.mergePages(start, asked[0 .. last - start.shard], limit, result_buf[0..carried], &cursor_buf);
                 try std.testing.expect(r.items.len <= limit);
                 for (r.items) |name| {
                     got[n_got] = name;
