@@ -1776,7 +1776,11 @@ pub const StreamHandler = struct {
                 const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
                 // Before anything changes: a namespace this shard never bound
                 // halts here on every replica, never lands in "default".
-                const ns = self.stream.resolveNamespace(cmd.namespace_hash) orelse return error.Halt;
+                // One whose create the log refused is refused here too.
+                const ns = (self.stream.resolveNamespace(cmd.namespace_hash) catch {
+                    out.refuse(.unavailable, .unclassified, stream_mod.NOT_CREATED_MESSAGE);
+                    return;
+                }) orelse return error.Halt;
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.

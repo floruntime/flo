@@ -2949,6 +2949,49 @@ test "e2e/processing: kv_lookup is refused on a server of more than one shard" {
     try testing.expect(!listed.contains("e2e-kvlookup-shards"));
 }
 
+test "e2e/processing: on 4 shards, stream sinks outside default on another shard are refused at submit, and in default they run" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "rv4" });
+    const sinks =
+        \\sources.[0].stream.name: rv-in
+        \\sinks.[0].stream.name: rv-out0
+        \\sinks.[1].stream.name: rv-out1
+        \\sinks.[2].stream.name: rv-out2
+        \\sinks.[3].stream.name: rv-out3
+        \\sinks.[4].stream.name: rv-out4
+        \\sinks.[5].stream.name: rv-out5
+        \\sinks.[6].stream.name: rv-out6
+        \\sinks.[7].stream.name: rv-out7
+    ;
+    const in_rv4 = try writeDottedToTempYaml(testing.allocator, "kind: Processing\nname: rv-pass\nnamespace: rv4\n" ++ sinks, "e2e-rv4.yaml");
+    defer cleanupTempFile(testing.allocator, in_rv4);
+    var refused = try ctx.cli.run(&.{ "processing", "submit", in_rv4, "-n", "rv4" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 3), refused.exit_code);
+    try testing.expect(refused.contains("sink outside the default namespace must be on the job's shard"));
+    var listed = try ctx.cli.run(&.{ "processing", "list", "-n", "rv4" });
+    defer listed.deinit();
+    try testing.expectEqual(@as(u8, 0), listed.exit_code);
+    try testing.expect(!listed.contains("rv-pass"));
+    // Every shard still takes writes in rv4.
+    var buf: [16]u8 = undefined;
+    for (0..8) |i| try ctx.exec(&.{ "stream", "append", try std.fmt.bufPrint(&buf, "rv-out{d}", .{i}), "direct", "-n", "rv4" });
+
+    // In default, the same sinks run, on every shard.
+    const in_default = try writeDottedToTempYaml(testing.allocator, "kind: Processing\nname: rv-pass\n" ++ sinks, "e2e-rv-default.yaml");
+    defer cleanupTempFile(testing.allocator, in_default);
+    const out = try ctx.execCapture(&.{ "processing", "submit", in_default });
+    _ = extractJobId(out) orelse return error.NoJobId;
+    try ctx.exec(&.{ "stream", "append", "rv-in", "hello-pipeline" });
+    for (0..8) |i| {
+        if (!try readStreamBlocking(ctx, try std.fmt.bufPrint(&buf, "rv-out{d}", .{i}), "default", "hello-pipeline", "8000")) {
+            ctx.dumpServerLogs();
+            return error.SinkRecordMissing;
+        }
+    }
+}
+
 test "e2e/processing: a key the engine doesn't run yet is refused by name, and window_count emits counts" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

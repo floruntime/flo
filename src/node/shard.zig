@@ -1086,11 +1086,13 @@ pub const Shard = struct {
     /// name via the shard's namespace registry. `ctx` is the (stable, heap-allocated)
     /// `*NamespaceHandler`, so this is safe to call during replay — before the
     /// shard's back-pointers are wired.
-    fn resolveQueueNamespace(ctx: *anyopaque, ns_hash: u32) ?[]const u8 {
+    fn resolveQueueNamespace(ctx: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 {
         const nh: *NamespaceHandler = @ptrCast(@alignCast(ctx));
         // An entry proposed with no namespace is the default one's.
         if (ns_hash == node_router.namespaceHash("")) return "default";
-        return nh.nameForHash(ns_hash);
+        if (nh.nameForHash(ns_hash)) |name| return name;
+        if (nh.createRefused(ns_hash)) return error.Refused;
+        return null;
     }
 
     /// Wire shard back-pointers into handlers that need Raft access.
@@ -8147,6 +8149,17 @@ fn entryAt(shard: *Shard, t: entry_mod.EntryType, from: u64) ?u64 {
     return null;
 }
 
+fn entriesOf(shard: *Shard, t: entry_mod.EntryType, from: u64) usize {
+    var n: usize = 0;
+    var i = from;
+    while (i <= shard.raft_node.log.lastIndex()) : (i += 1) {
+        if (shard.raft_node.log.getEntry(i)) |e| if (e.header.entry_type == @backingInt(t)) {
+            n += 1;
+        };
+    }
+    return n;
+}
+
 test "Shard: a write on shard 1 to a namespace nobody created is answered once, with shard 1's bind ahead of the write" {
     var two: TwoShards = undefined;
     try two.init();
@@ -8171,6 +8184,9 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     const bind = entryAt(b, .namespace_bind, from).?;
     const put = entryAt(b, .kv_put, from).?;
     try std.testing.expect(bind < put);
+    // Run once, and bound once.
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .kv_put, from));
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .namespace_bind, from));
     // Answered once: nothing more on the socket, no slot or gather left.
     try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, b, &out));
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
@@ -9795,6 +9811,69 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
     }
 }
 
+test "Shard: a write proposed behind a create the log refuses is refused too, and shard 0 doesn't halt" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    // A create an earlier leader committed that this one hasn't applied
+    // takes the next id first.
+    const C = @import("../protocol/namespace_entries.zig").Create;
+    var cbuf: [C.max_size]u8 = undefined;
+    _ = try a.raft_node.propose(.namespace_create, entry_mod.Flags.NONE, try C.encodeInto(&cbuf, .{ .name = "xold", .id = @import("../namespace/table.zig").FIRST_ALLOCATED }));
+    // A client's enqueue: the create, then the write.
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "ynew") == .go);
+    _ = try persistence_mod.proposeEntry(a, .queue_enqueue, entry_mod.Flags.NONE, "ynew", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+    two.settle();
+    try std.testing.expect(a.halted == null);
+    try std.testing.expect(!a.namespace_handler.namespaces.contains("ynew"));
+    try std.testing.expectEqual(@as(usize, 0), a.queue_handler.queue.readyCount());
+    // Once created, its writes land.
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "ynew") == .go);
+    _ = try persistence_mod.proposeEntry(a, .queue_enqueue, entry_mod.Flags.NONE, "ynew", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
+    two.settle();
+    try std.testing.expect(a.halted == null);
+    try std.testing.expectEqual(@as(usize, 1), a.queue_handler.queue.readyCount());
+}
+
+test "Shard: shard 0 creates no namespace until its leader has applied earlier terms' entries" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    // A leader whose earlier terms' tail hasn't applied here.
+    a.raft_node.ready_index = a.raft_node.last_applied + 1;
+    const last = a.raft_node.log.lastIndex();
+    switch (a.namespace_handler.prepareWrite(a, "fresh")) {
+        .refused => |r| {
+            try std.testing.expectEqual(proto.StatusCode.unavailable, r.status);
+            try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, r.message);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(last, a.raft_node.log.lastIndex());
+    // A namespace it knows needs nothing proposed, and goes.
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "default") == .go);
+    a.raft_node.ready_index = a.raft_node.last_applied;
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "fresh") == .go);
+}
+
+test "Shard: with every namespace id spent, a create is refused as such, not as an internal error" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    // Ids spent by creates refused or lost to leader changes.
+    a.namespace_handler.next_alloc = @import("../namespace/table.zig").CAPACITY;
+    switch (a.namespace_handler.prepareWrite(a, "fresh")) {
+        .refused => |r| {
+            try std.testing.expectEqual(proto.StatusCode.bad_request, r.status);
+            try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.IDS_USED_UP_MESSAGE, r.message);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "Shard: a publish that fails partway publishes the rest next tick, and none twice" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -10693,6 +10772,42 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
     try std.testing.expectEqualStrings("bad request: only writes are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: a create not on disk by its deadline is answered unavailable, once" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    // Proposed, never committed: the peer doesn't answer.
+    shard.runRequest(conn, try ParkTest.request(.namespace_create, 50, "", "late", "", ""), .client);
+    const nh = shard.namespace_handler;
+    try std.testing.expectEqual(@as(usize, 1), nh.waiters.items.len);
+    nh.settle(&shard);
+    try std.testing.expectEqual(@as(usize, 1), nh.waiters.items.len);
+    nh.waiters.items[0].deadline_ms = 0;
+    nh.settle(&shard);
+    try std.testing.expectEqual(@as(usize, 0), nh.waiters.items.len);
+    var buf: [512]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.FLUSH_MESSAGE, (try one[0].refused()).message);
+    // It commits later and is published, with no one left to answer.
+    try ParkTest.ack(&shard);
+    nh.settle(&shard);
+    try std.testing.expect(shard.namespace_handler.table.lookup("late") != null);
 }
 
 test "Shard: a write to a new namespace holds its room before it commits, so writes in flight cannot overshoot the limit" {

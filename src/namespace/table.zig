@@ -5,9 +5,9 @@
 //! Shared across shard threads, an exception to a shard's state being its
 //! own thread's. It is safe because the table only grows: an entry, once
 //! published, never changes or goes. A publish writes the name, then
-//! release-stores its length, then release-CASes the id into the index
-//! slot, then release-stores `version` and `published_index`. A reader
-//! that acquire-loads an index slot or an id's length sees the whole name
+//! release-stores its length, then release-stores the id into its index
+//! slot, then release-stores `published_index`. A reader that
+//! acquire-loads an index slot or an id's length sees the whole name
 //! behind it, and one that reads `published_index` sees every entry
 //! published at or below it. Readers take no lock and never wait.
 
@@ -44,10 +44,6 @@ pub const Table = struct {
     lens: [CAPACITY]Atomic(u32) = @splat(.init(0)),
     /// Name hash → id; 0 is an empty slot.
     index: [INDEX_SLOTS]Atomic(Id) = @splat(.init(INVALID)),
-    /// Moves on every change.
-    version: Atomic(u64) = .init(0),
-    /// Moves only on a removal or a key change; nothing removes yet.
-    binding_epoch: Atomic(u64) = .init(0),
     /// Shard 0's log index of the last change the table holds. Every entry
     /// at or below it is published.
     published_index: Atomic(u64) = .init(0),
@@ -91,13 +87,6 @@ pub const Table = struct {
                 break;
             }
         }
-        _ = self.version.fetchAdd(1, .release);
-        if (index > self.published_index.load(.monotonic)) self.published_index.store(index, .release);
-    }
-
-    /// The published index moves with no new name, for a change the table
-    /// holds no entry for.
-    pub fn advance(self: *Table, index: u64) void {
         if (index > self.published_index.load(.monotonic)) self.published_index.store(index, .release);
     }
 
@@ -146,17 +135,13 @@ test "namespace table: default and _flo are published from the start, and nothin
 test "namespace table: a published name is found by name and by id, and the index moves forward only" {
     const t = try Table.create(testing.allocator);
     defer t.destroy();
-    const before = t.version.load(.monotonic);
     try t.publish(FIRST_ALLOCATED, "orders", 9);
     try testing.expectEqual(@as(?Id, FIRST_ALLOCATED), t.lookup("orders"));
     try testing.expectEqualStrings("orders", t.nameOf(FIRST_ALLOCATED).?);
     try testing.expectEqual(@as(u64, 9), t.publishedIndex());
-    try testing.expectEqual(before + 1, t.version.load(.monotonic));
-    t.advance(7);
+    // A publish at a lower index leaves it where it was.
+    try t.publish(FIRST_ALLOCATED + 1, "ledger", 7);
     try testing.expectEqual(@as(u64, 9), t.publishedIndex());
-    t.advance(12);
-    try testing.expectEqual(@as(u64, 12), t.publishedIndex());
-    try testing.expectEqual(@as(u64, 0), t.binding_epoch.load(.monotonic));
 }
 
 test "namespace table: it holds every id it can, and every name is found" {
@@ -171,8 +156,6 @@ test "namespace table: it holds every id it can, and every name is found" {
 }
 
 test "namespace table: readers racing the publisher see whole names, and everything up to the published index" {
-    const t = try Table.create(testing.allocator);
-    defer t.destroy();
     const Shared = struct {
         t: *Table,
         done: Atomic(bool) = .init(false),
@@ -186,6 +169,20 @@ test "namespace table: readers racing the publisher see whole names, and everyth
         fn read(s: *@This()) void {
             var buf: [48]u8 = undefined;
             while (!s.done.load(.acquire)) {
+                // Past the published index, an id being published right
+                // now: its length or its index slot, once seen, must
+                // bring the whole name with it.
+                const frontier = s.t.publishedIndex() + 1;
+                var probe: Id = @intCast(@max(frontier, FIRST_ALLOCATED));
+                while (probe < @min(frontier + 4, CAPACITY)) : (probe += 1) {
+                    const want = name(&buf, probe);
+                    if (s.t.nameOf(probe)) |got| {
+                        if (!std.mem.eql(u8, got, want)) _ = s.bad.fetchAdd(1, .monotonic);
+                    }
+                    if (s.t.lookup(want)) |found| {
+                        if (found != probe) _ = s.bad.fetchAdd(1, .monotonic);
+                    }
+                }
                 // Everything at or below the published index is there, whole.
                 const upto = s.t.publishedIndex();
                 var id: Id = FIRST_ALLOCATED;
@@ -202,15 +199,21 @@ test "namespace table: readers racing the publisher see whole names, and everyth
             }
         }
     };
-    var shared: Shared = .{ .t = t };
-    var readers: [4]std.Thread = undefined;
-    for (&readers) |*r| r.* = try std.Thread.spawn(.{}, Shared.read, .{&shared});
-    var buf: [48]u8 = undefined;
-    var id: Id = FIRST_ALLOCATED;
-    // The id doubles as the index it was published at.
-    while (id < CAPACITY) : (id += 1) try t.publish(id, Shared.name(&buf, id), id);
-    shared.done.store(true, .release);
-    for (readers) |r| r.join();
-    try testing.expectEqual(@as(u32, 0), shared.bad.load(.monotonic));
-    try testing.expect(shared.checks.load(.monotonic) > 0);
+    // Several fresh tables, each filled while readers race it, so a
+    // reordered store has many chances to be seen.
+    for (0..16) |_| {
+        const t = try Table.create(testing.allocator);
+        defer t.destroy();
+        var shared: Shared = .{ .t = t };
+        var readers: [4]std.Thread = undefined;
+        for (&readers) |*r| r.* = try std.Thread.spawn(.{}, Shared.read, .{&shared});
+        var buf: [48]u8 = undefined;
+        var id: Id = FIRST_ALLOCATED;
+        // The id doubles as the index it was published at.
+        while (id < CAPACITY) : (id += 1) try t.publish(id, Shared.name(&buf, id), id);
+        shared.done.store(true, .release);
+        for (readers) |r| r.join();
+        try testing.expectEqual(@as(u32, 0), shared.bad.load(.monotonic));
+        try testing.expect(shared.checks.load(.monotonic) > 0);
+    }
 }

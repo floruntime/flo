@@ -251,6 +251,10 @@ pub const NamespaceHandler = struct {
     /// Namespace hash → name, for the appliers that see only the hash on
     /// every committed entry. Kept in step with `namespaces`.
     names_by_hash: std.AutoHashMap(u32, []const u8),
+    /// Shard 0: hashes of names whose create this log refused for its id
+    /// or the room, and that were never created after. A write proposed
+    /// behind such a create is refused at apply, the same on every replica.
+    refused_hashes: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// A page of names, built for each namespace.list answer.
     list_buf: ?[]u8 = null,
 
@@ -263,12 +267,21 @@ pub const NamespaceHandler = struct {
     /// A create whose id another took first, after a leader change: its
     /// leader proposes it again with a fresh id.
     pub const STALE_ID_MESSAGE = "unavailable: the namespace's id was taken by another create; retry";
-    /// How long a request waits for its namespace's create to reach disk.
-    pub const PUBLISH_WAIT_MS: u64 = 5_000;
+    /// How long a request waits for its namespace's create to reach disk:
+    /// a write held on another shard asks through a gather part, whose
+    /// deadline this is, so a create and a held write are told at once,
+    /// and both under the SDKs' 5 s request timeout.
+    pub const PUBLISH_WAIT_MS: u64 = @import("../node/reply_pool.zig").DEADLINE_MS;
     /// A sink's write to a namespace this shard can't create, and the node
     /// doesn't know yet.
     pub const UNKNOWN_HERE_MESSAGE = "unavailable: the namespace isn't created yet; create it first (flo namespace create)";
-    pub const FLUSH_MESSAGE = "unavailable: cannot flush to disk; the namespace isn't created yet — retry";
+    /// Every id is taken: ids aren't reused, and a create refused or lost
+    /// to a leader change spends one, so this can come below the limit.
+    pub const IDS_USED_UP_MESSAGE = "namespace not created: this node has no namespace id left";
+    /// Shard 0's leader hasn't applied what earlier leaders committed, so
+    /// it can't yet choose an id or count the room.
+    pub const CATCHING_UP_MESSAGE = "unavailable: a new leader is catching up; the namespace wasn't created — retry";
+    pub const FLUSH_MESSAGE = "unavailable: the namespace isn't on disk yet; it may still be created — retry";
 
     /// `name` is the registry's copy.
     const Unpublished = struct { index: u64, id: ns_table.Id, name: []const u8 };
@@ -339,6 +352,7 @@ pub const NamespaceHandler = struct {
         }
         self.namespaces.deinit();
         self.names_by_hash.deinit();
+        self.refused_hashes.deinit(self.allocator);
         if (self.list_buf) |b| self.allocator.free(b);
         self.unpublished.deinit(self.allocator);
         for (self.waiters.items) |w| self.freeWaiter(w);
@@ -478,6 +492,11 @@ pub const NamespaceHandler = struct {
         return self.names_by_hash.get(hash);
     }
 
+    /// Whether this log refused the create of the name with this hash.
+    pub fn createRefused(self: *const NamespaceHandler, hash: u32) bool {
+        return self.refused_hashes.contains(hash);
+    }
+
     /// Apply a committed namespace creation to the local registry. The
     /// name, its id and the cap are checked again here, the same on every
     /// replica, whatever proposed it.
@@ -553,7 +572,7 @@ pub const NamespaceHandler = struct {
         return 0;
     }
 
-    pub const Error = error{ OutOfMemory, Exists, NoNamespace, DeleteRefused, LeaderUnknown, WritesStopped, TooManyProposals, Internal };
+    pub const Error = error{ OutOfMemory, Exists, NoNamespace, DeleteRefused, LeaderUnknown, WritesStopped, TooManyProposals, IdsUsedUp, Internal };
 
     pub fn refusal(err: Error) table_run.Refused {
         return switch (err) {
@@ -564,6 +583,7 @@ pub const NamespaceHandler = struct {
             error.LeaderUnknown => refused(.unavailable, .leader_unknown, persistence_mod.failureMessage(error.NotLeader, "")),
             error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
+            error.IdsUsedUp => refused(.bad_request, .unclassified, IDS_USED_UP_MESSAGE),
             error.Internal => refused(.internal_error, .internal, "internal error: the request couldn't be run"),
         };
     }
@@ -578,6 +598,7 @@ pub const NamespaceHandler = struct {
             error.WritesStopped => error.WritesStopped,
             error.Overloaded => error.TooManyProposals,
             error.OutOfMemory => error.OutOfMemory,
+            error.NamespacesFull => error.IdsUsedUp,
             else => error.Internal,
         };
     }
@@ -625,6 +646,7 @@ pub const NamespaceHandler = struct {
             if (kind == .create) as = .joined;
         } else {
             if (self.createRefusal(name)) |r| return .{ .refused = .{ .status = r.status, .refusal = proto.notRun(r.message) } };
+            if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = proto.notRun(CATCHING_UP_MESSAGE) } };
             _ = proposeCreate(shard, name) catch |err| return proposeError(err);
             self.notePending(name);
         }
@@ -663,6 +685,7 @@ pub const NamespaceHandler = struct {
         if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return .go;
         if (self.owner) {
             if (self.createRefusal(name)) |r| return .{ .refused = r };
+            if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .message = CATCHING_UP_MESSAGE } };
             _ = proposeCreate(shard, name) catch |err| return .{ .refused = refusalOf(proposeError(err)) };
             self.notePending(name);
             return .go;
@@ -686,7 +709,7 @@ pub const NamespaceHandler = struct {
             defer self.allocator.free(r.name);
             // A create that lost its id to a leader change is proposed
             // again, by the leader, with a fresh one.
-            if (r.status == .unavailable and shard.raft_node.role == .leader and self.hasWaiter(r.name)) {
+            if (r.status == .unavailable and shard.raft_node.leaderReady() and self.hasWaiter(r.name)) {
                 if (proposeCreate(shard, r.name)) |_| {
                     self.notePending(r.name);
                     continue;
@@ -877,7 +900,13 @@ pub const NamespaceHandler = struct {
                 // Only shard 0 logs creates; one elsewhere was never proposed.
                 if (!self.owner) return error.Halt;
                 if (self.pending_creates.fetchRemove(c.name)) |kv| self.allocator.free(kv.key);
-                const refused_create: ?RefusedCreate = switch (self.applyCreateAt(c.name, c.id, entry.header.timestamp_ns, entry.header.index)) {
+                const outcome = self.applyCreateAt(c.name, c.id, entry.header.timestamp_ns, entry.header.index);
+                switch (outcome) {
+                    .created => _ = self.refused_hashes.remove(router.namespaceHash(c.name)),
+                    .stale_id, .full => try self.refused_hashes.put(self.allocator, router.namespaceHash(c.name), {}),
+                    else => {},
+                }
+                const refused_create: ?RefusedCreate = switch (outcome) {
                     .created => null,
                     .existed => .{ .name = c.name, .status = .conflict, .message = "namespace already exists" },
                     .invalid => .{ .name = c.name, .status = .bad_request, .message = nameRefusal(c.name) orelse "invalid namespace name" },

@@ -22,6 +22,7 @@ const Order = std.math.Order;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
 const node_router = @import("../node/router.zig");
+const NOT_CREATED_MESSAGE = @import("stream.zig").NOT_CREATED_MESSAGE;
 
 const Entry = entry_mod.Entry;
 const Result = router_mod.Result;
@@ -169,7 +170,7 @@ pub const QueueProjection = struct {
     /// queue_enqueue entry carries only the namespace hash, so on replay the
     /// apply path can't recover the namespace string on its own; this lets it
     /// register the queue under its real namespace instead of "default".
-    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) ?[]const u8 = null,
+    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
 
     pub const Lane = struct {
@@ -363,7 +364,7 @@ pub const QueueProjection = struct {
     /// The namespace an entry's hash names, or null when the shard has
     /// never bound it (see `StreamProjection.resolveNamespace`). Without a
     /// resolver, every hash is "default".
-    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) ?[]const u8 {
+    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) error{Refused}!?[]const u8 {
         const resolver = self.ns_resolver orelse return "default";
         return resolver(self.ns_resolver_ctx.?, ns_hash);
     }
@@ -593,7 +594,11 @@ pub const QueueProjection = struct {
                 const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
                 // Before anything changes: a namespace this shard never bound
                 // halts here on every replica, never lands in "default".
-                const namespace = self.resolveNamespace(cmd.namespace_hash) orelse return error.Halt;
+                // One whose create the log refused is refused here too.
+                const namespace = (self.resolveNamespace(cmd.namespace_hash) catch {
+                    out.refuse(.unavailable, .unclassified, NOT_CREATED_MESSAGE);
+                    return;
+                }) orelse return error.Halt;
                 const seq = try self.enqueue(entry.header.index, priority, entry.header.timestamp_ns, q_name_hash, payload);
                 // Register queue during recovery so list works after restart. The entry
                 // only has the namespace hash; resolve the real namespace string when a
@@ -923,7 +928,7 @@ test "queue: an enqueue in a namespace the shard never bound halts, and changes 
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer q.deinit();
     const Bound = struct {
-        fn resolve(_: *anyopaque, ns_hash: u32) ?[]const u8 {
+        fn resolve(_: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 {
             return if (ns_hash == 77) "orders" else null;
         }
     };
