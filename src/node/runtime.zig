@@ -1092,10 +1092,8 @@ pub const Runtime = struct {
         }
         self.peer_stream_handlers_slice = handlers;
 
-        const partition_count = shards[0].router.partition_count;
-        const shard_count = shards[0].router.shard_count;
         for (0..n) |i| {
-            shards[i].processing_handler.setPeerStreamHandlers(handlers, partition_count, shard_count);
+            shards[i].processing_handler.setPeerStreamHandlers(handlers);
         }
     }
 
@@ -1109,7 +1107,7 @@ pub const Runtime = struct {
         self.peer_kv_handlers_slice = handlers;
 
         for (0..n) |i| {
-            shards[i].processing_handler.setPeerKvHandlers(handlers, shards[i].id);
+            shards[i].processing_handler.setPeerKvHandlers(handlers);
         }
     }
 

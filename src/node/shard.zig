@@ -735,8 +735,11 @@ pub const Shard = struct {
         const processing_handler = try allocator.create(ProcessingHandler);
         errdefer allocator.destroy(processing_handler);
         processing_handler.* = ProcessingHandler.init(allocator);
-        // Set before the log replays: whether a stored job starts depends on it.
+        // Set before the log replays: whether a stored job starts depends on
+        // them (a kv_lookup, a sink on another shard).
         processing_handler.peer_shard_count = shard_count;
+        processing_handler.peer_partition_count = Router.init(partition_count, shard_count, shard_id).partition_count;
+        processing_handler.own_shard = shard_id;
 
         // Create SegmentWriter (persistence — per-shard, not per-partition)
         const seg_writer = try allocator.create(SegmentWriter);
@@ -1090,6 +1093,7 @@ pub const Shard = struct {
         const nh: *NamespaceHandler = @ptrCast(@alignCast(ctx));
         // An entry proposed with no namespace is the default one's.
         if (ns_hash == node_router.namespaceHash("")) return "default";
+        // The name first: one created after an earlier refusal resolves.
         if (nh.nameForHash(ns_hash)) |name| return name;
         if (nh.createRefused(ns_hash)) return error.Refused;
         return null;
@@ -9834,6 +9838,24 @@ test "Shard: a write proposed behind a create the log refuses is refused too, an
     two.settle();
     try std.testing.expect(a.halted == null);
     try std.testing.expectEqual(@as(usize, 1), a.queue_handler.queue.readyCount());
+    // The refusal is forgotten once the name is created, so the record
+    // holds only names that were never created.
+    try std.testing.expect(!a.namespace_handler.createRefused(node_router.namespaceHash("ynew")));
+}
+
+test "Shard: a shard's processing knows its shard and the partitions before the log replays" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // 0 partitions: the router's default, as a server is started with.
+    var shard = try Shard.init(std.testing.allocator, 2, 4, 0, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    // A stored job's sinks are checked against these as it replays, before
+    // the runtime wires the shards to each other.
+    try std.testing.expectEqual(@as(u16, 4), shard.processing_handler.peer_shard_count);
+    try std.testing.expectEqual(shard.router.partition_count, shard.processing_handler.peer_partition_count);
+    try std.testing.expect(shard.processing_handler.peer_partition_count > 0);
+    try std.testing.expectEqual(@as(u16, 2), shard.processing_handler.own_shard);
 }
 
 test "Shard: shard 0 creates no namespace until its leader has applied earlier terms' entries" {

@@ -263,17 +263,14 @@ pub const ProcessingHandler = struct {
 
     /// Wire cross-shard stream handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler, partition_count: u32, shard_count: u16) void {
+    pub fn setPeerStreamHandlers(self: *ProcessingHandler, handlers: []const *stream_handler_mod.StreamHandler) void {
         self.peer_stream_handlers = handlers;
-        self.peer_partition_count = partition_count;
-        self.peer_shard_count = shard_count;
     }
 
     /// Wire cross-shard KV handler references.
     /// Called by Runtime after all shards are initialized.
-    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler, own_shard: u16) void {
+    pub fn setPeerKvHandlers(self: *ProcessingHandler, handlers: []const *kv_handler_mod.KVHandler) void {
         self.peer_kv_handlers = handlers;
-        self.own_shard = own_shard;
     }
 
     /// Wire cross-shard TS handler references (for TS sinks).
@@ -2432,7 +2429,7 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
     defer handler.deinit();
     handler.peer_partition_count = 8;
     handler.peer_shard_count = 2;
-    handler.setPeerKvHandlers(&peers, 0);
+    handler.setPeerKvHandlers(&peers);
 
     // A key whose hash names shard 1, written here (as a routing key does).
     var elsewhere: []const u8 = "";
