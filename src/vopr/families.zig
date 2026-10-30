@@ -7,10 +7,17 @@
 //! must agree on it, and so must a replica that rebuilt by replay after a
 //! restart and one that applied the same entries live.
 //!
+//! `Kv` is the server's own KV machine on a store of its own, compared by
+//! the contract's canonical checksum of each of its families.
+//!
 //! `Mutant` plants the bugs this check exists to catch, one at a time.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
+const persistence = @import("../storage/persistence.zig");
+const store_mod = @import("../contract/store.zig");
+const machine_mod = @import("../contract/machine.zig");
+const kv_machine = @import("../kv/machine.zig");
 
 const Allocator = std.mem.Allocator;
 const HASH_SEED: u64 = 0xFA81_17E5;
@@ -29,6 +36,8 @@ pub const Mutant = enum {
     /// Part of an entry's effect runs only when it applies live (a
     /// post-apply hook that owns state), so replay rebuilds less.
     live_only_effect,
+    /// A replica rebuilding by replay skips KV's batches.
+    kv_replay_skips_batches,
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -123,6 +132,55 @@ pub const Counter = struct {
     }
 };
 
+/// KV as the server applies it: its machine, on a store of this replica's
+/// own. The store is strict, so an applier touching a key its entry didn't
+/// declare fails the run; VOPR builds ReleaseSafe, where a store would only
+/// count it.
+pub const Kv = struct {
+    store: store_mod.Store,
+    scratch: std.heap.ArenaAllocator,
+
+    /// The families compared, in the order `checksums` returns them.
+    pub const FAMILIES = [_]u16{ kv_machine.Values.ID, kv_machine.History.ID, kv_machine.NsCounts.ID };
+
+    pub fn init(allocator: Allocator) Kv {
+        var kv: Kv = .{ .store = store_mod.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator) };
+        kv.store.strict_keys = true;
+        return kv;
+    }
+
+    pub fn deinit(self: *Kv) void {
+        self.store.deinit();
+        self.scratch.deinit();
+    }
+
+    /// Empty, as a restarted replica starts; still strict.
+    pub fn reset(self: *Kv) void {
+        self.store.clear();
+        std.debug.assert(self.store.strict_keys);
+    }
+
+    pub fn owns(entry_type: u8) bool {
+        return kv_machine.owns(@fromBackingInt(entry_type));
+    }
+
+    /// Apply `e` as the shard does. A refusal is an answer, not an error;
+    /// an error (a halt, out of memory) is one a workload entry must never
+    /// meet.
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) persistence.ApplyError!void {
+        if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return;
+        var out: persistence.Result = .{};
+        out.reset(e);
+        try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
+    }
+
+    pub fn checksums(self: *Kv) [FAMILIES.len]u64 {
+        var sums: [FAMILIES.len]u64 = undefined;
+        for (FAMILIES, &sums) |fam, *sum| sum.* = store_mod.checksum(&self.store, fam);
+        return sums;
+    }
+};
+
 const testing = std.testing;
 
 fn put(c: *Counter, payload: []const u8, stamp: u64, r: Replica) Outcome {
@@ -160,4 +218,20 @@ test "families: a refused put leaves the state as it was" {
     const before = c.checksum(.none);
     try testing.expectEqual(Outcome.refused, put(&c, &payload, 2, live));
     try testing.expectEqual(before, c.checksum(.none));
+}
+
+test "families: a KV replica's store is strict, and stays so once reset" {
+    var kv = Kv.init(testing.allocator);
+    defer kv.deinit();
+    try testing.expect(kv.store.strict_keys);
+    var body_buf: [64]u8 = undefined;
+    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = "k", .value = "v", .ttl_ms = null });
+    var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
+    e.header.crc32c = e.computeCrc();
+    const empty = kv.checksums();
+    try kv.apply(&e, .{ .mutant = .none, .node_now = 0, .leader = false, .live = true });
+    try testing.expect(kv.checksums()[0] != empty[0]);
+    kv.reset();
+    try testing.expect(kv.store.strict_keys);
+    try testing.expectEqual(empty, kv.checksums());
 }
