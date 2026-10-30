@@ -361,8 +361,16 @@ jobs:
         # green means that fix landed and the pin should be retired here.
         # A pin may be a genuine hang, so every pin runs under a timeout —
         # a kill (exit 124) still counts as failing by design.
+        # The README's table names every pin, so a pin deleted or added
+        # without it fails here rather than leaving the loop with less to do.
         run: |
           shopt -s nullglob
+          files=$(for f in src/vopr/pins/*.json; do basename "$f"; done | sort)
+          listed=$({ grep -oE '^\| `?[A-Za-z0-9._-]+\.json`? \|' src/vopr/pins/README.md || true; } | tr -d '|` ' | sort)
+          if [ "$files" != "$listed" ]; then
+            echo "::error::src/vopr/pins holds [$(echo $files)] but its README lists [$(echo $listed)]"; exit 1
+          fi
+          [ -n "$files" ] || echo "no pins: the README lists none, and none exist"
           for pin in src/vopr/pins/*.json; do
             if timeout 300 ./zig-out/bin/vopr --scenario-in="$pin" > /dev/null 2>&1; then
               echo "::error::$pin passed — its product fix landed; retire the pin"; exit 1
