@@ -864,11 +864,11 @@ pub const NamespaceHandler = struct {
         failed: Error,
     };
 
-    /// Shard 0's leader proposes a create of `name`, a name this node
-    /// doesn't know, unless the name, the room or its id refuses it, or
-    /// the leader hasn't applied every earlier term's entry: the id comes
-    /// from what it has applied, so until then it may be one an earlier
-    /// leader's create already took.
+    /// Shard 0's leader proposes a create of `name`, which the caller has
+    /// checked this node doesn't know, unless the name, the room or its id
+    /// refuses it, or the leader hasn't applied every earlier term's
+    /// entry: the id comes from what it has applied, so until then it may
+    /// be one an earlier leader's create already took.
     pub fn proposeCreateOn(self: *NamespaceHandler, raft: *RaftNode, name: []const u8) CreateProposal {
         if (self.createRefusal(name)) |r| return .{ .refused = r };
         if (!raft.leaderReady()) return .{ .refused = .{ .status = .unavailable, .message = CATCHING_UP_MESSAGE } };
