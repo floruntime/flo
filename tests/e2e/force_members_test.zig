@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const data_format = @import("src").node.data_format;
 const ServerProcess = stdx.testing.ServerProcess;
 const CliRunner = stdx.testing.CliRunner;
 
@@ -95,16 +96,16 @@ test "e2e/cluster: inspect and force-members refuse a data dir of another format
     var older = try offline.runRaw(&.{ "server", "inspect", "--config", node.config_file, "--data-dir", node.data_dir });
     defer older.deinit();
     try testing.expectEqual(@as(u8, 78), older.exit_code);
-    const before_gating = try std.fmt.allocPrint(allocator, "Error: data directory {s} was written by an older Flo (before format gating); this server needs format 2. There is no migration: run flo server wipe --data-dir {s}", .{ node.data_dir, node.data_dir });
+    const before_gating = try std.fmt.allocPrint(allocator, "Error: data directory {s} was written by an older Flo (before format gating); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ node.data_dir, data_format.CURRENT, node.data_dir });
     defer allocator.free(before_gating);
     try testing.expectEqualStrings(before_gating, std.mem.trim(u8, older.stderr, &std.ascii.whitespace));
     try testing.expectError(error.FileNotFound, stdx.fs.openFile(path, .{}));
 
     // A newer flo wrote it.
     const f = try stdx.fs.createFile(path, .{ .truncate = true });
-    try stdx.fs.writeAll(f, "3\n");
+    try stdx.fs.writeAll(f, std.fmt.comptimePrint("{d}\n", .{data_format.CURRENT + 1}));
     stdx.fs.closeFile(f);
-    const want = try std.fmt.allocPrint(allocator, "Error: data directory format 3, this binary reads format 2 ({s}); start a flo that reads format 3", .{path});
+    const want = try std.fmt.allocPrint(allocator, "Error: data directory format {d}, this binary reads format {d} ({s}); start a flo that reads format {d}", .{ data_format.CURRENT + 1, data_format.CURRENT, path, data_format.CURRENT + 1 });
     defer allocator.free(want);
     for ([_][]const []const u8{
         &.{ "server", "inspect", "--config", node.config_file, "--data-dir", node.data_dir },

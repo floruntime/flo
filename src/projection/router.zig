@@ -214,7 +214,7 @@ const RouteTarget = enum(u8) {
 pub fn routeTarget(entry_type: EntryType) RouteTarget {
     return switch (entry_type) {
         // KV: its contract machine (kv/machine.zig).
-        .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire => .none,
+        .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => .none,
 
         // Consumer-group durability: cg_commit / cg_delete carry
         // consumer-group state, which lives on the StreamProjection. They are

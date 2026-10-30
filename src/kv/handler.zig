@@ -48,6 +48,7 @@ const schema = @import("../protocol/schema.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const json_path = @import("../util/json_path.zig");
 const json_depth = @import("../util/json_depth.zig");
+const kv_machine = @import("machine.zig");
 const table_run = @import("../node/table_run.zig");
 const mget_mod = @import("mget.zig");
 const gather_mod = @import("../node/gather.zig");
@@ -63,9 +64,9 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const RaftNetwork = network_mode.RaftNetwork;
 
-/// The largest single-key KV entry, a put: what `proposeKV` borrows
-/// scratch for. A transaction's batch is larger and allocated.
-pub const MAX_KEY_ENTRY_PAYLOAD: usize = kv_entries.Put.max_size;
+/// The largest single-key KV entry: what `proposeKV` borrows scratch for.
+/// A transaction's batch is larger and allocated.
+pub const MAX_KEY_ENTRY_PAYLOAD: usize = @max(kv_entries.Put.max_size, kv_entries.JsonPatch.max_size);
 
 /// Re-export from centralized namespace module for local convenience.
 const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
@@ -203,14 +204,14 @@ pub const KVHandler = struct {
             error.WritesStopped => refused(.unavailable, .writes_stopped, persistence_mod.failureMessage(error.WritesStopped, "")),
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
             error.AnswerTooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the JSON at that path is more than an answer holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
-            error.TooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the value to write is more than a key holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
-            error.NotACounter => refused(.bad_request, .wrong_type, "bad request: the key's value isn't an 8-byte counter"),
-            error.CounterOverflow => refused(.bad_request, .out_of_range, "bad request: delta would take the counter past an i64"),
-            error.PathNotFound => refused(.not_found, .not_found, "not found: nothing at that path in the document"),
-            error.BadPath => refused(.bad_request, .malformed, "bad request: path isn't a JSON path"),
-            error.NotADocument => refused(.bad_request, .wrong_type, "bad request: the key's value isn't a JSON document"),
+            error.TooLarge => refused(.bad_request, .field_too_long, kv_machine.TOO_LARGE),
+            error.NotACounter => refused(.bad_request, .wrong_type, kv_machine.NOT_A_COUNTER),
+            error.CounterOverflow => refused(.bad_request, .out_of_range, kv_machine.INCR_OVERFLOW),
+            error.PathNotFound => refused(.not_found, .not_found, kv_machine.PATH_NOT_FOUND),
+            error.BadPath => refused(.bad_request, .malformed, kv_machine.BAD_PATH),
+            error.NotADocument => refused(.bad_request, .wrong_type, kv_machine.NOT_A_DOCUMENT),
             error.NotJson => refused(.bad_request, .malformed, "bad request: document isn't JSON"),
-            error.TooDeep => refused(.bad_request, .field_too_long, "bad request: " ++ json_depth.TOO_DEEP_MESSAGE),
+            error.TooDeep => refused(.bad_request, .field_too_long, kv_machine.TOO_DEEP),
             error.TooManyTransactions => refused(.overloaded, .too_many_transactions, "overloaded: too many open transactions on this shard — commit or roll some back, or retry"),
             error.ScanShort => refused(.overloaded, .shard_busy, "overloaded: no memory to list this page — retry"),
             error.GatherBusy => refused(.overloaded, .shard_busy, "overloaded: too many reads across shards are under way; this request was not run — retry"),
@@ -728,14 +729,9 @@ pub const KVHandler = struct {
         const self = shard.kv_handler;
         if (!json_depth.within(document)) return error.TooDeep;
         if (!(std.json.validate(self.allocator, document) catch return error.Internal)) return error.NotJson;
-        const merged: []u8 = if (self.kv.get(qkey)) |e|
-            json_path.jsonPathSet(self.allocator, e.value, path, document) catch |err| return jsonError(err)
-        else if (std.mem.eql(u8, path, "$"))
-            self.allocator.dupe(u8, document) catch return error.Internal
-        else
-            return error.NotFound;
-        defer self.allocator.free(merged);
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = merged, .ttl_ms = null }) catch |err| return proposeError(err);
+        // Merged with the key's value at apply, not here: a write between
+        // this read and the apply would otherwise be lost.
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = document }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerJsonSet } };
     }
@@ -755,30 +751,19 @@ pub const KVHandler = struct {
     ) Error!table_run.Outcome(JsonDelResponse) {
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        const self = shard.kv_handler;
-        const e = self.kv.get(qkey) orelse return error.NotFound;
-        if (std.mem.eql(u8, path, "$")) {
-            const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
-            return .{ .park = .{ .proposed = proposed, .answer = answerJsonDeleted } };
-        }
-        const rest = json_path.jsonPathDel(self.allocator, e.value, path) catch |err| return jsonError(err);
-        defer self.allocator.free(rest);
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = rest, .ttl_ms = null }) catch |err| return proposeError(err);
-        return .{ .park = .{ .proposed = proposed, .answer = answerJsonPut } };
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = null }) catch |err| return proposeError(err);
+        return .{ .park = .{ .proposed = proposed, .answer = answerJsonDel } };
     }
 
-    /// The path was deleted from the document: its version now.
-    fn answerJsonPut(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+    /// The path was deleted: the document's version now, or none when `$`
+    /// deleted the key.
+    fn answerJsonDel(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
         var r = result.reader();
-        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
+        const version = r.int(u64) orelse 0;
+        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = if (version == 0) null else version });
     }
 
-    /// `$` was deleted: the key went with it, and has no version.
-    fn answerJsonDeleted(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
-        table_run.answer(JsonDelResponse, shard, conn, request_id, .{ .version = null });
-    }
-
-    fn jsonError(err: json_path.PathError) Error {
+    pub fn jsonError(err: json_path.PathError) Error {
         return switch (err) {
             error.PathNotFound, error.NotAnObject, error.NotAnArray, error.IndexOutOfBounds => error.PathNotFound,
             error.InvalidPath => error.BadPath,

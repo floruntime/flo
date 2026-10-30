@@ -11,7 +11,36 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 2;
+pub const CURRENT: u32 = 3;
+
+/// What each format stores: the log's segment version and a hash of the
+/// entry layouts in it. A new segment version or layout is a new format, so
+/// an older directory is refused here at boot, naming wipe, rather than at a
+/// segment open. The check below fails the build until they move together.
+/// Refusal reasons and ops are never stored, so they don't change the hash.
+const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
+    .{ .format = 1, .segment_version = 2, .entries = 0x69be2cbe871ae8d3 },
+    .{ .format = 2, .segment_version = 3, .entries = 0x2bef332533330bdf },
+    .{ .format = 3, .segment_version = 4, .entries = 0x3ff1b4bff4565f2 },
+};
+
+comptime {
+    for (formats[1..], formats[0 .. formats.len - 1]) |row, prev| {
+        // A format may change what stored bytes mean without changing a
+        // layout, so two formats can share a segment version.
+        if (row.format != prev.format + 1 or row.segment_version < prev.segment_version)
+            @compileError("formats: each row is the next format, with the same segment version or a newer one");
+    }
+    const row = formats[formats.len - 1];
+    if (row.format != CURRENT)
+        @compileError(std.fmt.comptimePrint("formats: the last row is format {d}, but CURRENT is {d}", .{ row.format, CURRENT }));
+    const segment_version = @import("../storage/ual/segment.zig").SEGMENT_VERSION;
+    if (segment_version != row.segment_version)
+        @compileError(std.fmt.comptimePrint("SEGMENT_VERSION is {d}, but format {d} stores segment version {d}: a new segment version is a new format; bump CURRENT and add its row", .{ segment_version, CURRENT, row.segment_version }));
+    const entries = @import("../protocol/ops.zig").entryTableHash(&@import("../protocol/table.zig").entry_table);
+    if (entries != row.entries)
+        @compileError(std.fmt.comptimePrint("the stored entry layouts hash to 0x{x}, but format {d} pins 0x{x}: a layout change needs a new SEGMENT_VERSION and format; bump both and add the row", .{ entries, CURRENT, row.entries }));
+}
 pub const FILENAME = "FORMAT";
 pub const SYSTEM_FILENAME = "SYSTEM";
 pub const LOCK_FILENAME = "flo.lock";
@@ -267,7 +296,7 @@ test "data format: an empty directory gets FORMAT, and so does one holding only 
     defer testing.allocator.free(path);
     const text = try stdx.fs.readFileAlloc(testing.allocator, path, 64);
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings("2\n", text);
+    try testing.expectEqualStrings(std.fmt.comptimePrint("{d}\n", .{CURRENT}), text);
     // And a second boot reads it.
     try check(testing.allocator, dir);
 }
@@ -288,7 +317,7 @@ test "data format: a Flo directory without FORMAT is an older Flo's, refused wit
         const r = (try checkReadOnly(testing.allocator, dir, &buf)).?;
         try testing.expectEqual(error.DataFormatMissing, r.err);
         var want: [MESSAGE_MAX]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory {s} was written by an older Flo (before format gating); this server needs format 2. There is no migration: run flo server wipe --data-dir {s}", .{ dir, dir }), r.message);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory {s} was written by an older Flo (before format gating); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ dir, CURRENT, dir }), r.message);
         try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, FILENAME, .{}));
     }
 }
@@ -332,7 +361,7 @@ test "data format: a marker is what Flo writes, not only its name" {
     try tmp.dir.createDirPath(io, "junk/94110"); // a shard's name, no segs/
     try tmp.dir.createDirPath(io, "real/00000/segs");
     try tmp.dir.writeFile(io, .{ .sub_path = "real/SYSTEM", .data = "{\"shards\": 1}" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "real/FORMAT", .data = "2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/FORMAT", .data = std.fmt.comptimePrint("{d}\n", .{CURRENT}) });
     try tmp.dir.createDirPath(io, "links");
     try tmp.dir.symLink(io, "../real/SYSTEM", "links/SYSTEM", .{});
     try tmp.dir.symLink(io, "../real/00000", "links/00001", .{ .is_directory = true });
@@ -367,7 +396,7 @@ test "data format: FORMAT is written through no link a crash or anyone left in i
     try check(testing.allocator, data);
     var buf: [8]u8 = undefined;
     try testing.expectEqualStrings("keep", try tmp.dir.readFile(io, "elsewhere/target", &buf));
-    try testing.expectEqualStrings("2\n", try tmp.dir.readFile(io, "data/" ++ FILENAME, &buf));
+    try testing.expectEqualStrings(std.fmt.comptimePrint("{d}\n", .{CURRENT}), try tmp.dir.readFile(io, "data/" ++ FILENAME, &buf));
 }
 
 test "data format: every refusal is one, and nothing else is" {
@@ -381,19 +410,19 @@ test "data format: a newer format is refused, and so is one that isn't a number"
     defer tmp.cleanup();
     const dir = try tmpDataDir(&tmp);
     defer testing.allocator.free(dir);
-    try writeFormat(dir, "3\n");
+    try writeFormat(dir, std.fmt.comptimePrint("{d}\n", .{CURRENT + 1}));
     try testing.expectError(error.DataFormatTooNew, check(testing.allocator, dir));
     // An older format: no migration, so refused, naming wipe.
     try writeFormat(dir, "1\n");
     try testing.expectError(error.DataFormatTooOld, check(testing.allocator, dir));
     var buf: [MESSAGE_MAX]u8 = undefined;
     var want: [MESSAGE_MAX]u8 = undefined;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory {s} was written by an older Flo (format 1); this server needs format 2. There is no migration: run flo server wipe --data-dir {s}", .{ dir, dir }), (try checkReadOnly(testing.allocator, dir, &buf)).?.message);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory {s} was written by an older Flo (format 1); this server needs format {d}. There is no migration: run flo server wipe --data-dir {s}", .{ dir, CURRENT, dir }), (try checkReadOnly(testing.allocator, dir, &buf)).?.message);
     for ([_][]const u8{ "", "\n", "0\n", "one\n", "1 \n", "-1\n", "1\n1\n", "99999999999\n", "1\n\n\n", "01", "002\n" }) |text| {
         try writeFormat(dir, text);
         try testing.expectError(error.DataFormatUnreadable, check(testing.allocator, dir));
     }
-    for ([_][]const u8{ "2", "2\n" }) |text| {
+    for ([_][]const u8{ std.fmt.comptimePrint("{d}", .{CURRENT}), std.fmt.comptimePrint("{d}\n", .{CURRENT}) }) |text| {
         try writeFormat(dir, text);
         try check(testing.allocator, dir);
     }
@@ -411,16 +440,16 @@ test "data format: the offline check refuses what boot refuses, and writes nothi
     defer testing.allocator.free(path);
     try testing.expectError(error.FileNotFound, stdx.fs.openFile(path, .{}));
 
-    try writeFormat(dir, "3\n");
+    try writeFormat(dir, std.fmt.comptimePrint("{d}\n", .{CURRENT + 1}));
     const newer = (try checkReadOnly(testing.allocator, dir, &buf)).?;
     try testing.expectEqual(error.DataFormatTooNew, newer.err);
     var want: [MESSAGE_MAX]u8 = undefined;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory format 3, this binary reads format 2 ({s}); start a flo that reads format 3", .{path}), newer.message);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "data directory format {d}, this binary reads format {d} ({s}); start a flo that reads format {d}", .{ CURRENT + 1, CURRENT, path, CURRENT + 1 }), newer.message);
 
     try writeFormat(dir, "two\n");
     const garbage = (try checkReadOnly(testing.allocator, dir, &buf)).?;
     try testing.expectEqual(error.DataFormatUnreadable, garbage.err);
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s} holds \"two\", not a data directory format; it should hold a number such as 2", .{path}), garbage.message);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s} holds \"two\", not a data directory format; it should hold a number such as {d}", .{ path, CURRENT }), garbage.message);
 }
 
 test "data format: a FORMAT that is a directory is refused by both checks, rather than read as missing" {

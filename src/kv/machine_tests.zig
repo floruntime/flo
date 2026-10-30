@@ -404,7 +404,7 @@ test "kv machine: keys of one namespace never reach another's, and the default n
     try testing.expectEqual(@as(usize, 1), st.scanKeyNames("default", "", &names));
 }
 
-test "kv machine: a key with no namespace halts its entry, a put's or a transaction's, before anything changes" {
+test "kv machine: a key with no namespace halts its entry, a put's, a patch's or a transaction's, before anything changes" {
     var kv = TestKv.init(testing.allocator);
     defer kv.deinit();
     try kv.put("k", "v", 0);
@@ -418,6 +418,7 @@ test "kv machine: a key with no namespace halts its entry, a put's or a transact
     }, 3, 0);
     defer testing.allocator.free(b.payload);
     try testing.expectError(error.Halt, kv.apply(&b.entry));
+    try testing.expectError(error.Halt, patch(&kv, "\x00k", "$", "{}"));
     try testing.expectEqual(before, store_mod.checksum(&kv.store, machine.Values.ID));
     try testing.expectEqual(@as(u64, 0), kv.store.undeclared_keys);
 }
@@ -485,4 +486,168 @@ test "kv machine: random entries keep every namespace's counts equal to a recoun
             }
         }
     }
+}
+
+fn patch(kv: *TestKv, key: []const u8, path: []const u8, document: ?[]const u8) !@import("../storage/persistence.zig").Result {
+    var buf: [512]u8 = undefined;
+    return kv.apply(&testEntry(&buf, .kv_json_patch, .{ .key = key, .path = path, .document = document }, kv.index + 1, STAMP));
+}
+
+test "kv machine: JSON patches merge at apply, so two built from the same document both land" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    _ = try patch(&kv, "doc", "$", "{\"a\":0,\"b\":0}");
+    // Both clients read version 1 and proposed: each change merges with
+    // what the entry before it left.
+    _ = try patch(&kv, "doc", "$.a", "1");
+    var r = try patch(&kv, "doc", "$.b", "2");
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u64, 3), rd.int(u64));
+    const json_path = @import("../util/json_path.zig");
+    for ([_][2][]const u8{ .{ "$.a", "1" }, .{ "$.b", "2" } }) |want| {
+        const got = try json_path.jsonPathGet(testing.allocator, kv.state().get("doc").?.value, want[0]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want[1], got);
+    }
+    try testing.expectEqual(machine.ValueType.json, kv.state().get("doc").?.value_type);
+}
+
+test "kv machine: a JSON patch sets $ on a missing key, deletes the key at $, and refuses what the merge can't take" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    // Not there: only the whole document can be set.
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$.a", "1")).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$", null)).refused().?.refusal.reason);
+    try testing.expect(kv.state().getRaw("doc") == null);
+    _ = try patch(&kv, "doc", "$", "{\"a\":{\"x\":1}}");
+    // A path with nothing at it, or a value that isn't JSON: refused, unchanged.
+    try testing.expectEqual(proto.Reason.not_found, (try patch(&kv, "doc", "$.nope.deeper", "1")).refused().?.refusal.reason);
+    try kv.put("text", "not json", STAMP);
+    try testing.expectEqual(proto.Reason.wrong_type, (try patch(&kv, "text", "$.a", "1")).refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 1), kv.state().get("doc").?.version);
+    // A path deleted leaves the rest; $ deleted takes the key, answering 0.
+    var r = try patch(&kv, "doc", "$.a.x", null);
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u64, 2), rd.int(u64));
+    try testing.expectEqualStrings("{\"a\":{}}", kv.state().get("doc").?.value);
+    r = try patch(&kv, "doc", "$", null);
+    rd = r.reader();
+    try testing.expectEqual(@as(?u64, 0), rd.int(u64));
+    try testing.expect(kv.state().get("doc") == null);
+    // "text" is the one live key left.
+    try testing.expectEqual(@as(u64, 1), kv.state().liveKeys("default"));
+}
+
+test "kv machine: a JSON patch whose merge outgrows a value is refused and changes nothing" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    const gpa = testing.allocator;
+    const buf = try gpa.alloc(u8, kv_ops.MAX_DOCUMENT + kv_ops.MAX_PATH + 256);
+    defer gpa.free(buf);
+    // A document as large as a patch may carry, then a field that grows it past a value.
+    const doc = try gpa.alloc(u8, kv_ops.MAX_DOCUMENT);
+    defer gpa.free(doc);
+    @memset(doc, 'x');
+    @memcpy(doc[0..6], "{\"a\":\"");
+    @memcpy(doc[doc.len - 2 ..], "\"}");
+    _ = try kv.apply(&testEntry(buf, .kv_json_patch, .{ .key = "doc", .path = "$", .document = doc }, kv.index + 1, STAMP));
+    const field = doc[5 .. doc.len - 1];
+    const r = try kv.apply(&testEntry(buf, .kv_json_patch, .{ .key = "doc", .path = "$.b", .document = field }, kv.index + 1, STAMP));
+    try testing.expectEqual(proto.Reason.field_too_long, r.refused().?.refusal.reason);
+    try testing.expectEqual(@as(u64, 1), kv.state().get("doc").?.version);
+    try testing.expectEqual(doc.len, kv.state().get("doc").?.value.len);
+}
+
+/// A patch stamped `stamp`.
+fn patchAt(kv: *TestKv, key: []const u8, path: []const u8, document: ?[]const u8, stamp: u64) !@import("../storage/persistence.zig").Result {
+    var buf: [4096]u8 = undefined;
+    return kv.apply(&testEntry(&buf, .kv_json_patch, .{ .key = key, .path = path, .document = document }, kv.index + 1, stamp));
+}
+
+const mixed_doc = "{ \"z\" : 1, \"a\": [1, 2.5, -0, -0.0, 1e3, 0.1, 12345678901234567890123, 1e400, 9007199254740993],\n \"s\": \"tab\\t quote\\\" uni\\u00e9 \\u2028 slash\\/ ctrl\\u0001 emoji\\ud83d\\ude00\", \"m\": {\"y\": null, \"x\": true, \"w\": false} }";
+const mixed_ops = [_]struct { path: []const u8, doc: ?[]const u8 }{
+    .{ .path = "$.m.v", .doc = "{\"q\": 1.5e-7, \"p\": [ ]}" },
+    .{ .path = "$.z", .doc = null }, // swapRemove: reorders keys
+    .{ .path = "$.a[2]", .doc = "-1.0E+2" },
+    .{ .path = "$.a[0]", .doc = null },
+    .{ .path = "$.n", .doc = "\"\\u0000\\b\\f\"" },
+    .{ .path = "$.m.x", .doc = null },
+    .{ .path = "$.a[99]", .doc = "1" }, // out of range: refused
+    .{ .path = "$.nope.deep", .doc = "1" }, // refused
+    .{ .path = "$.nope", .doc = null }, // refused
+};
+
+fn patchMixed(gpa: std.mem.Allocator, out: *std.ArrayList(u8), sums: *[3]u64) !void {
+    var kv = TestKv.init(gpa);
+    defer kv.deinit();
+    _ = try patchAt(&kv, "doc", "$", mixed_doc, STAMP);
+    _ = try patchAt(&kv, "doc", "$", mixed_doc, STAMP); // $ over a live key: normalised
+    for (mixed_ops) |op| _ = try patchAt(&kv, "doc", op.path, op.doc, STAMP);
+    try out.appendSlice(testing.allocator, kv.state().get("doc").?.value);
+    const store_mod = @import("../contract/store.zig");
+    sums.* = .{ store_mod.checksum(&kv.store, machine.Values.ID), store_mod.checksum(&kv.store, machine.History.ID), store_mod.checksum(&kv.store, machine.NsCounts.ID) };
+}
+
+test "kv machine: JSON patches give the same bytes under any allocator, the bytes json_path's own merge gives" {
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(testing.allocator);
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(testing.allocator);
+    var sa: [3]u64 = undefined;
+    var sb: [3]u64 = undefined;
+    try patchMixed(testing.allocator, &a, &sa);
+    // A different allocator: page-backed arena, with a different growth pattern.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    try patchMixed(arena.allocator(), &b, &sb);
+    try testing.expectEqualStrings(a.items, b.items);
+    try testing.expectEqual(sa, sb);
+
+    // json_path alone, the same functions in the same order: what a
+    // proposer merging before the log would have stored.
+    const json_path = @import("../util/json_path.zig");
+    const gpa = testing.allocator;
+    var cur = try json_path.jsonPathSet(gpa, mixed_doc, "$", mixed_doc);
+    for (mixed_ops) |op| {
+        const next = (if (op.doc) |d| json_path.jsonPathSet(gpa, cur, op.path, d) else json_path.jsonPathDel(gpa, cur, op.path)) catch continue;
+        gpa.free(cur);
+        cur = next;
+    }
+    defer gpa.free(cur);
+    try testing.expectEqualStrings(cur, a.items);
+}
+
+test "kv machine: a JSON patch finds an expired or deleted key missing, clears a TTL, and refuses a path it can't follow" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [512]u8 = undefined;
+    _ = try kv.apply(&putEntry(&buf, "doc", "{\"a\":1}", kv.index + 1, STAMP, 1_000));
+    const later = STAMP + 2 * std.time.ns_per_s;
+    // Expired by the entry's stamp: a path set is not found, $ del is not found.
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "doc", "$.b", "2", later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "doc", "$", null, later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "doc", "$.a", null, later)).refused().?.refusal.reason);
+    // $ set writes the whole document with no TTL.
+    _ = try patchAt(&kv, "doc", "$", "{\"c\":3}", later);
+    try testing.expectEqual(@as(u64, 0), kv.state().getRaw("doc").?.expiry_ns);
+    try testing.expectEqualStrings("{\"c\":3}", kv.state().getRaw("doc").?.value);
+    // A live key with a TTL: a path set clears it.
+    _ = try kv.apply(&putEntry(&buf, "t", "{\"a\":1}", kv.index + 1, later, 60_000));
+    try testing.expect(kv.state().getRaw("t").?.expiry_ns != 0);
+    _ = try patchAt(&kv, "t", "$.b", "2", later);
+    try testing.expectEqual(@as(u64, 0), kv.state().getRaw("t").?.expiry_ns);
+    // Tombstone.
+    _ = try patchAt(&kv, "t", "$", null, later);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "t", "$.b", "2", later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "t", "$", null, later)).refused().?.refusal.reason);
+    // Array index out of range, bad path, non-object: refused, unchanged.
+    _ = try patchAt(&kv, "arr", "$", "{\"l\":[1,2]}", later);
+    const v = kv.state().get("arr").?.version;
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "arr", "$.l[5]", "1", later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "arr", "$.l[5]", null, later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.malformed, (try patchAt(&kv, "arr", "l..x", "1", later)).refused().?.refusal.reason);
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "arr", "$.l.x", "1", later)).refused().?.refusal.reason);
+    try testing.expectEqual(v, kv.state().get("arr").?.version);
+    // A path's missing parents aren't created.
+    try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "arr", "$.new.x", "1", later)).refused().?.refusal.reason);
 }

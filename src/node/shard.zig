@@ -3813,7 +3813,7 @@ pub const Shard = struct {
             if (comptime build_options.test_faults) {
                 if (@import("test_faults.zig").of(entry) == .panic_after_apply) @panic("test fault: panic after apply");
             }
-            self.recordApplied(entry);
+            self.recordApplied(entry, result);
         }
         self.wakeApplied(entry);
         if (comptime build_options.test_faults) {
@@ -3825,10 +3825,10 @@ pub const Shard = struct {
 
     /// Triggers and per-namespace metrics for an entry that just applied:
     /// from the entry alone, so every replica that applies it does the same.
-    fn recordApplied(self: *Shard, entry: *const entry_mod.Entry) void {
+    fn recordApplied(self: *Shard, entry: *const entry_mod.Entry, result: *const persistence_mod.Result) void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
-            .kv_put, .kv_delete, .kv_incr, .kv_expire => {
+            .kv_put, .kv_delete, .kv_incr, .kv_expire, .kv_json_patch => {
                 // Every single-key KV entry starts with its key.
                 var diag: schema.Diagnostic = .{};
                 var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
@@ -3837,6 +3837,11 @@ pub const Shard = struct {
                     if (mr.registerKVNamespace(kv_state.Qualified.of(key).ns)) |km| switch (etype) {
                         .kv_put => km.recordSet(),
                         .kv_delete => km.recordDelete(),
+                        // A whole document deleted is a delete; any other
+                        // change, a set. A refused patch changed nothing.
+                        .kv_json_patch => if (result.refused() != null) {} else if (kv_entries.JsonPatch.decodeAll(entry.payload, &diag)) |p| {
+                            if (p.document == null and std.mem.eql(u8, p.path, "$")) km.recordDelete() else km.recordSet();
+                        } else |_| {},
                         else => {},
                     } else |_| {}
                 }
@@ -3884,7 +3889,7 @@ pub const Shard = struct {
     fn wakeApplied(self: *Shard, entry: *const entry_mod.Entry) void {
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         switch (etype) {
-            .kv_put, .kv_delete, .kv_incr, .kv_expire => {
+            .kv_put, .kv_delete, .kv_incr, .kv_expire, .kv_json_patch => {
                 var diag: schema.Diagnostic = .{};
                 var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
                 const key = kv_entries.Key.decode(&r, "key") catch return;
