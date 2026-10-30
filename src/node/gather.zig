@@ -87,6 +87,8 @@ pub fn GatherTable(comptime Context: type) type {
             /// forwarded here: its client is that shard's, not this one's.
             reply_to: ?ReplyTo = null,
             request_id: u64 = 0,
+            /// The client's op, for a report naming it.
+            op_code: u16 = 0,
             /// Each part's answer body, owned; null until it arrives.
             answers: []?[]u8 = &.{},
             arrived: u16 = 0,

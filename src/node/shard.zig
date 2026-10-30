@@ -1679,9 +1679,9 @@ pub const Shard = struct {
     /// answered it as deferred without saying so. It has its answer, so the
     /// no-answer fallback is skipped rather than sending a second under the
     /// same id, which would put the client's reads a frame behind.
-    fn answeredAsDeferred(self: *Shard, req: proto.Request) void {
+    fn answeredAsDeferred(self: *Shard, request_id: u64, op_code: u16) void {
         self.answered_as_deferred += 1;
-        log.err("shard {d}: request {d} (op 0x{x}) was answered as deferred without being parked. This is a bug", .{ self.id, req.header.request_id, req.header.op_code });
+        log.err("shard {d}: request {d} (op 0x{x}) was answered as deferred without being parked. This is a bug", .{ self.id, request_id, op_code });
         if (builtin.mode == .debug and !builtin.is_test) @panic("a request was answered as deferred without being parked");
     }
 
@@ -2015,6 +2015,7 @@ pub const Shard = struct {
         // A forwarded request is answered where it came from, and counts
         // against that shard's client, not the proxy running it.
         self.gathers.get(ticket).?.reply_to = conn.proxy_for;
+        self.gathers.get(ticket).?.op_code = req.header.op_code;
         if (conn.proxy_for == null) conn.forwards_in_flight += 1;
         // This shard's own part was read while it is halted.
         if (self.halted != null) for (parts) |p| {
@@ -2042,7 +2043,7 @@ pub const Shard = struct {
                 // here past the checks above. The parts already sent answer
                 // into an ended gather and are dropped there; their slots
                 // come back as they do.
-                conn.forwards_in_flight -|= 1;
+                if (conn.proxy_for == null) conn.forwards_in_flight -|= 1;
                 self.gathers.finish(self.allocator, self.gathers.get(ticket).?);
                 if (self.shard_metrics) |sm| sm.recordCrossShardOverloaded(.gather);
                 return error.GatherBusy;
@@ -2123,12 +2124,21 @@ pub const Shard = struct {
         const proxy = self.forward_proxy;
         loadProxy(proxy, reply_to);
         proxy.protocol = .binary;
-        e.context.op.merge(self, proxy, e.request_id, e.context.state, bodies[0..e.answers.len]) catch
+        // Noted as a dispatch is, so a handler that answers as deferred
+        // without parking is caught here too.
+        const prev = self.dispatching;
+        self.dispatching = .{ .reply_to = reply_to, .request_id = e.request_id };
+        const merged = e.context.op.merge(self, proxy, e.request_id, e.context.state, bodies[0..e.answers.len]);
+        const answered_deferred = self.dispatching.?.answered_deferred;
+        self.dispatching = prev;
+        merged catch
             return self.failGather(e, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: the parts' answers did not merge — retry" });
         var err_buf: [256]u8 = undefined;
         if (self.takeProxyAnswer(proxy, e.request_id, &err_buf)) |answer| {
             defer answer.free(self.allocator);
             self.deliverDeferred(reply_to, answer.bytes());
+        } else if (!proxy.response_deferred and answered_deferred) {
+            self.answeredAsDeferred(e.request_id, e.op_code);
         } else if (!proxy.response_deferred) {
             self.deliverDeferredRefusal(reply_to, e.request_id, .internal_error, persistence_mod.ANSWER_LOST_REFUSAL);
         }
@@ -2430,7 +2440,7 @@ pub const Shard = struct {
             defer answer.free(self.allocator);
             self.deliverDeferred(reply_to, answer.bytes());
         } else if (!proxy.response_deferred and answered_deferred) {
-            self.answeredAsDeferred(req);
+            self.answeredAsDeferred(req.header.request_id, req.header.op_code);
         } else if (!proxy.response_deferred) {
             const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
             self.deliverDeferred(reply_to, serialized);
@@ -2896,7 +2906,7 @@ pub const Shard = struct {
             defer answer.free(self.allocator);
             self.deliverDeferred(reply_to, answer.bytes());
         } else if (!proxy.response_deferred and answered_deferred) {
-            self.answeredAsDeferred(req);
+            self.answeredAsDeferred(req.header.request_id, req.header.op_code);
         } else if (!proxy.response_deferred) {
             self.deliverDeferredError(reply_to, request_id, .internal_error, self.noAnswer(req));
         }
@@ -2984,7 +2994,7 @@ pub const Shard = struct {
             defer answer.free(self.allocator);
             self.sendForwardReply(frame.source_node, id, answer.bytes());
         } else if (!proxy.response_deferred and answered_deferred) {
-            self.answeredAsDeferred(req);
+            self.answeredAsDeferred(req.header.request_id, req.header.op_code);
         } else if (!proxy.response_deferred) {
             const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
             self.sendForwardReply(frame.source_node, id, serialized);
@@ -4813,7 +4823,7 @@ pub const Shard = struct {
             // up unread was produced; the connection closes on the next flush.
             if (conn.write_buf.readable() == pending_before and !conn.response_deferred and !conn.write_overflow and !conn.closing) {
                 if (answered_deferred) {
-                    self.answeredAsDeferred(req);
+                    self.answeredAsDeferred(req.header.request_id, req.header.op_code);
                 } else {
                     self.sendErrorResponse(conn, req.header.request_id, .internal_error, self.noAnswer(req));
                 }
@@ -8288,6 +8298,125 @@ test "Shard: shard 0 refusing to create the namespace refuses the write, and not
     try std.testing.expect(entryAt(b, .namespace_bind, from) == null);
     try std.testing.expect(entryAt(b, .kv_put, from) == null);
     try std.testing.expect(!b.namespace_handler.namespaces.contains("one-more"));
+}
+
+test "Shard: a forwarded write whose namespace shard 0 refuses is refused once to its client, and holds nothing" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    var name_buf: [16]u8 = undefined;
+    const room = @import("../namespace/table.zig").MAX_LIVE - a.namespace_handler.namespaces.count();
+    for (0..room) |i| _ = a.namespace_handler.applyCreate(try std.fmt.bufPrint(&name_buf, "ns{d}", .{i}));
+    // The client is shard 0's; the write is shard 1's.
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, "one-more", 1, &kbuf);
+    const from = b.raft_node.log.lastIndex() + 1;
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 8, "one-more", k, "v", ""), .client);
+    two.settle();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 8), resp.header.request_id);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.LIMIT_MESSAGE, (try resp.refused()).message);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, a, &out));
+    try std.testing.expect(entryAt(b, .namespace_bind, from) == null);
+    try std.testing.expect(entryAt(b, .kv_put, from) == null);
+    // Nothing counted against the proxy that ran it, or held on either shard.
+    try std.testing.expectEqual(@as(u16, 0), b.forward_proxy.forwards_in_flight);
+    try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
+    try std.testing.expectEqual(@as(usize, 0), a.reply_pool.taken());
+}
+
+test "Shard: a forwarded write to a new namespace that waits for its commit is answered once, at commit" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // Shard 1's writes commit only once a second member has them.
+    b.raft_node.addPeer(2);
+    b.raft_node.peers[0].voter = true;
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, "later", 1, &kbuf);
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 21, "later", k, "v", ""), .client);
+    two.settle();
+    var out: [512]u8 = undefined;
+    // Parked on shard 1: nothing yet, and no "answer lost".
+    try std.testing.expect(b.pending_count > 0);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, a, &out));
+    try ParkTest.ack(b);
+    two.settle();
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 21), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, a, &out));
+}
+
+test "Shard: forwarded requests run while another waits for its namespace are each answered to their own client" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // Shard 1's writes wait for a second member, so each is parked under
+    // the client the proxy was running for when it was proposed.
+    b.raft_node.addPeer(2);
+    b.raft_node.peers[0].voter = true;
+    const c1 = try TestClient.open(a);
+    defer _ = std.c.close(c1.pair[1]);
+    const c2 = try TestClient.open(a);
+    defer _ = std.c.close(c2.pair[1]);
+    var k1buf: [16]u8 = undefined;
+    var k2buf: [16]u8 = undefined;
+    const k1 = try keyOn(b, "inter", 1, &k1buf);
+    const k2 = try keyOn(b, "default", 1, &k2buf);
+    // The first waits on shard 0; the second runs on shard 1 meanwhile.
+    a.runRequest(c1.conn, try ParkTest.request(.kv_put, 31, "inter", k1, "v", ""), .client);
+    a.runRequest(c2.conn, try ParkTest.request(.kv_put, 32, "default", k2, "v", ""), .client);
+    two.settle();
+    try ParkTest.ack(b);
+    two.settle();
+    var out: [512]u8 = undefined;
+    const r1 = try nextAnswer(c1, a, &out);
+    try std.testing.expectEqual(@as(u64, 31), r1.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r1.header.status);
+    const r2 = try nextAnswer(c2, a, &out);
+    try std.testing.expectEqual(@as(u64, 32), r2.header.request_id);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c1, a, &out));
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c2, a, &out));
+}
+
+test "Shard: a forwarded write whose ensure shard 0 doesn't answer in time is refused once to its client" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var kbuf: [16]u8 = undefined;
+    const k = try keyOn(b, "slow", 1, &kbuf);
+    a.runRequest(c.conn, try ParkTest.request(.kv_put, 41, "slow", k, "v", ""), .client);
+    // Shard 1 runs it and asks shard 0, which hasn't read the ask yet.
+    _ = b.drainInbox();
+    try std.testing.expectEqual(@as(usize, 1), b.gathers.inUse());
+    for (b.reply_pool.slots) |*s| {
+        if (s.active) s.answer_due_ms = 0;
+    }
+    b.reply_sweep_ms = 0;
+    b.expireReplySlots();
+    try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
+    two.settle();
+    var out: [512]u8 = undefined;
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u64, 41), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(c, a, &out));
 }
 
 test "Shard: a client gone while shard 0 creates its namespace runs nothing, and its slot is freed" {
