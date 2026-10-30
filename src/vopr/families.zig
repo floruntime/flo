@@ -38,6 +38,9 @@ pub const Mutant = enum {
     live_only_effect,
     /// A replica rebuilding by replay skips KV's batches.
     kv_replay_skips_batches,
+    /// A refused KV entry writes anyway, the same on every replica: no
+    /// comparison sees it, so `Kv.apply` checks refusals itself.
+    kv_refusal_writes,
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -139,6 +142,9 @@ pub const Counter = struct {
 pub const Kv = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
+    /// Entries the machine refused, and JSON patches it merged.
+    refusals: u64 = 0,
+    patches: u64 = 0,
 
     /// The families compared, in the order `checksums` returns them.
     pub const FAMILIES = [_]u16{ kv_machine.Values.ID, kv_machine.History.ID, kv_machine.NsCounts.ID };
@@ -164,14 +170,30 @@ pub const Kv = struct {
         return kv_machine.owns(@fromBackingInt(entry_type));
     }
 
-    /// Apply `e` as the shard does. A refusal is an answer, not an error;
-    /// an error (a halt, out of memory) is one a workload entry must never
-    /// meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) persistence.ApplyError!void {
+    /// Apply `e` as the shard does. A refusal is an answer, not an error,
+    /// but it must leave every family as it was: `RefusalChangedState` if
+    /// one moved. Any other error (a halt, out of memory) is one a workload
+    /// entry must never meet.
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!void {
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return;
         var out: persistence.Result = .{};
         out.reset(e);
+        const before = self.commits();
         try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
+        if (r.mutant == .kv_refusal_writes and out.refused() != null) self.store.families[FAMILIES[0]].commits += 1;
+        if (out.refused() == null) {
+            if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_json_patch)) self.patches += 1;
+            return;
+        }
+        self.refusals += 1;
+        if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+    }
+
+    /// Each family's count of records linked, replaced or unlinked.
+    fn commits(self: *const Kv) [FAMILIES.len]u64 {
+        var out: [FAMILIES.len]u64 = undefined;
+        for (FAMILIES, &out) |fam, *c| c.* = self.store.families[fam].commits;
+        return out;
     }
 
     pub fn checksums(self: *Kv) [FAMILIES.len]u64 {

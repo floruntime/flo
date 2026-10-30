@@ -30,7 +30,8 @@ pub const EntryType = entry_mod.EntryType;
 /// a slot's key and tombstones a key naming the op, so every op is still
 /// attributable from its payload alone. The marker key is the simulator's
 /// own bookkeeping, there only so an oracle can name the op; no client
-/// writes a delete this way.
+/// writes a delete this way. A third of puts are JSON patches instead
+/// (`kvPatch`).
 const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_batch };
 
 /// KV ops write a few keys over and over, across two namespaces, so
@@ -38,6 +39,10 @@ const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_writ
 const KV_SLOTS = 32;
 /// Where a delete's marker key lives: `del\0d` and the op id in hex.
 const MARKER_PREFIX = "del\x00d";
+/// A patch's document opens with the op id, and a patch that deletes names
+/// it in a field it deletes: `$.d` and the op id in hex.
+const DOC_PREFIX = "{\"op\":";
+const DEL_PATH_PREFIX = "$.d";
 /// The largest payload a scenario draws: the size of the KV encoder's
 /// scratch.
 pub const MAX_PAYLOAD = 4096;
@@ -118,13 +123,16 @@ pub const Workload = struct {
         var entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
         const len = r.intRangeAtMost(u32, payload_min, payload_max);
         const kv: ?[]u8 = switch (entry_type) {
-            .kv_put => kvPut(buf[0..payload_max], op_id, len, r),
+            .kv_put => if (r.uintLessThan(u8, 3) == 0) patch: {
+                entry_type = .kv_json_patch;
+                break :patch kvPatch(buf[0..payload_max], op_id, len, r);
+            } else kvPut(buf[0..payload_max], op_id, len, r),
             .kv_batch => kvDelete(buf[0..payload_max], op_id, r),
             else => null,
         };
         const payload = kv orelse raw: {
             // A KV op too large for this scenario's payloads goes as raw bytes.
-            if (entry_type == .kv_put or entry_type == .kv_batch) entry_type = .stream_append;
+            if (entry_type == .kv_put or entry_type == .kv_batch or entry_type == .kv_json_patch) entry_type = .stream_append;
             const p = buf[0..len];
             // First 8 bytes carry the op id so a committed entry is
             // attributable from its payload alone.
@@ -158,6 +166,42 @@ pub const Workload = struct {
         const body: kv_entries.Put.Value = .{ .key = key, .value = value, .ttl_ms = ttl_ms };
         if ((kv_entries.Put.encodedSize(body) catch return null) > buf.len) return null;
         const out = kv_entries.Put.encodeInto(buf, body) catch return null;
+        return buf[0..out.len];
+    }
+
+    /// A JSON patch of a slot's key. Most set a document at `$`, `$.a` or
+    /// `$.b`; the rest delete a field named after the op, which is never
+    /// there. A patch the key's value can't take (a put left raw bytes, or
+    /// no JSON at the path, or no key) is refused, which is half the point.
+    fn kvPatch(buf: []u8, op_id: u64, len: u32, r: std.Random) ?[]u8 {
+        var key_buf: [16]u8 = undefined;
+        const key = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
+        var path_buf: [DEL_PATH_PREFIX.len + 16]u8 = undefined;
+        var doc_buf: [MAX_PAYLOAD]u8 = undefined;
+        const kind = r.uintLessThan(u8, 4);
+        const path: []const u8 = switch (kind) {
+            0 => "$",
+            1 => "$.a",
+            2 => "$.b",
+            else => std.fmt.bufPrint(&path_buf, DEL_PATH_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable,
+        };
+        var document: ?[]const u8 = null;
+        if (kind < 3) {
+            // {"op":<id>,"r":"<hex>"}, padded toward `len`.
+            @memcpy(doc_buf[0..DOC_PREFIX.len], DOC_PREFIX);
+            const id_part = std.fmt.bufPrint(doc_buf[DOC_PREFIX.len..], "{d},\"r\":\"", .{op_id}) catch unreachable;
+            const head = doc_buf[0 .. DOC_PREFIX.len + id_part.len];
+            const room = doc_buf.len - head.len - 2;
+            const pad = @min(room, if (len > head.len + 32) len - head.len - 32 else 0);
+            const hex = "0123456789abcdef";
+            for (doc_buf[head.len..][0..pad]) |*c| c.* = hex[r.uintLessThan(u8, 16)];
+            doc_buf[head.len + pad] = '"';
+            doc_buf[head.len + pad + 1] = '}';
+            document = doc_buf[0 .. head.len + pad + 2];
+        }
+        const body: kv_entries.JsonPatch.Value = .{ .key = key, .path = path, .document = document };
+        if ((kv_entries.JsonPatch.encodedSize(body) catch return null) > buf.len) return null;
+        const out = kv_entries.JsonPatch.encodeInto(buf, body) catch return null;
         return buf[0..out.len];
     }
 
@@ -242,6 +286,17 @@ pub const Workload = struct {
             if (p.value.len < 8) return null;
             return std.mem.readInt(u64, p.value[0..8], .little);
         }
+        if (entry_type == @backingInt(EntryType.kv_json_patch)) {
+            const p = kv_entries.JsonPatch.decodeAll(payload, &diag) catch return null;
+            if (p.document) |doc| {
+                if (!std.mem.startsWith(u8, doc, DOC_PREFIX)) return null;
+                const digits = doc[DOC_PREFIX.len..];
+                const end = std.mem.indexOfScalar(u8, digits, ',') orelse return null;
+                return std.fmt.parseInt(u64, digits[0..end], 10) catch null;
+            }
+            if (!std.mem.startsWith(u8, p.path, DEL_PATH_PREFIX)) return null;
+            return std.fmt.parseInt(u64, p.path[DEL_PATH_PREFIX.len..], 16) catch null;
+        }
         if (entry_type == @backingInt(EntryType.kv_batch)) {
             const b = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
             var it = b.ops.iterator();
@@ -297,6 +352,7 @@ test "vopr workload: KV ops decode as their entries, with every kind in the mix"
     var buf: [4096]u8 = undefined;
     var puts: usize = 0;
     var deletes: usize = 0;
+    var patches: usize = 0;
     var diag: schema.Diagnostic = .{};
     for (0..400) |id| {
         const gen = Workload.synthesize(5, 16, 2048, id, &buf);
@@ -309,10 +365,14 @@ test "vopr workload: KV ops decode as their entries, with every kind in the mix"
                 _ = try kv_entries.Batch.decodeAll(gen.payload, &diag);
                 deletes += 1;
             },
+            .kv_json_patch => {
+                _ = try kv_entries.JsonPatch.decodeAll(gen.payload, &diag);
+                patches += 1;
+            },
             else => {},
         }
     }
-    try testing.expect(puts > 40 and deletes > 40);
+    try testing.expect(puts > 40 and deletes > 40 and patches > 20);
 }
 
 test "vopr workload: op lifecycle and idempotent transitions" {
