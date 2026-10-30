@@ -74,6 +74,9 @@ pub const Invariant = enum {
     /// that applied those entries live: apply read something besides the
     /// entry and the state.
     state_checksum,
+    /// An entry the KV machine refused changed a family anyway. Every
+    /// replica would agree on it, so `state_checksum` can't see it.
+    refusal_wrote,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -706,6 +709,8 @@ pub const Summary = struct {
     state_checks: u64,
     rebuilt_checks: u64,
     kv_checks: u64,
+    /// What KV's machine did with the run's entries, each counted once.
+    kv: families.Kv.Counts,
     violation_count: usize,
 };
 
@@ -756,6 +761,8 @@ pub const Simulator = struct {
     crashes: u64 = 0,
     restarts: u64 = 0,
     wipes: u64 = 0,
+    /// KV entries by outcome, counted at the first apply of each index.
+    kv_counts: families.Kv.Counts = .{},
     config_written: bool = false,
     /// What was acked when convergence began: every member must apply it.
     /// The probes acked after are the leader's to commit; the final
@@ -1667,12 +1674,26 @@ pub const Simulator = struct {
             .live = live,
         };
         if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
-        if (is_op and families.Kv.owns(e.header.entry_type)) node.kv.apply(e, replica) catch self.checker.fail(.{
-            .invariant = .applied_integrity,
-            .node = node.id,
-            .index = idx,
-            .tick = self.now,
-            .detail = "the KV machine failed a workload entry it should apply",
+        // Counted where the first replica reaches the index, so an entry
+        // counts once, not once per replica and replay.
+        const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
+        if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
+            if (first) self.kv_counts.count(effect);
+        } else |err| self.checker.fail(switch (err) {
+            error.RefusalChangedState => .{
+                .invariant = .refusal_wrote,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "a KV entry the machine refused changed a family",
+            },
+            else => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the KV machine failed a workload entry it should apply",
+            },
         });
         const kv_sums = if (idx % KV_SAMPLE == 0) node.kv.checksums() else null;
         self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), kv_sums, !live, self.now);
@@ -2005,6 +2026,7 @@ pub const Simulator = struct {
             .state_checks = self.checker.state_checks,
             .rebuilt_checks = self.checker.rebuilt_checks,
             .kv_checks = self.checker.kv_checks,
+            .kv = self.kv_counts,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2192,7 +2214,7 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
 
 /// What `state_checksum` found under a mutant: any violation, and one
 /// that set a replica rebuilt by replay against one that applied live.
-const Caught = struct { any: bool = false, rebuilt_vs_live: bool = false, kv: bool = false };
+const Caught = struct { any: bool = false, rebuilt_vs_live: bool = false, kv: bool = false, refusal: bool = false };
 
 fn stateChecksumUnder(mutant: families.Mutant) !Caught {
     var sim = try Simulator.init(testing.allocator, restartingScenario(77), .{ .family_mutant = mutant });
@@ -2200,6 +2222,7 @@ fn stateChecksumUnder(mutant: families.Mutant) !Caught {
     _ = try sim.run();
     var found: Caught = .{};
     for (sim.checker.violations.items) |v| {
+        if (v.invariant == .refusal_wrote) found.refusal = true;
         if (v.invariant != .state_checksum) continue;
         found.any = true;
         if (std.mem.startsWith(u8, v.detail, "a replica rebuilt by replay")) found.rebuilt_vs_live = true;
@@ -2224,6 +2247,22 @@ test "vopr sim: an effect only live apply runs fails state_checksum between a re
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
 }
 
+test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuses batches after staging" {
+    // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
+    // run is checked on its own, not summed, and each entry counts once
+    // however many replicas apply it.
+    for ([_]u64{ 1, 3, 7, 9, 10, 13, 15, 16 }) |seed| {
+        var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(seed), .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        try testing.expect(s.ok);
+        errdefer std.debug.print("seed {d}: {any}\n", .{ seed, s.kv });
+        try testing.expect(s.kv.merges >= 5);
+        try testing.expect(s.kv.field_deletes >= 2);
+        try testing.expect(s.kv.staged_refusals >= 5);
+    }
+}
+
 test "vopr sim: KV's families are compared at a run's last index even when sampling passed over it" {
     var checker: Checker = .{ .allocator = testing.allocator };
     defer checker.deinit();
@@ -2241,6 +2280,10 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
     // Another history at that index is not compared.
     checker.onFinalKv(4, idx, 43, .{ 0, 0, 0 }, false, 0);
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
+}
+
+test "vopr sim: a contract that commits a refused entry's staged writes fails refusal_wrote, though every replica agrees" {
+    try testing.expect((try stateChecksumUnder(.kv_refused_commits)).refusal);
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {

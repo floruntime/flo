@@ -18,6 +18,9 @@ const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("../contract/store.zig");
 const machine_mod = @import("../contract/machine.zig");
 const kv_machine = @import("../kv/machine.zig");
+const view_mod = @import("../contract/view.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
+const schema = @import("../protocol/schema.zig");
 
 const Allocator = std.mem.Allocator;
 const HASH_SEED: u64 = 0xFA81_17E5;
@@ -38,6 +41,10 @@ pub const Mutant = enum {
     live_only_effect,
     /// A replica rebuilding by replay skips KV's batches.
     kv_replay_skips_batches,
+    /// The contract commits a refused entry's staged writes, the same on
+    /// every replica: no comparison sees it, so `Kv.apply` checks refusals
+    /// itself.
+    kv_refused_commits,
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -139,6 +146,39 @@ pub const Counter = struct {
 pub const Kv = struct {
     store: store_mod.Store,
     scratch: std.heap.ArenaAllocator,
+    /// What an entry did, for a run's counts (`Counts`).
+    pub const Effect = enum {
+        other,
+        /// Refused before staging anything.
+        refused,
+        /// A batch refused, which has staged writes by then.
+        staged_refused,
+        /// A JSON patch merged into the value: a set below `$`.
+        merged,
+        /// A JSON patch that deleted a field.
+        field_deleted,
+    };
+
+    /// Entries by outcome, each counted once however many replicas apply it.
+    pub const Counts = struct {
+        refusals: u64 = 0,
+        staged_refusals: u64 = 0,
+        merges: u64 = 0,
+        field_deletes: u64 = 0,
+
+        pub fn count(self: *Counts, o: Effect) void {
+            switch (o) {
+                .other => {},
+                .refused => self.refusals += 1,
+                .staged_refused => {
+                    self.refusals += 1;
+                    self.staged_refusals += 1;
+                },
+                .merged => self.merges += 1,
+                .field_deleted => self.field_deletes += 1,
+            }
+        }
+    };
 
     /// The families compared, in the order `checksums` returns them.
     pub const FAMILIES = [_]u16{ kv_machine.Values.ID, kv_machine.History.ID, kv_machine.NsCounts.ID };
@@ -164,14 +204,52 @@ pub const Kv = struct {
         return kv_machine.owns(@fromBackingInt(entry_type));
     }
 
-    /// Apply `e` as the shard does. A refusal is an answer, not an error;
-    /// an error (a halt, out of memory) is one a workload entry must never
-    /// meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) persistence.ApplyError!void {
-        if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return;
+    /// Apply `e` as the shard does. A refusal is an answer, not an error,
+    /// but it must leave every family as it was: `RefusalChangedState` if
+    /// one moved. Any other error (a halt, out of memory) is one a workload
+    /// entry must never meet.
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
+        if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
         var out: persistence.Result = .{};
         out.reset(e);
-        try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
+        const before = self.commits();
+        if (r.mutant == .kv_refused_commits) {
+            try self.applyCommittingRefusals(e, &out);
+        } else {
+            try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
+        }
+        if (out.refused() == null) return patchEffect(e);
+        if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+        return if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) .staged_refused else .refused;
+    }
+
+    /// An applied JSON patch: merged into the value (a set below `$`), or a
+    /// field deleted. A set at `$` writes the whole value and merges nothing.
+    fn patchEffect(e: *const entry_mod.Entry) Effect {
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_json_patch)) return .other;
+        var diag: schema.Diagnostic = .{};
+        const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return .other;
+        if (std.mem.eql(u8, p.path, "$")) return .other;
+        return if (p.document != null) .merged else .field_deleted;
+    }
+
+    /// `machine.applyEntry` without its guard against committing a refused
+    /// entry: the bug `kv_refused_commits` plants.
+    fn applyCommittingRefusals(self: *Kv, e: *const entry_mod.Entry, out: *persistence.Result) persistence.ApplyError!void {
+        _ = self.scratch.reset(.retain_capacity);
+        const arena = self.scratch.allocator();
+        var keys = view_mod.KeySet.init(arena);
+        try kv_machine.machine.keys(e, &keys);
+        var view = view_mod.View.init(&self.store, arena, &keys);
+        try kv_machine.machine.apply(&view, e, out);
+        try view.commit();
+    }
+
+    /// Each family's count of records linked, replaced or unlinked.
+    fn commits(self: *const Kv) [FAMILIES.len]u64 {
+        var out: [FAMILIES.len]u64 = undefined;
+        for (FAMILIES, &out) |fam, *c| c.* = self.store.families[fam].commits;
+        return out;
     }
 
     pub fn checksums(self: *Kv) [FAMILIES.len]u64 {
@@ -229,7 +307,7 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
     e.header.crc32c = e.computeCrc();
     const empty = kv.checksums();
-    try kv.apply(&e, .{ .mutant = .none, .node_now = 0, .leader = false, .live = true });
+    try testing.expectEqual(Kv.Effect.other, try kv.apply(&e, .{ .mutant = .none, .node_now = 0, .leader = false, .live = true }));
     try testing.expect(kv.checksums()[0] != empty[0]);
     kv.reset();
     try testing.expect(kv.store.strict_keys);
