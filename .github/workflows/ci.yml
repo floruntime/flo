@@ -242,8 +242,11 @@ jobs:
           RESULT: ${{ needs.e2e-shard.result }}
           # How many tests skip on Linux. A test that skips passes silently,
           # so a count off by one fails here: update it only for a skip you
-          # meant.
-          SKIPS: 0
+          # meant. Four dashboard tests skip on fields no op returns yet
+          # (an action's owner and timeout, its latency, a job's metrics, a
+          # stream's retention); this is 0 again once the wider list entries
+          # and info ops carry them.
+          SKIPS: 4
         run: |
           fail() { echo "::error::$*"; bad=1; }
           bad=0
