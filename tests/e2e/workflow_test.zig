@@ -3310,3 +3310,74 @@ fn nestedArrays(buf: []u8, levels: usize) []const u8 {
     @memset(buf[levels .. 2 * levels], ']');
     return buf[0 .. 2 * levels];
 }
+
+test "e2e/workflow: on 4 shards, a run started with an id the client chose is found by every run op, wherever its workflow lives" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    const ids = [_][]const u8{ "alpha", "beta", "my-run", "gamma-na", "delta-1", "epsilon" };
+    for (ids, 0..) |id, i| {
+        var def_buf: [256]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: rid-wf-{d}
+            \\version: 1.0.0
+            \\start.run: @actions/validate
+            \\start.transitions.success: flo.Completed
+            \\start.transitions.failure: flo.Failed
+        , .{i});
+        var file_buf: [32]u8 = undefined;
+        const path = try writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "rid-wf-{d}.yaml", .{i}));
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+        var wf: [16]u8 = undefined;
+        try ctx.exec(&.{ "workflow", "start", try std.fmt.bufPrint(&wf, "rid-wf-{d}", .{i}), "{}", "--run-id", id });
+    }
+
+    for (ids, 0..) |id, i| {
+        var want: [64]u8 = undefined;
+        var status = try ctx.cli.run(&.{ "workflow", "status", id });
+        defer status.deinit();
+        if (status.stdoutCount(try std.fmt.bufPrint(&want, "Workflow: rid-wf-{d}", .{i})) != 1) std.debug.print("status {s}: {s}{s}\n", .{ id, status.stdout, status.stderr });
+        try testing.expectEqual(@as(usize, 1), status.stdoutCount(try std.fmt.bufPrint(&want, "Workflow: rid-wf-{d}", .{i})));
+
+        var history = try ctx.cli.run(&.{ "workflow", "history", id });
+        defer history.deinit();
+        try testing.expectEqual(@as(usize, 1), history.stdoutCount(try std.fmt.bufPrint(&want, "History for run: {s}", .{id})));
+
+        var signal = try ctx.cli.run(&.{ "workflow", "signal", id, "--type", "ping" });
+        defer signal.deinit();
+        try testing.expectEqual(@as(usize, 1), signal.stdoutCount(try std.fmt.bufPrint(&want, "Signal 'ping' sent to workflow {s}", .{id})));
+
+        var cancel = try ctx.cli.run(&.{ "workflow", "cancel", id });
+        defer cancel.deinit();
+        try testing.expectEqual(@as(usize, 1), cancel.stdoutCount(try std.fmt.bufPrint(&want, "Workflow {s} cancelled", .{id})));
+
+        var after = try ctx.cli.run(&.{ "workflow", "status", id });
+        defer after.deinit();
+        try testing.expect(std.mem.indexOf(u8, after.stdout, "cancel") != null);
+    }
+
+    // An id no run has, and a chosen id in another namespace, are not found.
+    try ctx.exec(&.{ "namespace", "create", "other" });
+    for ([_][]const []const u8{ &.{ "workflow", "status", "no-such-run" }, &.{ "workflow", "status", "alpha", "-n", "other" } }) |args| {
+        var r = try ctx.cli.run(args);
+        defer r.deinit();
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "Workflow run not found") != null);
+    }
+
+    // The same id chosen for runs of several workflows: some land on
+    // different shards, and a lookup by it names none of them.
+    var started: usize = 0;
+    for (0..ids.len) |i| {
+        var wf: [16]u8 = undefined;
+        var r = try ctx.cli.run(&.{ "workflow", "start", try std.fmt.bufPrint(&wf, "rid-wf-{d}", .{i}), "{}", "--run-id", "dup" });
+        defer r.deinit();
+        if (r.exit_code == 0 and r.stderr.len == 0) started += 1;
+    }
+    try testing.expect(started >= 2);
+    var dup = try ctx.cli.run(&.{ "workflow", "status", "dup" });
+    defer dup.deinit();
+    if (std.mem.indexOf(u8, dup.stderr, "more than one workflow") == null) std.debug.print("dup: {s}{s}\n", .{ dup.stdout, dup.stderr });
+    try testing.expect(std.mem.indexOf(u8, dup.stderr, "more than one workflow") != null);
+}

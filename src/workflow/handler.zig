@@ -3328,6 +3328,15 @@ pub const WorkflowHandler = struct {
     // ── Helpers ─────────────────────────────────────────────────────────
 
     /// Build a namespace-qualified key: "namespace:name" for map lookups.
+    /// Whether this shard holds run `run_id` in `namespace`.
+    pub fn holdsRun(self: *const WorkflowHandler, namespace: []const u8, run_id: []const u8) bool {
+        // Keyed as the start keys it (`makeNsKey`). A run's start entry holds
+        // ids under 600 bytes, so a longer one is no run's.
+        var buf: [1024]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}:{s}", .{ namespace, run_id }) catch return false;
+        return self.runs.contains(key);
+    }
+
     fn makeNsKey(self: *WorkflowHandler, namespace: []const u8, name: []const u8) ?[]const u8 {
         return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ namespace, name }) catch null;
     }

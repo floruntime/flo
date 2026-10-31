@@ -97,4 +97,17 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .none },
         .doc = "A shard's page of a workflow's runs, read from its own state.",
     },
+    .{
+        .name = "system.holds_run",
+        .code = 0x003,
+        .class = .read,
+        .origin = .internal,
+        .route = .local,
+        .request = Record(&.{}),
+        .response = Record(&.{
+            .{ .name = "holds", .T = schema.Bool, .doc = "Whether the shard holds the run the key names, in the request's namespace" },
+        }),
+        .cli = .{ .expose = .none },
+        .doc = "Whether a shard holds a workflow run whose id the client chose: such an id names no shard.",
+    },
 };

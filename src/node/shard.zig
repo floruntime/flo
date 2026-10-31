@@ -976,6 +976,7 @@ pub const Shard = struct {
         WorkerHandler.register(&dispatcher);
         WorkflowHandler.register(&dispatcher);
         dispatcher.register(.system_walk_page, walk_mod.handlePage);
+        dispatcher.register(.system_holds_run, handleHoldsRun);
         dispatcher.register(.system_runs_page, @import("../workflow/list_runs.zig").handlePage);
         ProcessingHandler.register(&dispatcher);
         dispatcher.register(.cluster_status, dispatchClusterStatus);
@@ -1530,6 +1531,10 @@ pub const Shard = struct {
         // An internal op from a client runs where an unknown op would: here.
         if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
 
+        // A workflow run id the client chose names no shard: ask each which
+        // holds the run (`RunFind`).
+        if (self.runIdUnplaced(req)) return self.findRun(conn, req, auth);
+
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
             .local => self.dispatchLocal(conn, req, auth),
@@ -1540,6 +1545,98 @@ pub const Shard = struct {
         // implicit namespace create) and anything past the entry `park`
         // answered at. In a cluster these wait for a peer's ack.
         _ = self.applyCommitted();
+    }
+
+    // ─── A run by an id the client chose ─────────────────────────────────
+
+    /// Whether `req` names a workflow run by an id the client chose at its
+    /// start. A generated id carries its run's partition, so its op routes
+    /// straight there; a chosen one carries none, and the run is on the
+    /// shard of its workflow's name, which the op doesn't name.
+    fn runIdUnplaced(self: *const Shard, req: proto.Request) bool {
+        const by_run_id = switch (req.header.op_code) {
+            @backingInt(proto.OpCode.workflow_status),
+            @backingInt(proto.OpCode.workflow_history),
+            @backingInt(proto.OpCode.workflow_signal),
+            @backingInt(proto.OpCode.workflow_cancel),
+            => true,
+            else => false,
+        };
+        return by_run_id and req.key.len > 0 and self.shardCount() > 1 and run_id_mod.extractPartition(req.key) == null;
+    }
+
+    /// A run-id request held while every shard says whether it holds the run;
+    /// then sent, once, to the one that does.
+    const RunFind = struct {
+        /// The request, serialized, and who may run it.
+        bytes: []u8,
+        auth: run_mod.Authorized,
+
+        const op: gather_mod.Op = .{ .merge = merge, .deinit = free };
+
+        fn free(state: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *RunFind = @ptrCast(@alignCast(state));
+            allocator.free(self.bytes);
+            allocator.destroy(self);
+        }
+
+        fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
+            const self: *RunFind = @ptrCast(@alignCast(state));
+            const Holds = table_run.op("system.holds_run").response;
+            var owner: ?u16 = null;
+            for (bodies, 0..) |body, i| {
+                var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+                if (!(try Holds.decodeAll(body, &diag)).holds) continue;
+                // Nothing makes a chosen id unique across workflows, so two
+                // can hold it: neither is the one asked for.
+                if (owner != null) return shard.sendRefusal(conn, request_id, .conflict, proto.notRun(RUN_ID_AMBIGUOUS));
+                owner = @intCast(i);
+            }
+            const req = try proto.Request.parse(self.bytes);
+            const to = owner orelse return shard.sendErrorResponse(conn, request_id, .not_found, "");
+            if (to == shard.id) shard.dispatchLocal(conn, req, self.auth) else shard.forwardToShard(to, conn, req, self.auth);
+        }
+    };
+
+    const RUN_ID_AMBIGUOUS = "conflict: runs of more than one workflow hold this id in this namespace, so it names none of them; choose run ids unique in a namespace";
+
+    fn findRun(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
+        const id = req.header.request_id;
+        const n = self.shardCount();
+        const state = self.allocator.create(RunFind) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        const bytes = serializeRequest(self.allocator, req) catch {
+            self.allocator.destroy(state);
+            return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        };
+        state.* = .{ .bytes = bytes, .auth = auth };
+        var gather_owns = false;
+        defer if (!gather_owns) RunFind.free(state, self.allocator);
+        const parts = self.allocator.alloc(gather_mod.Part, n) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        defer self.allocator.free(parts);
+        const Holds = table_run.op("system.holds_run").response;
+        var own_buf: [Holds.max_size]u8 = undefined;
+        const own_body = Holds.encodeInto(&own_buf, .{ .holds = self.workflow_handler.holdsRun(req.namespace, req.key) }) catch unreachable;
+        const own = self.allocator.dupe(u8, own_body) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        var own_owned = false;
+        defer if (!own_owned) self.allocator.free(own);
+        for (parts, 0..) |*p, i| {
+            const s: u16 = @intCast(i);
+            p.* = if (s == self.id) .{ .owner = s, .body = own } else .{ .owner = s, .body = "", .op = @backingInt(proto.OpCode.system_holds_run) };
+        }
+        gather_owns = true;
+        own_owned = true;
+        self.startGather(conn, req, parts, &RunFind.op, state) catch |err| return switch (err) {
+            error.GatherBusy => self.sendRefusal(conn, id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this request was not run — retry" }),
+            error.OutOfMemory => self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory")),
+        };
+        conn.response_deferred = true;
+    }
+
+    /// `system.holds_run`, on the shard asked: whether it holds the run.
+    fn handleHoldsRun(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        table_run.answer(table_run.op("system.holds_run").response, shard, conn, req.header.request_id, .{ .holds = shard.workflow_handler.holdsRun(req.namespace, req.key) });
     }
 
     /// Where a request goes when it goes to another shard, and whether it
