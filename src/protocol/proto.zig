@@ -62,6 +62,9 @@ pub const OpCode = enum(u16) {
     ping = 0x000,
     /// A shard asking another for its page of a list or scan.
     system_walk_page = 0x001,
+    /// A shard asking another whether it holds a workflow run, by an id the
+    /// client chose, which names no shard.
+    system_holds_run = 0x003,
     /// A shard asking another for its page of a workflow's runs.
     system_runs_page = 0x002,
 
