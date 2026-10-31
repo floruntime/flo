@@ -176,7 +176,8 @@ pub fn listRuns(
     cursor: ?[]const u8,
     search: ?[]const u8,
 ) !Response {
-    var value_buf: [512]u8 = undefined;
+    // [limit][status][cursor: a start time and a run id][search]
+    var value_buf: [4 + (2 + 32) + (2 + 8 + std.math.maxInt(u16)) + (2 + 4096)]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&value_buf);
     const writer = &fbs;
 

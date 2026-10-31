@@ -32,6 +32,8 @@ const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const system_ops = @import("../protocol/system_ops.zig");
+const list_runs = @import("list_runs.zig");
 const parser = @import("parser.zig");
 
 const definition = @import("definition.zig");
@@ -1207,16 +1209,16 @@ pub const WorkflowHandler = struct {
 
     // ── LIST RUNS ───────────────────────────────────────────────────────
 
-    const RunInfo = struct {
+    pub const RunInfo = struct {
         run_id: []const u8,
         workflow: []const u8,
         status: []const u8,
         created_at: i64,
     };
 
-    /// Collect runs matching filters from this handler's local runs map.
-    /// Called under mu.lock() — safe for both local and cross-shard use.
-    fn collectMatchingRuns(
+    /// Collect runs matching filters from this handler's own runs map, on
+    /// its own thread.
+    pub fn collectMatchingRuns(
         self: *WorkflowHandler,
         runs_list: *std.ArrayListUnmanaged(RunInfo),
         namespace: []const u8,
@@ -1286,129 +1288,36 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    fn handleListRuns(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const workflow_name = req.key;
-
+    /// A workflow's runs, or every workflow's when the request names none,
+    /// newest first, a page at a time (`list_runs`).
+    fn handleListRuns(_: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const query = parseListRunsQuery(req.value) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "invalid list-runs request");
             return;
         };
-        const limit = query.limit;
-        const status_filter = query.status;
-        const cursor_filter = query.cursor;
-        const search_query = query.search;
-
-        // Lowercase the search query once for case-insensitive matching:
-        // all of it, so a long query matches no more than it says.
-        const search_lower: ?[]u8 = if (search_query) |sq| blk: {
-            const lower = self.allocator.alloc(u8, sq.len) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "list-runs search not run (out of memory)");
-                return;
-            };
-            break :blk std.ascii.lowerString(lower, sq);
-        } else null;
-        defer if (search_lower) |sl| self.allocator.free(sl);
-
-        // Collect matching runs with sort key
-        var runs_list: std.ArrayListUnmanaged(RunInfo) = .empty;
-        defer runs_list.deinit(self.allocator);
-
-        // Cross-shard aggregation: when workflow_name is empty, search all shards.
-        // When workflow_name is set, all runs for that workflow are on this shard.
-        if (workflow_name.len == 0) {
-            // Search all shards via peer_shards
-            self.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            };
-            if (shard.peer_shards) |peers| {
-                for (peers) |peer| {
-                    if (peer.id == shard.id) continue; // skip self — already collected
-                    const peer_handler = peer.workflow_handler;
-                    peer_handler.mu.lock();
-                    defer peer_handler.mu.unlock();
-                    peer_handler.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
-                        shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                        return;
-                    };
-                }
-            }
-        } else {
-            // Single-shard: all runs for this workflow are local
-            self.collectMatchingRuns(&runs_list, req.namespace, workflow_name, status_filter, search_lower) catch {
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-                return;
-            };
-        }
-
-        // Sort by created_at descending (newest first)
-        std.mem.sortUnstable(RunInfo, runs_list.items, {}, struct {
-            fn lessThan(_: void, a: RunInfo, b: RunInfo) bool {
-                return a.created_at > b.created_at;
-            }
-        }.lessThan);
-
-        // Apply cursor-based pagination: skip past the cursor run_id
-        var start_idx: usize = 0;
-        if (cursor_filter) |c| {
-            for (runs_list.items, 0..) |item, idx| {
-                if (std.mem.eql(u8, item.run_id, c)) {
-                    start_idx = idx + 1;
-                    break;
-                }
-            }
-        }
-
-        const end_idx = @min(start_idx + limit, runs_list.items.len);
-        const page = runs_list.items[start_idx..end_idx];
-        const has_more = end_idx < runs_list.items.len;
-        const last_run_id: []const u8 = if (page.len > 0) page[page.len - 1].run_id else "";
-
-        // Serialize to binary wire format:
-        // [count:u32]([run_id_len:u16][run_id][workflow_len:u16][workflow]
-        //  [status_len:u16][status][created_at:i64])*
-        // [has_more:u8][cursor_len:u16][cursor]?
-        var total: usize = 4; // count
-        for (page) |r| {
-            total += 2 + r.run_id.len + 2 + r.workflow.len + 2 + r.status.len + 8;
-        }
-        total += 1 + 2 + (if (has_more) last_run_id.len else 0); // trailer
-
-        const buf = self.allocator.alloc(u8, total) catch {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+        const status = query.status orelse "";
+        const search = query.search orelse "";
+        if (status.len > system_ops.MAX_RUN_STATUS) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: no run has a status that long");
+        if (search.len > system_ops.MAX_RUN_SEARCH) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a run search is at most 4096 bytes");
+        const after: ?list_runs.RunAt.Value = if (query.cursor) |c|
+            list_runs.decodeCursor(c) orelse return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: the cursor isn't one this server sent")
+        else
+            null;
+        // Lowercased once for case-insensitive matching: all of it, so a
+        // long query matches no more than it says.
+        var search_buf: [system_ops.MAX_RUN_SEARCH]u8 = undefined;
+        const q: list_runs.Query = .{
+            .limit = if (query.limit == 0) list_runs.DEFAULT_LIMIT else @min(query.limit, list_runs.MAX_LIMIT),
+            .status = status,
+            .search = std.ascii.lowerString(search_buf[0..search.len], search),
+            .after = after,
         };
-        defer self.allocator.free(buf);
-
-        // A page is at most `limit` (u32) runs; run ids are under 600 bytes and
-        // workflow names under 65000 (the start entry), statuses literals.
-        std.mem.writeInt(u32, buf[0..4], @intCast(page.len), .little);
-        var pos: usize = 4;
-        for (page) |r| {
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.run_id.len), .little);
-            pos += 2;
-            @memcpy(buf[pos..][0..r.run_id.len], r.run_id);
-            pos += r.run_id.len;
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.workflow.len), .little);
-            pos += 2;
-            @memcpy(buf[pos..][0..r.workflow.len], r.workflow);
-            pos += r.workflow.len;
-            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.status.len), .little);
-            pos += 2;
-            @memcpy(buf[pos..][0..r.status.len], r.status);
-            pos += r.status.len;
-            std.mem.writeInt(i64, buf[pos..][0..8], r.created_at, .little);
-            pos += 8;
+        // One workflow's runs are on the shard that took the request.
+        if (req.key.len > 0 or shard.shardCount() == 1) return list_runs.answerOwn(shard, conn, req, q);
+        switch (list_runs.start(shard, conn, req, q)) {
+            .asked => conn.response_deferred = true,
+            .refused => |r| shard.sendRefusal(conn, req.header.request_id, r.status, r.refusal),
         }
-        buf[pos] = if (has_more) 1 else 0;
-        pos += 1;
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(if (has_more) last_run_id.len else 0), .little);
-        pos += 2;
-        if (has_more) {
-            @memcpy(buf[pos..][0..last_run_id.len], last_run_id);
-        }
-
-        shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
     // ── GET DEFINITION ──────────────────────────────────────────────────
@@ -5769,4 +5678,86 @@ test "workflow replay: a start whose input nests past 128 levels applies; a sear
             try testing.expectEqualStrings("{\"a\":null}", tags);
         }
     }
+}
+
+fn createTestRunAt(handler: *WorkflowHandler, run_id: []const u8, wf_name: []const u8, started_at: i64, status: WorkflowHandler.RunStatus) !void {
+    var key_buf: [64]u8 = undefined;
+    const ns_key = try std.fmt.bufPrint(&key_buf, "default:{s}", .{run_id});
+    createTestRun(handler, ns_key, run_id, wf_name);
+    const run = handler.runs.getPtr(ns_key) orelse return error.OutOfMemory;
+    run.started_at_ms = started_at;
+    run.status = status;
+}
+
+/// The run ids of a shard's page of runs, in order.
+fn pageRunIds(page: list_runs.PageResponse.Value, out: [][]const u8) ![]const []const u8 {
+    var it = page.runs.iterator();
+    var n: usize = 0;
+    while (try it.next()) |run| : (n += 1) out[n] = run.at.run_id;
+    return out[0..n];
+}
+
+fn expectRunIds(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "list runs: a shard's page is newest first, by id among runs started together, and resumes after the run given" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    try createTestRunAt(&handler, "r-old", "wf", 10, .running);
+    try createTestRunAt(&handler, "r-b", "wf", 20, .running);
+    try createTestRunAt(&handler, "r-a", "wf", 20, .running);
+    try createTestRunAt(&handler, "r-new", "wf", 30, .running);
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var ids: [8][]const u8 = undefined;
+
+    const first = try list_runs.ownPage(&handler, "default", "", .{ .limit = 2, .status = "", .search = "", .after = null }, 1 << 20, buf);
+    try expectRunIds(&.{ "r-new", "r-a" }, try pageRunIds(first, &ids));
+    try testing.expect(first.more);
+
+    const rest = try list_runs.ownPage(&handler, "default", "", .{ .limit = 10, .status = "", .search = "", .after = .{ .created_at = 20, .run_id = "r-a" } }, 1 << 20, buf);
+    try expectRunIds(&.{ "r-b", "r-old" }, try pageRunIds(rest, &ids));
+    try testing.expect(!rest.more);
+}
+
+test "list runs: a shard's page holds only runs with the status asked" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    try createTestRunAt(&handler, "r-1", "wf", 10, .running);
+    try createTestRunAt(&handler, "r-2", "wf", 20, .completed);
+    try createTestRunAt(&handler, "r-3", "wf", 30, .running);
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var ids: [8][]const u8 = undefined;
+    const page = try list_runs.ownPage(&handler, "default", "", .{ .limit = 10, .status = WorkflowHandler.RunStatus.completed.toString(), .search = "", .after = null }, 1 << 20, buf);
+    try expectRunIds(&.{"r-2"}, try pageRunIds(page, &ids));
+}
+
+test "list runs: a shard's page holds only runs the search matches" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    try createTestRunAt(&handler, "r-1", "orders", 10, .running);
+    try createTestRunAt(&handler, "r-2", "billing", 20, .running);
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var ids: [8][]const u8 = undefined;
+    const page = try list_runs.ownPage(&handler, "default", "", .{ .limit = 10, .status = "", .search = "bill", .after = null }, 1 << 20, buf);
+    try expectRunIds(&.{"r-2"}, try pageRunIds(page, &ids));
+}
+
+test "list runs: a shard's page stops before its entries pass the room it was given" {
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    try createTestRunAt(&handler, "r-1", "wf", 10, .running);
+    try createTestRunAt(&handler, "r-2", "wf", 20, .running);
+    const buf = try testing.allocator.alloc(u8, system_ops.Runs.max_size);
+    defer testing.allocator.free(buf);
+    var ids: [8][]const u8 = undefined;
+    // One entry: [3]["r-2"][2]["wf"][7]["running"][i64] = 2+3+2+2+2+7+8 bytes.
+    const one: u32 = 26;
+    const page = try list_runs.ownPage(&handler, "default", "", .{ .limit = 10, .status = "", .search = "", .after = null }, one + 1, buf);
+    try expectRunIds(&.{"r-2"}, try pageRunIds(page, &ids));
+    try testing.expect(page.more);
 }
