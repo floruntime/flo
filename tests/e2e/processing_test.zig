@@ -442,6 +442,31 @@ test "e2e/processing: list shows submitted jobs" {
     try testing.expectEqual(@as(usize, 1), one.stdoutCount("e2e-list-job"));
 }
 
+test "e2e/processing: jobs that share a name are each listed" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_same" });
+
+    const def =
+        \\kind: Processing
+        \\name: e2e-same-name
+        \\namespace: proc_same
+        \\sources.[0].stream.name: same-input
+        \\sinks.[0].stream.name: same-output
+    ;
+    const path = try writeDottedToTempYaml(testing.allocator, def, "e2e-same-name.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+
+    var ids: [3][]const u8 = undefined;
+    for (&ids) |*id| id.* = extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_same" })) orelse return error.NoJobId;
+
+    var list = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_same" });
+    defer list.deinit();
+    try testing.expectEqual(@as(u8, 0), list.exit_code);
+    try testing.expectEqual(@as(usize, 3), list.stdoutCount("e2e-same-name"));
+    for (ids) |id| try testing.expectEqual(@as(usize, 1), list.stdoutCount(id));
+}
+
 test "e2e/processing: passthrough pipeline - data flows from source to sink stream" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

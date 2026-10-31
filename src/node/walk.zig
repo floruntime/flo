@@ -121,7 +121,7 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []cons
         },
         .processing_list => {
             const handler: *const ProcessingHandler = @ptrCast(@alignCast(ctx));
-            const job = handler.jobNamed(namespace, name) orelse return;
+            const job = handler.listedJob(namespace, name) orelse return;
             if (ProcessingHandler.entrySize(job) > w.buffer.len) return error.EntryTooLarge;
             try ProcessingHandler.writeEntry(job, w);
         },

@@ -455,8 +455,8 @@ pub const ProcessingHandler = struct {
         return 0;
     }
 
-    /// ShardWalker LocalScanFn for processing_list — returns job names
-    /// from one shard's ProcessingHandler registry.
+    /// ShardWalker LocalScanFn for processing_list: one shard's job ids.
+    /// Ids, not names: jobs may share a name, and each is its own row.
     fn localScanJobs(
         ctx: *anyopaque,
         namespace: []const u8,
@@ -474,7 +474,7 @@ pub const ProcessingHandler = struct {
             if (count >= name_buf.len) break;
             const job = entry.value_ptr;
             if (!std.mem.eql(u8, job.namespace_owned, req_ns)) continue;
-            name_buf[count] = job.name_owned;
+            name_buf[count] = job.job_id_owned;
             count += 1;
         }
 
@@ -806,16 +806,12 @@ pub const ProcessingHandler = struct {
         try w.writeInt(i64, j.created_at_ms, .little);
     }
 
-    /// The job named `name` in `namespace` (empty is "default"), if this
-    /// shard holds it.
-    pub fn jobNamed(self: *const ProcessingHandler, namespace: []const u8, name: []const u8) ?*const JobRecord {
+    /// The job `job_id` in `namespace` (empty is "default"), if this shard
+    /// holds it.
+    pub fn listedJob(self: *const ProcessingHandler, namespace: []const u8, job_id: []const u8) ?*const JobRecord {
+        const job = self.jobs.getPtr(job_id) orelse return null;
         const ns = if (namespace.len > 0) namespace else "default";
-        var it = self.jobs.iterator();
-        while (it.next()) |entry| {
-            const job = entry.value_ptr;
-            if (std.mem.eql(u8, job.name_owned, name) and std.mem.eql(u8, job.namespace_owned, ns)) return job;
-        }
-        return null;
+        return if (std.mem.eql(u8, job.namespace_owned, ns)) job else null;
     }
 
     /// What status and list say beside a job's status: a failed job's
@@ -2623,7 +2619,7 @@ test "ProcessingHandler: replicas of different shard counts store the same statu
     // The list says so, beside the status.
     var entry_buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&entry_buf);
-    try ProcessingHandler.writeEntry(two.jobNamed("", "lookup").?, &w);
+    try ProcessingHandler.writeEntry(two.listedJob("", "job-1").?, &w);
     var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     _ = r.readLengthPrefixed(u16).?;
     _ = r.readLengthPrefixed(u16).?;
@@ -2894,7 +2890,7 @@ test "ProcessingHandler: list shows a failed job's reason, through the walk ever
     // A definition that doesn't parse has no name of its own: the job's id stands in.
     var entry_buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&entry_buf);
-    try ProcessingHandler.writeEntry(handler.jobNamed("", "job-r").?, &w);
+    try ProcessingHandler.writeEntry(handler.listedJob("", "job-r").?, &w);
     var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
@@ -2902,4 +2898,25 @@ test "ProcessingHandler: list shows a failed job's reason, through the walk ever
     try std.testing.expect(std.mem.startsWith(u8, status, "FAILED: "));
     try std.testing.expectEqualStrings(reason, status["FAILED: ".len..]);
     try std.testing.expectEqual(@as(i64, 1), r.readI64().?);
+}
+
+test "ProcessingHandler: jobs that share a name are each listed" {
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    const ids = [_][]const u8{ "job-a", "job-b", "job-c" };
+    for (ids, 1..) |id, i| _ = try applySubmit(&handler, id, testSubmitValue(&buf, .stopped, lookup_yaml), @intCast(i));
+
+    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), "", "", null, 0);
+    try std.testing.expectEqual(ids.len, page.items.len);
+    var seen: [ids.len]bool = @splat(false);
+    for (page.items) |item| {
+        const job = handler.listedJob("", item).?;
+        try std.testing.expectEqualStrings("lookup", job.name_owned);
+        for (ids, 0..) |id, i| if (std.mem.eql(u8, id, job.job_id_owned)) {
+            seen[i] = true;
+        };
+    }
+    for (seen) |s| try std.testing.expect(s);
+    try std.testing.expect(handler.listedJob("other", "job-a") == null);
 }
