@@ -14093,6 +14093,73 @@ test "actions: a task taken by an await asking another shard, whose client close
     try std.testing.expectEqual(@as(u64, 0), there.defaultPartition().store.family(action_machine.Requests.ID).count);
 }
 
+test "actions: a task taken for an await another shard forwarded, whose client was told none at its deadline, is handed back" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const there = &t.two.shards[1];
+    var wbuf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&wbuf, "fw-{d}", .{i});
+        if (there.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+    } else return error.NoWorker;
+    var b: [256]u8 = undefined;
+    const frame = try testRequest(.action_await, 2, worker, try ActionsHandler.for_tests.awaitBody(&b, &.{t.name}, 30_000, "k1"));
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(t.ca.pair[1], here, t.ca.conn.fd, frame);
+    t.two.settle();
+    // The client is told none; the parked await then takes a run.
+    for (here.reply_pool.slots) |*slot| {
+        if (slot.active) slot.answer_due_ms = 0;
+    }
+    here.reply_sweep_ms = 0;
+    here.expireReplySlots();
+    try t.invoke(1, "\x00job");
+    t.two.settle();
+    const run = ActionsHandler.for_tests.anyRun(there).?;
+    try std.testing.expectEqual(action_machine.Status.ready, run.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
+}
+
+test "actions: a task in the answer to a gather already ended is handed back" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const there = &t.two.shards[1];
+    try t.invoke(1, "\x00job");
+    try t.feedAwait(2, 0, "k1");
+    // The first pass looks for the key's delivery (none); the second asks
+    // for a task. Its gather ends before the owner answers.
+    _ = there.drainInbox();
+    _ = here.drainInbox();
+    const part = for (here.reply_pool.slots) |slot| {
+        if (slot.active) if (slot.gather) |p| break p;
+    } else return error.NoPart;
+    here.endGather(here.gathers.get(.{ .index = part.index, .gen = part.gen }).?);
+    t.two.settle();
+    const run = ActionsHandler.for_tests.anyRun(there).?;
+    try std.testing.expectEqual(action_machine.Status.ready, run.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
+}
+
+test "actions: an await asking another shard waits out what is left of its block, not all of it again" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const t0 = @import("stdx").time.monotonicMs();
+    try t.feedAwait(1, 30_000, null);
+    @import("stdx").time.sleep(50 * std.time.ns_per_ms);
+    t.two.settle();
+    try std.testing.expectEqual(@as(u16, 1), here.waiter_pool.countByKind(.action_await));
+    const w = for (here.waiter_pool.waiters[0..here.waiter_pool.count]) |w| {
+        if (w.active and w.kind == .action_await) break w;
+    } else unreachable;
+    try std.testing.expect(w.expires_at_ms < t0 + 30_000 + 50);
+}
+
 test "actions: delayed retries' due times are read from the store on a new term, and once a list that dropped some drains" {
     var t: ActionsTest = undefined;
     try t.init();
@@ -14118,6 +14185,31 @@ test "actions: delayed retries' due times are read from the store on a new term,
     actions.duty_term = 0;
     _ = actions.expireDue(&t.shard);
     try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
+}
+
+test "actions: a full due list keeps the earliest, and the store is read again a chunk a tick" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    // Latest first: each later arrival is earlier than all it holds.
+    var i: u64 = ActionsHandler.MAX_DUE + 100;
+    while (i > 0) : (i -= 1) actions.noteDue(i);
+    try std.testing.expect(actions.due_full);
+    try std.testing.expectEqual(ActionsHandler.MAX_DUE, actions.due.items.len);
+    try std.testing.expectEqual(@as(u64, ActionsHandler.MAX_DUE), std.mem.max(u64, actions.due.items));
+
+    _ = try t.ok(.action_register, "act", "");
+    var key: [16]u8 = undefined;
+    for (0..ActionsHandler.REBUILD_CHUNK + 1) |n| _ = try t.ok(.action_invoke, "act", try std.fmt.bufPrint(&key, "\x00j{d}", .{n}));
+    // Due by now: none are noted, the keys are read all the same.
+    const now = std.math.maxInt(u64);
+    actions.startRebuild();
+    actions.stepRebuild(&t.shard, now);
+    try std.testing.expect(actions.rebuilding);
+    actions.stepRebuild(&t.shard, now);
+    try std.testing.expect(!actions.rebuilding);
 }
 
 test "actions: what a shard keeps of runs asked about, and runs it was asked to start, goes in time" {

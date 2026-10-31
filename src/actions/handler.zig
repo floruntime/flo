@@ -165,16 +165,21 @@ pub const ActionsHandler = struct {
     /// The term the duty last ran in, and when it first ran in it.
     duty_term: u64 = 0,
     duty_since_ns: u64 = 0,
-    /// When runs released with a delay are due: the duty wakes awaits as
-    /// each comes. Leader memory; a new leader's first tick wakes them all.
+    /// When runs released with a delay are due, the earliest `MAX_DUE` of
+    /// them, as a max-heap: the duty wakes awaits as each comes. Leader
+    /// memory; a new leader reads them from the store again.
     due: std.ArrayListUnmanaged(u64) = .empty,
+    /// Reading due times from the store, `REBUILD_CHUNK` keys a tick: the
+    /// key it stopped after, or none at the start.
+    rebuilding: bool = false,
+    rebuild_after: std.ArrayListUnmanaged(u8) = .empty,
     /// Counts wakes for runs ready here, and wakes from other shards: an
     /// await asking other shards when one it could use came asks again
     /// rather than wait out its block time.
     wake_local: u64 = 0,
     wake_peer: u64 = 0,
-    /// Whether delays were dropped while `due` was full: it is rebuilt
-    /// from the store once it drains.
+    /// Whether later delays were dropped while `due` was full: it is read
+    /// from the store again once it drains.
     due_full: bool = false,
     /// Awaits woken this pass, to run again once the pass is over.
     reruns: std.ArrayListUnmanaged(Rerun) = .empty,
@@ -214,7 +219,9 @@ pub const ActionsHandler = struct {
     const ASK_EVERY_MS: u64 = 5000;
     /// Delayed retries the duty keeps a due time for; past it, every tick
     /// wakes.
-    const MAX_DUE: usize = 4096;
+    pub const MAX_DUE: usize = 4096;
+    /// Ready keys one duty tick reads while rebuilding `due`.
+    pub const REBUILD_CHUNK: usize = 1024;
 
     /// Requests and entries as clients and the log make them, for tests.
     pub const for_tests = test_support;
@@ -229,6 +236,7 @@ pub const ActionsHandler = struct {
         self.pending.deinit(self.allocator);
         self.extending.deinit(self.allocator);
         self.due.deinit(self.allocator);
+        self.rebuild_after.deinit(self.allocator);
         for (self.reruns.items) |r| self.allocator.free(r.bytes);
         self.reruns.deinit(self.allocator);
         var it = self.finished.iterator();
@@ -1341,30 +1349,78 @@ pub const ActionsHandler = struct {
         }
     }
 
-    fn noteDue(self: *ActionsHandler, due_ns: u64) void {
-        if (self.due.items.len == MAX_DUE) {
-            self.due_full = true;
+    /// Keep `due_ns` if it is among the earliest `MAX_DUE`.
+    pub fn noteDue(self: *ActionsHandler, due_ns: u64) void {
+        const d = &self.due;
+        if (d.items.len < MAX_DUE) {
+            d.append(self.allocator, due_ns) catch {
+                self.due_full = true;
+                return;
+            };
+            dueSiftUp(d.items, d.items.len - 1);
             return;
         }
-        self.due.append(self.allocator, due_ns) catch {
-            self.due_full = true;
-        };
+        self.due_full = true;
+        if (due_ns >= d.items[0]) return;
+        d.items[0] = due_ns;
+        dueSiftDown(d.items, 0);
     }
 
-    /// The due times of ready runs not yet due, read from the store: on a
-    /// new term, and once a list that dropped some has drained.
-    fn rebuildDue(self: *ActionsHandler, shard: *Shard, now: u64) void {
+    fn dueSiftUp(h: []u64, start: usize) void {
+        var i = start;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (h[parent] >= h[i]) return;
+            std.mem.swap(u64, &h[parent], &h[i]);
+            i = parent;
+        }
+    }
+
+    fn dueSiftDown(h: []u64, start: usize) void {
+        var i = start;
+        while (true) {
+            var big = i;
+            for ([_]usize{ 2 * i + 1, 2 * i + 2 }) |c| if (c < h.len and h[c] > h[big]) {
+                big = c;
+            };
+            if (big == i) return;
+            std.mem.swap(u64, &h[big], &h[i]);
+            i = big;
+        }
+    }
+
+    /// Start reading the due times of ready runs from the store again.
+    pub fn startRebuild(self: *ActionsHandler) void {
         self.due.clearRetainingCapacity();
         self.due_full = false;
-        var it = readOf(shard).range(machine.Ready, "");
+        self.rebuilding = true;
+        self.rebuild_after.clearRetainingCapacity();
+    }
+
+    /// Read the next `REBUILD_CHUNK` ready keys' due times, if rebuilding:
+    /// a large backlog is read over several ticks, never in one.
+    pub fn stepRebuild(self: *ActionsHandler, shard: *Shard, now: u64) void {
+        if (!self.rebuilding) return;
+        var it = if (self.rebuild_after.items.len == 0) readOf(shard).range(machine.Ready, "") else readOf(shard).rangeAfter(machine.Ready, "", self.rebuild_after.items);
+        var read: usize = 0;
         while (it.next() catch null) |item| {
             const k = item.key;
             const rest = k[1 + @as(usize, k[0]) ..];
-            const sep = std.mem.indexOfScalar(u8, rest, 0) orelse continue;
-            if (rest.len < sep + 9) continue;
-            const due = std.mem.readInt(u64, rest[sep + 1 ..][0..8], .big);
-            if (due > now) self.noteDue(due);
+            if (std.mem.indexOfScalar(u8, rest, 0)) |sep| if (rest.len >= sep + 9) {
+                const due = std.mem.readInt(u64, rest[sep + 1 ..][0..8], .big);
+                if (due > now) self.noteDue(due);
+            };
+            read += 1;
+            if (read == REBUILD_CHUNK) {
+                self.rebuild_after.clearRetainingCapacity();
+                self.rebuild_after.appendSlice(self.allocator, k) catch {
+                    self.rebuilding = false;
+                    self.due_full = true;
+                };
+                return;
+            }
         }
+        self.rebuilding = false;
     }
 
     fn tellWorkflowsOfExpire(self: *ActionsHandler, shard: *Shard, e: *const Entry) void {
@@ -1613,7 +1669,8 @@ pub const ActionsHandler = struct {
             self.duty_since_ns = now;
             // Runs ready before this term had no leader to wake for them,
             // and those due later none to note when.
-            self.rebuildDue(shard, now);
+            self.startRebuild();
+            self.stepRebuild(shard, now);
             ActionsHandler.wakeWorkers(shard);
         } else self.wakeDue(shard, now);
         if (self.expiring != null) return 0;
@@ -1648,19 +1705,33 @@ pub const ActionsHandler = struct {
         return n;
     }
 
-    /// Wake awaits once a delayed retry is due; with more delays than the
-    /// list holds, every tick wakes until it drains and is read again.
+    /// Wake awaits once a delayed retry is due. With later ones dropped,
+    /// the store is read again once the list drains to half: what it keeps
+    /// all come due before any it dropped.
     fn wakeDue(self: *ActionsHandler, shard: *Shard, now: u64) void {
-        if (self.due_full and self.due.items.len < MAX_DUE / 2) self.rebuildDue(shard, now);
-        var woke = self.due.items.len == MAX_DUE;
+        self.stepRebuild(shard, now);
+        const d = &self.due;
+        var woke = false;
         var i: usize = 0;
-        while (i < self.due.items.len) {
-            if (self.due.items[i] <= now) {
-                _ = self.due.swapRemove(i);
+        while (i < d.items.len) {
+            if (d.items[i] <= now) {
+                _ = d.swapRemove(i);
                 woke = true;
             } else i += 1;
         }
-        if (woke) ActionsHandler.wakeWorkers(shard);
+        if (woke) {
+            // What's left, a heap again.
+            var k = d.items.len / 2;
+            while (k > 0) {
+                k -= 1;
+                dueSiftDown(d.items, k);
+            }
+            ActionsHandler.wakeWorkers(shard);
+        }
+        if (self.due_full and !self.rebuilding and d.items.len < MAX_DUE / 2) {
+            self.startRebuild();
+            self.stepRebuild(shard, now);
+        }
     }
 
     /// Drop what is older than `FINISHED_KEEP_MS` at `now` (monotonic ms):
@@ -1707,6 +1778,8 @@ pub const ActionsHandler = struct {
         freeKeys(self.allocator, &self.reserved);
         freeKeys(self.allocator, &self.extending);
         self.due.clearRetainingCapacity();
+        self.due_full = false;
+        self.rebuilding = false;
         self.expiring = null;
         self.duty_term = 0;
     }
