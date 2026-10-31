@@ -1085,7 +1085,7 @@ pub const ActionsHandler = struct {
             return true;
         };
         if (!mayFind(shard, parts, from == .remote)) return false;
-        const left = waiter.expires_at_ms -| @import("stdx").time.monotonicMs();
+        const left = waitLeft(waiter, @import("stdx").time.monotonicMs());
         if (left == 0) return false;
         const bytes = rerunBytes(shard.allocator, waiter.request_id, parts, left) catch return false;
         self.reruns.append(self.allocator, .{ .reply_to = waiter.reply_to, .request_id = waiter.request_id, .bytes = bytes }) catch {
@@ -1116,6 +1116,11 @@ pub const ActionsHandler = struct {
         const first = (it.next() catch return false) orelse return false;
         const tail = first.key[prefix.len..];
         return tail.len >= 8 and std.mem.readInt(u64, tail[0..8], .big) <= wallNs();
+    }
+
+    /// What a waiting await has left of its wait, at `now_ms`.
+    fn waitLeft(waiter: *const Waiter, now_ms: u64) u64 {
+        return waiter.expires_at_ms -| now_ms;
     }
 
     /// The await a waiter was, as a request, waiting `left_ms` at most.
@@ -1734,6 +1739,10 @@ const test_support = struct {
     /// Action `name`'s version in `ns`.
     pub fn version(shard: *Shard, ns: []const u8, name: []const u8) ?u32 {
         return if (getDef(shard, ns, name)) |d| d.version else null;
+    }
+
+    pub fn waitLeft(waiter: *const Waiter, now_ms: u64) u64 {
+        return ActionsHandler.waitLeft(waiter, now_ms);
     }
 
     /// The first run the shard holds, in any namespace.
