@@ -115,7 +115,9 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         .to_ms = @max(to_val, 0),
     }) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
     defer got.deinit();
-    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
+    // A namespace never created holds no points.
+    const points: []const u8 = if (got.isNotFound()) "" else got.data;
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -133,7 +135,7 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
         // [count:u32]([timestamp_ms:i64][value:f64])*
         var series_arr = try obj.arrayField("series");
         try series_arr.begin();
-        var r = WireReader.init(got.data);
+        var r = WireReader.init(points);
         const count = r.readU32() orelse 0;
         for (0..count) |_| {
             const ts_ms = r.readI64() orelse break;
@@ -186,8 +188,10 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     var got = client.sendRequest(.ts_floql, ns, measurement, query_text) catch |err|
         return try loopback.readFailed(allocator, "FloQL query", err);
     defer got.deinit();
-    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
-    if (!wholeSeriesSet(got.data)) return try h.jsonError(allocator, "FloQL query: malformed answer");
+    if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
+    // A namespace never created holds no series: a set of none.
+    const set: []const u8 = if (got.isNotFound()) &.{ 0, 0, 0, 0 } else got.data;
+    if (!wholeSeriesSet(set)) return try h.jsonError(allocator, "FloQL query: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -199,7 +203,7 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     {
         var series_arr = try obj.arrayField("series");
         try series_arr.begin();
-        var r = WireReader.init(got.data);
+        var r = WireReader.init(set);
         const series_count = r.readU32() orelse 0;
         for (0..series_count) |_| {
             const key = r.readLengthPrefixed(u32).?;

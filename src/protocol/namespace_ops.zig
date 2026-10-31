@@ -96,6 +96,20 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .none, .key = name_key },
         .doc = "A shard asking shard 0 for a namespace's id, creating the namespace if it is new.",
     },
+    .{
+        .name = "namespace.published",
+        .code = 0x017,
+        .class = .read,
+        .origin = .internal,
+        .scope = .server,
+        .route = .shard0,
+        .request = Record(&.{}),
+        .response = Record(&.{
+            .{ .name = "published_index", .T = Int(u64), .doc = "Shard 0's log index its namespace table reflects" },
+        }),
+        .cli = .{ .expose = .none },
+        .doc = "A follower asking the leader how far its namespace table is published, before it resolves a name it doesn't know.",
+    },
 };
 
 /// The namespace op in the table named `name`; a name not there fails the build.

@@ -122,8 +122,9 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     var got = client.sendRequest(.queue_stats, ns_q, queue_name, "") catch |err|
         return try loopback.readFailed(allocator, "queue stats", err);
     defer got.deinit();
-    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
-    const s = parseStats(got.data) orelse return try h.jsonError(allocator, "queue stats: malformed answer");
+    if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
+    // A namespace never created holds the queue as any unknown one: zeros.
+    const s: QueueStats = if (got.isNotFound()) .{ .enqueued = 0, .dequeued = 0, .ready = 0, .leased = 0, .dlq = 0 } else parseStats(got.data) orelse return try h.jsonError(allocator, "queue stats: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -164,11 +165,14 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
     var got = client_mod.queue.dlqList(client, ns_q, queue_name) catch |err|
         return try loopback.readFailed(allocator, "queue dlq", err);
     defer got.deinit();
-    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
-    // [count:u32 = 0][total_dlq:u64]: a summary, no entries.
+    if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
+    // [count:u32 = 0][total_dlq:u64]: a summary, no entries. A namespace
+    // never created holds none.
     var r = WireReader.init(got.data);
-    _ = r.readU32() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
-    const total = r.readU64() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
+    const total: u64 = if (got.isNotFound()) 0 else blk: {
+        _ = r.readU32() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
+        break :blk r.readU64() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
+    };
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
