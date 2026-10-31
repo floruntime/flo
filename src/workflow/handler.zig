@@ -4701,6 +4701,36 @@ test "step executor: an action completed naming no outcome takes the success tra
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.runs.get("default:run-e").?.status);
 }
 
+test "step executor: a step whose action run another shard says was lost resumes, and fails" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b");
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-l", "run-l", "test-wf");
+    handler.advanceWorkflow(&shard, "default:run-l", "default");
+    _ = shard.applyCommitted();
+    const run = handler.runs.getPtr("default:run-l").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    // As if its action ran on shard 1, which says it never started it.
+    run.pending_action_shard_id = 1;
+    const rid = run.pending_action_run_id_owned.?;
+    var msg: [128]u8 = undefined;
+    std.mem.writeInt(u16, msg[0..2], @intCast(rid.len), .little);
+    @memcpy(msg[2..][0..rid.len], rid);
+    msg[2 + rid.len] = @backingInt(@import("../protocol/result.zig").CommandResult.ActionRunStatus.cancelled);
+    std.mem.writeInt(u16, msg[3 + rid.len ..][0..2], 0, .little);
+    actions.finishedFromInbox(msg[0 .. 5 + rid.len]);
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+    try testing.expect(handler.runs.get("default:run-l").?.status != .waiting);
+}
+
 test "step executor: retry on failure" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);

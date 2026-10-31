@@ -13983,6 +13983,178 @@ test "actions: a run its shard has no record of is answered as lost, and a workf
     try std.testing.expect(actions.finished.get("act-nothing") == null);
 }
 
+test "actions: an await asking another shard whose wait ran out meanwhile answers no task, and isn't asked again" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    try t.feedAwait(1, 50, null);
+    // The owner answers none; a wake comes, but the wait is spent by the
+    // time the answer is read.
+    _ = t.two.shards[1].drainInbox();
+    @import("stdx").time.sleep(80 * std.time.ns_per_ms);
+    ActionsHandler.wakeFromPeer(here);
+    _ = here.drainInbox();
+    const resp = try nextAnswer(t.ca, here, &t.out);
+    try std.testing.expectEqual(@as(u64, 1), resp.header.request_id);
+    try std.testing.expect((try ActionsHandler.for_tests.task(resp.data)) == null);
+    try std.testing.expectEqual(@as(usize, 0), here.gathers.inUse());
+}
+
+test "actions: an await asking another shard parks, not asks again, after a wake for runs here it names none of" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    try t.feedAwait(1, 30_000, null);
+    _ = t.two.shards[1].drainInbox();
+    ActionsHandler.wakeLocal(here);
+    _ = here.drainInbox();
+    try std.testing.expectEqual(@as(u16, 1), here.waiter_pool.countByKind(.action_await));
+    try std.testing.expectEqual(@as(usize, 0), here.gathers.inUse());
+}
+
+test "actions: a shard asked about a run says nothing until its leader is ready, nothing while the run is starting, and lost only after" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const there = &t.two.shards[1];
+    const actions = there.actions_handler;
+    var ask: [64]u8 = undefined;
+    std.mem.writeInt(u16, ask[0..2], 7, .little);
+    @memcpy(ask[2..9], "default");
+    @memcpy(ask[9..15], "run-xy");
+    const bytes = ask[0..15];
+    const raft = there.raft_node;
+    const ready = raft.ready_index;
+    raft.ready_index = raft.last_applied + 1000;
+    actions.resultAskFromInbox(there, 0, bytes);
+    raft.ready_index = ready;
+    try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
+    // Asked to start it: starting, not lost.
+    var start_buf: [256]u8 = undefined;
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-xy", "nope", "{}", "wf-run", "wf") orelse return error.OutOfMemory;
+    defer std.testing.allocator.free(start);
+    _ = &start_buf;
+    actions.startRunFromInbox(there, 0, start);
+    actions.resultAskFromInbox(there, 0, bytes);
+    try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
+    // Never started, and not starting: lost.
+    var other: [64]u8 = undefined;
+    @memcpy(other[0..15], bytes);
+    @memcpy(other[9..15], "run-zz");
+    actions.resultAskFromInbox(there, 0, other[0..15]);
+    try std.testing.expectEqual(@as(usize, 1), t.two.shards[0].mailbox.inbox.pending());
+    t.two.settle();
+}
+
+test "actions: a task taken by an await whose client, on another shard, closed before the answer came is handed back" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const there = &t.two.shards[1];
+    // A worker whose await runs on shard 1, where the action is: the
+    // client on shard 0 forwards it.
+    var wbuf: [16]u8 = undefined;
+    const worker = for (0..256) |i| {
+        const w = try std.fmt.bufPrint(&wbuf, "fw-{d}", .{i});
+        if (there.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+    } else return error.NoWorker;
+    try t.invoke(1, "\x00job");
+    var b: [256]u8 = undefined;
+    const frame = try testRequest(.action_await, 2, worker, try ActionsHandler.for_tests.awaitBody(&b, &.{t.name}, 0, "k1"));
+    defer std.testing.allocator.free(frame);
+    _ = feedClient(t.ca.pair[1], &t.two.shards[0], t.ca.conn.fd, frame);
+    t.two.shards[0].removeConnection(t.ca.conn.fd);
+    t.two.settle();
+    const run = ActionsHandler.for_tests.anyRun(there).?;
+    try std.testing.expectEqual(action_machine.Status.ready, run.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
+    // Its request key's record went with it.
+    try std.testing.expectEqual(@as(u64, 0), there.defaultPartition().store.family(action_machine.Requests.ID).count);
+}
+
+test "actions: a task taken by an await asking another shard, whose client closed meanwhile, is handed back with its request key's record" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const there = &t.two.shards[1];
+    try t.invoke(1, "\x00job");
+    try t.feedAwait(2, 0, "k1");
+    // The first pass looks for the key's delivery (none); the second asks
+    // for a task. The client goes before the owner answers it.
+    _ = there.drainInbox();
+    _ = t.two.shards[0].drainInbox();
+    t.two.shards[0].removeConnection(t.ca.conn.fd);
+    t.two.settle();
+    const run = ActionsHandler.for_tests.anyRun(there).?;
+    try std.testing.expectEqual(action_machine.Status.ready, run.status);
+    try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
+    try std.testing.expectEqual(@as(u64, 0), there.defaultPartition().store.family(action_machine.Requests.ID).count);
+}
+
+test "actions: delayed retries' due times are read from the store on a new term, and once a list that dropped some drains" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    _ = try t.ok(.action_register, "act", "");
+    _ = try t.ok(.action_invoke, "act", "\x00job");
+    const task = (try t.take("w1", "act", 0, null)).?;
+    var run_buf: [64]u8 = undefined;
+    const run_id = run_buf[0..task.run.len];
+    @memcpy(run_id, task.run);
+    var body: [1024]u8 = undefined;
+    _ = try t.ok(.action_fail, run_id, try table_run.op("action.fail").request.encodeInto(&body, .{ .action = "act", .worker = "w1", .deliveries = task.deliveries, .term = task.term, .index = task.index, .retry = true, .abandoned = false, .delay_ms = 60_000, .@"error" = "" }));
+    try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
+    // Dropped while full: read again once there is room.
+    actions.due.clearRetainingCapacity();
+    actions.due_full = true;
+    _ = actions.expireDue(&t.shard);
+    try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
+    // A new term reads them too.
+    actions.due.clearRetainingCapacity();
+    actions.duty_term = 0;
+    _ = actions.expireDue(&t.shard);
+    try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
+}
+
+test "actions: what a shard keeps of runs asked about, and runs it was asked to start, goes in time" {
+    var t: TwoShardActions = undefined;
+    try t.init();
+    defer t.deinit();
+    const here = &t.two.shards[0];
+    const actions = here.actions_handler;
+    actions.askResult(here, 1, "default", "act-old");
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", "nope", "{}", "wf-run", "wf") orelse return error.OutOfMemory;
+    defer std.testing.allocator.free(start);
+    actions.startRunFromInbox(here, 1, start);
+    actions.asked.getPtr("act-old").?.* = 0;
+    actions.starting.getPtr("run-old").?.* = 0;
+    _ = actions.expireDue(here);
+    try std.testing.expect(actions.asked.get("act-old") == null);
+    try std.testing.expect(actions.starting.get("run-old") == null);
+    t.two.settle();
+}
+
+test "actions: a waiting await's key holds every name the request gave, and as many of its worker's as fit" {
+    const long: [256]u8 = @splat('n');
+    var names: [40][]const u8 = undefined;
+    var bufs: [40][256]u8 = undefined;
+    for (&names, 0..) |*n, i| {
+        bufs[i] = long;
+        bufs[i][0] = @intCast('a' + (i % 26));
+        bufs[i][1] = @intCast('a' + (i / 26));
+        n.* = &bufs[i];
+    }
+    // Two named by the request, the rest registered: those that fit go in.
+    const n = ActionsHandler.for_tests.awaitKeyNames("w", &names, 2).?;
+    try std.testing.expect(n >= 2 and n < names.len);
+    // The request's own must fit.
+    try std.testing.expect(ActionsHandler.for_tests.awaitKeyNames("w", &names, names.len) == null);
+}
+
 test "Shard: a parked await and an invoke reusing its request id each get one answer" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);

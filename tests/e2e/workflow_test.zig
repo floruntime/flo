@@ -938,7 +938,7 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
     try stdx.testing.assertSucceeded(complete_result);
 
     // 7. The run resumes once the completion applies, and completes.
-    try expectRunCompletes(ctx, run_id);
+    try expectRunCompletes(ctx, run_id, 5000);
     var final_status = try ctx.cli.run(&.{ "workflow", "status", run_id });
     defer final_status.deinit();
     try stdx.testing.assertSucceeded(final_status);
@@ -962,9 +962,9 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
     try stdx.testing.assertContains(action_status, "completed");
 }
 
-/// Waits up to 5 s for workflow run `run_id` to complete.
-fn expectRunCompletes(ctx: anytype, run_id: []const u8) !void {
-    for (0..50) |_| {
+/// Waits up to `ms` for workflow run `run_id` to complete.
+fn expectRunCompletes(ctx: anytype, run_id: []const u8, ms: u64) !void {
+    for (0..ms / 100) |_| {
         var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
         defer status.deinit();
         if (status.exit_code == 0 and status.contains("completed")) return;
@@ -1016,7 +1016,9 @@ test "e2e/workflow: on many shards, a step whose action another shard owns resum
         const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
         try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "xs-w", "--result", "{}" });
     }
-    for (runs) |run_id| try expectRunCompletes(ctx, run_id);
+    // A run id the client chose names no shard: the action's shard is told
+    // which, so the step resumes at once, never at a 5 s ask.
+    for (runs) |run_id| try expectRunCompletes(ctx, run_id, 1500);
 }
 
 /// Extract task ID from worker await output.
