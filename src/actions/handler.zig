@@ -1244,7 +1244,12 @@ pub const ActionsHandler = struct {
             .action_deliver => if (leads) self.deliverApplied(shard, e, result),
             .action_invoke => {
                 const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
-                if (self.starting.fetchRemove(p.run)) |kv| self.allocator.free(kv.key);
+                // Refused for want of the action, a run another shard's
+                // workflow asked for stays starting, so that step waits for
+                // the action as it always has (on the workflow's own shard
+                // it fails at once); only a run whose invoke was lost is.
+                const no_action = if (result.refused()) |r| r.refusal.reason == .not_found else false;
+                if (!no_action) if (self.starting.fetchRemove(p.run)) |kv| self.allocator.free(kv.key);
                 if (leads and result.refused() == null) shard.wake_workers = true;
             },
             .action_extend => {
