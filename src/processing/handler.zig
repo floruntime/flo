@@ -38,6 +38,7 @@ const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
+const table_run = @import("../node/table_run.zig");
 const stream_handler_mod = @import("../stream/handler.zig");
 const kv_handler_mod = @import("../kv/handler.zig");
 const ns_keys = @import("../namespace/handler.zig");
@@ -109,9 +110,10 @@ pub const ProcessingHandler = struct {
     peer_ts_handlers: ?[]const *ts_handler_mod.TSHandler = null,
     peer_queue_handlers: ?[]const *queue_handler_mod.QueueHandler = null,
 
-    /// Most jobs a server holds. Jobs are never removed (stopped ones still
-    /// count) and each keeps its definition, up to 256 KiB, so a submit past
-    /// it is refused. A field only so tests can reach it.
+    /// Most jobs a server holds. Every held job counts, stopped or not: each
+    /// keeps its definition, up to 256 KiB, until `processing.remove` drops
+    /// it, so this bounds their memory. A submit past it is refused. A
+    /// field only so tests can reach it.
     max_jobs: usize = MAX_JOBS,
     /// Jobs whose status is failed, for /status.
     failed_jobs: u64 = 0,
@@ -443,6 +445,7 @@ pub const ProcessingHandler = struct {
         dispatcher.registerWithRoute(.processing_cancel, dispatchProcessing, run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.processing_status, dispatchProcessing, run_id_mod.preRouteByRunId);
         dispatcher.registerWalk(.processing_list, dispatchProcessing, localScanJobs);
+        dispatcher.registerWithRoute(.processing_remove, table_run.handler("processing.remove", ProcessingHandler, runRemove), run_id_mod.preRouteByRunId);
     }
 
     /// Every submit goes to shard 0, whatever its key: one shard holds the
@@ -500,6 +503,34 @@ pub const ProcessingHandler = struct {
     fn answerCancel(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
         if (shard.metrics_registry) |m| m.processing.recordCancelled();
         shard.sendOkResponse(conn, request_id, "");
+    }
+
+    // ── Remove ───────────────────────────────────────────────────────────
+
+    pub const Error = error{ NotFound, Running };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.NotFound => .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such processing job" } },
+            error.Running => .{ .status = .conflict, .refusal = .{ .reason = .job_running, .ran = .no, .message = "job is running: stop or cancel it, then remove it" } },
+        };
+    }
+
+    const RemoveResponse = table_run.op("processing.remove").response;
+
+    /// Remove a job that no longer runs: every replica drops it, its slot
+    /// and its memory, when the entry applies.
+    fn runRemove(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(RemoveResponse) {
+        const self = shard.processing_handler;
+        const job = self.ownedJob(req.key, req.namespace) orelse return error.NotFound;
+        if (job.status == .running) return error.Running;
+        const proposed = persistence_mod.proposeEntry(shard, .processing_remove, Flags.NONE, req.namespace, req.key, "") catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "remove not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerRemove } };
+    }
+
+    fn answerRemove(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        table_run.answer(RemoveResponse, shard, conn, request_id, .{});
     }
 
     // ── Command Routing ─────────────────────────────────────────────────
@@ -560,7 +591,7 @@ pub const ProcessingHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, why);
             return;
         }
-        if (self.operatorRefusal(&def)) |refusal| switch (refusal) {
+        if (self.operatorRefusal(&def)) |refused| switch (refused) {
             .invalid => |name| {
                 var buf: [192]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "operator '{s}' has a missing or invalid setting", .{name}) catch "an operator has a missing or invalid setting";
@@ -609,8 +640,8 @@ pub const ProcessingHandler = struct {
     }
 
     fn refuseAtJobLimit(self: *const ProcessingHandler, shard: *Shard, conn: *Connection, request_id: u64) void {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "job not submitted: this server holds at most {d} processing jobs", .{self.max_jobs}) catch "job not submitted: this server holds as many processing jobs as it may";
+        var buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "job not submitted: this server holds at most {d} processing jobs; remove a stopped, cancelled or failed one with `flo processing remove <job_id>`", .{self.max_jobs}) catch "job not submitted: this server holds as many processing jobs as it may";
         shard.sendRefusal(conn, request_id, .overloaded, .{ .reason = .unclassified, .ran = .no, .message = msg });
     }
 
@@ -623,6 +654,13 @@ pub const ProcessingHandler = struct {
         const job = self.jobs.getPtr(job_id) orelse return null;
         const home = if (namespace.len > 0) namespace else "default";
         return if (std.mem.eql(u8, job.namespace_owned, home)) job else null;
+    }
+
+    /// Whether `job` lives in the namespace an entry's hash names; a bare
+    /// namespace is "default", as it is for ownedJob.
+    fn inNamespace(job: *const JobRecord, ns_hash: u32) bool {
+        if (ns_hash == router.namespaceHash(job.namespace_owned)) return true;
+        return ns_hash == router.namespaceHash("") and std.mem.eql(u8, job.namespace_owned, "default");
     }
 
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -895,6 +933,7 @@ pub const ProcessingHandler = struct {
         registry.register(.processing_stop, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_cancel, @ptrCast(self), replayEntryThunk);
         registry.register(.processing_checkpoint, @ptrCast(self), replayEntryThunk);
+        registry.register(.processing_remove, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
@@ -911,8 +950,9 @@ pub const ProcessingHandler = struct {
 
         return switch (etype) {
             .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms, out),
-            .processing_stop => self.replayStatusChange(cmd.key, .stopped),
-            .processing_cancel => self.replayStatusChange(cmd.key, .cancelled),
+            .processing_stop => self.replayStatusChange(cmd.key, .stopped, out),
+            .processing_cancel => self.replayStatusChange(cmd.key, .cancelled, out),
+            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_hash, out),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => error.Halt,
         };
@@ -947,7 +987,7 @@ pub const ProcessingHandler = struct {
         // same submits. A job already held is a replay of itself.
         if (!self.jobs.contains(job_id) and self.jobs.count() >= self.max_jobs) {
             log.warn("processing job {s} not created: this server holds at most {d} jobs", .{ job_id, self.max_jobs });
-            return out.refuseFmt(.overloaded, .unclassified, "job not submitted: this server holds at most {d} processing jobs", .{self.max_jobs});
+            return out.refuseFmt(.overloaded, .unclassified, "job not submitted: this server holds at most {d} processing jobs; remove a stopped, cancelled or failed one with `flo processing remove <job_id>`", .{self.max_jobs});
         }
 
         // Re-parse with the job's namespace as fallback, as the submit did, so
@@ -1023,7 +1063,7 @@ pub const ProcessingHandler = struct {
 
         if (failure) |why| {
             self.failJob(job, why);
-            // The job is stored, and keeps its slot: jobs are never removed.
+            // The job is stored, and keeps its slot until it is removed.
             return refuseStoredFailure(out, owned_id, job.failure_owned);
         }
 
@@ -1033,7 +1073,7 @@ pub const ProcessingHandler = struct {
         // come from the record, and from replayCheckpoint for checkpoints
         // after this submit in log order.
         if (status == .running and self.pipelines.getPtr(owned_id) == null) {
-            if (self.startPipelines(owned_id, &parsed.?, &why_buf)) |refusal| switch (refusal) {
+            if (self.startPipelines(owned_id, &parsed.?, &why_buf)) |refused| switch (refused) {
                 .failed => |why| self.failJob(job, why),
                 .held => |why| self.holdJob(job, why),
             };
@@ -1043,18 +1083,33 @@ pub const ProcessingHandler = struct {
     }
 
     /// A submit whose job applied as failed: refused, but the job is stored
-    /// and keeps its slot, so it ran.
+    /// and keeps its slot until removed, so it ran.
     fn refuseStoredFailure(out: *persistence_mod.Result, job_id: []const u8, why: []const u8) void {
         var buf: [persistence_mod.Result.MESSAGE_MAX]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, "processing job {s} failed: {s}; cancel it with `flo processing cancel {s}`", .{ job_id, why, job_id }) catch buf[0..];
+        const message = std.fmt.bufPrint(&buf, "processing job {s} failed: {s}; free its slot with `flo processing remove {s}`", .{ job_id, why, job_id }) catch buf[0..];
         out.refuseRan(.bad_request, .unclassified, .yes, message);
     }
 
     /// Replay a status change (stop/cancel).
-    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus) persistence_mod.ApplyError!void {
-        // Jobs are never removed: a change names one that was submitted.
-        const job = self.jobs.getPtr(key) orelse return error.Halt;
+    fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus, out: *Result) persistence_mod.ApplyError!void {
+        // A stop or cancel taken before a remove applied lands after it.
+        const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
         self.setStatus(job, status);
+    }
+
+    /// Replay a processing_remove entry: drop the job and any pipelines it
+    /// left. A running job stays, refused in log order on every replica; a
+    /// job already gone was removed by an earlier entry.
+    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_hash: u32, out: *Result) persistence_mod.ApplyError!void {
+        const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        // The leader checked this too (ownedJob); every replica holds the
+        // entry to it, so a remove never reaches another namespace's job.
+        if (!inNamespace(job, ns_hash)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        if (job.status == .running) return out.refuse(.conflict, .job_running, "job is running: stop or cancel it, then remove it");
+        self.dropPipelines(key);
+        var removed = self.jobs.fetchRemove(key).?;
+        if (removed.value.status == .failed) self.failed_jobs -= 1;
+        self.freeJobRecord(&removed.value);
     }
 
     /// Replay a processing_checkpoint entry: advance the pipeline's source
@@ -1134,7 +1189,7 @@ pub const ProcessingHandler = struct {
         // A pipeline without one of its operators would run a different job
         // (a dropped filter passes everything), so a job any of whose
         // operators can't be built doesn't start at all.
-        if (self.operatorRefusal(def)) |refusal| return switch (refusal) {
+        if (self.operatorRefusal(def)) |refused| return switch (refused) {
             .invalid => |name| .{ .failed = std.fmt.bufPrint(why_buf, "operator '{s}' can't be built", .{name}) catch "an operator can't be built" },
             .out_of_memory => .{ .held = "an operator couldn't be built: out of memory" },
         };
@@ -2012,12 +2067,12 @@ test "ProcessingHandler: all opcodes are registered" {
     var d = Dispatch.init();
     ProcessingHandler.register(&d);
 
-    // Verify all 8 processing opcodes are registered
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_submit));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_stop));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_cancel));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_status));
     try std.testing.expect(d.hasHandler(proto.OpCode.processing_list));
+    try std.testing.expect(d.hasHandler(proto.OpCode.processing_remove));
 }
 
 test "ProcessingHandler: init and deinit" {
@@ -2310,7 +2365,8 @@ test "ProcessingHandler: a stored definition that no longer parses is kept as fa
     _ = try applySubmit(&handler, "job-r", testSubmitValue(&buf, .running, yaml), 1);
     try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
     // Cancelling it leaves none failed.
-    try handler.replayStatusChange("job-r", .cancelled);
+    var out: Result = .{};
+    try handler.replayStatusChange("job-r", .cancelled, &out);
     try std.testing.expectEqual(@as(u64, 0), handler.failed_jobs);
 }
 
@@ -2398,6 +2454,81 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
         try std.testing.expectEqual(@as(usize, 1), handler.jobs.count());
     }
     try std.testing.expect(!handler.jobs.contains("job-2"));
+}
+
+/// Applies a keyed entry of `etype` for job `key`, as the log does.
+fn applyKeyed(h: *ProcessingHandler, etype: EntryType, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
+    return applyKeyedIn(h, etype, router.namespaceHash(""), key, value);
+}
+
+fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_hash: u32, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
+    var pbuf: [1024]u8 = undefined;
+    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_hash, key, value, &pbuf).?;
+    return applyLogged(h, &entry);
+}
+
+test "ProcessingHandler: a remove is refused while its job runs, and frees the slot once it doesn't" {
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    handler.max_jobs = 1;
+    var buf: [512]u8 = undefined;
+    _ = try applySubmit(&handler, "job-1", testSubmitValue(&buf, .running, lookup_yaml), 1);
+    try std.testing.expect(handler.pipelines.contains("job-1"));
+
+    // Running: refused in log order, and nothing changes.
+    const running = (try applyKeyed(&handler, .processing_remove, "job-1", "")).refused().?;
+    try std.testing.expectEqual(proto.StatusCode.conflict, running.status);
+    try std.testing.expectEqual(proto.Reason.job_running, running.refusal.reason);
+    try std.testing.expect(handler.jobs.contains("job-1"));
+
+    // At the limit, a cancelled job still holds its slot.
+    try std.testing.expect((try applyKeyed(&handler, .processing_cancel, "job-1", &.{@backingInt(ProcessingHandler.JobStatus.cancelled)})).refused() == null);
+    try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 2)).refused() != null);
+
+    // Another namespace's remove finds no such job, on every replica.
+    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("other"), "job-1", "")).refused().?;
+    try std.testing.expectEqual(proto.StatusCode.not_found, elsewhere.status);
+    try std.testing.expect(handler.jobs.contains("job-1"));
+
+    // Removed: the job, its pipeline and its slot are gone; "default" by
+    // name is the bare namespace.
+    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("default"), "job-1", "")).refused() == null);
+    try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
+    try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
+    try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 3)).refused() == null);
+    try std.testing.expect(handler.jobs.contains("job-2"));
+
+    // A second remove, or a stop or cancel taken before the remove applied,
+    // finds no job: refused as not found, never a halt.
+    for ([_]EntryType{ .processing_remove, .processing_stop, .processing_cancel }) |etype| {
+        const gone = (try applyKeyed(&handler, etype, "job-1", &.{@backingInt(ProcessingHandler.JobStatus.stopped)})).refused().?;
+        try std.testing.expectEqual(proto.StatusCode.not_found, gone.status);
+    }
+}
+
+test "ProcessingHandler: removing a failed job un-counts it" {
+    const yaml =
+        \\kind: Processing
+        \\name: ranged
+        \\sources:
+        \\  - name: src
+        \\    stream:
+        \\      name: in
+        \\      partitions: "0-4294967295"
+        \\sinks:
+        \\  - name: out
+        \\    stream:
+        \\      name: out
+    ;
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    _ = try applySubmit(&handler, "job-f", testSubmitValue(&buf, .running, yaml), 1);
+    try std.testing.expectEqual(ProcessingHandler.JobStatus.failed, handler.jobs.get("job-f").?.status);
+    try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
+    try std.testing.expect((try applyKeyed(&handler, .processing_remove, "job-f", "")).refused() == null);
+    try std.testing.expectEqual(@as(u64, 0), handler.failed_jobs);
+    try std.testing.expect(!handler.jobs.contains("job-f"));
 }
 
 test "ProcessingHandler: every submit routes to shard 0, whatever its key" {
@@ -2499,7 +2630,8 @@ test "ProcessingHandler: replicas of different shard counts store the same statu
     try std.testing.expectEqualStrings("RUNNING (held here: kv_lookup needs a one-shard server (--shards 1) until lookups can read other shards)", r.readLengthPrefixed(u16).?);
 
     // Stopped, it is no longer held.
-    try two.replayStatusChange("job-1", .stopped);
+    var out: Result = .{};
+    try two.replayStatusChange("job-1", .stopped, &out);
     try std.testing.expect(!two.jobs.get("job-1").?.held);
     try std.testing.expectEqual(@as(u64, 0), two.held_jobs);
 }
