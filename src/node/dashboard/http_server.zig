@@ -252,6 +252,10 @@ pub const DashboardServer = struct {
                 self.sendError(client, .method_not_allowed, "Method not allowed");
                 return;
             }
+            if (err == error.BadCursor) {
+                self.sendError(client, .bad_request, "Bad request: the cursor is not one this dashboard sent");
+                return;
+            }
             if (err == error.NodeDidNotAnswer) {
                 self.sendError(client, .service_unavailable, "The node didn't answer in time; retry");
                 return;

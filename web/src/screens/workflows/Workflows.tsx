@@ -391,7 +391,7 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
   const q = useWorkflows(ns)
   const runsQ = useRuns(ns)
   const defs = useMemo<WorkflowDefInfo[]>(() => q.data ?? [], [q.data])
-  const runs = useMemo<WorkflowRunInfo[]>(() => runsQ.data ?? [], [runsQ.data])
+  const runs = useMemo<WorkflowRunInfo[]>(() => runsQ.data?.runs ?? [], [runsQ.data])
   const [tab, setTab] = useState<ListTab>('all')
 
   const runsByWf = useMemo(() => {
@@ -422,7 +422,7 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
 
       <Stats>
         <Stat label="Workflows" value={q.isLoading ? '…' : defs.length} sub={`${enabledKnown ? enabledCount : DASH} enabled · in ${ns}`} />
-        <Stat label="Runs" value={runsQ.isLoading ? '…' : runs.length} sub="all time" />
+        <Stat label="Runs" value={runsQ.isLoading ? '…' : `${runs.length}${runsQ.data?.has_more ? '+' : ''}`} sub={runsQ.data?.has_more ? 'newest shown' : 'all time'} />
         <Stat label="Active" value={activeRuns} valueColor={activeRuns ? '#6F9BD1' : undefined} sub="running / waiting" />
         <Stat label="Disabled" value={enabledKnown ? disabledCount : DASH} sub="blocked" />
       </Stats>
@@ -488,7 +488,7 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
 export function Workflows() {
   const { ns } = useNamespace()
   const runsQ = useRuns(ns)
-  const runs = useMemo<WorkflowRunInfo[]>(() => runsQ.data ?? [], [runsQ.data])
+  const runs = useMemo<WorkflowRunInfo[]>(() => runsQ.data?.runs ?? [], [runsQ.data])
   const [def, setDef] = useState<WorkflowDefInfo | null>(null)
   const [run, setRun] = useState<WorkflowRunInfo | null>(null)
 

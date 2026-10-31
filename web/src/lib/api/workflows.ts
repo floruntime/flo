@@ -3,7 +3,7 @@ import { api } from './client'
 import type {
   WorkflowDefInfo,
   WorkflowDefDetail,
-  WorkflowRunInfo,
+  WorkflowRunsPage,
   WorkflowRunDetail,
   WorkflowHistoryEvent,
   WorkflowMutationResult,
@@ -27,11 +27,12 @@ export function useWorkflowDef(ns: string, name: string | null) {
   })
 }
 
-/** All runs in a namespace (used for the list join + per-definition run lists). */
+/** A namespace's newest runs, up to 200 (the list join + per-definition run
+ *  lists); `has_more` says whether older ones were left out. */
 export function useRuns(ns: string) {
   return useQuery({
     queryKey: ['workflows', ns, 'runs'],
-    queryFn: () => api.get<WorkflowRunInfo[]>(`workflow/runs?namespace=${enc(ns)}&limit=200`),
+    queryFn: () => api.get<WorkflowRunsPage>(`workflow/runs?namespace=${enc(ns)}&limit=200`),
     refetchInterval: 5_000,
   })
 }

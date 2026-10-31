@@ -150,5 +150,83 @@ test "e2e/dashboard: on many shards, the runs list holds every run of the asked 
         var miss = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/workflow/runs/{s}?namespace={s}", .{ run_id, elsewhere }));
         defer miss.deinit();
         try testing.expectEqual(@as(u16, 404), miss.status);
+
+        // Paged five at a time, following each page's cursor, the list holds
+        // every run once; a page may end short with more after it.
+        var seen = @as([runs]usize, @splat(0));
+        var cursor_buf: [256]u8 = undefined;
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < 40) : (pages += 1) {
+            var url_buf: [384]u8 = undefined;
+            const url = if (cursor) |c|
+                try std.fmt.bufPrint(&url_buf, "/api/v1/workflow/runs?namespace={s}&limit=5&cursor={s}", .{ ns, c })
+            else
+                try std.fmt.bufPrint(&url_buf, "/api/v1/workflow/runs?namespace={s}&limit=5", .{ns});
+            var page = try http.get(url);
+            defer page.deinit();
+            try testing.expectEqual(@as(u16, 200), page.status);
+            for (0..runs) |r| {
+                var needle_buf: [96]u8 = undefined;
+                seen[r] += count(page.body, try std.fmt.bufPrint(&needle_buf, "\"run_id\":\"{s}\"", .{ids[s][r][0..id_lens[s][r]]}));
+            }
+            const key = "\"next_cursor\":\"";
+            const at = std.mem.indexOf(u8, page.body, key) orelse {
+                try testing.expect(std.mem.indexOf(u8, page.body, "\"has_more\":false") != null);
+                break;
+            };
+            const start = at + key.len;
+            const end = std.mem.indexOfScalarPos(u8, page.body, start, '"').?;
+            @memcpy(cursor_buf[0 .. end - start], page.body[start..end]);
+            cursor = cursor_buf[0 .. end - start];
+        }
+        try testing.expect(pages > 1);
+        for (seen) |n| try testing.expectEqual(@as(usize, 1), n);
     }
+
+    // A cursor the dashboard never sent is refused, not a wrong page.
+    var bad = try http.get("/api/v1/workflow/runs?namespace=na&cursor=run-3");
+    defer bad.deinit();
+    try testing.expectEqual(@as(u16, 400), bad.status);
+
+    // A run's input that isn't JSON comes back as a string, in a detail that
+    // is still JSON.
+    const odd = std.mem.trim(u8, try ctx.execCapture(&.{ "workflow", "start", "shard-wf", "not json\",\"evil\":\"1", "-n", "na", "-o", "raw" }), &std.ascii.whitespace);
+    var odd_path: [160]u8 = undefined;
+    var odd_detail = try http.get(try std.fmt.bufPrint(&odd_path, "/api/v1/workflow/runs/{s}?namespace=na", .{odd}));
+    defer odd_detail.deinit();
+    try testing.expectEqual(@as(u16, 200), odd_detail.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, odd_detail.body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("not json\",\"evil\":\"1", parsed.value.object.get("input").?.string);
+    try testing.expect(parsed.value.object.get("evil") == null);
+}
+
+test "e2e/dashboard: a runs list asks each of its first 100 runs' status, and no more" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+    const def =
+        \\kind: Workflow
+        \\name: many-wf
+        \\version: 1.0.0
+        \\start.run: @actions/validate
+        \\start.transitions.success: flo.Completed
+        \\start.transitions.failure: flo.Failed
+    ;
+    const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, "many-wf.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    for (0..103) |_| try ctx.exec(&.{ "workflow", "start", "many-wf", "{}" });
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    var list = try http.get("/api/v1/workflow/runs?limit=200");
+    defer list.deinit();
+    try testing.expectEqual(@as(u16, 200), list.status);
+    try testing.expectEqual(@as(usize, 103), count(list.body, "\"run_id\":"));
+    // A run's status always names its step; past the first 100 rows it
+    // wasn't asked.
+    try testing.expectEqual(@as(usize, 3), count(list.body, "\"current_step\":null"));
 }

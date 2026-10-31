@@ -370,6 +370,23 @@ fn ask(reader: *loopback.Reader, comptime f: anytype, args: anytype) !client_mod
     return @call(.auto, f, .{try reader.next()} ++ args);
 }
 
+/// A run's version, or null for "latest": the run doesn't say which
+/// version that was.
+fn knownVersion(version: []const u8) ?[]const u8 {
+    return if (std.mem.eql(u8, version, "latest")) null else version;
+}
+
+/// A run's input or output: the JSON itself when it parses, else the text
+/// as a string. A run takes any bytes as input, and written raw they could
+/// break the answer or add fields to it.
+fn jsonOrString(allocator: Allocator, obj: anytype, writer: *std.Io.Writer, name: []const u8, value: ?[]const u8) !void {
+    const v = value orelse return obj.nullField(name);
+    if (std.json.validate(allocator, v) catch false) {
+        try obj.field(name);
+        try writer.writeAll(v);
+    } else try obj.stringField(name, v);
+}
+
 /// Rows of one run list given their version, step, times and wait, from a
 /// `workflow_status` each: every one is a read on the dashboard's one
 /// thread. Later rows show those fields as null.
@@ -379,7 +396,7 @@ const ListedRun = struct { run_id: []const u8, workflow: []const u8, status: []c
 
 /// The rows of a `workflow_list_runs` answer:
 /// [count:u32]([run_id:u16][workflow:u16][status:u16][created_at:i64])*, then
-/// its has_more and cursor, which the list page doesn't use.
+/// [has_more:u8][cursor_len:u16][cursor] (`trailer`, once the rows are read).
 const ListedRuns = struct {
     reader: WireReader,
     left: u32,
@@ -399,7 +416,25 @@ const ListedRuns = struct {
         const created_at = self.reader.readI64() orelse return error.Truncated;
         return .{ .run_id = run_id, .workflow = workflow, .status = status, .created_at = created_at };
     }
+
+    /// The cursor of the page after this one, or null on the last.
+    fn trailer(self: *ListedRuns) error{Truncated}!?[]const u8 {
+        std.debug.assert(self.left == 0);
+        const more = (self.reader.readU8() orelse return error.Truncated) != 0;
+        const cursor = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        return if (more and cursor.len > 0) cursor else null;
+    }
 };
+
+/// The longest run-list cursor the server sends, and its hex form in a URL.
+const MAX_RUN_CURSOR = @import("../../../workflow/list_runs.zig").MAX_CURSOR;
+
+/// A runs page's cursor as the dashboard hands it out: the server's own,
+/// in hex, so it travels in a URL as it is.
+fn decodeRunCursor(buf: *[MAX_RUN_CURSOR]u8, hex: []const u8) error{BadCursor}![]const u8 {
+    if (hex.len == 0 or hex.len % 2 != 0 or hex.len / 2 > buf.len) return error.BadCursor;
+    return std.fmt.hexToBytes(buf[0 .. hex.len / 2], hex) catch error.BadCursor;
+}
 
 /// A `workflow_status` answer: [run_id:u16][workflow:u16][version:u16]
 /// [status:u8][current_step:u16][input:u32][created_at:i64]
@@ -515,15 +550,18 @@ fn optionalString(obj: anytype, name: []const u8, value: ?[]const u8) !void {
 /// one page of a namespace's runs, newest first. The dashboard asks each
 /// shard, as any client does: the run list for id, workflow, status and
 /// start, then a `workflow_status` for each of the first `RUNS_WITH_STATUS`
-/// rows. `cursor` is the server's, passed on as it came. No op answers
-/// triggered_by, error, parent_run_id, terminal_name or history_event_count
-/// per row, so they are null.
+/// rows. The answer is `{runs, has_more, next_cursor}`: a page can end short
+/// of `limit` with more after it, so only `has_more` says the list is whole.
+/// `next_cursor` is the server's cursor in hex; a `?cursor=` that isn't one
+/// is a 400. No op answers triggered_by, error, parent_run_id, terminal_name
+/// or history_event_count per row, so they are null.
 fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const workflow = h.parseQueryParam([]const u8, query_string, "workflow") orelse "";
     const status_filter = h.parseQueryParam([]const u8, query_string, "status");
     const search = h.parseQueryParam([]const u8, query_string, "search");
-    const cursor = h.parseQueryParam([]const u8, query_string, "cursor");
+    var cursor_buf: [MAX_RUN_CURSOR]u8 = undefined;
+    const cursor: ?[]const u8 = if (h.parseQueryParam([]const u8, query_string, "cursor")) |hex| try decodeRunCursor(&cursor_buf, hex) else null;
     const limit: u32 = @intCast(@min(h.parseQueryParam(u64, query_string, "limit") orelse 100, std.math.maxInt(u32)));
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "workflow runs", err);
@@ -537,7 +575,9 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
 
-    var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
+    var page = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try page.begin();
+    var arr = try page.arrayField("runs");
     try arr.begin();
 
     var rows = ListedRuns.init(got.data);
@@ -564,7 +604,7 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
         try obj.begin();
         try obj.stringField("run_id", row.run_id);
         try obj.stringField("workflow", row.workflow);
-        try optionalString(&obj, "version", if (state) |st| st.version else null);
+        try optionalString(&obj, "version", if (state) |st| knownVersion(st.version) else null);
         try obj.stringField("status", row.status);
         try obj.nullField("triggered_by");
         try optionalString(&obj, "current_step", if (state) |st| st.current_step else null);
@@ -577,8 +617,16 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
         for ([_][]const u8{ "parent_run_id", "terminal_name", "error", "history_event_count" }) |f| try obj.nullField(f);
         try obj.end();
     }
-
     try arr.end();
+
+    const next = rows.trailer() catch return try h.jsonError(allocator, "workflow runs: malformed answer");
+    try page.boolField("has_more", next != null);
+    if (next) |c| {
+        var hex_buf: [2 * MAX_RUN_CURSOR]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{c}) catch unreachable; // sized for the longest
+        try page.stringField("next_cursor", hex);
+    } else try page.nullField("next_cursor");
+    try page.end();
     return try json_aw.toOwnedSlice();
 }
 
@@ -650,7 +698,7 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     try obj.begin();
     try obj.stringField("run_id", run.run_id);
     try obj.stringField("workflow", run.workflow);
-    try obj.stringField("version", run.version);
+    try optionalString(&obj, "version", knownVersion(run.version));
     try obj.stringField("status", run.status);
     try obj.stringField("current_step", run.current_step);
     try optionalInt(&obj, "started_at_ms", run.started_at);
@@ -658,11 +706,8 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8, query_string: ?[]const
     try optionalInt(&obj, "updated_at_ms", run.completed_at);
     try optionalInt(&obj, "duration_ms", if (run.completed_at) |t| t - (run.started_at orelse run.created_at) else null);
     try optionalString(&obj, "error_message", summary.error_message);
-    // Input and output are JSON, written as they came.
-    try obj.field("input");
-    try writer.writeAll(if (run.input.len > 0) run.input else "null");
-    try obj.field("output");
-    try writer.writeAll(run.output orelse "null");
+    try jsonOrString(allocator, &obj, writer, "input", if (run.input.len > 0) run.input else null);
+    try jsonOrString(allocator, &obj, writer, "output", run.output);
     try obj.nullField("step_results");
     try optionalString(&obj, "triggered_by", summary.triggered_by);
     try obj.nullField("search_attributes");
@@ -873,4 +918,26 @@ test "handleWorkflowRequest cancel run surfaces loopback failure (no node in uni
     const result = try handleWorkflowRequest(allocator, .DELETE, "/runs/run-123", null, "", &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+}
+
+test "a runs page's cursor travels as hex, and anything else is refused" {
+    var buf: [MAX_RUN_CURSOR]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0xab, 'r' }, try decodeRunCursor(&buf, "01ab72"));
+    for ([_][]const u8{ "", "abc", "zz", "run-17" }) |bad| try std.testing.expectError(error.BadCursor, decodeRunCursor(&buf, bad));
+    // Longer than any cursor the server sends.
+    var long: [2 * MAX_RUN_CURSOR + 2]u8 = @splat('a');
+    try std.testing.expectError(error.BadCursor, decodeRunCursor(&buf, &long));
+}
+
+test "a run's input is its JSON when it parses, else a string" {
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var obj = json.ObjectBuilder(*std.Io.Writer).init(&aw.writer);
+    try obj.begin();
+    try jsonOrString(allocator, &obj, &aw.writer, "a", "{\"x\":1}");
+    try jsonOrString(allocator, &obj, &aw.writer, "b", "not json\",\"evil\":\"1");
+    try jsonOrString(allocator, &obj, &aw.writer, "c", null);
+    try obj.end();
+    try std.testing.expectEqualStrings("{\"a\":{\"x\":1},\"b\":\"not json\\\",\\\"evil\\\":\\\"1\",\"c\":null}", aw.written());
 }
