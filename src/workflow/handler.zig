@@ -4664,6 +4664,34 @@ test "step executor: failing action follows failure transition" {
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
 }
 
+test "step executor: an action completed naming no outcome takes the success transition" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b");
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-e", "run-e", "test-wf");
+    handler.advanceWorkflow(&shard, "default:run-e", "default");
+    _ = shard.applyCommitted();
+    // Both steps' workers complete with an empty outcome, as a plain
+    // complete sends.
+    for (0..2) |_| {
+        const run = handler.runs.getPtr("default:run-e").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+        completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "");
+        handler.checkPendingActions(&shard);
+        _ = shard.applyCommitted();
+    }
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.runs.get("default:run-e").?.status);
+}
+
 test "step executor: retry on failure" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);

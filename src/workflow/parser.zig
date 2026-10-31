@@ -518,6 +518,7 @@ fn parseTransitions(allocator: Allocator, obj: JsonValue, d: D) ParseError![]Tra
     while (iter.next()) |entry| {
         const outcome = entry.key_ptr.*;
         const target = entry.value_ptr.*;
+        if (outcome.len > MAX_OUTCOME_NAME) return d.fail(ParseError.InvalidFieldType, "an outcome a transition follows is at most {d} bytes, not {d}", .{ MAX_OUTCOME_NAME, outcome.len });
         if (target != .string) return wrongKind(d, outcome, "a step or terminal name", target);
 
         const outcome_d = try dupe(allocator, outcome);
@@ -558,6 +559,10 @@ fn parseSteps(allocator: Allocator, root: JsonValue, d: D) ParseError![]NamedSte
 }
 
 pub const MAX_TERMINAL_NAME: usize = 256;
+
+/// The longest outcome a transition follows: the longest a worker can
+/// complete a run with, so no branch is out of reach.
+pub const MAX_OUTCOME_NAME: usize = @import("../protocol/action_ops.zig").MAX_OUTCOME;
 
 fn parseTerminals(allocator: Allocator, root: JsonValue, d: D) ParseError![]Terminal {
     const terms_obj = try optObject(d, root, "terminals") orelse return allocator.alloc(Terminal, 0) catch ParseError.OutOfMemory;
@@ -1236,6 +1241,11 @@ test "parseWorkflow: a retry on a plan step is refused" {
 test "parseWorkflow: a trigger naming a stream longer than any stream is refused" {
     const name = comptime stdx.repeat("s", (MAX_TRIGGER_STREAM + 1));
     try expectRefused(wrap("", "\"trigger\": { \"stream\": \"" ++ name ++ "\" },"), ParseError.InvalidFieldType, std.fmt.comptimePrint("a stream name is at most {d} bytes, not {d} at trigger", .{ MAX_TRIGGER_STREAM, MAX_TRIGGER_STREAM + 1 }));
+}
+
+test "parseWorkflow: a transition's outcome longer than a worker can complete with is refused" {
+    const name = comptime stdx.repeat("o", (MAX_OUTCOME_NAME + 1));
+    try expectRefused("{ \"kind\": \"Workflow\", \"name\": \"w\", \"version\": \"1\", \"start\": { \"run\": \"@actions/x\", \"transitions\": { \"" ++ name ++ "\": \"flo.Completed\" } } }", ParseError.InvalidFieldType, "an outcome a transition follows is at most 256 bytes, not 257 at start.transitions");
 }
 
 test "parseWorkflow: a terminal name past its limit is refused" {
