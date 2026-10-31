@@ -535,7 +535,9 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
     var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-    var result = client_mod.action.workerComplete(&client, namespace, worker_id, id, ctx.getString("outcome") orelse "", ctx.getString("result") orelse "") catch |err| return outcome.requestFailed(ctx, err);
+    const named = ctx.getString("outcome") orelse "";
+    if (named.len > action_ops.MAX_OUTCOME) return outcome.usage(ctx, "--outcome is at most {d} bytes, not {d}", .{ action_ops.MAX_OUTCOME, named.len });
+    var result = client_mod.action.workerComplete(&client, namespace, worker_id, id, named, ctx.getString("result") orelse "") catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
     try outcome.check(ctx, result);
     ctx.print("OK\n", .{});
@@ -564,7 +566,9 @@ fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
     var result = client_mod.action.workerTouch(&client, namespace, worker_id, id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
     try outcome.check(ctx, result);
-    ctx.print("OK\n", .{});
+    var diag: schema.Diagnostic = .{};
+    const kept = action_ops.op("action.touch").response.decodeAll(result.asRawData() orelse "", &diag) catch return outcome.malformed(ctx, "touch answer");
+    ctx.print("Expires at: {d}\n", .{kept.expires_at_ms});
 }
 
 fn runWorkerList(ctx: *commander.Context) commander.Error!void {

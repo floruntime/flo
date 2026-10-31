@@ -176,6 +176,7 @@ pub const table = [_]ops.Op{
             .{ .name = "holder", .T = WorkerId, .doc = "The worker that takes it" },
             .{ .name = "labels", .T = Optional(Bytes(std.math.maxInt(u16))), .doc = "The worker's labels, for runs that require some" },
             .{ .name = "request_key", .T = Optional(Bytes(MAX_REQUEST_KEY)), .doc = "The await's request key" },
+            .{ .name = "again_only", .T = Defaulted(schema.Bool, false), .doc = "Only the task the request key got before, if still held: a retry looks there first" },
         }),
         .response = Record(&.{
             .{ .name = "task", .T = Optional(Task), .doc = "The task, or none if no run is ready" },

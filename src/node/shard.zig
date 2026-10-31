@@ -2244,9 +2244,12 @@ pub const Shard = struct {
     /// Every part answered ok: the op writes the client's answer.
     fn completeGather(self: *Shard, e: *Gathers.Entry) void {
         if (e.reply_to) |rt| return self.completeForwardedGather(e, rt);
-        const conn = self.gatherClient(e) orelse return self.endGather(e);
         var bodies: [gather_mod.MAX_PARTS][]const u8 = undefined;
         for (e.answers, 0..) |a, i| bodies[i] = a.?;
+        const conn = self.gatherClient(e) orelse {
+            if (e.context.op.orphaned) |o| o(self, e.context.state, bodies[0..e.answers.len]);
+            return self.endGather(e);
+        };
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or e.stale;
         defer proto.answering_stale = was_stale;
@@ -2381,7 +2384,7 @@ pub const Shard = struct {
     pub fn drainInbox(self: *Shard) usize {
         const flags = self.mailbox.wake.take();
         if (flags & mailbox_mod.Flag.stream_appended.bit() != 0) self.workflow_handler.triggers_dirty = true;
-        if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) ActionsHandler.wakeLocal(self);
+        if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) ActionsHandler.wakeFromPeer(self);
 
         var buf: [64]InboxMessage = undefined;
         while (true) {
@@ -2417,7 +2420,7 @@ pub const Shard = struct {
         switch (msg.tag) {
             .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
-            .action_finished, .action_result_ask => self.actionMessage(msg),
+            .action_finished, .action_result_ask, .action_abandon, .worker_report => self.actionMessage(msg),
             .kv_sink_put => self.runKvSinkPut(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -2473,6 +2476,8 @@ pub const Shard = struct {
         switch (msg.tag) {
             .action_finished => self.actions_handler.finishedFromInbox(bytes),
             .action_result_ask => self.actions_handler.resultAskFromInbox(self, msg.src_shard, bytes),
+            .action_abandon => self.actions_handler.abandonFromInbox(self, bytes),
+            .worker_report => ActionsHandler.reportFromInbox(self, bytes),
             else => unreachable,
         }
     }
@@ -4670,7 +4675,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .kv_sink_put, .action_finished, .action_result_ask => {
+                .action_start, .kv_sink_put, .action_finished, .action_result_ask, .action_abandon, .worker_report => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -5874,7 +5879,7 @@ pub const Shard = struct {
 
     /// The connection `reply_to` names, when it is this shard's and still
     /// the same client.
-    fn localConnection(self: *Shard, reply_to: ReplyTo) ?*Connection {
+    pub fn localConnection(self: *Shard, reply_to: ReplyTo) ?*Connection {
         const to = switch (reply_to) {
             .remote => return null,
             .socket => |s| s,
@@ -6107,7 +6112,9 @@ fn sendKVWaiterValue(shard: *Shard, waiter: *const Waiter, entry: kv_state.Curre
     // This shard's own client: written in place.
     if (shard.localConnection(waiter.reply_to)) |conn| {
         shard.noteDeferred(waiter.reply_to, waiter.request_id);
+        const before = conn.bytes_queued;
         table_run.answer(Response, shard, conn, waiter.request_id, answer);
+        conn.deferred_queued += conn.bytes_queued - before;
         shard.flushToClient(conn.fd);
         return;
     }
@@ -14049,8 +14056,8 @@ test "Shard: on a leader, an invoke and a retry wake workers; a settle, and anyt
     const role = shard.raft_node.role;
     defer shard.raft_node.role = role;
     const token: action_entries.Token.Value = .{ .term = 1, .index = 1 };
-    const release: action_entries.Release.Value = .{ .ns = "default", .action = "a", .run = "r", .deliveries = 1, .token = token, .expiry_ns = 0, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" };
-    const settle: action_entries.Settle.Value = .{ .ns = "default", .action = "a", .run = "r", .deliveries = 1, .token = token, .expiry_ns = 0, .outcome = "", .result = "" };
+    const release: action_entries.Release.Value = .{ .ns = "default", .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" };
+    const settle: action_entries.Settle.Value = .{ .ns = "default", .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .outcome = "", .result = "" };
     var buf: [1024]u8 = undefined;
     for ([_]struct { leads: bool, e: entry_mod.Entry, wakes: bool }{
         .{ .leads = true, .e = try ActionsHandler.for_tests.entry(.action_invoke, testInvoke("a", "r"), 1, 1, 0, buf[0..512]), .wakes = true },

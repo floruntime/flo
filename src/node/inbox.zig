@@ -42,7 +42,9 @@ pub const Tag = enum(u8) {
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
     kv_sink_put, // a processing KV sink's write of a key this shard owns: payload from KVHandler.SinkPut.encode
     action_finished, // how a run a workflow on the receiver waits on ended: payload from ActionsHandler.sendFinished
-    action_result_ask, // a workflow's shard asking a run's shard how it ended: payload the run id
+    action_result_ask, // a workflow's shard asking a run's shard how it ended: payload [ns_len:u16][ns][run]
+    action_abandon, // a task whose await went away before it was answered, handed back to the run's shard
+    worker_report, // a report counted toward its worker's stats, where the worker is registered
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.

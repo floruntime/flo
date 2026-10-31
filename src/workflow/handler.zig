@@ -2028,14 +2028,19 @@ pub const WorkflowHandler = struct {
     /// the message was lost.
     fn getActionRunResult(shard: *Shard, run_ns_key: []const u8, target_shard_id: ?u16, action_rid: []const u8) ?ActionsHandler.InternalRunResult {
         const tid = target_shard_id orelse shard.id;
-        if (tid == shard.id) {
-            const ns = run_ns_key[0 .. std.mem.indexOfScalar(u8, run_ns_key, ':') orelse 0];
-            return ActionsHandler.getRunResult(shard, ns, action_rid);
-        }
-        const f = shard.actions_handler.finished.get(action_rid) orelse {
-            shard.actions_handler.askResult(shard, tid, action_rid);
+        const ns = run_ns_key[0 .. std.mem.indexOfScalar(u8, run_ns_key, ':') orelse 0];
+        if (tid == shard.id) return ActionsHandler.getRunResult(shard, ns, action_rid);
+        const f = shard.actions_handler.finished.getPtr(action_rid) orelse {
+            shard.actions_handler.askResult(shard, tid, ns, action_rid);
             return null;
         };
+        return finishedResult(f.*);
+    }
+
+    /// A run another shard said ended, as a workflow reads it. Its invoke
+    /// lost on that shard reads as `cancelled`: the step fails as for one
+    /// lost here.
+    fn finishedResult(f: ActionsHandler.Finished) ActionsHandler.InternalRunResult {
         return .{ .status = f.status, .output = f.output, .outcome = if (f.status != .completed) null else if (f.outcome.len == 0) definition.StepOutcome.success else f.outcome };
     }
 
@@ -2134,7 +2139,7 @@ pub const WorkflowHandler = struct {
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
                 const done = if (getActionRunResult(shard, entry.key_ptr.*, run.pending_action_shard_id, action_rid)) |result|
-                    result.status == .completed or result.status == .failed or result.status == .timed_out
+                    result.status == .completed or result.status == .failed or result.status == .timed_out or result.status == .cancelled
                 else
                     pendingLost(shard, run, run.pending_action_shard_id);
                 if (done and resume_count < resume_keys.len) {
@@ -2334,9 +2339,13 @@ pub const WorkflowHandler = struct {
 
         // No run yet: wait, unless this shard has applied the invoke's index
         // without creating it. Then the log dropped it, and the step fails.
-        const found = getActionRunResult(shard, run_ns_key, run.pending_action_shard_id, action_rid);
-        // What another shard told this one is spent once read here.
-        defer if (found != null) if (shard.actions_handler.takeFinished(action_rid)) |f| shard.actions_handler.freeFinished(f);
+        // What another shard told this one is taken here, before the run's
+        // pending state (its id among it) is freed, and freed only once
+        // the step's outcome, which may point into it, is spent.
+        const remote = (run.pending_action_shard_id orelse shard.id) != shard.id;
+        const taken: ?ActionsHandler.Finished = if (remote) shard.actions_handler.takeFinished(action_rid) else null;
+        defer if (taken) |f| shard.actions_handler.freeFinished(f);
+        const found: ?ActionsHandler.InternalRunResult = if (taken) |f| finishedResult(f) else if (remote) null else getActionRunResult(shard, run_ns_key, run.pending_action_shard_id, action_rid);
         if (found == null) {
             if (!pendingLost(shard, run, run.pending_action_shard_id)) return;
             log.warn("workflow run {s}: the action run {s} its step waits for was never created (its invoke was dropped); the step fails", .{ run_ns_key, action_rid });
@@ -4145,14 +4154,14 @@ fn completeTestAction(shard: *Shard, run_id: []const u8) void {
 /// then settled by it.
 fn completeTestActionWith(shard: *Shard, run_id: []const u8, outcome: []const u8) void {
     const run = deliverTestAction(shard, run_id) orelse return;
-    applyTestActionEntry(shard, .action_settle, test_action_entries.Settle.Value{ .ns = "default", .action = run.action, .run = run_id, .deliveries = run.deliveries, .token = run.token, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = "" }, run.delivered_ns + 1);
+    applyTestActionEntry(shard, .action_settle, test_action_entries.Settle.Value{ .ns = "default", .action = run.action, .run = run_id, .holder = "w", .request_key = null, .deliveries = run.deliveries, .token = run.token, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = "" }, run.delivered_ns + 1);
 }
 
 /// A test action run whose only attempt's lease ran out.
 fn timeOutTestAction(shard: *Shard, run_id: []const u8) void {
     const run = deliverTestAction(shard, run_id) orelse return;
     var ib: [test_action_entries.ExpireItem.max_size]u8 = undefined;
-    const item = test_action_entries.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = run.action, .run = run_id, .expiry_ns = run.expiry_ns }) catch unreachable;
+    const item = test_action_entries.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = run.action, .run = run_id, .expiry_ns = run.expiry_ns, .holder = "w", .request_key = null }) catch unreachable;
     applyTestActionEntry(shard, .action_expire, test_action_entries.Expire.Value{ .items = .{ .bytes = item, .count = 1 } }, run.expiry_ns);
 }
 

@@ -160,18 +160,27 @@ pub const ActionsHandler = struct {
     /// Runs with an extend in flight, by store key: touches between answer
     /// with the lease as it stands.
     extending: std.StringHashMapUnmanaged(void) = .empty,
-    /// `holder\x00request_key` → the delivery it got, so a retried await
-    /// gets that one again while its lease runs.
-    remembered: std.StringHashMapUnmanaged(Remembered) = .empty,
     /// The expire proposed and not yet applied: one at a time.
     expiring: ?u64 = null,
     /// The term the duty last ran in, and when it first ran in it.
     duty_term: u64 = 0,
     duty_since_ns: u64 = 0,
+    /// When runs released with a delay are due: the duty wakes awaits as
+    /// each comes. Leader memory; a new leader's first tick wakes them all.
+    due: std.ArrayListUnmanaged(u64) = .empty,
+    /// Counts wakes: an await asking other shards when one came asks again
+    /// rather than wait out its block time.
+    wake_gen: u64 = 0,
     /// Awaits woken this pass, to run again once the pass is over.
     reruns: std.ArrayListUnmanaged(Rerun) = .empty,
-    /// How runs a workflow here waits on ended, sent by their own shards.
+    /// How runs a workflow here waits on ended, sent by their own shards;
+    /// dropped if no workflow takes them in `FINISHED_KEEP_MS`.
     finished: std.StringHashMapUnmanaged(Finished) = .empty,
+    /// When this shard last asked about a run on another shard, by run id.
+    asked: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Runs another shard's workflow asked this one to start, not yet
+    /// applied: asked about meanwhile, they aren't lost.
+    starting: std.StringHashMapUnmanaged(void) = .empty,
     /// Messages for other shards the inbox had no room for; sent again each
     /// duty tick.
     unsent: std.ArrayListUnmanaged(Unsent) = .empty,
@@ -184,17 +193,21 @@ pub const ActionsHandler = struct {
         term: u64,
         reply_to: ReplyTo,
         request_id: u64,
-        /// For a retried await to find this delivery again.
-        remember: ?[]u8,
     };
-
-    const Remembered = struct { ns: []u8, run: []u8, token: ae.Token.Value, expiry_ns: u64 };
 
     const Rerun = struct { reply_to: ReplyTo, request_id: u64, bytes: []u8 };
 
-    pub const Finished = struct { status: ActionRunStatus, outcome: []u8, output: []u8 };
+    pub const Finished = struct { status: ActionRunStatus, outcome: []u8, output: []u8, at_ms: u64 };
 
     const Unsent = struct { target: u16, tag: @import("../node/inbox.zig").Tag, bytes: []u8 };
+
+    /// How long a run's result from another shard waits for its workflow,
+    /// and how long a workflow waits before asking about a run again.
+    const FINISHED_KEEP_MS: u64 = 10 * 60 * 1000;
+    const ASK_EVERY_MS: u64 = 5000;
+    /// Delayed retries the duty keeps a due time for; past it, every tick
+    /// wakes.
+    const MAX_DUE: usize = 4096;
 
     /// Requests and entries as clients and the log make them, for tests.
     pub const for_tests = test_support;
@@ -208,7 +221,7 @@ pub const ActionsHandler = struct {
         self.reserved.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.extending.deinit(self.allocator);
-        self.remembered.deinit(self.allocator);
+        self.due.deinit(self.allocator);
         for (self.reruns.items) |r| self.allocator.free(r.bytes);
         self.reruns.deinit(self.allocator);
         var it = self.finished.iterator();
@@ -218,9 +231,19 @@ pub const ActionsHandler = struct {
             self.allocator.free(e.value_ptr.output);
         }
         self.finished.deinit(self.allocator);
+        freeKeys(self.allocator, &self.asked);
+        self.asked.deinit(self.allocator);
+        freeKeys(self.allocator, &self.starting);
+        self.starting.deinit(self.allocator);
         for (self.unsent.items) |u| self.allocator.free(u.bytes);
         self.unsent.deinit(self.allocator);
         if (self.status_buf) |b| self.allocator.free(b);
+    }
+
+    fn freeKeys(allocator: Allocator, map: anytype) void {
+        var kit = map.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        map.clearRetainingCapacity();
     }
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -506,16 +529,20 @@ pub const ActionsHandler = struct {
         const output: ?[]const u8 = if (run.status == .completed) try copyInto(buf, &used, run.result, action_ops.MAX_OUTPUT) else null;
         const error_message: ?[]const u8 = if (run.@"error".len == 0) null else try copyInto(buf, &used, run.@"error", action_ops.MAX_ERROR);
         const worker_id: ?[]const u8 = if (run.holder.len == 0) null else try copyInto(buf, &used, run.holder, action_ops.MAX_WORKER_ID);
-        return .{ .answer = .{
-            .status = @fromBackingInt(@backingInt(statusOf(run))),
-            .created_at_ms = nsToMs(run.created_ns),
-            .started_at_ms = if (run.started_ns == 0) null else nsToMs(run.started_ns),
-            .completed_at_ms = if (run.completed_ns == 0) null else nsToMs(run.completed_ns),
-            .attempt = run.deliveries,
-            .output = output,
-            .error_message = error_message,
-            .worker_id = worker_id,
-        } };
+        return .{
+            .answer = .{
+                .status = @fromBackingInt(@backingInt(statusOf(run))),
+                .created_at_ms = nsToMs(run.created_ns),
+                .started_at_ms = if (run.started_ns == 0) null else nsToMs(run.started_ns),
+                .completed_at_ms = if (run.completed_ns == 0) null else nsToMs(run.completed_ns),
+                // As a task counts it: the failures, and the attempt under way
+                // or that completed it; an abandoned delivery is no attempt.
+                .attempt = run.failures +| @intFromBool(run.status == .leased or run.status == .completed),
+                .output = output,
+                .error_message = error_message,
+                .worker_id = worker_id,
+            },
+        };
     }
 
     fn copyInto(buf: []u8, used: *usize, bytes: []const u8, max: usize) Error![]const u8 {
@@ -527,40 +554,72 @@ pub const ActionsHandler = struct {
 
     // ── Await: on the worker's shard ────────────────────────────────────
 
-    /// Take a task of one of the worker's actions: the request's, then the
-    /// others it registered. An action this shard owns is delivered here;
-    /// one another shard owns is asked of that shard, one at a time. With
-    /// nothing anywhere the await waits, and runs again when woken.
-    fn runAwait(shard: *Shard, conn: *Connection, req: Request, actions: schema.BoundedList(action_ops.ActionName, action_ops.MAX_AWAIT_ACTIONS, action_ops.MAX_AWAIT_ACTIONS * action_ops.ActionName.max_size).Value, block_ms: u64, request_key: ?[]const u8) Error!table_run.Outcome(AwaitResponse) {
-        const self = shard.actions_handler;
+    /// What an await needs between its steps: whom it is for, the actions
+    /// it names (the request's, then the others its worker registered),
+    /// and its wait.
+    const Want = struct {
+        ns: []const u8,
+        worker: []const u8,
+        labels: ?[]const u8,
+        request_key: ?[]const u8,
+        block_ms: u64,
+        names: Names,
+    };
+
+    /// Take a task of one of the worker's actions. With a request key, the
+    /// delivery that key got is looked for first, wherever its run is;
+    /// then an action this shard owns is delivered here, and one another
+    /// shard owns is asked of that shard, one at a time. With nothing
+    /// anywhere the await waits, and runs again when woken.
+    fn runAwait(shard: *Shard, conn: *Connection, req: Request, actions: action_ops.ActionNames.Value, block_ms: u64, request_key: ?[]const u8) Error!table_run.Outcome(AwaitResponse) {
         const ns = homeOf(req.namespace);
         const worker_id = req.key;
         if (worker_id.len > 0) if (shard.worker_handler.refusesWork(ns, worker_id)) |no| return .{ .refused = .{ .status = .bad_request, .refusal = no } };
-        const labels: ?[]const u8 = if (worker_id.len > 0) if (shard.worker_handler.find(ns, worker_id)) |w| w.metadata_owned else null else null;
-
-        var names: Names = .{};
-        var it = actions.iterator();
-        while (it.next() catch null) |name| names.add(name);
-        if (names.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: an await names at least one action") } };
-        const primary = names.items[0];
-        if (worker_id.len > 0) if (shard.worker_handler.find(ns, worker_id)) |w| for (w.processes.items) |p| {
-            if (p.kind == .action) names.add(p.name_owned);
+        var want: Want = .{ .ns = ns, .worker = worker_id, .labels = null, .request_key = request_key, .block_ms = block_ms, .names = .{} };
+        if (worker_id.len > 0) if (shard.worker_handler.find(ns, worker_id)) |w| {
+            want.labels = w.metadata_owned;
         };
+        var it = actions.iterator();
+        while (it.next() catch null) |name| want.names.add(name);
+        if (want.names.len == 0) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: an await names at least one action") } };
+        // Refused now rather than once it has to wait, so an await is
+        // refused the same whether or not work is ready.
+        var key_buf: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
+        if (AwaitKey.build(&key_buf, want) == null) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: worker id, request key and action names too long to wait on") } };
+        if (worker_id.len > 0) if (shard.worker_handler.find(ns, worker_id)) |w| for (w.processes.items) |p| {
+            if (p.kind == .action) want.names.add(p.name_owned);
+        };
+        return awaitPass(shard, conn, req, want, request_key != null);
+    }
 
+    /// One pass over the await's actions: those here first, then those
+    /// elsewhere, asked in turn. `again_only` looks only for the delivery
+    /// the request key got; the pass after it takes new work.
+    fn awaitPass(shard: *Shard, conn: *Connection, req: Request, want: Want, again_only: bool) Error!table_run.Outcome(AwaitResponse) {
+        const self = shard.actions_handler;
         var remote: Names = .{};
-        for (names.items[0..names.len]) |name| {
-            if (ownerOf(shard, ns, name) != shard.id) {
+        for (want.names.items[0..want.names.len]) |name| {
+            if (ownerOf(shard, want.ns, name) != shard.id) {
                 remote.add(name);
                 continue;
             }
-            switch (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, ns, name, worker_id, labels, request_key)) {
+            switch (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, want.ns, name, want.worker, want.labels, want.request_key, again_only)) {
                 .proposed => return .wait,
                 .again => |task| return .{ .answer = .{ .task = task } },
-                .none => {},
+                .none, .not_ready => {},
             }
         }
-        if (remote.len > 0) return askOwners(shard, conn, req, ns, primary, remote, worker_id, labels, request_key, block_ms);
-        return self.waitForTask(shard, conn, req, ns, primary, worker_id, request_key, block_ms);
+        if (remote.len > 0) {
+            const a = Ask.create(shard.allocator, req, want, remote, again_only, self.wake_gen) catch return error.OutOfMemory;
+            startAsk(shard, conn, req, a.nextName().?, a) catch |err| switch (err) {
+                // No room to ask now: it waits, and a wake asks again.
+                error.GatherBusy => return self.waitForTask(shard, conn, req, want),
+                else => return error.OutOfMemory,
+            };
+            return .wait;
+        }
+        if (again_only) return awaitPass(shard, conn, req, want, false);
+        return self.waitForTask(shard, conn, req, want);
     }
 
     /// The names an await tries, each once, in order.
@@ -576,45 +635,49 @@ pub const ActionsHandler = struct {
         }
     };
 
-    fn waitForTask(self: *ActionsHandler, shard: *Shard, conn: *Connection, req: Request, ns: []const u8, primary: []const u8, worker_id: []const u8, request_key: ?[]const u8, block_ms: u64) Error!table_run.Outcome(AwaitResponse) {
+    fn waitForTask(self: *ActionsHandler, shard: *Shard, conn: *Connection, req: Request, want: Want) Error!table_run.Outcome(AwaitResponse) {
         _ = self;
-        if (block_ms == 0) return .{ .answer = .{ .task = null } };
+        if (want.block_ms == 0) return .{ .answer = .{ .task = null } };
         var key_buf: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
-        const key = AwaitKey.build(&key_buf, ns, primary, worker_id, request_key orelse "") orelse
-            return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: worker id and action name too long to wait on") } };
-        if (!shard.waiter_pool.register(.{ .kind = .action_await, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .key = key.bytes, .min_version = key.lengths, .timeout_ms = @intCast(@min(block_ms, waiter_pool_mod.MAX_BLOCK_MS)) })) {
+        const key = AwaitKey.build(&key_buf, want) orelse
+            return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: worker id, request key and action names too long to wait on") } };
+        if (!shard.waiter_pool.register(.{ .kind = .action_await, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .key = key.bytes, .min_version = key.lengths, .timeout_ms = @intCast(@min(want.block_ms, waiter_pool_mod.MAX_BLOCK_MS)) })) {
             shard.refuseWaitersFull(conn, req.header.request_id);
-            return .wait;
         }
         return .wait;
     }
 
-    /// A woken await's waiter key: `[ns][action][worker][request_key]`,
-    /// the lengths packed in its min_version.
+    /// A waiting await's key: `[ns][worker][request_key][names]`, the
+    /// names as an await's list encodes them, the lengths and the names'
+    /// count packed in the waiter's min_version.
     const AwaitKey = struct {
         bytes: []const u8,
         lengths: u64,
 
-        fn build(buf: []u8, ns: []const u8, action: []const u8, worker: []const u8, request_key: []const u8) ?AwaitKey {
-            const total = ns.len + action.len + worker.len + request_key.len;
-            if (total > buf.len or ns.len > 0xFFFF or action.len > 0xFFFF or worker.len > 0xFFFF or request_key.len > 0xFFFF) return null;
-            var off: usize = 0;
-            for ([_][]const u8{ ns, action, worker, request_key }) |part| {
-                @memcpy(buf[off..][0..part.len], part);
-                off += part.len;
-            }
-            return .{ .bytes = buf[0..total], .lengths = (@as(u64, ns.len) << 48) | (@as(u64, action.len) << 32) | (@as(u64, worker.len) << 16) | request_key.len };
+        fn build(buf: []u8, want: Want) ?AwaitKey {
+            const rk = want.request_key orelse "";
+            if (want.ns.len > 0xFFFF or want.worker.len > 0xFFFF or rk.len > 0xFFFF) return null;
+            var w: schema.Writer = .{ .buf = buf };
+            w.put(want.ns) catch return null;
+            w.put(want.worker) catch return null;
+            w.put(rk) catch return null;
+            const n = @min(want.names.len, action_ops.MAX_AWAIT_ACTIONS);
+            for (want.names.items[0..n]) |name| action_ops.ActionName.encode(&w, name) catch return null;
+            return .{ .bytes = buf[0..w.pos], .lengths = (@as(u64, want.ns.len) << 48) | (@as(u64, want.worker.len) << 32) | (@as(u64, rk.len) << 16) | n };
         }
 
-        const Parts = struct { ns: []const u8, action: []const u8, worker: []const u8, request_key: []const u8 };
+        const Parts = struct { ns: []const u8, worker: []const u8, request_key: []const u8, names: action_ops.ActionNames.Value };
 
         fn parse(key: []const u8, lengths: u64) ?Parts {
-            const lens = [4]usize{ @intCast(lengths >> 48), @intCast((lengths >> 32) & 0xFFFF), @intCast((lengths >> 16) & 0xFFFF), @intCast(lengths & 0xFFFF) };
-            if (lens[0] + lens[1] + lens[2] + lens[3] != key.len) return null;
-            const a = lens[0];
-            const b = a + lens[1];
-            const c = b + lens[2];
-            return .{ .ns = key[0..a], .action = key[a..b], .worker = key[b..c], .request_key = key[c..] };
+            const ns_len: usize = @intCast(lengths >> 48);
+            const worker_len: usize = @intCast((lengths >> 32) & 0xFFFF);
+            const rk_len: usize = @intCast((lengths >> 16) & 0xFFFF);
+            const count: u32 = @intCast(lengths & 0xFFFF);
+            if (ns_len + worker_len + rk_len > key.len) return null;
+            const a = ns_len;
+            const b = a + worker_len;
+            const c = b + rk_len;
+            return .{ .ns = key[0..a], .worker = key[a..b], .request_key = key[b..c], .names = .{ .bytes = key[c..], .count = count } };
         }
     };
 
@@ -624,23 +687,72 @@ pub const ActionsHandler = struct {
     const Ask = struct {
         req_bytes: []u8,
         ns: []u8,
-        primary: []u8,
         worker: []u8,
         labels: ?[]u8,
         request_key: ?[]u8,
         block_ms: u64,
-        /// The names left to ask, each `[len:u16][name]`.
+        /// Every name the await tries, and those left to ask in this pass,
+        /// each `[len:u16][name]`.
+        names: []u8,
         left: []u8,
         left_off: usize = 0,
+        again_only: bool,
+        /// The wake count when the pass began.
+        wake_gen: u64,
+
+        fn create(allocator: Allocator, req: Request, want: Want, remote: Names, again_only: bool, wake_gen: u64) !*Ask {
+            const a = try allocator.create(Ask);
+            errdefer allocator.destroy(a);
+            a.* = .{
+                .req_bytes = try Shard.serializeRequest(allocator, req),
+                .ns = try allocator.dupe(u8, want.ns),
+                .worker = try allocator.dupe(u8, want.worker),
+                .labels = if (want.labels) |l| try allocator.dupe(u8, l) else null,
+                .request_key = if (want.request_key) |k| try allocator.dupe(u8, k) else null,
+                .block_ms = want.block_ms,
+                .names = try packNames(allocator, want.names),
+                .left = try packNames(allocator, remote),
+                .again_only = again_only,
+                .wake_gen = wake_gen,
+            };
+            return a;
+        }
+
+        fn packNames(allocator: Allocator, names: Names) ![]u8 {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(allocator);
+            for (names.items[0..names.len]) |name| {
+                var len: [2]u8 = undefined;
+                std.mem.writeInt(u16, &len, @intCast(name.len), .little);
+                try out.appendSlice(allocator, &len);
+                try out.appendSlice(allocator, name);
+            }
+            return out.toOwnedSlice(allocator);
+        }
+
+        fn unpack(bytes: []const u8) Names {
+            var names: Names = .{};
+            var off: usize = 0;
+            while (off + 2 <= bytes.len) {
+                const n: usize = std.mem.readInt(u16, bytes[off..][0..2], .little);
+                names.add(bytes[off + 2 ..][0..n]);
+                off += 2 + n;
+            }
+            return names;
+        }
+
+        fn asWant(a: *const Ask) Want {
+            return .{ .ns = a.ns, .worker = a.worker, .labels = a.labels, .request_key = a.request_key, .block_ms = a.block_ms, .names = unpack(a.names) };
+        }
 
         fn free(state: *anyopaque, allocator: Allocator) void {
             const a: *Ask = @ptrCast(@alignCast(state));
             allocator.free(a.req_bytes);
             allocator.free(a.ns);
-            allocator.free(a.primary);
             allocator.free(a.worker);
             if (a.labels) |l| allocator.free(l);
             if (a.request_key) |k| allocator.free(k);
+            allocator.free(a.names);
             allocator.free(a.left);
             allocator.destroy(a);
         }
@@ -652,10 +764,11 @@ pub const ActionsHandler = struct {
             return a.left[a.left_off + 2 ..][0..n];
         }
 
-        const op: gather_mod.Op = .{ .merge = merge, .deinit = free };
+        const op: gather_mod.Op = .{ .merge = merge, .deinit = free, .orphaned = orphaned };
 
-        /// The owner answered: its task is the await's; none asks the next
-        /// owner, or waits once every owner said none.
+        /// The owner answered: its task is the await's. None asks the next
+        /// owner; once every owner said none, the next pass begins, or the
+        /// await waits. A wake while it asked starts the pass again.
         fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
             const a: *Ask = @ptrCast(@alignCast(state));
             var diag: schema.Diagnostic = .{};
@@ -664,10 +777,14 @@ pub const ActionsHandler = struct {
             const req = try Request.parse(a.req_bytes);
             if (a.nextName()) |name| {
                 // The state moves to the next ask, which frees it.
-                const next = try a.clone(shard.allocator);
-                return startAsk(shard, conn, req, name, next);
+                return startAsk(shard, conn, req, name, try a.clone(shard.allocator));
             }
-            const outcome = try shard.actions_handler.waitForTask(shard, conn, req, a.ns, a.primary, a.worker, a.request_key, a.block_ms);
+            const self = shard.actions_handler;
+            const woken = self.wake_gen != a.wake_gen;
+            const outcome = if (a.again_only or woken)
+                try awaitPass(shard, conn, req, a.asWant(), false)
+            else
+                try self.waitForTask(shard, conn, req, a.asWant());
             switch (outcome) {
                 .answer => |v| table_run.answer(AwaitResponse, shard, conn, request_id, v),
                 .wait => conn.response_deferred = true,
@@ -676,62 +793,41 @@ pub const ActionsHandler = struct {
             }
         }
 
+        /// The await went away while its owner delivered: the task goes
+        /// back to the run's shard, released as abandoned.
+        fn orphaned(shard: *Shard, state: *anyopaque, bodies: []const []const u8) void {
+            const a: *Ask = @ptrCast(@alignCast(state));
+            var diag: schema.Diagnostic = .{};
+            const got = DeliverResponse.decodeAll(bodies[0], &diag) catch return;
+            const task = got.task orelse return;
+            shard.actions_handler.sendAbandon(shard, a.ns, a.worker, task);
+        }
+
         fn clone(a: *const Ask, allocator: Allocator) !*Ask {
             const c = try allocator.create(Ask);
             errdefer allocator.destroy(c);
             c.* = .{
                 .req_bytes = try allocator.dupe(u8, a.req_bytes),
                 .ns = try allocator.dupe(u8, a.ns),
-                .primary = try allocator.dupe(u8, a.primary),
                 .worker = try allocator.dupe(u8, a.worker),
                 .labels = if (a.labels) |l| try allocator.dupe(u8, l) else null,
                 .request_key = if (a.request_key) |k| try allocator.dupe(u8, k) else null,
                 .block_ms = a.block_ms,
+                .names = try allocator.dupe(u8, a.names),
                 .left = try allocator.dupe(u8, a.left),
                 .left_off = a.left_off,
+                .again_only = a.again_only,
+                .wake_gen = a.wake_gen,
             };
             return c;
         }
     };
 
-    fn askOwners(shard: *Shard, conn: *Connection, req: Request, ns: []const u8, primary: []const u8, remote: Names, worker_id: []const u8, labels: ?[]const u8, request_key: ?[]const u8, block_ms: u64) Error!table_run.Outcome(AwaitResponse) {
-        const a = buildAsk(shard.allocator, req, ns, primary, remote, worker_id, labels, request_key, block_ms) catch return error.OutOfMemory;
-        const first = a.nextName().?;
-        startAsk(shard, conn, req, first, a) catch |err| return switch (err) {
-            error.GatherBusy => .{ .refused = .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this await took nothing — retry" } } },
-            else => error.OutOfMemory,
-        };
-        return .wait;
-    }
-
-    fn buildAsk(allocator: Allocator, req: Request, ns: []const u8, primary: []const u8, remote: Names, worker_id: []const u8, labels: ?[]const u8, request_key: ?[]const u8, block_ms: u64) !*Ask {
-        var left: std.ArrayListUnmanaged(u8) = .empty;
-        defer left.deinit(allocator);
-        for (remote.items[0..remote.len]) |name| {
-            var len: [2]u8 = undefined;
-            std.mem.writeInt(u16, &len, @intCast(name.len), .little);
-            try left.appendSlice(allocator, &len);
-            try left.appendSlice(allocator, name);
-        }
-        const a = try allocator.create(Ask);
-        errdefer allocator.destroy(a);
-        a.* = .{
-            .req_bytes = try Shard.serializeRequest(allocator, req),
-            .ns = try allocator.dupe(u8, ns),
-            .primary = try allocator.dupe(u8, primary),
-            .worker = try allocator.dupe(u8, worker_id),
-            .labels = if (labels) |l| try allocator.dupe(u8, l) else null,
-            .request_key = if (request_key) |k| try allocator.dupe(u8, k) else null,
-            .block_ms = block_ms,
-            .left = try left.toOwnedSlice(allocator),
-        };
-        return a;
-    }
-
     /// Ask the owner of `name` for a task of it. `a` is the gather's from
     /// here, freed however it ends.
     fn startAsk(shard: *Shard, conn: *Connection, req: Request, name: []const u8, a: *Ask) !void {
-        const body_size = DeliverRequest.encodedSize(.{ .holder = a.worker, .labels = a.labels, .request_key = a.request_key }) catch {
+        const body_value: DeliverRequest.Value = .{ .holder = a.worker, .labels = a.labels, .request_key = a.request_key, .again_only = a.again_only };
+        const body_size = DeliverRequest.encodedSize(body_value) catch {
             Ask.free(a, shard.allocator);
             return error.OutOfMemory;
         };
@@ -740,7 +836,7 @@ pub const ActionsHandler = struct {
             return error.OutOfMemory;
         };
         defer shard.allocator.free(body);
-        _ = DeliverRequest.encodeInto(body, .{ .holder = a.worker, .labels = a.labels, .request_key = a.request_key }) catch unreachable;
+        _ = DeliverRequest.encodeInto(body, body_value) catch unreachable;
         const parts = [_]gather_mod.Part{.{ .owner = ownerOf(shard, a.ns, name), .op = @backingInt(OpCode.action_deliver), .key = name, .body = body }};
         try shard.startGather(conn, req, &parts, &Ask.op, a);
         conn.response_deferred = true;
@@ -748,12 +844,15 @@ pub const ActionsHandler = struct {
 
     // ── Deliver: on the action's shard ──────────────────────────────────
 
-    /// Another shard's await asking for a task of this shard's action.
-    fn runDeliver(shard: *Shard, conn: *Connection, req: Request, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8) Error!table_run.Outcome(DeliverResponse) {
-        return switch (try shard.actions_handler.deliverHere(shard, conn.replyTo(), req.header.request_id, homeOf(req.namespace), req.key, holder, labels, request_key)) {
+    /// Another shard's await asking for a task of this shard's action. A
+    /// leader whose term's entries haven't applied refuses: the await asks
+    /// again.
+    fn runDeliver(shard: *Shard, conn: *Connection, req: Request, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!table_run.Outcome(DeliverResponse) {
+        return switch (try shard.actions_handler.deliverHere(shard, conn.replyTo(), req.header.request_id, homeOf(req.namespace), req.key, holder, labels, request_key, again_only)) {
             .proposed => .wait,
             .again => |task| .{ .answer = .{ .task = task } },
             .none => .{ .answer = .{ .task = null } },
+            .not_ready => error.NotLeading,
         };
     }
 
@@ -763,6 +862,8 @@ pub const ActionsHandler = struct {
         /// The request key's delivery, still held: answered again as is.
         again: Task,
         none,
+        /// Not a leader whose term's entries have applied.
+        not_ready,
     };
 
     /// The next ready run of `action` the worker may take, delivered to it:
@@ -770,9 +871,10 @@ pub const ActionsHandler = struct {
     /// whose labels the worker lacks. Only a leader whose term's entries
     /// have applied chooses: before that, a run delivered in the last term
     /// may still read as ready here.
-    fn deliverHere(self: *ActionsHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, ns: []const u8, action: []const u8, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8) Error!Delivered {
-        if (!shard.raft_node.leaderReady()) return .none;
-        if (request_key) |rk| if (self.again(shard, holder, rk)) |task| return .{ .again = task };
+    fn deliverHere(self: *ActionsHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, ns: []const u8, action: []const u8, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!Delivered {
+        if (!shard.raft_node.leaderReady()) return .not_ready;
+        if (request_key) |rk| if (again(shard, ns, action, holder, rk)) |task| return .{ .again = task };
+        if (again_only) return .none;
         const def = getDef(shard, ns, action) orelse return .none;
         const now = wallNs();
         var pb: [KEY_BUF]u8 = undefined;
@@ -780,8 +882,7 @@ pub const ActionsHandler = struct {
         const prefix = storeKey(&pb, ns, machine.readyPrefix(&rb, action)) orelse return .none;
         var it = readOf(shard).range(machine.Ready, prefix);
         var looked: usize = 0;
-        while (it.next() catch null) |item| : (looked += 1) {
-            if (looked == MAX_LOOKED_AT) break;
+        while (it.next() catch null) |item| {
             const tail = item.key[prefix.len..];
             if (tail.len < 8) continue;
             const due = std.mem.readInt(u64, tail[0..8], .big);
@@ -789,51 +890,43 @@ pub const ActionsHandler = struct {
             const run_id = tail[8..];
             var kb: [KEY_BUF]u8 = undefined;
             const run_key = storeKey(&kb, ns, run_id) orelse continue;
+            // Runs being delivered don't count toward what one ask looks at.
             if (self.reserved.contains(run_key)) continue;
+            if (looked == MAX_LOOKED_AT) break;
+            looked += 1;
             const run = getRun(shard, ns, run_id) orelse continue;
             if (run.labels) |required| {
                 const have = labels orelse continue;
                 if (!labelsMatch(self.allocator, required, have)) continue;
             }
+            // Room first: once proposed, nothing here may fail.
+            try self.pending.ensureUnusedCapacity(self.allocator, 1);
+            try self.reserved.ensureUnusedCapacity(self.allocator, 1);
+            const owned_key = try self.allocator.dupe(u8, run_key);
             const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns, .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
+                self.allocator.free(owned_key);
                 if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not delivered: {s}", .{ shard.id, run_id, @errorName(err) });
                 return .none;
             };
-            const owned_key = try self.allocator.dupe(u8, run_key);
-            self.reserved.put(self.allocator, owned_key, {}) catch {
-                self.allocator.free(owned_key);
-                return error.OutOfMemory;
-            };
-            const kept: ?[]u8 = if (request_key) |rk| try rememberKey(self.allocator, holder, rk) else null;
-            self.pending.append(self.allocator, .{ .index = proposed.index, .term = proposed.term, .reply_to = reply_to, .request_id = request_id, .remember = kept }) catch {
-                if (kept) |r| self.allocator.free(r);
-                return error.OutOfMemory;
-            };
+            self.reserved.putAssumeCapacity(owned_key, {});
+            self.pending.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = reply_to, .request_id = request_id });
             return .proposed;
         }
         return .none;
     }
 
-    fn rememberKey(allocator: Allocator, holder: []const u8, request_key: []const u8) ![]u8 {
-        const k = try allocator.alloc(u8, holder.len + 1 + request_key.len);
-        @memcpy(k[0..holder.len], holder);
-        k[holder.len] = 0;
-        @memcpy(k[holder.len + 1 ..], request_key);
-        return k;
-    }
-
-    /// The delivery a retried await's request key got, if its holder holds
-    /// it still.
-    fn again(self: *ActionsHandler, shard: *Shard, holder: []const u8, request_key: []const u8) ?Task {
-        var kb: [action_ops.MAX_WORKER_ID + 1 + action_ops.MAX_REQUEST_KEY]u8 = undefined;
-        if (holder.len + 1 + request_key.len > kb.len) return null;
-        @memcpy(kb[0..holder.len], holder);
-        kb[holder.len] = 0;
-        @memcpy(kb[holder.len + 1 ..][0..request_key.len], request_key);
-        const r = self.remembered.get(kb[0 .. holder.len + 1 + request_key.len]) orelse return null;
-        const run = getRun(shard, r.ns, r.run) orelse return null;
-        if (run.status != .leased or run.token.term != r.token.term or run.token.index != r.token.index) return null;
-        return taskOf(r.run, run);
+    /// The delivery `holder`'s request key got, if the holder holds it
+    /// still: from the log's own record, so any leader finds it.
+    fn again(shard: *Shard, ns: []const u8, action: []const u8, holder: []const u8, request_key: []const u8) ?Task {
+        var kb: [KEY_BUF + action_ops.MAX_WORKER_ID + action_ops.MAX_REQUEST_KEY]u8 = undefined;
+        var rb: [action_ops.MAX_WORKER_ID + 1 + action_ops.MAX_REQUEST_KEY]u8 = undefined;
+        if (holder.len + 1 + request_key.len > rb.len) return null;
+        const k = storeKey(&kb, ns, machine.requestKey(&rb, holder, request_key)) orelse return null;
+        const rec = (readOf(shard).get(machine.Requests, k) catch return null) orelse return null;
+        const run = getRun(shard, ns, rec.v.run) orelse return null;
+        if (!std.mem.eql(u8, run.action, action) or run.status != .leased or !std.mem.eql(u8, run.holder, holder)) return null;
+        if (run.token.term != rec.v.term or run.token.index != rec.v.index) return null;
+        return taskOf(rec.v.run, run);
     }
 
     /// The task a delivered run is.
@@ -854,7 +947,8 @@ pub const ActionsHandler = struct {
     }
 
     /// A deliver applied: answer the await waiting for it, and free its run
-    /// for choosing again either way.
+    /// for choosing again either way. An await whose client is gone has the
+    /// task handed back.
     fn deliverApplied(self: *ActionsHandler, shard: *Shard, e: *const Entry, result: *const Result) void {
         var diag: schema.Diagnostic = .{};
         const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
@@ -864,52 +958,63 @@ pub const ActionsHandler = struct {
             if (pd.index == e.header.index and pd.term == e.header.term) break i;
         } else return;
         const pd = self.pending.swapRemove(at);
-        defer if (pd.remember) |r| self.allocator.free(r);
         const task: ?Task = if (result.refused() != null) null else if (getRun(shard, p.ns, p.run)) |run| taskOf(p.run, run) else null;
-        if (task) |t| if (pd.remember) |r| self.remember(r, p.ns, p.run, t, getRun(shard, p.ns, p.run).?.expiry_ns);
+        if (task) |t| if (gone(shard, pd.reply_to)) return self.abandon(shard, p.ns, p.holder, t);
         deliverAnswer(shard, pd.reply_to, pd.request_id, task);
     }
 
-    fn remember(self: *ActionsHandler, key: []const u8, ns: []const u8, run_id: []const u8, task: Task, expiry_ns: u64) void {
-        self.pruneRemembered();
-        const k = self.allocator.dupe(u8, key) catch return;
-        const ns_owned = self.allocator.dupe(u8, ns) catch {
-            self.allocator.free(k);
-            return;
+    /// Whether an answer for `reply_to` has nowhere to go: a client of this
+    /// shard's that closed. Another shard's or node's client is that one's
+    /// to tell.
+    fn gone(shard: *Shard, reply_to: ReplyTo) bool {
+        return switch (reply_to) {
+            .socket => |s| s.shard == shard.id and shard.localConnection(reply_to) == null,
+            .remote => false,
         };
-        const run_owned = self.allocator.dupe(u8, run_id) catch {
-            self.allocator.free(k);
-            self.allocator.free(ns_owned);
-            return;
-        };
-        const got = self.remembered.getOrPut(self.allocator, k) catch {
-            self.allocator.free(k);
-            self.allocator.free(ns_owned);
-            self.allocator.free(run_owned);
-            return;
-        };
-        if (got.found_existing) {
-            self.allocator.free(k);
-            self.allocator.free(got.value_ptr.ns);
-            self.allocator.free(got.value_ptr.run);
-        }
-        got.value_ptr.* = .{ .ns = ns_owned, .run = run_owned, .token = .{ .term = task.term, .index = task.index }, .expiry_ns = expiry_ns };
     }
 
-    /// Drop remembered deliveries whose lease has run out, once there are
-    /// many: a request key is kept for one lease.
-    fn pruneRemembered(self: *ActionsHandler) void {
-        if (self.remembered.count() < 4096) return;
-        const now = wallNs();
-        var it = self.remembered.iterator();
-        var gone: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer gone.deinit(self.allocator);
-        while (it.next()) |e| if (e.value_ptr.expiry_ns < now) gone.append(self.allocator, e.key_ptr.*) catch break;
-        for (gone.items) |k| if (self.remembered.fetchRemove(k)) |kv| {
-            self.allocator.free(kv.key);
-            self.allocator.free(kv.value.ns);
-            self.allocator.free(kv.value.run);
+    /// Hand a task back that no await took: released as abandoned, which
+    /// counts no failure.
+    fn abandon(self: *ActionsHandler, shard: *Shard, ns: []const u8, holder: []const u8, t: Task) void {
+        _ = self;
+        const run = getRun(shard, ns, t.run) orelse return;
+        _ = propose(shard, .action_release, ae.Release.Value{ .ns = ns, .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" }) catch |err| {
+            if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not handed back: {s}; its lease runs out", .{ shard.id, t.run, @errorName(err) });
         };
+    }
+
+    /// `[ns_len:u16][ns][holder_len:u16][holder][action_len:u16][action][run_len:u16][run][deliveries:u32][term:u64][index:u64]`.
+    fn sendAbandon(self: *ActionsHandler, shard: *Shard, ns: []const u8, holder: []const u8, t: Task) void {
+        const parts = [_][]const u8{ ns, holder, t.action, t.run };
+        var size: usize = 4 + 8 + 8;
+        for (parts) |p| size += 2 + p.len;
+        const bytes = self.allocator.alloc(u8, size) catch return;
+        var off: usize = 0;
+        for (parts) |p| {
+            std.mem.writeInt(u16, bytes[off..][0..2], @intCast(p.len), .little);
+            @memcpy(bytes[off + 2 ..][0..p.len], p);
+            off += 2 + p.len;
+        }
+        std.mem.writeInt(u32, bytes[off..][0..4], t.deliveries, .little);
+        std.mem.writeInt(u64, bytes[off + 4 ..][0..8], t.term, .little);
+        std.mem.writeInt(u64, bytes[off + 12 ..][0..8], t.index, .little);
+        self.send(shard, ownerOf(shard, ns, t.action), .action_abandon, bytes);
+    }
+
+    pub fn abandonFromInbox(self: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
+        var r: Fields = .{ .bytes = bytes };
+        const ns = r.next() orelse return;
+        const holder = r.next() orelse return;
+        const action = r.next() orelse return;
+        const run_id = r.next() orelse return;
+        if (r.off + 20 != bytes.len) return;
+        const run = getRun(shard, ns, run_id) orelse return;
+        var t = taskOf(run_id, run);
+        t.action = action;
+        t.deliveries = std.mem.readInt(u32, bytes[r.off..][0..4], .little);
+        t.term = std.mem.readInt(u64, bytes[r.off + 4 ..][0..8], .little);
+        t.index = std.mem.readInt(u64, bytes[r.off + 12 ..][0..8], .little);
+        self.abandon(shard, ns, holder, t);
     }
 
     /// An await or ask answered with its task, or none.
@@ -937,11 +1042,22 @@ pub const ActionsHandler = struct {
         }
     }
 
-    /// Wake this shard's awaits: each that may find a task runs again, as
-    /// it first ran, with the wait it has left.
+    /// Wake this shard's awaits for a run ready here: each that may find
+    /// one runs again, as it first ran, with the wait it has left.
     pub fn wakeLocal(shard: *Shard) void {
-        shard.waiter_pool.notifyAny(.action_await, resolveAwait, @ptrCast(shard));
+        wakeAwaits(shard, resolveLocal);
+    }
+
+    /// Wake this shard's awaits for a run another shard says is ready:
+    /// only those naming an action another shard owns.
+    pub fn wakeFromPeer(shard: *Shard) void {
+        wakeAwaits(shard, resolveRemote);
+    }
+
+    fn wakeAwaits(shard: *Shard, resolver: waiter_pool_mod.WaiterPool.ResolverFn) void {
         const self = shard.actions_handler;
+        self.wake_gen +%= 1;
+        shard.waiter_pool.notifyAny(.action_await, resolver, @ptrCast(shard));
         if (self.reruns.items.len == 0) return;
         const reruns = self.reruns.toOwnedSlice(self.allocator) catch return;
         defer self.allocator.free(reruns);
@@ -951,19 +1067,25 @@ pub const ActionsHandler = struct {
         }
     }
 
+    fn resolveLocal(waiter: *Waiter, ctx: *anyopaque) bool {
+        return resolveAwait(waiter, @ptrCast(@alignCast(ctx)), .local);
+    }
+
+    fn resolveRemote(waiter: *Waiter, ctx: *anyopaque) bool {
+        return resolveAwait(waiter, @ptrCast(@alignCast(ctx)), .remote);
+    }
+
     /// A waiting await that may find a task now: it leaves the pool and
     /// runs again after the wake. False leaves it waiting.
-    fn resolveAwait(waiter: *Waiter, ctx: *anyopaque) bool {
-        const shard: *Shard = @ptrCast(@alignCast(ctx));
+    fn resolveAwait(waiter: *Waiter, shard: *Shard, from: enum { local, remote }) bool {
         const self = shard.actions_handler;
         const parts = AwaitKey.parse(waiter.key(), waiter.min_version) orelse return false;
         if (parts.worker.len > 0) if (shard.worker_handler.refusesWork(parts.ns, parts.worker)) |no| {
             shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .bad_request, no);
             return true;
         };
-        if (!self.mayFind(shard, parts)) return false;
-        const now = @import("stdx").time.monotonicMs();
-        const left = waiter.expires_at_ms -| now;
+        if (!mayFind(shard, parts, from == .remote)) return false;
+        const left = waiter.expires_at_ms -| @import("stdx").time.monotonicMs();
         if (left == 0) return false;
         const bytes = rerunBytes(shard.allocator, waiter.request_id, parts, left) catch return false;
         self.reruns.append(self.allocator, .{ .reply_to = waiter.reply_to, .request_id = waiter.request_id, .bytes = bytes }) catch {
@@ -973,19 +1095,20 @@ pub const ActionsHandler = struct {
         return true;
     }
 
-    /// Whether a woken await may find a task: one of its actions is another
-    /// shard's (which the wake came from), or has a ready run due here.
-    fn mayFind(self: *ActionsHandler, shard: *Shard, parts: AwaitKey.Parts) bool {
-        _ = self;
-        if (mayFindOf(shard, parts.ns, parts.action)) return true;
+    /// Whether a woken await may find a task: one of its actions has a
+    /// ready run due here, or, for a wake from another shard, is that
+    /// shard's.
+    fn mayFind(shard: *Shard, parts: AwaitKey.Parts, remote: bool) bool {
+        var it = parts.names.iterator();
+        while (it.next() catch null) |name| if (mayFindOf(shard, parts.ns, name, remote)) return true;
         if (parts.worker.len > 0) if (shard.worker_handler.find(parts.ns, parts.worker)) |w| for (w.processes.items) |p| {
-            if (p.kind == .action and mayFindOf(shard, parts.ns, p.name_owned)) return true;
+            if (p.kind == .action and mayFindOf(shard, parts.ns, p.name_owned, remote)) return true;
         };
         return false;
     }
 
-    fn mayFindOf(shard: *Shard, ns: []const u8, action: []const u8) bool {
-        if (ownerOf(shard, ns, action) != shard.id) return true;
+    fn mayFindOf(shard: *Shard, ns: []const u8, action: []const u8, remote: bool) bool {
+        if (ownerOf(shard, ns, action) != shard.id) return remote;
         var pb: [KEY_BUF]u8 = undefined;
         var rb: [machine.MAX_KEY_LEN]u8 = undefined;
         const prefix = storeKey(&pb, ns, machine.readyPrefix(&rb, action)) orelse return false;
@@ -997,10 +1120,7 @@ pub const ActionsHandler = struct {
 
     /// The await a waiter was, as a request, waiting `left_ms` at most.
     fn rerunBytes(allocator: Allocator, request_id: u64, parts: AwaitKey.Parts, left_ms: u64) ![]u8 {
-        var lb: [action_ops.ActionName.max_size]u8 = undefined;
-        var lw: schema.Writer = .{ .buf = &lb };
-        try action_ops.ActionName.encode(&lw, parts.action);
-        const body: AwaitRequest.Value = .{ .actions = .{ .bytes = lb[0..lw.pos], .count = 1 }, .block_ms = @min(left_ms, action_ops.MAX_AWAIT_MS), .request_key = if (parts.request_key.len == 0) null else parts.request_key };
+        const body: AwaitRequest.Value = .{ .actions = parts.names, .block_ms = @min(left_ms, action_ops.MAX_AWAIT_MS), .request_key = if (parts.request_key.len == 0) null else parts.request_key };
         const value = try allocator.alloc(u8, try AwaitRequest.encodedSize(body));
         defer allocator.free(value);
         _ = try AwaitRequest.encodeInto(value, body);
@@ -1010,10 +1130,9 @@ pub const ActionsHandler = struct {
 
     // ── Reports: complete, fail, touch ──────────────────────────────────
 
-    /// The run a report names, if in scope (namespace and action), and the
-    /// report's delivery its live one. A resend of the report that ended
-    /// the delivery, and one for a delivery since moved on, are told apart
-    /// by the machine, which answers both as it did.
+    /// The run a report names, if in scope (namespace and action). A resend
+    /// of the report that ended the delivery, one for a delivery since moved
+    /// on, and one from another worker are told apart by the machine.
     fn reported(shard: *Shard, req: Request, action: []const u8) Error!Run {
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
         const run = getRun(shard, homeOf(req.namespace), req.key) orelse return error.NotFound;
@@ -1023,7 +1142,7 @@ pub const ActionsHandler = struct {
 
     fn runComplete(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, outcome: []const u8, result: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
-        const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
+        const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "complete not persisted") } };
         recordReport(shard, req.namespace, worker, action, false);
         return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
@@ -1031,7 +1150,7 @@ pub const ActionsHandler = struct {
 
     fn runFail(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, retry: bool, abandoned: bool, delay_ms: u64, err_text: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
-        const proposed = propose(shard, .action_release, ae.Release.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .abandoned = abandoned, .retry = retry, .delay_ms = delay_ms, .@"error" = err_text }) catch |err|
+        const proposed = propose(shard, .action_release, ae.Release.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .abandoned = abandoned, .retry = retry, .delay_ms = delay_ms, .@"error" = err_text }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "fail not persisted") } };
         if (!abandoned) recordReport(shard, req.namespace, worker, action, true);
         return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
@@ -1041,21 +1160,22 @@ pub const ActionsHandler = struct {
     /// than half of it is left, or while an extend for it is in flight;
     /// otherwise an extend is proposed and answered when it applies.
     fn runTouch(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64) Error!table_run.Outcome(TouchResponse) {
-        _ = worker;
         const self = shard.actions_handler;
         const run = try reported(shard, req, action);
-        if (run.status != .leased or run.deliveries != deliveries or run.token.term != term or run.token.index != index) return error.Stale;
+        const token: ae.Token.Value = .{ .term = term, .index = index };
+        if (run.status != .leased or run.deliveries != deliveries or run.token.term != term or run.token.index != index or !std.mem.eql(u8, run.holder, worker))
+            return .{ .refused = .{ .status = .conflict, .refusal = .{ .reason = .stale_report, .ran = .no, .message = machine.staleWhy(run, worker, deliveries, token) } } };
         var kb: [KEY_BUF]u8 = undefined;
         const run_key = storeKey(&kb, homeOf(req.namespace), req.key) orelse return error.NotFound;
         const half = (run.lease_ms *| std.time.ns_per_ms) / 2;
         if (run.expiry_ns -| wallNs() > half or self.extending.contains(run_key)) return .{ .answer = .{ .expires_at_ms = nsToMs(run.expiry_ns) } };
-        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err|
-            return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "touch not persisted") } };
+        try self.extending.ensureUnusedCapacity(self.allocator, 1);
         const owned = try self.allocator.dupe(u8, run_key);
-        self.extending.put(self.allocator, owned, {}) catch {
+        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
             self.allocator.free(owned);
-            return error.OutOfMemory;
+            return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "touch not persisted") } };
         };
+        self.extending.putAssumeCapacity(owned, {});
         return .{ .park = .{ .proposed = proposed, .answer = answerTouch } };
     }
 
@@ -1068,31 +1188,61 @@ pub const ActionsHandler = struct {
         table_run.answer(TouchResponse, shard, conn, request_id, .{ .expires_at_ms = nsToMs(r.int(u64) orelse 0) });
     }
 
-    /// A worker's report counts toward its stats where it is registered,
-    /// and only there: another shard's registry is that shard's to change.
+    /// A worker's report counts toward its stats where it is registered:
+    /// here, or on its own shard, told through the inbox.
     fn recordReport(shard: *Shard, namespace: []const u8, worker: []const u8, action: []const u8, failed: bool) void {
         if (worker.len == 0) return;
-        if (ownerOf(shard, homeOf(namespace), worker) != shard.id) return;
-        if (failed) shard.worker_handler.recordFailure(namespace, worker, action) else shard.worker_handler.recordCompletion(namespace, worker, action);
+        const ns = homeOf(namespace);
+        const target = ownerOf(shard, ns, worker);
+        if (target == shard.id) return countReport(shard, ns, worker, action, failed);
+        const parts = [_][]const u8{ ns, worker, action };
+        var size: usize = 1;
+        for (parts) |p| size += 2 + p.len;
+        const bytes = shard.allocator.alloc(u8, size) catch return;
+        var off: usize = 0;
+        for (parts) |p| {
+            std.mem.writeInt(u16, bytes[off..][0..2], @intCast(p.len), .little);
+            @memcpy(bytes[off + 2 ..][0..p.len], p);
+            off += 2 + p.len;
+        }
+        bytes[off] = @intFromBool(failed);
+        shard.actions_handler.send(shard, target, .worker_report, bytes);
+    }
+
+    fn countReport(shard: *Shard, ns: []const u8, worker: []const u8, action: []const u8, failed: bool) void {
+        if (failed) shard.worker_handler.recordFailure(ns, worker, action) else shard.worker_handler.recordCompletion(ns, worker, action);
+    }
+
+    /// `[ns_len:u16][ns][worker_len:u16][worker][action_len:u16][action][failed:u8]`.
+    pub fn reportFromInbox(shard: *Shard, bytes: []const u8) void {
+        var r: Fields = .{ .bytes = bytes };
+        const ns = r.next() orelse return;
+        const worker = r.next() orelse return;
+        const action = r.next() orelse return;
+        if (r.off + 1 != bytes.len) return;
+        countReport(shard, ns, worker, action, bytes[r.off] != 0);
     }
 
     // ── After an entry applies ──────────────────────────────────────────
 
     /// What the leader does once an action entry applies: answer the await
-    /// its deliver was for, wake awaits for a run newly ready, let its
-    /// extend or expire be proposed again, and tell a workflow on another
-    /// shard that a run it waits on finished. Every replica runs it; only a
-    /// leader holds anything it acts on.
+    /// its deliver was for, wake awaits for a run newly ready (or note when
+    /// a delayed one is due), let its extend or expire be proposed again,
+    /// and tell a workflow on another shard that a run it waits on
+    /// finished. Every replica runs it; only a leader holds anything it
+    /// acts on.
     pub fn afterApply(self: *ActionsHandler, shard: *Shard, e: *const Entry, result: *const Result) void {
         const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
         const leads = shard.raft_node.role == .leader;
+        var diag: schema.Diagnostic = .{};
         switch (etype) {
             .action_deliver => if (leads) self.deliverApplied(shard, e, result),
-            .action_invoke => if (leads and result.refused() == null) {
-                shard.wake_workers = true;
+            .action_invoke => {
+                const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
+                if (self.starting.fetchRemove(p.run)) |kv| self.allocator.free(kv.key);
+                if (leads and result.refused() == null) shard.wake_workers = true;
             },
             .action_extend => {
-                var diag: schema.Diagnostic = .{};
                 const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
                 var kb: [KEY_BUF]u8 = undefined;
                 if (storeKey(&kb, p.ns, p.run)) |k| if (self.extending.fetchRemove(k)) |kv| self.allocator.free(kv.key);
@@ -1104,20 +1254,22 @@ pub const ActionsHandler = struct {
                 if (leads) shard.wake_workers = true;
                 if (leads) self.tellWorkflowsOfExpire(shard, e);
             },
-            .action_settle, .action_release => if (leads and result.refused() == null) {
-                if (etype == .action_release) shard.wake_workers = true;
-                var diag: schema.Diagnostic = .{};
-                const ns, const run_id = if (etype == .action_settle) blk: {
-                    const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
-                    break :blk .{ p.ns, p.run };
-                } else blk: {
-                    const p = ae.Release.decodeAll(e.payload, &diag) catch return;
-                    break :blk .{ p.ns, p.run };
-                };
-                self.tellWorkflow(shard, ns, run_id);
+            .action_settle => if (leads and result.refused() == null) {
+                const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
+                self.tellWorkflow(shard, p.ns, p.run);
+            },
+            .action_release => if (leads and result.refused() == null) {
+                const p = ae.Release.decodeAll(e.payload, &diag) catch return;
+                if (p.delay_ms == 0) shard.wake_workers = true else self.noteDue(e.header.timestamp_ns +| p.delay_ms *| std.time.ns_per_ms);
+                self.tellWorkflow(shard, p.ns, p.run);
             },
             else => {},
         }
+    }
+
+    fn noteDue(self: *ActionsHandler, due_ns: u64) void {
+        if (self.due.items.len == MAX_DUE) return;
+        self.due.append(self.allocator, due_ns) catch {};
     }
 
     fn tellWorkflowsOfExpire(self: *ActionsHandler, shard: *Shard, e: *const Entry) void {
@@ -1136,7 +1288,7 @@ pub const ActionsHandler = struct {
         const caller = run.caller_run orelse return;
         const target = shard.router.partitionToShard(run_id_mod.extractPartition(caller) orelse return);
         if (target == shard.id) return;
-        self.sendFinished(shard, target, run_id, run);
+        self.sendFinished(shard, target, run_id, statusOf(run), if (run.status == .completed) run.outcome else "", if (run.status == .completed) run.result else "");
     }
 
     fn finishedStatus(s: machine.Status) bool {
@@ -1147,13 +1299,13 @@ pub const ActionsHandler = struct {
     }
 
     /// `[run_len:u16][run][status:u8][outcome_len:u16][outcome][output]`.
-    fn sendFinished(self: *ActionsHandler, shard: *Shard, target: u16, run_id: []const u8, run: Run) void {
-        const outcome = if (run.status == .completed) run.outcome else "";
-        const output = if (run.status == .completed) run.result else "";
+    /// A run its shard has no record of, and isn't starting, goes as
+    /// `cancelled`: its invoke was lost.
+    fn sendFinished(self: *ActionsHandler, shard: *Shard, target: u16, run_id: []const u8, status: ActionRunStatus, outcome: []const u8, output: []const u8) void {
         const bytes = self.allocator.alloc(u8, 2 + run_id.len + 1 + 2 + outcome.len + output.len) catch return;
         std.mem.writeInt(u16, bytes[0..2], @intCast(run_id.len), .little);
         @memcpy(bytes[2..][0..run_id.len], run_id);
-        bytes[2 + run_id.len] = @backingInt(statusOf(run));
+        bytes[2 + run_id.len] = @backingInt(status);
         std.mem.writeInt(u16, bytes[3 + run_id.len ..][0..2], @intCast(outcome.len), .little);
         @memcpy(bytes[5 + run_id.len ..][0..outcome.len], outcome);
         @memcpy(bytes[5 + run_id.len + outcome.len ..], output);
@@ -1168,7 +1320,7 @@ pub const ActionsHandler = struct {
     }
 
     /// A run's own shard telling this one how a run a workflow here waits
-    /// on ended. Kept until the workflow takes it.
+    /// on ended. Kept until the workflow takes it, or `FINISHED_KEEP_MS`.
     pub fn finishedFromInbox(self: *ActionsHandler, bytes: []const u8) void {
         if (bytes.len < 5) return;
         const rid_len: usize = std.mem.readInt(u16, bytes[0..2], .little);
@@ -1186,30 +1338,46 @@ pub const ActionsHandler = struct {
             self.allocator.free(k);
             return self.allocator.free(o);
         };
-        self.finished.put(self.allocator, k, .{ .status = status, .outcome = o, .output = out }) catch {
+        self.finished.put(self.allocator, k, .{ .status = status, .outcome = o, .output = out, .at_ms = @import("stdx").time.monotonicMs() }) catch {
             self.allocator.free(k);
             self.allocator.free(o);
             self.allocator.free(out);
         };
     }
 
-    /// A workflow here that has heard nothing of a run asks its shard; the
-    /// answer comes as `action_finished` if the run has finished.
-    pub fn askResult(self: *ActionsHandler, shard: *Shard, target: u16, run_id: []const u8) void {
-        const bytes = self.allocator.dupe(u8, run_id) catch return;
+    /// A workflow here that has heard nothing of a run asks its shard, at
+    /// most once per `ASK_EVERY_MS`; the answer comes as `action_finished`.
+    pub fn askResult(self: *ActionsHandler, shard: *Shard, target: u16, ns: []const u8, run_id: []const u8) void {
+        const now = @import("stdx").time.monotonicMs();
+        if (self.asked.getPtr(run_id)) |last| {
+            if (now -| last.* < ASK_EVERY_MS) return;
+            last.* = now;
+        } else {
+            const k = self.allocator.dupe(u8, run_id) catch return;
+            self.asked.put(self.allocator, k, now) catch return self.allocator.free(k);
+        }
+        const bytes = self.allocator.alloc(u8, 2 + ns.len + run_id.len) catch return;
+        std.mem.writeInt(u16, bytes[0..2], @intCast(ns.len), .little);
+        @memcpy(bytes[2..][0..ns.len], ns);
+        @memcpy(bytes[2 + ns.len ..], run_id);
         self.send(shard, target, .action_result_ask, bytes);
     }
 
-    pub fn resultAskFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, run_id: []const u8) void {
-        // The run's namespace isn't in the ask: the caller's run id names a
-        // run in one namespace, and run ids are unique on a shard.
-        var it = readOf(shard).range(machine.Runs, "");
-        while (it.next() catch null) |item| {
-            const ns_len = item.key[0];
-            if (!std.mem.eql(u8, item.key[1 + ns_len ..], run_id)) continue;
-            if (finishedStatus(item.value.v.status)) self.sendFinished(shard, from, run_id, item.value.v);
+    /// `[ns_len:u16][ns][run]`: answered if the run finished, or if this
+    /// shard has no such run and isn't starting it, which means its invoke
+    /// was lost.
+    pub fn resultAskFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8) void {
+        if (bytes.len < 2) return;
+        const ns_len: usize = std.mem.readInt(u16, bytes[0..2], .little);
+        if (2 + ns_len > bytes.len) return;
+        const ns = bytes[2..][0..ns_len];
+        const run_id = bytes[2 + ns_len ..];
+        if (getRun(shard, ns, run_id)) |run| {
+            if (finishedStatus(run.status)) self.sendFinished(shard, from, run_id, statusOf(run), if (run.status == .completed) run.outcome else "", if (run.status == .completed) run.result else "");
             return;
         }
+        if (self.starting.contains(run_id)) return;
+        self.sendFinished(shard, from, run_id, .cancelled, "", "");
     }
 
     // ── For workflows ───────────────────────────────────────────────────
@@ -1235,6 +1403,7 @@ pub const ActionsHandler = struct {
     /// A run on another shard, as that shard last told this one; taken, so
     /// the workflow resumes once.
     pub fn takeFinished(self: *ActionsHandler, run_id: []const u8) ?Finished {
+        if (self.asked.fetchRemove(run_id)) |kv| self.allocator.free(kv.key);
         const kv = self.finished.fetchRemove(run_id) orelse return null;
         self.allocator.free(kv.key);
         return kv.value;
@@ -1274,8 +1443,9 @@ pub const ActionsHandler = struct {
 
     /// A workflow on another shard asking this one to start a run it will
     /// wait on: `[run_len:u16][run][ns_len:u16][ns][action_len:u16][action]`
-    /// `[caller_len:u16][caller][workflow_len:u16][workflow][input]`.
-    pub fn startRunFromInbox(_: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
+    /// `[caller_len:u16][caller][workflow_len:u16][workflow][input]`. A run
+    /// that couldn't be started is lost: asked about, it says so.
+    pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
         var r: Fields = .{ .bytes = bytes };
         const run_id = r.next() orelse return;
         const ns = r.next() orelse return;
@@ -1283,8 +1453,12 @@ pub const ActionsHandler = struct {
         const caller = r.next() orelse return;
         const workflow = r.next() orelse return;
         const input = bytes[r.off..];
-        if (proposeInvoke(shard, ns, action, run_id, input, if (caller.len == 0) null else caller, if (workflow.len == 0) null else workflow) == null)
-            log.err("shard {d}: action run {s} asked for by a workflow on another shard could not be started; that workflow run stays parked", .{ shard.id, run_id });
+        if (proposeInvoke(shard, ns, action, run_id, input, if (caller.len == 0) null else caller, if (workflow.len == 0) null else workflow) == null) {
+            log.err("shard {d}: action run {s} asked for by a workflow on another shard could not be started; that workflow's step fails", .{ shard.id, run_id });
+            return;
+        }
+        const k = self.allocator.dupe(u8, run_id) catch return;
+        self.starting.put(self.allocator, k, {}) catch self.allocator.free(k);
     }
 
     const Fields = struct {
@@ -1323,22 +1497,24 @@ pub const ActionsHandler = struct {
     // ── The expire duty, and leadership ─────────────────────────────────
 
     /// The leader's tick: end leases past their deadline, as one expire of
-    /// the earliest keys past due. A key whose lease moved on is dropped by
+    /// the earliest keys past due; a key whose lease moved on is dropped by
     /// the same entry. A new leader ends a lease only past a grace: the
     /// lease's deadline, and at least min(lease, 30 s) after it first ran
-    /// in its term. Returns how many keys it named.
+    /// in its term. Also wakes awaits for delayed retries now due, resends
+    /// what the inbox refused, and drops results no workflow took. Returns
+    /// how many keys it named.
     pub fn expireDue(self: *ActionsHandler, shard: *Shard) u64 {
         self.resend(shard);
+        self.pruneFinished();
         if (!shard.raft_node.leaderReady()) return 0;
         const now = wallNs();
         if (self.duty_term != shard.raft_node.current_term) {
             self.duty_term = shard.raft_node.current_term;
             self.duty_since_ns = now;
             // Runs ready before this term had no leader to wake for them.
-            shard.wake_workers = true;
+            self.due.clearRetainingCapacity();
             ActionsHandler.wakeWorkers(shard);
-            shard.wake_workers = false;
-        }
+        } else self.wakeDue(shard, now);
         if (self.expiring != null) return 0;
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
@@ -1348,12 +1524,17 @@ pub const ActionsHandler = struct {
             if (n == ae.MAX_EXPIRE_ITEMS) break;
             const k = machine.parseDeadlineKey(item.key[1..]) orelse continue;
             if (k.expiry_ns > now) break;
+            var holder: []const u8 = "";
+            var request_key: ?[]const u8 = null;
             if (getRun(shard, k.ns, k.run)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
                 if (now < self.duty_since_ns +| grace) continue;
+                holder = run.holder;
+                request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.action, .run = k.run, .expiry_ns = k.expiry_ns }) catch continue;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.action, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
+            if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
             n += 1;
         }
@@ -1364,6 +1545,30 @@ pub const ActionsHandler = struct {
         };
         self.expiring = proposed.index;
         return n;
+    }
+
+    /// Wake awaits once a delayed retry is due; with more delays than the
+    /// list holds, every tick wakes.
+    fn wakeDue(self: *ActionsHandler, shard: *Shard, now: u64) void {
+        var woke = self.due.items.len == MAX_DUE;
+        var i: usize = 0;
+        while (i < self.due.items.len) {
+            if (self.due.items[i] <= now) {
+                _ = self.due.swapRemove(i);
+                woke = true;
+            } else i += 1;
+        }
+        if (woke) ActionsHandler.wakeWorkers(shard);
+    }
+
+    fn pruneFinished(self: *ActionsHandler) void {
+        if (self.finished.count() == 0) return;
+        const now = @import("stdx").time.monotonicMs();
+        var it = self.finished.iterator();
+        var old: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer old.deinit(self.allocator);
+        while (it.next()) |e| if (now -| e.value_ptr.at_ms > FINISHED_KEEP_MS) old.append(self.allocator, e.key_ptr.*) catch break;
+        for (old.items) |k| if (self.takeFinished(k)) |f| self.freeFinished(f);
     }
 
     fn resend(self: *ActionsHandler, shard: *Shard) void {
@@ -1378,26 +1583,15 @@ pub const ActionsHandler = struct {
     pub fn stoppedLeading(self: *ActionsHandler, shard: *Shard) void {
         for (self.pending.items) |pd| {
             shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the task was given; it may have been — retry with the same request key" });
-            if (pd.remember) |r| self.allocator.free(r);
         }
         self.pending.clearRetainingCapacity();
         self.forgetLeading();
     }
 
     fn forgetLeading(self: *ActionsHandler) void {
-        var rit = self.reserved.keyIterator();
-        while (rit.next()) |k| self.allocator.free(k.*);
-        self.reserved.clearRetainingCapacity();
-        var eit = self.extending.keyIterator();
-        while (eit.next()) |k| self.allocator.free(k.*);
-        self.extending.clearRetainingCapacity();
-        var mit = self.remembered.iterator();
-        while (mit.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.ns);
-            self.allocator.free(e.value_ptr.run);
-        }
-        self.remembered.clearRetainingCapacity();
+        freeKeys(self.allocator, &self.reserved);
+        freeKeys(self.allocator, &self.extending);
+        self.due.clearRetainingCapacity();
         self.expiring = null;
         self.duty_term = 0;
     }
