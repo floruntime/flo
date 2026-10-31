@@ -41,6 +41,8 @@ pub const Tag = enum(u8) {
     action_start, // Start an action run on the owning shard: payload from ActionsHandler.encodeStartRunMessage
     cancel_reads, // a client of the sender closed: drop its blocking reads parked here, answering each empty; sequence as forward_request
     kv_sink_put, // a processing KV sink's write of a key this shard owns: payload from KVHandler.SinkPut.encode
+    action_finished, // how a run a workflow on the receiver waits on ended: payload from ActionsHandler.sendFinished
+    action_result_ask, // a workflow's shard asking a run's shard how it ended: payload the run id
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.

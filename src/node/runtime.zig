@@ -1160,7 +1160,7 @@ pub const Runtime = struct {
             s.dispatcher.setWalkContext(.ts_list, @ptrCast(&s.defaultPartition().ts));
             s.dispatcher.setWalkContext(.kv_scan, @ptrCast(&s.defaultPartition().kv));
             s.dispatcher.setWalkContext(.stream_list, @ptrCast(&s.defaultPartition().stream));
-            s.dispatcher.setWalkContext(.action_list, @ptrCast(s.actions_handler));
+            s.dispatcher.setWalkContext(.action_list, @ptrCast(s));
             s.dispatcher.setWalkContext(.queue_list, @ptrCast(s.queue_handler));
             s.dispatcher.setWalkContext(.processing_list, @ptrCast(s.processing_handler));
             s.dispatcher.setWalkContext(.workflow_list_definitions, @ptrCast(s.workflow_handler));

@@ -1977,43 +1977,19 @@ pub const WorkflowHandler = struct {
         target_shard_id: u16,
         now_ms: i64,
     ) ?[]const u8 {
-        var kbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = ActionsHandler.defKey(&kbuf, namespace, action_name) orelse "";
-        const action = shard.actions_handler.actions.get(key) orelse {
+        if (!ActionsHandler.actionExists(shard, namespace, action_name)) {
             self.addHistoryEvent(run, "action_not_found", action_name, now_ms);
             return definition.StepOutcome.target_not_found;
-        };
-
-        if (!action.enabled) {
-            self.addHistoryEvent(run, "action_disabled", action_name, now_ms);
-            return definition.StepOutcome.target_disabled;
         }
 
         var action_id_buf: [32]u8 = undefined;
-        const invoked = shard.actions_handler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
+        const invoked = ActionsHandler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
             return definition.StepOutcome.execution_failure;
         };
         // The run exists once the invoke applies; `checkPendingActions`
         // resumes this one when it finishes.
         self.parkForAction(run, invoked.id, step_label, action_name, target_shard_id, now_ms, invoked.index);
         return null;
-    }
-
-    /// Resolve the ActionsHandler responsible for the given action name.
-    /// Uses peer_shards for cross-shard access, falls back to local.
-    fn resolveActionHandler(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) *ActionsHandler {
-        _ = self;
-        const hash = router.hashKeyWithNamespace(namespace, action_name);
-        const target = shard.router.route(hash);
-        switch (target) {
-            .local => return shard.actions_handler,
-            .shard => |t| {
-                if (shard.peer_shards) |peers| {
-                    return peers[t.shard_id].actions_handler;
-                }
-                return shard.actions_handler;
-            },
-        }
     }
 
     /// Resolve the StreamHandler that owns `stream_name` in `namespace`, using
@@ -2046,22 +2022,21 @@ pub const WorkflowHandler = struct {
         };
     }
 
-    /// Get an action run result, checking the correct shard's ActionsHandler.
-    /// For local shard: direct access. For remote shard: mutex-protected access.
-    fn getActionRunResult(shard: *Shard, target_shard_id: ?u16, action_rid: []const u8) ?ActionsHandler.InternalRunResult {
+    /// How the action run a workflow run waits on ended, or null while it
+    /// hasn't: this shard's store, or what the run's own shard told this
+    /// one. A run on another shard not heard of yet is asked about, in case
+    /// the message was lost.
+    fn getActionRunResult(shard: *Shard, run_ns_key: []const u8, target_shard_id: ?u16, action_rid: []const u8) ?ActionsHandler.InternalRunResult {
         const tid = target_shard_id orelse shard.id;
         if (tid == shard.id) {
-            // Local shard
-            return shard.actions_handler.getRunResult(action_rid);
+            const ns = run_ns_key[0 .. std.mem.indexOfScalar(u8, run_ns_key, ':') orelse 0];
+            return ActionsHandler.getRunResult(shard, ns, action_rid);
         }
-        // Cross-shard: use peer shard's handler with mutex
-        if (shard.peer_shards) |peers| {
-            const handler = peers[tid].actions_handler;
-            handler.runs_mu.lock();
-            defer handler.runs_mu.unlock();
-            return handler.getRunResult(action_rid);
-        }
-        return shard.actions_handler.getRunResult(action_rid);
+        const f = shard.actions_handler.finished.get(action_rid) orelse {
+            shard.actions_handler.askResult(shard, tid, action_rid);
+            return null;
+        };
+        return .{ .status = f.status, .output = f.output, .outcome = if (f.status != .completed) null else if (f.outcome.len == 0) definition.StepOutcome.success else f.outcome };
     }
 
     /// Park a workflow run waiting for an async action to complete.
@@ -2158,7 +2133,7 @@ pub const WorkflowHandler = struct {
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
-                const done = if (getActionRunResult(shard, run.pending_action_shard_id, action_rid)) |result|
+                const done = if (getActionRunResult(shard, entry.key_ptr.*, run.pending_action_shard_id, action_rid)) |result|
                     result.status == .completed or result.status == .failed or result.status == .timed_out
                 else
                     pendingLost(shard, run, run.pending_action_shard_id);
@@ -2359,7 +2334,9 @@ pub const WorkflowHandler = struct {
 
         // No run yet: wait, unless this shard has applied the invoke's index
         // without creating it. Then the log dropped it, and the step fails.
-        const found = getActionRunResult(shard, run.pending_action_shard_id, action_rid);
+        const found = getActionRunResult(shard, run_ns_key, run.pending_action_shard_id, action_rid);
+        // What another shard told this one is spent once read here.
+        defer if (found != null) if (shard.actions_handler.takeFinished(action_rid)) |f| shard.actions_handler.freeFinished(f);
         if (found == null) {
             if (!pendingLost(shard, run, run.pending_action_shard_id)) return;
             log.warn("workflow run {s}: the action run {s} its step waits for was never created (its invoke was dropped); the step fails", .{ run_ns_key, action_rid });
@@ -2367,8 +2344,8 @@ pub const WorkflowHandler = struct {
 
         const outcome: []const u8 = if (found) |result| switch (result.status) {
             .completed => blk: {
-                // Use the named outcome from the action if provided, otherwise default to "success"
-                const action_outcome = result.outcome orelse definition.StepOutcome.success;
+                // The outcome the worker named, "success" when it named none.
+                const action_outcome = if (result.outcome) |o| (if (o.len == 0) definition.StepOutcome.success else o) else definition.StepOutcome.success;
                 if (run.step_outputs) |*so| {
                     so.put(self.allocator, step_label, result.output orelse "{}", action_outcome) catch {};
                 }

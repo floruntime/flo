@@ -61,7 +61,6 @@ pub const Register = Record(&.{
     .{ .name = "ns", .T = Ns },
     .{ .name = "name", .T = ActionName },
     .{ .name = "owner", .T = Bytes(MAX_OWNER) },
-    .{ .name = "version", .T = Int(u32) },
     .{ .name = "lease_ms", .T = LeaseMs },
     .{ .name = "max_attempts", .T = schema.Range(u32, 1, 1000) },
 });

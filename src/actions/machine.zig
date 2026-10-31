@@ -134,6 +134,7 @@ pub const Deadlines = view_mod.Family(23, "action.deadline", Stored(Deadline));
 
 /// The longest key a family here holds, before its namespace prefix.
 const MAX_KEY = ae.MAX_ACTION_NAME + 1 + 8 + ae.MAX_RUN_ID;
+pub const MAX_KEY_LEN = MAX_KEY;
 
 const KeyBuf = [MAX_KEY]u8;
 
@@ -258,8 +259,10 @@ pub const NOT_READY = "conflict: the run isn't ready to deliver";
 pub const NAME_HAS_NUL = "bad request: an action's name holds no NUL";
 pub const NOT_ITS_LEASE = "bad request: an extend names its delivery's own lease and start";
 
-/// Answers: deliver, the run's delivery count (u32), which with the
-/// entry's (term, index) is the delivery id; expire, the leases it ended
+/// Answers: register, the action's version (u32, 1 then one more each
+/// register) and name; invoke, the run's id; deliver, the run's delivery
+/// count (u32), which with the entry's (term, index) is the delivery id;
+/// extend, the expiry it leaves (u64 ns); expire, the leases it ended
 /// (u32). The rest answer nothing.
 fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     var diag: schema.Diagnostic = .{};
@@ -270,8 +273,11 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (p.ns.len == 0) return error.Halt;
             if (std.mem.indexOfScalar(u8, p.name, 0) != null) return out.refuse(.bad_request, .malformed, NAME_HAS_NUL);
             const k = try nsKey(view, p.ns, p.name);
-            const created = if (try view.get(Defs, k)) |d| d.v.created_ns else stamp;
-            try view.put(Defs, k, .{ .v = .{ .owner = p.owner, .version = p.version, .lease_ms = p.lease_ms, .max_attempts = p.max_attempts, .created_ns = created } });
+            const old = try view.get(Defs, k);
+            const version: u32 = if (old) |d| d.v.version +| 1 else 1;
+            try view.put(Defs, k, .{ .v = .{ .owner = p.owner, .version = version, .lease_ms = p.lease_ms, .max_attempts = p.max_attempts, .created_ns = if (old) |d| d.v.created_ns else stamp } });
+            out.putInt(u32, version);
+            out.putBytes(p.name);
         },
         .action_delete => {
             const p = ae.Delete.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -311,6 +317,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             } });
             var b: KeyBuf = undefined;
             try view.put(Ready, try nsKey(view, p.ns, readyKey(&b, p.action, stamp, p.run)), .{});
+            out.putBytes(p.run);
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -385,13 +392,14 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (p.lease_ms != run.v.lease_ms or p.held_since_ns != run.v.delivered_ns) return out.refuse(.bad_request, .unclassified, NOT_ITS_LEASE);
             // More than half the lease left, or held to the ceiling: the
             // lease stands, and nothing is written.
-            if (run.v.expiry_ns -| stamp > (run.v.lease_ms *| std.time.ns_per_ms) / 2) return;
+            if (run.v.expiry_ns -| stamp > (run.v.lease_ms *| std.time.ns_per_ms) / 2) return out.putInt(u64, run.v.expiry_ns);
             const to = extendedTo(stamp, p.lease_ms, p.held_since_ns);
-            if (to <= run.v.expiry_ns) return;
+            if (to <= run.v.expiry_ns) return out.putInt(u64, run.v.expiry_ns);
             try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
             run.v.expiry_ns = to;
             try view.put(Runs, rk, run);
             try putDeadline(view, p.ns, p.run, run.v);
+            out.putInt(u64, to);
         },
         .action_expire => {
             const p = ae.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -492,10 +500,7 @@ fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
-    // DRAFT: register, delete and invoke join once the handler stops
-    // applying them; until then the shard's one-applier check gives them
-    // to the handler. `apply` already takes all eight.
-    .entry_types = &.{ .action_deliver, .action_settle, .action_release, .action_extend, .action_expire },
+    .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire },
     .families = &.{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(Ready), machine_mod.info(Deadlines) },
     .keys = keys,
     .apply = apply,
@@ -603,7 +608,7 @@ const LEASE_MS = ae.MIN_LEASE_MS;
 const LEASE = LEASE_MS * ms;
 
 fn registerIn(t: *TestActions, ns: []const u8, max_attempts: u32) !void {
-    const r = try t.apply(.action_register, ae.Register.Value{ .ns = ns, .name = "send", .owner = "", .version = 1, .lease_ms = LEASE_MS, .max_attempts = max_attempts }, 1);
+    const r = try t.apply(.action_register, ae.Register.Value{ .ns = ns, .name = "send", .owner = "", .lease_ms = LEASE_MS, .max_attempts = max_attempts }, 1);
     try testing.expect(r.refused() == null);
 }
 

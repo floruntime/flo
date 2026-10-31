@@ -179,10 +179,13 @@ pub const OpCode = enum(u16) {
     action_list = 0x303,
     action_list_runs = 0x304,
     action_delete = 0x305,
-    action_await = 0x306,
-    action_complete = 0x307,
-    action_fail = 0x308,
-    action_touch = 0x309,
+    // 0x306-0x309 were await, complete, fail and touch before deliveries
+    // were logged; retired.
+    action_await = 0x30A,
+    action_complete = 0x30B,
+    action_fail = 0x30C,
+    action_touch = 0x30D,
+    action_deliver = 0x30E,
 
     // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
     worker_register = 0x320,

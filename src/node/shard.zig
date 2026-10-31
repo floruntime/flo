@@ -812,7 +812,6 @@ pub const Shard = struct {
         replay_registry.register(.raft_config, @ptrCast(raft_node), applyRaftConfig);
         workflow_handler.registerReplay(&replay_registry);
         namespace_handler.registerReplay(&replay_registry);
-        actions_handler.registerReplay(&replay_registry);
         processing_handler.registerReplay(&replay_registry);
         stream_handler.registerReplay(&replay_registry);
         try checkAppliers(shard_id, &replay_registry);
@@ -1732,15 +1731,11 @@ pub const Shard = struct {
 
     /// How long a read may wait on purpose for its data, or null for any
     /// other request. Such a read holds a slot of its own class, and is not
-    /// a slow answer while it waits. A worker's await waits 30 s unless
-    /// told otherwise (`ActionsHandler`).
+    /// a slow answer while it waits.
     fn blockingWait(req: proto.Request) ?u64 {
         if (table.isOp(req.header.op_code)) return table_run.waitMs(req);
         if (req.getBlockMs()) |ms| return ms;
-        if (req.header.op_code != @backingInt(proto.OpCode.action_await)) return null;
-        const opt = req.findOption(.block_ms) orelse return 30_000;
-        const ms = opt.asU32() orelse 30_000;
-        return if (ms == 0) null else ms;
+        return null;
     }
 
     /// Why `conn`'s request cannot go to `to.target` now, or null when it
@@ -1980,7 +1975,7 @@ pub const Shard = struct {
     /// The request as wire bytes on the heap, for a copy that outlives the
     /// connection's buffer: a forward to another shard or to the leader, or a
     /// write held until commit. Length and CRC are recomputed.
-    fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
+    pub fn serializeRequest(allocator: std.mem.Allocator, req: proto.Request) ![]u8 {
         // Sized from the parts, not header.payload_length: a client may omit
         // the options trailer, which serialize always writes.
         const size = req.wireSize();
@@ -2386,7 +2381,7 @@ pub const Shard = struct {
     pub fn drainInbox(self: *Shard) usize {
         const flags = self.mailbox.wake.take();
         if (flags & mailbox_mod.Flag.stream_appended.bit() != 0) self.workflow_handler.triggers_dirty = true;
-        if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) self.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(self));
+        if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) ActionsHandler.wakeLocal(self);
 
         var buf: [64]InboxMessage = undefined;
         while (true) {
@@ -2422,6 +2417,7 @@ pub const Shard = struct {
         switch (msg.tag) {
             .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
+            .action_finished, .action_result_ask => self.actionMessage(msg),
             .kv_sink_put => self.runKvSinkPut(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -2464,6 +2460,20 @@ pub const Shard = struct {
             return self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
         if (KVHandler.sinkPropose(self, put.namespace, put.qkey, put.value, put.ttl_ms)) |why| {
             self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.qkey, why);
+        }
+    }
+
+    /// How a run a workflow here waits on ended, or a workflow's shard
+    /// asking how one here ended; the bytes are ours to free.
+    fn actionMessage(self: *Shard, msg: InboxMessage) void {
+        const ptr = msg.payload_ptr orelse return;
+        const data: [*]u8 = @ptrCast(ptr);
+        defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
+        const bytes = data[0..msg.payload_len];
+        switch (msg.tag) {
+            .action_finished => self.actions_handler.finishedFromInbox(bytes),
+            .action_result_ask => self.actions_handler.resultAskFromInbox(self, msg.src_shard, bytes),
+            else => unreachable,
         }
     }
 
@@ -2998,7 +3008,7 @@ pub const Shard = struct {
     }
 
     /// A held request, run here as the client's own.
-    fn runHeld(self: *Shard, bytes: []const u8, reply_to: ReplyTo, request_id: u64) void {
+    pub fn runHeld(self: *Shard, bytes: []const u8, reply_to: ReplyTo, request_id: u64) void {
         const req = proto.Request.parse(bytes) catch {
             self.deliverDeferredRefusal(reply_to, request_id, .internal_error, proto.notRun("internal error: the held request did not parse and was not run — retry"));
             return;
@@ -3985,7 +3995,7 @@ pub const Shard = struct {
         self.more_work = false;
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates(self);
-        self.actions_handler.forgetExpiries();
+        self.actions_handler.stoppedLeading(self);
         self.resolvePending(message);
         // Blocking reads that hand out work belong to the leader: a parked
         // dequeue woken here would take a message from this node's copy
@@ -4297,6 +4307,10 @@ pub const Shard = struct {
             self.recordApplied(entry, result);
         }
         self.wakeApplied(entry);
+        // The leader's own action steps: the await a deliver answers,
+        // workers woken for a run ready again (once a pass: each wake is a
+        // message to every other shard), a workflow told its run ended.
+        self.actions_handler.afterApply(self, entry, result);
         if (comptime build_options.test_faults) {
             const leads = self.raft_node.role == .leader and entry.header.term == self.raft_node.current_term;
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
@@ -4389,21 +4403,6 @@ pub const Shard = struct {
                 if (cmd.key.len == 0) return;
                 self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
                 self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
-            },
-            // A run exists from here. Only a leader wakes waiting workers: a
-            // claim is not in the log, so a worker woken here on a follower
-            // would take a run the leader's workers also take. Woken once
-            // per pass: an ack can apply many invokes, and each wake-up is a
-            // message to every other shard.
-            .action_invoke => if (self.raft_node.role == .leader) {
-                self.wake_workers = true;
-            },
-            // A failed attempt put back to pending is a run to take again,
-            // as an invoke is; left unannounced it waits out a parked
-            // worker's block time.
-            .action_update_run => if (self.raft_node.role == .leader) {
-                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-                if (cmd.value.len > 0 and cmd.value[0] == @backingInt(result_mod.CommandResult.ActionRunStatus.pending)) self.wake_workers = true;
             },
             .queue_enqueue => {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
@@ -4671,7 +4670,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .kv_sink_put => {
+                .action_start, .kv_sink_put, .action_finished, .action_result_ask => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -4782,10 +4781,11 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
-        // Action runs past their timeout, on the leader, which holds claims.
+        // Action leases past their deadline, on the leader. The key bound
+        // needs it at least every half the shortest lease.
         self.task_scheduler.register(
             "action_timeout_sweep",
-            1_000,
+            @import("../actions/handler.zig").DUTY_INTERVAL_MS,
             actionTimeoutSweepTask,
             @ptrCast(self),
         ) catch {};
@@ -4917,12 +4917,11 @@ pub const Shard = struct {
         return trims_proposed;
     }
 
-    /// TaskScheduler callback: on the leader, time out action runs held past
-    /// their lease. Returns how many timeouts it proposed.
+    /// TaskScheduler callback: on the leader, end action leases past their
+    /// deadline. Returns how many deadline keys it named.
     fn actionTimeoutSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
-        if (self.raft_node.role != .leader) return 0;
-        return self.actions_handler.expireRuns(self, @import("stdx").time.milliTimestamp());
+        return self.actions_handler.expireDue(self);
     }
 
     /// TaskScheduler callback: sweep every consumer group's PEL.
@@ -6078,9 +6077,11 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &buf);
         },
         // stream_read / action_await / stream_group_read → empty OK response
-        .stream_read, .action_await, .stream_group_read => {
+        .stream_read, .stream_group_read => {
             shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
         },
+        // No task in time: `{task: none}`, the optional's absent byte.
+        .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
     }
 }
 

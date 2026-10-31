@@ -10,6 +10,7 @@ const Int = schema.Int;
 const Bytes = schema.Bytes;
 const Optional = schema.Optional;
 const Record = schema.Record;
+const Defaulted = schema.Defaulted;
 
 /// Where a run is: the values `action.status` answers with.
 pub const RunStatus = enum(u8) {
@@ -35,6 +36,51 @@ pub const MAX_ERROR: u32 = 65_535;
 /// The longest worker id: a worker's id is its request's key.
 pub const MAX_WORKER_ID: u32 = ops.MAX_KEY;
 
+/// The longest action name.
+pub const MAX_ACTION_NAME: u32 = 256;
+pub const ActionName = Bytes(MAX_ACTION_NAME);
+pub const WorkerId = Bytes(MAX_WORKER_ID);
+/// The most actions one await names.
+pub const MAX_AWAIT_ACTIONS: u32 = 64;
+/// The longest a worker's await waits for a task.
+pub const MAX_AWAIT_MS: u64 = 300_000;
+/// A named outcome a workflow step follows: "success" when none is named.
+pub const MAX_OUTCOME: u32 = 256;
+/// The longest input a task carries: an invoke is one log entry.
+pub const MAX_INPUT: u32 = 64 * 1024;
+/// A retried await's key: the same key gets the same task while its lease
+/// runs.
+pub const MAX_REQUEST_KEY: u32 = 64;
+/// The longest a failed run waits before it's ready again.
+pub const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// A task: a delivery of a run to one worker. `run`, `deliveries`, `term`
+/// and `index` name the delivery, and a complete, fail or touch names it
+/// back; a report naming any other delivery of the run is refused stale.
+pub const Task = Record(&.{
+    .{ .name = "run", .T = Bytes(ops.MAX_KEY), .doc = "The run's id" },
+    .{ .name = "deliveries", .T = Int(u32), .doc = "The run's deliveries, this one included" },
+    .{ .name = "term", .T = Int(u64), .doc = "The term the delivery was made in" },
+    .{ .name = "index", .T = Int(u64), .doc = "The log index the delivery was made at" },
+    .{ .name = "action", .T = ActionName, .doc = "The action the run invokes" },
+    .{ .name = "created_at_ms", .T = Int(i64), .doc = "When the run was invoked, in Unix milliseconds" },
+    .{ .name = "attempt", .T = Int(u32), .doc = "The run's failures so far, plus one" },
+    .{ .name = "lease_ms", .T = Int(u64), .doc = "How long the worker holds it without a touch" },
+    .{ .name = "caller_run", .T = Optional(Bytes(ops.MAX_KEY)), .doc = "The workflow run that invoked it, if one did" },
+    .{ .name = "caller_workflow", .T = Optional(Bytes(ops.MAX_KEY)), .doc = "That run's workflow" },
+    .{ .name = "input", .T = Bytes(MAX_INPUT), .doc = "The run's input, as invoked" },
+});
+
+/// A delivery a worker reports on: the task's own fields, and the action,
+/// which the report must name to reach the run at all.
+const delivery_fields = [_]schema.Field{
+    .{ .name = "action", .T = ActionName, .doc = "The task's action" },
+    .{ .name = "worker", .T = WorkerId, .doc = "The worker reporting, for its counts" },
+    .{ .name = "deliveries", .T = Int(u32), .doc = "The task's deliveries" },
+    .{ .name = "term", .T = Int(u64), .doc = "The task's term" },
+    .{ .name = "index", .T = Int(u64), .doc = "The task's index" },
+};
+
 pub const table = [_]ops.Op{
     .{
         .name = "action.status",
@@ -53,14 +99,89 @@ pub const table = [_]ops.Op{
             .{ .name = "output", .T = Optional(Bytes(MAX_OUTPUT)), .doc = "What a completed run returned" },
             // Why its last attempt failed.
             .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
-            // Set when a worker takes the run. The take isn't logged, so only
-            // the leader knows it at once; followers, a restarted node and a
-            // new leader learn it at the run's next update, and until then
-            // show none, or the worker before a reclaim.
-            .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it; only the leader knows a take at once, other nodes learn it at the run's next update" },
+            .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it" },
         }),
         .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
         .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",
+    },
+    .{
+        .name = "action.await",
+        .code = 0x30A,
+        .class = .write,
+        .takes_items = true,
+        .wait = .{ .field = "block_ms", .default_ms = 30_000, .max_ms = MAX_AWAIT_MS },
+        // On the worker's shard, where its registration is: its labels,
+        // whether it drains, and the actions it runs.
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "actions", .T = schema.BoundedList(ActionName, MAX_AWAIT_ACTIONS, MAX_AWAIT_ACTIONS * ActionName.max_size), .doc = "The actions to take a task of, the first tried first" },
+            .{ .name = "block_ms", .T = Defaulted(schema.DurationMs(MAX_AWAIT_MS), 30_000), .doc = "How long to wait for a task; 0 answers at once" },
+            .{ .name = "request_key", .T = Optional(Bytes(MAX_REQUEST_KEY)), .doc = "Retrying with the same key gets the task the first try got" },
+        }),
+        .response = Record(&.{
+            .{ .name = "task", .T = Optional(Task), .doc = "The task, or none if no run was ready in time" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "worker_id", .doc = "The worker's id" } },
+        .doc = "Wait for a task of one of the worker's actions, and take it.",
+    },
+    .{
+        .name = "action.complete",
+        .code = 0x30B,
+        .class = .write,
+        .route = .run_id,
+        .request = Record(&(delivery_fields ++ [_]schema.Field{
+            .{ .name = "outcome", .T = Defaulted(Bytes(MAX_OUTCOME), ""), .doc = "The outcome a workflow step follows; none is \"success\"" },
+            .{ .name = "result", .T = Defaulted(Bytes(MAX_OUTPUT), ""), .doc = "What the run returns" },
+        })),
+        .response = Record(&.{}),
+        .cli = .{ .expose = .hand, .key = .{ .name = "task_id", .doc = "The task's id, as await printed it" } },
+        .doc = "Complete a task: its run is done, with this result.",
+    },
+    .{
+        .name = "action.fail",
+        .code = 0x30C,
+        .class = .write,
+        .route = .run_id,
+        .request = Record(&(delivery_fields ++ [_]schema.Field{
+            .{ .name = "retry", .T = Defaulted(schema.Bool, true), .doc = "Run it again while attempts are left; false fails the run now" },
+            .{ .name = "abandoned", .T = Defaulted(schema.Bool, false), .doc = "Hand it back untried: counts no failure" },
+            .{ .name = "delay_ms", .T = Defaulted(schema.DurationMs(MAX_DELAY_MS), 0), .doc = "How long before it is ready again" },
+            .{ .name = "error", .T = Defaulted(Bytes(MAX_ERROR), ""), .doc = "Why it failed" },
+        })),
+        .response = Record(&.{}),
+        .cli = .{ .expose = .hand, .key = .{ .name = "task_id", .doc = "The task's id, as await printed it" } },
+        .doc = "Fail a task: its run is ready again, unless its attempts are spent or retry is false.",
+    },
+    .{
+        .name = "action.touch",
+        .code = 0x30D,
+        .class = .write,
+        .route = .run_id,
+        .request = Record(&delivery_fields),
+        .response = Record(&.{
+            .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without another touch, in Unix milliseconds" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "task_id", .doc = "The task's id, as await printed it" } },
+        .doc = "Keep a task: its lease runs a full lease from now, up to 12 h from its delivery.",
+    },
+    .{
+        .name = "action.deliver",
+        .code = 0x30E,
+        .class = .write,
+        .origin = .internal,
+        .takes_items = true,
+        // On the action's shard, as an invoke is.
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "holder", .T = WorkerId, .doc = "The worker that takes it" },
+            .{ .name = "labels", .T = Optional(Bytes(std.math.maxInt(u16))), .doc = "The worker's labels, for runs that require some" },
+            .{ .name = "request_key", .T = Optional(Bytes(MAX_REQUEST_KEY)), .doc = "The await's request key" },
+        }),
+        .response = Record(&.{
+            .{ .name = "task", .T = Optional(Task), .doc = "The task, or none if no run is ready" },
+        }),
+        .cli = .{ .expose = .none, .key = .{ .name = "action" } },
+        .doc = "A worker's shard asking an action's shard for a task of it.",
     },
 };
 

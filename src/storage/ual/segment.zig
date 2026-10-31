@@ -26,7 +26,7 @@ pub const FOOTER_MAGIC: [8]u8 = .{ 'F', 'L', 'O', '_', 'E', 'N', 'D', 0 };
 /// a data directory written before it is refused at open, not misread.
 /// node/data_format.zig pins the entry layouts this version stores, and the
 /// data directory format that goes with it.
-pub const SEGMENT_VERSION: u16 = 4;
+pub const SEGMENT_VERSION: u16 = 5;
 pub const HEADER_SIZE: usize = 64;
 pub const FOOTER_SIZE: usize = 32;
 pub const SPARSE_INDEX_INTERVAL: u32 = 256;
