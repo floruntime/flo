@@ -345,11 +345,6 @@ pub const Runtime = struct {
     /// The node's namespace table: shard 0 publishes it, every shard reads it.
     namespaces: ?*ns_table.Table = null,
 
-    /// Walk context arrays — allocated during wireWalkContexts, freed on deinit.
-    /// Each entry is a per-shard array of projection pointers for one walk opcode.
-    /// Slots: [0] = ts_list. More slots added as modules gain list support.
-    walk_ctx_slices: [8]?[]*anyopaque,
-
     /// Cross-shard stream handler array — allocated during wirePeerStreamHandlers, freed on deinit.
     peer_stream_handlers_slice: ?[]const *StreamHandler,
 
@@ -431,7 +426,6 @@ pub const Runtime = struct {
             .metrics_registry = null,
             .metrics_server = null,
             .health = null,
-            .walk_ctx_slices = .{ null, null, null, null, null, null, null, null },
             .data_dir_lock = null,
             .peer_stream_handlers_slice = null,
             .peer_kv_handlers_slice = null,
@@ -501,14 +495,6 @@ pub const Runtime = struct {
                 if (pipe[1] >= 0) _ = std.c.close(pipe[1]);
             }
             self.allocator.free(pipes);
-        }
-
-        // Clean up walk context arrays (before shards — dispatchers reference these)
-        for (&self.walk_ctx_slices) |*slot| {
-            if (slot.*) |s| {
-                self.allocator.free(s);
-                slot.* = null;
-            }
         }
 
         // Clean up peer stream handler array
@@ -797,10 +783,10 @@ pub const Runtime = struct {
         self.shards = shards;
         const shards_created = shards.len;
 
-        try self.wireWalkContexts(shards);
+        wireWalkContexts(shards);
         for (shards) |*s| {
             if (s.dispatcher.unwiredWalk()) |op| {
-                log.err("op 0x{x} lists across shards, but no shard's walk contexts are wired for it", .{op});
+                log.err("op 0x{x} lists across shards, but its shards have no walk context for it", .{op});
                 return error.UnwiredWalk;
             }
         }
@@ -1169,84 +1155,19 @@ pub const Runtime = struct {
         }
     }
 
-    /// Wire cross-shard walk contexts for all walk-registered opcodes.
-    ///
-    /// For each walk opcode (e.g., ts_list, stream_list, queue_list), builds
-    /// a per-shard array of projection pointers and sets it on every shard's
-    /// dispatcher. This enables `Shard.executeWalk()` to iterate all shards'
-    /// projections for list/scan operations.
-    fn wireWalkContexts(self: *Runtime, shards: []Shard) !void {
-        const n = self.shard_count;
-
-        // ts_list → each shard's TSProjection
-        const ts_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            ts_ctxs[i] = @ptrCast(&shards[i].defaultPartition().ts);
+    /// Give each shard's dispatcher its own scan context for each walk op.
+    /// A walk asks the other shards for their pages, so no shard holds
+    /// another's.
+    fn wireWalkContexts(shards: []Shard) void {
+        for (shards) |*s| {
+            s.dispatcher.setWalkContext(.ts_list, @ptrCast(&s.defaultPartition().ts));
+            s.dispatcher.setWalkContext(.kv_scan, @ptrCast(&s.defaultPartition().kv));
+            s.dispatcher.setWalkContext(.stream_list, @ptrCast(&s.defaultPartition().stream));
+            s.dispatcher.setWalkContext(.action_list, @ptrCast(s.actions_handler));
+            s.dispatcher.setWalkContext(.queue_list, @ptrCast(s.queue_handler));
+            s.dispatcher.setWalkContext(.processing_list, @ptrCast(s.processing_handler));
+            s.dispatcher.setWalkContext(.workflow_list_definitions, @ptrCast(s.workflow_handler));
         }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.ts_list, ts_ctxs);
-        }
-        self.walk_ctx_slices[0] = ts_ctxs;
-
-        // kv_scan (full scan) → each shard's KV state
-        const kv_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            kv_ctxs[i] = @ptrCast(&shards[i].defaultPartition().kv);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.kv_scan, kv_ctxs);
-        }
-        self.walk_ctx_slices[1] = kv_ctxs;
-
-        // stream_list → each shard's StreamProjection
-        const stream_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            stream_ctxs[i] = @ptrCast(&shards[i].defaultPartition().stream);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.stream_list, stream_ctxs);
-        }
-        self.walk_ctx_slices[2] = stream_ctxs;
-
-        // action_list → each shard's ActionsHandler
-        const action_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            action_ctxs[i] = @ptrCast(shards[i].actions_handler);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.action_list, action_ctxs);
-        }
-        self.walk_ctx_slices[4] = action_ctxs;
-
-        // queue_list → each shard's QueueHandler
-        const queue_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            queue_ctxs[i] = @ptrCast(shards[i].queue_handler);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.queue_list, queue_ctxs);
-        }
-        self.walk_ctx_slices[5] = queue_ctxs;
-
-        // processing_list → each shard's ProcessingHandler
-        const proc_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            proc_ctxs[i] = @ptrCast(shards[i].processing_handler);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.processing_list, proc_ctxs);
-        }
-        self.walk_ctx_slices[6] = proc_ctxs;
-
-        // workflow_list_definitions → each shard's WorkflowHandler
-        const wf_ctxs = try self.allocator.alloc(*anyopaque, n);
-        for (0..n) |i| {
-            wf_ctxs[i] = @ptrCast(shards[i].workflow_handler);
-        }
-        for (0..n) |i| {
-            shards[i].dispatcher.setWalkContexts(proto.OpCode.workflow_list_definitions, wf_ctxs);
-        }
-        self.walk_ctx_slices[7] = wf_ctxs;
     }
 
     /// The client port this runtime bound: the configured one, or the one

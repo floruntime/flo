@@ -10,6 +10,8 @@ const client_mod = @import("../../../cli/client/mod.zig");
 const reply_pool = @import("../../reply_pool.zig");
 const serve = @import("../../../util/http/serve.zig");
 const stdx = @import("stdx");
+const log = stdx.log;
+const output = @import("../../../cli/output.zig");
 
 /// The longest one loopback read waits for its answer: the node's own read
 /// deadline, and a second to spare.
@@ -45,12 +47,36 @@ pub const Reader = struct {
     }
 
     pub fn call(self: *Reader, comptime op: @import("../../../protocol/ops.zig").Op, namespace: []const u8, key: []const u8, body: op.request.Value) !client_mod.Response {
+        return (try self.next()).call(op, namespace, key, body);
+    }
+
+    /// The client, for one read through the CLI's own op clients
+    /// (`client_mod.stream.list` and the rest), its wait set to what is
+    /// left of the request's time.
+    pub fn next(self: *Reader) !*client_mod.Client {
         const left = self.deadline_ms - nowMs();
         if (left <= 0) return error.OutOfTime;
         // Per read(), and an answer may take several: a slow one can run
         // past what is left. On loopback that is a small overrun at most.
         self.client.setReadTimeoutMs(@intCast(@min(left, LOOPBACK_READ_TIMEOUT_MS)));
-        return self.client.call(op, namespace, key, body);
+        return &self.client;
+    }
+
+    /// Every page of a list op, followed by its cursor, as one
+    /// `[count:u32]entries` for `columns` to decode. `ask(client, cursor)`
+    /// sends one page's request. The owner shards write the entries; a
+    /// refused page is `error.Refused`.
+    pub fn listAll(self: *Reader, allocator: Allocator, columns: []const output.WireColumn, asker: anytype) !output.WirePages {
+        var pages = output.WirePages.init(allocator, columns);
+        errdefer pages.deinit();
+        while (pages.more) {
+            var got = try asker.ask(try self.next(), pages.cursor);
+            defer got.deinit();
+            if (got.isError()) return error.Refused;
+            // An empty list answers with a count of 0, never no body.
+            try pages.take(got.data, std.math.maxInt(u32));
+        }
+        return pages;
     }
 
     fn nowMs() i64 {
@@ -59,12 +85,18 @@ pub const Reader = struct {
 };
 
 /// The answer to a read that didn't come back; the console keeps what it
-/// last showed, marked stale.
+/// last showed, marked stale. A request whose time ran out is
+/// `error.NodeDidNotAnswer`, which the server answers 503: never a hang,
+/// and never a partial page passed off as whole.
 pub fn readFailed(allocator: Allocator, what: []const u8, err: anyerror) ![]const u8 {
-    const msg = switch (err) {
-        error.OutOfTime, error.ConnectionTimedOut => try std.fmt.allocPrint(allocator, "{s}: the node didn't answer in time", .{what}),
-        else => try std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ what, @errorName(err) }),
-    };
+    switch (err) {
+        error.OutOfTime, error.ConnectionTimedOut => {
+            log.warn("dashboard: {s}: the node didn't answer in time", .{what});
+            return error.NodeDidNotAnswer;
+        },
+        else => {},
+    }
+    const msg = try std.fmt.allocPrint(allocator, "{s} failed: {s}", .{ what, @errorName(err) });
     defer allocator.free(msg);
     return h.jsonError(allocator, msg);
 }
@@ -94,9 +126,10 @@ test "Reader: a request whose time is spent reads nothing, and says it timed out
     var late: Reader = .{ .client = client_mod.Client.init(allocator, "127.0.0.1:1"), .deadline_ms = Reader.nowMs() - 1 };
     defer late.deinit();
     try std.testing.expectError(error.OutOfTime, late.call(@import("../../../protocol/kv_ops.zig").op("kv.get"), "default", "k", .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }));
-    const answer = try readFailed(allocator, "KV scan", error.OutOfTime);
+    try std.testing.expectError(error.NodeDidNotAnswer, readFailed(allocator, "KV scan", error.OutOfTime));
+    const answer = try readFailed(allocator, "KV scan", error.ConnectionRefused);
     defer allocator.free(answer);
-    try std.testing.expectEqualStrings("{\"error\":\"KV scan: the node didn't answer in time\"}", answer);
+    try std.testing.expectEqualStrings("{\"error\":\"KV scan failed: ConnectionRefused\"}", answer);
 }
 
 test "Reader: the reads' deadline is the response's, less room to write" {

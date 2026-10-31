@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react'
-import { cfmt, jhl } from '@/lib/format'
+import { useMemo, useState, type ReactNode } from 'react'
+import { DASH, cfmt, jhl, orDash } from '@/lib/format'
 import { cx } from '@/lib/cx'
-import { useQueueDetail, useQueueMessages, useRequeueDLQ } from '@/lib/api/queues'
+import { useQueueDetail, useQueueDLQ, useQueueMessages, useRequeueDLQ } from '@/lib/api/queues'
 import { Crumb, Stats, Stat } from '@/components/layout'
 import { Button } from '@/components/buttons/Button'
 import { OpPill, Tag } from '@/components/feedback'
@@ -15,6 +15,14 @@ function prioMeta(p: number): [string, string] {
 function PrioTag({ p }: { p: number }) {
   return <OpPill color={prioMeta(p)[0]}>P{p}</OpPill>
 }
+/** Why a list can't be shown: the server's own words when it said "not available yet". */
+function unavailable(err: unknown, what: string): string {
+  const m = (err as Error | null)?.message
+  return m ? m.charAt(0).toUpperCase() + m.slice(1) : `${what} couldn’t be loaded`
+}
+function Note({ children }: { children: ReactNode }) {
+  return <div className="card card-p" style={{ color: 'var(--tx-3)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>{children}</div>
+}
 function ago(ms: number): string {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000))
   return s < 60 ? s + 's ago' : s < 3600 ? Math.floor(s / 60) + 'm ago' : s < 86400 ? Math.floor(s / 3600) + 'h ago' : Math.floor(s / 86400) + 'd ago'
@@ -23,6 +31,7 @@ function ago(ms: number): string {
 export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; onBack: () => void }) {
   const detailQ = useQueueDetail(ns, name)
   const msgsQ = useQueueMessages(ns, name)
+  const dlqQ = useQueueDLQ(ns, name)
   const requeue = useRequeueDLQ(ns)
   const [tab, setTab] = useState<Tab>('ready')
   const [sel, setSel] = useState<QueueMessage | null>(null)
@@ -31,8 +40,17 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
   const msgs = msgsQ.data?.messages ?? []
   const ready = useMemo(() => msgs.filter((m) => m.state === 'ready').sort((a, b) => a.priority - b.priority || a.seq - b.seq), [msgs])
   const inflight = useMemo(() => msgs.filter((m) => m.state === 'leased').sort((a, b) => a.lease_remaining_ms - b.lease_remaining_ms), [msgs])
-  const dlq = useMemo(() => msgs.filter((m) => m.state === 'dlq'), [msgs])
-  const empty = msgs.length === 0
+  // Neither queue messages nor DLQ entries are listed by any op yet: the
+  // messages endpoint answers an error and the DLQ one null entries with a
+  // real count. Say so rather than show an empty queue.
+  const msgsErr = msgsQ.isError
+  const dlqEntries = useMemo(
+    () => dlqQ.data?.entries ?? (msgsQ.isSuccess ? msgs.filter((m) => m.state === 'dlq') : null),
+    [dlqQ.data, msgsQ.isSuccess, msgs],
+  )
+  const dlq = dlqEntries ?? []
+  const dlqCount = dlqQ.data?.count ?? d?.dlq_count ?? null
+  const empty = msgsQ.isSuccess && msgs.length === 0 && !dlqCount
   const sw = sel ? '1.35fr 1fr' : '1fr'
 
   const payloadObj = (() => {
@@ -60,15 +78,25 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
       </div>
 
       <Stats>
-        <Stat label="Ready" value={cfmt(d?.ready ?? 0)} sub="available to deliver" />
-        <Stat label="In-flight" value={d?.inflight ?? 0} valueColor={d?.inflight ? 'var(--info)' : undefined} sub="leased" />
+        <Stat label="Ready" value={d ? orDash(d.ready, cfmt) : '…'} sub={d && d.ready == null ? 'not available yet' : 'available to deliver'} />
+        <Stat label="In-flight" value={d ? orDash(d.inflight) : '…'} valueColor={d?.inflight ? 'var(--info)' : undefined} sub={d && d.inflight == null ? 'not available yet' : 'leased'} />
         <Stat label="Dead letters" value={d?.dlq_count ?? 0} valueColor={d?.dlq_count ? 'var(--crit)' : undefined} sub={d?.dlq_count ? 'needs triage' : 'none'} />
         <Stat label="Throughput" value={<span style={{ fontSize: 20 }}>{cfmt(d?.enqueued ?? 0)}<span className="u">/ {cfmt(d?.dequeued ?? 0)}</span></span>} sub="enqueued / dequeued" />
       </Stats>
 
-      {empty ? (
+      {requeue.isError && (
+        <div className="mono" style={{ fontSize: 12, color: 'var(--crit)', marginBottom: 12 }}>
+          Requeue failed: {String((requeue.error as Error)?.message ?? 'unknown error')}
+        </div>
+      )}
+
+      {msgsQ.isLoading ? (
         <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', fontSize: 13.5, padding: '40px 0' }}>
-          {msgsQ.isLoading ? 'Loading…' : 'Queue is empty — blocking dequeues are parked on the waiter pool.'}
+          Loading…
+        </div>
+      ) : empty ? (
+        <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', fontSize: 13.5, padding: '40px 0' }}>
+          Queue is empty — blocking dequeues are parked on the waiter pool.
         </div>
       ) : (
         <div className="sec" style={{ display: 'grid', gridTemplateColumns: sw, gap: 20, alignItems: 'start' }}>
@@ -76,9 +104,9 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
             <div className="wtabs">
               {(
                 [
-                  ['ready', 'Ready · ' + cfmt(ready.length)],
-                  ['inflight', 'In-flight · ' + inflight.length],
-                  ['dlq', 'DLQ · ' + dlq.length],
+                  ['ready', 'Ready · ' + (msgsErr ? orDash(d?.ready, cfmt) : cfmt(ready.length))],
+                  ['inflight', 'In-flight · ' + (msgsErr ? orDash(d?.inflight) : inflight.length)],
+                  ['dlq', 'DLQ · ' + (dlqCount ?? (dlqEntries ? dlq.length : DASH))],
                 ] as [Tab, string][]
               ).map(([id, l]) => (
                 <button key={id} className={cx('wtab', tab === id && 'on')} onClick={() => { setTab(id); setSel(null) }}>
@@ -87,7 +115,15 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
               ))}
             </div>
 
-            {tab === 'ready' && (
+            {tab !== 'dlq' && msgsErr && (
+              <Note>
+                {unavailable(msgsQ.error, 'Messages')}
+                {tab === 'ready' && d?.ready != null ? ` · ${cfmt(d.ready)} ready` : ''}
+                {tab === 'inflight' && d?.inflight != null ? ` · ${d.inflight} in flight` : ''}
+              </Note>
+            )}
+
+            {tab === 'ready' && !msgsErr && (
               <div className="list">
                 <div className="li head" style={{ gridTemplateColumns: '96px 64px 1fr 96px' }}>
                   <div className="c">Seq</div>
@@ -106,7 +142,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
               </div>
             )}
 
-            {tab === 'inflight' && (
+            {tab === 'inflight' && !msgsErr && (
               inflight.length === 0 ? (
                 <div className="card card-p" style={{ color: 'var(--tx-3)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>No leased messages.</div>
               ) : (
@@ -130,8 +166,14 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
             )}
 
             {tab === 'dlq' && (
-              dlq.length === 0 ? (
-                <div className="card card-p" style={{ color: 'var(--tx-3)', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>No dead-lettered messages.</div>
+              dlqCount === 0 ? (
+                <Note>No dead-lettered messages.</Note>
+              ) : dlqEntries == null || (dlq.length === 0 && dlqCount) ? (
+                <Note>
+                  {dlqCount ? `${cfmt(dlqCount)} dead-lettered · entries not available yet` : dlqQ.isError ? unavailable(dlqQ.error, 'Dead letters') : 'Dead-letter entries not available yet'}
+                </Note>
+              ) : dlq.length === 0 ? (
+                <Note>No dead-lettered messages.</Note>
               ) : (
                 <div className="list">
                   <div className="li head" style={{ gridTemplateColumns: '96px 70px 1fr 96px' }}>

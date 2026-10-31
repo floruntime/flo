@@ -84,7 +84,7 @@ pub fn handleRequest(
     // ── queues ──────────────────────────────────────────────
     if (std.mem.eql(u8, path, "queues")) {
         try only(method, &.{.GET});
-        return queues.getQueues(allocator, ctx);
+        return queues.getQueues(allocator, query_string, ctx);
     }
     if (std.mem.startsWith(u8, path, "queues/")) {
         return routeQueue(allocator, method, path["queues/".len..], query_string, body, ctx);
@@ -367,6 +367,24 @@ fn routeAction(allocator: Allocator, method: Method, rest: []const u8, query_str
 // Tests
 // =============================================================================
 
+/// The path reaches the handler that reads `what`: with nothing listening
+/// on the node's port, that read fails and says so, or a handler that
+/// reads nothing answers `what` itself.
+fn expectRoutedTo(path: []const u8, what: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var metrics = helpers.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1;
+
+    const result = try handleRequest(allocator, .GET, path, null, "", &ctx);
+    defer allocator.free(result);
+    const want = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}", .{what});
+    defer allocator.free(want);
+    if (!std.mem.startsWith(u8, result, want)) std.debug.print("{s} answered: {s}\n", .{ path, result });
+    try std.testing.expect(std.mem.startsWith(u8, result, want));
+}
+
 test "route namespaces list" {
     const allocator = std.testing.allocator;
     var metrics = helpers.MetricsRegistry.init(allocator);
@@ -380,25 +398,11 @@ test "route namespaces list" {
 }
 
 test "route streams list" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "streams", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("streams", "stream list");
 }
 
 test "route queues list" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "queues", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("queues", "queue list");
 }
 
 test "route kv namespaces" {
@@ -446,36 +450,15 @@ test "route not found" {
 }
 
 test "route workflow definitions" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "workflow/definitions", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("workflow/definitions", "workflow definitions");
 }
 
 test "route processing jobs" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "processing/jobs", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("processing/jobs", "processing job list");
 }
 
 test "route actions list" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "actions", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("actions", "action list");
 }
 
 test "route workers" {
@@ -505,25 +488,11 @@ test "route worker detail: the id is decoded, and one holding a NUL names no wor
 }
 
 test "route stream detail" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "streams/my-stream", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"my-stream\"") != null);
+    try expectRoutedTo("streams/my-stream", "stream info");
 }
 
 test "route stream group detail" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "streams/events/groups/my-group", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"group\":\"my-group\"") != null);
+    try expectRoutedTo("streams/events/groups/my-group", "group info");
 }
 
 test "route kv key get" {
@@ -538,36 +507,15 @@ test "route kv key get" {
 }
 
 test "route workflows alias maps to workflow definitions" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "workflows", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try expectRoutedTo("workflows", "workflow definitions");
 }
 
 test "route queue messages" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "queues/myq/messages", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"messages\":[]") != null);
+    try expectRoutedTo("queues/myq/messages", "queue messages are not available yet");
 }
 
 test "route queue dlq" {
-    const allocator = std.testing.allocator;
-    var metrics = helpers.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try handleRequest(allocator, .GET, "queues/myq/dlq", null, "", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"entries\":[]") != null);
+    try expectRoutedTo("queues/myq/dlq", "queue dlq");
 }
 
 test "route queue purge" {
