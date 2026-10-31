@@ -570,6 +570,8 @@ fn listRuns(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
     var got = ask(&reader, client_mod.workflow.listRuns, .{ ns, workflow, limit, status_filter, cursor, search }) catch |err|
         return try loopback.readFailed(allocator, "workflow runs", err);
     defer got.deinit();
+    // A namespace never created holds no runs, as an empty one doesn't.
+    if (got.isNotFound()) return try allocator.dupe(u8, "{\"runs\":[],\"has_more\":false,\"next_cursor\":null}");
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
