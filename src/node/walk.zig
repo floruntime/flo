@@ -27,7 +27,10 @@ pub const Response = PageOp.response;
 const Entries = system_ops.Entries;
 
 /// Shards one page asks: enough that a sparse list fills a page, few
-/// enough that a page's parts together hold no more than one answer.
+/// enough to bound what the asker holds. The parts' entries share one
+/// answer's room, but each part's body also carries its names, and may
+/// reach `Entries.max_size`, so a page holds up to WINDOW of those while
+/// it merges.
 pub const WINDOW: u16 = 8;
 
 /// What the client's answer holds besides its entries: the count, then
@@ -172,7 +175,7 @@ pub fn refusal(err: PageError) table_run.Refused {
     return switch (err) {
         error.NotAWalk => .{ .status = .bad_request, .refusal = proto.notRun("bad request: that op lists nothing across shards") },
         error.ScanShort => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory to list this page; retry") },
-        error.EntryTooLarge => .{ .status = .internal_error, .refusal = proto.notRun("internal error: a listed item is larger than a page entry holds") },
+        error.EntryTooLarge => .{ .status = .internal_error, .refusal = proto.notRun("internal error: a listed item's name (over 4096 bytes) or entry (over 16 KiB) is larger than a list page holds") },
     };
 }
 
@@ -264,6 +267,9 @@ const Walk = struct {
 pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: u16, limit: u32, cursor: ?[]const u8) void {
     const begin = NameWalker.startOf(cursor);
     if (begin.shard >= shard_count) return answerEmpty(shard, conn, req.header.request_id);
+    // No answer of this server's names a resume point that long.
+    if (begin.local_cursor) |lc| if (lc.len > system_ops.MAX_LOCAL_CURSOR)
+        return shard.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: the cursor is longer than any this server sends"));
     const last = @min(@as(u32, begin.shard) + WINDOW, shard_count);
     const n: u16 = @intCast(last - begin.shard);
     const room: u32 = @intCast(ROOM / n);

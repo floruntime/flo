@@ -7632,15 +7632,18 @@ const WalkFixture = struct {
     const NameList = struct {
         names: []const []const u8,
         refuse: bool = false,
+        scans: u32 = 0,
 
         fn byOffset(ctx: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
-            const self: *const NameList = @ptrCast(@alignCast(ctx));
+            const self: *NameList = @ptrCast(@alignCast(ctx));
+            self.scans += 1;
             if (self.refuse) dispatcher_mod.noteScanShort();
             return .{ .items = self.names[0..@min(limit, self.names.len)], .next_cursor = null };
         }
 
         fn byKey(ctx: *anyopaque, _: []const u8, _: []const u8, after: ?[]const u8, limit: u32) dispatcher_mod.NameWalker.ScanResult {
-            const self: *const NameList = @ptrCast(@alignCast(ctx));
+            const self: *NameList = @ptrCast(@alignCast(ctx));
+            self.scans += 1;
             var from: usize = 0;
             if (after) |a| {
                 while (from < self.names.len and std.mem.order(u8, self.names[from], a) != .gt) from += 1;
@@ -7734,6 +7737,40 @@ test "Shard: a list asked of every shard pages through them by limit and offset,
     for (want, names.items) |w, g| try std.testing.expectEqualStrings(w, g);
     try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].gathers.inUse());
     try std.testing.expectEqual(@as(usize, 0), f.two.shards[0].reply_pool.taken());
+}
+
+test "Shard: a list reads each shard's names on that shard, never from the shard that took it" {
+    for ([_]bool{ false, true }) |paged| {
+        var f: WalkFixture = undefined;
+        try f.init(&.{ "a1", "a2" }, &.{ "b1", "b2" }, paged);
+        defer f.deinit();
+        var body: [4]u8 = undefined;
+        std.mem.writeInt(u32, &body, 10, .little);
+        f.two.shards[0].runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.ts_list, 1), .namespace = "default", .key = "", .value = &body }, .client);
+        // Shard 0 read its own names; shard 1's wait for shard 1 to run.
+        try std.testing.expectEqual(@as(u32, 1), f.lists[0].scans);
+        try std.testing.expectEqual(@as(u32, 0), f.lists[1].scans);
+        f.two.settle();
+        try std.testing.expectEqual(@as(u32, 1), f.lists[1].scans);
+    }
+}
+
+test "Shard: a list cursor longer than any the server sends is a bad request, not an internal error" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{"a"}, &.{"b"}, true);
+    defer f.deinit();
+    // [limit][shard 1][a local cursor one byte past the longest]: the
+    // part goes to another shard, whose request can't carry it.
+    var body: [4 + 2 + @import("../protocol/system_ops.zig").MAX_LOCAL_CURSOR + 1]u8 = @splat('k');
+    std.mem.writeInt(u32, body[0..4], 10, .little);
+    std.mem.writeInt(u16, body[4..6], 1, .little);
+    const a = &f.two.shards[0];
+    a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.ts_list, 1), .namespace = "default", .key = "", .value = &body }, .client);
+    f.two.settle();
+    const got = try readAnswer(f.client.pair[1], a, f.client.conn.fd, f.out, @sizeOf(proto.ResponseHeader));
+    const resp = try proto.Response.parse(f.out[0..got]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expectEqual(@as(usize, 0), a.gathers.inUse());
 }
 
 test "Shard: a list whose scan pages itself resumes each shard after the last name it sent" {

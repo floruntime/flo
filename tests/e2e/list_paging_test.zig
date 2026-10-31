@@ -298,3 +298,46 @@ test "e2e/list: each CLI list client sends its limit in the value" {
     try expectLimitInValue(Calls.queue, .queue_list);
     try expectLimitInValue(Calls.ts, .ts_list);
 }
+
+/// More shards than a page asks at once: a list holds a cursor before its
+/// last page, and a CLI that read only the first page lost the rest.
+/// (Processing jobs all live on shard 0, so its list never spans them;
+/// its paging is `WirePages`'s unit test.)
+const WIDE_SHARDS = 12;
+
+fn expectEachListedOnce(ctx: *stdx.testing.TestContext, args: []const []const u8, comptime prefix: []const u8, n: usize) !void {
+    var r = try ctx.cli.run(args);
+    defer r.deinit();
+    var listed: usize = 0;
+    for (0..n) |i| {
+        var buf: [64]u8 = undefined;
+        const c = r.stdoutCount(try std.fmt.bufPrint(&buf, "\"" ++ prefix ++ "{d:0>2}\"", .{i}));
+        if (c != 1) std.debug.print("{s}{d:0>2} listed {d} times:\n{s}\n", .{ prefix, i, c, r.stdout });
+        try testing.expectEqual(@as(usize, 1), c);
+        listed += c;
+    }
+    try testing.expectEqual(n, listed);
+}
+
+test "e2e/list: the CLI's workflow list returns definitions on every shard" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = WIDE_SHARDS } });
+    defer ctx.deinit();
+
+    const workflows = 40;
+    for (0..workflows) |i| {
+        var def_buf: [256]u8 = undefined;
+        const def = try std.fmt.bufPrint(&def_buf,
+            \\kind: Workflow
+            \\name: lp-wf-{d:0>2}
+            \\version: 1.0.0
+            \\start.run: @actions/validate
+            \\start.transitions.success: flo.Completed
+            \\start.transitions.failure: flo.Failed
+        , .{i});
+        var file_buf: [32]u8 = undefined;
+        const path = try stdx.testing.writeDottedToTempYaml(testing.allocator, def, try std.fmt.bufPrint(&file_buf, "lp-wf-{d:0>2}.yaml", .{i}));
+        defer stdx.testing.cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+    }
+    try expectEachListedOnce(ctx, &.{ "workflow", "list", "-o", "json" }, "lp-wf-", workflows);
+}

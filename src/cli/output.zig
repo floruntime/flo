@@ -423,6 +423,62 @@ fn skipField(reader: *WireReader, col: WireColumn) error{Truncated}!void {
 }
 
 /// Checks that `data` holds a count and that many whole entries.
+/// The pages of a list, gathered as one answer for `printWireList`. A list
+/// that spans more shards than one page asks returns a cursor before its
+/// last page, so a caller reading only the first loses the rest.
+pub const WirePages = struct {
+    allocator: Allocator,
+    columns: []const WireColumn,
+    count: u32 = 0,
+    /// `[count:u32]` and then the rows of every page taken so far.
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    cursor: ?[]u8 = null,
+    more: bool = true,
+
+    pub fn init(allocator: Allocator, columns: []const WireColumn) WirePages {
+        return .{ .allocator = allocator, .columns = columns };
+    }
+
+    pub fn deinit(self: *WirePages) void {
+        self.buf.deinit(self.allocator);
+        if (self.cursor) |c| self.allocator.free(c);
+    }
+
+    /// Takes one page, at most `want` of its rows, and keeps its cursor
+    /// for the next ask.
+    pub fn take(self: *WirePages, data: []const u8, want: u32) !void {
+        if (self.buf.items.len == 0) try self.buf.appendNTimes(self.allocator, 0, 4);
+        var reader = WireReader.init(data);
+        const count = reader.readU32() orelse return error.Truncated;
+        const rows_at = reader.pos;
+        var taken: u32 = 0;
+        while (taken < count and taken < want) : (taken += 1) {
+            for (self.columns) |col| try skipField(&reader, col);
+        }
+        try self.buf.appendSlice(self.allocator, data[rows_at..reader.pos]);
+        self.count += taken;
+        // The rest of the page is skipped when it ran past `want`.
+        while (taken < count) : (taken += 1) {
+            for (self.columns) |col| try skipField(&reader, col);
+        }
+        if (self.cursor) |c| self.allocator.free(c);
+        self.cursor = null;
+        // An answer with no trailer is the whole list.
+        const has_more = reader.readU8() orelse 0;
+        const cursor_len = reader.readU16() orelse 0;
+        const next = reader.readSlice(cursor_len) orelse return error.Truncated;
+        self.more = has_more != 0 and cursor_len > 0;
+        if (self.more) self.cursor = try self.allocator.dupe(u8, next);
+    }
+
+    /// `[count:u32]rows`, for `printWireList`.
+    pub fn list(self: *WirePages) []const u8 {
+        if (self.buf.items.len < 4) return &.{ 0, 0, 0, 0 };
+        std.mem.writeInt(u32, self.buf.items[0..4], self.count, .little);
+        return self.buf.items;
+    }
+};
+
 fn checkWireList(data: []const u8, columns: []const WireColumn) error{Truncated}!u32 {
     var reader = WireReader.init(data);
     const count = reader.readU32() orelse return error.Truncated;
@@ -843,4 +899,37 @@ test "output: jsonString is always a JSON string, escaped, with bad UTF-8 replac
         const out = try std.fmt.bufPrint(&buf, "{f}", .{jsonString(c[0])});
         try std.testing.expectEqualStrings(c[1], out);
     }
+}
+
+test "output: WirePages joins every page's rows, follows each cursor, and stops at what was wanted" {
+    const cols = [_]WireColumn{.{ .field = "name", .header = "NAME", .field_type = .str_u16 }};
+    const a = [_]u8{ 1, 0, 'a' };
+    const b = [_]u8{ 1, 0, 'b' };
+    const c = [_]u8{ 1, 0, 'c' };
+    // Page one: a, b, with more after cursor "k1"; page two: c, the last.
+    const one = [_]u8{ 2, 0, 0, 0 } ++ a ++ b ++ [_]u8{ 1, 2, 0, 'k', '1' };
+    const two = [_]u8{ 1, 0, 0, 0 } ++ c ++ [_]u8{ 0, 0, 0 };
+
+    var pages = WirePages.init(std.testing.allocator, &cols);
+    defer pages.deinit();
+    try pages.take(&one, 10);
+    try std.testing.expect(pages.more);
+    try std.testing.expectEqualStrings("k1", pages.cursor.?);
+    try pages.take(&two, 10);
+    try std.testing.expect(!pages.more);
+    try std.testing.expectEqual(@as(?[]u8, null), pages.cursor);
+    try std.testing.expectEqualSlices(u8, &([_]u8{ 3, 0, 0, 0 } ++ a ++ b ++ c), pages.list());
+
+    // Wanting one row takes a and reads past b to the cursor.
+    var short = WirePages.init(std.testing.allocator, &cols);
+    defer short.deinit();
+    try short.take(&one, 1);
+    try std.testing.expectEqualSlices(u8, &([_]u8{ 1, 0, 0, 0 } ++ a), short.list());
+    try std.testing.expectEqualStrings("k1", short.cursor.?);
+
+    // No pages taken is an empty list; a cut page is Truncated.
+    var none = WirePages.init(std.testing.allocator, &cols);
+    defer none.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, none.list());
+    try std.testing.expectError(error.Truncated, none.take(one[0..5], 10));
 }

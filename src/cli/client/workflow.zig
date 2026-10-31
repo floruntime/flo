@@ -253,14 +253,13 @@ pub fn enable(
     return client.sendRequest(.workflow_enable, namespace, workflow_name, version orelse "");
 }
 
-/// List workflow definitions
-/// Wire format:
-///   - namespace: req.namespace
-///   - key: (unused)
-///   - value: (empty)
+/// List workflow definitions; value [limit:u32][cursor] like every list op.
 pub fn listDefinitions(
     client: *Client,
     namespace: []const u8,
+    limit: ?u32,
+    cursor: ?[]const u8,
 ) !Response {
-    return client.sendRequest(.workflow_list_definitions, namespace, "", "");
+    var value_buf: [base.WALK_VALUE_MAX]u8 = undefined;
+    return client.sendRequest(.workflow_list_definitions, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }
