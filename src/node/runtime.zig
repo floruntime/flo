@@ -448,9 +448,6 @@ pub const Runtime = struct {
             self.dashboard_server = null;
         }
         if (self.dashboard_ctx) |ctx| {
-            if (ctx.shard_ptrs) |ptrs| {
-                self.allocator.free(ptrs);
-            }
             self.allocator.destroy(ctx);
             self.dashboard_ctx = null;
         }
@@ -821,7 +818,7 @@ pub const Runtime = struct {
             for (shards) |*shard| shard.setMetricsRegistry(metrics);
         }
         for (shards) |*shard| shard.publishHealth();
-        if (self.dashboard_ctx) |ctx| try ctx.wireShards(self.allocator, shards);
+        if (self.dashboard_ctx) |ctx| ctx.markShardsReady();
 
         log.debug("Runtime.start: {d} shards initialized", .{shards_created});
 

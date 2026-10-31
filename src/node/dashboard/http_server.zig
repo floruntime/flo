@@ -889,9 +889,7 @@ test "dashboard: until the shards are wired the data APIs answer replaying, whil
     const replaying = try answerFor(&srv, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, replaying, "HTTP/1.1 503") and std.mem.endsWith(u8, replaying, "\r\n\r\nreplaying\n"));
 
-    const no_shards = [_]u8{};
-    try ctx.wireShards(allocator, &no_shards);
-    defer allocator.free(ctx.shard_ptrs.?);
+    ctx.markShardsReady();
     health.shards[0].set(.ok);
     health.accepting.store(true, .release);
     try std.testing.expect(std.mem.startsWith(u8, try answerFor(&srv, "GET /api/v1/streams HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf), "HTTP/1.1 200"));

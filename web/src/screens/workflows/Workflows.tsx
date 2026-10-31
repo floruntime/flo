@@ -2,8 +2,8 @@
    Durable orchestration · steps & plans · signals · history.
 
    Wired to the dashboard API. Workflows are namespace-scoped server-side. Reads
-   (definitions, runs, run detail, event history) are real; the run's per-step
-   results and the event timeline come straight from the engine. Start / cancel /
+   (definitions, runs, run detail, event history) are real; the event timeline
+   comes straight from the engine. Per-step results aren't served yet (null). Start / cancel /
    enable / disable are real loopback writes. The list `steps[]` is often empty
    (the start step isn't a named step) so the Definition tab shows the raw YAML
    rather than a synthesized DAG. create + signal have dashboard endpoints
@@ -133,14 +133,15 @@ function StartModal({ ns, workflow, onClose }: { ns: string; workflow: string; o
 
 /* ============ run detail ============ */
 function RunDetail({ ns, run, onBack, backLabel }: { ns: string; run: WorkflowRunInfo; onBack: () => void; backLabel: string }) {
-  const q = useRunDetail(run.run_id)
-  const histQ = useRunHistory(run.run_id)
+  const q = useRunDetail(ns, run.run_id)
+  const histQ = useRunHistory(ns, run.run_id)
   const cancel = useCancelRun(ns)
   const d = q.data
   const status = d?.status ?? run.status
   const events: WorkflowHistoryEvent[] = histQ.data ?? []
   const stepResults = d?.step_results ? Object.entries(d.step_results) : []
   const terminal = status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'timed_out'
+  const version = d?.version ?? run.version
 
   return (
     <div className="wrap fade">
@@ -152,7 +153,7 @@ function RunDetail({ ns, run, onBack, backLabel }: { ns: string; run: WorkflowRu
               {run.run_id} <Pill s={status} />
             </h1>
             <div className="ph-s mono">
-              {run.workflow} v{run.version} · {d?.triggered_by ?? run.triggered_by}
+              {run.workflow} {version != null ? 'v' + version : DASH} · {d?.triggered_by ?? run.triggered_by ?? DASH}
             </div>
           </div>
           <Button variant="danger" style={{ flex: 'none' }} disabled={terminal || cancel.isPending} onClick={() => cancel.mutate(run.run_id)}>
@@ -165,7 +166,7 @@ function RunDetail({ ns, run, onBack, backLabel }: { ns: string; run: WorkflowRu
         <Stat label="Status" value={WF_ST[status]?.[1] ?? status} valueColor={WF_ST[status]?.[0]} />
         <Stat label="Current step" value={d?.current_step ?? (terminal ? '—' : '…')} sub={d?.pending_signals ? `${d.pending_signals} pending signals` : undefined} />
         <Stat label="Duration" value={fmtDur(d?.duration_ms ?? run.duration_ms)} sub={terminal ? 'final' : 'running'} />
-        <Stat label="Events" value={d?.history_event_count ?? run.history_event_count} sub="in history" />
+        <Stat label="Events" value={d?.history_event_count ?? run.history_event_count ?? DASH} sub="in history" />
       </Stats>
 
       {(d?.error_message || run.error) && (
