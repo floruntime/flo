@@ -3,70 +3,62 @@
 //! - GET    /queues                           — All queues
 //! - GET    /queues/:name                     — Queue detail
 //! - GET    /queues/:name/messages            — Queue messages
-//! - GET    /queues/:name/dlq                 — Dead-letter queue entries
+//! - GET    /queues/:name/dlq                 — Dead-letter queue count
 //! - POST   /queues/:name/dlq/:seq/requeue   — Requeue DLQ entry
 //! - DELETE /queues/:name/dlq/:seq            — Delete DLQ entry
 //! - POST   /queues/:name/purge              — Purge queue
+//!
+//! The dashboard asks each shard, as any client does: every read goes over
+//! loopback to the node's own protocol port, and the shard that owns the
+//! queue answers it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
-const Shard = @import("../../shard.zig").Shard;
-const QueueProjection = @import("../../../projection/queue.zig").QueueProjection;
-const router = @import("../../router.zig");
+const loopback = @import("loopback.zig");
+const namespaces_api = @import("namespaces.zig");
+const output = @import("../../../cli/output.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
+const WireReader = client_mod.WireReader;
 
-/// Short-lived loopback client to the node's own protocol port — mutations can't
-/// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
-fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
-    var ep_buf: [32]u8 = undefined;
-    const endpoint = try ctx.clientEndpoint(&ep_buf);
-    var client = client_mod.Client.init(allocator, endpoint);
-    errdefer client.deinit();
-    try client.connect();
-    return client;
-}
+/// `queue_list` entries: [name_len:u32][name][ns_len:u32][ns]
+/// [pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64].
+const queue_list_columns = [_]output.WireColumn{
+    .{ .field = "name", .header = "", .field_type = .str_u32 },
+    .{ .field = "namespace", .header = "", .field_type = .str_u32 },
+    .{ .field = "pending", .header = "", .field_type = .uint_u64 },
+    .{ .field = "available", .header = "", .field_type = .uint_u64 },
+    .{ .field = "enqueued", .header = "", .field_type = .uint_u64 },
+    .{ .field = "dequeued", .header = "", .field_type = .uint_u64 },
+    .{ .field = "dlq", .header = "", .field_type = .uint_u64 },
+};
 
-fn queueHash(namespace: []const u8, name: []const u8) u64 {
-    return router.nameHash(router.namespaceHash(namespace), name);
-}
-
-/// Per-queue message tally by state (computed from the projection — the metrics
-/// counters under-report). `pending = ready + leased`.
-const QueueTally = struct { ready: u64 = 0, leased: u64 = 0, dlq: u64 = 0 };
-
-fn tallyQueue(qp: *QueueProjection, qhash: u64) QueueTally {
-    var t = QueueTally{};
-    var it = qp.messages.iterator();
-    while (it.next()) |kv| {
-        const msg = kv.value_ptr.*;
-        if (msg.queue_name_hash != qhash) continue;
-        switch (msg.state) {
-            .ready => t.ready += 1,
-            .leased => t.leased += 1,
-            .dlq => t.dlq += 1,
-        }
+const QueueListAsker = struct {
+    namespace: []const u8,
+    pub fn ask(self: QueueListAsker, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.queue.list(client, self.namespace, null, cursor);
     }
-    return t;
-}
+};
 
-// ── Helpers ──
+/// GET /queues - Every namespace's queues, or `?namespace=`'s alone,
+/// from `queue_list`, which asks every shard. Its counts are enqueued less
+/// dequeued, so `ready`, `inflight` and `available` (ready alone) are null.
+pub fn getQueues(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue list", err);
+    defer reader.deinit();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var namespaces: std.StringArrayHashMapUnmanaged(void) = .empty;
+    if (h.parseQueryParam([]const u8, query_string, "namespace")) |ns| {
+        try namespaces.put(arena.allocator(), ns, {});
+    } else {
+        try namespaces.put(arena.allocator(), "default", {});
+        namespaces_api.readNamespaceNames(&reader, arena.allocator(), &namespaces) catch |err|
+            return try loopback.readFailed(allocator, "queue list", err);
+    }
 
-fn getQueueProjection(ctx: *DashboardContext, idx: usize) ?*QueueProjection {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    const shard: *Shard = @ptrCast(@alignCast(ptrs[idx]));
-    return &shard.defaultPartition().queue;
-}
-
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
-
-/// GET /queues - List all queues
-pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -74,37 +66,33 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // List from the projection's registered queues (the metrics counters
-    // under-report); counts per queue are tallied from the message map.
-    var seen = std.AutoHashMap(u64, void).init(allocator);
-    defer seen.deinit();
-
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getQueueProjection(ctx, i)) |qp| {
-            var it = qp.known_queues.iterator();
-            while (it.next()) |kv| {
-                const qhash = kv.key_ptr.*;
-                const meta = kv.value_ptr.*;
-                if (meta.name.len > 0 and meta.name[0] == '_') continue; // system queue
-                const gop = try seen.getOrPut(qhash);
-                if (gop.found_existing) continue;
-
-                const t = tallyQueue(qp, qhash);
-                try arr.next();
-                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try obj.begin();
-                try obj.stringField("name", meta.name);
-                try obj.stringField("namespace", meta.namespace);
-                try obj.intField("ready", t.ready);
-                try obj.intField("inflight", t.leased);
-                try obj.intField("pending", t.ready + t.leased);
-                try obj.intField("available", t.ready);
-                try obj.intField("enqueued", meta.enqueued);
-                try obj.intField("dequeued", meta.dequeued);
-                try obj.intField("dlq_count", t.dlq);
-                try obj.end();
-            }
+    const malformed = "queue list: malformed answer";
+    for (namespaces.keys()) |namespace| {
+        var pages = reader.listAll(allocator, &queue_list_columns, QueueListAsker{ .namespace = namespace }) catch |err|
+            return try loopback.readFailed(allocator, "queue list", err);
+        defer pages.deinit();
+        var r = WireReader.init(pages.list());
+        const count = r.readU32() orelse 0;
+        for (0..count) |_| {
+            const name = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
+            const ns = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
+            var v: [5]u64 = undefined;
+            for (&v) |*x| x.* = r.readU64() orelse return try h.jsonError(allocator, malformed);
+            const pending, _, const enqueued, const dequeued, const dlq = v;
+            if (name.len > 0 and name[0] == '_') continue; // system queue
+            try arr.next();
+            var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try obj.begin();
+            try obj.stringField("name", name);
+            try obj.stringField("namespace", ns);
+            try obj.nullField("ready");
+            try obj.nullField("inflight");
+            try obj.intField("pending", pending);
+            try obj.nullField("available");
+            try obj.intField("enqueued", enqueued);
+            try obj.intField("dequeued", dequeued);
+            try obj.intField("dlq_count", dlq);
+            try obj.end();
         }
     }
 
@@ -112,10 +100,30 @@ pub fn getQueues(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /queues/:name - Queue detail
+/// A `queue_stats` answer, nine u64s: [enqueued][dequeued][acked][nacked]
+/// [dlq_total][leases_expired][ready][leased][dlq_current].
+const QueueStats = struct { enqueued: u64, dequeued: u64, ready: u64, leased: u64, dlq: u64 };
+
+fn parseStats(data: []const u8) ?QueueStats {
+    var r = WireReader.init(data);
+    var v: [9]u64 = undefined;
+    for (&v) |*x| x.* = r.readU64() orelse return null;
+    return .{ .enqueued = v[0], .dequeued = v[1], .ready = v[6], .leased = v[7], .dlq = v[8] };
+}
+
+/// GET /queues/:name - Queue detail, from `queue_stats` (answered by the
+/// shard that owns the queue). An unknown queue answers zeros.
 pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const qhash = queueHash(ns_q, queue_name);
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue stats", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "queue stats", err);
+    var got = client.sendRequest(.queue_stats, ns_q, queue_name, "") catch |err|
+        return try loopback.readFailed(allocator, "queue stats", err);
+    defer got.deinit();
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    const s = parseStats(got.data) orelse return try h.jsonError(allocator, "queue stats: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -125,109 +133,42 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     try obj.begin();
     try obj.stringField("name", queue_name);
     try obj.stringField("namespace", ns_q);
-
-    var enqueued: u64 = 0;
-    var dequeued: u64 = 0;
-    var t = QueueTally{};
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getQueueProjection(ctx, i)) |qp| {
-            if (qp.known_queues.get(qhash)) |meta| {
-                enqueued = meta.enqueued;
-                dequeued = meta.dequeued;
-                t = tallyQueue(qp, qhash);
-                break;
-            }
-        }
-    }
-
-    try obj.intField("ready", t.ready);
-    try obj.intField("inflight", t.leased);
-    try obj.intField("pending", t.ready + t.leased);
-    try obj.intField("available", t.ready);
-    try obj.intField("enqueued", enqueued);
-    try obj.intField("dequeued", dequeued);
-    try obj.intField("dlq_count", t.dlq);
+    try obj.intField("ready", s.ready);
+    try obj.intField("inflight", s.leased);
+    try obj.intField("pending", s.ready + s.leased);
+    try obj.intField("available", s.ready);
+    try obj.intField("enqueued", s.enqueued);
+    try obj.intField("dequeued", s.dequeued);
+    try obj.intField("dlq_count", s.dlq);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /queues/:name/messages - Queue messages with status filter
-/// Query params: ?status=&limit=
+/// GET /queues/:name/messages - No op lists a queue's messages yet, so this
+/// says so rather than answer an empty list.
 pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = h.parseQueryParam([]const u8, query_string, "status");
-    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 1000;
-    const limit: usize = @min(@as(usize, @intCast(limit_param)), 2000);
-    const qhash = queueHash(ns_q, queue_name);
-    const now_ms: i64 = @import("stdx").time.milliTimestamp();
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-
-    var msg_count: u64 = 0;
-    var total: u64 = 0;
-    {
-        var msgs_arr = try obj.arrayField("messages");
-        try msgs_arr.begin();
-
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getQueueProjection(ctx, i)) |qp| {
-                var it = qp.messages.iterator();
-                while (it.next()) |entry| {
-                    const msg = entry.value_ptr.*;
-                    if (msg.queue_name_hash != qhash) continue; // only THIS queue
-                    total += 1;
-                    if (msg_count >= limit) continue;
-                    const payload = if (std.unicode.utf8ValidateSlice(msg.payload)) msg.payload else "<binary>";
-                    const lease_ms: i64 = blk: {
-                        if (msg.state != .leased) break :blk 0;
-                        const exp_ms: i64 = @intCast(msg.lease_expiry_ns / std.time.ns_per_ms);
-                        break :blk if (exp_ms > now_ms) exp_ms - now_ms else 0;
-                    };
-                    try msgs_arr.next();
-                    var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try mobj.begin();
-                    try mobj.intField("seq", msg.seq);
-                    try mobj.intField("priority", msg.priority);
-                    try mobj.stringField("state", switch (msg.state) {
-                        .ready => "ready",
-                        .leased => "leased",
-                        .dlq => "dlq",
-                    });
-                    try mobj.intField("attempts", msg.attempts);
-                    try mobj.intField("enqueued_at", @as(i64, @intCast(msg.enqueued_at_ns / std.time.ns_per_ms)));
-                    try mobj.intField("lease_remaining_ms", lease_ms);
-                    try mobj.intField("size", @as(i64, @intCast(msg.payload.len)));
-                    try mobj.stringField("payload", payload);
-                    try mobj.end();
-                    msg_count += 1;
-                }
-            }
-        }
-
-        try msgs_arr.end();
-    }
-
-    try obj.intField("count", msg_count);
-    try obj.intField("total", total);
-    try obj.stringField("queue", queue_name);
-    try obj.end();
-    return try json_aw.toOwnedSlice();
+    _ = queue_name;
+    _ = query_string;
+    _ = ctx;
+    return try h.jsonError(allocator, "queue messages are not available yet");
 }
 
-/// GET /queues/:name/dlq - Dead-letter queue entries
-/// Query params: ?limit=&namespace=
+/// GET /queues/:name/dlq?namespace= - The queue's dead-letter count, from
+/// `queue_dlq_list`. No op lists the entries yet: `entries` is null.
 pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const limit_param = h.parseQueryParam(u32, query_string, "limit") orelse 100;
-    const limit: usize = @min(@as(usize, @intCast(limit_param)), 1000);
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const qhash = queueHash(ns_q, queue_name);
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue dlq", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "queue dlq", err);
+    var got = client_mod.queue.dlqList(client, ns_q, queue_name) catch |err|
+        return try loopback.readFailed(allocator, "queue dlq", err);
+    defer got.deinit();
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    // [count:u32 = 0][total_dlq:u64]: a summary, no entries.
+    var r = WireReader.init(got.data);
+    _ = r.readU32() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
+    const total = r.readU64() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -235,33 +176,8 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
-
-    var entry_count: u64 = 0;
-    {
-        var entries_arr = try obj.arrayField("entries");
-        try entries_arr.begin();
-
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getQueueProjection(ctx, i)) |qp| {
-                for (qp.deadLetters(qhash)) |dlq_entry| {
-                    if (entry_count >= limit) break;
-                    try entries_arr.next();
-                    var eobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try eobj.begin();
-                    try eobj.intField("seq", dlq_entry.seq);
-                    try eobj.intField("attempts", dlq_entry.attempts);
-                    try eobj.intField("moved_at", @as(i64, @intCast(dlq_entry.moved_at_ns / std.time.ns_per_ms)));
-                    try eobj.end();
-                    entry_count += 1;
-                }
-            }
-        }
-
-        try entries_arr.end();
-    }
-
-    try obj.intField("count", entry_count);
+    try obj.nullField("entries");
+    try obj.intField("count", total);
     try obj.stringField("queue", queue_name);
     try obj.end();
     return try json_aw.toOwnedSlice();
@@ -272,7 +188,7 @@ pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const seq = std.fmt.parseInt(u64, seq_str, 10) catch return try h.jsonError(allocator, "Invalid seq");
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.queue.dlqRequeue(&client, ns_q, queue_name, &[_]u64{seq}) catch
         return try h.jsonError(allocator, "DLQ requeue failed");
@@ -289,29 +205,20 @@ pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []
     return try json_aw.toOwnedSlice();
 }
 
-/// DELETE /queues/:name/dlq/:seq - Delete a DLQ entry
+/// DELETE /queues/:name/dlq/:seq - The server can't delete a dead letter
+/// yet, so this refuses rather than answer ok.
 pub fn deleteDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = ctx;
     _ = queue_name;
     _ = seq_str;
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    // Write operations require Raft proposal — not safe from dashboard thread.
-    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try obj.begin();
-    try obj.boolField("ok", true);
-    try obj.end();
-    return try json_aw.toOwnedSlice();
+    return try h.jsonError(allocator, "DLQ entries can't be deleted yet");
 }
 
 /// POST /queues/:name/purge - Purge all live (ready+leased) messages (loopback write).
 pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.queue.purge(&client, ns_q, queue_name) catch
         return try h.jsonError(allocator, "Purge failed");
@@ -344,7 +251,7 @@ pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []cons
     if (h.parseQueryParam([]const u8, query_string, "delay_ms") != null)
         return try h.jsonError(allocator, "delay_ms is not supported: queues have no delayed delivery");
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority) catch
         return try h.jsonError(allocator, "Enqueue failed");
@@ -373,51 +280,50 @@ pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []cons
 // Tests
 // =============================================================================
 
-test "getQueues returns empty array when no queues registered" {
+test "queue reads say the node didn't answer, never an empty list" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here → connect refused
 
-    const result = try getQueues(allocator, &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    const answers = [_][]const u8{
+        try getQueues(allocator, null, &ctx),
+        try getQueueDetail(allocator, "q", null, &ctx),
+        try getQueueDLQ(allocator, "q", null, &ctx),
+    };
+    defer for (answers) |a| allocator.free(a);
+    for (answers) |a| {
+        try std.testing.expect(std.mem.startsWith(u8, a, "{\"error\":"));
+        try std.testing.expect(std.mem.indexOf(u8, a, "failed") != null);
+    }
 }
 
-test "getQueueDetail returns zeroed queue for unknown name" {
+test "queue messages and DLQ deletes say they are not available yet" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1;
 
-    const result = try getQueueDetail(allocator, "unknown", null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"unknown\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"pending\":0") != null);
+    const msgs = try getQueueMessages(allocator, "q", null, &ctx);
+    defer allocator.free(msgs);
+    try std.testing.expectEqualStrings("{\"error\":\"queue messages are not available yet\"}", msgs);
+    const del = try deleteDLQEntry(allocator, "q", "1", &ctx);
+    defer allocator.free(del);
+    try std.testing.expectEqualStrings("{\"error\":\"DLQ entries can't be deleted yet\"}", del);
 }
 
-test "getQueueMessages returns empty list" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try getQueueMessages(allocator, "test-q", null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"messages\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"count\":0") != null);
-}
-
-test "getQueueDLQ returns empty list" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try getQueueDLQ(allocator, "test-q", null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"entries\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"count\":0") != null);
+test "queue stats answers parse; a short one doesn't" {
+    var buf: [72]u8 = undefined;
+    for (0..9) |i| std.mem.writeInt(u64, buf[i * 8 ..][0..8], i + 1, .little);
+    const s = parseStats(&buf).?;
+    try std.testing.expectEqual(@as(u64, 1), s.enqueued);
+    try std.testing.expectEqual(@as(u64, 2), s.dequeued);
+    try std.testing.expectEqual(@as(u64, 7), s.ready);
+    try std.testing.expectEqual(@as(u64, 8), s.leased);
+    try std.testing.expectEqual(@as(u64, 9), s.dlq);
+    try std.testing.expect(parseStats(buf[0..64]) == null);
 }
 
 test "purgeQueue surfaces loopback connect failure (no node in unit test)" {

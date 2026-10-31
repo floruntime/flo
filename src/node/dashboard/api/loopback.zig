@@ -10,6 +10,7 @@ const client_mod = @import("../../../cli/client/mod.zig");
 const reply_pool = @import("../../reply_pool.zig");
 const serve = @import("../../../util/http/serve.zig");
 const stdx = @import("stdx");
+const output = @import("../../../cli/output.zig");
 
 /// The longest one loopback read waits for its answer: the node's own read
 /// deadline, and a second to spare.
@@ -45,12 +46,36 @@ pub const Reader = struct {
     }
 
     pub fn call(self: *Reader, comptime op: @import("../../../protocol/ops.zig").Op, namespace: []const u8, key: []const u8, body: op.request.Value) !client_mod.Response {
+        return (try self.next()).call(op, namespace, key, body);
+    }
+
+    /// The client, for one read through the CLI's own op clients
+    /// (`client_mod.stream.list` and the rest), its wait set to what is
+    /// left of the request's time.
+    pub fn next(self: *Reader) !*client_mod.Client {
         const left = self.deadline_ms - nowMs();
         if (left <= 0) return error.OutOfTime;
         // Per read(), and an answer may take several: a slow one can run
         // past what is left. On loopback that is a small overrun at most.
         self.client.setReadTimeoutMs(@intCast(@min(left, LOOPBACK_READ_TIMEOUT_MS)));
-        return self.client.call(op, namespace, key, body);
+        return &self.client;
+    }
+
+    /// Every page of a list op, followed by its cursor, as one
+    /// `[count:u32]entries` for `columns` to decode. `ask(client, cursor)`
+    /// sends one page's request. The owner shards write the entries; a
+    /// refused page is `error.Refused`.
+    pub fn listAll(self: *Reader, allocator: Allocator, columns: []const output.WireColumn, asker: anytype) !output.WirePages {
+        var pages = output.WirePages.init(allocator, columns);
+        errdefer pages.deinit();
+        while (pages.more) {
+            var got = try asker.ask(try self.next(), pages.cursor);
+            defer got.deinit();
+            if (got.isError()) return error.Refused;
+            // An empty list answers with a count of 0, never no body.
+            try pages.take(got.data, std.math.maxInt(u32));
+        }
+        return pages;
     }
 
     fn nowMs() i64 {

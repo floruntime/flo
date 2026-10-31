@@ -1,61 +1,32 @@
 //! Dashboard API — Stream & Consumer Group Endpoints
 //!
 //! - GET /streams                                     — All streams
-//! - GET /streams/:name                               — Stream detail with partitions & groups
+//! - GET /streams/:name                               — Stream detail with partitions
 //! - GET /streams/:name/messages                      — Paginated messages from stream
 //! - GET /streams/:name/groups/:group                 — Consumer group detail
 //! - GET /streams/:name/groups/:group/members         — Consumer group members
 //! - GET /streams/:name/groups/:group/pending         — Pending messages
+//!
+//! The dashboard asks each shard, as any client does: every read goes over
+//! loopback to the node's own protocol port, and the shard that owns the
+//! stream answers it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
-const shard_mod = @import("../../shard.zig");
-const Shard = shard_mod.Shard;
-const stream_mod = @import("../../../projection/stream.zig");
-const StreamProjection = stream_mod.StreamProjection;
-const ns_keys = @import("../../../namespace/handler.zig");
-const router = @import("../../router.zig");
+const loopback = @import("loopback.zig");
+const output = @import("../../../cli/output.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
+const StreamID = client_mod.StreamID;
+const WireReader = client_mod.WireReader;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    return @ptrCast(@alignCast(ptrs[idx]));
-}
-
-fn getStreamProjection(ctx: *DashboardContext, idx: usize) ?*StreamProjection {
-    const shard = getShard(ctx, idx) orelse return null;
-    return &shard.defaultPartition().stream;
-}
-
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
-
-/// Short-lived loopback client to the node's own protocol port — stream
-/// mutations (trim/delete) can't be proposed from the dashboard thread, so they
-/// re-enter through the thread-safe protocol path (see api/workflows.zig).
-fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client {
-    var ep_buf: [32]u8 = undefined;
-    const endpoint = try ctx.clientEndpoint(&ep_buf);
-    var client = client_mod.Client.init(allocator, endpoint);
-    errdefer client.deinit();
-    try client.connect();
-    return client;
-}
-
-/// Logical record count for a stream = sum of each append batch's record count
-/// (a batch may carry N records). The projection maintains this incrementally,
-/// so this is an O(1) read and needs no UAL access — notably avoiding the
-/// zero-copy `ual.read`, which returns null for any entry whose payload wraps
-/// the hot-ring boundary and would undercount those as one record.
-fn streamLogicalCount(sp: *StreamProjection, name_hash: u64) u64 {
-    return sp.streamLogicalCount(name_hash);
+/// One read through the CLI's op client `f`, given the request's reader.
+fn ask(reader: *loopback.Reader, comptime f: anytype, args: anytype) !client_mod.Response {
+    return @call(.auto, f, .{try reader.next()} ++ args);
 }
 
 /// Cumulative append/read record counts for a (namespace, topic), summed across
@@ -78,25 +49,70 @@ fn streamCounts(ctx: *DashboardContext, namespace: []const u8, topic: []const u8
     return c;
 }
 
-/// Render a stream's persisted retention policy into the human string the
-/// console shows. Count/age/bytes are independent caps (first non-zero wins for
-/// display); "∞" means no policy is set.
-fn formatRetention(buf: []u8, meta: stream_mod.StreamMetadata) []const u8 {
-    if (meta.retention_count > 0) return std.fmt.bufPrint(buf, "{d} records", .{meta.retention_count}) catch "∞";
-    if (meta.retention_age_s > 0) {
-        const s = meta.retention_age_s;
-        if (s % 86400 == 0) return std.fmt.bufPrint(buf, "{d}d", .{s / 86400}) catch "∞";
-        if (s % 3600 == 0) return std.fmt.bufPrint(buf, "{d}h", .{s / 3600}) catch "∞";
-        if (s % 60 == 0) return std.fmt.bufPrint(buf, "{d}m", .{s / 60}) catch "∞";
-        return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "∞";
-    }
-    if (meta.retention_bytes > 0) return std.fmt.bufPrint(buf, "{d} bytes", .{meta.retention_bytes}) catch "∞";
-    return "∞";
+/// A `stream_info` answer: [first_ts:u64][first_seq:u64][last_ts:u64]
+/// [last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+/// [retention_age_s:u64][retention_count:u64][retention_bytes:u64].
+const StreamInfo = struct { count: u64, bytes: u64, partition_count: u32 };
+
+fn parseInfo(data: []const u8) ?StreamInfo {
+    var r = WireReader.init(data);
+    for (0..4) |_| _ = r.readU64() orelse return null;
+    const count = r.readU64() orelse return null;
+    const bytes = r.readU64() orelse return null;
+    const pc = r.readU32() orelse return null;
+    return .{ .count = count, .bytes = bytes, .partition_count = pc };
 }
 
-/// GET /streams - List all streams
+/// One stream's `stream_info`, or the JSON answer saying why there is none.
+fn streamInfo(allocator: Allocator, reader: *loopback.Reader, namespace: []const u8, stream: []const u8) !union(enum) { info: StreamInfo, answer: []const u8 } {
+    var got = ask(reader, client_mod.stream.info, .{ namespace, stream }) catch |err|
+        return .{ .answer = try loopback.readFailed(allocator, "stream info", err) };
+    defer got.deinit();
+    if (got.isError()) return .{ .answer = try h.jsonError(allocator, got.errorMessage()) };
+    const info = parseInfo(got.data) orelse return .{ .answer = try h.jsonError(allocator, "stream info: malformed answer") };
+    return .{ .info = info };
+}
+
+/// A `stream_group_info` answer: [pel_count:u64][member_count:u32][created_at_ns:u64].
+const GroupInfo = struct { pending: u64, members: u32 };
+
+fn parseGroupInfo(data: []const u8) ?GroupInfo {
+    var r = WireReader.init(data);
+    const pending = r.readU64() orelse return null;
+    const members = r.readU32() orelse return null;
+    return .{ .pending = pending, .members = members };
+}
+
+/// A name holding a NUL could spell another namespace's group: never asked.
+fn hasNul(s: []const u8) bool {
+    return std.mem.indexOfScalar(u8, s, 0) != null;
+}
+
+/// `stream_list` entries: [name_len:u32][name][partition_count:u32].
+const stream_list_columns = [_]output.WireColumn{
+    .{ .field = "name", .header = "", .field_type = .str_u32 },
+    .{ .field = "partitions", .header = "", .field_type = .uint_u32 },
+};
+
+const StreamListAsker = struct {
+    namespace: []const u8,
+    pub fn ask(self: StreamListAsker, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.stream.list(client, self.namespace, null, cursor);
+    }
+};
+
+/// GET /streams - A namespace's streams (?namespace=, default "default"),
+/// from `stream_list`, which asks every shard. Retention is null: it would
+/// take one `stream_info` per stream.
 pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace");
+    const effective_ns = ns_filter orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "stream list", err);
+    defer reader.deinit();
+    var pages = reader.listAll(allocator, &stream_list_columns, StreamListAsker{ .namespace = effective_ns }) catch |err|
+        return try loopback.readFailed(allocator, "stream list", err);
+    defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -105,57 +121,29 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // De-duplicate across shards
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
-    // Build namespace prefix for filtering (same logic as stream handler)
-    var ns_prefix_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const ns_prefix = if (ns_filter) |ns| try ns_keys.namespacePrefix(&ns_prefix_buf, ns) else &[_]u8{};
-    const effective_ns = ns_filter orelse "default";
-
-    // Scan StreamProjection on each shard for registered stream names
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getStreamProjection(ctx, i)) |sp| {
-            const name_buf = try allocator.alloc([]const u8, sp.stream_names.count());
-            defer allocator.free(name_buf);
-            const count = sp.scanStreamNames(name_buf);
-
-            for (name_buf[0..count]) |name| {
-                // Apply namespace filtering
-                const display_name = blk: {
-                    if (ns_prefix.len == 0) {
-                        // Default namespace — only bare names (no NUL separator)
-                        if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) != null) continue;
-                        break :blk name;
-                    } else {
-                        if (!std.mem.startsWith(u8, name, ns_prefix)) continue;
-                        break :blk name[ns_prefix.len..];
-                    }
-                };
-
-                const gop = try seen.getOrPut(display_name);
-                if (!gop.found_existing) {
-                    const partitions = sp.getPartitionCount(name);
-                    const counts = streamCounts(ctx, effective_ns, display_name);
-                    var ret_buf: [64]u8 = undefined;
-                    const retention = if (sp.stream_metadata.get(name)) |meta| formatRetention(&ret_buf, meta) else "∞";
-                    try arr.next();
-                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try obj.begin();
-                    try obj.stringField("name", display_name);
-                    try obj.stringField("namespace", effective_ns);
-                    try obj.intField("partitions", partitions);
-                    // Cumulative record counts (true per-second rate needs client-side
-                    // windowing across polls). Real retention from persisted metadata.
-                    try obj.intField("ingest_rate", counts.ingest);
-                    try obj.intField("reads", counts.reads);
-                    try obj.stringField("retention", retention);
-                    try obj.end();
-                }
-            }
-        }
+    var r = WireReader.init(pages.list());
+    const count = r.readU32() orelse 0;
+    for (0..count) |_| {
+        const name = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, "stream list: malformed answer");
+        const partitions = r.readU32() orelse return try h.jsonError(allocator, "stream list: malformed answer");
+        const gop = try seen.getOrPut(name);
+        if (gop.found_existing) continue;
+        const counts = streamCounts(ctx, effective_ns, name);
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("name", name);
+        try obj.stringField("namespace", effective_ns);
+        try obj.intField("partitions", partitions);
+        // Cumulative record counts (true per-second rate needs client-side
+        // windowing across polls).
+        try obj.intField("ingest_rate", counts.ingest);
+        try obj.intField("reads", counts.reads);
+        try obj.nullField("retention");
+        try obj.end();
     }
 
     // Also include any streams from MetricsRegistry (e.g. from metrics-only sources)
@@ -171,9 +159,8 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
             }
             const gop = try seen.getOrPut(stream_entry.topic);
             if (!gop.found_existing) {
-                // Metrics-only stream (not registered in any projection) — no
-                // persisted retention metadata is available here. Counts come
-                // straight from this entry's snapshot (we already hold the lock).
+                // Counts come straight from this entry's snapshot (we
+                // already hold the lock).
                 const snap = stream_entry.metrics.snapshot();
                 try arr.next();
                 var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -183,7 +170,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
                 try obj.intField("partitions", 1);
                 try obj.intField("ingest_rate", snap.append_records_total);
                 try obj.intField("reads", snap.read_records_total);
-                try obj.stringField("retention", "∞");
+                try obj.nullField("retention");
                 try obj.end();
             }
         }
@@ -218,7 +205,7 @@ pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?
         return try h.jsonError(allocator, "trim requires one of max_len or max_age_s");
     }
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.stream.trim(&client, ns_q, stream_name, max_len, null, max_age_s, dry_run) catch
         return try h.jsonError(allocator, "Trim failed");
@@ -246,7 +233,7 @@ pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string:
     const force = h.boolQueryParam(query_string, "force") catch
         return try h.jsonError(allocator, "force must be true, false, 1 or 0");
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.stream.delete(&client, ns_q, stream_name, force) catch
         return try h.jsonError(allocator, "Delete failed");
@@ -269,7 +256,7 @@ pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string:
 pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
+    var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
     var resp = client_mod.stream.groupDelete(&client, ns_q, stream_name, group_name) catch
         return try h.jsonError(allocator, "Group delete failed");
@@ -289,17 +276,19 @@ pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []
     return try json_aw.toOwnedSlice();
 }
 
-/// The key of `group` on `stream` in `namespace`, or null when either name
-/// holds a NUL (it could spell another namespace's group) or the key would
-/// not fit: never the bare name.
-fn groupKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, group: []const u8) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, stream, 0) != null or std.mem.indexOfScalar(u8, group, 0) != null) return null;
-    return ns_keys.qualifyGroupKey(buf, namespace, stream, group) catch null;
-}
-
-/// GET /streams/:name - Stream detail with partitions and consumer groups
+/// GET /streams/:name - Stream detail with partitions, from `stream_info`
+/// (answered by the shard that owns the stream). No op lists a stream's
+/// consumer groups yet: `consumer_groups` is null.
 pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "stream info", err);
+    defer reader.deinit();
+    const info = switch (try streamInfo(allocator, &reader, ns_q, stream_name)) {
+        .info => |i| i,
+        .answer => |a| return a,
+    };
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -307,109 +296,61 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", stream_name);
+    try obj.stringField("namespace", ns_q);
+    try obj.intField("total_count", info.count);
+    try obj.intField("total_bytes", info.bytes);
 
-    // Namespace + stats from MetricsRegistry (thread-safe). The namespace
-    // is copied out under the lock: an unregister frees the registry's.
-    var ns_buf: [ns_keys.MAX_NAMESPACE_LEN]u8 = undefined;
-    var ns: []const u8 = "default";
-    var total_appends: u64 = 0;
-    var total_bytes: u64 = 0;
-    {
-        ctx.metrics.mutex.lock();
-        defer ctx.metrics.mutex.unlock();
-        var it = ctx.metrics.streams.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.*.topic, stream_name)) {
-                const name = entry.value_ptr.*.namespace;
-                const n = @min(name.len, ns_buf.len);
-                @memcpy(ns_buf[0..n], name[0..n]);
-                ns = ns_buf[0..n];
-                const snap = entry.value_ptr.*.metrics.snapshot();
-                total_appends += snap.append_records_total;
-                total_bytes += snap.append_bytes_total;
-            }
-        }
-    }
-
-    try obj.stringField("namespace", ns);
-    try obj.intField("total_count", total_appends);
-    try obj.intField("total_bytes", total_bytes);
-
-    // Partitions — logical record count (sum of batch sizes) from shard 0.
+    // Counts are the stream's, not each partition's: a partition's own
+    // shows only when the stream has one.
     {
         var parts_arr = try obj.arrayField("partitions");
         try parts_arr.begin();
-        if (getShard(ctx, 0)) |shard| {
-            const partition = shard.defaultPartition();
-            const sp = &partition.stream;
-            const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
-            const record_count = streamLogicalCount(sp, name_hash);
-            if (record_count > 0 or sp.streamCount() > 0) {
-                try parts_arr.next();
-                var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try pobj.begin();
-                try pobj.intField("id", 0);
-                try pobj.intField("record_count", record_count);
-                try pobj.intField("stored_bytes", total_bytes);
-                try pobj.end();
-            }
+        const one = info.partition_count == 1;
+        for (0..info.partition_count) |p| {
+            try parts_arr.next();
+            var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try pobj.begin();
+            try pobj.intField("id", p);
+            if (one) try pobj.intField("record_count", info.count) else try pobj.nullField("record_count");
+            if (one) try pobj.intField("stored_bytes", info.bytes) else try pobj.nullField("stored_bytes");
+            try pobj.end();
         }
         try parts_arr.end();
     }
-
-    // Consumer groups — only those belonging to THIS stream+namespace. Group keys
-    // are `[ns\0]stream\0group`; filter by the stream's qualified prefix and emit
-    // the bare group name plus its last-delivered position (for the activity bar).
-    {
-        var groups_arr = try obj.arrayField("consumer_groups");
-        try groups_arr.begin();
-        var sp_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const stream_prefix = ns_keys.qualifyKey(&sp_buf, ns_q, stream_name) catch return error.NotFound;
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getStreamProjection(ctx, i)) |sp| {
-                var git = sp.groups.iterator();
-                while (git.next()) |ge| {
-                    const gkey = ge.key_ptr.*;
-                    if (!std.mem.startsWith(u8, gkey, stream_prefix)) continue;
-                    if (gkey.len <= stream_prefix.len or gkey[stream_prefix.len] != ns_keys.NAMESPACE_SEPARATOR) continue;
-                    const bare_group = gkey[stream_prefix.len + 1 ..];
-                    const grp = ge.value_ptr;
-                    try groups_arr.next();
-                    var gobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try gobj.begin();
-                    try gobj.stringField("name", bare_group);
-                    try gobj.intField("members", grp.members.count());
-                    try gobj.intField("pending_count", grp.pelCount());
-                    try gobj.intField("last_delivered_ms", @as(i64, @intCast(grp.last_delivered_id.timestamp_ms)));
-                    try gobj.end();
-                }
-            }
-        }
-        try groups_arr.end();
-    }
+    try obj.nullField("consumer_groups");
 
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /streams/:name/messages - Paginated messages
-/// Query params: ?cursor=<ts>-<seq>&limit=&partition=
-/// cursor format: "<timestamp_ms>-<sequence>" — omit for start of stream
+/// GET /streams/:name/messages - Paginated messages, from `stream_read`.
+/// Query params: ?cursor=<ts>-<seq>&limit=&namespace=
+/// cursor format: "<timestamp_ms>-<sequence>", the last id seen; omit for
+/// the start of the stream.
 pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const limit = h.parseQueryParam(u32, query_string, "limit") orelse 2000;
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    // Parse cursor "ts-seq" into StreamID
-    const StreamID = @import("../../../projection/stream.zig").StreamID;
     const cursor_str = h.parseQueryParam([]const u8, query_string, "cursor");
     const start_id = if (cursor_str) |cs| blk: {
-        // Find the '-' separator
         const sep_pos = std.mem.indexOfScalar(u8, cs, '-') orelse break :blk StreamID.MIN;
         const ts = std.fmt.parseInt(u64, cs[0..sep_pos], 10) catch break :blk StreamID.MIN;
         const seq = std.fmt.parseInt(u64, cs[sep_pos + 1 ..], 10) catch break :blk StreamID.MIN;
         break :blk StreamID{ .timestamp_ms = ts, .sequence = seq };
     } else StreamID.MIN;
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "stream read", err);
+    defer reader.deinit();
+    const info = switch (try streamInfo(allocator, &reader, ns_q, stream_name)) {
+        .info => |i| i,
+        .answer => |a| return a,
+    };
+    // The read takes the records after `start_id`, whole appends within
+    // `limit`, and waits for none.
+    var got = ask(&reader, client_mod.stream.read, .{ ns_q, stream_name, client_mod.stream.StartMode.stream_id, @as(?StreamID, start_id), @as(?StreamID, null), @as(?u32, limit), @as(?u32, null), @as(?u32, null), @as(?[]const u8, null) }) catch |err|
+        return try loopback.readFailed(allocator, "stream read", err);
+    defer got.deinit();
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -419,103 +360,79 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
     try obj.begin();
 
     var msg_count: u64 = 0;
-    var total_count: u64 = 0;
     var last_id: StreamID = StreamID.MIN;
-
     {
         var msgs_arr = try obj.arrayField("messages");
         try msgs_arr.begin();
-
-        // Read from shard 0's stream projection using StreamRecord, then resolve
-        // each record's payload from the partition's UAL via the wrap-safe
-        // readCopy (the zero-copy read silently skips ring-boundary-wrapping
-        // entries — a data-loss hazard, see getEntry-wrap-unsafe).
-        if (getShard(ctx, 0)) |shard| {
-            const partition = shard.defaultPartition();
-            const sp = &partition.stream;
-            const name_hash = router.nameHash(router.namespaceHash(ns_q), stream_name);
-            total_count = streamLogicalCount(sp, name_hash);
-            const cap: usize = @min(@as(usize, @intCast(limit)), stream_mod.MAX_READ_RECORDS);
-
-            const StreamRecord = stream_mod.StreamRecord;
-            const buf = allocator.alloc(StreamRecord, cap) catch null;
-            defer if (buf) |b| allocator.free(b);
-            if (buf) |b| {
-                const read_count = sp.readStreamAfter(name_hash, start_id, null, b);
-                // Whole appends within the record budget, so the cursor never
-                // lands inside one and the next page skips nothing.
-                const whole = stream_mod.wholeEntriesWithin(b[0..read_count], cap);
-                // A stored append is at most one request, plus its framing.
-                const payload_buf = try allocator.alloc(u8, 2 * shard_mod.MAX_REQUEST_SIZE);
-                defer allocator.free(payload_buf);
-                for (b[0..whole]) |rec| {
-                    // entry → CommandPayload.value → strip partition prefix → batch blob → its records
-                    var batch: ?stream_mod.BatchIterator = null;
-                    if (partition.ual.readCopy(rec.ual_index, payload_buf)) |entry| {
-                        if (entry.commandPayload()) |cmd| {
-                            batch = stream_mod.BatchIterator.init(stream_mod.decodeAppendValue(cmd.value).payload) catch null;
-                        }
-                    }
-                    var it = batch orelse {
-                        // Couldn't read/parse — still surface the record (id only).
-                        try msgs_arr.next();
-                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try mobj.begin();
-                        try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
-                        try mobj.intField("id_seq", @as(i64, @intCast(rec.id.sequence)));
-                        try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
-                        try mobj.intField("size", 0);
-                        try mobj.stringField("payload", "");
-                        try mobj.end();
-                        last_id = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + rec.record_count - 1 };
-                        msg_count += 1;
-                        continue;
-                    };
-                    var j: u64 = 0;
-                    while (it.next()) |br| : (j += 1) {
-                        const seq = rec.id.sequence + j;
-                        // A cursor inside an append resumes with the rest of it.
-                        const rid: stream_mod.StreamID = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = seq };
-                        if (!rid.greaterThan(start_id)) continue;
-                        const payload = if (std.unicode.utf8ValidateSlice(br.payload)) br.payload else "<binary>";
-                        try msgs_arr.next();
-                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try mobj.begin();
-                        try mobj.intField("id_ms", @as(i64, @intCast(rec.id.timestamp_ms)));
-                        try mobj.intField("id_seq", @as(i64, @intCast(seq)));
-                        try mobj.intField("ual_index", @as(i64, @intCast(rec.ual_index)));
-                        try mobj.intField("size", @as(i64, @intCast(payload.len)));
-                        try mobj.stringField("payload", payload);
-                        try mobj.end();
-                        last_id = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = seq };
-                        msg_count += 1;
-                    }
-                }
+        // [count:u32]([sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
+        //   [key_present:u8]([key_len:u32][key])?[payload_len:u32][payload]
+        //   [header_count:u32]([key_len:u32][key][value_len:u32][value])*)*
+        const malformed = "stream read: malformed answer";
+        var r = WireReader.init(got.data);
+        const count = r.readU32() orelse 0;
+        for (0..count) |_| {
+            const seq = r.readU64() orelse return try h.jsonError(allocator, malformed);
+            const ts = r.readI64() orelse return try h.jsonError(allocator, malformed);
+            _ = r.readU8() orelse return try h.jsonError(allocator, malformed); // tier
+            _ = r.readU32() orelse return try h.jsonError(allocator, malformed); // partition
+            const key_present = r.readU8() orelse return try h.jsonError(allocator, malformed);
+            if (key_present != 0) _ = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
+            const raw = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
+            const header_count = r.readU32() orelse return try h.jsonError(allocator, malformed);
+            for (0..header_count) |_| {
+                _ = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
+                _ = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
             }
+            const payload = if (std.unicode.utf8ValidateSlice(raw)) raw else "<binary>";
+            try msgs_arr.next();
+            var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try mobj.begin();
+            try mobj.intField("id_ms", ts);
+            try mobj.intField("id_seq", seq);
+            try mobj.nullField("ual_index");
+            try mobj.intField("size", payload.len);
+            try mobj.stringField("payload", payload);
+            try mobj.end();
+            last_id = .{ .timestamp_ms = @intCast(@max(ts, 0)), .sequence = seq };
+            msg_count += 1;
         }
-
         try msgs_arr.end();
     }
 
     // Next cursor — only present if we returned records
     if (msg_count > 0) {
-        // Format as "ts-seq"
         var cursor_buf: [64]u8 = undefined;
         const cursor_slice = std.fmt.bufPrint(&cursor_buf, "{d}-{d}", .{ last_id.timestamp_ms, last_id.sequence }) catch "";
         try obj.stringField("next_cursor", cursor_slice);
     }
 
-    try obj.intField("limit", @as(i64, @intCast(limit)));
+    try obj.intField("limit", limit);
     try obj.intField("count", msg_count);
-    try obj.intField("total_count", total_count);
-    try obj.intField("total_bytes", 0);
+    try obj.intField("total_count", info.count);
+    try obj.intField("total_bytes", info.bytes);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /streams/:name/groups/:group - Consumer group detail
+/// GET /streams/:name/groups/:group - Consumer group detail, from
+/// `stream_group_info`. No op lists a group's members yet: `members` is null.
 pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    if (hasNul(stream_name) or hasNul(group_name)) return error.NotFound;
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "group info", err);
+    defer reader.deinit();
+    var got = ask(&reader, client_mod.stream.groupInfo, .{ ns_q, stream_name, group_name }) catch |err|
+        return try loopback.readFailed(allocator, "group info", err);
+    defer got.deinit();
+    // An unknown group answers as an empty one.
+    const info: GroupInfo = if (got.isNotFound())
+        .{ .pending = 0, .members = 0 }
+    else if (got.isError())
+        return try h.jsonError(allocator, got.errorMessage())
+    else
+        parseGroupInfo(got.data) orelse return try h.jsonError(allocator, "group info: malformed answer");
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -525,144 +442,80 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     try obj.stringField("stream", stream_name);
     try obj.stringField("group", group_name);
     try obj.stringField("namespace", ns_q);
-
-    // Find group across shard projections. Groups are keyed per-(stream, group)
-    // as `qualifyGroupKey(ns, stream, group)`; honor the `?namespace=` param so
-    // non-default-namespace streams resolve (matches getStreamDetail).
-    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
-    var found = false;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_key)) |group| {
-                found = true;
-                try obj.intField("generation", 0);
-                try obj.intField("partition_count", 1);
-                try obj.intField("member_count", group.members.count());
-
-                {
-                    var members_arr = try obj.arrayField("members");
-                    try members_arr.begin();
-                    var mit = group.members.iterator();
-                    while (mit.next()) |me| {
-                        try members_arr.next();
-                        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try mobj.begin();
-                        try mobj.stringField("id", me.value_ptr.id);
-                        try mobj.stringField("state", if (me.value_ptr.state == .active) "active" else "leaving");
-                        try mobj.end();
-                    }
-                    try members_arr.end();
-                }
-
-                {
-                    var assignments_arr = try obj.arrayField("assignments");
-                    try assignments_arr.begin();
-                    try assignments_arr.end();
-                }
-
-                try obj.intField("pending_count", group.pelCount());
-                break;
-            }
-        }
-    }
-
-    if (!found) {
-        try obj.intField("generation", 0);
-        try obj.intField("partition_count", 1);
-        try obj.intField("member_count", 0);
-        var members_arr = try obj.arrayField("members");
-        try members_arr.begin();
-        try members_arr.end();
+    try obj.intField("generation", 0);
+    try obj.intField("partition_count", 1);
+    try obj.intField("member_count", info.members);
+    try obj.nullField("members");
+    {
         var assignments_arr = try obj.arrayField("assignments");
         try assignments_arr.begin();
         try assignments_arr.end();
-        try obj.intField("pending_count", 0);
     }
-
+    try obj.intField("pending_count", info.pending);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /streams/:name/groups/:group/members - Consumer group members (flat array)
+/// GET /streams/:name/groups/:group/members - No op lists a group's members
+/// yet, so this says so rather than answer an empty list.
 pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-
-    var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
-    const writer = &json_aw.writer;
-
-    var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
-    try arr.begin();
-
-    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_key)) |group| {
-                var mit = group.members.iterator();
-                while (mit.next()) |me| {
-                    try arr.next();
-                    var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try mobj.begin();
-                    try mobj.stringField("id", me.value_ptr.id);
-                    try mobj.stringField("state", if (me.value_ptr.state == .active) "active" else "leaving");
-                    try mobj.intField("joined_at", @as(i64, @intCast(me.value_ptr.joined_at_ns / std.time.ns_per_ms)));
-                    try mobj.end();
-                }
-                break;
-            }
-        }
-    }
-
-    try arr.end();
-    return try json_aw.toOwnedSlice();
+    _ = stream_name;
+    _ = group_name;
+    _ = query_string;
+    _ = ctx;
+    return try h.jsonError(allocator, "group members are not available yet");
 }
 
-/// GET /streams/:name/groups/:group/pending - Pending messages
+/// GET /streams/:name/groups/:group/pending - Pending messages, from
+/// `stream_group_pending` (at most one read's worth) and the group's whole
+/// count from `stream_group_info`. `delivered_at_ms` is null: the answer
+/// doesn't carry it.
 pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    if (hasNul(stream_name) or hasNul(group_name)) return error.NotFound;
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "group pending", err);
+    defer reader.deinit();
+    var info_got = ask(&reader, client_mod.stream.groupInfo, .{ ns_q, stream_name, group_name }) catch |err|
+        return try loopback.readFailed(allocator, "group info", err);
+    defer info_got.deinit();
+    var got = ask(&reader, client_mod.stream.groupPending, .{ ns_q, stream_name, group_name }) catch |err|
+        return try loopback.readFailed(allocator, "group pending", err);
+    defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    const PendingEntry = @import("../../../projection/stream.zig").PendingEntry;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     var pending_arr = try obj.arrayField("pending");
     try pending_arr.begin();
 
-    var gk_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = groupKey(&gk_buf, ns_q, stream_name, group_name) orelse return error.NotFound;
-    var pel_count: usize = 0;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getStreamProjection(ctx, i)) |sp| {
-            if (sp.getGroup(group_key)) |group| {
-                pel_count = group.pelCount();
-                const cap: usize = @min(pel_count, 1000);
-                const buf = allocator.alloc(PendingEntry, cap) catch null;
-                defer if (buf) |b| allocator.free(b);
-                if (buf) |b| {
-                    const count = group.getPending(null, b);
-                    for (b[0..count]) |pe| {
-                        try pending_arr.next();
-                        var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try pobj.begin();
-                        try pobj.intField("id_ms", @as(i64, @intCast(pe.id.timestamp_ms)));
-                        try pobj.intField("id_seq", @as(i64, @intCast(pe.id.sequence)));
-                        try pobj.stringField("consumer", pe.consumer);
-                        try pobj.intField("delivered_at_ms", @as(i64, @intCast(pe.delivered_at_ms)));
-                        try pobj.intField("delivery_count", @as(i64, @intCast(pe.delivery_count)));
-                        try pobj.end();
-                    }
-                }
-                break;
-            }
+    // An unknown group answers as an empty one.
+    var pel_count: u64 = 0;
+    if (!info_got.isNotFound() and !got.isNotFound()) {
+        if (info_got.isError()) return try h.jsonError(allocator, info_got.errorMessage());
+        if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+        const malformed = "group pending: malformed answer";
+        pel_count = (parseGroupInfo(info_got.data) orelse return try h.jsonError(allocator, malformed)).pending;
+        // [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])*
+        var r = WireReader.init(got.data);
+        const count = r.readU32() orelse return try h.jsonError(allocator, malformed);
+        for (0..count) |_| {
+            const ts = r.readU64() orelse return try h.jsonError(allocator, malformed);
+            const seq = r.readU64() orelse return try h.jsonError(allocator, malformed);
+            const deliveries = r.readU32() orelse return try h.jsonError(allocator, malformed);
+            const consumer = r.readLengthPrefixed(u16) orelse return try h.jsonError(allocator, malformed);
+            try pending_arr.next();
+            var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try pobj.begin();
+            try pobj.intField("id_ms", ts);
+            try pobj.intField("id_seq", seq);
+            try pobj.stringField("consumer", consumer);
+            try pobj.nullField("delivered_at_ms");
+            try pobj.intField("delivery_count", deliveries);
+            try pobj.end();
         }
     }
 
@@ -676,38 +529,62 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
 // Tests
 // =============================================================================
 
-test "getStreams returns empty when no streams registered" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try getStreams(allocator, null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+/// A context whose node port refuses every connect.
+fn unreachableNode(metrics: *h.MetricsRegistry) DashboardContext {
+    var ctx = DashboardContext.init(std.testing.allocator, metrics, 1);
+    ctx.listen_port = 1; // nothing listens here
+    return ctx;
 }
 
-test "getStreamDetail returns detail without shards" {
+test "stream reads say the node didn't answer, never an empty list" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableNode(&metrics);
 
-    const result = try getStreamDetail(allocator, "events", null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"events\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"partitions\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"consumer_groups\":[]") != null);
+    const answers = [_][]const u8{
+        try getStreams(allocator, null, &ctx),
+        try getStreamDetail(allocator, "events", null, &ctx),
+        try getStreamMessages(allocator, "events", null, &ctx),
+        try getGroupDetail(allocator, "events", "g", null, &ctx),
+        try getGroupPending(allocator, "events", "g", null, &ctx),
+    };
+    defer for (answers) |a| allocator.free(a);
+    for (answers) |a| {
+        try std.testing.expect(std.mem.startsWith(u8, a, "{\"error\":"));
+        try std.testing.expect(std.mem.indexOf(u8, a, "failed") != null);
+    }
 }
 
-test "getStreamMessages returns empty" {
+test "stream group members say they are not available yet" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableNode(&metrics);
 
-    const result = try getStreamMessages(allocator, "events", null, &ctx);
+    const result = try getGroupMembers(allocator, "events", "g", null, &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"messages\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"count\":0") != null);
+    try std.testing.expectEqualStrings("{\"error\":\"group members are not available yet\"}", result);
+}
+
+test "stream group reads refuse a name holding a NUL before they connect" {
+    const allocator = std.testing.allocator;
+    var metrics = h.MetricsRegistry.init(allocator);
+    defer metrics.deinit();
+    var ctx = unreachableNode(&metrics);
+
+    try std.testing.expectError(error.NotFound, getGroupDetail(allocator, "events", "a\x00b", null, &ctx));
+    try std.testing.expectError(error.NotFound, getGroupPending(allocator, "e\x00v", "g", null, &ctx));
+}
+
+test "stream info answers parse; a short one doesn't" {
+    var buf: [76]u8 = @splat(0);
+    std.mem.writeInt(u64, buf[32..40], 7, .little);
+    std.mem.writeInt(u64, buf[40..48], 99, .little);
+    std.mem.writeInt(u32, buf[48..52], 3, .little);
+    const info = parseInfo(&buf).?;
+    try std.testing.expectEqual(@as(u64, 7), info.count);
+    try std.testing.expectEqual(@as(u64, 99), info.bytes);
+    try std.testing.expectEqual(@as(u32, 3), info.partition_count);
+    try std.testing.expect(parseInfo(buf[0..40]) == null);
 }

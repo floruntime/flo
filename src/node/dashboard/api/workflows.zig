@@ -23,6 +23,9 @@ const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler
 const wf_parser = @import("../../../workflow/parser.zig");
 const wf_definition = @import("../../../workflow/definition.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
+const loopback = @import("loopback.zig");
+const cli_output = @import("../../../cli/output.zig");
+const WireReader = @import("../../../util/wire.zig").WireReader;
 
 // ── Helpers ──
 
@@ -82,7 +85,7 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
         }
         // /workflow/definitions/:name
         if (method != .GET) return error.MethodNotAllowed;
-        return getDefinition(allocator, rest, ctx);
+        return getDefinition(allocator, rest, query_string, ctx);
     }
 
     // /workflow/runs/:id[/history|/signal]
@@ -113,8 +116,58 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
 // Definitions
 // ---------------------------------------------------------------------------
 
+/// A `workflow_list_definitions` entry: [name:u16][version:u16][created_at:i64].
+pub const definition_columns: []const cli_output.WireColumn = &.{
+    .{ .field = "name", .header = "", .field_type = .str_u16 },
+    .{ .field = "version", .header = "", .field_type = .str_u16 },
+    .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+};
+
+/// Asks for one page of a namespace's definitions, for `Reader.listAll`.
+pub const DefinitionsAsker = struct {
+    namespace: []const u8,
+
+    pub fn ask(self: DefinitionsAsker, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.workflow.listDefinitions(client, self.namespace, null, cursor);
+    }
+};
+
+const Definition = struct { name: []const u8, version: []const u8, created_at: i64 };
+
+/// The definitions of a `[count:u32]entries` list, as `listAll` gathers it.
+const Definitions = struct {
+    reader: WireReader,
+    left: u32,
+
+    fn init(list: []const u8) Definitions {
+        var reader = WireReader.init(list);
+        const count = reader.readU32() orelse 0;
+        return .{ .reader = reader, .left = count };
+    }
+
+    fn next(self: *Definitions) error{Truncated}!?Definition {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const name = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        const version = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        const created_at = self.reader.readI64() orelse return error.Truncated;
+        return .{ .name = name, .version = version, .created_at = created_at };
+    }
+};
+
+/// GET /workflow/definitions?namespace= (and /workflows) — a namespace's
+/// definitions, with the step metadata of each one's YAML. The dashboard asks
+/// each shard, as any client does: the list walk for name, version and
+/// created_at, then each definition's YAML. No op says whether one is
+/// enabled, so `enabled` is null.
 fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "workflow definitions", err);
+    defer reader.deinit();
+    var pages = reader.listAll(allocator, definition_columns, DefinitionsAsker{ .namespace = ns }) catch |err|
+        return try loopback.readFailed(allocator, "workflow definitions", err);
+    defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -123,46 +176,30 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // Collect definitions from all shards (de-duplicate by name)
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
+    var defs = Definitions.init(pages.list());
+    while (defs.next() catch return try h.jsonError(allocator, "workflow definitions: malformed answer")) |d| {
+        var got = client_mod.workflow.getDefinition(reader.next() catch |err| return try loopback.readFailed(allocator, "workflow definition", err), ns, d.name, null) catch |err|
+            return try loopback.readFailed(allocator, "workflow definition", err);
+        defer got.deinit();
+        // Deleted since the list was read.
+        if (got.isNotFound()) continue;
+        if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            const wh = shard.workflow_handler;
-            var it = wh.definitions.iterator();
-            while (it.next()) |entry| {
-                const rec = entry.value_ptr;
-                const map_key = entry.key_ptr.*;
-                // Filter by namespace (defaults to "default", map key is "namespace:name")
-                if (std.mem.indexOfScalar(u8, map_key, ':')) |colon| {
-                    if (!std.mem.eql(u8, map_key[0..colon], ns_filter)) continue;
-                }
-                const gop = try seen.getOrPut(rec.name_owned);
-                if (!gop.found_existing) {
-                    try arr.next();
-                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try obj.begin();
-                    try obj.stringField("name", rec.name_owned);
-                    try obj.stringField("version", rec.version_owned);
-                    try obj.intField("created_at", rec.created_at_ms);
-                    // Check if disabled
-                    const is_disabled = wh.disabled.contains(entry.key_ptr.*);
-                    try obj.boolField("enabled", !is_disabled);
-
-                    // Parse YAML to extract step metadata
-                    if (wf_parser.parseWorkflow(allocator, rec.yaml_owned, null)) |parsed| {
-                        var def = parsed;
-                        defer def.deinit(allocator);
-                        try def.writeJsonMeta(&obj);
-                    } else |_| {
-                        try wf_definition.WorkflowDefinition.writeJsonMetaEmpty(&obj);
-                    }
-                    try obj.end();
-                }
-            }
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("name", d.name);
+        try obj.stringField("version", d.version);
+        try obj.intField("created_at", d.created_at);
+        try obj.nullField("enabled");
+        if (wf_parser.parseWorkflow(allocator, got.data, null)) |parsed| {
+            var def = parsed;
+            defer def.deinit(allocator);
+            try def.writeJsonMeta(&obj);
+        } else |_| {
+            try wf_definition.WorkflowDefinition.writeJsonMetaEmpty(&obj);
         }
+        try obj.end();
     }
 
     try arr.end();
@@ -215,70 +252,54 @@ fn createDefinition(allocator: Allocator, query_string: ?[]const u8, body: []con
     return try json_aw.toOwnedSlice();
 }
 
-fn getDefinition(allocator: Allocator, name: []const u8, ctx: *DashboardContext) ![]const u8 {
+/// GET /workflow/definitions/:name?namespace= — one definition's YAML, with
+/// its version and created_at from the list walk. The dashboard asks each
+/// shard, as any client does. No op says whether it is enabled or how many
+/// runs it has had, so `enabled`, `status` and `run_count` are null.
+fn getDefinition(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "workflow definition", err);
+    defer reader.deinit();
+    var got = client_mod.workflow.getDefinition(reader.next() catch |err| return try loopback.readFailed(allocator, "workflow definition", err), ns, name, null) catch |err|
+        return try loopback.readFailed(allocator, "workflow definition", err);
+    defer got.deinit();
+    if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Search shards for this definition
-    var found_rec: ?*const WorkflowHandler.DefinitionRecord = null;
-    var found_handler: ?*const WorkflowHandler = null;
-    var found_key: ?[]const u8 = null;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            const wh = shard.workflow_handler;
-            // Definitions are keyed by "namespace:name"; try the name directly first
-            if (wh.definitions.getPtr(name)) |rec| {
-                found_rec = rec;
-                found_handler = wh;
-                found_key = name;
-                break;
-            }
-            // Also search by matching the record's name_owned field
-            var it = wh.definitions.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.value_ptr.name_owned, name)) {
-                    found_rec = entry.value_ptr;
-                    found_handler = wh;
-                    found_key = entry.key_ptr.*;
-                    break;
-                }
-            }
-            if (found_rec != null) break;
-        }
-    }
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", name);
 
-    if (found_rec) |rec| {
-        try obj.stringField("version", rec.version_owned);
-        try obj.intField("created_at", rec.created_at_ms);
-        const is_disabled = if (found_handler) |wh_ptr| (if (found_key) |k| wh_ptr.disabled.contains(k) else false) else false;
-        try obj.boolField("enabled", !is_disabled);
-        try obj.stringField("status", if (is_disabled) "disabled" else "active");
-        try obj.stringField("definition_yaml", rec.yaml_owned);
-
-        // Count runs for this workflow
-        var run_count: u64 = 0;
-        for (0..n) |i| {
-            if (getShard(ctx, i)) |shard| {
-                var rit = shard.workflow_handler.runs.iterator();
-                while (rit.next()) |re| {
-                    if (std.mem.eql(u8, re.value_ptr.workflow_name_owned, name)) {
-                        run_count += 1;
-                    }
-                }
+    if (got.isNotFound()) {
+        try obj.stringField("status", "unknown");
+    } else {
+        var pages = reader.listAll(allocator, definition_columns, DefinitionsAsker{ .namespace = ns }) catch |err|
+            return try loopback.readFailed(allocator, "workflow definitions", err);
+        defer pages.deinit();
+        var listed: ?Definition = null;
+        var defs = Definitions.init(pages.list());
+        while (defs.next() catch return try h.jsonError(allocator, "workflow definitions: malformed answer")) |d| {
+            if (std.mem.eql(u8, d.name, name)) {
+                listed = d;
+                break;
             }
         }
-        try obj.intField("run_count", @as(i64, @intCast(run_count)));
-    } else {
-        try obj.stringField("status", "unknown");
-        try obj.boolField("enabled", false);
-        try obj.intField("run_count", 0);
+        if (listed) |d| {
+            try obj.stringField("version", d.version);
+            try obj.intField("created_at", d.created_at);
+        } else {
+            try obj.nullField("version");
+            try obj.nullField("created_at");
+        }
+        try obj.nullField("status");
+        try obj.stringField("definition_yaml", got.data);
     }
+    try obj.nullField("enabled");
+    try obj.nullField("run_count");
 
     try obj.end();
     return try json_aw.toOwnedSlice();
@@ -995,15 +1016,16 @@ fn containsLower(haystack: []const u8, needle_lower: []const u8) bool {
 // Tests
 // =============================================================================
 
-test "handleWorkflowRequest routes definitions" {
+test "handleWorkflowRequest routes definitions to the list walk, which says when no node answers" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: a connect would be refused
 
     const result = try handleWorkflowRequest(allocator, .GET, "/definitions", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"workflow definitions failed: "));
 }
 
 test "handleWorkflowRequest routes runs" {
@@ -1017,15 +1039,16 @@ test "handleWorkflowRequest routes runs" {
     try std.testing.expectEqualStrings("[]", result);
 }
 
-test "handleWorkflowRequest get definition detail" {
+test "handleWorkflowRequest routes a definition's detail to its get, which says when no node answers" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: a connect would be refused
 
-    const result = try handleWorkflowRequest(allocator, .GET, "/definitions/my-workflow", null, "", &ctx);
+    const result = try handleWorkflowRequest(allocator, .GET, "/definitions/my-workflow", "namespace=other", "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"my-workflow\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"workflow definition failed: "));
 }
 
 test "handleWorkflowRequest cancel run surfaces loopback failure (no node in unit test)" {

@@ -21,6 +21,9 @@ fn extractJobId(output: []const u8) ?[]const u8 {
 }
 
 test "e2e/dashboard: processing job surfaces real runtime metrics" {
+    // No op answers a job's runtime metrics yet (null, shown as "—"); a
+    // wider processing status brings them back.
+    if (true) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });

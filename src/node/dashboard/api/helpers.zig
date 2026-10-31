@@ -5,7 +5,6 @@
 //! - BinaryReader: Safe little-endian binary wire format parser
 //! - Query parameter parsing (generic over int types + string)
 //! - JSON error responses
-//! - Run statistics types + JSON helpers
 
 const std = @import("std");
 const log = @import("stdx").log;
@@ -21,20 +20,18 @@ pub const NodeHealth = @import("../../health.zig").NodeHealth;
 
 /// Central context providing data access for dashboard API handlers.
 ///
-/// In the new shard architecture, the dashboard thread communicates with
-/// shards via direct projection reads (read-only) and MetricsRegistry
-/// (mutex-protected metadata).
-///
-/// `shard_ptrs` holds opaque pointers to the Shard array — each API
-/// handler casts to the concrete type when it needs projection data.
-/// Read-only access is safe for dashboard display purposes.
+/// A shard's state is its own thread's: the dashboard reads it by asking
+/// the node over loopback, as any client does (`loopback.zig`), and reads
+/// MetricsRegistry (mutex-protected) directly. Reading a shard's maps from
+/// this thread races its writes.
 pub const DashboardContext = struct {
     allocator: Allocator,
     metrics: *MetricsRegistry,
     num_shards: u32,
     start_time: i64,
-    /// Opaque pointers to Shard structs (set by runtime after shard creation).
-    /// Handlers cast via `getShard()` to access projections read-only.
+    /// Opaque pointers to Shard structs (set by runtime after shard
+    /// creation). Only the workflow run views still read through them,
+    /// until list-runs asks each shard.
     shard_ptrs: ?[]*anyopaque,
     /// The node's own client port and the address it is reachable at from
     /// this process. Mutations from the dashboard thread are issued as a
@@ -249,35 +246,6 @@ pub fn jsonError(allocator: Allocator, message: []const u8) ![]const u8 {
     try obj.end();
 
     return try json_aw.toOwnedSlice();
-}
-
-// =============================================================================
-// Run Statistics Types + JSON Helpers
-// =============================================================================
-
-/// Run statistics counters
-pub const RunCounts = struct {
-    total: u32 = 0,
-    pending: u32 = 0,
-    running: u32 = 0,
-    completed: u32 = 0,
-    failed: u32 = 0,
-    cancelled: u32 = 0,
-    timed_out: u32 = 0,
-};
-
-/// Write RunCounts as a nested JSON object field
-pub fn writeRunCountsJson(writer: anytype, counts: RunCounts) !void {
-    var runs_obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-    try runs_obj.begin();
-    try runs_obj.intField("total", counts.total);
-    try runs_obj.intField("pending", counts.pending);
-    try runs_obj.intField("running", counts.running);
-    try runs_obj.intField("completed", counts.completed);
-    try runs_obj.intField("failed", counts.failed);
-    try runs_obj.intField("cancelled", counts.cancelled);
-    try runs_obj.intField("timed_out", counts.timed_out);
-    try runs_obj.end();
 }
 
 // =============================================================================
