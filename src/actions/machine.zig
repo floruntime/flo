@@ -1068,3 +1068,18 @@ test "actions machine: a delivery's request key is recorded at its deliver and g
     _ = try t.apply(.action_expire, try expiring(&ibuf, item), expiry);
     try testing.expectEqual(@as(usize, 0), t.count(Requests));
 }
+
+test "actions machine: a run completed after a failed attempt keeps no error" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    var rel = releaseOf(&t, "r1", false);
+    rel.delay_ms = 0;
+    _ = try t.apply(.action_release, rel, 21 * ms);
+    try testing.expectEqualStrings("boom", t.run("default", "r1").?.@"error");
+    try testing.expect((try deliver(&t, "r1", 21 * ms, 22 * ms)).refused() == null);
+    _ = try t.apply(.action_settle, settleOf(&t, "r1"), 23 * ms);
+    try testing.expectEqualStrings("", t.run("default", "r1").?.@"error");
+}
