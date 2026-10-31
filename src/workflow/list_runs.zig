@@ -93,8 +93,9 @@ pub fn ownPage(handler: *WorkflowHandler, namespace: []const u8, workflow: []con
     var b = Runs.Builder.init(buf);
     var used: usize = 0;
     for (page, 0..) |r, i| {
-        // A run id longer than a list carries can't be one a run has.
-        if (r.run_id.len > system_ops.MAX_RUN_ID) continue;
+        // No run has an id longer than a list carries: its start entry,
+        // keyed by the id, can't hold one (`system_ops.MAX_RUN_ID`).
+        std.debug.assert(r.run_id.len <= system_ops.MAX_RUN_ID);
         var eb: [system_ops.MAX_RUN_ENTRY]u8 = undefined;
         const entry = writeEntry(&eb, r);
         if (i == q.limit or used + entry.len > room or !(b.add(.{ .at = atOf(r), .entry = entry }) catch false))
