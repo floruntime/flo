@@ -833,29 +833,29 @@ pub const Command = struct {
 
     /// Get a flag by name (includes inherited persistent flags)
     pub fn getFlag(self: *Command, name: []const u8) ?*Flag {
-        // Check local flags first (linear lookup)
-        for (self.flags.items) |*flag| {
-            if (std.mem.eql(u8, flag.long, name)) {
-                return flag;
-            }
-        }
-        // Check local persistent flags
-        for (self.persistent_flags.items) |*flag| {
-            if (std.mem.eql(u8, flag.long, name)) {
-                return flag;
-            }
-        }
-        // Check parent's persistent flags
+        var own: ?*Flag = null;
+        for (self.flags.items) |*flag| if (std.mem.eql(u8, flag.long, name)) {
+            own = flag;
+            break;
+        };
+        if (own == null) for (self.persistent_flags.items) |*flag| if (std.mem.eql(u8, flag.long, name)) {
+            own = flag;
+            break;
+        };
+        var inherited: ?*Flag = null;
         var parent_ptr = self.parent;
-        while (parent_ptr) |p| {
-            for (p.persistent_flags.items) |*flag| {
-                if (std.mem.eql(u8, flag.long, name)) {
-                    return flag;
-                }
-            }
-            parent_ptr = p.parent;
+        while (parent_ptr) |p| : (parent_ptr = p.parent) {
+            for (p.persistent_flags.items) |*flag| if (std.mem.eql(u8, flag.long, name)) {
+                // A global flag this command declares again, given before
+                // the command's name (`flo -e host:port kv get k`): it applies
+                // here, over the command's own default. A flag of the same
+                // name but another letter or type is the command's own.
+                if (own) |o| {
+                    if (!o.changed and flag.changed and o.short == flag.short and o.value_type == flag.value_type) return flag;
+                } else if (inherited == null or (flag.changed and !inherited.?.changed)) inherited = flag;
+            };
         }
-        return null;
+        return own orelse inherited;
     }
 
     /// Get a flag by short name
@@ -1829,4 +1829,40 @@ test "help shows an inherited flag as it parses from the command: hidden by a sh
     try std.testing.expect(std.mem.indexOf(u8, help, "-n\x1b[0m, --namespace") == null);
     try std.testing.expect(std.mem.indexOf(u8, help, "-n\x1b[0m, --node-id") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "-o\x1b[0m, --output") != null);
+}
+
+test "a global flag given before the command applies to a command that declares it again, but not to its own flag of the name" {
+    const allocator = std.testing.allocator;
+    const root = Command.init(allocator, .{ .name = "app" });
+    defer root.deinit();
+    try root.addPersistentFlag(.{ .long = "endpoint", .short = 'e', .description = "", .value_type = .string, .default = .{ .string = "" } });
+    try root.addPersistentFlag(.{ .long = "port", .short = 'p', .description = "", .value_type = .uint, .default = .{ .uint = 0 } });
+    const Seen = struct {
+        endpoint: [32]u8 = undefined,
+        endpoint_len: usize = 0,
+        port: u32 = 99,
+    };
+    var seen: Seen = .{};
+    const child = Command.init(allocator, .{
+        .name = "get",
+        .run = wrapTestRun(struct {
+            fn run(ctx: *Context) Error!void {
+                const s: *Seen = @ptrCast(@alignCast(ctx.user_data.?));
+                const ep = ctx.getString("endpoint") orelse "";
+                @memcpy(s.endpoint[0..ep.len], ep);
+                s.endpoint_len = ep.len;
+                s.port = ctx.getUint("port") orelse 0;
+            }
+        }.run),
+        .user_data = @ptrCast(&seen),
+    });
+    try root.addCommand(child);
+    // The global flag again, as each command used to declare it.
+    try child.stringFlag("endpoint", 'e', "", "Server endpoint");
+    // Another flag of a global name: another letter makes it the command's own.
+    try child.uintFlag("port", 'P', 7, "Child port");
+
+    try root.executeSlice(&.{ "app", "-e", "host:1", "-p", "9", "get" });
+    try std.testing.expectEqualStrings("host:1", seen.endpoint[0..seen.endpoint_len]);
+    try std.testing.expectEqual(@as(u32, 7), seen.port);
 }

@@ -47,7 +47,6 @@ pub fn createReplCommand(allocator: Allocator) !*commander.Command {
             "flo repl --endpoint localhost:9000",
             "flo repl --namespace myapp",
         })
-        .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
         .stringFlag("namespace", 'n', "default", "Initial namespace")
         .action(wrapHandler(runRepl))
         .build();

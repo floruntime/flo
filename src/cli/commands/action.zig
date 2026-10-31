@@ -55,8 +55,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("owner", 0, "cli", "Owner/team name")
                 .uintFlag("timeout", 0, 30000, "Execution timeout (ms)")
                 .uintFlag("retries", 'r', 0, "Max retry attempts")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runRegister)),
         )
         .subcommand(
@@ -71,8 +69,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .arg("name", "Action name")
                 .arg("input", "Input payload (JSON)")
                 .stringFlag("labels", 'l', "", "Required worker labels (JSON, e.g. '{\"gpu\":true}')")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runInvoke)),
         )
         .subcommand(
@@ -80,8 +76,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .name("status")
                 .about("Get execution status")
                 .arg("run_id", "Run ID to check")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runStatus)),
         )
         .subcommand(
@@ -91,8 +85,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"ls"})
                 .uintFlag("limit", 'l', 100, "Maximum actions to show")
                 .stringFlag("prefix", 0, "", "Only actions whose names start with this")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runList)),
         )
         .subcommand(
@@ -101,8 +93,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .about("Delete an action")
                 .aliases(&.{"rm"})
                 .arg("name", "Action name to delete")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
@@ -112,8 +102,6 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"tasks"})
                 .arg("name", "Action name")
                 .uintFlag("limit", 'l', 50, "Maximum runs to show")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runRuns)),
         )
         .build();
@@ -141,8 +129,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .arg("worker_id", "Worker identifier")
                 .variadicArg("task_types", "Task types to handle, one or more")
                 .stringFlag("labels", 'l', "", "Worker labels (JSON, e.g. '{\"gpu\":true}')")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerRegister)),
         )
         .subcommand(
@@ -152,8 +138,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .variadicArg("task_types", "Task types to wait for, one or more")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .uintFlag("block", 'b', 5000, "Block for tasks (ms, at most 300000; 0 = don't wait)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerAwait)),
         )
         .subcommand(
@@ -164,8 +148,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .stringFlag("action", 'a', "", "Action name (required for routing)")
                 .stringFlag("result", 0, "", "Result payload (JSON)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerComplete)),
         )
         .subcommand(
@@ -177,8 +159,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("action", 'a', "", "Action name (required for routing)")
                 .stringFlag("error", 0, "", "Error message")
                 .boolFlag("retry", 'r', "Allow retry")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerFail)),
         )
         .subcommand(
@@ -189,8 +169,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .stringFlag("action", 'a', "", "Action name (required for routing)")
                 .uintFlag("extend", 0, 30000, "Extend by (ms)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerTouch)),
         )
         .subcommand(
@@ -199,8 +177,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .about("List registered workers")
                 .aliases(&.{"ls"})
                 .uintFlag("limit", 'l', 0, "Most workers to show (0: all)")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerList)),
         )
         .subcommand(
@@ -212,8 +188,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                     "flo worker drain worker-1 -n my-namespace",
                 })
                 .arg("worker_id", "Worker identifier to drain")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerDrain)),
         )
         .subcommand(
@@ -224,8 +198,6 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                     "flo worker info worker-1",
                 })
                 .arg("worker_id", "Worker identifier")
-                .stringFlag("namespace", 'n', "default", "Namespace to use")
-                .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runWorkerInfo)),
         )
         .build();
