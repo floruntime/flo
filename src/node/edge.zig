@@ -10,8 +10,8 @@ const ReplyTo = @import("reply_to.zig").ReplyTo;
 const Origin = @import("run.zig").Origin;
 const limits = @import("../protocol/limits.zig");
 
-/// Reads held at once, each shard. Past it a read is answered that the
-/// namespace isn't found, unasked.
+/// Reads held at once, each shard. Past it a read is refused overloaded,
+/// not run: never that the namespace isn't found, since nothing looked.
 pub const WAITS: usize = 64;
 /// How long a held read waits for the leader's answer and then for this
 /// node's table to catch up, before it is answered unavailable.

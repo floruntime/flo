@@ -108,6 +108,9 @@ test "e2e/scoping: a job is seen and changed only from its own namespace" {
     const submitted = try ctx.execCapture(&.{ "processing", "submit", path, "-n", "a" });
     const job_id = after(submitted, "Job submitted: ") orelse return error.NoJobId;
 
+    // From a namespace that exists but isn't the job's: a namespace never
+    // created is refused before any job is looked up.
+    try ctx.exec(&.{ "namespace", "create", "b" });
     for ([_][]const u8{ "status", "stop", "cancel" }) |verb| {
         var r = try ctx.cli.run(&.{ "processing", verb, job_id, "-n", "b" });
         defer r.deinit();

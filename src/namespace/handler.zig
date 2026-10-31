@@ -280,6 +280,9 @@ pub const NamespaceHandler = struct {
     pub const IDS_USED_UP_MESSAGE = "namespace not created: this node has no namespace id left";
     /// Shard 0's leader hasn't applied what earlier leaders committed, so
     /// it can't yet choose an id or count the room.
+    pub const PUBLISHED_NOT_READY = "unavailable: this node isn't a leader that has caught up, so it can't say which namespaces exist; the read was not run — retry";
+    /// A read waiting on a create that didn't end in one: it ran nothing.
+    const READ_UNSETTLED = "unavailable: the namespace's create didn't settle in time; the read was not run — retry";
     pub const CATCHING_UP_MESSAGE = "unavailable: a new leader is catching up; the namespace wasn't created — retry";
     pub const FLUSH_MESSAGE = "unavailable: the namespace isn't on disk yet; it may still be created — retry";
 
@@ -636,6 +639,10 @@ pub const NamespaceHandler = struct {
     /// is published, so the asker finds it.
     fn runPublished(shard: *Shard, conn: *Connection, req: Request) Error!table_run.Outcome(PublishedResponse) {
         const self = shard.namespace_handler;
+        // Only a ready leader's table has every create acknowledged: a
+        // deposed node's is behind, and a new leader's may not have applied
+        // its predecessor's yet.
+        if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = PUBLISHED_NOT_READY } } };
         const name = req.key;
         const unpublished = self.table.lookup(name) == null and (self.namespaces.contains(name) or self.pending_creates.contains(name));
         if (!unpublished) return .{ .answer = .{ .published_index = self.table.publishedIndex() } };
@@ -776,7 +783,10 @@ pub const NamespaceHandler = struct {
             }
             _ = self.waiters.swapRemove(i);
             defer self.freeWaiter(w);
-            shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = FLUSH_MESSAGE });
+            if (w.kind == .published)
+                shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
+            else
+                shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = FLUSH_MESSAGE });
         }
     }
 
@@ -799,8 +809,16 @@ pub const NamespaceHandler = struct {
             _ = self.waiters.swapRemove(i);
             defer self.freeWaiter(w);
             switch (how) {
-                .refused => |r| shard.deliverDeferredRefusal(w.reply_to, w.request_id, r.status, proto.notRun(r.message)),
-                .stopped_leading => shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: lost leadership before the namespace was created; it may still be — retry" }),
+                // A read waiting on the create: refused, there is no
+                // namespace; unsettled, it ran nothing either way.
+                .refused => |r| if (w.kind == .published)
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .no_namespace, .{ .reason = .not_found, .ran = .no, .message = "namespace not found" })
+                else
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, r.status, proto.notRun(r.message)),
+                .stopped_leading => if (w.kind == .published)
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
+                else
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: lost leadership before the namespace was created; it may still be — retry" }),
                 .published => switch (w.kind) {
                     .create => {
                         var buf: [@sizeOf(proto.ResponseHeader) + Empty.max_size]u8 = undefined;
