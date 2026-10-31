@@ -5155,7 +5155,7 @@ pub const Shard = struct {
             conn.give_up_bytes -|= consumed;
 
             // Dispatch request, detecting if the handler sent a response
-            const pending_before = conn.write_buf.readable();
+            const queued_before = conn.bytes_queued - conn.deferred_queued;
             const forwards_before = conn.forwards_in_flight;
             var answered_deferred = false;
             if (held) |w| self.refuseWaited(conn, req, w, waited) else answered_deferred = self.dispatchNoted(conn, req, if (conn.admin) .admin else .client);
@@ -5170,7 +5170,7 @@ pub const Shard = struct {
             // If handler didn't queue any response, check if it was deferred.
             // An answer refused because the client let 4 MiB of answers pile
             // up unread was produced; the connection closes on the next flush.
-            if (conn.write_buf.readable() == pending_before and !conn.response_deferred and !conn.write_overflow and !conn.closing) {
+            if (conn.bytes_queued - conn.deferred_queued == queued_before and !conn.response_deferred and !conn.write_overflow and !conn.closing) {
                 if (answered_deferred) {
                     self.answeredAsDeferred(req.header.request_id, req.header.op_code);
                 } else {
@@ -5910,7 +5910,7 @@ pub const Shard = struct {
         if (owner_shard == my_id) {
             const conn = self.getConnection(fd) orelse return;
             if (conn.id != conn_id) return; // fd was reused for a new connection
-            _ = conn.queueWrite(bytes);
+            conn.deferred_queued += conn.queueWrite(bytes);
             self.flushToClient(fd);
             return;
         }
@@ -5954,7 +5954,9 @@ pub const Shard = struct {
         }
         if (self.localConnection(reply_to)) |conn| {
             self.noteDeferred(reply_to, request_id);
+            const before = conn.bytes_queued;
             self.sendOkResponse(conn, request_id, data);
+            conn.deferred_queued += conn.bytes_queued - before;
             self.flushToClient(conn.fd);
             return;
         }
@@ -6969,6 +6971,36 @@ fn applyLoggedTo(handler: anytype, e: *const entry_mod.Entry) !void {
     try handler.replayEntry(e, &out);
 }
 
+const action_entries = @import("../protocol/action_entries.zig");
+const action_machine = @import("../actions/machine.zig");
+
+/// An action entry applied to `shard`'s store, as its log applies it.
+fn applyActionEntry(shard: *Shard, comptime etype: entry_mod.EntryType, body: anytype, index: u64, stamp_ns: u64) !persistence_mod.Result {
+    const buf = try std.testing.allocator.alloc(u8, 70_000);
+    defer std.testing.allocator.free(buf);
+    const e = try ActionsHandler.for_tests.entry(etype, body, 1, index, stamp_ns, buf);
+    var out = persistence_mod.Result.start(&e);
+    const p = shard.defaultPartition();
+    try contract_machine.applyEntry(&action_machine.machine, &p.store, &p.apply_scratch, &e, &out);
+    return out;
+}
+
+/// An action entry proposed, as its handler proposes it.
+fn proposeAction(shard: *Shard, comptime etype: entry_mod.EntryType, body: anytype) !raft_node_mod.ProposeResult {
+    const buf = try std.testing.allocator.alloc(u8, 70_000);
+    defer std.testing.allocator.free(buf);
+    const P = action_entries.Payload(@backingInt(etype));
+    return shard.raft_node.propose(etype, entry_mod.Flags.NONE, try P.encodeInto(buf, body));
+}
+
+fn testRegister(name: []const u8) action_entries.Register.Value {
+    return .{ .ns = "default", .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 3 };
+}
+
+fn testInvoke(name: []const u8, run_id: []const u8) action_entries.Invoke.Value {
+    return .{ .ns = "default", .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null };
+}
+
 test "Shard: init and deinit" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -7392,11 +7424,12 @@ test "Shard: a wait of 0 answers at once with no waiter, and a wait over 5 minut
     defer _ = std.c.close(c.pair[1]);
 
     const Case = struct { op: proto.OpCode, tag: proto.OptionTag, ms: u32, key: []const u8, value: []const u8, status: proto.StatusCode, waits: bool };
-    const await_value = [_]u8{ 1, 0, 0, 0, 1, 0, 'a' };
+    var await_buf: [64]u8 = undefined;
+    const await_value = try ActionsHandler.for_tests.awaitBody(&await_buf, &.{"a"}, 0, null);
     const cases = [_]Case{
         .{ .op = .queue_dequeue, .tag = .block_ms, .ms = 0, .key = "q", .value = "", .status = .ok, .waits = false },
         .{ .op = .kv_get, .tag = .block_ms, .ms = 0, .key = "missing", .value = "", .status = .not_found, .waits = false },
-        .{ .op = .action_await, .tag = .block_ms, .ms = 0, .key = "", .value = &await_value, .status = .ok, .waits = false },
+        .{ .op = .action_await, .tag = .block_ms, .ms = 0, .key = "", .value = await_value, .status = .ok, .waits = false },
         .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS, .key = "missing", .value = "", .status = .ok, .waits = true },
         .{ .op = .kv_get, .tag = .block_ms, .ms = waiter_pool_mod.MAX_BLOCK_MS + 1, .key = "missing", .value = "", .status = .bad_request, .waits = false },
     };
@@ -7499,6 +7532,16 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
         },
         // The namespace ops' bodies are empty records.
         .namespace_create, .namespace_delete, .namespace_info, .namespace_ensure => return "",
+        // An await's body as given, its wait taken from `block_ms` if set.
+        .action_await => {
+            const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
+            const ms = if (opts.findOption(.block_ms)) |o| o.asU32() orelse return value else return value;
+            var diag: schema.Diagnostic = .{};
+            var body = table_run.op("action.await").request.decodeAll(value, &diag) catch unreachable;
+            body.block_ms = ms;
+            return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
+        },
+        .action_complete, .action_fail, .action_touch, .action_deliver => return value,
         else => unreachable,
     }
 }
@@ -10447,11 +10490,9 @@ test "Shard: a worker's await on a node that does not lead goes to the leader" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
-    var await_value: [16]u8 = undefined;
-    std.mem.writeInt(u32, await_value[0..4], 1, .little);
-    std.mem.writeInt(u16, await_value[4..6], 3, .little);
-    @memcpy(await_value[6..9], "job");
-    shard.runRequest(conn, testReq(.action_await, 7, "", "w-1", await_value[0..9], ""), .client);
+    var await_buf: [64]u8 = undefined;
+    const await_value = try ActionsHandler.for_tests.awaitBody(&await_buf, &.{"job"}, 30_000, null);
+    shard.runRequest(conn, testReq(.action_await, 7, "", "w-1", await_value, ""), .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.action_await));
 }
@@ -10542,7 +10583,7 @@ test "Shard: a start that applies on a follower, or on a later leader, queues no
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
 }
 
-test "Shard: a node that stops leading forgets the action timeouts it proposed" {
+test "Shard: a node that stops leading forgets the expire it proposed and the runs it was delivering" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -10555,42 +10596,25 @@ test "Shard: a node that stops leading forgets the action timeouts it proposed" 
     try ParkTest.joinPeer(&shard);
     const actions = shard.actions_handler;
 
-    var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
-    var pbuf: [1024]u8 = undefined;
-    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?);
-    var inv_buf: [256]u8 = undefined;
-    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
-    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?);
-    const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
-    std.testing.allocator.free(task.body);
-
     // Proposed and not yet applied when this node stops leading.
-    actions.runs.getPtr("act-1").?.expiry_proposed = true;
+    actions.expiring = 7;
+    try actions.reserved.put(actions.allocator, try actions.allocator.dupe(u8, "run"), {});
     shard.replica.leadershipLost("test");
-    try std.testing.expect(!actions.runs.get("act-1").?.expiry_proposed);
+    try std.testing.expect(actions.expiring == null);
+    try std.testing.expectEqual(@as(u32, 0), actions.reserved.count());
 }
 
-test "Shard: an action timeout this node can't propose is proposed again by a later sweep" {
+test "Shard: a node that doesn't lead ends no lease, however far past its deadline" {
     var t: FollowerTest = undefined;
     try t.init();
     defer t.deinit();
-    const actions = t.shard.actions_handler;
-
-    var reg: [9]u8 = .{ 0, 0xe8, 0x03, 0, 0, 3, 0, 0, 0 }; // timeout 1000 ms, 3 retries
-    var pbuf: [1024]u8 = undefined;
-    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_register, 0, 1, 1, 0, 0, "echo", &reg, &pbuf).?);
-    var inv_buf: [256]u8 = undefined;
-    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", null, null, null).?;
-    try applyLoggedTo(actions, &entry_mod.buildCommandEntry(.action_invoke, 0, 1, 2, 0, 0, "act-1", inv, &pbuf).?);
-    const task = actions.claimPendingRun(std.testing.allocator, "default", "echo", null, "w-1").?;
-    std.testing.allocator.free(task.body);
-    actions.runs.getPtr("act-1").?.lease_from_ms = 0;
-
-    // No leader to take it: refused, so nothing is left marked proposed.
-    try std.testing.expectEqual(@as(usize, 1), actions.expireRuns(&t.shard, 5000));
-    const run = actions.runs.get("act-1").?;
-    try std.testing.expect(!run.expiry_proposed);
-    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.running, run.status);
+    const s = &t.shard;
+    _ = try applyActionEntry(s, .action_register, testRegister("echo"), 1, 1);
+    _ = try applyActionEntry(s, .action_invoke, testInvoke("echo", "act-1"), 2, 1);
+    _ = try applyActionEntry(s, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "echo", .run = "act-1", .due_ns = 1, .holder = "w-1", .request_key = null, .lease_ms = 5000 }, 3, 1);
+    try std.testing.expectEqual(@as(u64, 0), s.actions_handler.expireDue(s));
+    try std.testing.expect(s.actions_handler.expiring == null);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(s, "default", "act-1").?.status);
 }
 
 test "Shard: a connection's blocking reads held for the leader count toward its cap" {
@@ -10661,8 +10685,8 @@ test "Shard: a blocking read with no room left to wait is refused overloaded, no
     try ob.addU32(.block_ms, 60_000);
     // [group_len:u16][group][consumer_len:u16][consumer]
     const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
-    // [count:u32][type_len:u16][type]
-    const await_value = "\x01\x00\x00\x00" ++ "\x03\x00" ++ "job";
+    var await_buf: [64]u8 = undefined;
+    const await_value = try ActionsHandler.for_tests.awaitBody(&await_buf, &.{"job"}, 60_000, null);
     for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8 }{
         .{ .op = .queue_dequeue, .key = "q", .value = "" },
         .{ .op = .stream_read, .key = "s", .value = "" },
@@ -11539,7 +11563,7 @@ test "Shard: two action invokes parked behind a peer's ack each answer with the 
     const raft = t.shard.raft_node;
     var buf: [2048]u8 = undefined;
 
-    _ = try persistence_mod.proposeEntry(&t.shard, .action_register, entry_mod.Flags.NONE, "", "act", "");
+    _ = try proposeAction(&t.shard, .action_register, testRegister("act"));
     try ParkTest.ack(&t.shard);
     // An invoke's value starts with its has_labels byte.
     try ParkTest.send(&t.shard, t.conn, .action_invoke, 1, "act", "\x00");
@@ -11552,10 +11576,11 @@ test "Shard: two action invokes parked behind a peer's ack each answer with the 
     var rs: [2]proto.Response = undefined;
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &rs);
     for (rs, [_]u64{ first, second }) |resp, index| {
-        // [run_id_len:u16][run_id]...: the run id is its entry's key.
+        // [run_id_len:u16][run_id]...: the run its entry created.
         const n = std.mem.readInt(u16, resp.data[0..2], .little);
-        const cmd = entry_mod.CommandPayload.deserialize(raft.log.getEntry(index).?.payload).?;
-        try std.testing.expectEqualStrings(cmd.key, resp.data[2..][0..n]);
+        var diag: schema.Diagnostic = .{};
+        const inv = try action_entries.Invoke.decodeAll(raft.log.getEntry(index).?.payload, &diag);
+        try std.testing.expectEqualStrings(inv.run, resp.data[2..][0..n]);
     }
 }
 
@@ -11580,7 +11605,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     var one: [1]proto.Response = undefined;
 
     // An action workers take, and a workflow whose first step invokes it.
-    _ = try persistence_mod.proposeEntry(&shard, .action_register, entry_mod.Flags.NONE, "", "act", "");
+    _ = try proposeAction(&shard, .action_register, testRegister("act"));
     const def =
         \\{"kind":"Workflow","name":"flow","version":"1.0.0",
         \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
@@ -11623,7 +11648,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     const a = Run.byId(wf, a_id);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, a.status);
     const action_run = a.pending_action_run_id_owned.?;
-    try std.testing.expect(shard.actions_handler.runs.get(action_run) == null);
+    try std.testing.expect(ActionsHandler.for_tests.run(&shard, "default", action_run) == null);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
     // One ack commits both: the second start is answered (its applier
@@ -11633,21 +11658,23 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, shard.actions_handler.runs.get(action_run).?.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&shard, "default", action_run).?.status);
     wf.advanceStartedRuns(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, one[0].data).status);
 
-    // The action's completion is parked like any write; once it applies,
-    // the run resumes and follows its success transition.
-    var done: [64]u8 = undefined;
-    var off: usize = 0;
-    inline for (.{ "act", action_run, "success" }) |part| {
-        std.mem.writeInt(u16, done[off..][0..2], @intCast(part.len), .little);
-        off += 2;
-        @memcpy(done[off .. off + part.len], part);
-        off += part.len;
-    }
-    try ParkTest.send(&shard, conn, .action_complete, 24, "", done[0..off]);
+    // A worker takes it: answered once its deliver applies.
+    var aw_buf: [64]u8 = undefined;
+    try ParkTest.send(&shard, conn, .action_await, 23, "w", try ActionsHandler.for_tests.awaitBody(&aw_buf, &.{"act"}, 0, null));
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 23), one[0].header.request_id);
+    const task = (try ActionsHandler.for_tests.task(one[0].data)).?;
+    try std.testing.expectEqualStrings(action_run, task.run);
+
+    // Its completion is parked like any write; once it applies, the run
+    // resumes and follows its success transition.
+    var done: [512]u8 = undefined;
+    try ParkTest.send(&shard, conn, .action_complete, 24, action_run, try ActionsHandler.for_tests.completeBody(&done, task, "w", "", ""));
     // Proposed, not applied: the run still waits.
     wf.checkPendingActions(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, a_id).status);
@@ -11934,7 +11961,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), rs[3].header.status);
     // Two registers are two versions.
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[5].header.status);
-    try std.testing.expectEqual(@as(u32, 2), shard.actions_handler.actions.get("act").?.version);
+    try std.testing.expectEqual(@as(?u32, 2), ActionsHandler.for_tests.version(&shard, "default", "act"));
 }
 
 test "Shard: park answers from its own entry when a later one has already committed" {
@@ -13336,21 +13363,20 @@ test "Shard: an await that claims a pending run at once gets exactly one answer,
     }
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
 
-    // The await claims it while dispatched: one ok frame with the task, and
-    // nothing after it (it used to be followed by "not implemented").
-    // await value: [count:u32][type_len:u16][type]
-    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 3, 0 } ++ "act";
-    const frame = try testRequest(.action_await, 3, "worker-1", await_value);
+    // The await takes it: one ok frame with the task once its deliver
+    // applies, and nothing after it.
+    var await_buf: [64]u8 = undefined;
+    const frame = try testRequest(.action_await, 3, "worker-1", try ActionsHandler.for_tests.awaitBody(&await_buf, &.{"act"}, 30_000, null));
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
+    _ = shard.applyCommitted();
     const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
     const resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
-    try std.testing.expect(std.mem.endsWith(u8, resp.data, "job-input"));
-    // [task_id_len:u16][task_id][task_type_len:u16]"act"…
-    const id_len = std.mem.readInt(u16, resp.data[0..2], .little);
-    try std.testing.expectEqualStrings("act", resp.data[2 + id_len + 2 ..][0..3]);
+    const task = (try ActionsHandler.for_tests.task(resp.data)).?;
+    try std.testing.expectEqualStrings("job-input", task.input);
+    try std.testing.expectEqualStrings("act", task.action);
     try std.testing.expectEqual(n, @sizeOf(proto.ResponseHeader) + resp.data.len);
     shard.flushToClient(c.conn.fd);
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(c.pair[1]));
@@ -13375,8 +13401,8 @@ test "Shard: a parked await and an invoke reusing its request id each get one an
     _ = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
 
     // The await parks: nothing is pending yet.
-    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 3, 0 } ++ "act";
-    const aw = try testRequest(.action_await, 7, "worker-1", await_value);
+    var await_buf: [64]u8 = undefined;
+    const aw = try testRequest(.action_await, 7, "worker-1", try ActionsHandler.for_tests.awaitBody(&await_buf, &.{"act"}, 30_000, null));
     defer std.testing.allocator.free(aw);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, aw);
     shard.flushToClient(c.conn.fd);
@@ -13389,6 +13415,8 @@ test "Shard: a parked await and an invoke reusing its request id each get one an
     const inv = try testRequest(.action_invoke, 7, "act", invoke_value);
     defer std.testing.allocator.free(inv);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, inv);
+    _ = shard.applyCommitted();
+    // Woken, the await proposed its deliver; it answers once that applies.
     _ = shard.applyCommitted();
     shard.flushToClient(c.conn.fd);
 
@@ -13596,16 +13624,13 @@ test "Shard: a worker's await runs where the worker is registered, so a labelled
     _ = other.applyCommitted();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(cb, other, &out)).header.status);
 
-    // The await arrives on shard 0; the worker's labels are on shard 1.
-    var await_value: [64]u8 = undefined;
-    std.mem.writeInt(u32, await_value[0..4], 1, .little);
-    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
-    @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 4, worker, await_value[0 .. 6 + name.len]);
+    // The await arrives on shard 0 and runs on shard 1, where the worker's
+    // labels are; it asks shard 0, which owns the action, for the run.
+    var await_buf: [64]u8 = undefined;
+    const aw = try testRequest(.action_await, 4, worker, try ActionsHandler.for_tests.awaitBody(&await_buf, &.{name}, 30_000, null));
     defer std.testing.allocator.free(aw);
     _ = feedClient(ca.pair[1], owner, ca.conn.fd, aw);
-    _ = other.drainInbox();
-    _ = owner.drainInbox();
+    two.settle();
     const resp = try nextAnswer(ca, owner, &out);
     try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
@@ -13669,14 +13694,13 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(cb, other, &out)).header.status);
     }
 
-    // Parked with nothing to take, then drained.
-    var await_value: [64]u8 = undefined;
-    std.mem.writeInt(u32, await_value[0..4], 1, .little);
-    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
-    @memcpy(await_value[6..][0..name.len], name);
-    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
+    // Parked with nothing to take (shard 0, which owns the action, said
+    // so), then drained.
+    var await_buf: [64]u8 = undefined;
+    const aw = try testRequest(.action_await, 3, worker, try ActionsHandler.for_tests.awaitBody(&await_buf, &.{name}, 30_000, null));
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
+    two.settle();
     other.flushToClient(cb.conn.fd);
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
     switch (how) {
@@ -13724,8 +13748,7 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
             try std.testing.expectEqual(proto.Reason.worker_unhealthy, (try resp.refused()).reason);
         },
     }
-    var runs = owner.actions_handler.runs.valueIterator();
-    try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.pending, runs.next().?.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.anyRun(owner).?.status);
 }
 
 test "Shard: a failed attempt sent back to pending wakes an await parked on another shard" {
@@ -13759,77 +13782,78 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     }
 
-    // Worker w0 holds the run; w1 then waits for work on the other shard.
-    const task = owner.actions_handler.claimPendingRun(std.testing.allocator, "default", name, null, "w0") orelse return error.NoRun;
-    defer std.testing.allocator.free(task.body);
-    var run_id_buf: [64]u8 = undefined;
-    const run_id = run_id_buf[0..task.run_id.len];
-    @memcpy(run_id, task.run_id);
-    _ = other.drainInbox();
+    // Worker w0 takes the run; w1 then waits for work on the other shard.
+    var await_buf: [64]u8 = undefined;
+    const await_value = try ActionsHandler.for_tests.awaitBody(&await_buf, &.{name}, 0, null);
+    const take = try testRequest(.action_await, 9, "w0", await_value);
+    defer std.testing.allocator.free(take);
+    _ = feedClient(ca.pair[1], owner, ca.conn.fd, take);
+    two.settle();
+    var task_out: [4096]u8 = undefined;
+    const taken = try nextAnswer(ca, owner, &task_out);
+    try std.testing.expectEqual(@as(u64, 9), taken.header.request_id);
+    const task = (try ActionsHandler.for_tests.task(taken.data)) orelse return error.NoRun;
     const cb = try TestClient.open(other);
     defer _ = std.c.close(cb.pair[1]);
-    var await_value: [64]u8 = undefined;
-    std.mem.writeInt(u32, await_value[0..4], 1, .little);
-    std.mem.writeInt(u16, await_value[4..6], @intCast(name.len), .little);
-    @memcpy(await_value[6..][0..name.len], name);
+    var wait_buf: [64]u8 = undefined;
+    const wait_value = try ActionsHandler.for_tests.awaitBody(&wait_buf, &.{name}, 30_000, null);
     // A worker registered on the other shard, where its await runs.
     var worker_buf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
         if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
     } else return error.NoLocalWorker;
-    const aw = try testRequest(.action_await, 3, worker, await_value[0 .. 6 + name.len]);
+    const aw = try testRequest(.action_await, 3, worker, wait_value);
     defer std.testing.allocator.free(aw);
     _ = feedClient(cb.pair[1], other, cb.conn.fd, aw);
+    two.settle();
     other.flushToClient(cb.conn.fd);
     try std.testing.expectEqual(@as(c_int, 0), unreadBytes(cb.pair[1]));
 
     // w0 fails its attempt asking for another: once that applies, the run
-    // is pending again and w1 gets it now, not when its wait runs out.
-    var fail_value: [128]u8 = undefined;
-    var off: usize = 0;
-    for ([_][]const u8{ name, run_id }) |f| {
-        std.mem.writeInt(u16, fail_value[off..][0..2], @intCast(f.len), .little);
-        @memcpy(fail_value[off + 2 ..][0..f.len], f);
-        off += 2 + f.len;
-    }
-    fail_value[off] = 1;
-    off += 1;
-    const fail = try testRequest(.action_fail, 4, "w0", fail_value[0..off]);
+    // is ready again and w1 gets it now, not when its wait runs out.
+    var fail_value: [512]u8 = undefined;
+    const fail = try testRequest(.action_fail, 4, task.run, try ActionsHandler.for_tests.failBody(&fail_value, task, "w0", true, "boom"));
     defer std.testing.allocator.free(fail);
     _ = feedClient(ca.pair[1], owner, ca.conn.fd, fail);
-    _ = owner.applyCommitted();
+    two.settle();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(ca, owner, &out)).header.status);
 
-    _ = other.drainInbox();
+    two.settle();
     const resp = try nextAnswer(cb, other, &out);
     try std.testing.expectEqual(@as(u64, 3), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
 }
 
-test "Shard: only a run update to pending, applied on a leader, wakes workers" {
+test "Shard: on a leader, an invoke and a retry wake workers; a settle, and anything on a follower, don't" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
     const shard = &two.shards[0];
     const role = shard.raft_node.role;
     defer shard.raft_node.role = role;
-
-    var pbuf: [256]u8 = undefined;
-    for ([_]struct { leads: bool, status: result_mod.CommandResult.ActionRunStatus, wakes: bool }{
-        .{ .leads = true, .status = .pending, .wakes = true },
-        .{ .leads = true, .status = .completed, .wakes = false },
-        .{ .leads = true, .status = .failed, .wakes = false },
-        .{ .leads = false, .status = .pending, .wakes = false },
+    const token: action_entries.Token.Value = .{ .term = 1, .index = 1 };
+    const release: action_entries.Release.Value = .{ .ns = "default", .action = "a", .run = "r", .deliveries = 1, .token = token, .expiry_ns = 0, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" };
+    const settle: action_entries.Settle.Value = .{ .ns = "default", .action = "a", .run = "r", .deliveries = 1, .token = token, .expiry_ns = 0, .outcome = "", .result = "" };
+    var buf: [1024]u8 = undefined;
+    for ([_]struct { leads: bool, e: entry_mod.Entry, wakes: bool }{
+        .{ .leads = true, .e = try ActionsHandler.for_tests.entry(.action_invoke, testInvoke("a", "r"), 1, 1, 0, buf[0..512]), .wakes = true },
+        .{ .leads = true, .e = try ActionsHandler.for_tests.entry(.action_release, release, 1, 2, 0, buf[512..]), .wakes = true },
+        .{ .leads = false, .e = try ActionsHandler.for_tests.entry(.action_invoke, testInvoke("a", "r"), 1, 1, 0, buf[0..512]), .wakes = false },
     }) |c| {
         shard.raft_node.role = if (c.leads) .leader else .follower;
         shard.wake_workers = false;
-        const value = [_]u8{ @backingInt(c.status), 0, 0, 0, 0, 0 };
-        const entry = entry_mod.buildCommandEntry(.action_update_run, 0, 1, 1, 0, 0, "act-1", &value, &pbuf).?;
-        shard.wakeApplied(&entry);
+        var out = persistence_mod.Result.start(&c.e);
+        shard.actions_handler.afterApply(shard, &c.e, &out);
         try std.testing.expectEqual(c.wakes, shard.wake_workers);
     }
+    shard.raft_node.role = .leader;
+    shard.wake_workers = false;
+    const e = try ActionsHandler.for_tests.entry(.action_settle, settle, 1, 3, 0, &buf);
+    var out = persistence_mod.Result.start(&e);
+    shard.actions_handler.afterApply(shard, &e, &out);
+    try std.testing.expect(!shard.wake_workers);
 }
 
 /// A clustered shard leading alone (node 1), with a client connection.
@@ -14894,7 +14918,7 @@ const SkipState = struct {
             .queued = DamageTest.queued(shard),
             .kv = shard.kv_handler.kv.countLive(),
             .defs = shard.workflow_handler.definitions.count(),
-            .action_runs = shard.actions_handler.runs.count(),
+            .action_runs = ActionsHandler.runCount(shard),
         };
         if (shard.workflow_handler.definitions.get("default:wf")) |d| {
             const n = @min(d.version_owned.len, st.def_version.len);
@@ -16085,13 +16109,8 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
         const id = gen.next(.action, partition, &id_buf);
         if (a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("", id))) == 0) break id;
     } else return error.TestUnexpectedResult;
-    const b = two.shards[1].actions_handler;
-    var reg_out: persistence_mod.Result = .{};
-    try b.replayRegister("echo", "", 1, &reg_out);
-    var inv_buf: [512]u8 = undefined;
-    const inv = ActionsHandler.encodeInvokeValue(&inv_buf, "default", "echo", "{}", "", "", "") orelse return error.EncodeFailed;
-    var inv_out: persistence_mod.Result = .{};
-    try b.replayInvoke(run_id, inv, 1000 * std.time.ns_per_ms, &inv_out);
+    _ = try applyActionEntry(&two.shards[1], .action_register, testRegister("echo"), 1, 1);
+    _ = try applyActionEntry(&two.shards[1], .action_invoke, testInvoke("echo", run_id), 2, 1000 * std.time.ns_per_ms);
 
     // Asked on shard 0, it's sent to shard 1 before anything runs; before,
     // the id was hashed as a key and could land on a shard without the run.

@@ -4108,64 +4108,52 @@ const test_poll_workflow_json =
     \\"transitions":{"success":"flo.Completed","failure":"flo.Failed","timeout":"flo.TimedOut"}}}
 ;
 
-/// Register a test action for workflow step executor tests.
-fn registerTestAction(actions: *ActionsHandler, name: []const u8) void {
-    const alloc = actions.allocator;
-    const owned_name = alloc.dupe(u8, name) catch return;
-    const owned_ns = alloc.dupe(u8, "default") catch {
-        alloc.free(owned_name);
-        return;
-    };
-    const owned_owner = alloc.dupe(u8, "") catch {
-        alloc.free(owned_name);
-        alloc.free(owned_ns);
-        return;
-    };
-    const owned_key = alloc.dupe(u8, name) catch unreachable;
-    actions.actions.put(owned_key, .{
-        .key_owned = owned_key,
-        .name_owned = owned_name,
-        .namespace_owned = owned_ns,
-        .owner_owned = owned_owner,
-        .action_type = .user,
-        .version = 1,
-        .enabled = true,
-        .created_at_ns = 0,
-    }) catch {
-        alloc.free(owned_name);
-        alloc.free(owned_ns);
-        alloc.free(owned_owner);
-    };
+const test_action_entries = @import("../protocol/action_entries.zig");
+const test_action_machine = @import("../actions/machine.zig");
+var test_action_index: u64 = 1_000_000;
+
+/// An action entry applied to the test shard's store, as its log would.
+fn applyTestActionEntry(shard: *Shard, comptime etype: @import("../storage/ual/entry.zig").EntryType, body: anytype, stamp_ns: u64) void {
+    var buf: [8192]u8 = undefined;
+    test_action_index += 1;
+    const e = ActionsHandler.for_tests.entry(etype, body, 1, test_action_index, stamp_ns, &buf) catch unreachable;
+    var out = persistence_mod.Result.start(&e);
+    const part = shard.defaultPartition();
+    @import("../contract/machine.zig").applyEntry(&test_action_machine.machine, &part.store, &part.apply_scratch, &e, &out) catch unreachable;
 }
 
-/// Register a test action that simulates failure on invocation.
-fn registerFailingAction(actions: *ActionsHandler, name: []const u8) void {
-    const alloc = actions.allocator;
-    const owned_name = alloc.dupe(u8, name) catch return;
-    const owned_ns = alloc.dupe(u8, "default") catch {
-        alloc.free(owned_name);
-        return;
-    };
-    const owned_owner = alloc.dupe(u8, "") catch {
-        alloc.free(owned_name);
-        alloc.free(owned_ns);
-        return;
-    };
-    const owned_key = alloc.dupe(u8, name) catch unreachable;
-    actions.actions.put(owned_key, .{
-        .key_owned = owned_key,
-        .name_owned = owned_name,
-        .namespace_owned = owned_ns,
-        .owner_owned = owned_owner,
-        .action_type = .user,
-        .version = 1,
-        .enabled = true,
-        .created_at_ns = 0,
-    }) catch {
-        alloc.free(owned_name);
-        alloc.free(owned_ns);
-        alloc.free(owned_owner);
-    };
+/// Register a test action, with one attempt: a run whose lease runs out
+/// times out.
+fn registerTestAction(shard: *Shard, name: []const u8) void {
+    applyTestActionEntry(shard, .action_register, test_action_entries.Register.Value{ .ns = "default", .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 1 }, 1);
+}
+
+/// A run a worker took: its deliver applied.
+fn deliverTestAction(shard: *Shard, run_id: []const u8) ?test_action_machine.Run.Value {
+    const run = ActionsHandler.for_tests.run(shard, "default", run_id) orelse return null;
+    applyTestActionEntry(shard, .action_deliver, test_action_entries.Deliver.Value{ .ns = "default", .action = run.action, .run = run_id, .due_ns = run.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 }, run.due_ns);
+    return ActionsHandler.for_tests.run(shard, "default", run_id);
+}
+
+/// Complete a test action run with outcome "success".
+/// Call this after advanceWorkflow parks, then call checkPendingActions to resume.
+fn completeTestAction(shard: *Shard, run_id: []const u8) void {
+    completeTestActionWith(shard, run_id, "success");
+}
+
+/// Complete a test action run with a specific outcome: taken by a worker,
+/// then settled by it.
+fn completeTestActionWith(shard: *Shard, run_id: []const u8, outcome: []const u8) void {
+    const run = deliverTestAction(shard, run_id) orelse return;
+    applyTestActionEntry(shard, .action_settle, test_action_entries.Settle.Value{ .ns = "default", .action = run.action, .run = run_id, .deliveries = run.deliveries, .token = run.token, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = "" }, run.delivered_ns + 1);
+}
+
+/// A test action run whose only attempt's lease ran out.
+fn timeOutTestAction(shard: *Shard, run_id: []const u8) void {
+    const run = deliverTestAction(shard, run_id) orelse return;
+    var ib: [test_action_entries.ExpireItem.max_size]u8 = undefined;
+    const item = test_action_entries.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = run.action, .run = run_id, .expiry_ns = run.expiry_ns }) catch unreachable;
+    applyTestActionEntry(shard, .action_expire, test_action_entries.Expire.Value{ .items = .{ .bytes = item, .count = 1 } }, run.expiry_ns);
 }
 
 /// Create a minimal test shard with an actions handler for unit tests.
@@ -4175,6 +4163,7 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     const RaftNode = @import("../raft/node.zig").RaftNode;
     var shard: Shard = undefined;
     shard.id = 0;
+    shard.allocator = std.testing.allocator;
     shard.actions_handler = actions;
     shard.peer_shards = null;
     shard.peer_mailboxes = null;
@@ -4200,16 +4189,14 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.router = router.Router.init(1, 1, 0);
     shard.run_id_gen = .{};
     shard.waiter_pool = try waiter_pool_mod.WaiterPool.init(std.testing.allocator);
-    // The one applier needs a partition to append to, the registry that
-    // owns action entries, and the copy buffer it reads committed entries
-    // through.
+    // The one applier needs a partition to append to (whose store holds
+    // the actions), and the copy buffer it reads committed entries through.
     const partition = try std.testing.allocator.create(Partition);
     partition.* = try Partition.init(std.testing.allocator, 0, 256 * 1024, 0);
     const partitions = try std.testing.allocator.alloc(*Partition, 1);
     partitions[0] = partition;
     shard.partitions = partitions;
     shard.replay_registry = .{};
-    actions.registerReplay(&shard.replay_registry);
     shard.apply_buf = try std.testing.allocator.alloc(u8, @import("../protocol/limits.zig").MAX_LOG_ENTRY_PAYLOAD);
     shard.entry_buf = try std.testing.allocator.alloc(u8, persistence_mod.MAX_PERSIST_PAYLOAD);
     shard.scratch = try @import("../node/scratch.zig").Scratch.init(std.testing.allocator, shard_mod.SCRATCH_SIZE);
@@ -4236,21 +4223,6 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.free(shard.entry_buf);
     shard.scratch.deinit(std.testing.allocator);
     std.testing.allocator.free(shard.pending);
-}
-
-/// Complete a pending test action run with outcome "success".
-/// Call this after advanceWorkflow parks, then call checkPendingActions to resume.
-fn completeTestAction(actions: *ActionsHandler, run_id: []const u8) void {
-    completeTestActionWith(actions, run_id, "success");
-}
-
-/// Complete a pending test action run with a specific outcome.
-fn completeTestActionWith(actions: *ActionsHandler, run_id: []const u8, outcome: []const u8) void {
-    const run = actions.runs.getPtr(run_id) orelse return;
-    run.status = .completed;
-    run.completed_at_ms = @import("stdx").time.milliTimestamp();
-    if (run.outcome_owned) |old| actions.allocator.free(old);
-    run.outcome_owned = actions.allocator.dupe(u8, outcome) catch null;
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
@@ -4385,10 +4357,10 @@ test "a producer's start joins the first-step queue when it applies, then takes 
     defer handler.deinit();
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "step-a");
-    registerTestAction(&actions, "step-b");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b");
     handler.registerReplay(&shard.replay_registry);
     shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
@@ -4445,9 +4417,9 @@ test "a step whose action run the log dropped fails once the invoke's index has 
     defer handler.deinit();
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "step-a");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-l", "run-l", "test-wf");
 
@@ -4478,10 +4450,10 @@ test "step executor: linear workflow completes via action invocation" {
     // Set up actions handler with test WASM actions
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "step-a");
-    registerTestAction(&actions, "step-b");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b");
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-1", "run-1", "test-wf");
@@ -4495,7 +4467,7 @@ test "step executor: linear workflow completes via action invocation" {
         const run = handler.runs.getPtr("default:run-1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-a with "success"
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
 
     // Phase 2: checkPendingActions resumes step-a, advances to step-b (parks again)
@@ -4505,7 +4477,7 @@ test "step executor: linear workflow completes via action invocation" {
         const run = handler.runs.getPtr("default:run-1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b with "success"
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
 
     // Phase 3: checkPendingActions resumes step-b, workflow completes
@@ -4529,9 +4501,9 @@ test "step executor: wait_for_signal parks run" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "init");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "init");
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-2", "run-2", "wait-wf");
@@ -4543,7 +4515,7 @@ test "step executor: wait_for_signal parks run" {
         const run = handler.runs.getPtr("default:run-2").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete init with success so workflow transitions to wait_approval
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
 
     // Phase 2: checkPendingActions resumes init, workflow transitions to wait_approval (parks for signal)
@@ -4564,9 +4536,9 @@ test "step executor: signal resumes waiting workflow" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "init");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "init");
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
     createTestRun(&handler, "default:run-3", "run-3", "wait-wf");
@@ -4576,7 +4548,7 @@ test "step executor: signal resumes waiting workflow" {
     _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-3").?;
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
     // Resume init → transitions to wait_approval → parks for signal
     handler.checkPendingActions(&shard);
@@ -4659,10 +4631,10 @@ test "step executor: failing action follows failure transition" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "step-a");
-    registerFailingAction(&actions, "step-b"); // step-b will fail
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b"); // step-b will fail
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-6", "run-6", "test-wf");
@@ -4672,7 +4644,7 @@ test "step executor: failing action follows failure transition" {
     _ = shard.applyCommitted();
     {
         const run = handler.runs.getPtr("default:run-6").?;
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
     // Phase 2: step-a completes (success) → transitions to step_b → step-b parks
     handler.checkPendingActions(&shard);
@@ -4681,7 +4653,7 @@ test "step executor: failing action follows failure transition" {
         const run = handler.runs.getPtr("default:run-6").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b with "failure"
-        completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "failure");
+        completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "failure");
     }
     // Phase 3: step-b fails → follows "failure" transition → flo.Failed
     handler.checkPendingActions(&shard);
@@ -4699,9 +4671,9 @@ test "step executor: retry on failure" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerFailingAction(&actions, "flaky"); // always fails
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "flaky"); // always fails
 
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
     createTestRun(&handler, "default:run-7", "run-7", "retry-wf");
@@ -4718,7 +4690,7 @@ test "step executor: retry on failure" {
         const run_ptr = handler.runs.getPtr("default:run-7").?;
         if (run_ptr.status.isTerminal()) break;
         const rid = run_ptr.pending_action_run_id_owned orelse break;
-        completeTestActionWith(&actions, rid, "failure");
+        completeTestActionWith(&shard, rid, "failure");
         handler.checkPendingActions(&shard);
         _ = shard.applyCommitted();
     }
@@ -4755,10 +4727,10 @@ test "step executor: a plan whose executors all fail fails the step after one pa
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerFailingAction(&actions, "stripe");
-    registerFailingAction(&actions, "paypal");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "stripe");
+    registerTestAction(&shard, "paypal");
 
     createTestDef(&handler, "default:plan-wf", "plan-wf", test_plan_exhaust_workflow_json);
     createTestRun(&handler, "default:run-plan", "run-plan", "plan-wf");
@@ -4772,7 +4744,7 @@ test "step executor: a plan whose executors all fail fails the step after one pa
         const run_ptr = handler.runs.getPtr("default:run-plan").?;
         if (run_ptr.status.isTerminal()) break;
         const rid = run_ptr.pending_action_run_id_owned orelse break;
-        completeTestActionWith(&actions, rid, "failure");
+        completeTestActionWith(&shard, rid, "failure");
         handler.checkPendingActions(&shard);
         _ = shard.applyCommitted();
     }
@@ -4796,9 +4768,9 @@ test "step executor: an action run that timed out takes the step's failure trans
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "flaky");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "flaky");
 
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
     createTestRun(&handler, "default:run-to", "run-to", "retry-wf");
@@ -4811,7 +4783,7 @@ test "step executor: an action run that timed out takes the step's failure trans
         const run = handler.runs.getPtr("default:run-to").?;
         if (run.status.isTerminal()) break;
         const rid = run.pending_action_run_id_owned orelse break;
-        actions.runs.getPtr(rid).?.status = .timed_out;
+        timeOutTestAction(&shard, rid);
         handler.checkPendingActions(&shard);
         _ = shard.applyCommitted();
     }
@@ -4829,9 +4801,9 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
 
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "poller");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "poller");
 
     createTestDef(&handler, "default:poll-wf", "poll-wf", test_poll_workflow_json);
     createTestRun(&handler, "default:run-poll", "run-poll", "poll-wf");
@@ -4844,7 +4816,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     {
         const run = handler.runs.getPtr("default:run-poll").?;
         try testing.expect(run.pending_action_run_id_owned != null);
-        completeTestActionWith(&actions, run.pending_action_run_id_owned.?, "pending");
+        completeTestActionWith(&shard, run.pending_action_run_id_owned.?, "pending");
     }
     handler.checkPendingActions(&shard);
     _ = shard.applyCommitted();
@@ -4863,7 +4835,7 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
         const run = handler.runs.getPtr("default:run-poll").?;
         if (run.status.isTerminal()) break;
         if (run.pending_action_run_id_owned) |rid| {
-            completeTestActionWith(&actions, rid, "pending");
+            completeTestActionWith(&shard, rid, "pending");
         }
         handler.checkPendingActions(&shard);
         _ = shard.applyCommitted();
@@ -4961,32 +4933,11 @@ test "step executor: checkPendingActions handles completed async action" {
         };
     }
 
-    // Create a completed action run in the actions handler
-    {
-        const arid = actions.allocator.dupe(u8, "action-42") catch return;
-        const aname = actions.allocator.dupe(u8, "step-a") catch {
-            actions.allocator.free(arid);
-            return;
-        };
-        actions.runs.put(arid, .{
-            .run_id_owned = arid,
-            .action_name_owned = aname,
-            .namespace_owned = actions.allocator.dupe(u8, "default") catch unreachable,
-            .input_owned = null,
-            .status = .completed,
-            .created_at_ms = 0,
-            .started_at_ms = 0,
-            .completed_at_ms = 1000,
-        }) catch {
-            actions.allocator.free(arid);
-            actions.allocator.free(aname);
-            return;
-        };
-
-        // Also register the action so transition resolution works
-        registerTestAction(&actions, "step-a");
-        registerTestAction(&actions, "step-b");
-    }
+    // A completed action run, of an action the transitions resolve.
+    registerTestAction(&shard, "step-a");
+    registerTestAction(&shard, "step-b");
+    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = "default", .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null }, 1000);
+    completeTestAction(&shard, "action-42");
 
     // checkPendingActions should detect the completed action and resume step-a
     handler.checkPendingActions(&shard);
@@ -4997,7 +4948,7 @@ test "step executor: checkPendingActions handles completed async action" {
         const run = handler.runs.getPtr("default:run-8").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
         // Complete step-b so the workflow can finish
-        completeTestAction(&actions, run.pending_action_run_id_owned.?);
+        completeTestAction(&shard, run.pending_action_run_id_owned.?);
     }
 
     // Second checkPendingActions: step-b done → flo.Completed
@@ -5633,9 +5584,9 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
     defer handler.deinit();
     var actions = ActionsHandler.init(allocator);
     defer actions.deinit();
-    registerTestAction(&actions, "step-a");
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
     // Its completions apply through the log, as on a shard.
     handler.registerReplay(&shard.replay_registry);
     createTestDef(&handler, "default:map-wf", "map-wf",

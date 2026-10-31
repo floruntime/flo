@@ -138,10 +138,12 @@ fn ownerOf(shard: *Shard, ns: []const u8, name: []const u8) u16 {
     };
 }
 
-/// Propose a schema'd action entry.
+/// Propose a schema'd action entry, encoded in the shard's entry buffer
+/// when it fits (a run's input can make an invoke larger).
 fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence.ProposeResult {
     const P = ae.Payload(@backingInt(etype));
     const size = try P.encodedSize(body);
+    if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, Flags.NONE, try P.encodeInto(shard.entry_buf[0..size], body));
     const buf = try shard.allocator.alloc(u8, size);
     defer shard.allocator.free(buf);
     return shard.raft_node.propose(etype, Flags.NONE, try P.encodeInto(buf, body));
@@ -193,6 +195,9 @@ pub const ActionsHandler = struct {
     pub const Finished = struct { status: ActionRunStatus, outcome: []u8, output: []u8 };
 
     const Unsent = struct { target: u16, tag: @import("../node/inbox.zig").Tag, bytes: []u8 };
+
+    /// Requests and entries as clients and the log make them, for tests.
+    pub const for_tests = test_support;
 
     pub fn init(allocator: Allocator) ActionsHandler {
         return .{ .allocator = allocator };
@@ -1482,3 +1487,65 @@ fn sendActionResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
         else => shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled action response"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// For tests: requests and entries as clients and the log make them
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const test_support = struct {
+    /// An await's body naming `names`.
+    pub fn awaitBody(buf: []u8, names: []const []const u8, block_ms: u64, request_key: ?[]const u8) ![]const u8 {
+        var lb: [4096]u8 = undefined;
+        var lw: schema.Writer = .{ .buf = &lb };
+        for (names) |n| try action_ops.ActionName.encode(&lw, n);
+        return AwaitRequest.encodeInto(buf, .{ .actions = .{ .bytes = lb[0..lw.pos], .count = @intCast(names.len) }, .block_ms = block_ms, .request_key = request_key });
+    }
+
+    /// The task an await's answer body carries, if any.
+    pub fn task(body: []const u8) !?Task {
+        var diag: schema.Diagnostic = .{};
+        return (try AwaitResponse.decodeAll(body, &diag)).task;
+    }
+
+    /// A complete of `t`'s delivery.
+    pub fn completeBody(buf: []u8, t: Task, worker: []const u8, outcome: []const u8, result: []const u8) ![]const u8 {
+        return table_run.op("action.complete").request.encodeInto(buf, .{ .action = t.action, .worker = worker, .deliveries = t.deliveries, .term = t.term, .index = t.index, .outcome = outcome, .result = result });
+    }
+
+    /// A fail of `t`'s delivery.
+    pub fn failBody(buf: []u8, t: Task, worker: []const u8, retry: bool, err_text: []const u8) ![]const u8 {
+        return table_run.op("action.fail").request.encodeInto(buf, .{ .action = t.action, .worker = worker, .deliveries = t.deliveries, .term = t.term, .index = t.index, .retry = retry, .abandoned = false, .delay_ms = 0, .@"error" = err_text });
+    }
+
+    /// An action entry of type `etype`, as the log holds it.
+    pub fn entry(comptime etype: EntryType, body: anytype, term: u64, index: u64, stamp_ns: u64, buf: []u8) !Entry {
+        const P = ae.Payload(@backingInt(etype));
+        return entry_mod.buildEntry(etype, Flags.NONE, term, index, stamp_ns, try P.encodeInto(buf, body));
+    }
+
+    /// A register value: the lease (0 is the default) and attempts.
+    pub fn registerValue(buf: *[11]u8, timeout_ms: u32, max_retries: u32) []const u8 {
+        buf[0] = 0;
+        std.mem.writeInt(u32, buf[1..5], timeout_ms, .little);
+        std.mem.writeInt(u32, buf[5..9], max_retries, .little);
+        std.mem.writeInt(u16, buf[9..11], 0, .little);
+        return buf;
+    }
+
+    /// The run `id` in `ns`, from the shard's store.
+    pub fn run(shard: *Shard, ns: []const u8, id: []const u8) ?Run {
+        return getRun(shard, ns, id);
+    }
+
+    /// Action `name`'s version in `ns`.
+    pub fn version(shard: *Shard, ns: []const u8, name: []const u8) ?u32 {
+        return if (getDef(shard, ns, name)) |d| d.version else null;
+    }
+
+    /// The first run the shard holds, in any namespace.
+    pub fn anyRun(shard: *Shard) ?Run {
+        var it = readOf(shard).range(machine.Runs, "");
+        const first = (it.next() catch return null) orelse return null;
+        return first.value.v;
+    }
+};
