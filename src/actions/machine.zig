@@ -408,16 +408,20 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 
 /// One expire item, past due by the log's clock: its key goes, and if it
 /// is the run's live deadline, the lease ends as a failure. A key not yet
-/// due, or naming another action's run, is left alone.
+/// due is left alone. An item naming another action's run ends nothing,
+/// and drops the key only if it isn't that run's live deadline: dropping
+/// a live one would leave its lease with none.
 fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool {
     if (item.expiry_ns > stamp) return false;
     const rk = try nsKey(view, item.ns, item.run);
     const found = try view.get(Runs, rk);
-    if (found) |r| if (!std.mem.eql(u8, r.v.action, item.action)) return false;
+    const live = if (found) |r| r.v.status == .leased and r.v.expiry_ns == item.expiry_ns else false;
+    const ours = if (found) |r| std.mem.eql(u8, r.v.action, item.action) else true;
+    if (!ours and live) return false;
     var b: KeyBuf = undefined;
     try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run)));
-    var run = found orelse return false;
-    if (run.v.status != .leased or run.v.expiry_ns != item.expiry_ns) return false;
+    if (!live) return false;
+    var run = found.?;
     run.v.ended = .expired;
     run.v.failures +|= 1;
     run.v.@"error" = "lease expired";
@@ -868,7 +872,11 @@ test "actions machine: an expire drops a stale key, and ends a live lease with a
     try testing.expect((try t.apply(.action_extend, ext, 20 * ms + LEASE * 3 / 4)).refused() == null);
     try testing.expectEqual(@as(usize, 2), t.count(Deadlines));
 
-    _ = try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", old)), old + ms);
+    // Named with another action, the stale key still goes, so a duty
+    // that misnames it doesn't name it again every tick.
+    var misnamed = keyOf("r1", old);
+    misnamed.action = "other";
+    _ = try t.apply(.action_expire, try expiring(&ibuf, misnamed), old + ms);
     try testing.expectEqual(Status.leased, t.run("default", "r1").?.status);
     try testing.expectEqual(@as(usize, 1), t.count(Deadlines));
 
