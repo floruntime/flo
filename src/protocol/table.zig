@@ -39,6 +39,12 @@ pub fn isInternal(code: u16) bool {
     return false;
 }
 
+/// Whether table op `code` concerns the server, not a namespace.
+pub fn serverScoped(code: u16) bool {
+    inline for (op_table) |op| if (op.code == code) return op.scope == .server;
+    return false;
+}
+
 /// Whether table op `code` administers the node.
 pub fn isAdmin(code: u16) bool {
     inline for (op_table) |op| if (op.code == code) return op.class == .admin;
