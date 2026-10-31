@@ -769,7 +769,7 @@ pub const ActionsHandler = struct {
 
         const namespace = if (req.namespace.len == 0) "default" else req.namespace;
 
-        const data = self.serializeActionList(namespace) catch {
+        const data = self.serializeActionList(namespace, req.key) catch {
             return .{ .err = .{ .code = .internal_error, .message = "action list serialization failed" } };
         };
 
@@ -883,12 +883,12 @@ pub const ActionsHandler = struct {
         } };
     }
 
-    /// ShardWalker LocalScanFn for action_list — returns action names
-    /// from one shard's ActionsHandler registry.
+    /// ShardWalker LocalScanFn for action_list — returns the names of one
+    /// shard's actions that start with `prefix`, the request's key.
     fn localScanActions(
         ctx: *anyopaque,
         namespace: []const u8,
-        _: []const u8, // filter
+        prefix: []const u8,
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
@@ -905,6 +905,7 @@ pub const ActionsHandler = struct {
         while (it.next()) |entry| {
             if (count >= name_buf.len) break;
             if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, effective_ns)) continue;
+            if (!std.mem.startsWith(u8, entry.value_ptr.name_owned, prefix)) continue;
             name_buf[count] = entry.value_ptr.name_owned;
             count += 1;
         }
@@ -1146,13 +1147,15 @@ pub const ActionsHandler = struct {
     /// Wire format (scan format matching CLI expectations):
     ///   [count:u32] ([key_len:u16][key][value_len:u32][value])* [has_more:u8] [cursor_len:u16]
     /// Key = action name, Value = [type:u8][version:u32][enabled:u8]
-    fn serializeActionList(self: *ActionsHandler, namespace: []const u8) ![]u8 {
+    /// The actions in `namespace` whose names start with `prefix`.
+    fn serializeActionList(self: *ActionsHandler, namespace: []const u8, prefix: []const u8) ![]u8 {
         const value_size: usize = 1 + 4 + 1; // type + version + enabled
         var total_size: usize = 4; // count
         var entry_count: u32 = 0;
         var it = self.actions.iterator();
         while (it.next()) |entry| {
             if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) continue;
+            if (!std.mem.startsWith(u8, entry.value_ptr.name_owned, prefix)) continue;
             total_size += 2 + entry.value_ptr.name_owned.len + 4 + value_size;
             entry_count += 1;
         }
@@ -1169,6 +1172,7 @@ pub const ActionsHandler = struct {
         while (it2.next()) |entry| {
             const rec = entry.value_ptr;
             if (!std.mem.eql(u8, rec.namespace_owned, namespace)) continue;
+            if (!std.mem.startsWith(u8, rec.name_owned, prefix)) continue;
             // key_len + key
             std.mem.writeInt(u16, buf[offset..][0..2], @intCast(rec.name_owned.len), .little);
             offset += 2;

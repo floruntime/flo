@@ -90,6 +90,7 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .about("List registered actions")
                 .aliases(&.{"ls"})
                 .uintFlag("limit", 'l', 100, "Maximum actions to show")
+                .stringFlag("prefix", 0, "", "Only actions whose names start with this")
                 .stringFlag("namespace", 'n', "default", "Namespace to use")
                 .stringFlag("endpoint", 'e', "", "Server endpoint (host:port)")
                 .action(wrapHandler(runList)),
@@ -354,6 +355,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
+    const prefix: ?[]const u8 = if (ctx.getString("prefix")) |p| if (p.len > 0) p else null else null;
+
     // Collect all action names across shards using cursor-based shard walking
     var all_names: std.ArrayList([]const u8) = .empty;
     defer {
@@ -369,7 +372,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     // Walk all shards until no more data
     while (all_names.items.len < limit) {
-        var result = client_mod.action.list(&client, namespace, null, cursor) catch |err| return outcome.requestFailed(ctx, err);
+        var result = client_mod.action.list(&client, namespace, prefix, cursor) catch |err| return outcome.requestFailed(ctx, err);
         defer result.deinit();
 
         try outcome.check(ctx, result);
