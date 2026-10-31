@@ -1605,7 +1605,7 @@ pub const ActionsHandler = struct {
     /// how many keys it named.
     pub fn expireDue(self: *ActionsHandler, shard: *Shard) u64 {
         self.resend(shard);
-        self.pruneFinished();
+        self.pruneAt(@import("stdx").time.monotonicMs());
         if (!shard.raft_node.leaderReady()) return 0;
         const now = wallNs();
         if (self.duty_term != shard.raft_node.current_term) {
@@ -1663,8 +1663,9 @@ pub const ActionsHandler = struct {
         if (woke) ActionsHandler.wakeWorkers(shard);
     }
 
-    fn pruneFinished(self: *ActionsHandler) void {
-        const now = @import("stdx").time.monotonicMs();
+    /// Drop what is older than `FINISHED_KEEP_MS` at `now` (monotonic ms):
+    /// results no workflow took, asks, and runs asked to start.
+    pub fn pruneAt(self: *ActionsHandler, now: u64) void {
         pruneOld(self.allocator, &self.asked, now);
         pruneOld(self.allocator, &self.starting, now);
         if (self.finished.count() == 0) return;

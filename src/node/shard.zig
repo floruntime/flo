@@ -13977,9 +13977,9 @@ test "actions: a run its shard has no record of is answered as lost, and a workf
     try std.testing.expectEqual(@as(usize, 1), t.two.shards[1].mailbox.inbox.pending());
     t.two.settle();
     try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.cancelled, actions.finished.get("act-nothing").?.status);
-    // Untaken, it is dropped in time.
-    actions.finished.getPtr("act-nothing").?.at_ms = 0;
-    _ = actions.expireDue(here);
+    // Untaken, it is dropped in time. Time is moved on, not the stamp
+    // back: the monotonic clock is uptime, which may be short.
+    actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
     try std.testing.expect(actions.finished.get("act-nothing") == null);
 }
 
@@ -14130,9 +14130,7 @@ test "actions: what a shard keeps of runs asked about, and runs it was asked to 
     const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", "nope", "{}", "wf-run", "wf") orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
     actions.startRunFromInbox(here, 1, start);
-    actions.asked.getPtr("act-old").?.* = 0;
-    actions.starting.getPtr("run-old").?.* = 0;
-    _ = actions.expireDue(here);
+    actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
     try std.testing.expect(actions.asked.get("act-old") == null);
     try std.testing.expect(actions.starting.get("run-old") == null);
     t.two.settle();
