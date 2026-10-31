@@ -163,7 +163,7 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("touch")
-                .about("Keep a task: its lease runs a full lease from now")
+                .about("Keep a task: with half its lease or less left, it runs a full lease from now; earlier, nothing changes")
                 .arg("task_id", "Task ID, as await printed it")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .action(wrapHandler(runWorkerTouch)),
