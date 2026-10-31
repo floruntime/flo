@@ -1,4 +1,4 @@
-import { cfmt } from '@/lib/format'
+import { cfmt, DASH } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useStreams } from '@/lib/api/streams'
 import { Stats, Stat } from '@/components/layout'
@@ -50,7 +50,7 @@ export function StreamsList({ onOpen }: { onOpen: (name: string) => void }) {
               </div>
               <div className="c r muted-num">{r.partitions}</div>
               <div className="c r muted-num">{cfmt(r.ingest_rate)}</div>
-              <div className="c r dim mono">{r.retention}</div>
+              <div className="c r dim mono">{r.retention ?? DASH}</div>
             </div>
           ))}
         </div>

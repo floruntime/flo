@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './client'
-import type { QueueInfo, QueueDetailInfo, QueueMessagesResponse } from './types'
+import type { QueueInfo, QueueDetailInfo, QueueDLQResponse, QueueMessagesResponse } from './types'
 
 const enc = encodeURIComponent
 
@@ -24,6 +24,15 @@ export function useQueueMessages(ns: string, name: string | null) {
   return useQuery({
     queryKey: ['queues', ns, 'messages', name],
     queryFn: () => api.get<QueueMessagesResponse>(`queues/${enc(name!)}/messages?namespace=${enc(ns)}&limit=2000`),
+    enabled: !!name,
+  })
+}
+
+/** The queue's dead letters: the count, and the entries once an op lists them. */
+export function useQueueDLQ(ns: string, name: string | null) {
+  return useQuery({
+    queryKey: ['queues', ns, 'dlq', name],
+    queryFn: () => api.get<QueueDLQResponse>(`queues/${enc(name!)}/dlq?namespace=${enc(ns)}`),
     enabled: !!name,
   })
 }

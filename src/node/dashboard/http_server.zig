@@ -252,6 +252,10 @@ pub const DashboardServer = struct {
                 self.sendError(client, .method_not_allowed, "Method not allowed");
                 return;
             }
+            if (err == error.NodeDidNotAnswer) {
+                self.sendError(client, .service_unavailable, "The node didn't answer in time; retry");
+                return;
+            }
             std.log.warn("Dashboard API error: {}", .{err});
             self.sendError(client, .internal_server_error, "Internal server error");
             return;
