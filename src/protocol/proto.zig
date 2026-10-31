@@ -60,6 +60,8 @@ pub const OpCode = enum(u16) {
 
     // ── System (0x000 – 0x00F) ───────────────────────────────────────────────
     ping = 0x000,
+    /// A shard asking another for its page of a list or scan.
+    system_walk_page = 0x001,
 
     // ── Namespace (0x010 – 0x02F) ────────────────────────────────────────────
     namespace_create = 0x010,

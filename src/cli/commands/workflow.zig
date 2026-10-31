@@ -634,19 +634,25 @@ fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.listDefinitions(&client, namespace) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    // No definitions still answers with a count of 0.
-    const data = result.asRawData() orelse return outcome.malformed(ctx, "list response (empty)");
-
-    output.printWireList(ctx, data, "(no workflows)", &.{
+    const columns: []const output.WireColumn = &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
         .{ .field = "version", .header = "VERSION", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at", .header = "", .field_type = .int_i64 },
-    }) catch return outcome.malformed(ctx, "list");
+    };
+    var pages = output.WirePages.init(ctx.allocator, columns);
+    defer pages.deinit();
+    while (pages.more) {
+        var result = client_mod.workflow.listDefinitions(&client, namespace, null, pages.cursor) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
+        // No definitions still answers with a count of 0.
+        const data = result.asRawData() orelse return outcome.malformed(ctx, "list response (empty)");
+        pages.take(data, std.math.maxInt(u32)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return outcome.malformed(ctx, "list"),
+        };
+    }
+    output.printWireList(ctx, pages.list(), "(no workflows)", columns) catch return outcome.malformed(ctx, "list");
 }
 
 // =============================================================================

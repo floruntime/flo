@@ -733,28 +733,6 @@ pub const ProcessingHandler = struct {
         shard.sendOkResponse(conn, req.header.request_id, buf);
     }
 
-    /// A walk's list answer: each named job in `namespace`, from every
-    /// shard's handler in `contexts`.
-    pub fn serializeWalkJobs(allocator: Allocator, names: []const []const u8, next_cursor: ?[]const u8, contexts: []const *anyopaque, namespace: []const u8) ![]u8 {
-        const req_ns = if (namespace.len > 0) namespace else "default";
-        var jobs: std.ArrayListUnmanaged(*const JobRecord) = .empty;
-        defer jobs.deinit(allocator);
-        for (names) |name| {
-            for (contexts) |ctx| {
-                const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
-                var it = handler.jobs.iterator();
-                while (it.next()) |entry| {
-                    const job = entry.value_ptr;
-                    if (std.mem.eql(u8, job.name_owned, name) and std.mem.eql(u8, job.namespace_owned, req_ns)) {
-                        try jobs.append(allocator, job);
-                        break;
-                    }
-                }
-            }
-        }
-        return encodeJobList(allocator, jobs.items, next_cursor);
-    }
-
     /// The list answer, for a single shard and a walk alike:
     /// [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
     ///  [status_len:u16][status][created_at:i64])*[has_more:u8][cursor_len:u16][cursor]
@@ -764,23 +742,42 @@ pub const ProcessingHandler = struct {
     fn encodeJobList(allocator: Allocator, jobs: []const *const JobRecord, next_cursor: ?[]const u8) ![]u8 {
         const cursor = next_cursor orelse "";
         var total: usize = 4 + 1 + 2 + cursor.len;
-        for (jobs) |j| total += 2 + j.name_owned.len + 2 + j.job_id_owned.len + 2 + statusLen(j) + 8;
+        for (jobs) |j| total += entrySize(j);
         const buf = try allocator.alloc(u8, total);
         var w: std.Io.Writer = .fixed(buf);
         w.writeInt(u32, @intCast(jobs.len), .little) catch unreachable;
-        for (jobs) |j| {
-            w.writeInt(u16, @intCast(j.name_owned.len), .little) catch unreachable;
-            w.writeAll(j.name_owned) catch unreachable;
-            w.writeInt(u16, @intCast(j.job_id_owned.len), .little) catch unreachable;
-            w.writeAll(j.job_id_owned) catch unreachable;
-            w.writeInt(u16, @intCast(statusLen(j)), .little) catch unreachable;
-            writeStatus(j, &w);
-            w.writeInt(i64, j.created_at_ms, .little) catch unreachable;
-        }
+        for (jobs) |j| writeEntry(j, &w) catch unreachable;
         w.writeByte(@intFromBool(next_cursor != null)) catch unreachable;
         w.writeInt(u16, @intCast(cursor.len), .little) catch unreachable;
         w.writeAll(cursor) catch unreachable;
         return buf;
+    }
+
+    pub fn entrySize(j: *const JobRecord) usize {
+        return 2 + j.name_owned.len + 2 + j.job_id_owned.len + 2 + statusLen(j) + 8;
+    }
+
+    /// One job as the list answer lists it.
+    pub fn writeEntry(j: *const JobRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeInt(u16, @intCast(j.name_owned.len), .little);
+        try w.writeAll(j.name_owned);
+        try w.writeInt(u16, @intCast(j.job_id_owned.len), .little);
+        try w.writeAll(j.job_id_owned);
+        try w.writeInt(u16, @intCast(statusLen(j)), .little);
+        writeStatus(j, w);
+        try w.writeInt(i64, j.created_at_ms, .little);
+    }
+
+    /// The job named `name` in `namespace` (empty is "default"), if this
+    /// shard holds it.
+    pub fn jobNamed(self: *const ProcessingHandler, namespace: []const u8, name: []const u8) ?*const JobRecord {
+        const ns = if (namespace.len > 0) namespace else "default";
+        var it = self.jobs.iterator();
+        while (it.next()) |entry| {
+            const job = entry.value_ptr;
+            if (std.mem.eql(u8, job.name_owned, name) and std.mem.eql(u8, job.namespace_owned, ns)) return job;
+        }
+        return null;
     }
 
     /// What status and list say beside a job's status: a failed job's
@@ -2493,11 +2490,10 @@ test "ProcessingHandler: replicas of different shard counts store the same statu
     try std.testing.expectEqual(@as(u64, 1), two.held_jobs);
 
     // The list says so, beside the status.
-    const ctxs = [_]*anyopaque{@ptrCast(&two)};
-    const answer = try ProcessingHandler.serializeWalkJobs(std.testing.allocator, &.{"lookup"}, null, &ctxs, "");
-    defer std.testing.allocator.free(answer);
-    var r = @import("../util/wire.zig").WireReader.init(answer);
-    _ = r.readU32().?;
+    var entry_buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&entry_buf);
+    try ProcessingHandler.writeEntry(two.jobNamed("", "lookup").?, &w);
+    var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     _ = r.readLengthPrefixed(u16).?;
     _ = r.readLengthPrefixed(u16).?;
     try std.testing.expectEqualStrings("RUNNING (held here: kv_lookup needs a one-shard server (--shards 1) until lookups can read other shards)", r.readLengthPrefixed(u16).?);
@@ -2764,11 +2760,10 @@ test "ProcessingHandler: list shows a failed job's reason, through the walk ever
     try std.testing.expect(reason.len > 0);
 
     // A definition that doesn't parse has no name of its own: the job's id stands in.
-    const ctxs = [_]*anyopaque{@ptrCast(&handler)};
-    const answer = try ProcessingHandler.serializeWalkJobs(std.testing.allocator, &.{"job-r"}, null, &ctxs, "");
-    defer std.testing.allocator.free(answer);
-    var r = @import("../util/wire.zig").WireReader.init(answer);
-    try std.testing.expectEqual(@as(u32, 1), r.readU32().?);
+    var entry_buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&entry_buf);
+    try ProcessingHandler.writeEntry(handler.jobNamed("", "job-r").?, &w);
+    var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
     const status = r.readLengthPrefixed(u16).?;

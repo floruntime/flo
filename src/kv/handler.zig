@@ -147,7 +147,7 @@ pub const KVHandler = struct {
         // client is.
         dispatcher.registerWithRoute(.kv_mget, table_run.handler("kv.mget", KVHandler, mget), table_run.routeByField("kv.mget"));
         // Every shard: walked from the client's.
-        dispatcher.registerWalk(.kv_scan, table_run.handler("kv.scan", KVHandler, scan), localScanKeys);
+        dispatcher.registerPagedWalk(.kv_scan, table_run.handler("kv.scan", KVHandler, scan), localScanKeys);
     }
 
     // ── Table ops ───────────────────────────────────────────────────────

@@ -242,21 +242,25 @@ fn runList(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    const limit = ctx.getUint("limit") orelse 100;
-    var result = client_mod.processing.list(&client, namespace, limit, null) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    const data = result.asRawData() orelse {
-        output.printEmptyList(ctx, "(no processing jobs)");
-        return;
-    };
-
-    output.printWireList(ctx, data, "(no processing jobs)", &.{
+    const limit: u32 = ctx.getUint("limit") orelse 100;
+    const columns: []const output.WireColumn = &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
         .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16, .alignment = .left },
         .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
-    }) catch return outcome.malformed(ctx, "list");
+    };
+    var pages = output.WirePages.init(ctx.allocator, columns);
+    defer pages.deinit();
+    while (pages.more and pages.count < limit) {
+        const want = limit - pages.count;
+        var result = client_mod.processing.list(&client, namespace, want, pages.cursor) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
+        const data = result.asRawData() orelse break;
+        pages.take(data, want) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return outcome.malformed(ctx, "list"),
+        };
+    }
+    output.printWireList(ctx, pages.list(), "(no processing jobs)", columns) catch return outcome.malformed(ctx, "list");
 }

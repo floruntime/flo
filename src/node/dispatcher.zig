@@ -132,6 +132,9 @@ pub const Dispatcher = struct {
     /// Set for opcodes that need cross-shard walking (list/scan).
     /// Matches `NameWalker.LocalScanFn` signature.
     walk_fn: [proto.MAX_OPCODES]?NameWalker.LocalScanFn,
+    /// The walk's scan pages itself by its own cursor (`ShardWalker.initPaged`),
+    /// rather than by an offset the walker keeps.
+    walk_paged: [proto.MAX_OPCODES]bool,
 
     /// Per-opcode cross-shard walk contexts.
     /// walk_contexts[opcode] = slice of per-shard *anyopaque (one per shard).
@@ -151,6 +154,7 @@ pub const Dispatcher = struct {
             .pre_route = @as([proto.MAX_OPCODES]?PreRouteFn, @splat(null)),
             .shard_route = @as([proto.MAX_OPCODES]?ShardRouteFn, @splat(null)),
             .walk_fn = @as([proto.MAX_OPCODES]?NameWalker.LocalScanFn, @splat(null)),
+            .walk_paged = @splat(false),
             .walk_contexts = @as([proto.MAX_OPCODES]?[]const *anyopaque, @splat(null)),
             .on_error = null,
             .handler_count = 0,
@@ -190,6 +194,19 @@ pub const Dispatcher = struct {
         self.handlers[idx] = handler;
         self.walk_fn[idx] = scan_fn;
         // pre_route stays null — walk opcodes have no hash routing
+    }
+
+    /// `registerWalk` for a scan that pages itself by its own cursor.
+    pub fn registerPagedWalk(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn) void {
+        self.registerWalk(opcode, handler, scan_fn);
+        self.walk_paged[@backingInt(opcode)] = true;
+    }
+
+    /// The walker for `op`'s scan, over `shard_count` shards.
+    pub fn walker(self: *const Dispatcher, op: u16, shard_count: u16) ?NameWalker {
+        if (op >= proto.MAX_OPCODES) return null;
+        const scan = self.walk_fn[op] orelse return null;
+        return if (self.walk_paged[op]) NameWalker.initPaged(scan, shard_count) else NameWalker.init(scan, shard_count);
     }
 
     /// Register a walk opcode with a pre-route hook for dual-path routing.
@@ -285,6 +302,7 @@ pub const Dispatcher = struct {
             self.pre_route[idx] = null;
             self.shard_route[idx] = null;
             self.walk_fn[idx] = null;
+            self.walk_paged[idx] = false;
             self.walk_contexts[idx] = null;
             self.handler_count -= 1;
         }
