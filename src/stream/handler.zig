@@ -781,6 +781,8 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(ns_hash, req.key);
         var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const meta_key = metaKey(&meta_buf, req) orelse return NAME_TOO_LONG;
+        // An unknown stream is not an empty one.
+        if (!self.stream.stream_names.contains(meta_key)) return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         const pc = self.stream.getPartitionCount(meta_key);
 
         const first_id = self.stream.streamFirstId(name_hash);

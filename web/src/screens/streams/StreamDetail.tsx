@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { cfmt, jhl, tfmt } from '@/lib/format'
+import { DASH, cfmt, jhl, orDash, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useStreamDetail, useStreamMessages } from '@/lib/api/streams'
 import { Crumb, Stats, Stat } from '@/components/layout'
@@ -23,7 +23,9 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
   const dragRef = useRef<'s' | 'e' | 'c' | null>(null)
 
   const detail = detailQ.data
-  const recordCount = detail?.partitions?.[0]?.record_count ?? msgsQ.data?.total_count ?? 0
+  const recordCount = detail?.total_count ?? msgsQ.data?.total_count ?? 0
+  // Null: no op lists a stream's groups yet. Unknown is not "no groups".
+  const groupsKnown = !detail || detail.consumer_groups != null
 
   // Build records (ascending) + bucket them by TIME (a real activity histogram:
   // bursts → tall bars, quiet stretches → short). Bar height = total bytes per
@@ -133,14 +135,19 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
       <div className="ph">
         <h1 className="ph-t">{name}</h1>
         <div className="ph-s">
-          {detail?.namespace ?? ns} · {gpos.length} consumer group{gpos.length === 1 ? '' : 's'} · append-only log
+          {detail?.namespace ?? ns} · {groupsKnown ? gpos.length : DASH} consumer group{gpos.length === 1 ? '' : 's'} · append-only log
         </div>
       </div>
 
       <Stats>
         <Stat label="Records" value={cfmt(recordCount)} sub="in stream" />
-        <Stat label="Consumer groups" value={gpos.length} />
-        <Stat label="Max lag" value={cfmt(maxLag)} valueColor={maxLag > 0 ? 'var(--warn)' : undefined} sub={maxLag > 0 ? 'behind' : 'caught up'} />
+        <Stat label="Consumer groups" value={groupsKnown ? gpos.length : DASH} sub={groupsKnown ? undefined : 'not available yet'} />
+        <Stat
+          label="Max lag"
+          value={groupsKnown ? cfmt(maxLag) : DASH}
+          valueColor={maxLag > 0 ? 'var(--warn)' : undefined}
+          sub={!groupsKnown ? 'not available yet' : maxLag > 0 ? 'behind' : 'caught up'}
+        />
         <Stat label="Loaded" value={records.length} sub="recent window" />
       </Stats>
 
@@ -210,7 +217,7 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
           {(
             [
               ['data', 'Stream data' + (fullRange ? '' : ' · ' + inRange.length)],
-              ['groups', 'Consumer groups · ' + gpos.length],
+              ['groups', 'Consumer groups · ' + (groupsKnown ? gpos.length : DASH)],
               ['pel', 'Pending'],
             ] as [Tab, string][]
           ).map(([id, lbl]) => (
@@ -264,7 +271,9 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
 
         {tab === 'groups' && (
           <div className="card card-p" style={{ padding: '6px 20px 12px' }}>
-            {gpos.length === 0 ? (
+            {!groupsKnown ? (
+              <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--tx-3)', fontSize: 13 }}>Consumer groups not available yet.</div>
+            ) : gpos.length === 0 ? (
               <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--tx-3)', fontSize: 13 }}>No consumer groups.</div>
             ) : (
               <>
@@ -281,7 +290,7 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
                       <Dot color={g.color} style={{ flex: 'none' }} />
                       <span className="gn" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{g.name}</span>
                     </span>
-                    <span className="r mono" style={{ color: 'var(--tx-2)', fontSize: 13 }}>{g.members}</span>
+                    <span className="r mono" style={{ color: 'var(--tx-2)', fontSize: 13 }}>{orDash(g.members)}</span>
                     <span className="r mono" style={{ fontSize: 13, color: g.pending_count > 0 ? 'var(--warn)' : 'var(--tx-3)' }}>{g.pending_count}</span>
                     <span className="r mono" style={{ fontSize: 13, color: g.lag > 0 ? 'var(--warn)' : 'var(--accent)' }}>{g.lag}</span>
                     <span className="r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
@@ -296,7 +305,9 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
 
         {tab === 'pel' && (
           <div className="card card-p" style={{ color: 'var(--tx-3)', fontSize: 13.5, textAlign: 'center', padding: '40px 24px' }}>
-            {gpos.reduce((a, g) => a + g.pending_count, 0) > 0
+            {!groupsKnown
+              ? 'Pending entries not available yet.'
+              : gpos.reduce((a, g) => a + g.pending_count, 0) > 0
               ? `${gpos.reduce((a, g) => a + g.pending_count, 0)} pending entries across ${gpos.length} group(s).`
               : 'No pending entries — all groups have acknowledged.'}
           </div>

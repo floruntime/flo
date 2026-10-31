@@ -1,10 +1,10 @@
 /* Flo Console v2 — Processing screen (live).
    Stream processing · pipeline DAG.
 
-   Wired to the dashboard API. Jobs are namespace-scoped server-side. The API
-   exposes the registry record (status, batch_size, records_processed) and the
-   full submitted pipeline YAML (parsed here into the source→operator→sink
-   DAG). It does NOT expose live rates, e2e latency, backpressure,
+   Wired to the dashboard API. Jobs are namespace-scoped server-side. The job
+   detail answers status, batch_size and records_processed; the list answers
+   neither count, and the submitted YAML (parsed here into the
+   source→operator→sink DAG) comes back null until an op answers it. It does NOT expose live rates, e2e latency, backpressure,
    per-operator in/out counts, checkpoints or window metrics — those mock cards were
    dropped, not faked. Submit / stop / cancel are real loopback writes. See API_INTEGRATION.md. */
 import { Fragment, useMemo, useState } from 'react'
@@ -12,6 +12,7 @@ import { Button } from '@/components/buttons/Button'
 import { Crumb, PhSec, Stat, Stats } from '@/components/layout'
 import { StatusPill, OpPill } from '@/components'
 import { Modal } from '@/components/overlay/Modal'
+import { DASH, sumKnown } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useJobs, useJobDetail, useSubmitJob, useStopJob, useCancelJob } from '@/lib/api/processing'
 import type { ProcessingJobInfo, ProcessingJobDetail, JobStatus } from '@/lib/api/types'
@@ -168,7 +169,7 @@ function Wire({ n, flow, running }: { n?: number | null; flow?: boolean; running
     </div>
   )
 }
-function Topology({ pipe, records, running }: { pipe: Pipeline; records: number; running: boolean }) {
+function Topology({ pipe, records, running }: { pipe: Pipeline; records: number | null; running: boolean }) {
   return (
     <div className="ptopo-scroll">
       <div className="ptopo">
@@ -278,7 +279,7 @@ function SubmitModal({ ns, onClose }: { ns: string; onClose: () => void }) {
 
 /* ---------- detail ---------- */
 function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; onBack: () => void }) {
-  const q = useJobDetail(job.job_id)
+  const q = useJobDetail(job.namespace, job.job_id)
   const stop = useStopJob(ns)
   const cancel = useCancelJob(ns)
   const [tab, setTab] = useState<'overview' | 'definition'>('overview')
@@ -320,8 +321,8 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
       </div>
 
       <Stats>
-        <Stat label="Records processed" value={pfmtN(records)} sub={running ? 'climbing' : 'final'} />
-        <Stat label="Batch size" value={d?.batch_size ?? job.batch_size} sub="per tick" />
+        <Stat label="Records processed" value={records == null ? DASH : pfmtN(records)} sub={running ? 'climbing' : 'final'} />
+        <Stat label="Batch size" value={d?.batch_size ?? job.batch_size ?? DASH} sub="per tick" />
         <Stat label="Uptime" value={pUp(d?.created_at ?? job.created_at)} sub="since submit" />
       </Stats>
 
@@ -348,7 +349,9 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
             <PhSec icon={PSEC.layers} title="Pipeline topology" />
             <Topology pipe={pipe} records={records} running={running} />
             <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 10 }}>
-              Edge counts aren’t exposed per-operator — only the source record total is live.
+              {d && d.yaml == null
+                ? 'The pipeline definition isn’t available yet, so its operators can’t be drawn.'
+                : 'Edge counts aren’t exposed per-operator — only the source record total is live.'}
             </div>
           </div>
         ) : (
@@ -358,7 +361,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
               <pre className="code" dangerouslySetInnerHTML={{ __html: pYamlHL(d.yaml) }} />
             ) : (
               <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-faint)' }}>
-                {q.isLoading ? 'Loading…' : 'No definition available.'}
+                {q.isLoading ? 'Loading…' : 'The submitted definition isn’t available yet.'}
               </div>
             )}
           </div>
@@ -378,7 +381,8 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
   const [submit, setSubmit] = useState(false)
 
   const running = jobs.filter((j) => j.status === 'RUNNING').length
-  const records = jobs.reduce((a, j) => a + j.records_processed, 0)
+  // The list answers no record counts: an unknown total, not 0.
+  const records = sumKnown(jobs.map((j) => j.records_processed))
   const notRunning = jobs.length - running
   const filtered =
     tab === 'all' ? jobs : tab === 'running' ? jobs.filter((j) => j.status === 'RUNNING') : jobs.filter((j) => j.status !== 'RUNNING')
@@ -402,7 +406,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
       <Stats>
         <Stat label="Jobs" value={q.isLoading ? '…' : jobs.length} sub={`${running} running · in ${ns}`} />
         <Stat label="Running" value={running} sub="active pipelines" />
-        <Stat label="Records processed" value={pfmtN(records)} sub="across jobs" />
+        <Stat label="Records processed" value={records == null ? DASH : pfmtN(records)} sub={records == null ? 'open a job to see its count' : 'across jobs'} />
         <Stat label="Not running" value={notRunning} valueColor={notRunning ? 'var(--warn)' : undefined} sub="stopped / cancelled" />
       </Stats>
 
@@ -450,7 +454,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
                   <span>
                     <StatusPill color={c} label={l} />
                   </span>
-                  <span className="c r mono">{pfmtN(j.records_processed)}</span>
+                  <span className="c r mono">{j.records_processed == null ? DASH : pfmtN(j.records_processed)}</span>
                   <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
                     {pUp(j.created_at)}
                   </span>

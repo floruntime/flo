@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { cfmt } from '@/lib/format'
+import { cfmt, orDash, sumKnown } from '@/lib/format'
 import { cx } from '@/lib/cx'
 import { useNamespace } from '@/lib/namespace'
 import { useQueues } from '@/lib/api/queues'
@@ -20,8 +20,10 @@ export function Queues() {
 
   if (open) return <QueueDetail name={open.name} ns={open.ns} onBack={() => setOpen(null)} />
 
-  const totReady = queues.reduce((a, x) => a + x.ready, 0)
-  const totInflight = queues.reduce((a, x) => a + x.inflight, 0)
+  // Ready / in-flight are null until an op answers them: a total over an
+  // unknown is unknown, never a sum that counts it as 0.
+  const totReady = sumKnown(queues.map((x) => x.ready))
+  const totInflight = sumKnown(queues.map((x) => x.inflight))
   const totDlq = queues.reduce((a, x) => a + x.dlq_count, 0)
   const dlqQueues = queues.filter((x) => x.dlq_count > 0)
 
@@ -41,8 +43,8 @@ export function Queues() {
 
       <Stats>
         <Stat label="Queues" value={q.isLoading ? '…' : queues.length} sub="across namespaces" />
-        <Stat label="Ready" value={cfmt(totReady)} sub="available to deliver" />
-        <Stat label="In-flight" value={totInflight} sub="leased now" />
+        <Stat label="Ready" value={orDash(totReady, cfmt)} sub={totReady == null ? 'not available yet' : 'available to deliver'} />
+        <Stat label="In-flight" value={orDash(totInflight)} sub={totInflight == null ? 'not available yet' : 'leased now'} />
         <Stat label="Dead letters" value={totDlq} valueColor={totDlq ? 'var(--crit)' : undefined} sub={totDlq ? 'needs triage' : 'all clear'} />
       </Stats>
 
@@ -95,8 +97,8 @@ export function Queues() {
                     </div>
                     <div className="desc">{x.namespace}</div>
                   </div>
-                  <span className="c r mono">{cfmt(x.ready)}</span>
-                  <span className="c r mono" style={{ color: x.inflight ? 'var(--info)' : 'var(--tx-3)' }}>{x.inflight}</span>
+                  <span className="c r mono">{orDash(x.ready, cfmt)}</span>
+                  <span className="c r mono" style={{ color: x.inflight ? 'var(--info)' : 'var(--tx-3)' }}>{orDash(x.inflight)}</span>
                   <span className="c r mono" style={{ color: 'var(--tx-3)' }}>{cfmt(x.enqueued)}</span>
                   <span className="c r mono" style={{ color: 'var(--tx-3)' }}>{cfmt(x.dequeued)}</span>
                   <span className="c r mono" style={{ color: x.dlq_count ? 'var(--crit)' : 'var(--tx-3)' }}>{x.dlq_count}</span>

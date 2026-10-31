@@ -12,17 +12,10 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Method = @import("../../../util/http/mod.zig").Method;
-const Shard = @import("../../shard.zig").Shard;
-const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
 const client_mod = @import("../../../cli/client/mod.zig");
-
-// ── Helpers ──
-
-fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    return @ptrCast(@alignCast(ptrs[idx]));
-}
+const loopback = @import("loopback.zig");
+const output = @import("../../../cli/output.zig");
+const WireReader = @import("../../../util/wire.zig").WireReader;
 
 /// Short-lived loopback client to the node's own protocol port — mutations can't
 /// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
@@ -35,90 +28,39 @@ fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Cli
     return client;
 }
 
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
-
-/// Live per-job runtime metrics for the dashboard Metrics tab (issue #27).
-/// Counters come from the job's pipeline state(s); rates are derived against the
-/// job's elapsed lifetime. `running` is false when no pipeline exists (stopped
-/// jobs), in which case the live gauges are zero but cumulative counts persist.
-const JobMetrics = struct {
-    records_in: u64,
-    records_out: u64 = 0,
-    throughput_per_sec: f64 = 0,
-    output_per_sec: f64 = 0,
-    last_read_count: u32 = 0,
-    batch_size: u32,
-    idle_ms: i64 = 0,
-    watermark_ms: i64 = 0,
-    watermark_lag_ms: i64 = 0,
-    latency_last_ms: f64 = 0,
-    latency_avg_ms: f64 = 0,
-    latency_max_ms: f64 = 0,
-    running: bool = false,
+/// `processing_list`'s entry: `[name_len:u16][name][job_id_len:u16][job_id]
+/// [status_len:u16][status][created_at:i64]`.
+const job_columns = [_]output.WireColumn{
+    .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+    .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16 },
+    .{ .field = "status", .header = "STATUS", .field_type = .str_u16 },
+    .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
 };
 
-fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-}
-
-fn jobMetrics(shard: *Shard, job: *const ProcessingHandler.JobRecord, now_ms: i64) JobMetrics {
-    var m = JobMetrics{ .records_in = job.records_processed, .batch_size = job.batch_size };
-    const elapsed_s: f64 = @as(f64, @floatFromInt(@max(@as(i64, 1), now_ms - job.created_at_ms))) / 1000.0;
-    m.throughput_per_sec = @as(f64, @floatFromInt(m.records_in)) / elapsed_s;
-
-    // A job maps to one pipeline, or several `job_id\0idx` entries for a
-    // multi-source job; aggregate across all that belong to this job. Pipelines
-    // live on the same shard as the job, so scanning this shard suffices.
-    var tick_sum: u64 = 0;
-    var tick_count: u64 = 0;
-    var tick_max: u64 = 0;
-    var last_ns: u64 = 0;
-    var last_poll: i64 = 0;
-    var it = shard.processing_handler.pipelines.iterator();
-    while (it.next()) |e| {
-        const key = e.key_ptr.*;
-        const base = if (std.mem.indexOfScalar(u8, key, 0)) |p| key[0..p] else key;
-        if (!std.mem.eql(u8, base, job.job_id_owned)) continue;
-        const pipe = e.value_ptr;
-        m.running = true;
-        m.records_out += pipe.records_out;
-        if (pipe.last_read_count > m.last_read_count) m.last_read_count = pipe.last_read_count;
-        if (pipe.watermark_ms > m.watermark_ms) m.watermark_ms = pipe.watermark_ms;
-        if (pipe.last_poll_ms > last_poll) last_poll = pipe.last_poll_ms;
-        tick_sum += pipe.tick_ns_sum;
-        tick_count += pipe.tick_count;
-        if (pipe.tick_ns_max > tick_max) tick_max = pipe.tick_ns_max;
-        if (pipe.tick_ns_last > last_ns) last_ns = pipe.tick_ns_last;
+const JobLister = struct {
+    namespace: []const u8,
+    pub fn ask(self: JobLister, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.processing.list(client, self.namespace, null, cursor);
     }
+};
 
-    m.output_per_sec = @as(f64, @floatFromInt(m.records_out)) / elapsed_s;
-    m.idle_ms = if (last_poll > 0) now_ms - last_poll else 0;
-    m.latency_last_ms = nsToMs(last_ns);
-    m.latency_max_ms = nsToMs(tick_max);
-    m.latency_avg_ms = if (tick_count > 0) nsToMs(tick_sum / tick_count) else 0;
-    m.watermark_lag_ms = if (m.watermark_ms > 0) now_ms - m.watermark_ms else 0;
-    return m;
+/// A listed job's status reads `FAILED: <reason>` or `RUNNING (<note>)`;
+/// the status alone is its first word.
+fn statusWord(listed: []const u8) []const u8 {
+    const end = std.mem.indexOfAny(u8, listed, ": ") orelse listed.len;
+    return listed[0..end];
 }
 
-fn writeJobMetrics(obj: anytype, m: JobMetrics) !void {
-    var mo = try obj.objectField("metrics");
-    try mo.begin();
-    try mo.intField("records_in", @as(i64, @intCast(m.records_in)));
-    try mo.intField("records_out", @as(i64, @intCast(m.records_out)));
-    try mo.floatField("throughput_per_sec", m.throughput_per_sec);
-    try mo.floatField("output_per_sec", m.output_per_sec);
-    try mo.intField("last_read_count", @as(i64, @intCast(m.last_read_count)));
-    try mo.intField("batch_size", @as(i64, @intCast(m.batch_size)));
-    try mo.intField("idle_ms", m.idle_ms);
-    try mo.intField("watermark_ms", m.watermark_ms);
-    try mo.intField("watermark_lag_ms", m.watermark_lag_ms);
-    try mo.floatField("latency_last_ms", m.latency_last_ms);
-    try mo.floatField("latency_avg_ms", m.latency_avg_ms);
-    try mo.floatField("latency_max_ms", m.latency_max_ms);
-    try mo.boolField("running", m.running);
-    try mo.end();
+/// `processing_status`'s status byte, as the job's status reads.
+fn statusName(code: u8) []const u8 {
+    return switch (code) {
+        0 => "RUNNING",
+        1 => "STOPPED",
+        2 => "CANCELLED",
+        3 => "FAILED",
+        4 => "COMPLETED",
+        else => "UNKNOWN",
+    };
 }
 
 /// Router for /processing/* requests
@@ -151,86 +93,117 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
     return h.jsonError(allocator, "Not found");
 }
 
+/// `processing_status`'s answer: [job_id_len:u16][job_id][name_len:u16][name]
+/// [status:u8][batch_size:u32][records_processed:u64][created_at:i64]
+/// [reason_len:u16][reason].
+const JobStatus = struct {
+    id: []const u8,
+    name: []const u8,
+    status: u8,
+    batch_size: u32,
+    records: u64,
+    created_at: i64,
+    reason: []const u8,
+
+    fn decode(data: []const u8) ?JobStatus {
+        var r = WireReader.init(data);
+        const st: JobStatus = .{
+            .id = r.readLengthPrefixed(u16) orelse return null,
+            .name = r.readLengthPrefixed(u16) orelse return null,
+            .status = r.readU8() orelse return null,
+            .batch_size = r.readU32() orelse return null,
+            .records = r.readU64() orelse return null,
+            .created_at = r.readI64() orelse return null,
+            .reason = r.readLengthPrefixed(u16) orelse return null,
+        };
+        return if (r.remainingLen() == 0) st else null;
+    }
+};
+
+/// GET /processing/jobs — The namespace's jobs (`processing_list`). The
+/// list answers no counts or live metrics, so those are null.
 fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "processing job list", err);
+    defer reader.deinit();
+    var pages = reader.listAll(allocator, &job_columns, JobLister{ .namespace = ns }) catch |err|
+        return try loopback.readFailed(allocator, "processing job list", err);
+    defer pages.deinit();
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-
-    // Collect jobs from all shards (de-duplicate by job_id)
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
-    const now_ms = @import("stdx").time.milliTimestamp();
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            const ph = shard.processing_handler;
-            var it = ph.jobs.iterator();
-            while (it.next()) |entry| {
-                const job = entry.value_ptr;
-                const gop = try seen.getOrPut(job.job_id_owned);
-                if (!gop.found_existing) {
-                    // Filter by namespace (defaults to "default")
-                    if (!std.mem.eql(u8, job.namespace_owned, ns_filter)) continue;
-                    try arr.next();
-                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try obj.begin();
-                    try obj.stringField("job_id", job.job_id_owned);
-                    try obj.stringField("name", job.name_owned);
-                    try obj.stringField("namespace", job.namespace_owned);
-                    try obj.stringField("status", job.status.toString());
-                    try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
-                    try obj.intField("created_at", job.created_at_ms);
-                    try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
-                    try writeJobMetrics(&obj, jobMetrics(shard, job, now_ms));
-                    try obj.end();
-                }
-            }
-        }
+    var r = WireReader.init(pages.list());
+    _ = r.readU32();
+    for (0..pages.count) |_| {
+        // Each page's rows were checked whole as they were taken.
+        const name = r.readLengthPrefixed(u16) orelse break;
+        const job_id = r.readLengthPrefixed(u16) orelse break;
+        const status = r.readLengthPrefixed(u16) orelse break;
+        const created_at = r.readI64() orelse break;
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("job_id", job_id);
+        try obj.stringField("name", name);
+        try obj.stringField("namespace", ns);
+        try obj.stringField("status", statusWord(status));
+        try obj.nullField("batch_size");
+        try obj.intField("created_at", created_at);
+        try obj.nullField("records_processed");
+        try obj.nullField("metrics");
+        try obj.end();
     }
-
     try arr.end();
     return try json_aw.toOwnedSlice();
 }
 
+/// GET /processing/jobs/:id?namespace= — One job (`processing_status`, on
+/// the job's shard). Its definition and live metrics are null: no op
+/// answers them yet.
 fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = query_string;
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "processing job status", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "processing job status", err);
+    var got = client_mod.processing.status(client, ns, job_id) catch |err|
+        return try loopback.readFailed(allocator, "processing job status", err);
+    defer got.deinit();
+
+    // Not found: a stub, the id echoed, so callers can tell.
+    if (got.isNotFound()) return try unknownJob(allocator, job_id);
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    const st = JobStatus.decode(got.data) orelse
+        return try h.jsonError(allocator, "processing job status: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("job_id", st.id);
+    try obj.stringField("name", st.name);
+    try obj.stringField("namespace", ns);
+    try obj.stringField("status", statusName(st.status));
+    if (st.reason.len > 0) try obj.stringField("reason", st.reason) else try obj.nullField("reason");
+    try obj.intField("batch_size", @as(i64, st.batch_size));
+    try obj.intField("created_at", st.created_at);
+    try obj.intField("records_processed", @as(i64, @intCast(st.records)));
+    try obj.nullField("metrics");
+    try obj.nullField("yaml");
+    try obj.end();
+    return try json_aw.toOwnedSlice();
+}
 
-    // Find the real job across shards (mirror listJobs). Each job hashes to one
-    // shard, but scan all to be safe.
-    const n = shardCount(ctx);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const shard = getShard(ctx, i) orelse continue;
-        const job = shard.processing_handler.jobs.getPtr(job_id) orelse continue;
-
-        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-        try obj.begin();
-        try obj.stringField("job_id", job.job_id_owned);
-        try obj.stringField("name", job.name_owned);
-        try obj.stringField("namespace", job.namespace_owned);
-        try obj.stringField("status", job.status.toString());
-        try obj.intField("batch_size", @as(i64, @intCast(job.batch_size)));
-        try obj.intField("created_at", job.created_at_ms);
-        try obj.intField("records_processed", @as(i64, @intCast(job.records_processed)));
-        try writeJobMetrics(&obj, jobMetrics(shard, job, @import("stdx").time.milliTimestamp()));
-        // Full pipeline definition — the frontend parses this for the source/
-        // operator/sink DAG.
-        try obj.stringField("yaml", job.yaml_owned);
-
-        try obj.end();
-        return try json_aw.toOwnedSlice();
-    }
-
-    // Not found — keep a minimal stub (job_id echoed) so callers can detect it.
+fn unknownJob(allocator: Allocator, job_id: []const u8) ![]const u8 {
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("job_id", job_id);
@@ -316,33 +289,55 @@ fn cancelJob(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8
 // Tests
 // =============================================================================
 
-test "handleProcessingRequest lists jobs" {
+/// A context whose loopback connect is refused: nothing listens on port 1.
+fn unreachableContext(allocator: Allocator, metrics: *h.MetricsRegistry) DashboardContext {
+    var ctx = DashboardContext.init(allocator, metrics, 1);
+    ctx.listen_port = 1;
+    return ctx;
+}
+
+test "handleProcessingRequest says the job list failed when the node can't be reached" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try handleProcessingRequest(allocator, .GET, "/jobs", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"processing job list"));
 }
 
-test "handleProcessingRequest job detail" {
+test "handleProcessingRequest says the job status failed when the node can't be reached" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try handleProcessingRequest(allocator, .GET, "/jobs/job-456", null, "", &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"job_id\":\"job-456\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"processing job status"));
+}
+
+test "processing: a listed status reads as its first word, and a status answer decodes whole" {
+    try std.testing.expectEqualStrings("FAILED", statusWord("FAILED: source gone"));
+    try std.testing.expectEqualStrings("RUNNING", statusWord("RUNNING (held here: x)"));
+    try std.testing.expectEqualStrings("STOPPED", statusWord("STOPPED"));
+
+    const answer = [_]u8{ 1, 0, 'j', 1, 0, 'n', 3, 10, 0, 0, 0 } ++ [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 2, 0, 'n', 'o' };
+    const st = JobStatus.decode(&answer).?;
+    try std.testing.expectEqualStrings("j", st.id);
+    try std.testing.expectEqualStrings("FAILED", statusName(st.status));
+    try std.testing.expectEqual(@as(u32, 10), st.batch_size);
+    try std.testing.expectEqual(@as(u64, 7), st.records);
+    try std.testing.expectEqualStrings("no", st.reason);
+    try std.testing.expect(JobStatus.decode(answer[0 .. answer.len - 1]) == null);
 }
 
 test "handleProcessingRequest cancel job surfaces loopback failure (no node in unit test)" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     // cancel is now a real loopback write; with no node listening it must fail
     // gracefully with an error envelope rather than the old stub success.
@@ -355,7 +350,7 @@ test "handleProcessingRequest stop job surfaces loopback failure (no node in uni
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try handleProcessingRequest(allocator, .PUT, "/jobs/job-789/stop", null, "", &ctx);
     defer allocator.free(result);

@@ -9,12 +9,15 @@
    are fully applied — partial sets, `!=`, and `=~`/`!~` globs all select series
    via the projection's tag dictionary.
    Ingest is command-only (no write endpoint); measurements are namespace-scoped
-   server-side (`?namespace=`). See API_INTEGRATION.md. */
+   server-side (`?namespace=`). No op answers a measurement's series, fields or
+   points yet: those come back null and render "—", and the detail charts a
+   field the viewer names, since /data still answers one. See API_INTEGRATION.md. */
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { Modal } from '@/components/overlay/Modal'
 import { Crumb, Stats, Stat } from '@/components/layout'
 import { Button } from '@/components/buttons/Button'
-import { cfmt } from '@/lib/format'
+import { Field } from '@/components'
+import { cfmt, DASH, orDash, sumKnown } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useMeasurements, useMeasurementDetail, useSeriesData, useFloql } from '@/lib/api/ts'
 import type { TsMeasurement } from '@/lib/api/types'
@@ -484,7 +487,13 @@ function FieldChart({ ns, measurement, field }: { ns: string; measurement: strin
 function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBack: () => void }) {
   const q = useMeasurementDetail(ns, row.name)
   const detail = q.data
+  const fieldsKnown = detail?.fields != null
   const fields = detail?.fields ?? []
+  const fieldCount = detail ? (detail.field_count ?? row.field_count) : row.field_count
+  const seriesCount = detail ? (detail.series_count ?? row.series_count) : row.series_count
+  // With no field list, /data still answers a named field ("value" by default).
+  const [askField, setAskField] = useState('value')
+  const [shownField, setShownField] = useState('value')
 
   return (
     <div className="wrap fade">
@@ -494,7 +503,7 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
           <div>
             <h1 className="ph-t">{row.name}</h1>
             <div className="ph-s">
-              {fields.length === 1 ? 'single field' : (detail?.field_count ?? row.field_count) + ' fields'} ·{' '}
+              {fieldCount == null ? `${DASH} fields` : fieldCount === 1 ? 'single field' : fieldCount + ' fields'} ·{' '}
               {detail ? `namespace ${detail.namespace}` : 'columnar engine'}
             </div>
           </div>
@@ -502,10 +511,10 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
       </div>
 
       <Stats>
-        <Stat label="Series" value={detail?.series_count ?? row.series_count} sub={`${detail?.field_count ?? row.field_count} fields`} />
-        <Stat label="Datapoints" value={cfmt(row.points)} sub="buffered" />
-        <Stat label="Fields" value={detail?.field_count ?? row.field_count} sub="per measurement" />
-        <Stat label="Retention" value={detail?.retention ?? '—'} sub={detail?.retention ? 'policy' : 'no policy set'} />
+        <Stat label="Series" value={orDash(seriesCount)} sub={`${orDash(fieldCount)} fields`} />
+        <Stat label="Datapoints" value={orDash(row.points, cfmt)} sub="buffered" />
+        <Stat label="Fields" value={orDash(fieldCount)} sub="per measurement" />
+        <Stat label="Retention" value={detail?.retention ?? DASH} sub={detail?.retention ? 'policy' : 'not available yet'} />
       </Stats>
 
       {q.isError ? (
@@ -515,6 +524,28 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
       ) : q.isLoading ? (
         <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '40px 0' }}>
           Loading…
+        </div>
+      ) : !fieldsKnown ? (
+        <div className="sec">
+          <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '24px 0', marginBottom: 16 }}>
+            Field details not available yet.
+          </div>
+          <form
+            style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 12 }}
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (askField.trim()) setShownField(askField.trim())
+            }}
+          >
+            <span className="set-h" style={{ padding: 0 }}>
+              Chart field
+            </span>
+            <Field className="mono" wrapStyle={{ width: 200 }} value={askField} onChange={(e) => setAskField(e.target.value)} />
+            <Button type="submit" style={{ flex: 'none' }}>
+              Show
+            </Button>
+          </form>
+          <FieldChart key={shownField} ns={ns} measurement={row.name} field={shownField} />
         </div>
       ) : (
         <>
@@ -567,9 +598,9 @@ export function TimeSeries() {
 
   if (open) return <MeasDetail ns={ns} row={open} onBack={() => setOpen(null)} />
 
-  const totSeries = meas.reduce((a, m) => a + m.series_count, 0)
-  const totFields = meas.reduce((a, m) => a + m.field_count, 0)
-  const totPoints = meas.reduce((a, m) => a + m.points, 0)
+  const totSeries = sumKnown(meas.map((m) => m.series_count))
+  const totFields = sumKnown(meas.map((m) => m.field_count))
+  const totPoints = sumKnown(meas.map((m) => m.points))
 
   return (
     <div className="wrap fade">
@@ -587,9 +618,9 @@ export function TimeSeries() {
 
       <Stats>
         <Stat label="Measurements" value={q.isLoading ? '…' : meas.length} sub={`in ${ns}`} />
-        <Stat label="Series" value={cfmt(totSeries)} sub="measurement + field" />
-        <Stat label="Fields" value={cfmt(totFields)} sub="numeric columns" />
-        <Stat label="Datapoints" value={cfmt(totPoints)} sub="buffered · Raft-replicated" />
+        <Stat label="Series" value={orDash(totSeries, cfmt)} sub="measurement + field" />
+        <Stat label="Fields" value={orDash(totFields, cfmt)} sub="numeric columns" />
+        <Stat label="Datapoints" value={orDash(totPoints, cfmt)} sub="buffered · Raft-replicated" />
       </Stats>
 
       <FloQLConsole ns={ns} measurements={meas} />
@@ -626,13 +657,15 @@ export function TimeSeries() {
                   <div className="mono nw" style={{ fontWeight: 500, color: 'var(--tx)' }}>
                     {m.name}
                   </div>
-                  <div className="desc">columnar · {m.field_count === 1 ? 'single field' : m.field_count + ' fields'}</div>
+                  <div className="desc">
+                    columnar · {m.field_count == null ? `${DASH} fields` : m.field_count === 1 ? 'single field' : m.field_count + ' fields'}
+                  </div>
                 </div>
-                <span className="c r mono">{m.series_count}</span>
+                <span className="c r mono">{orDash(m.series_count)}</span>
                 <span className="c r mono" style={{ color: 'var(--tx-3)' }}>
-                  {m.field_count}
+                  {orDash(m.field_count)}
                 </span>
-                <span className="c r mono">{cfmt(m.points)}</span>
+                <span className="c r mono">{orDash(m.points, cfmt)}</span>
               </div>
             ))}
           </div>
