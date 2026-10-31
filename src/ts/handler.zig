@@ -80,7 +80,7 @@ pub const TSHandler = struct {
         dispatcher.registerWithRoute(.ts_write, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_read, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
-        dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByQueryMeasurement);
         dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
         dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
@@ -91,6 +91,14 @@ pub const TSHandler = struct {
     fn preRouteByMeasurement(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
         return router.hashKeyWithNamespace(req.namespace, req.key);
+    }
+
+    /// A FloQL query carries its measurement in the query, not the key: it
+    /// runs on that measurement's shard. A query with none is refused
+    /// wherever it lands.
+    fn preRouteByQueryMeasurement(req: Request) ?u64 {
+        const measurement = floql_parser.Parser.sourceMeasurement(req.value) orelse return 0;
+        return router.hashKeyWithNamespace(req.namespace, measurement);
     }
 
     // ── Shard Walker: Local Scan ──────────────────────────────────────

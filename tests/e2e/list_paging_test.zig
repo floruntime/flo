@@ -342,6 +342,54 @@ test "e2e/list: the CLI's workflow list returns definitions on every shard" {
     try expectEachListedOnce(ctx, &.{ "workflow", "list", "-o", "json" }, "lp-wf-", workflows);
 }
 
+test "e2e/list: an action list with a prefix lists only the actions it names, on every shard" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = WIDE_SHARDS } });
+    defer ctx.deinit();
+
+    const wanted = 20;
+    for (0..wanted) |i| {
+        var name: [16]u8 = undefined;
+        try ctx.exec(&.{ "action", "register", try std.fmt.bufPrint(&name, "ap-{d:0>2}", .{i}) });
+    }
+    for (0..10) |i| {
+        var name: [16]u8 = undefined;
+        try ctx.exec(&.{ "action", "register", try std.fmt.bufPrint(&name, "aq-{d:0>2}", .{i}) });
+    }
+
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
+    defer _ = std.c.close(fd);
+    var seen = @as([wanted]usize, @splat(0));
+    var cursor_buf: [kv_ops.MAX_CURSOR]u8 = undefined;
+    var cursor: []const u8 = "";
+    var out: [16 * 1024]u8 = undefined;
+    var pages: usize = 0;
+    while (pages < 100) : (pages += 1) {
+        var value: [4 + 256]u8 = undefined;
+        std.mem.writeInt(u32, value[0..4], 3, .little);
+        @memcpy(value[4..][0..cursor.len], cursor);
+        const d = try call(fd, .action_list, "ap-", value[0 .. 4 + cursor.len], &out);
+        const count = std.mem.readInt(u32, d[0..4], .little);
+        var pos: usize = 4;
+        for (0..count) |_| {
+            const name = scanEntry(d, &pos);
+            try testing.expect(std.mem.startsWith(u8, name, "ap-"));
+            seen[try std.fmt.parseInt(usize, name["ap-".len..], 10)] += 1;
+        }
+        const has_more = d[pos] != 0;
+        const clen = std.mem.readInt(u16, d[pos + 1 ..][0..2], .little);
+        if (!has_more) break;
+        @memcpy(cursor_buf[0..clen], d[pos + 3 ..][0..clen]);
+        cursor = cursor_buf[0..clen];
+    }
+    for (seen) |s| try testing.expectEqual(@as(usize, 1), s);
+
+    // The CLI sends its --prefix.
+    var r = try ctx.cli.run(&.{ "action", "list", "--prefix", "aq-" });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 10), r.stdoutCount("aq-"));
+    try testing.expectEqual(@as(usize, 0), r.stdoutCount("ap-"));
+}
+
 /// One page of every workflow's runs that `search` matches:
 /// `[limit:u32][status_len:u16 = 0][cursor_len:u16][cursor][search_len:u16][search]`.
 fn runsPage(fd: std.c.fd_t, limit: u32, cursor: []const u8, search: []const u8, out: []u8) ![]const u8 {
