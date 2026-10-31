@@ -325,3 +325,64 @@ test "e2e/namespace: on 4 shards, creates through connections on different shard
     // default and the 16, each once.
     try testing.expectEqual(@as(usize, 17), std.mem.count(u8, json.stdout, "\"name\""));
 }
+
+test "e2e/namespace: on 4 shards, a read in a namespace never created is refused, of every kind, and a write's namespace is readable at once on every shard" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    const reads = [_][]const []const u8{
+        &.{ "kv", "get", "k", "-n", "never" },
+        &.{ "kv", "scan", "-n", "never" },
+        &.{ "stream", "read", "s", "-n", "never" },
+        &.{ "stream", "list", "-n", "never" },
+        &.{ "queue", "list", "-n", "never" },
+        &.{ "ts", "read", "m", "-n", "never" },
+        &.{ "action", "list", "-n", "never" },
+        &.{ "workflow", "list", "-n", "never" },
+    };
+    for (reads) |args| {
+        var r = try ctx.cli.run(args);
+        defer r.deinit();
+        if (std.mem.indexOf(u8, r.stderr, "namespace not found [no_namespace/not_found]") == null) std.debug.print("{s}: {s}{s}\n", .{ args[0], r.stdout, r.stderr });
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "namespace not found [no_namespace/not_found]") != null);
+    }
+
+    // A write creates its namespace through whichever shard took it; a read
+    // of another key, owned by any shard, then finds the namespace.
+    for (0..12) |i| {
+        var ns: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&ns, "fresh-{d}", .{i});
+        try ctx.exec(&.{ "kv", "set", "a", "v", "-n", name });
+        for ([_][]const u8{ "b", "c", "d", "e" }) |key| {
+            var r = try ctx.cli.run(&.{ "kv", "get", key, "-n", name });
+            defer r.deinit();
+            try testing.expect(std.mem.indexOf(u8, r.stderr, "no_namespace") == null);
+            try testing.expect(std.mem.indexOf(u8, r.stderr, "not found [not_found/not_found]") != null);
+        }
+    }
+}
+
+test "e2e/namespace/cluster: a namespace created through one node is readable through every other at once" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+
+    for (0..6) |i| {
+        var ns: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&ns, "cl-{d}", .{i});
+        try cluster.execOn(i % cluster.node_count, &.{ "ns", "create", name });
+        // No retry: a node behind asks the leader and waits for its own
+        // table, rather than answer that the namespace isn't there.
+        for (0..cluster.node_count) |node| {
+            var r = try cluster.clis[node].?.run(&.{ "kv", "get", "k", "-n", name });
+            defer r.deinit();
+            if (std.mem.indexOf(u8, r.stderr, "not found [not_found/not_found]") == null) std.debug.print("node {d}, {s}: {s}{s}\n", .{ node, name, r.stdout, r.stderr });
+            try testing.expect(std.mem.indexOf(u8, r.stderr, "not found [not_found/not_found]") != null);
+        }
+    }
+    // One never created is refused through every node.
+    for (0..cluster.node_count) |node| {
+        var r = try cluster.clis[node].?.run(&.{ "kv", "get", "k", "-n", "cl-never" });
+        defer r.deinit();
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "[no_namespace/not_found]") != null);
+    }
+}

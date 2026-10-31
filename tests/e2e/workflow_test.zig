@@ -243,11 +243,17 @@ test "e2e/workflow: list is namespace-scoped" {
     try stdx.testing.assertSucceeded(result_a);
     try stdx.testing.assertContains(result_a, "list-ns-wf");
 
-    // List in team-b should be empty
+    // List in team-b, which exists but holds none, should be empty
+    try ctx.exec(&.{ "namespace", "create", "team-b" });
     var result_b = try ctx.cli.run(&.{ "workflow", "list", "-n", "team-b" });
     defer result_b.deinit();
     try stdx.testing.assertSucceeded(result_b);
     try stdx.testing.assertContains(result_b, "(no workflows)");
+
+    // A namespace never created has no list at all.
+    var result_c = try ctx.cli.run(&.{ "workflow", "list", "-n", "team-c" });
+    defer result_c.deinit();
+    try testing.expect(std.mem.indexOf(u8, result_c.stderr, "namespace not found [no_namespace/not_found]") != null);
 }
 
 // =============================================================================

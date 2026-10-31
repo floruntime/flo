@@ -156,6 +156,9 @@ const RunList = struct {
 
 const RunsShape = enum { recent, page };
 
+/// A run list holding none: its count, 0.
+const NO_RUNS = [_]u8{ 0, 0, 0, 0 };
+
 /// One run, from its listing and its `action.status` (its attempt, worker,
 /// output and error). What no op answers about a run yet — its input,
 /// source and caller — is null.
@@ -205,8 +208,10 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     var listed = client_mod.action.listRuns(client, ns, name, RECENT_RUNS) catch |err|
         return try loopback.readFailed(allocator, "action runs", err);
     defer listed.deinit();
-    if (listed.isError()) return try h.jsonError(allocator, listed.errorMessage());
-    if (!RunList.whole(listed.data)) return try h.jsonError(allocator, "action runs: malformed answer");
+    if (listed.isError() and !listed.isNotFound()) return try h.jsonError(allocator, listed.errorMessage());
+    // A namespace never created holds no runs.
+    const run_data: []const u8 = if (listed.isNotFound()) &NO_RUNS else listed.data;
+    if (!RunList.whole(run_data)) return try h.jsonError(allocator, "action runs: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     defer json_aw.deinit();
@@ -225,7 +230,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     {
         var recent_arr = try obj.arrayField("recent_runs");
         try recent_arr.begin();
-        var runs = RunList.init(listed.data);
+        var runs = RunList.init(run_data);
         while (runs.next() catch unreachable) |run| {
             try recent_arr.next();
             writeRun(&reader, writer, ns, run, .recent) catch |err| return try loopback.readFailed(allocator, "action run status", err);
@@ -258,8 +263,10 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
     var listed = client_mod.action.listRuns(client, ns, name, want) catch |err|
         return try loopback.readFailed(allocator, "action runs", err);
     defer listed.deinit();
-    if (listed.isError()) return try h.jsonError(allocator, listed.errorMessage());
-    if (!RunList.whole(listed.data)) return try h.jsonError(allocator, "action runs: malformed answer");
+    if (listed.isError() and !listed.isNotFound()) return try h.jsonError(allocator, listed.errorMessage());
+    // A namespace never created holds no runs.
+    const run_data: []const u8 = if (listed.isNotFound()) &NO_RUNS else listed.data;
+    if (!RunList.whole(run_data)) return try h.jsonError(allocator, "action runs: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     defer json_aw.deinit();
@@ -267,7 +274,7 @@ pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]co
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-    var runs = RunList.init(listed.data);
+    var runs = RunList.init(run_data);
     var seen: u64 = 0;
     while (runs.next() catch unreachable) |run| {
         seen += 1;

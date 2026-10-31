@@ -242,7 +242,8 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
             if (reader.call(kv_ops.op("kv.scan"), name, "", .{ .limit = KV_KEYS_SHOWN, .cursor = "" })) |resp_| {
                 var resp = resp_;
                 defer resp.deinit();
-                if (resp.isError()) {
+                // A namespace never created holds no keys.
+                if (resp.isNotFound()) {} else if (resp.isError()) {
                     failed = "KV scan refused";
                 } else {
                     var diag: schema.Diagnostic = .{};
