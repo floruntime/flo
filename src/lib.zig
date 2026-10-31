@@ -60,6 +60,10 @@ pub const kv = struct {
     pub const state = @import("kv/state.zig");
 };
 
+pub const actions = struct {
+    pub const machine = @import("actions/machine.zig");
+};
+
 // =============================================================================
 // Cluster: Controller Raft, Partition Table
 // =============================================================================

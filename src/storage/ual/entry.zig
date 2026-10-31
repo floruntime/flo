@@ -113,6 +113,11 @@ pub const EntryType = enum(u8) {
     action_delete = 0x71,
     action_invoke = 0x72,
     action_update_run = 0x73,
+    action_deliver = 0x74,
+    action_settle = 0x75,
+    action_release = 0x76,
+    action_extend = 0x77,
+    action_expire = 0x78,
 
     // ── Processing ──
     processing_submit = 0x80,
@@ -127,6 +132,7 @@ pub const EntryType = enum(u8) {
         return switch (self) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
             .namespace_create, .namespace_bind => false,
+            .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .stream_append, .stream_trim, .stream_delete => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,

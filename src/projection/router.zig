@@ -244,6 +244,8 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .workflow_create, .workflow_start, .workflow_complete => .none,
         .namespace_create, .namespace_bind => .none,
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
+        // Actions on the contract (actions/machine.zig).
+        .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,
         .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => .none,
     };
 }
