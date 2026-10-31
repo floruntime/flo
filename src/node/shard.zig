@@ -1545,8 +1545,10 @@ pub const Shard = struct {
         if (run_mod.internalFromClient(op, auth.origin)) return self.dispatchLocal(conn, req, auth);
 
         // A workflow run id the client chose names no shard: ask each which
-        // holds the run (`RunFind`).
-        if (self.runIdUnplaced(req)) return self.findRun(conn, req, auth);
+        // holds the run (`RunFind`), and for a start that chooses one,
+        // whether another workflow's run has it already.
+        if (self.runIdUnplaced(req)) return self.findRun(conn, req, auth, req.key, null);
+        if (self.startChoosesRunId(req)) |rid| return self.findRun(conn, req, auth, rid, self.startHome(req));
 
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
@@ -1575,15 +1577,38 @@ pub const Shard = struct {
             => true,
             else => false,
         };
-        return by_run_id and req.key.len > 0 and self.shardCount() > 1 and run_id_mod.extractPartition(req.key) == null;
+        // Only the server mints ids of the generated form (a start refuses a
+        // chosen one), so this splits them exactly; a chosen id can decode as
+        // a partition (`order-123`), and that partition is no run's.
+        return by_run_id and req.key.len > 0 and self.shardCount() > 1 and !run_id_mod.looksGenerated(.workflow, req.key);
+    }
+
+    /// The run id a workflow start chooses, on a node of several shards.
+    fn startChoosesRunId(self: *const Shard, req: proto.Request) ?[]const u8 {
+        if (req.header.op_code != @backingInt(proto.OpCode.workflow_start) or self.shardCount() <= 1) return null;
+        const rid = WorkflowHandler.startChosenRunId(req.value) orelse return null;
+        // The start refuses an id of the server's form itself.
+        return if (run_id_mod.looksGenerated(.workflow, rid)) null else rid;
+    }
+
+    /// The shard a start runs on: its workflow's.
+    fn startHome(self: *Shard, req: proto.Request) u16 {
+        return switch (self.resolveTarget(req.header.op_code, req)) {
+            .local => self.id,
+            .shard => |t| t.shard_id,
+        };
     }
 
     /// A run-id request held while every shard says whether it holds the run;
-    /// then sent, once, to the one that does.
+    /// then sent, once, to the one that does. For a start that chooses an id,
+    /// `start_home` is its workflow's shard: another shard holding the id
+    /// refuses it, and its own shard decides as for any start there (a
+    /// retried start with its idempotency key answers its run).
     const RunFind = struct {
         /// The request, serialized, and who may run it.
         bytes: []u8,
         auth: run_mod.Authorized,
+        start_home: ?u16,
 
         const op: gather_mod.Op = .{ .merge = merge, .deinit = free };
 
@@ -1596,6 +1621,15 @@ pub const Shard = struct {
         fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
             const self: *RunFind = @ptrCast(@alignCast(state));
             const Holds = table_run.op("system.holds_run").response;
+            if (self.start_home) |home| {
+                for (bodies, 0..) |body, i| {
+                    var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+                    if ((try Holds.decodeAll(body, &diag)).holds and i != home)
+                        return shard.sendRefusal(conn, request_id, .conflict, proto.notRun(RUN_ID_TAKEN));
+                }
+                const req = try proto.Request.parse(self.bytes);
+                return if (home == shard.id) shard.dispatchLocal(conn, req, self.auth) else shard.forwardToShard(home, conn, req, self.auth);
+            }
             var owner: ?u16 = null;
             for (bodies, 0..) |body, i| {
                 var diag: @import("../protocol/schema.zig").Diagnostic = .{};
@@ -1611,9 +1645,10 @@ pub const Shard = struct {
         }
     };
 
+    const RUN_ID_TAKEN = "conflict: a run of another workflow has this id in this namespace; choose another";
     const RUN_ID_AMBIGUOUS = "conflict: runs of more than one workflow hold this id in this namespace, so it names none of them; choose run ids unique in a namespace";
 
-    fn findRun(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized) void {
+    fn findRun(self: *Shard, conn: *Connection, req: proto.Request, auth: run_mod.Authorized, run_id: []const u8, start_home: ?u16) void {
         const id = req.header.request_id;
         const n = self.shardCount();
         const state = self.allocator.create(RunFind) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
@@ -1621,20 +1656,20 @@ pub const Shard = struct {
             self.allocator.destroy(state);
             return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
         };
-        state.* = .{ .bytes = bytes, .auth = auth };
+        state.* = .{ .bytes = bytes, .auth = auth, .start_home = start_home };
         var gather_owns = false;
         defer if (!gather_owns) RunFind.free(state, self.allocator);
         const parts = self.allocator.alloc(gather_mod.Part, n) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
         defer self.allocator.free(parts);
         const Holds = table_run.op("system.holds_run").response;
         var own_buf: [Holds.max_size]u8 = undefined;
-        const own_body = Holds.encodeInto(&own_buf, .{ .holds = self.workflow_handler.holdsRun(req.namespace, req.key) }) catch unreachable;
+        const own_body = Holds.encodeInto(&own_buf, .{ .holds = self.workflow_handler.holdsRun(req.namespace, run_id) }) catch unreachable;
         const own = self.allocator.dupe(u8, own_body) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
         var own_owned = false;
         defer if (!own_owned) self.allocator.free(own);
         for (parts, 0..) |*p, i| {
             const s: u16 = @intCast(i);
-            p.* = if (s == self.id) .{ .owner = s, .body = own } else .{ .owner = s, .body = "", .op = @backingInt(proto.OpCode.system_holds_run) };
+            p.* = if (s == self.id) .{ .owner = s, .body = own } else .{ .owner = s, .body = "", .op = @backingInt(proto.OpCode.system_holds_run), .key = run_id };
         }
         gather_owns = true;
         own_owned = true;
@@ -16677,4 +16712,45 @@ test "Shard: a read waiting on shard 0 for a create that is then refused is answ
     try std.testing.expectEqual(@as(u64, 7), got.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), got.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
+}
+
+test "Shard: a run id the client chose is told apart from a generated one exactly, though it may read as a partition" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    var buf: [32]u8 = undefined;
+    const generated = a.run_id_gen.next(.workflow, 3, &buf);
+    const chosen = [_][]const u8{ "alpha", "order-123", "run-1", "job-abc", "123e4567-e89b-12d3-a456-426614174000" };
+    for (chosen) |id| try std.testing.expect(a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_status, 1), .namespace = "", .key = id, .value = "" }));
+    try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_status, 1), .namespace = "", .key = generated, .value = "" }));
+    // Not a run-id op, or no id.
+    try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.kv_get, 1), .namespace = "", .key = "alpha", .value = "" }));
+    try std.testing.expect(!a.runIdUnplaced(.{ .header = proto.RequestHeader.init(.workflow_cancel, 1), .namespace = "", .key = "", .value = "" }));
+}
+
+test "Shard: a start's chosen run id is read from its value, and a start with none, or the server's form, chooses none" {
+    // [ver_len:u16][ver][has_idem:u8][key_len:u16][key][has_rid:u8][rid_len:u16][rid][input]
+    const with = "\x03\x001.0" ++ "\x01\x02\x00ik" ++ "\x01\x09\x00order-123" ++ "{}";
+    try std.testing.expectEqualStrings("order-123", WorkflowHandler.startChosenRunId(with).?);
+    try std.testing.expect(WorkflowHandler.startChosenRunId("\x00\x00" ++ "\x00" ++ "\x00" ++ "{}") == null);
+    try std.testing.expect(WorkflowHandler.startChosenRunId("\x00\x00") == null);
+    // Cut short inside the id: none, and the start refuses it whole.
+    try std.testing.expect(WorkflowHandler.startChosenRunId("\x00\x00\x00\x01\x09\x00order") == null);
+}
+
+test "Shard: a shard holds a run by its id only in the namespace it was started in" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const wh = two.shards[0].workflow_handler;
+    const key = try std.testing.allocator.dupe(u8, "team-a:shared");
+    try wh.runs.put(key, undefined);
+    defer {
+        _ = wh.runs.remove("team-a:shared");
+        std.testing.allocator.free(key);
+    }
+    try std.testing.expect(wh.holdsRun("team-a", "shared"));
+    try std.testing.expect(!wh.holdsRun("team-b", "shared"));
+    try std.testing.expect(!wh.holdsRun("team-a", "other"));
 }

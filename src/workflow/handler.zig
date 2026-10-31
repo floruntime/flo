@@ -3327,7 +3327,29 @@ pub const WorkflowHandler = struct {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    /// Build a namespace-qualified key: "namespace:name" for map lookups.
+    /// The run id a start's value chooses, if it chooses one and reads that
+    /// far: `[ver_len:u16][ver][has_idem:u8][key_len:u16]?[key]?[has_rid:u8][rid_len:u16]?[rid]?`.
+    /// `handleStart` reads the whole value and refuses a malformed one.
+    pub fn startChosenRunId(value: []const u8) ?[]const u8 {
+        var off: usize = 0;
+        if (value.len < 2) return null;
+        off += 2 + std.mem.readInt(u16, value[0..2], .little);
+        if (off >= value.len) return null;
+        const has_idem = value[off];
+        off += 1;
+        if (has_idem == 1) {
+            if (off + 2 > value.len) return null;
+            off += 2 + std.mem.readInt(u16, value[off..][0..2], .little);
+        }
+        if (off >= value.len or value[off] != 1) return null;
+        off += 1;
+        if (off + 2 > value.len) return null;
+        const len = std.mem.readInt(u16, value[off..][0..2], .little);
+        off += 2;
+        if (off + len > value.len or len == 0) return null;
+        return value[off .. off + len];
+    }
+
     /// Whether this shard holds run `run_id` in `namespace`.
     pub fn holdsRun(self: *const WorkflowHandler, namespace: []const u8, run_id: []const u8) bool {
         // Keyed as the start keys it (`makeNsKey`). A run's start entry holds
@@ -3337,6 +3359,7 @@ pub const WorkflowHandler = struct {
         return self.runs.contains(key);
     }
 
+    /// Build a namespace-qualified key: "namespace:name" for map lookups.
     fn makeNsKey(self: *WorkflowHandler, namespace: []const u8, name: []const u8) ?[]const u8 {
         return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ namespace, name }) catch null;
     }
