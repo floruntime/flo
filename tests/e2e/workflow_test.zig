@@ -969,7 +969,9 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
 
     // 8. Query the action run to verify the workflow created a visible run
     //    in the actions handler via invokeByName.
-    var action_status = try ctx.cli.run(&.{ "action", "status", task_id });
+    // A task id starts with its run's id.
+    const action_run = task_id[0 .. std.mem.indexOfScalar(u8, task_id, ':') orelse task_id.len];
+    var action_status = try ctx.cli.run(&.{ "action", "status", action_run });
     defer action_status.deinit();
     try stdx.testing.assertSucceeded(action_status);
 
@@ -3027,7 +3029,7 @@ test "e2e/workflow: steps.outcome resolves in input mapping" {
     defer a1.deinit();
     try stdx.testing.assertSucceeded(a1);
     const t1 = extractTaskId(a1.stdoutTrimmed()) orelse return error.AssertionFailed;
-    try ctx.exec(&.{ "worker", "complete", t1, "--worker-id", "aw", "--action", "audit-s1", "--result", "{}" });
+    try ctx.exec(&.{ "worker", "complete", t1, "--worker-id", "aw", "--result", "{}" });
 
     @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 

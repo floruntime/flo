@@ -185,6 +185,56 @@ pub const table = [_]ops.Op{
     },
 };
 
+pub const ActionNames = schema.BoundedList(ActionName, MAX_AWAIT_ACTIONS, MAX_AWAIT_ACTIONS * ActionName.max_size);
+
+/// `names` as an await's `actions`, encoded into `buf`.
+pub fn actionNames(buf: []u8, names: []const []const u8) schema.EncodeError!ActionNames.Value {
+    if (names.len > MAX_AWAIT_ACTIONS) return error.TooLong;
+    var w: schema.Writer = .{ .buf = buf };
+    for (names) |n| try ActionName.encode(&w, n);
+    return .{ .bytes = buf[0..w.pos], .count = @intCast(names.len) };
+}
+
+/// A task's id as a person copies it: `run:deliveries:term:index:action`.
+/// A run id holds no colon, and the action comes last, so it may.
+pub const TaskId = struct {
+    run: []const u8,
+    deliveries: u32,
+    term: u64,
+    index: u64,
+    action: []const u8,
+
+    pub fn of(t: Task.Value) TaskId {
+        return .{ .run = t.run, .deliveries = t.deliveries, .term = t.term, .index = t.index, .action = t.action };
+    }
+
+    pub fn format(self: TaskId, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}:{d}:{d}:{d}:{s}", .{ self.run, self.deliveries, self.term, self.index, self.action });
+    }
+
+    pub fn parse(s: []const u8) ?TaskId {
+        var it = std.mem.splitScalar(u8, s, ':');
+        const run = it.next() orelse return null;
+        const deliveries = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+        const term = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        const index = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        const action = it.rest();
+        if (run.len == 0 or action.len == 0) return null;
+        return .{ .run = run, .deliveries = deliveries, .term = term, .index = index, .action = action };
+    }
+};
+
+test "a task id round-trips, its action keeping its colons, and a cut one doesn't parse" {
+    var buf: [128]u8 = undefined;
+    const id: TaskId = .{ .run = "act-1", .deliveries = 2, .term = 3, .index = 40, .action = "send:mail" };
+    const text = try id.format(&buf);
+    try std.testing.expectEqualStrings("act-1:2:3:40:send:mail", text);
+    const back = TaskId.parse(text).?;
+    try std.testing.expectEqualStrings("send:mail", back.action);
+    try std.testing.expectEqual(@as(u64, 40), back.index);
+    for ([_][]const u8{ "", "act-1", "act-1:2:3:40", "act-1:2:3:40:", ":2:3:40:a", "act-1:x:3:40:a" }) |cut| try std.testing.expect(TaskId.parse(cut) == null);
+}
+
 /// The action op in the table named `name`; a name not there fails the build.
 pub fn op(comptime name: []const u8) ops.Op {
     for (table) |o| if (std.mem.eql(u8, o.name, name)) return o;

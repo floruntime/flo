@@ -72,7 +72,10 @@ test "e2e/dashboard: action latency reflects a completed run" {
     defer await_res.deinit();
     try stdx.testing.assertSucceeded(await_res);
 
-    var complete_res = try ctx.cli.run(&.{ "worker", "complete", run_id, "--worker-id", worker_id, "--action", action_name, "--result", "{\"ok\":true}" });
+    const start = (std.mem.indexOf(u8, await_res.stdout, "Task: ") orelse return error.NoTask) + "Task: ".len;
+    const task_id = await_res.stdout[start .. std.mem.indexOfScalarPos(u8, await_res.stdout, start, '\n') orelse await_res.stdout.len];
+    try std.testing.expect(std.mem.startsWith(u8, task_id, run_id));
+    var complete_res = try ctx.cli.run(&.{ "worker", "complete", task_id, "--worker-id", worker_id, "--result", "{\"ok\":true}" });
     defer complete_res.deinit();
     try stdx.testing.assertSucceeded(complete_res);
 

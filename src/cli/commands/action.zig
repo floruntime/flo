@@ -144,19 +144,18 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
             commander.newBuilder(allocator)
                 .name("complete")
                 .about("Complete a task successfully")
-                .arg("task_id", "Task ID")
+                .arg("task_id", "Task ID, as await printed it")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
-                .stringFlag("action", 'a', "", "Action name (required for routing)")
                 .stringFlag("result", 0, "", "Result payload (JSON)")
+                .stringFlag("outcome", 0, "", "The outcome a workflow step follows (default success)")
                 .action(wrapHandler(runWorkerComplete)),
         )
         .subcommand(
             commander.newBuilder(allocator)
                 .name("fail")
                 .about("Fail a task")
-                .arg("task_id", "Task ID")
+                .arg("task_id", "Task ID, as await printed it")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
-                .stringFlag("action", 'a', "", "Action name (required for routing)")
                 .stringFlag("error", 0, "", "Error message")
                 .boolFlag("retry", 'r', "Allow retry")
                 .action(wrapHandler(runWorkerFail)),
@@ -164,11 +163,9 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
         .subcommand(
             commander.newBuilder(allocator)
                 .name("touch")
-                .about("Extend task visibility timeout")
-                .arg("task_id", "Task ID")
+                .about("Keep a task: its lease runs a full lease from now")
+                .arg("task_id", "Task ID, as await printed it")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
-                .stringFlag("action", 'a', "", "Action name (required for routing)")
-                .uintFlag("extend", 0, 30000, "Extend by (ms)")
                 .action(wrapHandler(runWorkerTouch)),
         )
         .subcommand(
@@ -510,147 +507,63 @@ fn runWorkerAwait(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, result);
 
     const data = result.asRawData() orelse "";
-    const task = (parseTaskAssignment(data) catch return outcome.malformed(ctx, "task assignment")) orelse {
+    var diag: schema.Diagnostic = .{};
+    const answer = action_ops.op("action.await").response.decodeAll(data, &diag) catch return outcome.malformed(ctx, "task assignment");
+    const task = answer.task orelse {
         ctx.print("(no tasks)\n", .{});
         return;
     };
-    ctx.print("Task: {s}\n", .{task.task_id});
-    ctx.print("Action: {s}\n", .{task.task_type});
+    var id_buf: [action_ops.Task.max_size]u8 = undefined;
+    const id = action_ops.TaskId.of(task).format(&id_buf) catch return outcome.malformed(ctx, "task assignment");
+    ctx.print("Task: {s}\n", .{id});
+    ctx.print("Action: {s}\n", .{task.action});
     ctx.print("Attempt: {d}\n", .{task.attempt});
-    if (task.caller_run_id) |caller| ctx.print("Caller: {s} ({s})\n", .{ caller, task.caller_workflow });
-    if (task.payload.len > 0) ctx.print("Payload: {s}\n", .{task.payload});
+    if (task.caller_run) |caller| ctx.print("Caller: {s} ({s})\n", .{ caller, task.caller_workflow orelse "" });
+    if (task.input.len > 0) ctx.print("Payload: {s}\n", .{task.input});
 }
 
-const TaskAssignment = struct {
-    task_id: []const u8,
-    task_type: []const u8,
-    created_at_ms: i64,
-    attempt: u32,
-    caller_run_id: ?[]const u8,
-    caller_workflow: []const u8,
-    payload: []const u8,
-};
-
-/// An await's answer: empty when no task came, else
-///   [task_id_len:u16][task_id][task_type_len:u16][task_type][created_at:i64][attempt:u32]
-///   [has_caller:u8]([caller_run_id_len:u16][caller_run_id][caller_wf_len:u16][caller_wf])?[payload]
-fn parseTaskAssignment(data: []const u8) error{Malformed}!?TaskAssignment {
-    if (data.len == 0) return null;
-    var r: TaskReader = .{ .data = data };
-    const task_id = try r.lenBytes();
-    const task_type = try r.lenBytes();
-    const created_at_ms = std.mem.readInt(i64, (try r.take(8))[0..8], .little);
-    const attempt = std.mem.readInt(u32, (try r.take(4))[0..4], .little);
-    var caller_run_id: ?[]const u8 = null;
-    var caller_workflow: []const u8 = "";
-    switch ((try r.take(1))[0]) {
-        0 => {},
-        1 => {
-            caller_run_id = try r.lenBytes();
-            caller_workflow = try r.lenBytes();
-        },
-        else => return error.Malformed,
-    }
-    return .{
-        .task_id = task_id,
-        .task_type = task_type,
-        .created_at_ms = created_at_ms,
-        .attempt = attempt,
-        .caller_run_id = caller_run_id,
-        .caller_workflow = caller_workflow,
-        .payload = data[r.pos..],
-    };
+/// The task id a report names, or a usage error.
+fn taskIdOf(ctx: *commander.Context) commander.Error!action_ops.TaskId {
+    const text = ctx.getPositional("task_id").?; // validated by commander
+    return action_ops.TaskId.parse(text) orelse outcome.usage(ctx, "task id {s} isn't one await printed: run:deliveries:term:index:action", .{text});
 }
-
-const TaskReader = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    fn take(r: *TaskReader, n: usize) error{Malformed}![]const u8 {
-        if (r.data.len - r.pos < n) return error.Malformed;
-        defer r.pos += n;
-        return r.data[r.pos..][0..n];
-    }
-    fn lenBytes(r: *TaskReader) error{Malformed}![]const u8 {
-        return r.take(std.mem.readInt(u16, (try r.take(2))[0..2], .little));
-    }
-};
 
 fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
-    const task_id = ctx.getPositional("task_id").?; // validated by commander
-
-    const worker_id = ctx.getString("worker-id") orelse {
-        return outcome.usage(ctx, "Missing --worker-id", .{});
-    };
-
-    const action_name = ctx.getString("action") orelse "";
-    const result_payload = ctx.getString("result") orelse "";
+    const id = try taskIdOf(ctx);
+    const worker_id = ctx.getString("worker-id") orelse return outcome.usage(ctx, "Missing --worker-id", .{});
     const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    // workerComplete(client, namespace, worker_id, action_name, task_id, result)
-    var result = client_mod.action.workerComplete(&client, namespace, worker_id, action_name, task_id, result_payload) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.action.workerComplete(&client, namespace, worker_id, id, ctx.getString("outcome") orelse "", ctx.getString("result") orelse "") catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
     try outcome.check(ctx, result);
-
     ctx.print("OK\n", .{});
 }
 
 fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
-    const task_id = ctx.getPositional("task_id").?; // validated by commander
-
-    const worker_id = ctx.getString("worker-id") orelse {
-        return outcome.usage(ctx, "Missing --worker-id", .{});
-    };
-
-    const action_name = ctx.getString("action") orelse "";
-    const error_msg = ctx.getString("error") orelse "";
-    const allow_retry = ctx.getBool("retry");
+    const id = try taskIdOf(ctx);
+    const worker_id = ctx.getString("worker-id") orelse return outcome.usage(ctx, "Missing --worker-id", .{});
     const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-    // workerFail(client, namespace, worker_id, action_name, task_id, error_message, retry)
-    var result = client_mod.action.workerFail(&client, namespace, worker_id, action_name, task_id, error_msg, allow_retry) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.action.workerFail(&client, namespace, worker_id, id, ctx.getString("error") orelse "", ctx.getBool("retry")) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
     try outcome.check(ctx, result);
-
     ctx.print("OK\n", .{});
 }
 
 fn runWorkerTouch(ctx: *commander.Context) commander.Error!void {
-    const task_id = ctx.getPositional("task_id").?; // validated by commander
-
-    const worker_id = ctx.getString("worker-id") orelse {
-        return outcome.usage(ctx, "Missing --worker-id", .{});
-    };
-
-    const action_name = ctx.getString("action") orelse "";
-    const extend = ctx.getUint("extend") orelse 30000;
+    const id = try taskIdOf(ctx);
+    const worker_id = ctx.getString("worker-id") orelse return outcome.usage(ctx, "Missing --worker-id", .{});
     const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
+    var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    // workerTouch(client, namespace, worker_id, action_name, task_id, extend_ms)
-    var result = client_mod.action.workerTouch(&client, namespace, worker_id, action_name, task_id, @intCast(extend)) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.action.workerTouch(&client, namespace, worker_id, id) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
-
     try outcome.check(ctx, result);
-
     ctx.print("OK\n", .{});
 }
 
@@ -806,48 +719,4 @@ test "create worker command" {
 
     try std.testing.expectEqualStrings("worker", cmd.name);
     try std.testing.expect(cmd.commands.items.len >= 3);
-}
-
-/// A task assignment for run "r1" of action "a" at attempt 2, with an optional caller.
-fn testTask(buf: []u8, caller: bool, payload: []const u8) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    for ([_][]const u8{ "r1", "a" }) |s| {
-        w.writeInt(u16, @intCast(s.len), .little) catch unreachable;
-        w.writeAll(s) catch unreachable;
-    }
-    w.writeInt(i64, 1000, .little) catch unreachable;
-    w.writeInt(u32, 2, .little) catch unreachable;
-    w.writeByte(@intFromBool(caller)) catch unreachable;
-    if (caller) for ([_][]const u8{ "wf-run", "checkout" }) |s| {
-        w.writeInt(u16, @intCast(s.len), .little) catch unreachable;
-        w.writeAll(s) catch unreachable;
-    };
-    w.writeAll(payload) catch unreachable;
-    return w.buffered();
-}
-
-test "worker await: the payload starts after the caller block" {
-    var buf: [128]u8 = undefined;
-    const plain = (try parseTaskAssignment(testTask(&buf, false, "{\"x\":1}"))).?;
-    try std.testing.expectEqualStrings("r1", plain.task_id);
-    try std.testing.expectEqualStrings("a", plain.task_type);
-    try std.testing.expectEqual(@as(u32, 2), plain.attempt);
-    try std.testing.expectEqual(@as(?[]const u8, null), plain.caller_run_id);
-    try std.testing.expectEqualStrings("{\"x\":1}", plain.payload);
-
-    const called = (try parseTaskAssignment(testTask(&buf, true, "in"))).?;
-    try std.testing.expectEqualStrings("wf-run", called.caller_run_id.?);
-    try std.testing.expectEqualStrings("checkout", called.caller_workflow);
-    try std.testing.expectEqualStrings("in", called.payload);
-}
-
-test "worker await: no data is no task, and a cut or bad caller block is malformed" {
-    try std.testing.expectEqual(@as(?TaskAssignment, null), try parseTaskAssignment(""));
-    var buf: [128]u8 = undefined;
-    const full = testTask(&buf, true, "");
-    for (1..full.len) |n| try std.testing.expectError(error.Malformed, parseTaskAssignment(full[0..n]));
-    var bad: [128]u8 = undefined;
-    const t = testTask(&bad, false, "");
-    bad[t.len - 1] = 2;
-    try std.testing.expectError(error.Malformed, parseTaskAssignment(t));
 }

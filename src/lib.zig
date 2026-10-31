@@ -12,6 +12,7 @@ pub const log = @import("stdx").log;
 pub const protocol = struct {
     pub const proto = @import("protocol/proto.zig");
     pub const kv_ops = @import("protocol/kv_ops.zig");
+    pub const action_ops = @import("protocol/action_ops.zig");
     pub const namespace_ops = @import("protocol/namespace_ops.zig");
     pub const ops = @import("protocol/ops.zig");
     pub const kv_entries = @import("protocol/kv_entries.zig");
