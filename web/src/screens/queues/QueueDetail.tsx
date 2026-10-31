@@ -166,7 +166,9 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
             )}
 
             {tab === 'dlq' && (
-              dlqEntries == null || (dlq.length === 0 && dlqCount) ? (
+              dlqCount === 0 ? (
+                <Note>No dead-lettered messages.</Note>
+              ) : dlqEntries == null || (dlq.length === 0 && dlqCount) ? (
                 <Note>
                   {dlqCount ? `${cfmt(dlqCount)} dead-lettered · entries not available yet` : dlqQ.isError ? unavailable(dlqQ.error, 'Dead letters') : 'Dead-letter entries not available yet'}
                 </Note>

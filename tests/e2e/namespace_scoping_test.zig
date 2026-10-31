@@ -14,31 +14,11 @@ fn after(output: []const u8, prefix: []const u8) ?[]const u8 {
     return if (end > start) output[start..end] else null;
 }
 
-/// The seq of the first message in `queue`, as the dashboard lists it.
-fn firstSeq(ctx: *stdx.testing.TestContext, queue: []const u8, ns: []const u8, buf: []u8) ![]const u8 {
-    var http = try ctx.createDashboardHttp();
-    defer http.deinit();
-    var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/api/v1/queues/{s}/messages?namespace={s}", .{ queue, ns });
-    var waited: u32 = 0;
-    while (waited < 30) : (waited += 1) {
-        var r = try http.get(path);
-        defer r.deinit();
-        if (after(r.body, "\"seq\":")) |seq| {
-            @memcpy(buf[0..seq.len], seq);
-            return buf[0..seq.len];
-        }
-        stdx.time.sleep(100 * std.time.ns_per_ms);
-    }
-    return error.NoMessage;
-}
-
 test "e2e/scoping: a queue message is acked or nacked only from its own queue and namespace" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .dashboard_enabled = true } });
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    try ctx.exec(&.{ "queue", "enqueue", "q", "secret", "-n", "qa" });
-    var seq_buf: [24]u8 = undefined;
-    const seq = try firstSeq(ctx, "q", "qa", &seq_buf);
+    const enqueued = try ctx.execCapture(&.{ "queue", "enqueue", "q", "secret", "-n", "qa" });
+    const seq = after(enqueued, "Enqueued: ") orelse return error.NoSeq;
 
     for ([_][]const u8{ "ack", "nack" }) |verb| {
         var r = try ctx.cli.run(&.{ "queue", verb, "q", seq, "-n", "qb" });
