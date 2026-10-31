@@ -430,9 +430,10 @@ const ListedRuns = struct {
 const MAX_RUN_CURSOR = @import("../../../workflow/list_runs.zig").MAX_CURSOR;
 
 /// A runs page's cursor as the dashboard hands it out: the server's own,
-/// in hex, so it travels in a URL as it is.
+/// in hex, so it travels in a URL as it is. The server's is a created_at
+/// (8 bytes) and a run id, so a shorter one was never sent.
 fn decodeRunCursor(buf: *[MAX_RUN_CURSOR]u8, hex: []const u8) error{BadCursor}![]const u8 {
-    if (hex.len == 0 or hex.len % 2 != 0 or hex.len / 2 > buf.len) return error.BadCursor;
+    if (hex.len % 2 != 0 or hex.len / 2 <= 8 or hex.len / 2 > buf.len) return error.BadCursor;
     return std.fmt.hexToBytes(buf[0 .. hex.len / 2], hex) catch error.BadCursor;
 }
 
@@ -922,8 +923,9 @@ test "handleWorkflowRequest cancel run surfaces loopback failure (no node in uni
 
 test "a runs page's cursor travels as hex, and anything else is refused" {
     var buf: [MAX_RUN_CURSOR]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0xab, 'r' }, try decodeRunCursor(&buf, "01ab72"));
-    for ([_][]const u8{ "", "abc", "zz", "run-17" }) |bad| try std.testing.expectError(error.BadCursor, decodeRunCursor(&buf, bad));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0, 'r' }, try decodeRunCursor(&buf, "010000000000000072"));
+    // No run id after the created_at, or not hex at all.
+    for ([_][]const u8{ "", "01", "0100000000000000", "abc", "zz", "run-17" }) |bad| try std.testing.expectError(error.BadCursor, decodeRunCursor(&buf, bad));
     // Longer than any cursor the server sends.
     var long: [2 * MAX_RUN_CURSOR + 2]u8 = @splat('a');
     try std.testing.expectError(error.BadCursor, decodeRunCursor(&buf, &long));

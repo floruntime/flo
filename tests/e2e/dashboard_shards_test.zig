@@ -185,9 +185,12 @@ test "e2e/dashboard: on many shards, the runs list holds every run of the asked 
     }
 
     // A cursor the dashboard never sent is refused, not a wrong page.
-    var bad = try http.get("/api/v1/workflow/runs?namespace=na&cursor=run-3");
-    defer bad.deinit();
-    try testing.expectEqual(@as(u16, 400), bad.status);
+    for ([_][]const u8{ "run-3", "01" }) |c| {
+        var bad_path: [96]u8 = undefined;
+        var bad = try http.get(try std.fmt.bufPrint(&bad_path, "/api/v1/workflow/runs?namespace=na&cursor={s}", .{c}));
+        defer bad.deinit();
+        try testing.expectEqual(@as(u16, 400), bad.status);
+    }
 
     // A run's input that isn't JSON comes back as a string, in a detail that
     // is still JSON.
