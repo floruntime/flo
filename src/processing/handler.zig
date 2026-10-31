@@ -457,12 +457,14 @@ pub const ProcessingHandler = struct {
 
     /// ShardWalker LocalScanFn for processing_list: one shard's job ids.
     /// Ids, not names: jobs may share a name, and each is its own row.
+    /// The list takes no filter: no client sends a key with it. It returns
+    /// no cursor either, so the walker pages it by offset.
     fn localScanJobs(
         ctx: *anyopaque,
         namespace: []const u8,
-        _: []const u8, // filter
-        _: ?[]const u8, // cursor
-        _: u32, // limit
+        _: []const u8,
+        _: ?[]const u8,
+        _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(handler.jobs.count());
