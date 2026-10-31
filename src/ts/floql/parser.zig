@@ -43,6 +43,14 @@ pub const Parser = struct {
     source: []const u8,
     pos: usize,
 
+    /// The measurement a query reads, as `parse` reads it, without parsing
+    /// the rest: where the query runs is the measurement's shard.
+    pub fn sourceMeasurement(source: []const u8) ?[]const u8 {
+        var p = Parser{ .source = source, .pos = 0 };
+        p.skipWhitespace();
+        return p.parseIdentifier();
+    }
+
     pub fn parse(source: []const u8, allocator: Allocator) ParseError!Query {
         var p = Parser{ .source = source, .pos = 0 };
         const src = try p.parseSource(allocator);
@@ -743,4 +751,11 @@ test "floql_parse_mixed_filters" {
     try std.testing.expectEqual(FilterOp.eq, q.source.filters[0].op);
     try std.testing.expectEqual(FilterOp.regex, q.source.filters[1].op);
     try std.testing.expectEqual(FilterOp.neq, q.source.filters[2].op);
+}
+
+test "parser: a query's measurement is read without parsing the rest" {
+    try std.testing.expectEqualStrings("cpu_usage", Parser.sourceMeasurement("  cpu_usage{host=\"a\"}[1h] | avg()").?);
+    try std.testing.expectEqualStrings("http.requests", Parser.sourceMeasurement("http.requests").?);
+    try std.testing.expect(Parser.sourceMeasurement("|||bad") == null);
+    try std.testing.expect(Parser.sourceMeasurement("") == null);
 }

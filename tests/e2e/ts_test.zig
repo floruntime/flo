@@ -1752,3 +1752,24 @@ test "e2e/ts: a read or query with no data is still JSON under -o json" {
         try testing.expectEqualStrings("{\"series\":[]}", std.mem.trim(u8, query.stdout, &std.ascii.whitespace));
     }
 }
+
+test "e2e/ts: a floql query runs on its measurement's shard, wherever that is" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    // Eight measurements: most hash to a shard other than 0.
+    for (0..8) |i| {
+        var name: [24]u8 = undefined;
+        var value: [16]u8 = undefined;
+        try ctx.exec(&.{ "ts", "write", try std.fmt.bufPrint(&name, "floql_shard_{d}", .{i}), "--value", try std.fmt.bufPrint(&value, "{d}.5", .{4100 + i}) });
+    }
+    for (0..8) |i| {
+        var query: [40]u8 = undefined;
+        var result = try ctx.cli.run(&.{ "ts", "floql", try std.fmt.bufPrint(&query, "floql_shard_{d}[1h]", .{i}) });
+        defer result.deinit();
+        var want: [16]u8 = undefined;
+        const value = try std.fmt.bufPrint(&want, "{d}.5", .{4100 + i});
+        if (std.mem.indexOf(u8, result.stdout, value) == null) std.debug.print("floql_shard_{d}: no {s} in:\n{s}\n{s}\n", .{ i, value, result.stdout, result.stderr });
+        try testing.expect(std.mem.indexOf(u8, result.stdout, value) != null);
+    }
+}
