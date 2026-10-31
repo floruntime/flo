@@ -509,10 +509,12 @@ pub const StreamHandler = struct {
             };
             return .{ .parked = proposed };
         }
+        // Named before anything is written: a stream that holds records but
+        // no name would be missing from lists and answer info "not found".
+        self.registerStreamName(req) catch return .{ .err = .{ .code = .internal_error, .message = "stream append not run (out of memory)" } };
         const stream_id = self.applyLocalStreamAppend(req, payload_value, partition_index) catch {
             return .{ .err = .{ .code = .internal_error, .message = "stream apply failed" } };
         };
-        self.registerStreamName(req);
         return appendOk(stream_id);
     }
 
@@ -523,11 +525,13 @@ pub const StreamHandler = struct {
         } };
     }
 
-    /// Register the namespace-qualified name so the stream is listed.
-    fn registerStreamName(self: *StreamHandler, req: Request) void {
+    /// Register the namespace-qualified name so the stream is listed and
+    /// found. A name that cannot be qualified is not listed rather than
+    /// listed bare, where it could pass for another namespace's.
+    fn registerStreamName(self: *StreamHandler, req: Request) error{OutOfMemory}!void {
         var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch return;
-        self.stream.registerStream(ns_stream_name) catch {};
+        try self.stream.registerStream(ns_stream_name);
     }
 
     // ── READ ────────────────────────────────────────────────────────────
@@ -781,6 +785,8 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(ns_hash, req.key);
         var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const meta_key = metaKey(&meta_buf, req) orelse return NAME_TOO_LONG;
+        // An unknown stream is not an empty one.
+        if (!self.stream.stream_names.contains(meta_key)) return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         const pc = self.stream.getPartitionCount(meta_key);
 
         const first_id = self.stream.streamFirstId(name_hash);
@@ -825,7 +831,7 @@ pub const StreamHandler = struct {
         if (req.key.len > 0) {
             var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
             const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch return NAME_TOO_LONG;
-            self.stream.registerStream(ns_stream_name) catch {};
+            self.stream.registerStream(ns_stream_name) catch return .{ .err = .{ .code = .internal_error, .message = "stream create not run (out of memory)" } };
 
             // Parse partition_count from wire value (u32 LE) if present
             var partition_count: u32 = 1;

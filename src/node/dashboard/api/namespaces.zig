@@ -14,10 +14,7 @@ const h = @import("helpers.zig");
 const loopback = @import("loopback.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
-const Shard = @import("../../shard.zig").Shard;
-const WorkflowHandler = @import("../../../workflow/handler.zig").WorkflowHandler;
-const ProcessingHandler = @import("../../../processing/handler.zig").ProcessingHandler;
-const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
+const namespace_ops = @import("../../../protocol/namespace_ops.zig");
 const ns_keys = @import("../../../namespace/handler.zig");
 const kv_ops = @import("../../../protocol/kv_ops.zig");
 const schema = @import("../../../protocol/schema.zig");
@@ -26,10 +23,45 @@ const schema = @import("../../../protocol/schema.zig");
 const KV_KEYS_SHOWN: u32 = 100;
 const client_mod = @import("../../../cli/client/mod.zig");
 
-// ── Helpers ──
-
-/// GET /namespaces - List all namespaces with resource counts
+/// GET /namespaces - List all namespaces with resource counts. The
+/// registry's names come from `namespace.list`. The counts of definitions,
+/// jobs and actions are null: counting them would walk three lists for
+/// every namespace (up to 4096) on the dashboard's one thread, so they
+/// wait until the namespace list carries them.
 pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "namespace list", err);
+    defer reader.deinit();
+
+    // Every name is copied: the answers and the metrics registry free theirs.
+    var names_arena = std.heap.ArenaAllocator.init(allocator);
+    defer names_arena.deinit();
+    const names = names_arena.allocator();
+    // In the arena too, which frees it.
+    var ns_set: std.StringArrayHashMapUnmanaged(void) = .empty;
+
+    readNamespaceNames(&reader, names, &ns_set) catch |err| return try loopback.readFailed(allocator, "namespace list", err);
+
+    // Implicit namespaces, from data writes the metrics registry saw.
+    {
+        ctx.metrics.mutex.lock();
+        defer ctx.metrics.mutex.unlock();
+
+        var kv_it = ctx.metrics.kv_namespaces.iterator();
+        while (kv_it.next()) |entry| try putName(&ns_set, names, entry.value_ptr.*.namespace);
+        var q_it = ctx.metrics.queues.iterator();
+        while (q_it.next()) |entry| try putName(&ns_set, names, entry.value_ptr.*.namespace);
+        var s_it = ctx.metrics.streams.iterator();
+        while (s_it.next()) |entry| try putName(&ns_set, names, entry.value_ptr.*.namespace);
+    }
+    try putName(&ns_set, names, "default");
+
+    const sorted = ns_set.keys();
+    std.mem.sortUnstable([]const u8, sorted, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -37,88 +69,17 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
 
-    // Collect namespace names from multiple sources
-    var ns_set = std.StringHashMap(void).init(allocator);
-    defer ns_set.deinit();
-    // The registry's names are copied out under its lock: an unregister
-    // frees them.
-    var names = std.heap.ArenaAllocator.init(allocator);
-    defer names.deinit();
-
-    // 1. From ALL shards' namespace handlers, workflow handlers, and processing handlers
-    if (ctx.shard_ptrs) |ptrs| {
-        for (ptrs) |ptr| {
-            const shard: *Shard = @ptrCast(@alignCast(ptr));
-
-            // Explicit namespace registry
-            var ns_it = shard.namespace_handler.namespaces.iterator();
-            while (ns_it.next()) |entry| {
-                try ns_set.put(entry.key_ptr.*, {});
-            }
-
-            // Workflow definitions (keys are "namespace:name")
-            var wf_it = shard.workflow_handler.definitions.iterator();
-            while (wf_it.next()) |entry| {
-                if (extractNsPrefix(entry.key_ptr.*)) |ns| {
-                    try ns_set.put(ns, {});
-                }
-            }
-
-            // Processing jobs (keys are "namespace:job_id" or have namespace_owned)
-            var pj_it = shard.processing_handler.jobs.iterator();
-            while (pj_it.next()) |entry| {
-                try ns_set.put(entry.value_ptr.namespace_owned, {});
-            }
-
-            // Actions (have namespace_owned field)
-            var act_it = shard.actions_handler.actions.iterator();
-            while (act_it.next()) |entry| {
-                try ns_set.put(entry.value_ptr.namespace_owned, {});
-            }
-        }
-    }
-
-    // 2. From metrics registry (implicit namespaces from data writes)
-    {
-        ctx.metrics.mutex.lock();
-        defer ctx.metrics.mutex.unlock();
-
-        // From KV namespaces
-        var kv_it = ctx.metrics.kv_namespaces.iterator();
-        while (kv_it.next()) |entry| {
-            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
-        }
-
-        // From queues
-        var q_it = ctx.metrics.queues.iterator();
-        while (q_it.next()) |entry| {
-            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
-        }
-
-        // From streams
-        var s_it = ctx.metrics.streams.iterator();
-        while (s_it.next()) |entry| {
-            try ns_set.put(try names.allocator().dupe(u8, entry.value_ptr.*.namespace), {});
-        }
-    }
-
-    // Always include "default"
-    try ns_set.put("default", {});
-
-    var ns_it = ns_set.iterator();
-    while (ns_it.next()) |entry| {
+    for (sorted) |ns_name| {
         try arr.next();
-        const ns_name = entry.key_ptr.*;
-
         var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
         try obj.begin();
         try obj.stringField("name", ns_name);
         try obj.intField("stream_count", countStreamsInNamespace(ctx, ns_name));
         try obj.intField("queue_count", countQueuesInNamespace(ctx, ns_name));
         try obj.intField("kv_count", countKVInNamespace(ctx, ns_name));
-        try obj.intField("workflow_count", countWorkflowsInNamespace(ctx, ns_name));
-        try obj.intField("processing_count", countProcessingInNamespace(ctx, ns_name));
-        try obj.intField("action_count", countActionsInNamespace(ctx, ns_name));
+        try obj.nullField("workflow_count");
+        try obj.nullField("processing_count");
+        try obj.nullField("action_count");
         try obj.intField("created_at", 0);
         try obj.boolField("is_system", std.mem.startsWith(u8, ns_name, "_"));
         try obj.end();
@@ -126,6 +87,29 @@ pub fn getNamespaces(allocator: Allocator, ctx: *DashboardContext) ![]const u8 {
 
     try arr.end();
     return try json_aw.toOwnedSlice();
+}
+
+fn putName(set: *std.StringArrayHashMapUnmanaged(void), names: Allocator, name: []const u8) !void {
+    if (set.contains(name)) return;
+    try set.put(names, try names.dupe(u8, name), {});
+}
+
+/// Every name in the namespace registry, a page at a time to the last.
+pub fn readNamespaceNames(reader: *loopback.Reader, names: Allocator, set: *std.StringArrayHashMapUnmanaged(void)) !void {
+    const list_op = namespace_ops.op("namespace.list");
+    var cursor: []const u8 = "";
+    while (true) {
+        var got = try reader.call(list_op, "", "", .{ .limit = namespace_ops.MAX_LIST, .cursor = cursor });
+        defer got.deinit();
+        if (got.isError()) return error.Refused;
+        var diag: schema.Diagnostic = .{};
+        const page = try list_op.response.decodeAll(got.data, &diag);
+        var it = page.names.iterator();
+        while (try it.next()) |name| try putName(set, names, name);
+        const next = page.cursor orelse return;
+        if (std.mem.eql(u8, next, cursor)) return error.CursorRepeats;
+        cursor = try names.dupe(u8, next);
+    }
 }
 
 /// POST /namespaces — Create a new namespace. Proposed over the node's own
@@ -209,7 +193,7 @@ pub fn getNamespaceDetail(allocator: Allocator, name: []const u8, ctx: *Dashboar
                 try sobj.intField("partitions", 1);
                 try sobj.intField("ingest_rate", 0);
                 try sobj.intField("reads", 0);
-                try sobj.stringField("retention", "7d");
+                try sobj.nullField("retention");
                 try sobj.end();
             }
         }
@@ -441,75 +425,20 @@ fn countKVInNamespace(ctx: *DashboardContext, namespace: []const u8) u64 {
     return ctx.metrics.kvLiveKeys(namespace);
 }
 
-fn countWorkflowsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
-    const ptrs = ctx.shard_ptrs orelse return 0;
-    var count: u32 = 0;
-    for (ptrs) |ptr| {
-        const shard: *Shard = @ptrCast(@alignCast(ptr));
-        var it = shard.workflow_handler.definitions.iterator();
-        while (it.next()) |entry| {
-            if (nsKeyMatchesNamespace(entry.key_ptr.*, namespace)) count += 1;
-        }
-    }
-    return count;
-}
-
-fn countProcessingInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
-    const ptrs = ctx.shard_ptrs orelse return 0;
-    var count: u32 = 0;
-    for (ptrs) |ptr| {
-        const shard: *Shard = @ptrCast(@alignCast(ptr));
-        var it = shard.processing_handler.jobs.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) count += 1;
-        }
-    }
-    return count;
-}
-
-fn countActionsInNamespace(ctx: *DashboardContext, namespace: []const u8) u32 {
-    const ptrs = ctx.shard_ptrs orelse return 0;
-    var seen = std.StringHashMap(void).init(ctx.allocator);
-    defer seen.deinit();
-    for (ptrs) |ptr| {
-        const shard: *Shard = @ptrCast(@alignCast(ptr));
-        var it = shard.actions_handler.actions.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.namespace_owned, namespace)) {
-                seen.put(entry.value_ptr.name_owned, {}) catch continue;
-            }
-        }
-    }
-    return @intCast(seen.count());
-}
-
-/// Extract namespace prefix from a "namespace:name" key.
-fn extractNsPrefix(key: []const u8) ?[]const u8 {
-    const idx = std.mem.indexOfScalar(u8, key, ':') orelse return null;
-    return key[0..idx];
-}
-
-/// Check if a "namespace:name" key belongs to the given namespace.
-fn nsKeyMatchesNamespace(key: []const u8, namespace: []const u8) bool {
-    if (key.len <= namespace.len) return false;
-    if (key[namespace.len] != ':') return false;
-    return std.mem.eql(u8, key[0..namespace.len], namespace);
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
 
-test "getNamespaces includes default namespace" {
+test "getNamespaces asks the node, and says when no node answers" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
     var ctx = DashboardContext.init(allocator, &metrics, 1);
+    ctx.listen_port = 1; // nothing listens here: a connect would be refused
 
     const result = try getNamespaces(allocator, &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"stream_count\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"namespace list failed: "));
 }
 
 test "getNamespaceDetail returns detail object with arrays" {

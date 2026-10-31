@@ -1,94 +1,47 @@
 //! Dashboard API — Time-Series Endpoints
 //!
-//! - GET  /timeseries                       — All measurements with stats
-//! - GET  /timeseries/:measurement          — Measurement detail (fields, series count)
+//! - GET  /timeseries                       — All measurements
+//! - GET  /timeseries/:measurement          — Measurement detail
 //! - GET  /timeseries/:measurement/data     — Query data points
 //! - POST /timeseries/floql                 — Execute FloQL query
+//!
+//! The dashboard asks each shard, as any client does: every read is a
+//! request over loopback to the node's own protocol port.
 
 const std = @import("std");
-const time_units = @import("../../../util/time_units.zig");
 const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const Method = @import("../../../util/http/mod.zig").Method;
-const Shard = @import("../../shard.zig").Shard;
-const TSProjection = @import("../../../projection/ts.zig").TSProjection;
-const router = @import("../../router.zig");
 const floql_parser = @import("../../../ts/floql/parser.zig");
-const floql_executor = @import("../../../ts/floql/executor.zig");
-const ss_mod = @import("../../../ts/floql/series_set.zig");
-const floql_ast = @import("../../../ts/floql/ast.zig");
-const ts_projection = @import("../../../projection/ts.zig");
+const loopback = @import("loopback.zig");
+const client_mod = @import("../../../cli/client/mod.zig");
+const output = @import("../../../cli/output.zig");
+const WireReader = @import("../../../util/wire.zig").WireReader;
 
-// ── Helpers ──
+/// `ts_list`'s entry: `[name_len:u16][name]`.
+const measurement_columns = [_]output.WireColumn{
+    .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+};
 
-fn getTSProjection(ctx: *DashboardContext, idx: usize) ?*TSProjection {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    const shard: *Shard = @ptrCast(@alignCast(ptrs[idx]));
-    return &shard.defaultPartition().ts;
-}
-
-// TS series keys are `[namespace_hash:4 LE][measurement]\x00[field]` (see
-// projection/ts.zig). The 4-byte prefix may contain 0x00, so always parse the
-// measurement from offset 4.
-fn keyNsHash(key: []const u8) u32 {
-    if (key.len < 4) return 0;
-    return std.mem.readInt(u32, key[0..4], .little);
-}
-fn keyMeasurement(key: []const u8) []const u8 {
-    if (key.len < 4) return key;
-    const rest = key[4..];
-    const sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
-    return rest[0..sep];
-}
-
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
-
-/// Translate FloQL source tag filters into tag predicates. Every operator maps
-/// through — `=~`/`!~` are glob — so a partial or negated filter now selects
-/// series instead of being dropped.
-fn floqlTagPredicates(filters: []const floql_ast.TagFilter, out: []ts_projection.TagPredicate) []const ts_projection.TagPredicate {
-    var n: usize = 0;
-    for (filters) |f| {
-        if (n >= out.len) break;
-        out[n] = .{
-            .key = f.key,
-            .op = switch (f.op) {
-                .eq => .eq,
-                .neq => .neq,
-                .regex => .glob,
-                .nregex => .nglob,
-            },
-            .value = f.value,
-        };
-        n += 1;
+const MeasurementLister = struct {
+    namespace: []const u8,
+    pub fn ask(self: MeasurementLister, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.ts.list(client, self.namespace, null, cursor);
     }
-    return out[0..n];
-}
+};
 
-/// Parse a `k=v,k=v` query param into equality predicates.
-fn parseTagPredicates(tags: []const u8, out: []ts_projection.TagPredicate) []const ts_projection.TagPredicate {
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, tags, ',');
-    while (it.next()) |raw| {
-        if (n >= out.len) break;
-        const part = std.mem.trim(u8, raw, " \t");
-        if (part.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        out[n] = .{ .key = part[0..eq], .op = .eq, .value = part[eq + 1 ..] };
-        n += 1;
-    }
-    return out[0..n];
-}
-
-/// GET /timeseries — List all measurements with field counts and stats
+/// GET /timeseries — The namespace's measurements (`ts_list`). No op
+/// answers a measurement's series, fields or points yet, so those are null.
 pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const ns_hash = router.namespaceHash(ns);
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "time-series list", err);
+    defer reader.deinit();
+    var pages = reader.listAll(allocator, &measurement_columns, MeasurementLister{ .namespace = ns }) catch |err|
+        return try loopback.readFailed(allocator, "time-series list", err);
+    defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -96,59 +49,29 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-
-    // Collect unique measurement names from all shard TS projections (this namespace)
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getTSProjection(ctx, i)) |ts| {
-            const buf = try allocator.alloc([]const u8, ts.buffers.count());
-            defer allocator.free(buf);
-            const count = ts.scanMeasurementNames(ns_hash, buf);
-            for (buf[0..count]) |meas_name| {
-                const gop = try seen.getOrPut(meas_name);
-                if (gop.found_existing) continue;
-
-                // Tally per-measurement series (= write buffers, one per
-                // measurement+field) and points across all shards, scoped to
-                // this namespace (key = [ns_hash:4][measurement]\x00[field]).
-                var series_count: usize = 0;
-                var points: u64 = 0;
-                for (0..n) |j| {
-                    if (getTSProjection(ctx, j)) |tsj| {
-                        var it = tsj.buffers.iterator();
-                        while (it.next()) |kv| {
-                            const key = kv.key_ptr.*;
-                            if (keyNsHash(key) == ns_hash and std.mem.eql(u8, keyMeasurement(key), meas_name)) {
-                                series_count += 1;
-                                points += kv.value_ptr.len();
-                            }
-                        }
-                    }
-                }
-
-                try arr.next();
-                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try obj.begin();
-                try obj.stringField("name", meas_name);
-                try obj.intField("series_count", series_count);
-                try obj.intField("field_count", series_count);
-                try obj.intField("points", points);
-                try obj.end();
-            }
-        }
+    var r = WireReader.init(pages.list());
+    _ = r.readU32();
+    for (0..pages.count) |_| {
+        // Each page's rows were checked whole as they were taken.
+        const name = r.readLengthPrefixed(u16) orelse break;
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("name", name);
+        try obj.nullField("series_count");
+        try obj.nullField("field_count");
+        try obj.nullField("points");
+        try obj.end();
     }
-
     try arr.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /timeseries/:measurement — Measurement detail
+/// GET /timeseries/:measurement — Measurement detail. No op answers a
+/// measurement's fields or series yet, so those are null; nothing is read.
 pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    _ = ctx;
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const ns_hash = router.namespaceHash(ns);
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -158,77 +81,41 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
     try obj.begin();
     try obj.stringField("name", measurement);
     try obj.stringField("namespace", ns);
-
-    // Collect field names and series count for this namespace+measurement.
-    var field_set = std.StringHashMap(void).init(allocator);
-    defer field_set.deinit();
-    var total_series: usize = 0;
-    var total_points: u64 = 0;
-
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getTSProjection(ctx, i)) |ts| {
-            var it = ts.buffers.iterator();
-            while (it.next()) |kv| {
-                const key = kv.key_ptr.*;
-                if (keyNsHash(key) != ns_hash) continue;
-                const meas = keyMeasurement(key);
-                if (std.mem.eql(u8, meas, measurement)) {
-                    total_series += 1;
-                    total_points += kv.value_ptr.len();
-                    // field = bytes after `[ns:4][measurement]\x00`
-                    const field_off = 4 + meas.len + 1;
-                    if (field_off <= key.len) {
-                        try field_set.put(key[field_off..], {});
-                    }
-                }
-            }
-        }
-    }
-
-    try obj.intField("field_count", field_set.count());
-    {
-        var fields_arr = try obj.arrayField("fields");
-        try fields_arr.begin();
-        var fit = field_set.iterator();
-        while (fit.next()) |fe| {
-            try fields_arr.next();
-            var fobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-            try fobj.begin();
-            try fobj.stringField("name", fe.key_ptr.*);
-            try fobj.stringField("type", "float");
-            try fobj.end();
-        }
-        try fields_arr.end();
-    }
-
-    try obj.intField("series_count", total_series);
-    {
-        var series_arr = try obj.arrayField("series");
-        try series_arr.begin();
-        try series_arr.end();
-    }
+    try obj.nullField("field_count");
+    try obj.nullField("fields");
+    try obj.nullField("series_count");
+    try obj.nullField("series");
     try obj.nullField("retention");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /timeseries/:measurement/data — Query data points
+/// GET /timeseries/:measurement/data — One field's raw points (`ts_read`,
+/// answered by the measurement's shard). `?tags=k=v,k=v` selects matching
+/// tag-series; `?from=` / `?to=` bound it in ms. `window` and `aggregation`
+/// are echoed back, not applied.
 pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     const field = h.parseQueryParam([]const u8, query_string, "field") orelse "value";
-    const ns_hash = router.namespaceHash(h.parseQueryParam([]const u8, query_string, "namespace") orelse "default");
-    // `?tags=host=web-01` selects matching tag-series; absent = every series.
-    // Predicates constrain only the tags they name, so a partial filter matches
-    // a superset tag set.
-    var pred_buf: [32]ts_projection.TagPredicate = undefined;
-    const preds: []const ts_projection.TagPredicate = if (h.parseQueryParam([]const u8, query_string, "tags")) |t|
-        (if (t.len > 0) parseTagPredicates(t, &pred_buf) else &.{})
-    else
-        &.{};
+    const tags = h.parseQueryParam([]const u8, query_string, "tags") orelse "";
     const from_str = h.parseQueryParam([]const u8, query_string, "from");
     const to_str = h.parseQueryParam([]const u8, query_string, "to");
     const window = h.parseQueryParam(u64, query_string, "window") orelse 0;
     const aggregation = h.parseQueryParam([]const u8, query_string, "aggregation") orelse "none";
+    const from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
+    const to_val: i64 = if (to_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "time-series read", err);
+    var got = client_mod.ts.read(client, ns, measurement, .{
+        .tags = tags,
+        .field = field,
+        .from_ms = @max(from_val, 0),
+        .to_ms = @max(to_val, 0),
+    }) catch |err| return try loopback.readFailed(allocator, "time-series read", err);
+    defer got.deinit();
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -240,58 +127,35 @@ pub fn getSeriesData(allocator: Allocator, measurement: []const u8, query_string
     try obj.stringField("field", field);
     try obj.stringField("aggregation", aggregation);
     try obj.intField("window_ms", @as(i64, @intCast(@min(window, std.math.maxInt(i64)))));
-
-    const from_val: i64 = if (from_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
-    const to_val: i64 = if (to_str) |s| std.fmt.parseInt(i64, s, 10) catch 0 else 0;
     try obj.intField("from_ms", from_val);
     try obj.intField("to_ms", to_val);
-
-    // Query data from shard TS projections
     {
+        // [count:u32]([timestamp_ms:i64][value:f64])*
         var series_arr = try obj.arrayField("series");
         try series_arr.begin();
-
-        // Convert ms → ns for projection query
-        const from_ns: u64 = if (from_val > 0) time_units.msToNsSat(@intCast(from_val)) else 0;
-        const to_ns: u64 = if (to_val > 0) time_units.msToNsSat(@intCast(to_val)) else std.math.maxInt(u64);
-
-        const StoredPoint = @import("../../../projection/ts.zig").StoredPoint;
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getTSProjection(ctx, i)) |ts| {
-                var point_buf: [1024]StoredPoint = undefined;
-                const result = ts.queryRangeFiltered(ns_hash, measurement, field, preds, from_ns, to_ns, &point_buf) catch continue;
-                if (result.points_in_buffer > 0) {
-                    for (point_buf[0..result.points_in_buffer]) |pt| {
-                        try series_arr.next();
-                        var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try pobj.begin();
-                        try pobj.intField("timestamp", @as(i64, @intCast(pt.timestamp_ns / std.time.ns_per_ms)));
-
-                        // Write float using fixed precision
-                        try pobj.floatField("value", pt.field_value);
-                        try pobj.end();
-                    }
-                }
-            }
+        var r = WireReader.init(got.data);
+        const count = r.readU32() orelse 0;
+        for (0..count) |_| {
+            const ts_ms = r.readI64() orelse break;
+            const bits = r.readU64() orelse break;
+            try series_arr.next();
+            var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try pobj.begin();
+            try pobj.intField("timestamp", ts_ms);
+            try pobj.floatField("value", @bitCast(bits));
+            try pobj.end();
         }
-
         try series_arr.end();
     }
-
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// POST /timeseries/floql — Execute a FloQL query.
-///
-/// Mirrors the wire handler (`ts/handler.zig` handleFloQL): parse → resolve the
-/// source into a SeriesSet → run the pipeline stages → serialize. The one
-/// difference is source resolution: the wire handler reads a single shard's
-/// projection, while the dashboard must merge points across every shard.
+/// POST /timeseries/floql — Execute a FloQL query (`ts_floql`), on the
+/// shard that holds the query's measurement.
 ///
 /// Query text comes from the POST body or `?q=`; `?namespace=` selects the
-/// namespace.
+/// namespace. The answer carries no tags, so each series' `tags` is empty.
 pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const u8, body: []const u8, ctx: *DashboardContext) ![]const u8 {
     _ = method;
 
@@ -306,94 +170,25 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     else
         "";
     if (query_text.len == 0) return try h.jsonError(allocator, "Empty query");
-    const ns_hash = router.namespaceHash(h.parseQueryParam([]const u8, query_string, "namespace") orelse "default");
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
-    // 1. Parse
+    // Parsed here only for its measurement: the request is routed by it, as
+    // a write to the measurement was.
     var query = floql_parser.Parser.parse(query_text, allocator) catch
         return try h.jsonError(allocator, "FloQL parse error");
     defer query.deinit(allocator);
-
     const measurement = query.source.measurement;
     if (measurement.len == 0) return try h.jsonError(allocator, "FloQL: measurement name is required");
 
-    // 2. Time range — the AST carries ms, the projection stores ns.
-    const now_ms: i64 = @import("stdx").time.milliTimestamp();
-    var from_ns: u64 = 0;
-    var to_ns: u64 = std.math.maxInt(u64);
-    if (query.source.range.duration_ms > 0) {
-        const from_ms = now_ms - query.source.range.duration_ms;
-        from_ns = if (from_ms > 0) time_units.msToNsSat(@intCast(from_ms)) else 0;
-        to_ns = time_units.msToNsSat(@intCast(now_ms));
-    } else if (query.source.range.from_ms > 0) {
-        from_ns = time_units.msToNsSat(@intCast(query.source.range.from_ms));
-        if (query.source.range.to_ms > 0) to_ns = time_units.msToNsSat(@intCast(query.source.range.to_ms));
-    }
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "FloQL query", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "FloQL query", err);
+    var got = client.sendRequest(.ts_floql, ns, measurement, query_text) catch |err|
+        return try loopback.readFailed(allocator, "FloQL query", err);
+    defer got.deinit();
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    if (!wholeSeriesSet(got.data)) return try h.jsonError(allocator, "FloQL query: malformed answer");
 
-    // 3. Field — from a `field()` stage when present, else the default.
-    var field_name: []const u8 = "value";
-    for (query.stages) |stage| {
-        switch (stage) {
-            .field => |f| {
-                field_name = f.name;
-                break;
-            },
-            else => {},
-        }
-    }
-
-    // 4. Resolve the source across every shard.
-    //
-    // Source tag filters are applied here via the tag dictionary, so partial,
-    // negated and glob filters all select series.
-    var pred_buf: [32]ts_projection.TagPredicate = undefined;
-    const src_preds = floqlTagPredicates(query.source.filters, &pred_buf);
-    const StoredPoint = @import("../../../projection/ts.zig").StoredPoint;
-    var points: std.ArrayList(ss_mod.DataPoint) = .empty;
-    defer points.deinit(allocator);
-    {
-        const n = shardCount(ctx);
-        for (0..n) |i| {
-            if (getTSProjection(ctx, i)) |ts| {
-                var point_buf: [4096]StoredPoint = undefined;
-                const qr = ts.queryRangeFiltered(ns_hash, measurement, field_name, src_preds, from_ns, to_ns, &point_buf) catch continue;
-                for (point_buf[0..qr.points_in_buffer]) |sp| {
-                    points.append(allocator, .{
-                        .timestamp_ms = @intCast(sp.timestamp_ns / std.time.ns_per_ms),
-                        .value = sp.field_value,
-                    }) catch break;
-                }
-            }
-        }
-    }
-    // Per-shard results are each ordered, but interleave once merged; window/
-    // rate/delta stages assume a time-ordered input.
-    std.mem.sort(ss_mod.DataPoint, points.items, {}, struct {
-        fn lt(_: void, a: ss_mod.DataPoint, b: ss_mod.DataPoint) bool {
-            return a.timestamp_ms < b.timestamp_ms;
-        }
-    }.lt);
-
-    // 5. Build the initial SeriesSet (one series — see the tag caveat below).
-    const dp_slice = allocator.dupe(ss_mod.DataPoint, points.items) catch
-        return try h.jsonError(allocator, "FloQL: out of memory");
-    const series_slice = allocator.alloc(ss_mod.Series, 1) catch {
-        allocator.free(dp_slice);
-        return try h.jsonError(allocator, "FloQL: out of memory");
-    };
-    series_slice[0] = .{ .key = measurement, .field = field_name, .points = dp_slice };
-    var initial = ss_mod.SeriesSet.fromOwned(allocator, series_slice);
-
-    // 6. Run the pipeline. `execute` returns `initial` unchanged for an empty
-    //    pipeline; otherwise it returns a fresh set and does NOT free `initial`
-    //    (freeing it in the empty case would double-free).
-    var result_set = floql_executor.execute(query.stages, initial, allocator) catch {
-        initial.deinit();
-        return try h.jsonError(allocator, "FloQL execution failed");
-    };
-    defer result_set.deinit();
-    if (query.stages.len > 0) initial.deinit();
-
-    // 7. Serialize
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
     const writer = &json_aw.writer;
@@ -404,35 +199,34 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     {
         var series_arr = try obj.arrayField("series");
         try series_arr.begin();
-        for (result_set.series) |s| {
+        var r = WireReader.init(got.data);
+        const series_count = r.readU32() orelse 0;
+        for (0..series_count) |_| {
+            const key = r.readLengthPrefixed(u32).?;
+            const field = r.readLengthPrefixed(u32).?;
+            const point_count = r.readU32().?;
             try series_arr.next();
             var sobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try sobj.begin();
-            try sobj.stringField("key", s.key);
-            try sobj.stringField("field", s.field);
-            try sobj.intField("point_count", @as(i64, @intCast(s.points.len)));
+            try sobj.stringField("key", key);
+            try sobj.stringField("field", field);
+            try sobj.intField("point_count", @as(i64, point_count));
             {
                 var tags_arr = try sobj.arrayField("tags");
                 try tags_arr.begin();
-                for (s.tags) |t| {
-                    try tags_arr.next();
-                    var tobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try tobj.begin();
-                    try tobj.stringField("key", t.key);
-                    try tobj.stringField("value", t.value);
-                    try tobj.end();
-                }
                 try tags_arr.end();
             }
             {
                 var pts_arr = try sobj.arrayField("points");
                 try pts_arr.begin();
-                for (s.points) |p| {
+                for (0..point_count) |_| {
+                    const ts_ms = r.readI64().?;
+                    const bits = r.readU64().?;
                     try pts_arr.next();
                     var pobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
                     try pobj.begin();
-                    try pobj.intField("timestamp", p.timestamp_ms);
-                    try pobj.floatField("value", p.value);
+                    try pobj.intField("timestamp", ts_ms);
+                    try pobj.floatField("value", @bitCast(bits));
                     try pobj.end();
                 }
                 try pts_arr.end();
@@ -445,65 +239,85 @@ pub fn executeFloql(allocator: Allocator, method: Method, query_string: ?[]const
     return try json_aw.toOwnedSlice();
 }
 
+/// Whether `data` is a whole encoded SeriesSet: `[series_count:u32]`, then
+/// per series `[key_len:u32][key][field_len:u32][field][point_count:u32]`
+/// and that many `[timestamp_ms:i64][value:f64]`.
+fn wholeSeriesSet(data: []const u8) bool {
+    var r = WireReader.init(data);
+    const series_count = r.readU32() orelse return false;
+    for (0..series_count) |_| {
+        _ = r.readLengthPrefixed(u32) orelse return false;
+        _ = r.readLengthPrefixed(u32) orelse return false;
+        const point_count = r.readU32() orelse return false;
+        if (r.remainingLen() / 16 < point_count) return false;
+        _ = r.skip(@as(usize, point_count) * 16);
+    }
+    return true;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
 
-test "getMeasurements returns empty array" {
+/// A context whose loopback connect is refused: nothing listens on port 1.
+fn unreachableContext(allocator: Allocator, metrics: *h.MetricsRegistry) DashboardContext {
+    var ctx = DashboardContext.init(allocator, metrics, 1);
+    ctx.listen_port = 1;
+    return ctx;
+}
+
+test "getMeasurements says the list failed when the node can't be reached" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try getMeasurements(allocator, null, &ctx);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"time-series list"));
 }
 
-test "getMeasurementDetail returns stub" {
+test "getMeasurementDetail answers what it knows and reads nothing" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try getMeasurementDetail(allocator, "cpu", null, &ctx);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"cpu\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"fields\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"fields\":null") != null);
 }
 
-test "executeFloql parses and executes a query" {
+test "executeFloql parses the query before it asks the node" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
-    // No shards wired here, so the source resolves to zero points — but the
-    // query must still parse and run the pipeline, echoing the query back and
-    // emitting a real (single, empty) series rather than the old `[]` stub.
-    const result = try executeFloql(allocator, .POST, null, "cpu{host=web-01}[1h]", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"query\":\"cpu{host=web-01}[1h]\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"key\":\"cpu\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"point_count\":0") != null);
+    // A query that parses goes to the node; none answers here.
+    const asked = try executeFloql(allocator, .POST, null, "cpu{host=web-01}[1h]", &ctx);
+    defer allocator.free(asked);
+    try std.testing.expect(std.mem.startsWith(u8, asked, "{\"error\":\"FloQL query"));
+
+    const bad = try executeFloql(allocator, .POST, null, "|||not a query|||", &ctx);
+    defer allocator.free(bad);
+    try std.testing.expectEqualStrings("{\"error\":\"FloQL parse error\"}", bad);
 }
 
-test "executeFloql surfaces a parse error" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try executeFloql(allocator, .POST, null, "|||not a query|||", &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+test "wholeSeriesSet refuses a cut answer" {
+    // One series "m"/"value" with one point.
+    const whole = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 'm', 5, 0, 0, 0, 'v', 'a', 'l', 'u', 'e', 1, 0, 0, 0 } ++ @as([16]u8, @splat(0));
+    try std.testing.expect(wholeSeriesSet(&whole));
+    try std.testing.expect(!wholeSeriesSet(whole[0 .. whole.len - 1]));
+    try std.testing.expect(!wholeSeriesSet(&.{}));
 }
 
 test "executeFloql rejects empty query" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
     const result = try executeFloql(allocator, .POST, null, "", &ctx);
     defer allocator.free(result);

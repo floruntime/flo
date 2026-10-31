@@ -10,19 +10,13 @@ const Allocator = std.mem.Allocator;
 const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
-const Shard = @import("../../shard.zig").Shard;
-const ActionsHandler = @import("../../../actions/handler.zig").ActionsHandler;
 const client_mod = @import("../../../cli/client/mod.zig");
 const loopback = @import("loopback.zig");
 const worker_api = @import("worker.zig");
-
-// ── Helpers ──
-
-fn getShard(ctx: *DashboardContext, idx: usize) ?*Shard {
-    const ptrs = ctx.shard_ptrs orelse return null;
-    if (idx >= ptrs.len) return null;
-    return @ptrCast(@alignCast(ptrs[idx]));
-}
+const output = @import("../../../cli/output.zig");
+const schema = @import("../../../protocol/schema.zig");
+const action_ops = @import("../../../protocol/action_ops.zig");
+const WireReader = @import("../../../util/wire.zig").WireReader;
 
 /// Short-lived loopback client to the node's own protocol port — mutations can't
 /// be proposed from the dashboard thread (see api/kv.zig loopbackConnect).
@@ -35,73 +29,46 @@ fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Cli
     return client;
 }
 
-fn shardCount(ctx: *DashboardContext) usize {
-    return if (ctx.shard_ptrs) |p| p.len else 0;
-}
+/// Runs an action's detail shows.
+const RECENT_RUNS: u32 = 20;
+/// The most runs one page of `/runs` shows: each is asked its status, a
+/// read on the dashboard's one thread.
+const MAX_RUNS_PAGE: u64 = 100;
 
-/// Whether `run` is a run of action `name` in `namespace`: one name in two
-/// namespaces is two actions, with runs of their own.
-fn runOf(run: *const ActionsHandler.RunRecord, namespace: []const u8, name: []const u8) bool {
-    return std.mem.eql(u8, run.action_name_owned, name) and std.mem.eql(u8, run.namespace_owned, namespace);
-}
+/// `action_list`'s entry: `[key_len:u16][key][value_len:u32 = 0]`.
+const action_columns = [_]output.WireColumn{
+    .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+    .{ .field = "value", .header = "", .field_type = .str_u32 },
+};
 
-const LatencyStats = struct { count: u64 = 0, avg_ms: i64 = 0, p99_ms: i64 = 0 };
-
-/// Real invocation latency for an action, derived from completed run records
-/// (`completed_at_ms - started_at_ms`). avg is over all completed runs; p99 is
-/// over a bounded sample (the first `LAT_CAP` completed runs found).
-fn computeLatency(allocator: Allocator, ctx: *DashboardContext, namespace: []const u8, name: []const u8) LatencyStats {
-    const LAT_CAP: usize = 4096;
-    const buf = allocator.alloc(i64, LAT_CAP) catch return .{};
-    defer allocator.free(buf);
-
-    var n_samples: usize = 0;
-    var sum: i64 = 0;
-    var total: u64 = 0;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            var rit = shard.actions_handler.runs.iterator();
-            while (rit.next()) |re| {
-                const run = re.value_ptr;
-                if (!runOf(run, namespace, name)) continue;
-                const started = run.started_at_ms orelse continue;
-                const completed = run.completed_at_ms orelse continue;
-                if (completed < started) continue;
-                const lat = completed - started;
-                total += 1;
-                sum += lat;
-                if (n_samples < LAT_CAP) {
-                    buf[n_samples] = lat;
-                    n_samples += 1;
-                }
-            }
-        }
+const ActionLister = struct {
+    namespace: []const u8,
+    pub fn ask(self: ActionLister, client: *client_mod.Client, cursor: ?[]const u8) !client_mod.Response {
+        return client_mod.action.list(client, self.namespace, null, cursor);
     }
+};
 
-    if (total == 0) return .{};
-    var stats = LatencyStats{ .count = total, .avg_ms = @divTrunc(sum, @as(i64, @intCast(total))) };
-    if (n_samples > 0) {
-        std.mem.sort(i64, buf[0..n_samples], {}, std.sort.asc(i64));
-        const idx = @min((n_samples * 99) / 100, n_samples - 1);
-        stats.p99_ms = buf[idx];
-    }
-    return stats;
+/// The fields no op answers about an action yet, as null.
+fn writeUnknownMetadata(obj: anytype) !void {
+    try obj.nullField("type");
+    try obj.nullField("owner");
+    try obj.stringField("description", "");
+    try obj.nullField("version");
+    try obj.nullField("enabled");
+    try obj.nullField("timeout_ms");
+    try obj.nullField("max_retries");
 }
 
-/// Emit a `latency` JSON object (avg/p99 in ms + sample count).
-fn writeLatency(obj: anytype, stats: LatencyStats) !void {
-    var lat_obj = try obj.objectField("latency");
-    try lat_obj.begin();
-    try lat_obj.intField("count", @as(i64, @intCast(stats.count)));
-    try lat_obj.intField("avg_ms", stats.avg_ms);
-    try lat_obj.intField("p99_ms", stats.p99_ms);
-    try lat_obj.end();
-}
-
-/// GET /actions — List all registered actions with run counts
+/// GET /actions — The namespace's actions (`action_list`). The list
+/// answers names only: metadata, run counts and latency are null.
 pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action list", err);
+    defer reader.deinit();
+    var pages = reader.listAll(allocator, &action_columns, ActionLister{ .namespace = ns }) catch |err|
+        return try loopback.readFailed(allocator, "action list", err);
+    defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -109,388 +76,207 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-
-    // Collect actions from all shards (de-duplicate by name)
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            const ah = shard.actions_handler;
-            var it = ah.actions.iterator();
-            while (it.next()) |entry| {
-                const rec = entry.value_ptr;
-                // Filter by namespace
-                if (!std.mem.eql(u8, rec.namespace_owned, ns_filter)) continue;
-                const gop = try seen.getOrPut(rec.name_owned);
-                if (!gop.found_existing) {
-                    // Count runs for this action across all shards
-                    var counts = h.RunCounts{};
-                    for (0..n) |si| {
-                        if (getShard(ctx, si)) |s| {
-                            var rit = s.actions_handler.runs.iterator();
-                            while (rit.next()) |re| {
-                                if (runOf(re.value_ptr, rec.namespace_owned, rec.name_owned)) {
-                                    counts.total += 1;
-                                    switch (re.value_ptr.status) {
-                                        .pending => counts.pending += 1,
-                                        .running => counts.running += 1,
-                                        .completed => counts.completed += 1,
-                                        .failed => counts.failed += 1,
-                                        .cancelled => counts.cancelled += 1,
-                                        .timed_out => counts.timed_out += 1,
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    try arr.next();
-                    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                    try obj.begin();
-                    try obj.stringField("name", rec.name_owned);
-                    try obj.stringField("namespace", rec.namespace_owned);
-                    try obj.stringField("type", rec.action_type.toString());
-                    try obj.stringField("owner", rec.owner_owned);
-                    try obj.stringField("description", "");
-                    try obj.intField("version", @as(i64, @intCast(rec.version)));
-                    try obj.boolField("enabled", rec.enabled);
-                    try obj.intField("timeout_ms", @as(i64, @intCast(rec.timeout_ms)));
-                    try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
-                    try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-                    try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-                    try writeLatency(&obj, computeLatency(allocator, ctx, rec.namespace_owned, rec.name_owned));
-                    {
-                        var runs_obj = try obj.objectField("runs");
-                        try runs_obj.begin();
-                        try runs_obj.intField("total", @as(i64, @intCast(counts.total)));
-                        try runs_obj.intField("pending", @as(i64, @intCast(counts.pending)));
-                        try runs_obj.intField("running", @as(i64, @intCast(counts.running)));
-                        try runs_obj.intField("completed", @as(i64, @intCast(counts.completed)));
-                        try runs_obj.intField("failed", @as(i64, @intCast(counts.failed)));
-                        try runs_obj.intField("cancelled", @as(i64, @intCast(counts.cancelled)));
-                        try runs_obj.intField("timed_out", @as(i64, @intCast(counts.timed_out)));
-                        try runs_obj.end();
-                    }
-                    try obj.end();
-                }
-            }
-        }
+    var r = WireReader.init(pages.list());
+    _ = r.readU32();
+    for (0..pages.count) |_| {
+        // Each page's rows were checked whole as they were taken.
+        const name = r.readLengthPrefixed(u16) orelse break;
+        _ = r.readLengthPrefixed(u32) orelse break;
+        try arr.next();
+        var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try obj.begin();
+        try obj.stringField("name", name);
+        try obj.stringField("namespace", ns);
+        try writeUnknownMetadata(&obj);
+        try obj.nullField("created_at");
+        try obj.nullField("updated_at");
+        try obj.nullField("latency");
+        try obj.nullField("runs");
+        try obj.end();
     }
-
     try arr.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /actions/:name — Action detail (metadata, trigger info, run counts, workers, recent runs)
+/// One run as `action_list_runs` lists it.
+const ListedRun = struct {
+    run_id: []const u8,
+    action: []const u8,
+    status: u8,
+    created_at: i64,
+    started_at: ?i64,
+    completed_at: ?i64,
+
+    fn statusName(self: ListedRun) []const u8 {
+        const s = std.enums.fromInt(action_ops.RunStatus, self.status) orelse return "unknown";
+        return @tagName(s);
+    }
+};
+
+/// `action_list_runs`'s answer: [count:u32] then per run [run_id_len:u16]
+/// [run_id][action_len:u16][action][status:u8][created_at:i64]
+/// [has:u8][started_at:i64]?[has:u8][completed_at:i64]?.
+const RunList = struct {
+    reader: WireReader,
+    left: u32,
+
+    fn init(data: []const u8) RunList {
+        var r = WireReader.init(data);
+        const count = r.readU32() orelse 0;
+        return .{ .reader = r, .left = count };
+    }
+
+    fn next(self: *RunList) error{Malformed}!?ListedRun {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const r = &self.reader;
+        return .{
+            .run_id = r.readLengthPrefixed(u16) orelse return error.Malformed,
+            .action = r.readLengthPrefixed(u16) orelse return error.Malformed,
+            .status = r.readU8() orelse return error.Malformed,
+            .created_at = r.readI64() orelse return error.Malformed,
+            .started_at = try optionalI64(r),
+            .completed_at = try optionalI64(r),
+        };
+    }
+
+    fn optionalI64(r: *WireReader) error{Malformed}!?i64 {
+        const has = r.readU8() orelse return error.Malformed;
+        if (has == 0) return null;
+        return r.readI64() orelse error.Malformed;
+    }
+
+    /// Whether every run the count names is there whole.
+    fn whole(data: []const u8) bool {
+        var runs = RunList.init(data);
+        while (runs.next() catch return false) |_| {}
+        return true;
+    }
+};
+
+const RunsShape = enum { recent, page };
+
+/// One run, from its listing and its `action.status` (its attempt, worker,
+/// output and error). What no op answers about a run yet — its input,
+/// source and caller — is null.
+fn writeRun(reader: *loopback.Reader, writer: anytype, namespace: []const u8, run: ListedRun, shape: RunsShape) !void {
+    var got = try reader.call(action_ops.op("action.status"), namespace, run.run_id, .{});
+    defer got.deinit();
+    var diag: schema.Diagnostic = .{};
+    // Gone since it was listed, or refused: its listing alone.
+    const st = if (got.isError()) null else action_ops.op("action.status").response.decodeAll(got.data, &diag) catch null;
+
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("run_id", run.run_id);
+    if (shape == .page) try obj.stringField("action", run.action);
+    try obj.stringField("status", run.statusName());
+    if (shape == .recent) {
+        if (st) |s| try obj.intField("attempt", @as(i64, s.attempt)) else try obj.nullField("attempt");
+    }
+    try obj.intField("created_at", run.created_at);
+    if (run.started_at) |t| try obj.intField("started_at", t) else try obj.nullField("started_at");
+    if (run.completed_at) |t| try obj.intField("completed_at", t) else try obj.nullField("completed_at");
+    const s = st orelse {
+        for ([_][]const u8{ "worker_id", "error", "outcome", "input", "output", "source", "caller_run_id", "caller_workflow" }) |f| try obj.nullField(f);
+        return obj.end();
+    };
+    if (s.worker_id) |w| try obj.stringField("worker_id", w) else try obj.nullField("worker_id");
+    if (s.error_message) |e| try obj.stringField("error", e) else try obj.nullField("error");
+    if (s.output) |o| try obj.stringField("outcome", o) else try obj.nullField("outcome");
+    try obj.nullField("input");
+    // Cut to 2 KiB for the overview.
+    if (s.output) |o| try obj.stringField("output", o[0..@min(o.len, 2048)]) else try obj.nullField("output");
+    try obj.nullField("source");
+    try obj.nullField("caller_run_id");
+    try obj.nullField("caller_workflow");
+    try obj.end();
+}
+
+/// GET /actions/:name — Action detail. No op answers an action's metadata,
+/// run counts or latency yet, so those are null. Its recent runs come from
+/// `action_list_runs` on the action's shard; its workers from `worker.list`.
 pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action detail", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
+    var listed = client_mod.action.listRuns(client, ns, name, RECENT_RUNS) catch |err|
+        return try loopback.readFailed(allocator, "action runs", err);
+    defer listed.deinit();
+    if (listed.isError()) return try h.jsonError(allocator, listed.errorMessage());
+    if (!RunList.whole(listed.data)) return try h.jsonError(allocator, "action runs: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
-
-    // Search shards for this action (matching namespace)
-    var found_rec: ?*const ActionsHandler.ActionRecord = null;
-    var kbuf: [@import("../../../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
-    const key = ActionsHandler.defKey(&kbuf, ns_filter, name) orelse "";
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (getShard(ctx, i)) |shard| {
-            if (shard.actions_handler.actions.getPtr(key)) |rec| {
-                found_rec = rec;
-                break;
-            }
-        }
-    }
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
     try obj.stringField("name", name);
-
-    if (found_rec) |rec| {
-        try obj.stringField("namespace", rec.namespace_owned);
-        try obj.stringField("type", rec.action_type.toString());
-        try obj.stringField("owner", rec.owner_owned);
-        try obj.stringField("description", "");
-        try obj.intField("version", @as(i64, @intCast(rec.version)));
-        try obj.boolField("enabled", rec.enabled);
-        try obj.intField("timeout_ms", @as(i64, @intCast(rec.timeout_ms)));
-        try obj.intField("max_retries", @as(i64, @intCast(rec.max_retries)));
-        try obj.intField("retry_delay_ms", 1000); // not persisted — see gap log
-        try obj.intField("created_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-        try obj.intField("updated_at", @as(i64, @intCast(rec.created_at_ns / std.time.ns_per_ms)));
-        try writeLatency(&obj, computeLatency(allocator, ctx, ns_filter, name));
-
-        // Count runs for this action across all shards
-        var counts = h.RunCounts{};
-        for (0..n) |i| {
-            if (getShard(ctx, i)) |shard| {
-                var rit = shard.actions_handler.runs.iterator();
-                while (rit.next()) |re| {
-                    if (runOf(re.value_ptr, ns_filter, name)) {
-                        counts.total += 1;
-                        switch (re.value_ptr.status) {
-                            .pending => counts.pending += 1,
-                            .running => counts.running += 1,
-                            .completed => counts.completed += 1,
-                            .failed => counts.failed += 1,
-                            .cancelled => counts.cancelled += 1,
-                            .timed_out => counts.timed_out += 1,
-                        }
-                    }
-                }
-            }
+    try obj.stringField("namespace", ns);
+    try writeUnknownMetadata(&obj);
+    try obj.nullField("retry_delay_ms");
+    try obj.nullField("created_at");
+    try obj.nullField("updated_at");
+    try obj.nullField("latency");
+    try obj.nullField("runs");
+    {
+        var recent_arr = try obj.arrayField("recent_runs");
+        try recent_arr.begin();
+        var runs = RunList.init(listed.data);
+        while (runs.next() catch unreachable) |run| {
+            try recent_arr.next();
+            writeRun(&reader, writer, ns, run, .recent) catch |err| return try loopback.readFailed(allocator, "action run status", err);
         }
-
-        // runs object
-        {
-            var runs_obj = try obj.objectField("runs");
-            try runs_obj.begin();
-            try runs_obj.intField("total", @as(i64, @intCast(counts.total)));
-            try runs_obj.intField("pending", @as(i64, @intCast(counts.pending)));
-            try runs_obj.intField("running", @as(i64, @intCast(counts.running)));
-            try runs_obj.intField("completed", @as(i64, @intCast(counts.completed)));
-            try runs_obj.intField("failed", @as(i64, @intCast(counts.failed)));
-            try runs_obj.intField("cancelled", @as(i64, @intCast(counts.cancelled)));
-            try runs_obj.intField("timed_out", @as(i64, @intCast(counts.timed_out)));
-            try runs_obj.end();
-        }
-
-        // recent_runs — last 20 runs for this action
-        {
-            var recent_arr = try obj.arrayField("recent_runs");
-            try recent_arr.begin();
-            var rcount: u32 = 0;
-            for (0..n) |i| {
-                if (rcount >= 20) break;
-                if (getShard(ctx, i)) |shard| {
-                    var rit = shard.actions_handler.runs.iterator();
-                    while (rit.next()) |re| {
-                        if (rcount >= 20) break;
-                        const run = re.value_ptr;
-                        if (!runOf(run, ns_filter, name)) continue;
-                        try recent_arr.next();
-                        var robj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                        try robj.begin();
-                        try robj.stringField("run_id", run.run_id_owned);
-                        try robj.stringField("status", @tagName(run.status));
-                        try robj.intField("attempt", 1);
-                        try robj.intField("created_at", run.created_at_ms);
-                        if (run.started_at_ms) |t| {
-                            try robj.intField("started_at", t);
-                        } else {
-                            try robj.nullField("started_at");
-                        }
-                        if (run.completed_at_ms) |t| {
-                            try robj.intField("completed_at", t);
-                        } else {
-                            try robj.nullField("completed_at");
-                        }
-                        if (run.worker_id_owned) |wid| {
-                            try robj.stringField("worker_id", wid);
-                        } else {
-                            try robj.nullField("worker_id");
-                        }
-                        if (run.error_owned) |err_msg| {
-                            try robj.stringField("error", err_msg);
-                        } else {
-                            try robj.nullField("error");
-                        }
-                        if (run.result_owned) |res| {
-                            try robj.stringField("outcome", res);
-                        } else {
-                            try robj.nullField("outcome");
-                        }
-                        if (run.input_owned) |inp| {
-                            // Truncate input to 2KB for overview
-                            const max_len = @min(inp.len, 2048);
-                            try robj.stringField("input", inp[0..max_len]);
-                        } else {
-                            try robj.nullField("input");
-                        }
-                        if (run.result_owned) |res| {
-                            // Truncate output to 2KB for overview
-                            const max_len = @min(res.len, 2048);
-                            try robj.stringField("output", res[0..max_len]);
-                        } else {
-                            try robj.nullField("output");
-                        }
-                        try robj.stringField("source", switch (run.source) {
-                            1 => "workflow",
-                            2 => "trigger",
-                            else => "direct",
-                        });
-                        if (run.caller_run_id_owned) |crid| {
-                            try robj.stringField("caller_run_id", crid);
-                        } else {
-                            try robj.nullField("caller_run_id");
-                        }
-                        if (run.caller_workflow_name_owned) |cwn| {
-                            try robj.stringField("caller_workflow", cwn);
-                        } else {
-                            try robj.nullField("caller_workflow");
-                        }
-                        try robj.end();
-                        rcount += 1;
-                    }
-                }
-            }
-            try recent_arr.end();
-        }
-
-        // The workers that run it, read as a client over loopback
-        // (`worker.list`, filtered to the action).
-        {
-            var workers_arr = try obj.arrayField("workers");
-            try workers_arr.begin();
-            var reader = loopback.Reader.open(allocator, ctx) catch |err| {
-                json_aw.deinit();
-                return try loopback.readFailed(allocator, "action workers", err);
-            };
-            defer reader.deinit();
-            worker_api.writeActionWorkers(&reader, &workers_arr, writer, ns_filter, name) catch |err| {
-                json_aw.deinit();
-                return try loopback.readFailed(allocator, "action workers", err);
-            };
-            try workers_arr.end();
-        }
-    } else {
-        // Action not registered — return stub with empty defaults
-        try obj.stringField("namespace", ns_filter);
-        try obj.stringField("type", "user");
-        try obj.stringField("owner", "");
-        try obj.stringField("description", "");
-        try obj.intField("version", 0);
-        try obj.boolField("enabled", false);
-        try obj.intField("timeout_ms", 30000);
-        try obj.intField("max_retries", 3);
-        try obj.intField("retry_delay_ms", 1000);
-        try obj.intField("created_at", 0);
-        try obj.intField("updated_at", 0);
-        try writeLatency(&obj, .{});
-        {
-            var runs_obj = try obj.objectField("runs");
-            try runs_obj.begin();
-            try runs_obj.intField("total", 0);
-            try runs_obj.intField("pending", 0);
-            try runs_obj.intField("running", 0);
-            try runs_obj.intField("completed", 0);
-            try runs_obj.intField("failed", 0);
-            try runs_obj.intField("cancelled", 0);
-            try runs_obj.intField("timed_out", 0);
-            try runs_obj.end();
-        }
-        {
-            var recent_arr = try obj.arrayField("recent_runs");
-            try recent_arr.begin();
-            try recent_arr.end();
-        }
-        {
-            var workers_arr = try obj.arrayField("workers");
-            try workers_arr.begin();
-            try workers_arr.end();
-        }
+        try recent_arr.end();
     }
-
+    {
+        var workers_arr = try obj.arrayField("workers");
+        try workers_arr.begin();
+        worker_api.writeActionWorkers(&reader, &workers_arr, writer, ns, name) catch |err|
+            return try loopback.readFailed(allocator, "action workers", err);
+        try workers_arr.end();
+    }
     try obj.end();
-    return try json_aw.toOwnedSlice();
+    return try allocator.dupe(u8, json_aw.written());
 }
 
-/// GET /actions/:name/runs — Execution history
+/// GET /actions/:name/runs — Execution history (`action_list_runs`, on the
+/// action's shard). The op takes a count and no offset, so a page past
+/// `offset` asks for `offset + limit` runs and skips the first `offset`.
 pub fn getActionRuns(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    const limit = h.parseQueryParam(u64, query_string, "limit") orelse 100;
+    const limit = @min(h.parseQueryParam(u64, query_string, "limit") orelse 100, MAX_RUNS_PAGE);
     const offset = h.parseQueryParam(u64, query_string, "offset") orelse 0;
-    const ns_filter = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const want: u32 = @intCast(@min(offset +| limit, std.math.maxInt(u32)));
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action runs", err);
+    defer reader.deinit();
+    const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
+    var listed = client_mod.action.listRuns(client, ns, name, want) catch |err|
+        return try loopback.readFailed(allocator, "action runs", err);
+    defer listed.deinit();
+    if (listed.isError()) return try h.jsonError(allocator, listed.errorMessage());
+    if (!RunList.whole(listed.data)) return try h.jsonError(allocator, "action runs: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
     try arr.begin();
-
+    var runs = RunList.init(listed.data);
     var seen: u64 = 0;
-    var count: u64 = 0;
-    const n = shardCount(ctx);
-    for (0..n) |i| {
-        if (count >= limit) break;
-        if (getShard(ctx, i)) |shard| {
-            var it = shard.actions_handler.runs.iterator();
-            while (it.next()) |entry| {
-                if (count >= limit) break;
-                const run = entry.value_ptr;
-                if (!runOf(run, ns_filter, name)) continue;
-                seen += 1;
-                if (seen <= offset) continue;
-                try arr.next();
-                var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
-                try obj.begin();
-                try obj.stringField("run_id", run.run_id_owned);
-                try obj.stringField("action", run.action_name_owned);
-                try obj.stringField("status", @tagName(run.status));
-                try obj.intField("created_at", run.created_at_ms);
-                if (run.started_at_ms) |t| {
-                    try obj.intField("started_at", t);
-                } else {
-                    try obj.nullField("started_at");
-                }
-                if (run.completed_at_ms) |t| {
-                    try obj.intField("completed_at", t);
-                } else {
-                    try obj.nullField("completed_at");
-                }
-                if (run.worker_id_owned) |wid| {
-                    try obj.stringField("worker_id", wid);
-                } else {
-                    try obj.nullField("worker_id");
-                }
-                if (run.error_owned) |err_msg| {
-                    try obj.stringField("error", err_msg);
-                } else {
-                    try obj.nullField("error");
-                }
-                if (run.result_owned) |res| {
-                    try obj.stringField("outcome", res);
-                } else {
-                    try obj.nullField("outcome");
-                }
-                if (run.input_owned) |inp| {
-                    const max_len = @min(inp.len, 2048);
-                    try obj.stringField("input", inp[0..max_len]);
-                } else {
-                    try obj.nullField("input");
-                }
-                if (run.result_owned) |res| {
-                    const max_len = @min(res.len, 2048);
-                    try obj.stringField("output", res[0..max_len]);
-                } else {
-                    try obj.nullField("output");
-                }
-                try obj.stringField("source", switch (run.source) {
-                    1 => "workflow",
-                    2 => "trigger",
-                    else => "direct",
-                });
-                if (run.caller_run_id_owned) |crid| {
-                    try obj.stringField("caller_run_id", crid);
-                } else {
-                    try obj.nullField("caller_run_id");
-                }
-                if (run.caller_workflow_name_owned) |cwn| {
-                    try obj.stringField("caller_workflow", cwn);
-                } else {
-                    try obj.nullField("caller_workflow");
-                }
-                try obj.end();
-                count += 1;
-            }
-        }
+    while (runs.next() catch unreachable) |run| {
+        seen += 1;
+        if (seen <= offset) continue;
+        try arr.next();
+        writeRun(&reader, writer, ns, run, .page) catch |err| return try loopback.readFailed(allocator, "action run status", err);
     }
-
     try arr.end();
-    return try json_aw.toOwnedSlice();
+    return try allocator.dupe(u8, json_aw.written());
 }
 
 /// POST /actions/:name/invoke?namespace= — Invoke action (loopback write)
@@ -535,25 +321,40 @@ pub fn invokeAction(allocator: Allocator, name: []const u8, body: []const u8, qu
 // Tests
 // =============================================================================
 
-test "getActions returns empty array" {
-    const allocator = std.testing.allocator;
-    var metrics = h.MetricsRegistry.init(allocator);
-    defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
-
-    const result = try getActions(allocator, null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("[]", result);
+/// A context whose loopback connect is refused: nothing listens on port 1.
+fn unreachableContext(allocator: Allocator, metrics: *h.MetricsRegistry) DashboardContext {
+    var ctx = DashboardContext.init(allocator, metrics, 1);
+    ctx.listen_port = 1;
+    return ctx;
 }
 
-test "getActionDetail returns stub" {
+test "action reads say they failed when the node can't be reached" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
-    var ctx = DashboardContext.init(allocator, &metrics, 1);
+    var ctx = unreachableContext(allocator, &metrics);
 
-    const result = try getActionDetail(allocator, "my_action", null, &ctx);
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"my_action\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"type\":\"user\"") != null);
+    const list = try getActions(allocator, null, &ctx);
+    defer allocator.free(list);
+    try std.testing.expect(std.mem.startsWith(u8, list, "{\"error\":\"action list"));
+    const detail = try getActionDetail(allocator, "my_action", null, &ctx);
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.startsWith(u8, detail, "{\"error\":\"action detail"));
+    const runs = try getActionRuns(allocator, "my_action", "offset=5", &ctx);
+    defer allocator.free(runs);
+    try std.testing.expect(std.mem.startsWith(u8, runs, "{\"error\":\"action runs"));
+}
+
+test "action_list_runs' answer decodes run by run, and a cut one is refused" {
+    // One run: "r1" of "a", completed (2), created at 5, started at 6, not completed.
+    const answer = [_]u8{ 1, 0, 0, 0, 2, 0, 'r', '1', 1, 0, 'a', 2 } ++ [_]u8{ 5, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{1} ++ [_]u8{ 6, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{0};
+    try std.testing.expect(RunList.whole(&answer));
+    var runs = RunList.init(&answer);
+    const run = (try runs.next()).?;
+    try std.testing.expectEqualStrings("r1", run.run_id);
+    try std.testing.expectEqualStrings("completed", run.statusName());
+    try std.testing.expectEqual(@as(?i64, 6), run.started_at);
+    try std.testing.expectEqual(@as(?i64, null), run.completed_at);
+    try std.testing.expect((try runs.next()) == null);
+    try std.testing.expect(!RunList.whole(answer[0 .. answer.len - 1]));
 }

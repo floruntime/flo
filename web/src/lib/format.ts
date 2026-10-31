@@ -34,3 +34,21 @@ export function jhl(obj: unknown): string {
     .replace(/: "([^"]*)"/g, ': <span class="js">"$1"</span>')
     .replace(/: (\d+\.?\d*)/g, ': <span class="jn">$1</span>')
 }
+
+/** What a field the API answers as null (unknown, not zero) renders as. */
+export const DASH = '—'
+
+/** `fmt(v)`, or "—" when the API sent null for it. */
+export function orDash<T>(v: T | null | undefined, fmt: (x: T) => string | number = String): string | number {
+  return v == null ? DASH : fmt(v)
+}
+
+/** The sum of `vs`, or null if any is unknown: an unknown never counts as 0. */
+export function sumKnown(vs: (number | null | undefined)[]): number | null {
+  let t = 0
+  for (const v of vs) {
+    if (v == null) return null
+    t += v
+  }
+  return t
+}

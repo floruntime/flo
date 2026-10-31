@@ -5,12 +5,12 @@
 // ── namespaces ──────────────────────────────────────────────
 export interface NamespaceInfo {
   name: string
-  stream_count: number
-  queue_count: number
-  kv_count: number
-  workflow_count: number
-  processing_count: number
-  action_count: number
+  stream_count: number | null
+  queue_count: number | null
+  kv_count: number | null
+  workflow_count: number | null
+  processing_count: number | null
+  action_count: number | null
   created_at?: number
   is_system?: boolean
 }
@@ -119,16 +119,17 @@ export interface StreamInfo {
   partitions: number
   ingest_rate: number
   reads: number
-  retention: string
+  retention: string | null
 }
 export interface StreamPartition {
   id: number
-  record_count: number
-  stored_bytes: number
+  /** Null when the stream has more than one partition: no op answers per-partition counts yet. */
+  record_count: number | null
+  stored_bytes: number | null
 }
 export interface StreamConsumerGroup {
   name: string
-  members: number
+  members: number | null
   pending_count: number
   /** Timestamp (ms) of the group's last-delivered record — its position on the log. */
   last_delivered_ms: number
@@ -139,12 +140,13 @@ export interface StreamDetailInfo {
   total_count: number
   total_bytes: number
   partitions: StreamPartition[]
-  consumer_groups: StreamConsumerGroup[]
+  /** Null: no op lists a stream's groups yet. */
+  consumer_groups: StreamConsumerGroup[] | null
 }
 export interface StreamMessage {
   id_ms: number
   id_seq: number
-  ual_index: number
+  ual_index: number | null
   size: number
   payload: string
 }
@@ -161,10 +163,10 @@ export interface StreamMessagesResponse {
 export interface QueueInfo {
   name: string
   namespace: string
-  ready: number
-  inflight: number
+  ready: number | null
+  inflight: number | null
   pending: number
-  available: number
+  available: number | null
   enqueued: number
   dequeued: number
   dlq_count: number
@@ -180,6 +182,12 @@ export interface QueueMessage {
   size: number
   payload: string
 }
+/** GET /queues/:name/dlq. `entries` is null until an op lists them; `count` is real. */
+export interface QueueDLQResponse {
+  entries: QueueMessage[] | null
+  count: number
+  queue: string
+}
 export interface QueueMessagesResponse {
   messages: QueueMessage[]
   count: number
@@ -194,9 +202,9 @@ export interface QueueMessagesResponse {
 // buffered point total across them.
 export interface TsMeasurement {
   name: string
-  series_count: number
-  field_count: number
-  points: number
+  series_count: number | null
+  field_count: number | null
+  points: number | null
 }
 export interface TsField {
   name: string
@@ -205,11 +213,11 @@ export interface TsField {
 export interface TsMeasurementDetail {
   name: string
   namespace: string
-  field_count: number
-  fields: TsField[]
-  series_count: number
-  /** Per-series rollup — empty until the projection tracks tag series. */
-  series: unknown[]
+  field_count: number | null
+  /** Null: no op answers a measurement's fields yet. */
+  fields: TsField[] | null
+  series_count: number | null
+  series: unknown[] | null
   retention: string | null
 }
 export interface TsPoint {
@@ -250,27 +258,28 @@ export interface ActionRunCounts {
   cancelled: number
   timed_out: number
 }
+/** The list answers names only; every other field may be null (unknown). */
 export interface ActionInfo {
   name: string
   namespace: string
-  type: string
-  owner: string
+  type: string | null
+  owner: string | null
   description: string
-  version: number
-  enabled: boolean
-  /** Hardcoded default — not persisted on the action record (see gap log). */
-  timeout_ms: number
-  max_retries: number
-  created_at: number
-  updated_at: number
-  runs: ActionRunCounts
+  version: number | null
+  enabled: boolean | null
+  timeout_ms: number | null
+  max_retries: number | null
+  created_at: number | null
+  updated_at: number | null
+  latency?: unknown
+  runs: ActionRunCounts | null
 }
 export interface ActionRun {
   run_id: string
   /** Present on the `/runs` list endpoint, absent in `detail.recent_runs`. */
   action?: string
   status: ActionRunStatus
-  attempt?: number
+  attempt?: number | null
   created_at: number
   started_at: number | null
   completed_at: number | null
@@ -279,24 +288,25 @@ export interface ActionRun {
   outcome: string | null
   input: string | null
   output: string | null
-  source: 'direct' | 'workflow' | 'trigger'
+  source: 'direct' | 'workflow' | 'trigger' | null
   caller_run_id: string | null
   caller_workflow: string | null
 }
 export interface ActionDetailInfo {
   name: string
   namespace: string
-  type: string
-  owner: string
+  type: string | null
+  owner: string | null
   description: string
-  version: number
-  enabled: boolean
-  timeout_ms: number
-  max_retries: number
-  retry_delay_ms: number
-  created_at: number
-  updated_at: number
-  runs: ActionRunCounts
+  version: number | null
+  enabled: boolean | null
+  timeout_ms: number | null
+  max_retries: number | null
+  retry_delay_ms: number | null
+  created_at: number | null
+  updated_at: number | null
+  latency?: unknown
+  runs: ActionRunCounts | null
   recent_runs: ActionRun[]
   /** Workers running this action, as the worker list gives them. */
   workers: WorkerListItem[]
@@ -315,13 +325,16 @@ export interface ProcessingJobInfo {
   name: string
   namespace: string
   status: JobStatus
-  batch_size: number
+  batch_size: number | null
   created_at: number
-  records_processed: number
+  /** Null in the list; the detail answers it. */
+  records_processed: number | null
+  metrics?: unknown
 }
 export interface ProcessingJobDetail extends ProcessingJobInfo {
   /** Full submitted pipeline definition (parsed client-side into the DAG). */
-  yaml: string
+  yaml: string | null
+  reason?: string | null
 }
 export interface ProcessingMutationResult {
   ok: boolean
@@ -343,7 +356,8 @@ export interface WorkflowDefInfo {
   name: string
   version: string
   created_at: number
-  enabled: boolean
+  /** Null: no op answers whether a definition is enabled yet. */
+  enabled: boolean | null
   step_count: number
   plan_count: number
   has_schedule: boolean
@@ -355,12 +369,12 @@ export interface WorkflowDefInfo {
 }
 export interface WorkflowDefDetail {
   name: string
-  version: string
-  created_at: number
-  enabled: boolean
-  status: string
+  version: string | null
+  created_at: number | null
+  enabled: boolean | null
+  status: string | null
   definition_yaml: string
-  run_count: number
+  run_count: number | null
 }
 export interface WorkflowRunInfo {
   run_id: string

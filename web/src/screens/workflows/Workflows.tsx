@@ -15,7 +15,7 @@ import { Button } from '@/components/buttons/Button'
 import { Crumb, PhSec, Stat, Stats } from '@/components/layout'
 import { StatusPill, OpPill } from '@/components'
 import { Modal } from '@/components/overlay/Modal'
-import { jhl, tfmt } from '@/lib/format'
+import { DASH, jhl, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import {
   useWorkflows,
@@ -251,6 +251,8 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
   const [tab, setTab] = useState<'runs' | 'definition'>('runs')
   const [start, setStart] = useState(false)
   const detail = q.data
+  // Null: no op answers whether a definition is enabled yet. Unknown is not
+  // disabled — Start stays on, and both Enable and Disable are offered.
   const enabled = detail?.enabled ?? def.enabled
   const myRuns = useMemo(() => runs.filter((r) => r.workflow === def.name), [runs, def.name])
 
@@ -262,7 +264,7 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
           <div>
             <h1 className="ph-t" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               {def.name}
-              {!enabled && <OpPill color="var(--warn)">disabled</OpPill>}
+              {enabled === false && <OpPill color="var(--warn)">disabled</OpPill>}
             </h1>
             <div className="ph-s mono">
               v{def.version} · {def.step_count} step{def.step_count === 1 ? '' : 's'}
@@ -270,21 +272,51 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
             </div>
           </div>
           <div style={{ display: 'flex', gap: 9 }}>
-            <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: !enabled })}>
-              {enabled ? 'Disable' : 'Enable'}
-            </Button>
-            <Button variant="accent" style={{ flex: 'none' }} disabled={!enabled} onClick={() => setStart(true)}>
+            {enabled == null ? (
+              <>
+                <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: true })}>
+                  Enable
+                </Button>
+                <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: false })}>
+                  Disable
+                </Button>
+              </>
+            ) : (
+              <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: !enabled })}>
+                {enabled ? 'Disable' : 'Enable'}
+              </Button>
+            )}
+            <Button variant="accent" style={{ flex: 'none' }} disabled={enabled === false} onClick={() => setStart(true)}>
               Start run
             </Button>
           </div>
         </div>
+        {toggle.isError && (
+          <div className="mono" style={{ fontSize: 12, color: 'var(--crit)', marginTop: 8 }}>
+            {String((toggle.error as Error)?.message ?? 'Toggle failed')}
+          </div>
+        )}
+        {toggle.isSuccess && enabled == null && (
+          <div className="mono" style={{ fontSize: 12, color: 'var(--tx-faint)', marginTop: 8 }}>
+            {toggle.variables?.enable ? 'enabled' : 'disabled'} · the current state isn’t answered yet
+          </div>
+        )}
       </div>
 
       <Stats>
-        <Stat label="Runs" value={detail?.run_count ?? myRuns.length} sub="all time" />
+        <Stat
+          label="Runs"
+          value={detail?.run_count ?? myRuns.length}
+          sub={detail?.run_count != null ? 'all time' : 'listed'}
+        />
         <Stat label="Steps" value={def.step_count} sub={`${def.plan_count} plans`} />
         <Stat label="Version" value={'v' + def.version} sub={detail?.status ?? '—'} />
-        <Stat label="Status" value={enabled ? 'enabled' : 'disabled'} valueColor={enabled ? undefined : 'var(--warn)'} sub="accepts runs" />
+        <Stat
+          label="Status"
+          value={enabled == null ? DASH : enabled ? 'enabled' : 'disabled'}
+          valueColor={enabled === false ? 'var(--warn)' : undefined}
+          sub={enabled == null ? 'not available yet' : enabled ? 'accepts runs' : 'refuses runs'}
+        />
       </Stats>
 
       <div className="sec">
@@ -372,9 +404,12 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
     return m
   }, [runs])
 
-  const enabledCount = defs.filter((d) => d.enabled).length
+  const enabledKnown = defs.every((d) => d.enabled != null)
+  const enabledCount = defs.filter((d) => d.enabled === true).length
+  const disabledCount = defs.filter((d) => d.enabled === false).length
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'waiting' || r.status === 'pending').length
-  const filtered = tab === 'all' ? defs : tab === 'enabled' ? defs.filter((d) => d.enabled) : defs.filter((d) => !d.enabled)
+  const filtered =
+    tab === 'all' ? defs : tab === 'enabled' ? defs.filter((d) => d.enabled === true) : defs.filter((d) => d.enabled === false)
   const grid = '1.6fr 90px 90px 110px 110px'
 
   return (
@@ -385,10 +420,10 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
       </div>
 
       <Stats>
-        <Stat label="Workflows" value={q.isLoading ? '…' : defs.length} sub={`${enabledCount} enabled · in ${ns}`} />
+        <Stat label="Workflows" value={q.isLoading ? '…' : defs.length} sub={`${enabledKnown ? enabledCount : DASH} enabled · in ${ns}`} />
         <Stat label="Runs" value={runsQ.isLoading ? '…' : runs.length} sub="all time" />
         <Stat label="Active" value={activeRuns} valueColor={activeRuns ? '#6F9BD1' : undefined} sub="running / waiting" />
-        <Stat label="Disabled" value={defs.length - enabledCount} sub="blocked" />
+        <Stat label="Disabled" value={enabledKnown ? disabledCount : DASH} sub="blocked" />
       </Stats>
 
       <div className="sec">
@@ -428,9 +463,9 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
               return (
                 <div className="li" key={d.name} style={{ gridTemplateColumns: grid }} onClick={() => onOpen(d)}>
                   <div style={{ minWidth: 0 }}>
-                    <div className="mono nw" style={{ fontWeight: 500, color: d.enabled ? 'var(--tx)' : 'var(--tx-3)' }}>
+                    <div className="mono nw" style={{ fontWeight: 500, color: d.enabled === false ? 'var(--tx-3)' : 'var(--tx)' }}>
                       {d.name}
-                      {!d.enabled && <span style={{ marginLeft: 8 }}><OpPill color="var(--warn)">off</OpPill></span>}
+                      {d.enabled === false && <span style={{ marginLeft: 8 }}><OpPill color="var(--warn)">off</OpPill></span>}
                     </div>
                     <div className="desc">{d.has_schedule ? 'scheduled' : d.has_trigger ? 'triggered' : 'manual'}</div>
                   </div>

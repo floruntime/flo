@@ -14,10 +14,11 @@ export function useJobs(ns: string) {
   })
 }
 
-export function useJobDetail(id: string | null) {
+/** One job. The server looks it up in `ns` (default "default"), so pass the job's own. */
+export function useJobDetail(ns: string, id: string | null) {
   return useQuery({
-    queryKey: ['processing', 'detail', id],
-    queryFn: () => api.get<ProcessingJobDetail>(`processing/jobs/${enc(id!)}`),
+    queryKey: ['processing', ns, 'detail', id],
+    queryFn: () => api.get<ProcessingJobDetail>(`processing/jobs/${enc(id!)}?namespace=${enc(ns)}`),
     enabled: !!id,
     refetchInterval: 5_000,
   })
