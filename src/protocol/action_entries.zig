@@ -30,8 +30,12 @@ pub const Holder = Bytes(action_ops.MAX_WORKER_ID);
 pub const MAX_INPUT: u32 = 64 * 1024;
 pub const MAX_LABELS: u32 = 4096;
 pub const MAX_OWNER: u32 = 256;
-/// The longest lease a deliver or an extend may ask for.
-pub const MAX_LEASE_MS: u64 = 60 * 60 * 1000;
+/// A lease's floor, above three election timeouts, so a new leader's
+/// grace never outlasts it; and its ceiling, which also bounds how long
+/// one delivery may be held, however often it's touched.
+pub const MIN_LEASE_MS: u64 = 5 * 1000;
+pub const MAX_LEASE_MS: u64 = 12 * 60 * 60 * 1000;
+pub const MAX_HOLD_MS: u64 = MAX_LEASE_MS;
 /// The longest a release may hold a run back before it is ready again.
 pub const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most leases one expire entry ends.
@@ -39,16 +43,15 @@ pub const MAX_EXPIRE_ITEMS: u32 = 256;
 /// A retried await's key, so it gets the delivery the first one made.
 pub const MAX_REQUEST_KEY: u32 = 64;
 
-pub const LeaseMs = schema.DurationMs(MAX_LEASE_MS);
+pub const LeaseMs = schema.Range(u64, MIN_LEASE_MS, MAX_LEASE_MS);
+/// A named outcome a workflow step follows ("success" when none is named).
+pub const MAX_OUTCOME: u32 = 256;
+pub const Outcome = Bytes(MAX_OUTCOME);
 
 /// Where a run came from.
 pub const Source = enum(u8) { direct = 0, workflow = 1, trigger = 2 };
 
-/// What a worker settled a run with.
-pub const Outcome = enum(u8) { success = 0, failure = 1, pending = 2 };
-
-/// The delivery a report or touch names: the run's delivery count when it
-/// was made, and the deliver entry's (term, index).
+/// The delivery a report or touch names: the deliver entry's (term, index).
 pub const Token = Record(&.{
     .{ .name = "term", .T = Int(u64) },
     .{ .name = "index", .T = Int(u64) },
@@ -94,12 +97,17 @@ pub const Deliver = Record(&.{
     .{ .name = "lease_ms", .T = LeaseMs },
 });
 
+/// A delivery completed by its holder. `expiry_ns` is the run's expiry as
+/// the leader saw it: its deadline key goes with the lease when it is
+/// still the run's.
 pub const Settle = Record(&.{
     .{ .name = "ns", .T = Ns },
+    .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "token", .T = Token },
-    .{ .name = "outcome", .T = schema.Enum(Outcome) },
+    .{ .name = "expiry_ns", .T = Int(u64) },
+    .{ .name = "outcome", .T = Outcome },
     .{ .name = "result", .T = Bytes(action_ops.MAX_OUTPUT) },
 });
 
@@ -112,16 +120,23 @@ pub const Release = Record(&.{
     .{ .name = "run", .T = RunId },
     .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "token", .T = Token },
+    .{ .name = "expiry_ns", .T = Int(u64) },
     .{ .name = "abandoned", .T = schema.Bool },
     .{ .name = "retry", .T = schema.Bool },
     .{ .name = "delay_ms", .T = schema.DurationMs(MAX_DELAY_MS) },
     .{ .name = "error", .T = Bytes(action_ops.MAX_ERROR) },
 });
 
+/// A delivery's lease moved out. It names the delivery's own lease, when
+/// the delivery began (`held_since_ns`, so the hold ceiling follows from
+/// the entry) and the expiry the leader saw, whose key it replaces.
 pub const Extend = Record(&.{
     .{ .name = "ns", .T = Ns },
+    .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "token", .T = Token },
+    .{ .name = "expiry_ns", .T = Int(u64) },
+    .{ .name = "held_since_ns", .T = Int(u64) },
     .{ .name = "lease_ms", .T = LeaseMs },
 });
 
