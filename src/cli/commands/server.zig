@@ -1331,6 +1331,8 @@ const MAX_METRICS_ANSWER: usize = 4 * 1024 * 1024;
 
 fn runMetrics(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
+    // The global -e and -p name the client port; metrics are served elsewhere.
+    if (ctx.flagChanged("endpoint") or ctx.flagChanged("port")) return outcome.usage(ctx, "-e/--endpoint and -p/--port name the client port; server metrics reads --metrics-endpoint", .{});
     const endpoint = ctx.getString("metrics-endpoint") orelse "localhost:9001";
     const format = ctx.getString("format") orelse "text";
     const json = if (std.mem.eql(u8, format, "json")) true else if (std.mem.eql(u8, format, "text")) false else return outcome.usage(ctx, "--format is text or json, not '{s}'", .{format});

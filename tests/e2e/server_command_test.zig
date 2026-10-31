@@ -124,6 +124,7 @@ test "e2e/server: flags that are never read or contradict each other are refused
         .{ .args = &.{ "server", "start", "--data-dir", server.data_dir, "--no-dashboard", "--dashboard-port", "9998" }, .want = "Error: --dashboard-port names a port for the dashboard that --no-dashboard turns off; give one or the other\n" },
         .{ .args = &.{ "server", "metrics", "--format", "prometheus" }, .want = "Error: --format is text or json, not 'prometheus'\n" },
         .{ .args = &.{ "server", "metrics", "--metrics-endpoint", "localhost:abc" }, .want = "Error: --metrics-endpoint localhost:abc: 'abc' is not a port\n" },
+        .{ .args = &.{ "server", "metrics", "-e", "127.0.0.1:9001" }, .want = "Error: -e/--endpoint and -p/--port name the client port; server metrics reads --metrics-endpoint\n" },
         .{ .args = &.{ "server", "start", "--data-dir", server.data_dir, "--threads", "4" }, .want = "Error: unknown flag --threads\n" },
     };
     for (cases) |c| {

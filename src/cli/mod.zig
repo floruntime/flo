@@ -20,7 +20,6 @@ const outcome = @import("outcome.zig");
 // Server config for flo.toml generation
 const server_config = @import("../config/server.zig");
 
-/// Wrapper to cast *anyopaque to *Context
 /// A global port out of range is refused before any command runs, not
 /// read as no port at all.
 fn checkGlobalFlags(ctx_ptr: *anyopaque) commander.Error!void {
@@ -28,6 +27,7 @@ fn checkGlobalFlags(ctx_ptr: *anyopaque) commander.Error!void {
     _ = try ctx.getChangedPort("port");
 }
 
+/// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
     return struct {
         fn run(ctx_ptr: *anyopaque) commander.Error!void {
