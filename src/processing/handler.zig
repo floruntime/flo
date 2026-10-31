@@ -656,6 +656,13 @@ pub const ProcessingHandler = struct {
         return if (std.mem.eql(u8, job.namespace_owned, home)) job else null;
     }
 
+    /// Whether `job` lives in the namespace an entry's hash names; a bare
+    /// namespace is "default", as it is for ownedJob.
+    fn inNamespace(job: *const JobRecord, ns_hash: u32) bool {
+        if (ns_hash == router.namespaceHash(job.namespace_owned)) return true;
+        return ns_hash == router.namespaceHash("") and std.mem.eql(u8, job.namespace_owned, "default");
+    }
+
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
         const job_id = req.key;
         if (job_id.len == 0) {
@@ -945,7 +952,7 @@ pub const ProcessingHandler = struct {
             .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms, out),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped, out),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled, out),
-            .processing_remove => self.replayRemove(cmd.key, out),
+            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_hash, out),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => error.Halt,
         };
@@ -1093,8 +1100,11 @@ pub const ProcessingHandler = struct {
     /// Replay a processing_remove entry: drop the job and any pipelines it
     /// left. A running job stays, refused in log order on every replica; a
     /// job already gone was removed by an earlier entry.
-    fn replayRemove(self: *ProcessingHandler, key: []const u8, out: *Result) persistence_mod.ApplyError!void {
+    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_hash: u32, out: *Result) persistence_mod.ApplyError!void {
         const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        // The leader checked this too (ownedJob); every replica holds the
+        // entry to it, so a remove never reaches another namespace's job.
+        if (!inNamespace(job, ns_hash)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
         if (job.status == .running) return out.refuse(.conflict, .job_running, "job is running: stop or cancel it, then remove it");
         self.dropPipelines(key);
         var removed = self.jobs.fetchRemove(key).?;
@@ -2448,8 +2458,12 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
 
 /// Applies a keyed entry of `etype` for job `key`, as the log does.
 fn applyKeyed(h: *ProcessingHandler, etype: EntryType, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
+    return applyKeyedIn(h, etype, router.namespaceHash(""), key, value);
+}
+
+fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_hash: u32, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
     var pbuf: [1024]u8 = undefined;
-    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, 0, key, value, &pbuf).?;
+    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_hash, key, value, &pbuf).?;
     return applyLogged(h, &entry);
 }
 
@@ -2471,8 +2485,14 @@ test "ProcessingHandler: a remove is refused while its job runs, and frees the s
     try std.testing.expect((try applyKeyed(&handler, .processing_cancel, "job-1", &.{@backingInt(ProcessingHandler.JobStatus.cancelled)})).refused() == null);
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 2)).refused() != null);
 
-    // Removed: the job, its pipeline and its slot are gone.
-    try std.testing.expect((try applyKeyed(&handler, .processing_remove, "job-1", "")).refused() == null);
+    // Another namespace's remove finds no such job, on every replica.
+    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("other"), "job-1", "")).refused().?;
+    try std.testing.expectEqual(proto.StatusCode.not_found, elsewhere.status);
+    try std.testing.expect(handler.jobs.contains("job-1"));
+
+    // Removed: the job, its pipeline and its slot are gone; "default" by
+    // name is the bare namespace.
+    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("default"), "job-1", "")).refused() == null);
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
     try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 3)).refused() == null);
