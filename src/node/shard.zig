@@ -2891,7 +2891,7 @@ pub const Shard = struct {
     const NO_NAMESPACE_YET: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found; one created a moment ago through another node can take up to 100 ms to be seen here — retry" };
     /// The node never looked, so this isn't no_namespace: a client may take
     /// that as final for a namespace that exists.
-    const EDGE_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: this node doesn't know the namespace yet and is already asking the leader about 64 others; the request was not run — retry" };
+    pub const EDGE_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: this node doesn't know the namespace yet and is already asking the leader about 64 others; the request was not run — retry" };
     const ASK_FAILED = "unavailable: this node could not ask the leader about this namespace; the request was not run — retry";
 
     /// Whether `op` runs within a namespace: every op but the node's own
@@ -16398,9 +16398,15 @@ test "Shard: a follower holds at most a shard's share of reads at the edge; past
     try f.init();
     defer f.deinit();
     const shard = &f.t.shard;
+    // Spread over two connections, so neither reaches its own cap first.
+    const other = try TestClient.open(shard);
+    defer _ = std.c.close(other.pair[1]);
     var body: [64]u8 = undefined;
     var name: [16]u8 = undefined;
-    for (0..edge_mod.WAITS) |i| shard.runRequest(f.c.conn, edgeGet(&body, i + 1, try std.fmt.bufPrint(&name, "held-{d}", .{i}), "k"), .client);
+    for (0..edge_mod.WAITS) |i| {
+        const c = if (i % 2 == 0) f.c else other;
+        shard.runRequest(c.conn, edgeGet(&body, i + 1, try std.fmt.bufPrint(&name, "held-{d}", .{i}), "k"), .client);
+    }
     try std.testing.expectEqual(@as(u32, edge_mod.WAITS), shard.edge.count);
     shard.runRequest(f.c.conn, edgeGet(&body, 999, "one-more", "k"), .client);
     var out: [512]u8 = undefined;
@@ -16408,6 +16414,52 @@ test "Shard: a follower holds at most a shard's share of reads at the edge; past
     try std.testing.expectEqual(@as(u64, 999), over.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), over.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try over.refused()).ran);
+    try std.testing.expectEqualStrings(Shard.EDGE_FULL.message, (try over.refused()).message);
+}
+
+test "Shard: a connection with as many requests waiting as it may have can't hold another read at the edge" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    f.c.conn.forwards_in_flight = Connection.MAX_FORWARDS_IN_FLIGHT;
+    var body: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "capped", "k"), .client);
+    var out: [512]u8 = undefined;
+    const over = try nextAnswer(f.c, shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), over.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try over.refused()).message, "on this connection") != null);
+    try std.testing.expectEqual(@as(u32, 0), shard.edge.count);
+}
+
+test "Shard: an ask a follower couldn't send yet waits, once this node leads, until it has caught up" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    defer {
+        for (t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        t.rn.outbound.clearRetainingCapacity();
+    }
+    const shard = &t.shard;
+    // A leader known but not linked: the ask stays unsent.
+    shard.raft_node.leader_id = 2;
+    const c = try TestClient.open(shard);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    shard.runRequest(c.conn, edgeGet(&body, 1, "pending", "k"), .client);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    // This node leads now, with an earlier leader's entries unapplied.
+    shard.raft_node.role = .leader;
+    shard.raft_node.leader_id = shard.cluster_node_id;
+    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
+    shard.sweepForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    try std.testing.expect(shard.edge.waits[0].index == null);
+    // Caught up: its own table is the one to wait for.
+    shard.raft_node.ready_index = shard.raft_node.last_applied;
+    shard.sweepForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    try std.testing.expect(shard.edge.waits[0].index != null);
 }
 
 test "Shard: another shard's read of a namespace shard 0 is creating waits for the create's publish, then runs" {
@@ -16491,4 +16543,41 @@ test "Shard: a follower's held reads count against their connection's requests i
     try std.testing.expectEqual(@as(u16, 1), f.c.conn.forwards_in_flight);
     shard.sweepEdge(Shard.nowMs() + edge_mod.WAIT_MS);
     try std.testing.expectEqual(@as(u16, 0), f.c.conn.forwards_in_flight);
+}
+
+test "Shard: a read waiting on shard 0 for a create that is then refused is answered that there is no namespace" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const asker = try TestClient.open(&shard);
+    defer _ = std.c.close(asker.pair[1]);
+    const nh = shard.namespace_handler;
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+    shard.runRequest(conn, try ParkTest.request(.namespace_create, 2, "", "mine", "", ""), .client);
+    // Another shard asks about the name while its create is under way: the
+    // answer waits for the create.
+    shard.runRequest(asker.conn, .{ .header = proto.RequestHeader.init(.namespace_published, 7), .namespace = "", .key = "mine", .value = "" }, .peer);
+    try expectNoAnswer(asker, &shard);
+    // The create's id was taken first, and this leader can't propose it
+    // again yet: the create is refused.
+    try std.testing.expectEqual(NamespaceHandler.CreateOutcome.created, nh.applyCreateAt("taken", first, 0, 1));
+    try ParkTest.ack(&shard);
+    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
+    nh.settle(&shard);
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(asker, &shard, &out);
+    try std.testing.expectEqual(@as(u64, 7), got.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), got.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
 }
