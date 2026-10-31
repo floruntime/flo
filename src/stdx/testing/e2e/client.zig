@@ -249,8 +249,9 @@ pub const CliRunner = struct {
     /// Run a CLI command asynchronously (returns handle to wait on)
     /// Useful for testing blocking operations like `kv get --wait-ms`
     pub fn runAsync(self: *Self, args: []const []const u8) !*AsyncCommand {
-        // Build full argument list, inserting --endpoint before any "--" separator
-        const extra_flags: usize = 2;
+        // Build full argument list, inserting --endpoint before any "--"
+        // separator; a command that refuses it gets none.
+        const extra_flags: usize = if (takesNoEndpoint(args)) 0 else 2;
         const total_args = 1 + args.len + extra_flags;
 
         var argv = try self.allocator.alloc([]const u8, total_args);
@@ -271,7 +272,9 @@ pub const CliRunner = struct {
         }
 
         argv[0] = self.flo_binary;
-        if (dashdash_pos) |dd| {
+        if (extra_flags == 0) {
+            for (args, 0..) |_, i| argv[1 + i] = owned_argv[i];
+        } else if (dashdash_pos) |dd| {
             for (0..dd) |i| argv[1 + i] = owned_argv[i];
             var inject_at: usize = 1 + dd;
             argv[inject_at] = "--endpoint";
@@ -375,6 +378,8 @@ pub const CliRunner = struct {
         // Build full argument list: [flo_binary] + args_before_-- + [--endpoint, endpoint, (--api-key, key)] + args_from_--
         // We must insert flags BEFORE "--" because commander treats everything
         // after "--" as positional (no flag parsing).
+        // A command that refuses -e/--endpoint gets none.
+        if (takesNoEndpoint(args)) return self.runRaw(args);
         const extra_flags: usize = 2;
         const total_args = 1 + args.len + extra_flags;
 
@@ -548,4 +553,12 @@ test "CommandResult: count occurrences" {
     // Reset to prevent deinit from freeing string literals
     result.stdout = "";
     result.stderr = "";
+}
+
+/// Whether `args` run a command that refuses -e/--endpoint: `server
+/// start`, which listens, and `server metrics`, which reads the metrics
+/// endpoint, not the client port.
+fn takesNoEndpoint(args: []const []const u8) bool {
+    if (args.len < 2 or !std.mem.eql(u8, args[0], "server")) return false;
+    return std.mem.eql(u8, args[1], "start") or std.mem.eql(u8, args[1], "metrics");
 }
