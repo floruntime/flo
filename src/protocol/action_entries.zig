@@ -99,10 +99,15 @@ pub const Deliver = Record(&.{
 /// A delivery completed by its holder. `expiry_ns` is the run's expiry as
 /// the leader saw it: its deadline key goes with the lease when it is
 /// still the run's.
+pub const RequestKey = Optional(Bytes(MAX_REQUEST_KEY));
+
 pub const Settle = Record(&.{
     .{ .name = "ns", .T = Ns },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
+    .{ .name = "holder", .T = Holder },
+    // The delivery's request key, if it had one: its record goes too.
+    .{ .name = "request_key", .T = RequestKey },
     .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "token", .T = Token },
     .{ .name = "expiry_ns", .T = Int(u64) },
@@ -117,6 +122,8 @@ pub const Release = Record(&.{
     .{ .name = "ns", .T = Ns },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
+    .{ .name = "holder", .T = Holder },
+    .{ .name = "request_key", .T = RequestKey },
     .{ .name = "deliveries", .T = Int(u32) },
     .{ .name = "token", .T = Token },
     .{ .name = "expiry_ns", .T = Int(u64) },
@@ -133,6 +140,7 @@ pub const Extend = Record(&.{
     .{ .name = "ns", .T = Ns },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
+    .{ .name = "holder", .T = Holder },
     .{ .name = "token", .T = Token },
     .{ .name = "expiry_ns", .T = Int(u64) },
     .{ .name = "held_since_ns", .T = Int(u64) },
@@ -148,10 +156,18 @@ pub const ExpireItem = Record(&.{
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "expiry_ns", .T = Int(u64) },
+    // The live delivery's holder and request key, as the duty read them:
+    // its request record goes with the lease.
+    .{ .name = "holder", .T = Holder },
+    .{ .name = "request_key", .T = RequestKey },
 });
 
+/// The most bytes one expire's items take: a holder can be long, so the
+/// duty stops adding items short of it.
+pub const MAX_EXPIRE_BYTES: u32 = 512 * 1024;
+
 pub const Expire = Record(&.{
-    .{ .name = "items", .T = BoundedList(ExpireItem, MAX_EXPIRE_ITEMS, MAX_EXPIRE_ITEMS * ExpireItem.max_size) },
+    .{ .name = "items", .T = BoundedList(ExpireItem, MAX_EXPIRE_ITEMS, MAX_EXPIRE_BYTES) },
 });
 
 pub const table = [_]entries.Entry{

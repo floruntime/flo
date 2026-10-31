@@ -97,6 +97,7 @@ pub const Run = Record(&.{
     // The latest delivery: its holder, token, lease, when it began and
     // until when it runs.
     .{ .name = "holder", .T = ae.Holder },
+    .{ .name = "request_key", .T = ae.RequestKey },
     .{ .name = "token", .T = ae.Token },
     .{ .name = "lease_ms", .T = Int(u64) },
     .{ .name = "delivered_ns", .T = Int(u64) },
@@ -117,6 +118,14 @@ pub const Deadline = Record(&.{
     .{ .name = "action", .T = ae.ActionName },
 });
 
+/// The delivery a holder's request key got, so a retried await gets it
+/// again, from whichever leader it reaches.
+pub const Request = Record(&.{
+    .{ .name = "run", .T = ae.RunId },
+    .{ .name = "term", .T = Int(u64) },
+    .{ .name = "index", .T = Int(u64) },
+});
+
 pub const Empty = struct {
     pub fn encode(_: Empty, _: *std.Io.Writer) std.Io.Writer.Error!void {}
     pub fn decode(bytes: []const u8) error{Malformed}!Empty {
@@ -129,6 +138,7 @@ pub const Defs = view_mod.Family(20, "action.def", Stored(Def));
 pub const Runs = view_mod.Family(21, "action.run", Stored(Run));
 pub const Ready = view_mod.Family(22, "action.ready", Empty);
 pub const Deadlines = view_mod.Family(23, "action.deadline", Stored(Deadline));
+pub const Requests = view_mod.Family(24, "action.request", Stored(Request));
 
 // ─── Keys ────────────────────────────────────────────────────────────────
 
@@ -180,6 +190,17 @@ pub fn parseDeadlineKey(k: []const u8) ?DeadlineKey {
     return .{ .expiry_ns = std.mem.readInt(u64, k[0..8], .big), .ns = k[9..][0..ns_len], .run = k[9 + ns_len ..] };
 }
 
+/// `[holder][0][request_key]`, in the namespace: a holder's request keys.
+/// A worker id holds no NUL, so one holder's keys never run into another's.
+pub fn requestKey(buf: []u8, holder: []const u8, request_key: []const u8) []const u8 {
+    @memcpy(buf[0..holder.len], holder);
+    buf[holder.len] = 0;
+    @memcpy(buf[holder.len + 1 ..][0..request_key.len], request_key);
+    return buf[0 .. holder.len + 1 + request_key.len];
+}
+
+const ReqBuf = [ae.Holder.max_size + 1 + ae.MAX_REQUEST_KEY]u8;
+
 fn after(stamp_ns: u64, millis: u64) u64 {
     return stamp_ns +| (millis *| std.time.ns_per_ms);
 }
@@ -197,6 +218,7 @@ fn typeOf(e: *const Entry) EntryType {
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     var diag: schema.Diagnostic = .{};
     var b: KeyBuf = undefined;
+    var rb: ReqBuf = undefined;
     const stamp = e.header.timestamp_ns;
     switch (typeOf(e)) {
         .action_register => {
@@ -219,17 +241,20 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             try out.add(Runs.ID, p.ns, p.run);
             try out.add(Ready.ID, p.ns, readyKey(&b, p.action, p.due_ns, p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), p.ns, p.run));
+            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
             try out.add(Runs.ID, p.ns, p.run);
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
+            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return;
             try out.add(Runs.ID, p.ns, p.run);
             try out.add(Ready.ID, p.ns, readyKey(&b, p.action, after(stamp, p.delay_ms), p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
+            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
@@ -244,6 +269,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
                 try out.add(Runs.ID, item.ns, item.run);
                 try out.add(Deadlines.ID, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run));
                 try out.add(Ready.ID, item.ns, readyKey(&b, item.action, stamp, item.run));
+                if (item.request_key) |k| try out.add(Requests.ID, item.ns, requestKey(&rb, item.holder, k));
             }
         },
         else => {},
@@ -304,6 +330,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .failures = 0,
                 .max_attempts = def.v.max_attempts,
                 .holder = "",
+                .request_key = null,
                 .token = .{ .term = 0, .index = 0 },
                 .lease_ms = 0,
                 .delivered_ns = 0,
@@ -333,6 +360,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             run.v.status = .leased;
             run.v.deliveries +|= 1;
             run.v.holder = p.holder;
+            run.v.request_key = p.request_key;
             run.v.token = .{ .term = e.header.term, .index = e.header.index };
             run.v.lease_ms = p.lease_ms;
             run.v.delivered_ns = stamp;
@@ -341,22 +369,32 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (run.v.started_ns == 0) run.v.started_ns = stamp;
             try view.put(Runs, rk, run);
             try putDeadline(view, p.ns, p.run, run.v);
+            if (p.request_key) |k| {
+                var rb: ReqBuf = undefined;
+                try view.put(Requests, try nsKey(view, p.ns, requestKey(&rb, p.holder, k)), .{ .v = .{ .run = p.run, .term = e.header.term, .index = e.header.index } });
+            }
             out.putInt(u32, run.v.deliveries);
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return error.Halt;
             const rk = try nsKey(view, p.ns, p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
-            if (!holds(run.v, p.deliveries, p.token)) {
-                // A resend of the settle that applied answers as it did.
-                if (sameDelivery(run.v, p.deliveries, p.token) and run.v.ended == .settled) return;
-                return stale(out, run.v, p.deliveries, p.token);
+            if (!holds(run.v, p.holder, p.deliveries, p.token)) {
+                // A resend of the settle that applied answers as it did; a
+                // second with another result is told the run has one.
+                if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == .settled) {
+                    if (std.mem.eql(u8, run.v.outcome, p.outcome) and std.mem.eql(u8, run.v.result, p.result)) return;
+                    return out.refuse(.conflict, .stale_report, OTHER_RESULT);
+                }
+                return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
             try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
+            try dropRequest(view, p.ns, p.holder, p.request_key, p.run);
             run.v.status = .completed;
             run.v.ended = .settled;
             run.v.outcome = p.outcome;
             run.v.result = p.result;
+            run.v.@"error" = "";
             run.v.completed_ns = stamp;
             try view.put(Runs, rk, run);
         },
@@ -364,12 +402,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return error.Halt;
             const rk = try nsKey(view, p.ns, p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
-            if (!holds(run.v, p.deliveries, p.token)) {
+            if (!holds(run.v, p.holder, p.deliveries, p.token)) {
                 const ended: Ended = if (p.abandoned) .abandoned else .released;
-                if (sameDelivery(run.v, p.deliveries, p.token) and run.v.ended == ended) return;
-                return stale(out, run.v, p.deliveries, p.token);
+                if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == ended) return;
+                return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
             try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
+            try dropRequest(view, p.ns, p.holder, p.request_key, p.run);
             run.v.@"error" = p.@"error";
             if (p.abandoned) {
                 run.v.ended = .abandoned;
@@ -388,7 +427,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
             const rk = try nsKey(view, p.ns, p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
-            if (!holds(run.v, run.v.deliveries, p.token)) return stale(out, run.v, run.v.deliveries, p.token);
+            if (!holds(run.v, p.holder, run.v.deliveries, p.token)) return stale(out, run.v, p.holder, run.v.deliveries, p.token);
             if (p.lease_ms != run.v.lease_ms or p.held_since_ns != run.v.delivered_ns) return out.refuse(.bad_request, .unclassified, NOT_ITS_LEASE);
             // More than half the lease left, or held to the ceiling: the
             // lease stands, and nothing is written.
@@ -430,6 +469,7 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run)));
     if (!live) return false;
     var run = found.?;
+    try dropRequest(view, item.ns, item.holder, item.request_key, item.run);
     run.v.ended = .expired;
     run.v.failures +|= 1;
     run.v.@"error" = "lease expired";
@@ -469,26 +509,42 @@ fn dropDeadline(view: *View, ns: []const u8, run_id: []const u8, run: Run.Value,
     try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, seen, ns, run_id)));
 }
 
-/// Whether the report's delivery is the run's live one.
-fn holds(run: Run.Value, deliveries: u32, token: ae.Token.Value) bool {
-    return run.status == .leased and sameDelivery(run, deliveries, token);
+pub const OTHER_RESULT = "stale report: the run was completed with another result";
+
+/// Whether the report's delivery is the run's live one, reported by its
+/// holder.
+fn holds(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
+    return run.status == .leased and sameDelivery(run, holder, deliveries, token);
 }
 
-fn sameDelivery(run: Run.Value, deliveries: u32, token: ae.Token.Value) bool {
-    return run.deliveries == deliveries and run.token.term == token.term and run.token.index == token.index;
+fn sameDelivery(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
+    return run.deliveries == deliveries and run.token.term == token.term and run.token.index == token.index and std.mem.eql(u8, run.holder, holder);
 }
 
-/// A report for a delivery that has moved on, said by what happened.
-fn stale(out: *Result, run: Run.Value, deliveries: u32, token: ae.Token.Value) void {
-    const why = if (!sameDelivery(run, deliveries, token))
-        "stale report: the run was delivered again since"
-    else switch (run.ended) {
+/// A report for a delivery that has moved on, or from a worker that
+/// doesn't hold it, said by what happened.
+fn stale(out: *Result, run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) void {
+    out.refuse(.conflict, .stale_report, staleWhy(run, holder, deliveries, token));
+}
+
+pub fn staleWhy(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) []const u8 {
+    if (run.deliveries != deliveries or run.token.term != token.term or run.token.index != token.index) return "stale report: the run was delivered again since";
+    if (!std.mem.eql(u8, run.holder, holder)) return "stale report: another worker holds this delivery";
+    return switch (run.ended) {
         .expired => "stale report: the lease expired and the run moved on",
         .settled => "stale report: the run was completed",
         .released, .abandoned => "stale report: the run was released",
         .none => "stale report: the run isn't held",
     };
-    out.refuse(.conflict, .stale_report, why);
+}
+
+/// A delivery's request record goes with it, if it still names the run.
+fn dropRequest(view: *View, ns: []const u8, holder: []const u8, request_key: ?[]const u8, run_id: []const u8) ApplyError!void {
+    const k = request_key orelse return;
+    var rb: ReqBuf = undefined;
+    const key = try nsKey(view, ns, requestKey(&rb, holder, k));
+    const got = (try view.get(Requests, key)) orelse return;
+    if (std.mem.eql(u8, got.v.run, run_id)) try view.delete(Requests, key);
 }
 
 /// `k` in `ns`, as a family stores it, in the entry's scratch.
@@ -501,7 +557,7 @@ fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
     .entry_types = &.{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire },
-    .families = &.{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(Ready), machine_mod.info(Deadlines) },
+    .families = &.{ machine_mod.info(Defs), machine_mod.info(Runs), machine_mod.info(Ready), machine_mod.info(Deadlines), machine_mod.info(Requests) },
     .keys = keys,
     .apply = apply,
 };
@@ -566,9 +622,9 @@ pub const TestActions = struct {
     }
 
     /// Every family's checksum: equal before and after means nothing changed.
-    pub fn sums(self: *TestActions) [4]u64 {
-        var out: [4]u64 = undefined;
-        inline for (.{ Defs, Runs, Ready, Deadlines }, 0..) |F, i| out[i] = store_mod.checksum(&self.store, F.ID);
+    pub fn sums(self: *TestActions) [5]u64 {
+        var out: [5]u64 = undefined;
+        inline for (.{ Defs, Runs, Ready, Deadlines, Requests }, 0..) |F, i| out[i] = store_mod.checksum(&self.store, F.ID);
         return out;
     }
 
@@ -591,7 +647,7 @@ pub const TestActions = struct {
             if (k.expiry_ns > stamp) break;
             const d = try Stored(Deadline).decode(rec.value);
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.action, .run = k.run, .expiry_ns = k.expiry_ns }));
+            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.action, .run = k.run, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
             n += 1;
         }
         if (n == 0) return;
@@ -636,17 +692,17 @@ fn deliver(t: *TestActions, run_id: []const u8, due: u64, stamp: u64) !Result {
 /// A settle of the run's live delivery, as its leader would propose it.
 fn settleOf(t: *TestActions, run_id: []const u8) ae.Settle.Value {
     const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .outcome = "", .result = "done" };
+    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .outcome = "", .result = "done" };
 }
 
 fn releaseOf(t: *TestActions, run_id: []const u8, abandoned: bool) ae.Release.Value {
     const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .abandoned = abandoned, .retry = true, .delay_ms = 5, .@"error" = "boom" };
+    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .abandoned = abandoned, .retry = true, .delay_ms = 5, .@"error" = "boom" };
 }
 
 fn extendOf(t: *TestActions, run_id: []const u8) ae.Extend.Value {
     const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
+    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
 }
 
 /// An expire of `item` alone.
@@ -655,7 +711,7 @@ fn expiring(buf: []u8, item: ae.ExpireItem.Value) !ae.Expire.Value {
 }
 
 fn keyOf(run_id: []const u8, expiry_ns: u64) ae.ExpireItem.Value {
-    return .{ .ns = "default", .action = "send", .run = run_id, .expiry_ns = expiry_ns };
+    return .{ .ns = "default", .action = "send", .run = run_id, .expiry_ns = expiry_ns, .holder = "w1", .request_key = null };
 }
 
 test "actions machine: a run is delivered once, settled by its holder, and a resent settle answers as it did" {
@@ -755,7 +811,7 @@ test "actions machine: failures count to max_attempts; an abandoned delivery cou
         try testing.expectEqual(before, t.sums());
         // A settle or the other kind of release for that delivery is
         // refused: it ended otherwise.
-        const settle: ae.Settle.Value = .{ .ns = "default", .action = "send", .run = "r1", .deliveries = rel.deliveries, .token = rel.token, .expiry_ns = rel.expiry_ns, .outcome = "", .result = "" };
+        const settle: ae.Settle.Value = .{ .ns = "default", .action = "send", .run = "r1", .holder = rel.holder, .request_key = null, .deliveries = rel.deliveries, .token = rel.token, .expiry_ns = rel.expiry_ns, .outcome = "", .result = "" };
         try testing.expectEqualStrings("stale report: the run was released", (try t.apply(.action_settle, settle, stamp + 2 * ms)).refused().?.refusal.message);
         var other = rel;
         other.abandoned = !abandon;
@@ -961,4 +1017,54 @@ test "actions machine: one log replayed onto another store leaves the same state
     defer b.deinit();
     try a.replayInto(&b);
     try testing.expectEqual(a.sums(), b.sums());
+}
+
+test "actions machine: a report from a worker that doesn't hold the delivery is refused, and a second settle with another result is told the run has one" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
+    const before = t.sums();
+    var other = settleOf(&t, "r1");
+    other.holder = "w2";
+    try testing.expectEqualStrings("stale report: another worker holds this delivery", (try t.apply(.action_settle, other, 30 * ms)).refused().?.refusal.message);
+    var ext = extendOf(&t, "r1");
+    ext.holder = "w2";
+    try testing.expect((try t.apply(.action_extend, ext, 30 * ms)).refused() != null);
+    try testing.expectEqual(before, t.sums());
+
+    const settle = settleOf(&t, "r1");
+    try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
+    var second = settle;
+    second.result = "other";
+    try testing.expectEqualStrings(OTHER_RESULT, (try t.apply(.action_settle, second, 31 * ms)).refused().?.refusal.message);
+    try testing.expectEqualStrings("done", t.run("default", "r1").?.result);
+}
+
+test "actions machine: a delivery's request key is recorded at its deliver and goes when it settles, releases or expires" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    var ibuf: [ae.ExpireItem.max_size]u8 = undefined;
+    try register(&t, 3);
+    try invoke(&t, "r1", 10 * ms);
+    try invoke(&t, "r2", 10 * ms);
+    try invoke(&t, "r3", 10 * ms);
+    for ([_][]const u8{ "r1", "r2", "r3" }, [_][]const u8{ "k1", "k2", "k3" }) |id, k| {
+        const r = try t.apply(.action_deliver, ae.Deliver.Value{ .ns = "default", .action = "send", .run = id, .due_ns = 10 * ms, .holder = "w1", .request_key = k, .lease_ms = LEASE_MS }, 20 * ms);
+        try testing.expect(r.refused() == null);
+    }
+    try testing.expectEqual(@as(usize, 3), t.count(Requests));
+    var s = settleOf(&t, "r1");
+    s.request_key = "k1";
+    _ = try t.apply(.action_settle, s, 30 * ms);
+    var rel = releaseOf(&t, "r2", false);
+    rel.request_key = "k2";
+    _ = try t.apply(.action_release, rel, 30 * ms);
+    try testing.expectEqual(@as(usize, 1), t.count(Requests));
+    const expiry = t.run("default", "r3").?.expiry_ns;
+    var item = keyOf("r3", expiry);
+    item.request_key = "k3";
+    _ = try t.apply(.action_expire, try expiring(&ibuf, item), expiry);
+    try testing.expectEqual(@as(usize, 0), t.count(Requests));
 }
