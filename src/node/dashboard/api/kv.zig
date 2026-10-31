@@ -101,10 +101,14 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
     var scanned = reader.call(kv_ops.op("kv.scan"), namespace, prefix, .{ .limit = @max(limit, 1), .cursor = cursor }) catch |err|
         return try readFailed(allocator, "KV scan", err);
     defer scanned.deinit();
-    if (scanned.isError()) return try h.jsonError(allocator, scanned.errorMessage());
+    if (scanned.isError() and !scanned.isNotFound()) return try h.jsonError(allocator, scanned.errorMessage());
     var diag: schema.Diagnostic = .{};
-    const page = kv_ops.op("kv.scan").response.decodeAll(scanned.data, &diag) catch
-        return try h.jsonError(allocator, "KV scan: malformed answer");
+    // A namespace never created holds no keys.
+    const page: kv_ops.op("kv.scan").response.Value = if (scanned.isNotFound())
+        .{ .names = .{ .bytes = "", .count = 0 }, .cursor = null }
+    else
+        kv_ops.op("kv.scan").response.decodeAll(scanned.data, &diag) catch
+            return try h.jsonError(allocator, "KV scan: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();

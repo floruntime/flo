@@ -72,6 +72,11 @@ pub const Reader = struct {
         while (pages.more) {
             var got = try asker.ask(try self.next(), pages.cursor);
             defer got.deinit();
+            // A namespace never created: nothing in it.
+            if (got.isNotFound()) {
+                pages.more = false;
+                break;
+            }
             if (got.isError()) return error.Refused;
             // An empty list answers with a count of 0, never no body.
             try pages.take(got.data, std.math.maxInt(u32));
@@ -109,6 +114,10 @@ pub fn connect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Client 
     const endpoint = try ctx.clientEndpoint(&ep_buf);
     var client = client_mod.Client.init(allocator, endpoint);
     errdefer client.deinit();
+    // A namespace never created holds nothing to show: its lists are empty
+    // and its items not found, as in one that exists and is empty (the
+    // console opens on "production" before anything is in it).
+    client.no_namespace_as_not_found = true;
     try client.connect();
     return client;
 }

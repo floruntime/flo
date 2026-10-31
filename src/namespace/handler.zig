@@ -280,6 +280,9 @@ pub const NamespaceHandler = struct {
     pub const IDS_USED_UP_MESSAGE = "namespace not created: this node has no namespace id left";
     /// Shard 0's leader hasn't applied what earlier leaders committed, so
     /// it can't yet choose an id or count the room.
+    pub const PUBLISHED_NOT_READY = "unavailable: this node isn't a leader that has caught up, so it can't say which namespaces exist; the read was not run — retry";
+    /// A read waiting on a create that didn't end in one: it ran nothing.
+    const READ_UNSETTLED = "unavailable: the namespace's create didn't settle in time; the read was not run — retry";
     pub const CATCHING_UP_MESSAGE = "unavailable: a new leader is catching up; the namespace wasn't created — retry";
     pub const FLUSH_MESSAGE = "unavailable: the namespace isn't on disk yet; it may still be created — retry";
 
@@ -289,7 +292,7 @@ pub const NamespaceHandler = struct {
     /// made it (ok); `joined` asked to create a name another request was
     /// already creating (conflict once it exists, or that create's refusal);
     /// `ensure` wants the id.
-    pub const WaiterKind = enum { create, joined, ensure };
+    pub const WaiterKind = enum { create, joined, ensure, published };
     const Waiter = struct {
         /// Owned.
         name: []const u8,
@@ -552,6 +555,7 @@ pub const NamespaceHandler = struct {
     const ListResponse = namespace_ops.op("namespace.list").response;
     const InfoResponse = namespace_ops.op("namespace.info").response;
     const EnsureResponse = namespace_ops.op("namespace.ensure").response;
+    const PublishedResponse = namespace_ops.op("namespace.published").response;
     const Empty = namespace_ops.op("namespace.create").response;
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -561,6 +565,7 @@ pub const NamespaceHandler = struct {
             .{ "namespace.list", OpCode.namespace_list, runList },
             .{ "namespace.info", OpCode.namespace_info, runInfo },
             .{ "namespace.ensure", OpCode.namespace_ensure, runEnsure },
+            .{ "namespace.published", OpCode.namespace_published, runPublished },
         }) |o| {
             comptime std.debug.assert(namespace_ops.op(o[0]).route == .shard0);
             dispatcher.register(o[1], table_run.handler(o[0], NamespaceHandler, o[2]));
@@ -625,6 +630,30 @@ pub const NamespaceHandler = struct {
             .refused => |r| .{ .refused = r },
             else => .wait,
         };
+    }
+
+    /// namespace.published: how far this node's table is published, for a
+    /// shard or follower that doesn't know the name asked about. It waits
+    /// for its own table to reach this index, then resolves the name itself.
+    /// A create of the name applied here or under way is answered once it
+    /// is published, so the asker finds it.
+    fn runPublished(shard: *Shard, conn: *Connection, req: Request) Error!table_run.Outcome(PublishedResponse) {
+        const self = shard.namespace_handler;
+        // Only a ready leader's table has every create acknowledged: a
+        // deposed node's is behind, and a new leader's may not have applied
+        // its predecessor's yet.
+        if (!shard.raft_node.leaderReady()) return .{ .refused = .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = PUBLISHED_NOT_READY } } };
+        const name = req.key;
+        const unpublished = self.table.lookup(name) == null and (self.namespaces.contains(name) or self.pending_creates.contains(name));
+        if (!unpublished) return .{ .answer = .{ .published_index = self.table.publishedIndex() } };
+        try self.addWaiter(name, .published, conn.replyTo(), req.header.request_id);
+        return .wait;
+    }
+
+    /// Whether this shard has a create of `name` applied or under way that
+    /// the table doesn't show yet: shard 0 only.
+    pub fn creating(self: *const NamespaceHandler, name: []const u8) bool {
+        return self.owner and (self.namespaces.contains(name) or self.pending_creates.contains(name));
     }
 
     /// Shard 0: a published name answers now; a known or pending one waits
@@ -754,7 +783,10 @@ pub const NamespaceHandler = struct {
             }
             _ = self.waiters.swapRemove(i);
             defer self.freeWaiter(w);
-            shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = FLUSH_MESSAGE });
+            if (w.kind == .published)
+                shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
+            else
+                shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .unclassified, .ran = .unknown, .message = FLUSH_MESSAGE });
         }
     }
 
@@ -777,8 +809,16 @@ pub const NamespaceHandler = struct {
             _ = self.waiters.swapRemove(i);
             defer self.freeWaiter(w);
             switch (how) {
-                .refused => |r| shard.deliverDeferredRefusal(w.reply_to, w.request_id, r.status, proto.notRun(r.message)),
-                .stopped_leading => shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: lost leadership before the namespace was created; it may still be — retry" }),
+                // A read waiting on the create: refused, there is no
+                // namespace; unsettled, it ran nothing either way.
+                .refused => |r| if (w.kind == .published)
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .no_namespace, .{ .reason = .not_found, .ran = .no, .message = "namespace not found" })
+                else
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, r.status, proto.notRun(r.message)),
+                .stopped_leading => if (w.kind == .published)
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(READ_UNSETTLED))
+                else
+                    shard.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: lost leadership before the namespace was created; it may still be — retry" }),
                 .published => switch (w.kind) {
                     .create => {
                         var buf: [@sizeOf(proto.ResponseHeader) + Empty.max_size]u8 = undefined;
@@ -792,6 +832,10 @@ pub const NamespaceHandler = struct {
                         var buf: [@sizeOf(proto.ResponseHeader) + EnsureResponse.max_size]u8 = undefined;
                         const v: EnsureResponse.Value = .{ .id = self.table.lookup(name).?, .published_index = self.table.publishedIndex() };
                         shard.deliverDeferred(w.reply_to, table_run.encodeAnswer(EnsureResponse, &buf, w.request_id, v).?);
+                    },
+                    .published => {
+                        var buf: [@sizeOf(proto.ResponseHeader) + PublishedResponse.max_size]u8 = undefined;
+                        shard.deliverDeferred(w.reply_to, table_run.encodeAnswer(PublishedResponse, &buf, w.request_id, .{ .published_index = self.table.publishedIndex() }).?);
                     },
                 },
             }
@@ -968,11 +1012,11 @@ test "namespace handler: every namespace op is registered, routed to shard 0, an
     var dispatcher = Dispatcher.init();
     NamespaceHandler.register(&dispatcher);
     const req: Request = .{ .header = proto.RequestHeader.init(.namespace_list, 1), .namespace = "", .key = "", .value = "", .options = "" };
-    for ([_]OpCode{ .namespace_create, .namespace_delete, .namespace_list, .namespace_info, .namespace_ensure }) |op| {
+    for ([_]OpCode{ .namespace_create, .namespace_delete, .namespace_list, .namespace_info, .namespace_ensure, .namespace_published }) |op| {
         try testing.expect(dispatcher.hasHandler(op));
         try testing.expectEqual(@as(?u16, 0), dispatcher.shard_route[@backingInt(op)].?(req));
     }
-    try testing.expectEqual(@as(u16, 5), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 6), dispatcher.handler_count);
     for ([_]u16{ 0x014, 0x015 }) |retired| try testing.expect(std.enums.tagName(OpCode, @fromBackingInt(retired)) == null);
 }
 

@@ -50,6 +50,7 @@ const InboxMessage = @import("inbox.zig").Message;
 const dispatcher_mod = @import("dispatcher.zig");
 const run_mod = @import("run.zig");
 const table_run = @import("table_run.zig");
+const ops = @import("../protocol/ops.zig");
 const table = @import("../protocol/table.zig");
 const schema = @import("../protocol/schema.zig");
 const kv_ops = @import("../protocol/kv_ops.zig");
@@ -92,6 +93,7 @@ const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
 const handler_mod = @import("../namespace/handler.zig");
+const edge_mod = @import("edge.zig");
 const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
@@ -434,6 +436,9 @@ pub const Shard = struct {
     /// applied what the leader committed, so the client reads its write.
     forwards: []Forward,
     forward_count: u32,
+    /// Reads of a namespace this follower's table doesn't have yet, held
+    /// while it asks the leader (`edgeMiss`).
+    edge: edge_mod.Edge = .{},
     /// Of those, blocking reads, which may wait there for minutes: they hold
     /// at most FORWARD_SLOTS - FORWARD_WRITE_RESERVE slots, so writes always
     /// find one.
@@ -1299,7 +1304,9 @@ pub const Shard = struct {
         for (self.forwards) |*f| if (f.active) {
             self.allocator.free(f.bytes);
             if (f.reply) |r| self.allocator.free(r);
+            if (f.ask) |a| self.allocator.free(a);
         };
+        self.edge.deinit(self.allocator);
         self.allocator.free(self.forwards);
         self.allocator.free(self.pending);
         self.respond_proxy.deinit();
@@ -1407,6 +1414,9 @@ pub const Shard = struct {
         if (self.forward_count > 0) {
             if (self.connections.get(fd)) |conn| self.dropForwardsFor(fd, conn.id);
         }
+        if (self.edge.count > 0) {
+            if (self.connections.get(fd)) |conn| self.dropEdgeFor(fd, conn.id);
+        }
         if (self.connections.get(fd)) |conn| {
             if (conn.blocking_in_flight > 0) self.releaseForwardsFor(conn);
         }
@@ -1491,6 +1501,9 @@ pub const Shard = struct {
                 return;
             }
         }
+        // A read of a namespace no one created finds none; a client's read
+        // is resolved here, once, before it goes anywhere.
+        if ((origin == .client or origin == .admin) and self.edgeMiss(conn, req, origin)) return;
 
         switch (origin) {
             .client, .admin => self.route(conn, req, auth),
@@ -1498,10 +1511,10 @@ pub const Shard = struct {
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
                 answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
-            else if (requestWrites(req))
+            else if (requestWrites(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published))
                 self.dispatchLocal(conn, req, auth)
             else
-                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes are forwarded to a leader")),
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, and a follower's ask about the namespaces, are forwarded to a leader")),
         }
     }
 
@@ -2861,7 +2874,8 @@ pub const Shard = struct {
         // yet, and the leader resolves it), and its table's published index.
         std.mem.writeInt(u16, buf[4..6], FORWARD_FIELDS, .little);
         const req_ns = if (proto.Request.parse(f.bytes)) |r| r.namespace else |_| "";
-        const ns_id = self.namespace_handler.table.lookup(if (req_ns.len == 0) "default" else req_ns) orelse 0;
+        // An ask names no namespace of its own.
+        const ns_id = if (f.ask != null) 0 else self.namespace_handler.table.lookup(if (req_ns.len == 0) "default" else req_ns) orelse 0;
         std.mem.writeInt(u32, buf[FORWARD_PREFIX..][0..4], ns_id, .little);
         std.mem.writeInt(u64, buf[FORWARD_PREFIX + 4 ..][0..8], self.namespace_handler.table.publishedIndex(), .little);
         @memcpy(buf[body_at..][0..f.bytes.len], f.bytes);
@@ -2913,7 +2927,13 @@ pub const Shard = struct {
                 continue;
             }
             if (leader == self.cluster_node_id) {
-                self.runHeldLocally(f);
+                // This node leads now: its own table is the one to wait for.
+                if (f.ask) |name| {
+                    // Not before it has applied every earlier leader's creates.
+                    if (!raft.leaderReady()) continue;
+                    self.edge.answered(name, self.namespace_handler.table.publishedIndex(), now);
+                    self.dropForward(f);
+                } else self.runHeldLocally(f);
                 continue;
             }
             if (leader != 0) {
@@ -2922,7 +2942,8 @@ pub const Shard = struct {
             }
             // Never sent: it can't have run.
             if (now >= f.deadline_ms) {
-                self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, proto.notRun(if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry"));
+                const why = proto.notRun(if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry");
+                if (f.ask) |name| self.failAsk(name, .unavailable, why) else self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, why);
                 self.dropForward(f);
             }
         }
@@ -2938,8 +2959,13 @@ pub const Shard = struct {
         const request_id = f.request_id;
         self.dropForward(f);
         defer self.allocator.free(bytes);
+        self.runHeld(bytes, reply_to, request_id);
+    }
+
+    /// A held request, run here as the client's own.
+    fn runHeld(self: *Shard, bytes: []const u8, reply_to: ReplyTo, request_id: u64) void {
         const req = proto.Request.parse(bytes) catch {
-            self.deliverDeferredRefusal(reply_to, request_id, .internal_error, proto.notRun("internal error: the held write did not parse and was not written — retry"));
+            self.deliverDeferredRefusal(reply_to, request_id, .internal_error, proto.notRun("internal error: the held request did not parse and was not run — retry"));
             return;
         };
         const proxy = self.respond_proxy;
@@ -2956,6 +2982,235 @@ pub const Shard = struct {
         }
     }
 
+    // ─── The edge: a namespace this node doesn't know ────────────────────
+
+    const NO_NAMESPACE: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" };
+    const NO_NAMESPACE_YET: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found; one created a moment ago through another node can take up to 100 ms to be seen here — retry" };
+    /// The node never looked, so this isn't no_namespace: a client may take
+    /// that as final for a namespace that exists.
+    pub const EDGE_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: this node doesn't know the namespace yet and is already asking the leader about 64 others; the request was not run — retry" };
+    const ASK_FAILED = "unavailable: this node could not ask the leader about this namespace; the request was not run — retry";
+
+    /// Whether `op` runs within a namespace: every op but the node's own
+    /// (system, namespace, cluster) and those another shard sends.
+    fn namespaced(op: u16) bool {
+        return op > ops.Family.range(.cluster).hi and !table.isInternal(op) and !table.serverScoped(op);
+    }
+
+    /// A read in a namespace this node's table doesn't have. The table
+    /// shows a create once shard 0 has published it, which is after a write
+    /// that created it implicitly may have been answered; so:
+    /// - shard 0 knows its own creates, applied or under way;
+    /// - another shard asks shard 0 (`namespace.published`, a gather), which
+    ///   answers once a create of the name it holds is published, and then
+    ///   looks again (`EdgeAsk`);
+    /// - on one node, or the leader, shard 0 has every create there is, so a
+    ///   name it doesn't hold is none;
+    /// - a follower's shard 0 may be behind: it holds the read and asks the
+    ///   leader how far its table is published, waits for its own to get
+    ///   there, and looks again.
+    /// A write creates its namespace, so it goes on. True when the request is
+    /// answered or held.
+    ///
+    /// A shard other than 0 never asks the leader: a cluster member runs one
+    /// shard, so it has none, and on one node shard 0 holds every create.
+    fn edgeMiss(self: *Shard, conn: *Connection, req: proto.Request, origin: run_mod.Origin) bool {
+        if (!namespaced(req.header.op_code) or requestWrites(req)) return false;
+        const name = if (req.namespace.len == 0) "default" else req.namespace;
+        const nh = self.namespace_handler;
+        if (nh.table.lookup(name) != null) return false;
+        if (self.id != 0) {
+            self.askShard0(conn, req, name, origin);
+            return true;
+        }
+        if (nh.creating(name)) return false;
+        if (self.raft_network == null or self.raft_node.role == .leader) {
+            // A new leader may not have applied its predecessor's creates.
+            if (!self.raft_node.leaderReady()) self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(handler_mod.NamespaceHandler.PUBLISHED_NOT_READY)) else self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
+            return true;
+        }
+        const now = nowMs();
+        if (self.edge.missed(name, now)) {
+            self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE_YET);
+            return true;
+        }
+        self.holdAtEdge(conn, req, name, origin, now);
+        return true;
+    }
+
+    /// A read held on a shard other than 0 while shard 0 answers whether
+    /// its namespace is created: one gather each, so however it ends the
+    /// client is answered once.
+    const EdgeAsk = struct {
+        /// The request, serialized, and where it came from.
+        bytes: []u8,
+        origin: run_mod.Origin,
+
+        const op: gather_mod.Op = .{ .merge = merge, .deinit = free };
+
+        fn free(state: *anyopaque, allocator: std.mem.Allocator) void {
+            const self: *EdgeAsk = @ptrCast(@alignCast(state));
+            allocator.free(self.bytes);
+            allocator.destroy(self);
+        }
+
+        /// Shard 0 answered after any create of the name it held was
+        /// published, so the table now has the namespace if it exists.
+        fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
+            const self: *EdgeAsk = @ptrCast(@alignCast(state));
+            var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+            _ = try table_run.op("namespace.published").response.decodeAll(bodies[0], &diag);
+            const req = try proto.Request.parse(self.bytes);
+            const name = if (req.namespace.len == 0) "default" else req.namespace;
+            if (shard.namespace_handler.table.lookup(name) == null)
+                return shard.sendRefusal(conn, request_id, .no_namespace, NO_NAMESPACE);
+            shard.runRequest(conn, req, self.origin);
+        }
+    };
+
+    fn askShard0(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin) void {
+        const id = req.header.request_id;
+        const state = self.allocator.create(EdgeAsk) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        const bytes = serializeRequest(self.allocator, req) catch {
+            self.allocator.destroy(state);
+            return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
+        };
+        state.* = .{ .bytes = bytes, .origin = origin };
+        const parts = [_]gather_mod.Part{.{ .owner = 0, .op = @backingInt(proto.OpCode.namespace_published), .key = name, .body = "" }};
+        self.startGather(conn, req, &parts, &EdgeAsk.op, state) catch |err| return switch (err) {
+            error.GatherBusy => self.sendRefusal(conn, id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this request was not run — retry" }),
+            error.OutOfMemory => self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory")),
+        };
+        conn.response_deferred = true;
+    }
+
+    fn holdAtEdge(self: *Shard, conn: *Connection, req: proto.Request, name: []const u8, origin: run_mod.Origin, now: u64) void {
+        if (conn.forwards_in_flight >= Connection.MAX_FORWARDS_IN_FLIGHT) return self.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests on this connection are waiting; this request was not run — back off and retry" });
+        const w = self.edge.free() orelse return self.sendRefusal(conn, req.header.request_id, .overloaded, EDGE_FULL);
+        const bytes = serializeRequest(self.allocator, req) catch return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
+        const owned = self.allocator.dupe(u8, name) catch {
+            self.allocator.free(bytes);
+            return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun("internal error: out of memory"));
+        };
+        const index = self.edge.knownIndex(name);
+        const asked = index != null or self.askingAbout(name);
+        w.* = .{ .active = true, .reply_to = conn.replyTo(), .origin = origin, .request_id = req.header.request_id, .bytes = bytes, .name = owned, .index = index, .deadline_ms = now + edge_mod.WAIT_MS };
+        self.edge.count += 1;
+        // One of the connection's requests waiting elsewhere, as a gather's.
+        conn.forwards_in_flight += 1;
+        // Held, the read lets the connection's later requests run first, as a
+        // blocking read does: a write sent after it may apply before it runs,
+        // and it then sees that write.
+        conn.response_deferred = true;
+        if (!asked) self.askLeader(owned);
+    }
+
+    fn askingAbout(self: *const Shard, name: []const u8) bool {
+        for (self.forwards) |*f| if (f.active) if (f.ask) |a| if (std.mem.eql(u8, a, name)) return true;
+        return false;
+    }
+
+    /// Ask the leader how far its namespaces are published, over the
+    /// forward path as a write would go: one ask a name, whatever reads of
+    /// it are held. Asks are at most edge_mod.WAITS (one a held name) of
+    /// FORWARD_SLOTS, so they never reach the slots kept for writes.
+    fn askLeader(self: *Shard, name: []const u8) void {
+        const slot = for (self.forwards) |*f| {
+            if (!f.active) break f;
+        } else return self.failAsk(name, .overloaded, proto.notRun("overloaded: too many requests waiting for the leader; this one was not run — retry"));
+        const ask = self.allocator.dupe(u8, name) catch return self.failAsk(name, .internal_error, proto.notRun("internal error: out of memory"));
+        const id = self.next_forward_id;
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(.namespace_published, id), .namespace = "", .key = name, .value = "", .options = "" };
+        const bytes = serializeRequest(self.allocator, req) catch {
+            self.allocator.free(ask);
+            return self.failAsk(name, .internal_error, proto.notRun("internal error: out of memory"));
+        };
+        // Its answer goes to the reads held for the name, never to a socket.
+        slot.* = .{ .active = true, .id = id, .reply_to = .{ .remote = .{ .node = 0, .forward_id = 0 } }, .request_id = id, .bytes = bytes, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS, .ask = ask };
+        self.next_forward_id +%= 1;
+        if (self.next_forward_id == 0) self.next_forward_id = FORWARD_ID_FIRST;
+        self.forward_count += 1;
+        self.sendForward(slot);
+    }
+
+    fn takeAskAnswer(self: *Shard, name: []const u8, resp: proto.Response) void {
+        if (resp.header.status != @backingInt(proto.StatusCode.ok)) return self.failAsk(name, .unavailable, proto.notRun(ASK_FAILED));
+        const Published = table_run.op("namespace.published").response;
+        var diag: @import("../protocol/schema.zig").Diagnostic = .{};
+        const v = Published.decodeAll(resp.data, &diag) catch return self.failAsk(name, .unavailable, proto.notRun(ASK_FAILED));
+        self.edge.answered(name, v.published_index, nowMs());
+    }
+
+    /// Every read of `name` still waiting for the leader is answered so.
+    fn failAsk(self: *Shard, name: []const u8, status: proto.StatusCode, why: proto.Refusal) void {
+        for (&self.edge.waits) |*w| if (w.active and w.index == null and std.mem.eql(u8, w.name, name)) {
+            self.deliverDeferredRefusal(w.reply_to, w.request_id, status, why);
+            self.endEdgeWait(w);
+        };
+    }
+
+    /// Held reads whose wait is over: this node's table reached the
+    /// leader's index, so the name is resolved here, or the wait ran out.
+    fn sweepEdge(self: *Shard, now: u64) void {
+        const t = self.namespace_handler.table;
+        for (&self.edge.waits) |*w| {
+            if (!w.active) continue;
+            if (w.index) |index| if (t.publishedIndex() >= index) {
+                self.resolveAtEdge(w, now);
+                continue;
+            };
+            if (now >= w.deadline_ms) {
+                self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun("unavailable: this node hasn't caught up with the leader's namespaces yet; the request was not run — retry"));
+                self.endEdgeWait(w);
+            }
+        }
+    }
+
+    fn resolveAtEdge(self: *Shard, w: *edge_mod.Wait, now: u64) void {
+        if (self.namespace_handler.table.lookup(w.name) == null) {
+            self.edge.noteMissing(self.allocator, w.name, now);
+            self.deliverDeferredRefusal(w.reply_to, w.request_id, .no_namespace, NO_NAMESPACE_YET);
+            self.endEdgeWait(w);
+            return;
+        }
+        const bytes = w.bytes;
+        w.bytes = &.{};
+        const reply_to = w.reply_to;
+        const origin = w.origin;
+        self.endEdgeWait(w);
+        defer self.allocator.free(bytes);
+        // Run as the client's own request, now that its namespace resolves.
+        // Only a client's or the admin socket's request is held here.
+        const s = switch (reply_to) {
+            .socket => |sock| sock,
+            .remote => return,
+        };
+        const conn = self.getConnection(s.fd) orelse return;
+        if (conn.id != s.conn_id) return;
+        const req = proto.Request.parse(bytes) catch unreachable; // serialized here
+        self.runRequest(conn, req, origin);
+        // Run from the tick, not from reading the client: nothing else
+        // sends what it answered.
+        self.flushToClient(conn.fd);
+    }
+
+    /// A held read is over: its connection has one fewer request waiting.
+    fn endEdgeWait(self: *Shard, w: *edge_mod.Wait) void {
+        switch (w.reply_to) {
+            .socket => |sock| if (self.getConnection(sock.fd)) |conn| {
+                if (conn.id == sock.conn_id) conn.forwards_in_flight -|= 1;
+            },
+            .remote => {},
+        }
+        self.edge.drop(self.allocator, w);
+    }
+
+    fn dropEdgeFor(self: *Shard, fd: i32, conn_id: u32) void {
+        for (&self.edge.waits) |*w| {
+            if (w.active and w.reply_to.isSocket(@intCast(self.id), fd, conn_id)) self.endEdgeWait(w);
+        }
+    }
+
     /// The client is gone: nothing it was waiting for needs a slot.
     fn dropForwardsFor(self: *Shard, fd: i32, conn_id: u32) void {
         for (self.forwards) |*f| {
@@ -2964,12 +3219,14 @@ pub const Shard = struct {
     }
 
     fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, message: []const u8) void {
-        self.deliverDeferredError(f.reply_to, f.request_id, status, message);
+        // An ask is a read: whatever ended it, nothing ran.
+        if (f.ask) |name| self.failAsk(name, status, proto.notRun(ASK_FAILED)) else self.deliverDeferredError(f.reply_to, f.request_id, status, message);
         self.dropForward(f);
     }
 
     fn dropForward(self: *Shard, f: *Forward) void {
         self.allocator.free(f.bytes);
+        if (f.ask) |a| self.allocator.free(a);
         if (f.reply) |r| {
             self.allocator.free(r);
             self.replies_held -= 1;
@@ -3095,6 +3352,11 @@ pub const Shard = struct {
         const bytes = frame.payload[12..];
         const resp = proto.Response.parse(bytes) catch return self.replica.badFrame(frame);
         if (resp.header.request_id != f.request_id) return self.replica.badFrame(frame);
+        if (f.ask) |name| {
+            self.takeAskAnswer(name, resp);
+            self.dropForward(f);
+            return;
+        }
         if (self.raft_node.last_applied >= committed) {
             self.deliverDeferred(f.reply_to, bytes);
             self.dropForward(f);
@@ -3337,6 +3599,7 @@ pub const Shard = struct {
         if (self.raft_node.role == .leader) self.adjustMembership(now);
         if (self.joinWanted(now)) self.askToJoin(now);
         if (self.forward_count > 0) self.sweepForwards(now);
+        if (self.edge.count > 0) self.sweepEdge(now);
     }
 
     /// Stop at entry `e`, which no replica can apply: its `last_applied`
@@ -4293,8 +4556,16 @@ pub const Shard = struct {
     /// shards whose answer never came.
     fn answerAtShutdown(self: *Shard) void {
         self.resolvePending(SHUTTING_DOWN);
+        for (&self.edge.waits) |*w| if (w.active) {
+            self.deliverDeferredRefusal(w.reply_to, w.request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
+            self.endEdgeWait(w);
+        };
         for (self.forwards) |*f| {
             if (!f.active) continue;
+            if (f.ask != null) {
+                self.dropForward(f);
+                continue;
+            }
             if (f.reply) |r| {
                 // The leader answered; it was only held for this node to catch up.
                 self.deliverDeferred(f.reply_to, r);
@@ -6061,6 +6332,10 @@ const Forward = struct {
     /// The leader's answer, held until `applied_by` is applied here.
     reply: ?[]u8 = null,
     applied_by: u64 = 0,
+    /// For a follower's ask of how far the leader's namespaces are
+    /// published, the name it asks for (owned): its answer goes to the reads
+    /// held for that name (`Shard.edge`), not to a client.
+    ask: ?[]u8 = null,
 };
 const FORWARD_SLOTS: usize = 1024;
 /// Forward slots blocking reads may not take.
@@ -10959,7 +11234,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
-    try std.testing.expectEqualStrings("bad request: only writes are forwarded to a leader", (try resp.refused()).message);
+    try std.testing.expectEqualStrings("bad request: only writes, and a follower's ask about the namespaces, are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
@@ -11775,6 +12050,13 @@ test "Shard: a blocking stream read wakes on its own namespace's append, even on
     // An append's value is a batch: [count:u32]([len:u32][payload][header_count:u16])*
     const first = "\x01\x00\x00\x00" ++ "\x0c\x00\x00\x00" ++ "first-record" ++ "\x00\x00";
     const second = "\x01\x00\x00\x00" ++ "\x0d\x00\x00\x00" ++ "second-record" ++ "\x00\x00";
+    // The other namespace exists, by a write to another of its streams: a
+    // read of one never created is answered at once that it isn't.
+    shard.runRequest(conn, try ParkTest.request(.stream_append, 9, "other", "elsewhere", first, ""), .client);
+    try ParkTest.ack(&shard);
+    var created: [1]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &created);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), created[0].header.status);
     shard.runRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", first, ""), .client);
     try ParkTest.ack(&shard);
     var one: [1]proto.Response = undefined;
@@ -16037,4 +16319,362 @@ test "applyEntryCore: a KV entry delivered twice applies once" {
         try std.testing.expect(applyEntryCore(&part, &registry, &e, &out) == .applied);
     }
     try std.testing.expectEqual(@as(u64, 1), part.kv.get("k").?.version);
+}
+
+// ─── The edge ────────────────────────────────────────────────────────────
+
+/// kv.get of `key` in `namespace`, its body in `buf`.
+fn edgeGet(buf: []u8, id: u64, namespace: []const u8, key: []const u8) proto.Request {
+    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch unreachable;
+    return .{ .header = proto.RequestHeader.init(.kv_get, id), .namespace = namespace, .key = key, .value = body };
+}
+
+fn expectNoAnswer(c: TestClient, shard: *Shard) !void {
+    shard.flushToClient(c.conn.fd);
+    var out: [64]u8 = undefined;
+    try std.testing.expect(std.c.read(c.pair[1], &out, out.len) <= 0);
+}
+
+/// The asks a follower sent its leader: their forward ids, in order.
+fn edgeAsks(rn: *RaftNetwork, ids: []u32) ![]u32 {
+    var n: usize = 0;
+    for (rn.outbound.items) |o| {
+        const payload = o.frame[transport.HEADER_SIZE..];
+        const req = try proto.Request.parse(payload[FORWARD_PREFIX + FORWARD_FIELDS ..]);
+        if (req.header.op_code != @backingInt(proto.OpCode.namespace_published)) continue;
+        // An ask names no namespace id of its own.
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, payload[FORWARD_PREFIX..][0..4], .little));
+        ids[n] = std.mem.readInt(u32, payload[0..4], .little);
+        n += 1;
+    }
+    return ids[0..n];
+}
+
+/// The leader's answer to ask `id`: its table published to `index`.
+fn answerAsk(shard: *Shard, id: u32, index: u64) !void {
+    const Published = table_run.op("namespace.published").response;
+    var abuf: [@sizeOf(proto.ResponseHeader) + Published.max_size]u8 = undefined;
+    const answer = table_run.encodeAnswer(Published, &abuf, id, .{ .published_index = index }).?;
+    var buf: [12 + abuf.len]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], id, .little);
+    std.mem.writeInt(u64, buf[4..12], 0, .little);
+    @memcpy(buf[12..][0..answer.len], answer);
+    shard.takeForwardReply(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_reply, .payload = buf[0 .. 12 + answer.len] });
+}
+
+const EdgeFollower = struct {
+    t: FollowerTest,
+    c: TestClient,
+
+    fn init(f: *EdgeFollower) !void {
+        try f.t.init();
+        f.t.shard.raft_node.leader_id = 2;
+        f.t.rn.linked_ids[0].store(2, .release);
+        f.t.rn.linked_sessions[0].store(5, .release);
+        f.c = try TestClient.open(&f.t.shard);
+    }
+
+    fn deinit(f: *EdgeFollower) void {
+        for (f.t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        f.t.rn.outbound.clearRetainingCapacity();
+        _ = std.c.close(f.c.pair[1]);
+        f.t.deinit();
+    }
+};
+
+test "Shard: a lone node's read of a namespace never created is answered missing at once, and a write creates it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+
+    shard.runRequest(c.conn, edgeGet(&body, 1, "nope", "k"), .client);
+    const missing = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), missing.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try missing.refused()).ran);
+
+    // A write creates it; shard 0 counts its create known before it is
+    // published, so a read right after finds the namespace.
+    shard.runRequest(c.conn, testReq(.kv_put, 2, "nope", "k", "v", ""), .client);
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, &shard, &out)).header.status);
+    shard.runRequest(c.conn, edgeGet(&body, 3, "nope", "other"), .client);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, &shard, &out)).header.status);
+}
+
+test "Shard: a follower's reads of a namespace it doesn't know share one ask of the leader, wait for its table, and run once it gets there" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&b1, 1, "fresh", "k"), .client);
+    shard.runRequest(f.c.conn, edgeGet(&b2, 2, "fresh", "j"), .client);
+    var ids: [4]u32 = undefined;
+    const asks = try edgeAsks(&f.t.rn, &ids);
+    try std.testing.expectEqual(@as(usize, 1), asks.len);
+    try std.testing.expectEqual(@as(u32, 2), shard.edge.count);
+
+    // The leader's table is ahead: the reads wait for this one's.
+    try answerAsk(shard, asks[0], 7);
+    shard.sweepEdge(Shard.nowMs());
+    try expectNoAnswer(f.c, shard);
+    try shard.namespace_handler.table.publish(@import("../namespace/table.zig").FIRST_ALLOCATED, "fresh", 7);
+    shard.sweepEdge(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), shard.edge.count);
+    // Both ran: the namespace is there, the keys aren't.
+    // Sent from the tick, unasked: read without flushing for it.
+    var out: [1024]u8 = undefined;
+    var n: usize = 0;
+    var tries: usize = 0;
+    while (n < 2 * @sizeOf(proto.ResponseHeader) and tries < 10_000) : (tries += 1) {
+        const got = std.c.read(f.c.pair[1], out[n..].ptr, out.len - n);
+        if (got > 0) n += @intCast(got);
+    }
+    var at: usize = 0;
+    for (0..2) |_| {
+        const r = try proto.Response.parse(out[at..n]);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), r.header.status);
+        at += @sizeOf(proto.ResponseHeader) + r.data.len;
+    }
+}
+
+test "Shard: a follower's read of a namespace the leader doesn't have either is answered missing, and the name is remembered missing" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    var body: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "nope", "k"), .client);
+    var ids: [4]u32 = undefined;
+    const asks = try edgeAsks(&f.t.rn, &ids);
+    try std.testing.expectEqual(@as(usize, 1), asks.len);
+    // Its table is already where the leader's is: none such.
+    try answerAsk(shard, asks[0], shard.namespace_handler.table.publishedIndex());
+    shard.sweepEdge(Shard.nowMs());
+    var out: [512]u8 = undefined;
+    const missing = try nextAnswer(f.c, shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), missing.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try missing.refused()).message, "100 ms") != null);
+    // Asked again at once: answered without asking.
+    shard.runRequest(f.c.conn, edgeGet(&body, 2, "nope", "k"), .client);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), (try nextAnswer(f.c, shard, &out)).header.status);
+    try std.testing.expectEqual(@as(usize, 1), (try edgeAsks(&f.t.rn, &ids)).len);
+}
+
+test "Shard: a follower's held read is answered unavailable, not run, when its wait runs out; the client leaving frees it" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    var body: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "slow", "k"), .client);
+    shard.sweepEdge(Shard.nowMs() + edge_mod.WAIT_MS);
+    var out: [512]u8 = undefined;
+    const late = try nextAnswer(f.c, shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), late.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try late.refused()).ran);
+    try std.testing.expectEqual(@as(u32, 0), shard.edge.count);
+
+    shard.runRequest(f.c.conn, edgeGet(&body, 2, "slow2", "k"), .client);
+    try std.testing.expectEqual(@as(u32, 1), shard.edge.count);
+    shard.dropEdgeFor(f.c.conn.fd, f.c.conn.id);
+    try std.testing.expectEqual(@as(u32, 0), shard.edge.count);
+}
+
+test "Shard: a follower holds at most a shard's share of reads at the edge; past it, one is refused overloaded, never missing" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    // Spread over two connections, so neither reaches its own cap first.
+    const other = try TestClient.open(shard);
+    defer _ = std.c.close(other.pair[1]);
+    var body: [64]u8 = undefined;
+    var name: [16]u8 = undefined;
+    for (0..edge_mod.WAITS) |i| {
+        const c = if (i % 2 == 0) f.c else other;
+        shard.runRequest(c.conn, edgeGet(&body, i + 1, try std.fmt.bufPrint(&name, "held-{d}", .{i}), "k"), .client);
+    }
+    try std.testing.expectEqual(@as(u32, edge_mod.WAITS), shard.edge.count);
+    shard.runRequest(f.c.conn, edgeGet(&body, 999, "one-more", "k"), .client);
+    var out: [512]u8 = undefined;
+    const over = try nextAnswer(f.c, shard, &out);
+    try std.testing.expectEqual(@as(u64, 999), over.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), over.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try over.refused()).ran);
+    try std.testing.expectEqualStrings(Shard.EDGE_FULL.message, (try over.refused()).message);
+}
+
+test "Shard: a connection with as many requests waiting as it may have can't hold another read at the edge" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    f.c.conn.forwards_in_flight = Connection.MAX_FORWARDS_IN_FLIGHT;
+    var body: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "capped", "k"), .client);
+    var out: [512]u8 = undefined;
+    const over = try nextAnswer(f.c, shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), over.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try over.refused()).message, "on this connection") != null);
+    try std.testing.expectEqual(@as(u32, 0), shard.edge.count);
+}
+
+test "Shard: an ask a follower couldn't send yet waits, once this node leads, until it has caught up" {
+    var t: FollowerTest = undefined;
+    try t.init();
+    defer t.deinit();
+    defer {
+        for (t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        t.rn.outbound.clearRetainingCapacity();
+    }
+    const shard = &t.shard;
+    // A leader known but not linked: the ask stays unsent.
+    shard.raft_node.leader_id = 2;
+    const c = try TestClient.open(shard);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    shard.runRequest(c.conn, edgeGet(&body, 1, "pending", "k"), .client);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    // This node leads now, with an earlier leader's entries unapplied.
+    shard.raft_node.role = .leader;
+    shard.raft_node.leader_id = shard.cluster_node_id;
+    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
+    shard.sweepForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    try std.testing.expect(shard.edge.waits[0].index == null);
+    // Caught up: its own table is the one to wait for.
+    shard.raft_node.ready_index = shard.raft_node.last_applied;
+    shard.sweepForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    try std.testing.expect(shard.edge.waits[0].index != null);
+}
+
+test "Shard: another shard's read of a namespace shard 0 is creating waits for the create's publish, then runs" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const c0 = try TestClient.open(&two.shards[0]);
+    defer _ = std.c.close(c0.pair[1]);
+    const c1 = try TestClient.open(&two.shards[1]);
+    defer _ = std.c.close(c1.pair[1]);
+    var out: [512]u8 = undefined;
+    var body: [64]u8 = undefined;
+
+    // A write through shard 0 creates the namespace; it isn't published yet
+    // when another shard reads it.
+    two.shards[0].runRequest(c0.conn, testReq(.kv_put, 1, "fresh", "k", "v", ""), .client);
+    try std.testing.expect(two.shards[0].namespace_handler.table.lookup("fresh") == null);
+    two.shards[1].runRequest(c1.conn, edgeGet(&body, 2, "fresh", "k"), .client);
+    two.settle();
+    const got = try nextAnswer(c1, &two.shards[1], &out);
+    try std.testing.expectEqual(@as(u64, 2), got.header.request_id);
+    try std.testing.expect(got.header.status != @backingInt(proto.StatusCode.no_namespace));
+
+    // One never created is missing, asked of shard 0 all the same.
+    two.shards[1].runRequest(c1.conn, edgeGet(&body, 3, "never", "k"), .client);
+    two.settle();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), (try nextAnswer(c1, &two.shards[1], &out)).header.status);
+}
+
+test "Shard: a leader that hasn't caught up answers a read of a namespace it doesn't hold unavailable, and refuses to say how far its table is published" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(raft_node_mod.Role.leader, shard.raft_node.role);
+    // An earlier leader's entries not yet applied: its creates may be among them.
+    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
+    try std.testing.expect(!shard.raft_node.leaderReady());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    shard.runRequest(c.conn, edgeGet(&body, 1, "maybe", "k"), .client);
+    const read = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), read.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try read.refused()).ran);
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.namespace_published, 2), .namespace = "", .key = "maybe", .value = "" }, .peer);
+    const asked = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), asked.header.status);
+    try std.testing.expectEqual(proto.Reason.leader_unknown, (try asked.refused()).reason);
+}
+
+test "Shard: a name found missing and published since is found within the 100 ms it is remembered missing" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    shard.edge.noteMissing(std.testing.allocator, "late", Shard.nowMs());
+    try shard.namespace_handler.table.publish(@import("../namespace/table.zig").FIRST_ALLOCATED, "late", 1);
+    var body: [64]u8 = undefined;
+    var out: [512]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "late", "k"), .client);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(f.c, shard, &out)).header.status);
+    var ids: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try edgeAsks(&f.t.rn, &ids)).len);
+}
+
+test "Shard: a follower's held reads count against their connection's requests in flight, and give them back when answered" {
+    var f: EdgeFollower = undefined;
+    try f.init();
+    defer f.deinit();
+    const shard = &f.t.shard;
+    var body: [64]u8 = undefined;
+    shard.runRequest(f.c.conn, edgeGet(&body, 1, "count", "k"), .client);
+    try std.testing.expectEqual(@as(u16, 1), f.c.conn.forwards_in_flight);
+    shard.sweepEdge(Shard.nowMs() + edge_mod.WAIT_MS);
+    try std.testing.expectEqual(@as(u16, 0), f.c.conn.forwards_in_flight);
+}
+
+test "Shard: a read waiting on shard 0 for a create that is then refused is answered that there is no namespace" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const asker = try TestClient.open(&shard);
+    defer _ = std.c.close(asker.pair[1]);
+    const nh = shard.namespace_handler;
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+    shard.runRequest(conn, try ParkTest.request(.namespace_create, 2, "", "mine", "", ""), .client);
+    // Another shard asks about the name while its create is under way: the
+    // answer waits for the create.
+    shard.runRequest(asker.conn, .{ .header = proto.RequestHeader.init(.namespace_published, 7), .namespace = "", .key = "mine", .value = "" }, .peer);
+    try expectNoAnswer(asker, &shard);
+    // The create's id was taken first, and this leader can't propose it
+    // again yet: the create is refused.
+    try std.testing.expectEqual(NamespaceHandler.CreateOutcome.created, nh.applyCreateAt("taken", first, 0, 1));
+    try ParkTest.ack(&shard);
+    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
+    nh.settle(&shard);
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(asker, &shard, &out);
+    try std.testing.expectEqual(@as(u64, 7), got.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), got.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
 }

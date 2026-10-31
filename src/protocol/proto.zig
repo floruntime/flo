@@ -76,6 +76,7 @@ pub const OpCode = enum(u16) {
     // 0x014 and 0x015 were namespace settings, never supported; retired.
     /// A shard asking shard 0 for a namespace's id, creating it if new.
     namespace_ensure = 0x016,
+    namespace_published = 0x017,
 
     // ── Cluster (0x030 – 0x04F) ──────────────────────────────────────────────
     cluster_status = 0x030,
