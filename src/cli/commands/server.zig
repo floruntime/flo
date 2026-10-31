@@ -283,10 +283,11 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .about("Fetch server metrics (Prometheus format)")
                 .examples(&.{
                     "flo server metrics",
-                    "flo server metrics --endpoint localhost:9001",
+                    "flo server metrics --metrics-endpoint localhost:9001",
                     "flo server metrics --format json",
                 })
-                .stringFlag("endpoint", 'e', "localhost:9001", "Metrics endpoint (host:port)")
+                // Not -e/--endpoint: that names the server's client port everywhere.
+                .stringFlag("metrics-endpoint", 0, "localhost:9001", "Metrics HTTP endpoint (host:port)")
                 .stringFlag("format", 'f', "text", "Output format: text (the Prometheus exposition) or json")
                 .action(wrapHandler(runMetrics)),
         )
@@ -459,6 +460,8 @@ fn resolveSecret(ctx: *commander.Context, config: *server_config.ServerConfig) c
 
 fn runStart(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
+    // The global -e names a server to talk to; this one listens.
+    if (ctx.flagChanged("endpoint")) return outcome.usage(ctx, "-e/--endpoint names a server to talk to; server start listens on --port", .{});
 
     // Get flag values (convert to appropriate types)
     const config_path = ctx.getString("config");
@@ -1328,7 +1331,7 @@ const MAX_METRICS_ANSWER: usize = 4 * 1024 * 1024;
 
 fn runMetrics(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
-    const endpoint = ctx.getString("endpoint") orelse "localhost:9001";
+    const endpoint = ctx.getString("metrics-endpoint") orelse "localhost:9001";
     const format = ctx.getString("format") orelse "text";
     const json = if (std.mem.eql(u8, format, "json")) true else if (std.mem.eql(u8, format, "text")) false else return outcome.usage(ctx, "--format is text or json, not '{s}'", .{format});
 
@@ -1337,7 +1340,7 @@ fn runMetrics(ctx: *commander.Context) commander.Error!void {
     const host = if (colon_pos) |pos| endpoint[0..pos] else endpoint;
     const port_str = if (colon_pos) |pos| endpoint[pos + 1 ..] else "9001";
     const port = std.fmt.parseInt(u16, port_str, 10) catch
-        return outcome.usage(ctx, "--endpoint {s}: '{s}' is not a port", .{ endpoint, port_str });
+        return outcome.usage(ctx, "--metrics-endpoint {s}: '{s}' is not a port", .{ endpoint, port_str });
 
     // Resolve localhost to 127.0.0.1
     const resolved_host = if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host;

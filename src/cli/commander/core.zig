@@ -1141,6 +1141,11 @@ pub const Command = struct {
         }
     }
 
+    /// A flag given after this command's name. A short one sets the flag
+    /// `getFlagShort` finds: this command's own copy when it declares one, so
+    /// it wins over a global given earlier. A long one sets what `getFlag`
+    /// finds: the global itself when it was given earlier and this command's
+    /// copy wasn't, so the later value replaces the earlier one there.
     fn parseFlag(self: *Command, args: []const []const u8, start_idx: usize) Error!usize {
         const arg = args[start_idx];
         var idx = start_idx;
@@ -1243,8 +1248,21 @@ pub const Command = struct {
         return idx + 1;
     }
 
+    /// Sets `flag` from the text given for it, or says what it takes.
     fn setFlagValue(self: *Command, flag: *Flag, value_str: []const u8) Error!void {
-        _ = self;
+        parseFlagValue(flag, value_str) catch |err| {
+            if (!self.silence_errors) self.printErrf("Error: --{s} takes {s}, not '{s}'\n", .{ flag.long, switch (flag.value_type) {
+                .bool => "true or false",
+                .int, .int64 => "a whole number",
+                .uint, .uint64 => "a whole number, 0 or more",
+                .float => "a number",
+                .string, .string_array => "text",
+            }, value_str });
+            return err;
+        };
+    }
+
+    fn parseFlagValue(flag: *Flag, value_str: []const u8) Error!void {
         flag.changed = true;
 
         switch (flag.value_type) {
@@ -1865,4 +1883,38 @@ test "a global flag given before the command applies to a command that declares 
     try root.executeSlice(&.{ "app", "-e", "host:1", "-p", "9", "get" });
     try std.testing.expectEqualStrings("host:1", seen.endpoint[0..seen.endpoint_len]);
     try std.testing.expectEqual(@as(u32, 7), seen.port);
+}
+
+test "a flag given both before and after the command takes the later value, short or long" {
+    const allocator = std.testing.allocator;
+    const root = Command.init(allocator, .{ .name = "app" });
+    defer root.deinit();
+    try root.addPersistentFlag(.{ .long = "endpoint", .short = 'e', .description = "", .value_type = .string, .default = .{ .string = "" } });
+    const Seen = struct {
+        buf: [32]u8 = undefined,
+        len: usize = 0,
+    };
+    var seen: Seen = .{};
+    const child = Command.init(allocator, .{
+        .name = "set",
+        .run = wrapTestRun(struct {
+            fn run(ctx: *Context) Error!void {
+                const s: *Seen = @ptrCast(@alignCast(ctx.user_data.?));
+                const ep = ctx.getString("endpoint") orelse "";
+                @memcpy(s.buf[0..ep.len], ep);
+                s.len = ep.len;
+            }
+        }.run),
+        .user_data = @ptrCast(&seen),
+    });
+    try root.addCommand(child);
+    // A command that declares the global again, as `config set-context` does.
+    try child.stringFlag("endpoint", 'e', "", "Server endpoint");
+
+    try root.executeSlice(&.{ "app", "-e", "early:1", "set", "-e", "late:2" });
+    try std.testing.expectEqualStrings("late:2", seen.buf[0..seen.len]);
+    root.getFlag("endpoint").?.changed = false;
+    child.getFlag("endpoint").?.changed = false;
+    try root.executeSlice(&.{ "app", "-e", "early:1", "set", "--endpoint", "late:3" });
+    try std.testing.expectEqualStrings("late:3", seen.buf[0..seen.len]);
 }

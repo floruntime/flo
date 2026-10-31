@@ -21,6 +21,13 @@ const outcome = @import("outcome.zig");
 const server_config = @import("../config/server.zig");
 
 /// Wrapper to cast *anyopaque to *Context
+/// A global port out of range is refused before any command runs, not
+/// read as no port at all.
+fn checkGlobalFlags(ctx_ptr: *anyopaque) commander.Error!void {
+    const ctx: *commander.Context = @ptrCast(@alignCast(ctx_ptr));
+    _ = try ctx.getChangedPort("port");
+}
+
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
     return struct {
         fn run(ctx_ptr: *anyopaque) commander.Error!void {
@@ -110,6 +117,7 @@ fn buildRoot(allocator: std.mem.Allocator) !*commander.Command {
         .persistentFlag("endpoint", .{ .short = 'e', .value = .{ .string = "" }, .desc = "Server endpoint (host:port)" })
         .persistentFlag("port", .{ .short = 'p', .value = .{ .uint = 0 }, .desc = "Server port (shorthand for --endpoint 127.0.0.1:<port>)" })
         .persistentFlag("namespace", .{ .short = 'n', .value = .{ .string = "default" }, .desc = "Namespace to use" })
+        .persistentPreRun(checkGlobalFlags)
 
         // Server Commands (pre-built)
         .addCommand(server)
@@ -360,7 +368,10 @@ fn checkShortFlags(gpa: std.mem.Allocator, cmd: *commander.Command, clashes: *us
         const same_long = std.mem.eql(u8, a.long, b.long);
         const short_clash = a.short != 0 and a.short == b.short and !same_long;
         const long_clash = same_long and a.short != b.short;
-        if (short_clash or long_clash) {
+        // The same flag declared again must read as the same thing: a
+        // global given before the command applies to the command's copy.
+        const type_clash = same_long and a.short == b.short and a.value_type != b.value_type;
+        if (short_clash or long_clash or type_clash) {
             var names: [8][]const u8 = undefined;
             var depth: usize = 0;
             var at: ?*commander.Command = cmd;

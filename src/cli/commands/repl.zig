@@ -56,11 +56,7 @@ pub fn createReplCommand(allocator: Allocator) !*commander.Command {
 fn runRepl(ctx: *commander.Context) commander.Error!void {
     const allocator = ctx.allocator;
 
-    // Get endpoint from flag or use default
-    var endpoint: []const u8 = "127.0.0.1:9000";
-    if (ctx.getString("endpoint")) |ep| {
-        if (ep.len > 0) endpoint = ep;
-    }
+    const endpoint = cli_config.getEndpoint(ctx);
 
     // Get initial namespace
     var current_namespace: []const u8 = cli_config.getNamespace(ctx);

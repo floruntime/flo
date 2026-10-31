@@ -395,7 +395,12 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     }
 
     // Output results
-    if (all_names.items.len == 0) {
+    if (cli_output.getFormat(ctx) == .json) {
+        // An object per action, as `ns ls` gives a namespace.
+        ctx.print("[", .{});
+        for (all_names.items, 0..) |name, i| ctx.print("{s}{{\"name\":{f}}}", .{ if (i == 0) "" else ",", cli_output.jsonString(name) });
+        ctx.print("]\n", .{});
+    } else if (all_names.items.len == 0) {
         ctx.print("(no actions)\n", .{});
     } else {
         for (all_names.items) |name| {

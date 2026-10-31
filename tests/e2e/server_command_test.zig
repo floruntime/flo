@@ -123,7 +123,7 @@ test "e2e/server: flags that are never read or contradict each other are refused
         .{ .args = &.{ "server", "start", "--data-dir", server.data_dir, "--no-metrics", "--metrics-port", "9999" }, .want = "Error: --metrics-port names a port for the metrics server that --no-metrics turns off; give one or the other\n" },
         .{ .args = &.{ "server", "start", "--data-dir", server.data_dir, "--no-dashboard", "--dashboard-port", "9998" }, .want = "Error: --dashboard-port names a port for the dashboard that --no-dashboard turns off; give one or the other\n" },
         .{ .args = &.{ "server", "metrics", "--format", "prometheus" }, .want = "Error: --format is text or json, not 'prometheus'\n" },
-        .{ .endpoint = "localhost:abc", .args = &.{ "server", "metrics" }, .want = "Error: --endpoint localhost:abc: 'abc' is not a port\n" },
+        .{ .args = &.{ "server", "metrics", "--metrics-endpoint", "localhost:abc" }, .want = "Error: --metrics-endpoint localhost:abc: 'abc' is not a port\n" },
         .{ .args = &.{ "server", "start", "--data-dir", server.data_dir, "--threads", "4" }, .want = "Error: unknown flag --threads\n" },
     };
     for (cases) |c| {
@@ -147,7 +147,7 @@ test "e2e/server: metrics as json are valid JSON carrying the exposition whole" 
 
     var ep_buf: [32]u8 = undefined;
     const ep = try std.fmt.bufPrint(&ep_buf, "127.0.0.1:{d}", .{ctx.getMetricsPort()});
-    var out = try runAt(ctx.server.flo_binary, ep, &.{ "server", "metrics", "--format", "json" });
+    var out = try runAt(ctx.server.flo_binary, "127.0.0.1:1", &.{ "server", "metrics", "--metrics-endpoint", ep, "--format", "json" });
     defer out.deinit();
     try testing.expectEqual(@as(u8, 0), out.exit_code);
     const parsed = try std.json.parseFromSlice(struct { metrics: []const u8 }, testing.allocator, out.stdout, .{});
@@ -156,7 +156,7 @@ test "e2e/server: metrics as json are valid JSON carrying the exposition whole" 
     try testing.expect(std.mem.indexOfScalar(u8, parsed.value.metrics, '\n') != null);
     try testing.expect(std.mem.indexOf(u8, parsed.value.metrics, "flo_stream_append_records_total{") != null);
 
-    var text = try runAt(ctx.server.flo_binary, ep, &.{ "server", "metrics" });
+    var text = try runAt(ctx.server.flo_binary, "127.0.0.1:1", &.{ "server", "metrics", "--metrics-endpoint", ep });
     defer text.deinit();
     try testing.expectEqual(@as(u8, 0), text.exit_code);
     // The same exposition as text (counters move between the two fetches).
