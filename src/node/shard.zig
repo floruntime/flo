@@ -976,6 +976,7 @@ pub const Shard = struct {
         WorkerHandler.register(&dispatcher);
         WorkflowHandler.register(&dispatcher);
         dispatcher.register(.system_walk_page, walk_mod.handlePage);
+        dispatcher.register(.system_runs_page, @import("../workflow/list_runs.zig").handlePage);
         ProcessingHandler.register(&dispatcher);
         dispatcher.register(.cluster_status, dispatchClusterStatus);
         dispatcher.register(.cluster_members, dispatchClusterMembers);
@@ -1518,7 +1519,7 @@ pub const Shard = struct {
         const op = req.header.op_code;
 
         // Walk opcodes: multi-shard aggregation unless pre-route picks one target.
-        if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
+        if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_context[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!has_single_target) {
                 self.executeWalk(conn, req, auth);
@@ -1550,7 +1551,7 @@ pub const Shard = struct {
     fn forwardTarget(self: *Shard, req: proto.Request) ?ForwardTo {
         const op = req.header.op_code;
         if (op >= proto.MAX_OPCODES or table.isInternal(op)) return null;
-        if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_contexts[op] != null) {
+        if (self.dispatcher.isWalkOp(op) and self.dispatcher.walk_context[op] != null) {
             const single = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!single) return null;
         }
@@ -2199,10 +2200,10 @@ pub const Shard = struct {
             self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
         };
-        const contexts = self.dispatcher.walk_contexts[op_idx] orelse {
+        if (self.dispatcher.walk_context[op_idx] == null) {
             self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
             return;
-        };
+        }
         // A walk asks every shard: one offline would leave its part missing
         // in an answer that looks whole.
         if (self.offlineShard()) |down| {
@@ -2222,7 +2223,11 @@ pub const Shard = struct {
             if (parsed_limit > 0) limit = @min(parsed_limit, NameWalker.MAX_BATCH);
             if (req.value.len > 4) cursor = req.value[4..];
         }
-        walk_mod.start(self, conn, req, @intCast(contexts.len), limit, cursor);
+        switch (walk_mod.start(self, conn, req, @intCast(self.shardCount()), limit, cursor)) {
+            .asked => conn.response_deferred = true,
+            .past_end => walk_mod.answerEmpty(self, conn, req.header.request_id),
+            .refused => |r| self.sendRefusal(conn, req.header.request_id, r.status, r.refusal),
+        }
     }
 
     // ─── Inbox draining ──────────────────────────────────────────────────
@@ -7626,7 +7631,6 @@ const WalkFixture = struct {
     two: TwoShards,
     client: TestClient,
     lists: [2]NameList,
-    contexts: [2]*anyopaque,
     out: []u8,
 
     const NameList = struct {
@@ -7659,13 +7663,14 @@ const WalkFixture = struct {
         try self.two.init();
         errdefer self.two.deinit();
         self.lists = .{ .{ .names = a }, .{ .names = b } };
-        self.contexts = .{ @ptrCast(&self.lists[0]), @ptrCast(&self.lists[1]) };
         for (&self.two.shards) |*s| {
             if (paged)
                 s.dispatcher.registerPagedWalk(.ts_list, NameList.handle, NameList.byKey)
             else
                 s.dispatcher.registerWalk(.ts_list, NameList.handle, NameList.byOffset);
-            s.dispatcher.setWalkContexts(.ts_list, &self.contexts);
+        }
+        for (&self.two.shards, &self.lists) |*s, *list| {
+            s.dispatcher.setWalkContext(.ts_list, @ptrCast(list));
         }
         self.client = try TestClient.open(&self.two.shards[0]);
         self.out = try std.testing.allocator.alloc(u8, proto.MAX_ANSWER_BYTES);
@@ -7723,6 +7728,16 @@ const WalkFixture = struct {
         names.deinit(std.testing.allocator);
     }
 };
+
+test "Shard: a shard asked for a page of a list with a limit of 0 sends one name, so the walk moves on" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{ "m", "n" }, &.{"a"}, true);
+    defer f.deinit();
+    var buf: [1024]u8 = undefined;
+    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), "", "", null, 0, 0, 1024, &buf);
+    try std.testing.expectEqual(@as(u32, 1), v.entries.count);
+    try std.testing.expect(v.more);
+}
 
 test "Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order" {
     var f: WalkFixture = undefined;
@@ -13628,8 +13643,7 @@ test "Shard: a list page whose scan couldn't hold its names is refused, not cut 
         fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
     };
     shard.dispatcher.registerWalk(.stream_list, Short.handle, Short.scan);
-    const contexts = [_]*anyopaque{@ptrCast(&shard)};
-    shard.dispatcher.setWalkContexts(.stream_list, &contexts);
+    shard.dispatcher.setWalkContext(.stream_list, @ptrCast(&shard));
 
     const frame = try testRequest(.stream_list, 14, "", &.{ 0, 0, 0, 0 });
     defer std.testing.allocator.free(frame);

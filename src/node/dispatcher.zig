@@ -136,10 +136,9 @@ pub const Dispatcher = struct {
     /// rather than by an offset the walker keeps.
     walk_paged: [proto.MAX_OPCODES]bool,
 
-    /// Per-opcode cross-shard walk contexts.
-    /// walk_contexts[opcode] = slice of per-shard *anyopaque (one per shard).
-    /// Set by runtime after all shards are created.
-    walk_contexts: [proto.MAX_OPCODES]?[]const *anyopaque,
+    /// Each walk op's scan context: this shard's own, never another's. A
+    /// walk asks the other shards for their pages.
+    walk_context: [proto.MAX_OPCODES]?*anyopaque,
 
     /// Error callback for unknown opcodes.
     on_error: ?ErrorFn,
@@ -155,7 +154,7 @@ pub const Dispatcher = struct {
             .shard_route = @as([proto.MAX_OPCODES]?ShardRouteFn, @splat(null)),
             .walk_fn = @as([proto.MAX_OPCODES]?NameWalker.LocalScanFn, @splat(null)),
             .walk_paged = @splat(false),
-            .walk_contexts = @as([proto.MAX_OPCODES]?[]const *anyopaque, @splat(null)),
+            .walk_context = @as([proto.MAX_OPCODES]?*anyopaque, @splat(null)),
             .on_error = null,
             .handler_count = 0,
         };
@@ -184,8 +183,8 @@ pub const Dispatcher = struct {
     }
 
     /// Register a walk (list/scan) opcode — handler + ShardWalker local-scan function.
-    /// The handler is used as fallback for single-shard mode (walk_contexts not set).
-    /// When walk_contexts are wired, Shard.executeWalk() drives ShardWalker with scan_fn.
+    /// The handler is used as fallback for single-shard mode (no walk context set).
+    /// With its context set, Shard.executeWalk() asks every shard's scan_fn.
     pub fn registerWalk(self: *Dispatcher, opcode: proto.OpCode, handler: HandlerFn, scan_fn: NameWalker.LocalScanFn) void {
         const idx = @backingInt(opcode);
         if (self.handlers[idx] == null) {
@@ -222,10 +221,9 @@ pub const Dispatcher = struct {
         self.pre_route[idx] = pre_route_fn;
     }
 
-    /// Set walk contexts for a walk-registered opcode (called by runtime).
-    /// contexts is a slice of per-shard *anyopaque — one projection per shard.
-    pub fn setWalkContexts(self: *Dispatcher, opcode: proto.OpCode, contexts: []const *anyopaque) void {
-        self.walk_contexts[@backingInt(opcode)] = contexts;
+    /// Set a walk op's scan context: this shard's own state for it.
+    pub fn setWalkContext(self: *Dispatcher, opcode: proto.OpCode, context: *anyopaque) void {
+        self.walk_context[@backingInt(opcode)] = context;
     }
 
     /// Check if an opcode is a walk (list/scan) operation.
@@ -234,11 +232,11 @@ pub const Dispatcher = struct {
         return self.walk_fn[op_code] != null;
     }
 
-    /// A walk op with no walk contexts, if any: on a node of several shards
+    /// A walk op with no walk context, if any: on a node of several shards
     /// it would list the connection's shard alone.
     pub fn unwiredWalk(self: *const Dispatcher) ?u16 {
-        for (self.walk_fn, self.walk_contexts, 0..) |scan, contexts, op| {
-            if (scan != null and contexts == null) return @intCast(op);
+        for (self.walk_fn, self.walk_context, 0..) |scan, context, op| {
+            if (scan != null and context == null) return @intCast(op);
         }
         return null;
     }
@@ -303,7 +301,7 @@ pub const Dispatcher = struct {
             self.shard_route[idx] = null;
             self.walk_fn[idx] = null;
             self.walk_paged[idx] = false;
-            self.walk_contexts[idx] = null;
+            self.walk_context[idx] = null;
             self.handler_count -= 1;
         }
     }

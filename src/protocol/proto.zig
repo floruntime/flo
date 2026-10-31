@@ -62,6 +62,8 @@ pub const OpCode = enum(u16) {
     ping = 0x000,
     /// A shard asking another for its page of a list or scan.
     system_walk_page = 0x001,
+    /// A shard asking another for its page of a workflow's runs.
+    system_runs_page = 0x002,
 
     // ── Namespace (0x010 – 0x02F) ────────────────────────────────────────────
     namespace_create = 0x010,
