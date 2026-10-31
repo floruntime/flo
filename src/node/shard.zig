@@ -16754,3 +16754,27 @@ test "Shard: a shard holds a run by its id only in the namespace it was started 
     try std.testing.expect(!wh.holdsRun("team-b", "shared"));
     try std.testing.expect(!wh.holdsRun("team-a", "other"));
 }
+
+test "Shard: a lookup by a chosen run id two shards hold is refused as a conflict, run on neither" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    // Two starts that raced with one id: each shard holds a run of it.
+    var keys: [2][]u8 = undefined;
+    for (&two.shards, &keys) |*s, *k| {
+        k.* = try std.testing.allocator.dupe(u8, "default:twice");
+        try s.workflow_handler.runs.put(k.*, undefined);
+    }
+    defer for (&two.shards, keys) |*s, k| {
+        _ = s.workflow_handler.runs.remove("default:twice");
+        std.testing.allocator.free(k);
+    };
+    const c = try TestClient.open(&two.shards[0]);
+    defer _ = std.c.close(c.pair[1]);
+    two.shards[0].runRequest(c.conn, .{ .header = proto.RequestHeader.init(.workflow_status, 5), .namespace = "default", .key = "twice", .value = "" }, .client);
+    two.settle();
+    var out: [512]u8 = undefined;
+    const got = try nextAnswer(c, &two.shards[0], &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), got.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
+}

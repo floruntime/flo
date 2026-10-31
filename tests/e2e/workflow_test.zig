@@ -3393,6 +3393,16 @@ test "e2e/workflow: on 4 shards, a run started with an id the client chose is fo
     defer still.deinit();
     try testing.expectEqual(@as(usize, 1), still.stdoutCount("Workflow: rid-wf-0"));
 
+    // A retried start with its idempotency key answers its run, chosen id
+    // and all, rather than being refused as taking that id.
+    var first = try ctx.cli.run(&.{ "workflow", "start", "rid-wf-2", "{}", "--run-id", "retried", "-k", "once" });
+    defer first.deinit();
+    var again = try ctx.cli.run(&.{ "workflow", "start", "rid-wf-2", "{}", "--run-id", "retried", "-k", "once" });
+    defer again.deinit();
+    if (again.stdoutCount("Started workflow run: retried") != 1) std.debug.print("retried: {s}{s}\n", .{ again.stdout, again.stderr });
+    try testing.expectEqual(@as(usize, 1), first.stdoutCount("Started workflow run: retried"));
+    try testing.expectEqual(@as(usize, 1), again.stdoutCount("Started workflow run: retried"));
+
     // The same id in another namespace is another run: it starts, each
     // namespace finds its own, and neither is a conflict.
     try ctx.exec(&.{ "namespace", "create", "other" });
