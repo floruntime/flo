@@ -39,6 +39,8 @@ test "e2e/dashboard: a namespace never created answers as one that exists and is
         "/api/v1/timeseries/m1/data?field=value&namespace={s}",
         "/api/v1/streams/s1/groups?namespace={s}",
         "/api/v1/workflows?namespace={s}",
+        "/api/v1/workflow/runs/r1?namespace={s}",
+        "/api/v1/workflow/runs/r1/history?namespace={s}",
     };
     inline for (paths) |path| {
         var never_buf: [128]u8 = undefined;

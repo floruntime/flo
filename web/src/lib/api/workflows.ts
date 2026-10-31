@@ -3,7 +3,7 @@ import { api } from './client'
 import type {
   WorkflowDefInfo,
   WorkflowDefDetail,
-  WorkflowRunInfo,
+  WorkflowRunsPage,
   WorkflowRunDetail,
   WorkflowHistoryEvent,
   WorkflowMutationResult,
@@ -27,29 +27,30 @@ export function useWorkflowDef(ns: string, name: string | null) {
   })
 }
 
-/** All runs in a namespace (used for the list join + per-definition run lists). */
+/** A namespace's newest runs, up to 200 (the list join + per-definition run
+ *  lists); `has_more` says whether older ones were left out. */
 export function useRuns(ns: string) {
   return useQuery({
     queryKey: ['workflows', ns, 'runs'],
-    queryFn: () => api.get<WorkflowRunInfo[]>(`workflow/runs?namespace=${enc(ns)}&limit=200`),
+    queryFn: () => api.get<WorkflowRunsPage>(`workflow/runs?namespace=${enc(ns)}&limit=200`),
     refetchInterval: 5_000,
   })
 }
 
-/** A single run snapshot (run_id is globally unique — no namespace needed). */
-export function useRunDetail(runId: string | null) {
+/** A single run snapshot (runs are namespace-scoped server-side). */
+export function useRunDetail(ns: string, runId: string | null) {
   return useQuery({
-    queryKey: ['workflows', 'run', runId],
-    queryFn: () => api.get<WorkflowRunDetail>(`workflow/runs/${enc(runId!)}`),
+    queryKey: ['workflows', ns, 'run', runId],
+    queryFn: () => api.get<WorkflowRunDetail>(`workflow/runs/${enc(runId!)}?namespace=${enc(ns)}`),
     enabled: !!runId,
     refetchInterval: 5_000,
   })
 }
 
-export function useRunHistory(runId: string | null) {
+export function useRunHistory(ns: string, runId: string | null) {
   return useQuery({
-    queryKey: ['workflows', 'run', runId, 'history'],
-    queryFn: () => api.get<WorkflowHistoryEvent[]>(`workflow/runs/${enc(runId!)}/history`),
+    queryKey: ['workflows', ns, 'run', runId, 'history'],
+    queryFn: () => api.get<WorkflowHistoryEvent[]>(`workflow/runs/${enc(runId!)}/history?namespace=${enc(ns)}`),
     enabled: !!runId,
     refetchInterval: 5_000,
   })

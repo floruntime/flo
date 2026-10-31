@@ -28,10 +28,6 @@ pub const DashboardContext = struct {
     metrics: *MetricsRegistry,
     num_shards: u32,
     start_time: i64,
-    /// Opaque pointers to Shard structs (set by runtime after shard
-    /// creation). Only the workflow run views still read through them,
-    /// until list-runs asks each shard.
-    shard_ptrs: ?[]*anyopaque,
     /// The node's own client port and the address it is reachable at from
     /// this process. Mutations from the dashboard thread are issued as a
     /// client request to it, reusing the thread-safe protocol path (the
@@ -42,8 +38,8 @@ pub const DashboardContext = struct {
     host: HostStats.Sampler = .{},
     /// Each shard's published state, for /ready.
     health: ?*const NodeHealth = null,
-    /// `shard_ptrs` is set. The dashboard starts before the shards replay,
-    /// and a data API before this would read shards still being built.
+    /// The shards are built and serving. The dashboard starts before they
+    /// replay, and a data API before this would ask shards still being built.
     shards_ready: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: Allocator, metrics: *MetricsRegistry, num_shards: u32) DashboardContext {
@@ -52,15 +48,11 @@ pub const DashboardContext = struct {
             .metrics = metrics,
             .num_shards = num_shards,
             .start_time = @import("stdx").time.milliTimestamp(),
-            .shard_ptrs = null,
         };
     }
 
-    /// Point the data APIs at the shards, once they are built and wired.
-    pub fn wireShards(self: *DashboardContext, allocator: Allocator, shards: anytype) !void {
-        const ptrs = try allocator.alloc(*anyopaque, shards.len);
-        for (shards, ptrs) |*shard, *p| p.* = @ptrCast(shard);
-        self.shard_ptrs = ptrs;
+    /// Open the data APIs, once the shards are built and wired.
+    pub fn markShardsReady(self: *DashboardContext) void {
         self.shards_ready.store(true, .release);
     }
 
@@ -351,7 +343,7 @@ test "DashboardContext init and uptime" {
 }
 
 test "dashboard: the client endpoint follows the bind address" {
-    var ctx = DashboardContext{ .allocator = std.testing.allocator, .metrics = undefined, .num_shards = 1, .start_time = 0, .shard_ptrs = null, .listen_port = 9000 };
+    var ctx = DashboardContext{ .allocator = std.testing.allocator, .metrics = undefined, .num_shards = 1, .start_time = 0, .listen_port = 9000 };
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("127.0.0.1:9000", try ctx.clientEndpoint(&buf));
     ctx.client_ip4 = .{ 10, 0, 1, 12 };

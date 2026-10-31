@@ -376,12 +376,22 @@ export interface WorkflowDefDetail {
   definition_yaml: string
   run_count: number | null
 }
+/** One page of the run list, newest first. A page can end short of its
+ *  limit with more after it: only `has_more` says the list is whole. */
+export interface WorkflowRunsPage {
+  runs: WorkflowRunInfo[]
+  has_more: boolean
+  /** Pass back as `?cursor=` for the next page. */
+  next_cursor: string | null
+}
+/** One row of the run list. Fields read per run (version, current_step,
+ *  completed_at, duration_ms, wait_type) are null past the first 100 rows. */
 export interface WorkflowRunInfo {
   run_id: string
   workflow: string
-  version: string
+  version: string | null
   status: WorkflowRunStatus
-  triggered_by: string
+  triggered_by: string | null
   current_step: string | null
   started_at: number
   completed_at: number | null
@@ -390,7 +400,7 @@ export interface WorkflowRunInfo {
   parent_run_id: string | null
   terminal_name: string | null
   error: string | null
-  history_event_count: number
+  history_event_count: number | null
 }
 export interface WorkflowStepResult {
   outcome: string
@@ -406,17 +416,18 @@ export interface WorkflowRunDetail {
   version: string
   status: WorkflowRunStatus
   current_step: string | null
-  started_at_ms: number
+  started_at_ms: number | null
   completed_at: number | null
-  updated_at_ms: number
+  updated_at_ms: number | null
   duration_ms: number | null
   error_message: string | null
-  input?: Record<string, unknown>
+  input: Record<string, unknown> | null
   output: unknown
-  step_results?: Record<string, WorkflowStepResult>
-  triggered_by: string
-  pending_signals: number
-  history_event_count: number
+  step_results: Record<string, WorkflowStepResult> | null
+  triggered_by: string | null
+  search_attributes: Record<string, unknown> | null
+  pending_signals: number | null
+  history_event_count: number | null
 }
 export interface WorkflowHistoryEvent {
   event_type: string
