@@ -4973,7 +4973,7 @@ test "step executor: checkPendingActions handles completed async action" {
     // A completed action run, of an action the transitions resolve.
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
-    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = "default", .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null }, 1000);
+    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = "default", .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null, .caller_shard = null }, 1000);
     completeTestAction(&shard, "action-42");
 
     // checkPendingActions should detect the completed action and resume step-a

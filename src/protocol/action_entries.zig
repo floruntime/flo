@@ -79,6 +79,9 @@ pub const Invoke = Record(&.{
     .{ .name = "source", .T = schema.Enum(Source) },
     .{ .name = "caller_run", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
     .{ .name = "caller_workflow", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
+    // The shard the calling workflow's run is on, which its run id may
+    // not say (a client may choose it): the run's end is told there.
+    .{ .name = "caller_shard", .T = Optional(Int(u16)) },
 });
 
 /// A worker given a ready run. `due` is the ready key the leader chose it

@@ -2035,6 +2035,7 @@ pub const Shard = struct {
         const allowance = if (claims) reply_pool_mod.SLOT_DEADLINE_MS else reply_pool_mod.DEADLINE_MS;
         const ticket = self.reply_pool.take(class, target_shard_id, conn.fd, conn.id, req.header.request_id, writes, since, now, allowance, if (claims) 0 else block orelse 0) catch
             return self.refuseForward(conn, req, target_shard_id, .target_busy);
+        self.reply_pool.tagOp(ticket, req.header.op_code);
 
         // Serialize request (header + recomposed payload) onto the heap so the
         // target shard can re-parse it after the source buffer is gone.
@@ -2199,6 +2200,7 @@ pub const Shard = struct {
     fn sendGatherPart(self: *Shard, target: *Mailbox, owner: u16, conn: *Connection, piece: proto.Request, seq: u64, since: u64, now: u64, part: ReplyPool.GatherPart) bool {
         const ticket = self.reply_pool.take(.ordinary, owner, conn.fd, conn.id, piece.header.request_id, false, since, now, reply_pool_mod.DEADLINE_MS, 0) catch return false;
         self.reply_pool.tagGather(ticket, part);
+        self.reply_pool.tagOp(ticket, piece.header.op_code);
         const buf = serializeRequest(self.allocator, piece) catch {
             _ = self.reply_pool.release(ticket, owner);
             return false;
@@ -2216,7 +2218,8 @@ pub const Shard = struct {
     /// A gather's part answered, its slot already freed. A refusal ends the
     /// gather and goes to the client as it came; the last answer merges.
     fn gatherPartAnswered(self: *Shard, slot: ReplyPool.Slot, part: ReplyPool.GatherPart, bytes: []const u8) void {
-        const e = self.gathers.get(.{ .index = part.index, .gen = part.gen }) orelse return; // ended
+        // Ended: an answer that took something is handed back.
+        const e = self.gathers.get(.{ .index = part.index, .gen = part.gen }) orelse return ActionsHandler.orphanedAnswer(self, slot.op, bytes);
         if (bytes.len == 0) {
             var buf: [128]u8 = undefined;
             const message = std.fmt.bufPrint(&buf, "internal error: shard {d} lost its answer — retry", .{slot.target}) catch "internal error: an answer was lost — retry";
@@ -2489,7 +2492,7 @@ pub const Shard = struct {
         const data: [*]u8 = @ptrCast(ptr);
         defer if (msg.payload_len > 0) self.allocator.free(data[0..msg.payload_len]);
         if (msg.payload_len == 0) return;
-        self.actions_handler.startRunFromInbox(self, data[0..msg.payload_len]);
+        self.actions_handler.startRunFromInbox(self, msg.src_shard, data[0..msg.payload_len]);
     }
 
     /// Drive a request that another shard forwarded to us. The request bytes
@@ -2628,9 +2631,11 @@ pub const Shard = struct {
         const held = msg.replySlot();
         const slot = self.reply_pool.release(.{ .slot = held.slot, .gen = held.gen }, msg.src_shard) orelse return;
         if (self.shard_metrics) |sm| sm.setCrossShardInFlight(self.reply_pool.taken());
-        if (slot.answered) return; // its client was told at the deadline
+        // Its client was told at the deadline, or is gone: an answer that
+        // took something is handed back.
+        if (slot.answered) return ActionsHandler.orphanedAnswer(self, slot.op, bytes);
         if (slot.gather) |part| return self.gatherPartAnswered(slot, part, bytes);
-        const conn = self.forwardAnswered(slot) orelse return;
+        const conn = self.forwardAnswered(slot) orelse return ActionsHandler.orphanedAnswer(self, slot.op, bytes);
         if (bytes.len == 0) {
             var buf: [128]u8 = undefined;
             const message = std.fmt.bufPrint(&buf, "internal error: shard {d} lost its answer — the request may still apply", .{msg.src_shard}) catch "internal error: the answer was lost — the request may still apply";
@@ -7005,7 +7010,7 @@ fn testRegister(name: []const u8) action_entries.Register.Value {
 }
 
 fn testInvoke(name: []const u8, run_id: []const u8) action_entries.Invoke.Value {
-    return .{ .ns = "default", .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null };
+    return .{ .ns = "default", .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null };
 }
 
 test "Shard: init and deinit" {

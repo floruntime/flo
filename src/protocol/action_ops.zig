@@ -59,6 +59,7 @@ pub const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// back; a report naming any other delivery of the run is refused stale.
 pub const Task = Record(&.{
     .{ .name = "run", .T = Bytes(ops.MAX_KEY), .doc = "The run's id" },
+    .{ .name = "namespace", .T = Bytes(@import("limits.zig").MAX_NAMESPACE_NAME), .doc = "The run's namespace" },
     .{ .name = "deliveries", .T = Int(u32), .doc = "The run's deliveries, this one included" },
     .{ .name = "term", .T = Int(u64), .doc = "The term the delivery was made in" },
     .{ .name = "index", .T = Int(u64), .doc = "The log index the delivery was made at" },
@@ -75,7 +76,7 @@ pub const Task = Record(&.{
 /// which the report must name to reach the run at all.
 const delivery_fields = [_]schema.Field{
     .{ .name = "action", .T = ActionName, .doc = "The task's action" },
-    .{ .name = "worker", .T = WorkerId, .doc = "The worker reporting, for its counts" },
+    .{ .name = "worker", .T = WorkerId, .doc = "The worker reporting: the one the task was given to, or the report is refused" },
     .{ .name = "deliveries", .T = Int(u32), .doc = "The task's deliveries" },
     .{ .name = "term", .T = Int(u64), .doc = "The task's term" },
     .{ .name = "index", .T = Int(u64), .doc = "The task's index" },
@@ -162,7 +163,7 @@ pub const table = [_]ops.Op{
             .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without another touch, in Unix milliseconds" },
         }),
         .cli = .{ .expose = .hand, .key = .{ .name = "task_id", .doc = "The task's id, as await printed it" } },
-        .doc = "Keep a task: its lease runs a full lease from now, up to 12 h from its delivery.",
+        .doc = "Keep a task: with half its lease or less left, its lease runs a full lease from now, up to 12 h from its delivery; with more left, nothing changes. Touch at least every half lease.",
     },
     .{
         .name = "action.deliver",

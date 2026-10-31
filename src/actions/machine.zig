@@ -88,6 +88,7 @@ pub const Run = Record(&.{
     .{ .name = "source", .T = schema.Enum(ae.Source) },
     .{ .name = "caller_run", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
     .{ .name = "caller_workflow", .T = Optional(Bytes(limits.MAX_QUALIFIED_KEY)) },
+    .{ .name = "caller_shard", .T = Optional(Int(u16)) },
     .{ .name = "created_ns", .T = Int(u64) },
     // Its ready key's due time, while ready.
     .{ .name = "due_ns", .T = Int(u64) },
@@ -324,6 +325,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .source = p.source,
                 .caller_run = p.caller_run,
                 .caller_workflow = p.caller_workflow,
+                .caller_shard = p.caller_shard,
                 .created_ns = stamp,
                 .due_ns = stamp,
                 .deliveries = 0,
@@ -673,7 +675,7 @@ fn register(t: *TestActions, max_attempts: u32) !void {
 }
 
 fn invokeIn(t: *TestActions, ns: []const u8, run_id: []const u8, stamp: u64) !void {
-    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns, .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null }, stamp);
+    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns, .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, stamp);
     try testing.expect(r.refused() == null);
 }
 
