@@ -422,7 +422,6 @@ fn skipField(reader: *WireReader, col: WireColumn) error{Truncated}!void {
     }
 }
 
-/// Checks that `data` holds a count and that many whole entries.
 /// The pages of a list, gathered as one answer for `printWireList`. A list
 /// that spans more shards than one page asks returns a cursor before its
 /// last page, so a caller reading only the first loses the rest.
@@ -445,7 +444,9 @@ pub const WirePages = struct {
     }
 
     /// Takes one page, at most `want` of its rows, and keeps its cursor
-    /// for the next ask.
+    /// for the next ask. A page may hold no rows and still move on, but
+    /// one that hands back the cursor it was asked from would be asked
+    /// again forever: that is `CursorRepeats`.
     pub fn take(self: *WirePages, data: []const u8, want: u32) !void {
         if (self.buf.items.len == 0) try self.buf.appendNTimes(self.allocator, 0, 4);
         var reader = WireReader.init(data);
@@ -461,14 +462,16 @@ pub const WirePages = struct {
         while (taken < count) : (taken += 1) {
             for (self.columns) |col| try skipField(&reader, col);
         }
-        if (self.cursor) |c| self.allocator.free(c);
-        self.cursor = null;
         // An answer with no trailer is the whole list.
         const has_more = reader.readU8() orelse 0;
         const cursor_len = reader.readU16() orelse 0;
         const next = reader.readSlice(cursor_len) orelse return error.Truncated;
-        self.more = has_more != 0 and cursor_len > 0;
-        if (self.more) self.cursor = try self.allocator.dupe(u8, next);
+        const more = has_more != 0 and cursor_len > 0;
+        if (more) if (self.cursor) |c| if (std.mem.eql(u8, c, next)) return error.CursorRepeats;
+        if (self.cursor) |c| self.allocator.free(c);
+        self.cursor = null;
+        self.more = more;
+        if (more) self.cursor = try self.allocator.dupe(u8, next);
     }
 
     /// `[count:u32]rows`, for `printWireList`.
@@ -479,6 +482,7 @@ pub const WirePages = struct {
     }
 };
 
+/// Checks that `data` holds a count and that many whole entries.
 fn checkWireList(data: []const u8, columns: []const WireColumn) error{Truncated}!u32 {
     var reader = WireReader.init(data);
     const count = reader.readU32() orelse return error.Truncated;
@@ -926,6 +930,16 @@ test "output: WirePages joins every page's rows, follows each cursor, and stops 
     try short.take(&one, 1);
     try std.testing.expectEqualSlices(u8, &([_]u8{ 1, 0, 0, 0 } ++ a), short.list());
     try std.testing.expectEqualStrings("k1", short.cursor.?);
+
+    // An empty page that moves on is fine; one that repeats its cursor
+    // would be asked forever.
+    const empty_on = [_]u8{ 0, 0, 0, 0, 1, 2, 0, 'k', '2' };
+    var stuck = WirePages.init(std.testing.allocator, &cols);
+    defer stuck.deinit();
+    try stuck.take(&one, 10);
+    try stuck.take(&empty_on, 10);
+    try std.testing.expectEqualStrings("k2", stuck.cursor.?);
+    try std.testing.expectError(error.CursorRepeats, stuck.take(&empty_on, 10));
 
     // No pages taken is an empty list; a cut page is Truncated.
     var none = WirePages.init(std.testing.allocator, &cols);
