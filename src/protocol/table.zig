@@ -58,7 +58,7 @@ pub fn creates(code: u16) bool {
 /// are hashed by name and value, and the golden vectors by their bytes, so
 /// adding one of those or changing a vectored layout needs no bump. It goes
 /// once that list is empty.
-pub const HAND_LAYOUT_EPOCH: u32 = 6;
+pub const HAND_LAYOUT_EPOCH: u32 = 7;
 
 pub const HASH: u64 = hash(&op_table, &entry_table, HAND_LAYOUT_EPOCH);
 

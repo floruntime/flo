@@ -489,13 +489,35 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit), status_val, null, search_val) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    // No matching runs still answers with a count of 0.
-    const data = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
+    // A page may hold fewer runs than asked while more follow: follow the
+    // cursor until `limit` runs or the last page.
+    var rows: std.ArrayListUnmanaged(u8) = .empty;
+    defer rows.deinit(ctx.allocator);
+    var count: u32 = 0;
+    var cursor_buf: [64 * 1024 + 8]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    while (count < limit) {
+        var result = client_mod.workflow.listRuns(&client, namespace, name, @intCast(limit - count), status_val, cursor, search_val) catch |err| return outcome.requestFailed(ctx, err);
+        defer result.deinit();
+        try outcome.check(ctx, result);
+        // No matching runs still answers with a count of 0.
+        const page = result.asRawData() orelse return outcome.malformed(ctx, "list-runs response (empty)");
+        const split = splitRunsPage(page) orelse return outcome.malformed(ctx, "list-runs response");
+        rows.appendSlice(ctx.allocator, split.rows) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+        count += split.count;
+        const next = split.cursor orelse break;
+        if (next.len > cursor_buf.len) return outcome.malformed(ctx, "list-runs cursor");
+        @memcpy(cursor_buf[0..next.len], next);
+        cursor = cursor_buf[0..next.len];
+    }
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(ctx.allocator);
+    data.ensureTotalCapacity(ctx.allocator, 4 + rows.items.len + 3) catch return outcome.malformed(ctx, "list-runs response (out of memory)");
+    var count_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_le, count, .little);
+    data.appendSliceAssumeCapacity(&count_le);
+    data.appendSliceAssumeCapacity(rows.items);
+    data.appendSliceAssumeCapacity(&.{ 0, 0, 0 });
     if (output.getFormat(ctx) == .table) {
         if (name.len > 0) {
             ctx.print("Runs for workflow: {s}\n", .{name});
@@ -503,12 +525,40 @@ fn runListRuns(ctx: *commander.Context) commander.Error!void {
             ctx.print("Runs across all workflows:\n", .{});
         }
     }
-    output.printWireList(ctx, data, "(no runs)", &.{
+    output.printWireList(ctx, data.items, "(no runs)", &.{
         .{ .field = "run_id", .header = "RUN ID", .field_type = .str_u16, .alignment = .left },
         .{ .field = "workflow", .header = "WORKFLOW", .field_type = .str_u16, .alignment = .left },
         .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at", .header = "", .field_type = .int_i64 },
     }) catch return outcome.malformed(ctx, "list");
+}
+
+/// A list-runs page: its rows' bytes, their count, and the cursor when
+/// more follow. Rows are `[run_id][workflow][status]` (u16-prefixed each)
+/// then `[created_at:i64]`.
+fn splitRunsPage(page: []const u8) ?struct { count: u32, rows: []const u8, cursor: ?[]const u8 } {
+    if (page.len < 4) return null;
+    const count = std.mem.readInt(u32, page[0..4], .little);
+    var pos: usize = 4;
+    for (0..count) |_| {
+        for (0..3) |_| {
+            if (page.len - pos < 2) return null;
+            const len = std.mem.readInt(u16, page[pos..][0..2], .little);
+            pos += 2;
+            if (page.len - pos < len) return null;
+            pos += len;
+        }
+        if (page.len - pos < 8) return null;
+        pos += 8;
+    }
+    const rows = page[4..pos];
+    if (page.len - pos < 3) return null;
+    const more = page[pos] != 0;
+    const cursor_len = std.mem.readInt(u16, page[pos + 1 ..][0..2], .little);
+    pos += 3;
+    if (page.len - pos != cursor_len) return null;
+    if (more and cursor_len == 0) return null;
+    return .{ .count = count, .rows = rows, .cursor = if (more) page[pos..] else null };
 }
 
 fn runCancel(ctx: *commander.Context) commander.Error!void {
