@@ -28,6 +28,9 @@ pub const MAX_LIMIT: u32 = system_ops.MAX_PAGE;
 pub const DEFAULT_LIMIT: u32 = 100;
 
 pub const MAX_CURSOR: usize = 8 + system_ops.MAX_RUN_ID;
+comptime {
+    std.debug.assert(MAX_CURSOR <= std.math.maxInt(u16));
+}
 
 /// What the client's answer holds besides its entries: the count, then
 /// `[has_more:u8][cursor_len:u16][cursor]`.
@@ -46,7 +49,7 @@ pub const Query = struct {
     after: ?RunAt.Value,
 };
 
-/// The run a client's cursor names; null for bytes this server never sent.
+/// The run a client's cursor names; null for a malformed one.
 pub fn decodeCursor(cursor: []const u8) ?RunAt.Value {
     if (cursor.len <= 8 or cursor.len > MAX_CURSOR) return null;
     return .{ .created_at = std.mem.readInt(i64, cursor[0..8], .little), .run_id = cursor[8..] };
@@ -90,6 +93,8 @@ pub fn ownPage(handler: *WorkflowHandler, namespace: []const u8, workflow: []con
     var b = Runs.Builder.init(buf);
     var used: usize = 0;
     for (page, 0..) |r, i| {
+        // A run id longer than a list carries can't be one a run has.
+        if (r.run_id.len > system_ops.MAX_RUN_ID) continue;
         var eb: [system_ops.MAX_RUN_ENTRY]u8 = undefined;
         const entry = writeEntry(&eb, r);
         if (i == q.limit or used + entry.len > room or !(b.add(.{ .at = atOf(r), .entry = entry }) catch false))

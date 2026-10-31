@@ -1300,7 +1300,7 @@ pub const WorkflowHandler = struct {
         if (status.len > system_ops.MAX_RUN_STATUS) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: no run has a status that long");
         if (search.len > system_ops.MAX_RUN_SEARCH) return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a run search is at most 4096 bytes");
         const after: ?list_runs.RunAt.Value = if (query.cursor) |c|
-            list_runs.decodeCursor(c) orelse return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: the cursor isn't one this server sent")
+            list_runs.decodeCursor(c) orelse return shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: a malformed cursor")
         else
             null;
         // Lowercased once for case-insensitive matching: all of it, so a

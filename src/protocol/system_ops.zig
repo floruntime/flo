@@ -30,8 +30,10 @@ pub const Entry = Record(&.{
 const more_size = schema.Bool.max_size;
 pub const Entries = schema.BoundedList(Entry, MAX_PAGE, @intCast(ops.MAX_RESPONSE_BODY - more_size - @sizeOf(u32)));
 
-/// A run id's longest: the start request's u16 length.
-pub const MAX_RUN_ID: u32 = std.math.maxInt(u16);
+/// A run id's longest a list carries. A run's start entry keys it by id and
+/// holds one under 600 bytes, so no run has a longer one; this bound keeps a
+/// cursor of a start time and an id within its u16 length.
+pub const MAX_RUN_ID: u32 = @intCast(ops.MAX_KEY);
 /// A run's status, as the list names it.
 pub const MAX_RUN_STATUS: u32 = 32;
 /// The longest search a run list takes.

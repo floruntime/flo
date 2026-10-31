@@ -40,6 +40,12 @@ const FRAME: usize = 4 + 1 + 2 + 2 + system_ops.MAX_LOCAL_CURSOR;
 /// The bytes a page's entries may take in the client's answer.
 const ROOM: usize = ops.MAX_RESPONSE_BODY - FRAME;
 
+comptime {
+    // Each shard's share of the room holds the largest entry, so a shard
+    // with an item left always sends one.
+    std.debug.assert(ROOM / WINDOW >= system_ops.MAX_ENTRY);
+}
+
 // ── The owner's side ─────────────────────────────────────────────────────
 
 pub const PageError = error{ NotAWalk, ScanShort, EntryTooLarge };
@@ -233,10 +239,10 @@ const Walk = struct {
         defer allocator.free(taken);
         var cursor_buf: [2 + system_ops.MAX_LOCAL_CURSOR]u8 = undefined;
         const r = walker.mergePages(resume_at, pages, self.limit, taken, &cursor_buf);
-        // A page that took nothing and resumes where it was asked from would
-        // be asked again forever.
-        if (r.items.len == 0) if (r.next_cursor) |next| if (std.mem.eql(u8, next, self.cursor))
-            return shard.sendRefusal(conn, request_id, .internal_error, proto.notRun("internal error: a shard's page of this list made no progress"));
+        // Every page asked holds a name when its shard has one left (`ownPage`
+        // asks for at least one, and each shard's room holds the largest), so
+        // a merge always moves past the cursor it was asked from.
+        if (r.items.len == 0) if (r.next_cursor) |next| std.debug.assert(!std.mem.eql(u8, next, self.cursor));
 
         // The pages were taken in order, so what was taken is their entries'
         // prefix. A name two shards both list is answered once.
@@ -292,10 +298,10 @@ pub const Begun = union(enum) {
 const OUT_OF_MEMORY: table_run.Refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } };
 
 /// Ask the shards from the cursor's for their pages of `req`'s list, the
-/// merge answering. This shard's own page is read here. A limit of 0 asks
-/// for one name: a page must take something to move on.
-pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: u16, limit_asked: u32, cursor: ?[]const u8) Begun {
-    const limit = @max(limit_asked, 1);
+/// merge answering. This shard's own page is read here. `limit` is at least
+/// 1: a list's default stands for 0, and kv.scan's schema refuses it.
+pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: u16, limit: u32, cursor: ?[]const u8) Begun {
+    std.debug.assert(limit > 0);
     const begin = NameWalker.startOf(cursor);
     if (begin.shard >= shard_count) return .past_end;
     // No answer of this server's names a resume point that long.
