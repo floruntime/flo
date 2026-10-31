@@ -217,14 +217,44 @@ test "e2e/action/worker: invoke and await task" {
         "2000",
     });
     defer await_result.deinit();
-    // Its task id names the run's first delivery, then the action.
-    const head = try std.fmt.allocPrint(testing.allocator, "Task: {s}:1:", .{run_id});
-    defer testing.allocator.free(head);
-    try testing.expect(std.mem.startsWith(u8, await_result.stdout, head));
-    const tail = "\nAction: " ++ action_name ++ "\nAttempt: 1\nPayload: {\"task\":\"process-data\"}\n";
-    const id = taskIdOf(await_result.stdout) orelse return error.NoTask;
-    try testing.expect(std.mem.endsWith(u8, id, ":" ++ action_name));
-    try testing.expect(std.mem.endsWith(u8, await_result.stdout, tail));
+    // Its task id names the run's first delivery: the term and log index
+    // its deliver was made at, then the action.
+    const id = action_ops.TaskId.parse(taskIdOf(await_result.stdout) orelse return error.NoTask) orelse return error.NoTask;
+    try testing.expect(id.term >= 1 and id.index >= 1);
+    const want = try std.fmt.allocPrint(testing.allocator, "Task: {s}:1:{d}:{d}:{s}\nAction: {s}\nAttempt: 1\nPayload: {{\"task\":\"process-data\"}}\n", .{ run_id, id.term, id.index, action_name, action_name });
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, await_result.stdout);
+}
+
+test "e2e/action/worker: a touch keeps a task, and a complete may name its outcome, at most 256 bytes" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "kept" });
+    const run_id = extractRunId(try ctx.execCapture(&.{ "action", "invoke", "kept", "{}" })) orelse return error.NoRunId;
+    var taken = try ctx.cli.run(&.{ "worker", "await", "kept", "--worker-id", "kw", "--block", "5000" });
+    defer taken.deinit();
+    try testing.expectEqual(@as(u8, 0), taken.exit_code);
+    const id = taskIdOf(taken.stdout) orelse return error.NoTask;
+
+    var touch = try ctx.cli.run(&.{ "worker", "touch", id, "--worker-id", "kw" });
+    defer touch.deinit();
+    try testing.expectEqual(@as(u8, 0), touch.exit_code);
+    try testing.expect(std.mem.startsWith(u8, touch.stdout, "Expires at: "));
+    // Another worker can't keep it.
+    var other = try ctx.cli.run(&.{ "worker", "touch", id, "--worker-id", "someone-else" });
+    defer other.deinit();
+    try testing.expectEqual(@as(u8, 3), other.exit_code);
+
+    const long: [257]u8 = @splat('o');
+    var too_long = try ctx.cli.run(&.{ "worker", "complete", id, "--worker-id", "kw", "--outcome", &long });
+    defer too_long.deinit();
+    try testing.expectEqual(@as(u8, 2), too_long.exit_code);
+    var done = try ctx.cli.run(&.{ "worker", "complete", id, "--worker-id", "kw", "--outcome", "approved", "--result", "{\"ok\":1}" });
+    defer done.deinit();
+    try testing.expectEqual(@as(u8, 0), done.exit_code);
+    var status = try ctx.cli.run(&.{ "action", "status", run_id });
+    defer status.deinit();
+    try testing.expect(status.contains("status: completed\n"));
 }
 
 // =============================================================================

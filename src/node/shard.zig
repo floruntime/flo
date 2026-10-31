@@ -13910,7 +13910,9 @@ test "actions: a retry with its request key gets the task another shard gave it 
     try t.feedAwait(2, 0, "k1");
     t.two.settle();
     const first = (try ActionsHandler.for_tests.task((try nextAnswer(t.ca, here, &t.out)).data)).?;
-    const index = first.index;
+    var first_buf: [64]u8 = undefined;
+    const first_run = first_buf[0..first.run.len];
+    @memcpy(first_run, first.run);
     // A run of an action this shard owns, ready, which the same worker
     // also runs: the retry must not take it.
     var local_buf: [16]u8 = undefined;
@@ -13927,7 +13929,7 @@ test "actions: a retry with its request key gets the task another shard gave it 
     _ = feedClient(t.ca.pair[1], here, t.ca.conn.fd, frame);
     t.two.settle();
     const again = (try ActionsHandler.for_tests.task((try nextAnswer(t.ca, here, &t.out)).data)).?;
-    try std.testing.expectEqual(index, again.index);
+    try std.testing.expectEqualStrings(first_run, again.run);
 }
 
 test "actions: a report counts toward its worker's stats on the worker's own shard" {

@@ -241,6 +241,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "action.deliver", .field = "holder", .tests = &.{"Shard: a worker's await runs where the worker is registered, so a labelled run finds its labels"} },
     .{ .op = "action.deliver", .field = "labels", .tests = &.{"Shard: a worker's await runs where the worker is registered, so a labelled run finds its labels"} },
     .{ .op = "action.deliver", .field = "request_key", .tests = &.{"actions: an await retried with its request key gets the task the first got, while the worker holds it; another key gets another run"} },
+    .{ .op = "action.deliver", .field = "again_only", .tests = &.{"actions: a retry with its request key gets the task another shard gave it before taking one here"} },
     .{ .op = "system.walk_page", .field = "op", .tests = &.{"Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order"} },
     .{ .op = "system.walk_page", .field = "cursor", .tests = &.{"Shard: a list whose scan pages itself resumes each shard after the last name it sent"} },
     .{ .op = "system.walk_page", .field = "skip", .tests = &.{"Shard: a list asked of every shard pages through them by limit and offset, each name once, in shard order"} },
