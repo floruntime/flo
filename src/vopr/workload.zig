@@ -17,6 +17,7 @@ const std = @import("std");
 const PRNG = @import("stdx").PRNG;
 const entry_mod = @import("../storage/ual/entry.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const namespace_entries = @import("../protocol/namespace_entries.zig");
 const schema = @import("../protocol/schema.zig");
 const Scenario = @import("scenario.zig").Scenario;
 
@@ -50,6 +51,11 @@ const JSON_SLOTS = 4;
 /// and at most how many.
 const PATCH_LOOKAHEAD = 256;
 const PATCH_DELETES_MAX = 32;
+/// With creates on, one op in this many creates a namespace, chosen by a
+/// hash of its id apart from the op's own draws, so every other op is what
+/// it would be without creates. Its name is `o` and the op id in hex.
+const CREATE_EVERY = 16;
+const CREATE_SALT: u64 = 0x6E73_C2EA_7E00_0001;
 /// The largest payload a scenario draws: the size of the KV encoder's
 /// scratch.
 pub const MAX_PAYLOAD = 4096;
@@ -62,6 +68,9 @@ pub const OpState = enum {
     acked,
     /// A conflicting entry took its slot before commit — legal loss.
     lost,
+    /// Never proposed: the leader refused it, as shard 0's leader refuses
+    /// a namespace create before it is ready.
+    refused,
 };
 
 pub const Op = struct {
@@ -82,6 +91,7 @@ pub const Workload = struct {
     seed: u64,
     payload_min: u32,
     payload_max: u32,
+    creates: bool,
     next_op_id: u64,
     /// Indexed by op id — ids are dense from 0.
     ops: std.ArrayListUnmanaged(Op),
@@ -90,6 +100,7 @@ pub const Workload = struct {
 
     acked_count: u64,
     lost_count: u64,
+    refused_count: u64 = 0,
 
     pub fn init(allocator: Allocator, scenario: *const Scenario) !Workload {
         return .{
@@ -97,6 +108,7 @@ pub const Workload = struct {
             .seed = scenario.seed,
             .payload_min = scenario.payload_min,
             .payload_max = scenario.payload_max,
+            .creates = scenario.namespace_creates,
             .next_op_id = 0,
             .ops = .empty,
             .scratch = try allocator.alloc(u8, scenario.payload_max),
@@ -105,10 +117,16 @@ pub const Workload = struct {
         };
     }
 
+    fn draws(self: *const Workload) Draws {
+        return .{ .seed = self.seed, .payload_min = self.payload_min, .payload_max = self.payload_max, .creates = self.creates };
+    }
+
     pub fn deinit(self: *Workload) void {
         self.ops.deinit(self.allocator);
         self.allocator.free(self.scratch);
     }
+
+    pub const NewOp = struct { id: u64, entry_type: EntryType, payload: []const u8 };
 
     pub const Synthesized = struct {
         entry_type: EntryType,
@@ -119,21 +137,25 @@ pub const Workload = struct {
     /// Deterministically derive the op with the given id into `buf`
     /// (must be ≥ payload_max). Pure function of (seed, op_id) — the
     /// checker calls this at verification time with no stored state.
-    pub fn synthesize(seed: u64, payload_min: u32, payload_max: u32, op_id: u64, buf: []u8) Synthesized {
+    pub fn synthesize(d: Draws, op_id: u64, buf: []u8) Synthesized {
+        const seed = d.seed;
+        const payload_min = d.payload_min;
+        const payload_max = d.payload_max;
         std.debug.assert(payload_min >= 8); // op id occupies the first 8 bytes
         std.debug.assert(buf.len >= payload_max);
         // Mix the op id so consecutive ids don't produce correlated
         // streams from the xorshift state.
+        std.debug.assert(payload_max <= MAX_PAYLOAD);
+        if (d.creates and isCreate(seed, op_id)) return createOf(buf[0..payload_max], op_id);
         var prng = PRNG.init(seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
-        std.debug.assert(payload_max <= MAX_PAYLOAD);
         var entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
         const len = r.intRangeAtMost(u32, payload_min, payload_max);
         const kv: ?[]u8 = switch (entry_type) {
             .kv_put => if (r.uintLessThan(u8, 3) == 0) patch: {
                 entry_type = .kv_json_patch;
                 const shape = PatchShape.draw(r);
-                break :patch kvPatch(buf[0..payload_max], .{ .seed = seed, .payload_min = payload_min, .payload_max = payload_max }, op_id, shape, len, r);
+                break :patch kvPatch(buf[0..payload_max], d, op_id, shape, len, r);
             } else kvPut(buf[0..payload_max], op_id, len, r),
             .kv_batch => kvDelete(buf[0..payload_max], op_id, r),
             else => null,
@@ -195,11 +217,13 @@ pub const Workload = struct {
         }
     };
 
-    const Draws = struct { seed: u64, payload_min: u32, payload_max: u32 };
+    /// What an op's synthesis depends on besides its id.
+    pub const Draws = struct { seed: u64, payload_min: u32, payload_max: u32, creates: bool = false };
 
     /// Op `op_id`'s patch shape, from the same draws `synthesize` makes;
     /// null when it isn't a JSON patch.
     fn shapeOf(d: Draws, op_id: u64) ?PatchShape {
+        if (d.creates and isCreate(d.seed, op_id)) return null;
         var prng = PRNG.init(d.seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
         if (OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)] != .kv_put) return null;
@@ -284,6 +308,24 @@ pub const Workload = struct {
         return buf[0..w.written().len];
     }
 
+    /// Whether op `op_id` creates a namespace.
+    /// Op `op_id`'s create. The leader chooses the id when it proposes the
+    /// create, so the payload's hash is recorded then (`recordPayload`).
+    fn createOf(buf: []u8, op_id: u64) Synthesized {
+        var name_buf: [17]u8 = undefined;
+        const out = namespace_entries.Create.encodeInto(buf, .{ .name = createName(&name_buf, op_id), .id = 0 }) catch unreachable;
+        return .{ .entry_type = .namespace_create, .payload = buf[0..out.len], .hash = std.hash.Wyhash.hash(0x5EED, out) };
+    }
+
+    pub fn isCreate(seed: u64, op_id: u64) bool {
+        return std.hash.Wyhash.hash(seed ^ CREATE_SALT, std.mem.asBytes(&op_id)) % CREATE_EVERY == 0;
+    }
+
+    /// The namespace op `op_id` creates.
+    pub fn createName(buf: *[17]u8, op_id: u64) []const u8 {
+        return std.fmt.bufPrint(buf, "o{x:0>16}", .{op_id}) catch unreachable;
+    }
+
     /// A JSON slot's key: one only patches write.
     fn jsonKey(buf: *[16]u8, slot: u8) []const u8 {
         return std.fmt.bufPrint(buf, "j{d}", .{slot}) catch unreachable;
@@ -297,10 +339,20 @@ pub const Workload = struct {
     /// Generate the next op. The payload points into the workload's
     /// scratch buffer — valid until the next `nextOp` or `expectedHash`
     /// call (both reuse `scratch`).
-    pub fn nextOp(self: *Workload) !struct { id: u64, entry_type: EntryType, payload: []const u8 } {
+    pub fn nextOp(self: *Workload) !NewOp {
+        return self.appendOp(synthesize(self.draws(), self.next_op_id, self.scratch));
+    }
+
+    /// The next op as a namespace create, whatever its id would draw: for
+    /// a leader that has just won. A JSON set before it may name a delete
+    /// this id would have drawn; that field just stays.
+    pub fn nextCreate(self: *Workload) !NewOp {
+        return self.appendOp(createOf(self.scratch, self.next_op_id));
+    }
+
+    fn appendOp(self: *Workload, gen: Synthesized) !NewOp {
         const id = self.next_op_id;
         self.next_op_id += 1;
-        const gen = synthesize(self.seed, self.payload_min, self.payload_max, id, self.scratch);
         try self.ops.append(self.allocator, .{
             .id = id,
             .entry_type = gen.entry_type,
@@ -320,6 +372,21 @@ pub const Workload = struct {
         op.proposer = proposer;
         op.term = term;
         op.index = index;
+    }
+
+    /// The payload proposed for an op whose leader wrote it.
+    pub fn recordPayload(self: *Workload, op_id: u64, payload: []const u8) void {
+        const op = &self.ops.items[op_id];
+        op.payload_len = @intCast(payload.len);
+        op.payload_hash = std.hash.Wyhash.hash(0x5EED, payload);
+    }
+
+    /// The leader refused the op: it was never proposed.
+    pub fn markRefused(self: *Workload, op_id: u64) void {
+        const op = &self.ops.items[op_id];
+        std.debug.assert(op.state == .pending);
+        op.state = .refused;
+        self.refused_count += 1;
     }
 
     /// Ack: the proposing leader's commit_index reached the op's index
@@ -343,7 +410,7 @@ pub const Workload = struct {
 
     /// Recompute the expected payload hash for an op id.
     pub fn expectedHash(self: *Workload, op_id: u64) u64 {
-        return synthesize(self.seed, self.payload_min, self.payload_max, op_id, self.scratch).hash;
+        return synthesize(self.draws(), op_id, self.scratch).hash;
     }
 
     /// Recover an op id from a committed payload: a KV put's value, a KV
@@ -366,6 +433,11 @@ pub const Workload = struct {
             }
             if (!std.mem.startsWith(u8, p.path, DEL_PATH_PREFIX)) return null;
             return std.fmt.parseInt(u64, p.path[DEL_PATH_PREFIX.len..], 16) catch null;
+        }
+        if (entry_type == @backingInt(EntryType.namespace_create)) {
+            const c = namespace_entries.Create.decodeAll(payload, &diag) catch return null;
+            if (c.name.len != 17 or c.name[0] != 'o') return null;
+            return std.fmt.parseInt(u64, c.name[1..], 16) catch null;
         }
         if (entry_type == @backingInt(EntryType.kv_batch)) {
             const b = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
@@ -391,8 +463,8 @@ test "vopr workload: synthesis is deterministic and self-verifying" {
     var buf_a: [4096]u8 = undefined;
     var buf_b: [4096]u8 = undefined;
     for (0..50) |id| {
-        const a = Workload.synthesize(99, 16, 2048, id, &buf_a);
-        const b = Workload.synthesize(99, 16, 2048, id, &buf_b);
+        const a = Workload.synthesize(.{ .seed = 99, .payload_min = 16, .payload_max = 2048, .creates = true }, id, &buf_a);
+        const b = Workload.synthesize(.{ .seed = 99, .payload_min = 16, .payload_max = 2048, .creates = true }, id, &buf_b);
         try testing.expectEqual(a.hash, b.hash);
         try testing.expectEqual(a.entry_type, b.entry_type);
         try testing.expectEqualSlices(u8, a.payload, b.payload);
@@ -403,15 +475,15 @@ test "vopr workload: synthesis is deterministic and self-verifying" {
 test "vopr workload: different seeds produce different payloads" {
     var buf_a: [4096]u8 = undefined;
     var buf_b: [4096]u8 = undefined;
-    const a = Workload.synthesize(1, 16, 2048, 0, &buf_a);
-    const b = Workload.synthesize(2, 16, 2048, 0, &buf_b);
+    const a = Workload.synthesize(.{ .seed = 1, .payload_min = 16, .payload_max = 2048 }, 0, &buf_a);
+    const b = Workload.synthesize(.{ .seed = 2, .payload_min = 16, .payload_max = 2048 }, 0, &buf_b);
     try testing.expect(a.hash != b.hash);
 }
 
 test "vopr workload: payload length respects bounds" {
     var buf: [4096]u8 = undefined;
     for (0..200) |id| {
-        const gen = Workload.synthesize(7, 16, 100, id, &buf);
+        const gen = Workload.synthesize(.{ .seed = 7, .payload_min = 16, .payload_max = 100 }, id, &buf);
         try testing.expect(gen.payload.len <= 100);
         // A KV delete is as long as its encoding.
         if (gen.entry_type != .kv_batch) try testing.expect(gen.payload.len >= 16);
@@ -425,7 +497,7 @@ test "vopr workload: KV ops decode as their entries, with every kind in the mix"
     var patches: usize = 0;
     var diag: schema.Diagnostic = .{};
     for (0..400) |id| {
-        const gen = Workload.synthesize(5, 16, 2048, id, &buf);
+        const gen = Workload.synthesize(.{ .seed = 5, .payload_min = 16, .payload_max = 2048 }, id, &buf);
         switch (gen.entry_type) {
             .kv_put => {
                 _ = try kv_entries.Put.decodeAll(gen.payload, &diag);
@@ -443,6 +515,24 @@ test "vopr workload: KV ops decode as their entries, with every kind in the mix"
         }
     }
     try testing.expect(puts > 40 and deletes > 40 and patches > 20);
+}
+
+test "vopr workload: one op in about sixteen creates a namespace, named by its op" {
+    var buf: [4096]u8 = undefined;
+    var creates: usize = 0;
+    var diag: schema.Diagnostic = .{};
+    for (0..1600) |id| {
+        const gen = Workload.synthesize(.{ .seed = 5, .payload_min = 16, .payload_max = 2048, .creates = true }, id, &buf);
+        var plain_buf: [4096]u8 = undefined;
+        try testing.expect(Workload.synthesize(.{ .seed = 5, .payload_min = 16, .payload_max = 2048 }, id, &plain_buf).entry_type != .namespace_create);
+        if (gen.entry_type != .namespace_create) continue;
+        creates += 1;
+        const c = try namespace_entries.Create.decodeAll(gen.payload, &diag);
+        var name_buf: [17]u8 = undefined;
+        try testing.expectEqualStrings(Workload.createName(&name_buf, id), c.name);
+        try testing.expect(@import("../namespace/handler.zig").nameRefusal(c.name) == null);
+    }
+    try testing.expect(creates > 60 and creates < 140);
 }
 
 test "vopr workload: op lifecycle and idempotent transitions" {
