@@ -12,6 +12,7 @@ const std = @import("std");
 const base = @import("base.zig");
 const Client = base.Client;
 const Response = base.Response;
+const processing_ops = @import("../../protocol/processing_ops.zig");
 
 // =============================================================================
 // Processing Operations
@@ -54,6 +55,15 @@ pub fn cancel(
     job_id: []const u8,
 ) !Response {
     return client.sendRequest(.processing_cancel, namespace, job_id, "");
+}
+
+/// Remove a stopped, cancelled or failed job, freeing its slot.
+pub fn remove(
+    client: *Client,
+    namespace: []const u8,
+    job_id: []const u8,
+) !Response {
+    return client.call(processing_ops.op("processing.remove"), namespace, job_id, .{});
 }
 
 /// Get processing job status

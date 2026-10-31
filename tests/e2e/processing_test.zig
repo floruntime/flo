@@ -63,6 +63,7 @@ test "e2e/processing: help shows all subcommands" {
     try stdx.testing.assertContains(result, "cancel");
     try stdx.testing.assertContains(result, "status");
     try stdx.testing.assertContains(result, "list");
+    try stdx.testing.assertContains(result, "remove");
 }
 
 test "e2e/processing: submit help shows usage" {
@@ -3045,4 +3046,99 @@ test "e2e/processing: a key the engine doesn't run yet is refused by name, and w
     }
     try testing.expectEqual(@as(usize, 2), counts);
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_notyet" });
+}
+
+// =============================================================================
+// Removing a job
+// =============================================================================
+
+/// Runs `args` and checks it exits `code` with `want` in its stdout or
+/// stderr.
+fn expectRun(cli: anytype, args: []const []const u8, code: u8, want: []const u8) !void {
+    var r = try cli.run(args);
+    defer r.deinit();
+    const found = std.mem.indexOf(u8, r.stdout, want) != null or std.mem.indexOf(u8, r.stderr, want) != null;
+    if (r.exit_code != code or !found) std.debug.print("flo {s}: exit {d}\nstdout: {s}\nstderr: {s}\n", .{ args[1], r.exit_code, r.stdout, r.stderr });
+    try testing.expectEqual(code, r.exit_code);
+    try testing.expect(found);
+}
+
+const remove_job_def =
+    \\kind: Processing
+    \\name: remove-job
+    \\namespace: proc_remove
+    \\sources.[0].stream.name: remove-input
+    \\sinks.[0].stream.name: remove-output
+;
+
+test "e2e/processing: remove refuses a running job, and drops a cancelled one" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_remove" });
+    const path = try writeDottedToTempYaml(testing.allocator, remove_job_def, "e2e-remove.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const job_id = extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_remove" })) orelse return error.NoJobId;
+
+    try expectRun(ctx.cli, &.{ "processing", "remove", job_id, "-n", "proc_remove" }, 3, "job is running: stop or cancel it, then remove it [conflict/job_running]");
+    try expectRun(ctx.cli, &.{ "processing", "status", job_id, "-n", "proc_remove" }, 0, "RUNNING");
+    // Only from its own namespace.
+    try ctx.exec(&.{ "processing", "cancel", job_id, "-n", "proc_remove" });
+    try expectRun(ctx.cli, &.{ "processing", "remove", job_id }, 1, "Job not found");
+
+    try expectRun(ctx.cli, &.{ "processing", "remove", job_id, "-n", "proc_remove" }, 0, "Job removed: ");
+    try expectRun(ctx.cli, &.{ "processing", "status", job_id, "-n", "proc_remove" }, 1, "Job not found");
+    try expectRun(ctx.cli, &.{ "processing", "remove", job_id, "-n", "proc_remove" }, 1, "Job not found");
+    var list = try ctx.cli.run(&.{ "processing", "list", "-n", "proc_remove" });
+    defer list.deinit();
+    try testing.expectEqual(@as(u8, 0), list.exit_code);
+    try testing.expect(std.mem.indexOf(u8, list.stdout, job_id) == null);
+}
+
+test "e2e/processing: a removed job stays removed across a restart" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .durability = .sync },
+    });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "proc_remove" });
+    const path = try writeDottedToTempYaml(testing.allocator, remove_job_def, "e2e-remove-restart.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const removed = try testing.allocator.dupe(u8, extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_remove" })) orelse return error.NoJobId);
+    defer testing.allocator.free(removed);
+    const kept = try testing.allocator.dupe(u8, extractJobId(try ctx.execCapture(&.{ "processing", "submit", path, "-n", "proc_remove" })) orelse return error.NoJobId);
+    defer testing.allocator.free(kept);
+    try ctx.exec(&.{ "processing", "stop", removed, "-n", "proc_remove" });
+    try ctx.exec(&.{ "processing", "remove", removed, "-n", "proc_remove" });
+
+    try ctx.restartServer();
+
+    try expectRun(ctx.cli, &.{ "processing", "status", removed, "-n", "proc_remove" }, 1, "Job not found");
+    try expectRun(ctx.cli, &.{ "processing", "status", kept, "-n", "proc_remove" }, 0, "RUNNING");
+}
+
+test "e2e/processing/cluster: a job removed through one node is gone on every node" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    try cluster.execOn(0, &.{ "ns", "create", "proc_remove" });
+    const path = try writeDottedToTempYaml(testing.allocator, remove_job_def, "e2e-remove-cluster.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    const submitted = try cluster.execCaptureOn(0, &.{ "processing", "submit", path, "-n", "proc_remove" });
+    defer testing.allocator.free(submitted);
+    const job_id = extractJobId(submitted) orelse return error.NoJobId;
+    try cluster.execOn(0, &.{ "processing", "cancel", job_id, "-n", "proc_remove" });
+    try cluster.execOn(1, &.{ "processing", "remove", job_id, "-n", "proc_remove" });
+
+    // A node behind takes a moment to apply it.
+    for (0..cluster.node_count) |node| {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            var r = try cluster.clis[node].?.run(&.{ "processing", "status", job_id, "-n", "proc_remove" });
+            defer r.deinit();
+            if (r.exit_code == 1 and std.mem.indexOf(u8, r.stderr, "Job not found") != null) break;
+            if (tries >= 50) {
+                std.debug.print("node {d}: exit {d}\nstdout: {s}\nstderr: {s}\n", .{ node, r.exit_code, r.stdout, r.stderr });
+                return error.StillThere;
+            }
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+    }
 }

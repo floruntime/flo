@@ -166,8 +166,8 @@ pub const Family = enum {
             .ts => .{ .lo = 0x1A0, .hi = 0x1BF },
             .action => .{ .lo = 0x300, .hi = 0x31F },
             .worker => .{ .lo = 0x320, .hi = 0x33F },
-            .workflow => .{ .lo = 0x340, .hi = 0x37F },
-            .processing => .{ .lo = 0x380, .hi = 0x3BF },
+            .workflow => .{ .lo = 0x340, .hi = 0x35F },
+            .processing => .{ .lo = 0x360, .hi = 0x37F },
         };
     }
 
@@ -657,7 +657,7 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0x309e1d0bf6192c21), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0xdd45521c688656a9), comptime tableHash(&test_table, NoEntries));
 }
 
 test "ops: the hash covers which field a route names and a wait's default" {

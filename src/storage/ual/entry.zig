@@ -119,6 +119,7 @@ pub const EntryType = enum(u8) {
     processing_stop = 0x81,
     processing_cancel = 0x82,
     processing_checkpoint = 0x85,
+    processing_remove = 0x86,
 
     /// Returns true if this type carries a key-value command payload. KV
     /// entries don't: their payloads are schemas (`protocol/kv_entries.zig`).
@@ -132,7 +133,7 @@ pub const EntryType = enum(u8) {
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start, .workflow_complete => true,
             .action_register, .action_delete, .action_invoke, .action_update_run => true,
-            .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => true,
+            .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
     }

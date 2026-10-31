@@ -4,6 +4,7 @@
 //!   flo processing submit <file> [--namespace <ns>]
 //!   flo processing stop <job_id> [--namespace <ns>]
 //!   flo processing cancel <job_id> [--namespace <ns>]
+//!   flo processing remove <job_id> [--namespace <ns>]
 //!   flo processing status <job_id> [--namespace <ns>]
 //!   flo processing list [--limit <n>] [--namespace <ns>]
 
@@ -37,7 +38,7 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
             \\Manage stream processing jobs.
             \\
             \\Submit YAML job definitions, check their status, list them, and
-            \\stop or cancel them.
+            \\stop or cancel them, and remove those that no longer run.
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -69,6 +70,16 @@ pub fn createProcessingCommand(allocator: Allocator) !*commander.Command {
                 })
                 .arg("job_id", "Job ID to cancel")
                 .action(wrapHandler(runCancel)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("remove")
+                .about("Remove a stopped, cancelled or failed job, freeing its slot")
+                .examples(&.{
+                    "flo processing remove job-123",
+                })
+                .arg("job_id", "Job ID to remove")
+                .action(wrapHandler(runRemove)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -170,6 +181,28 @@ fn runCancel(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, result);
 
     ctx.print("Job cancelled: {s}\n", .{job_id});
+}
+
+fn runRemove(ctx: *commander.Context) commander.Error!void {
+    const job_id = ctx.getPositional("job_id").?;
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+
+    var result = client_mod.processing.remove(&client, namespace, job_id) catch |err| return outcome.requestFailed(ctx, err);
+    defer result.deinit();
+
+    if (result.isNotFound()) {
+        return outcome.notFound(ctx, "Job not found: {s}", .{job_id});
+    }
+
+    try outcome.check(ctx, result);
+
+    ctx.print("Job removed: {s}\n", .{job_id});
 }
 
 fn runStatus(ctx: *commander.Context) commander.Error!void {

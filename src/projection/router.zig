@@ -244,7 +244,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .workflow_create, .workflow_start, .workflow_complete => .none,
         .namespace_create, .namespace_bind => .none,
         .action_register, .action_delete, .action_invoke, .action_update_run => .none,
-        .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint => .none,
+        .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => .none,
     };
 }
 

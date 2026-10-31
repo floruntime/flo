@@ -81,6 +81,8 @@ pub const Reason = enum(u16) {
     shard_halted = 29,
     /// The op is served only on the node's admin socket.
     admin_only = 30,
+    /// The processing job is running: stop or cancel it first.
+    job_running = 31,
 };
 
 /// Whether a refused request took effect.
