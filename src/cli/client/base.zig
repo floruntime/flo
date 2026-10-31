@@ -104,6 +104,10 @@ pub const Client = struct {
     server_error_len: usize = 0,
     server_error_status: proto.StatusCode = .ok,
     server_error_reason: proto.Reason = .unclassified,
+    /// Read an answer that the namespace doesn't exist as one that the item
+    /// isn't found: for a reader that shows a namespace never created as
+    /// holding nothing (the dashboard), not for the CLI, which says which.
+    no_namespace_as_not_found: bool = false,
 
     const Self = @This();
 
@@ -292,8 +296,9 @@ pub const Client = struct {
             return error.InvalidChecksum;
         }
 
+        const status: proto.StatusCode = @fromBackingInt(@intCast(response_header.status));
         return Response{
-            .status = @fromBackingInt(@intCast(response_header.status)),
+            .status = if (self.no_namespace_as_not_found and status == .no_namespace) .not_found else status,
             .data = data,
             .allocator = self.allocator,
         };

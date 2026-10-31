@@ -33,6 +33,8 @@ pub fn getWorkers(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     var got = reader.call(worker_ops.op("worker.list"), ns, "", .{ .limit = limit, .cursor = cursor, .action = "" }) catch |err|
         return try loopback.readFailed(allocator, "worker list", err);
     defer got.deinit();
+    // A namespace never created has no workers.
+    if (got.isNotFound()) return try allocator.dupe(u8, "{\"workers\":[],\"has_more\":false,\"cursor\":null}");
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
     var diag: schema.Diagnostic = .{};
     const page = worker_ops.op("worker.list").response.decodeAll(got.data, &diag) catch
@@ -85,6 +87,8 @@ pub fn writeActionWorkers(reader: *loopback.Reader, arr: anytype, writer: anytyp
     while (true) {
         var got = try reader.call(worker_ops.op("worker.list"), namespace, "", .{ .limit = worker_ops.MAX_LIST, .cursor = cursor, .action = action });
         defer got.deinit();
+        // A namespace never created has no workers.
+        if (got.isNotFound()) return;
         if (got.isError()) return error.Refused;
         var diag: schema.Diagnostic = .{};
         const page = try worker_ops.op("worker.list").response.decodeAll(got.data, &diag);
