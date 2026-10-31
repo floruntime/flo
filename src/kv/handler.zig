@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const kv_state = @import("state.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
+const walk_mod = @import("../node/walk.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
@@ -419,27 +420,31 @@ pub const KVHandler = struct {
     }
 
     /// The names of keys starting with the request's key, a page at a time
-    /// across every shard. A walk runs from the shard the client is on; a
-    /// node whose walk isn't wired yet lists its own shard.
+    /// across every shard: each shard answers its page from its own keys
+    /// (`walk.start`), and this one merges them.
     fn scan(
         shard: *Shard,
-        _: *Connection,
+        conn: *Connection,
         req: Request,
         limit: u32,
         cursor: []const u8,
     ) Error!table_run.Outcome(ScanResponse) {
         const NameWalker = dispatcher_mod.NameWalker;
         const self = shard.kv_handler;
-        const local = [_]*anyopaque{@ptrCast(self.kv)};
-        const contexts = shard.dispatcher.walk_contexts[@backingInt(OpCode.kv_scan)] orelse &local;
-        const walker = NameWalker.initPaged(localScanKeys, @intCast(contexts.len));
-        var found: [NameWalker.MAX_BATCH][]const u8 = undefined;
         const from = if (cursor.len == 0) null else cursor;
-        var want: u32 = @min(limit, NameWalker.MAX_BATCH);
         const Names = ScanResponse.field_list[0].T;
+        if (shard.shardCount() > 1) return switch (walk_mod.start(shard, conn, req, @intCast(shard.shardCount()), limit, from)) {
+            .asked => .wait,
+            .past_end => .{ .answer = .{ .names = Names.Builder.init(&self.answer_buf).value(), .cursor = null } },
+            .refused => |r| .{ .refused = r },
+        };
+        const contexts = [_]*anyopaque{@ptrCast(self.kv)};
+        const walker = NameWalker.initPaged(localScanKeys, 1);
+        var found: [NameWalker.MAX_BATCH][]const u8 = undefined;
+        var want: u32 = @min(limit, NameWalker.MAX_BATCH);
         while (true) {
             _ = dispatcher_mod.takeScanShort();
-            const page = walker.walk(contexts, req.namespace, req.key, from, want, &found, &self.cursor_buf);
+            const page = walker.walk(&contexts, req.namespace, req.key, from, want, &found, &self.cursor_buf);
             if (dispatcher_mod.takeScanShort()) return error.ScanShort;
 
             var names = Names.Builder.init(&self.answer_buf);

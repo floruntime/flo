@@ -40,6 +40,12 @@ const FRAME: usize = 4 + 1 + 2 + 2 + system_ops.MAX_LOCAL_CURSOR;
 /// The bytes a page's entries may take in the client's answer.
 const ROOM: usize = ops.MAX_RESPONSE_BODY - FRAME;
 
+comptime {
+    // Each shard's share of the room holds the largest entry, so a shard
+    // with an item left always sends one.
+    std.debug.assert(ROOM / WINDOW >= system_ops.MAX_ENTRY);
+}
+
 // ── The owner's side ─────────────────────────────────────────────────────
 
 pub const PageError = error{ NotAWalk, ScanShort, EntryTooLarge };
@@ -50,12 +56,12 @@ pub const PageError = error{ NotAWalk, ScanShort, EntryTooLarge };
 /// offsets count it as the scan did.
 pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8, cursor: ?[]const u8, skip: u32, limit: u32, room: u32, buf: []u8) PageError!Response.Value {
     if (op >= proto.MAX_OPCODES) return error.NotAWalk;
-    const contexts = shard.dispatcher.walk_contexts[op] orelse return error.NotAWalk;
-    if (shard.id >= contexts.len) return error.NotAWalk;
-    const ctx = contexts[shard.id];
-    const walker = shard.dispatcher.walker(op, @intCast(contexts.len)) orelse return error.NotAWalk;
+    const ctx = shard.dispatcher.walk_context[op] orelse return error.NotAWalk;
+    const walker = shard.dispatcher.walker(op, @intCast(shard.shardCount())) orelse return error.NotAWalk;
     _ = dispatcher_mod.takeScanShort();
-    const page = walker.localPage(ctx, namespace, filter, cursor, skip, @min(limit, system_ops.MAX_PAGE));
+    // A page of nothing resumes where it was asked from, and the walk
+    // would ask again forever: a limit of 0 is one.
+    const page = walker.localPage(ctx, namespace, filter, cursor, skip, std.math.clamp(limit, 1, system_ops.MAX_PAGE));
     if (dispatcher_mod.takeScanShort()) return error.ScanShort;
 
     var entries = Entries.Builder.init(buf);
@@ -184,24 +190,22 @@ pub fn refusal(err: PageError) table_run.Refused {
 /// A page under way: what the merge needs once every part has answered.
 const Walk = struct {
     op: u16,
-    start: NameWalker.Start,
-    /// The start's local cursor, owned: the request's bytes don't outlive it.
-    local_cursor: []u8,
+    /// The client's cursor, owned: the request's bytes don't outlive it.
+    cursor: []u8,
     limit: u32,
 
     pub const gather_op: gather_mod.Op = .{ .merge = merge, .deinit = free };
 
     fn free(state: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Walk = @ptrCast(@alignCast(state));
-        allocator.free(self.local_cursor);
+        allocator.free(self.cursor);
         allocator.destroy(self);
     }
 
     fn merge(shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void {
         const self: *Walk = @ptrCast(@alignCast(state));
         const allocator = shard.allocator;
-        var resume_at = self.start;
-        resume_at.local_cursor = if (self.local_cursor.len == 0) null else self.local_cursor;
+        const resume_at = NameWalker.startOf(if (self.cursor.len == 0) null else self.cursor);
 
         // Each part's names, for the merge, and its entries, for the answer.
         var name_count: usize = 0;
@@ -230,58 +234,92 @@ const Walk = struct {
             page.* = .{ .items = names[from..at], .more = d.more };
         }
 
-        const walker = shard.dispatcher.walker(self.op, @intCast(shard.dispatcher.walk_contexts[self.op].?.len)).?;
+        const walker = shard.dispatcher.walker(self.op, @intCast(shard.shardCount())).?;
         const taken = try allocator.alloc([]const u8, name_count);
         defer allocator.free(taken);
         var cursor_buf: [2 + system_ops.MAX_LOCAL_CURSOR]u8 = undefined;
         const r = walker.mergePages(resume_at, pages, self.limit, taken, &cursor_buf);
+        // Every page asked holds a name when its shard has one left (`ownPage`
+        // asks for at least one, and each shard's room holds the largest), so
+        // a merge always moves past the cursor it was asked from.
+        if (r.items.len == 0) if (r.next_cursor) |next| std.debug.assert(!std.mem.eql(u8, next, self.cursor));
 
         // The pages were taken in order, so what was taken is their entries'
         // prefix. A name two shards both list is answered once.
+        var kept: usize = 0;
+        for (entries[0..r.items.len], 0..) |entry, i| {
+            if (entry.len == 0) continue;
+            const dup = for (names[0..kept]) |earlier| {
+                if (std.mem.eql(u8, earlier, names[i])) break true;
+            } else false;
+            if (dup) continue;
+            names[kept] = names[i];
+            entries[kept] = entry;
+            kept += 1;
+        }
+        if (self.op == @backingInt(OpCode.kv_scan)) return answerScan(shard, conn, request_id, names[0..kept], r.next_cursor);
+
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();
         const w = &body.writer;
-        try w.writeInt(u32, 0, .little);
-        var count: u32 = 0;
-        for (entries[0..r.items.len], 0..) |entry, i| {
-            if (entry.len == 0) continue;
-            const dup = for (names[0..i], entries[0..i]) |earlier, e| {
-                if (e.len > 0 and std.mem.eql(u8, earlier, names[i])) break true;
-            } else false;
-            if (dup) continue;
-            try w.writeAll(entry);
-            count += 1;
-        }
+        try w.writeInt(u32, @intCast(kept), .little);
+        for (entries[0..kept]) |entry| try w.writeAll(entry);
         const cursor = r.next_cursor orelse "";
         try w.writeByte(@intFromBool(r.next_cursor != null));
         try w.writeInt(u16, @intCast(cursor.len), .little);
         try w.writeAll(cursor);
-        const bytes = body.written();
-        std.mem.writeInt(u32, bytes[0..4], count, .little);
-        shard.sendOkResponse(conn, request_id, bytes);
+        shard.sendOkResponse(conn, request_id, body.written());
     }
 };
 
-/// Ask the shards from the cursor's for their pages of `req`'s list, and
-/// answer from their merge. This shard's own page is read here.
-pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: u16, limit: u32, cursor: ?[]const u8) void {
+const Scan = table_run.op("kv.scan");
+const ScanNames = Scan.response.field_list[0].T;
+
+/// kv.scan's answer: the names, then the cursor. Each shard's page kept
+/// to its share of one answer's room, so they fit.
+fn answerScan(shard: *Shard, conn: *Connection, request_id: u64, names: []const []const u8, cursor: ?[]const u8) void {
+    const buf = shard.allocator.alloc(u8, ScanNames.max_size) catch return outOfMemoryFor(shard, conn, request_id);
+    defer shard.allocator.free(buf);
+    var b = ScanNames.Builder.init(buf);
+    for (names) |name| if (!(b.add(name) catch false))
+        return shard.sendRefusal(conn, request_id, .internal_error, proto.notRun("internal error: a scan's pages hold more than one answer"));
+    table_run.answer(Scan.response, shard, conn, request_id, .{ .names = b.value(), .cursor = cursor });
+}
+
+/// How `start` left the request.
+pub const Begun = union(enum) {
+    /// The pages are asked for; the merge answers.
+    asked,
+    /// The cursor is past the last shard: the page is empty and the last.
+    past_end,
+    refused: table_run.Refused,
+};
+
+const OUT_OF_MEMORY: table_run.Refused = .{ .status = .internal_error, .refusal = .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" } };
+
+/// Ask the shards from the cursor's for their pages of `req`'s list, the
+/// merge answering. This shard's own page is read here. `limit` is at least
+/// 1: a list's default stands for 0, and kv.scan's schema refuses it.
+pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: u16, limit: u32, cursor: ?[]const u8) Begun {
+    std.debug.assert(limit > 0);
     const begin = NameWalker.startOf(cursor);
-    if (begin.shard >= shard_count) return answerEmpty(shard, conn, req.header.request_id);
+    if (begin.shard >= shard_count) return .past_end;
     // No answer of this server's names a resume point that long.
     if (begin.local_cursor) |lc| if (lc.len > system_ops.MAX_LOCAL_CURSOR)
-        return shard.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: the cursor is longer than any this server sends"));
+        return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: the cursor is longer than any this server sends") } };
     const last = @min(@as(u32, begin.shard) + WINDOW, shard_count);
     const n: u16 = @intCast(last - begin.shard);
     const room: u32 = @intCast(ROOM / n);
     const op = req.header.op_code;
     const Request = PageOp.request;
 
-    const state = shard.allocator.create(Walk) catch return outOfMemory(shard, conn, req);
-    const local_copy = shard.allocator.dupe(u8, begin.local_cursor orelse "") catch {
+    const state = shard.allocator.create(Walk) catch return .{ .refused = OUT_OF_MEMORY };
+    const cursor_copy = shard.allocator.dupe(u8, cursor orelse "") catch {
         shard.allocator.destroy(state);
-        return outOfMemory(shard, conn, req);
+        return .{ .refused = OUT_OF_MEMORY };
     };
-    state.* = .{ .op = op, .start = begin, .local_cursor = local_copy, .limit = limit };
+    state.* = .{ .op = op, .cursor = cursor_copy, .limit = limit };
+    const local_copy: []const u8 = (NameWalker.startOf(if (cursor_copy.len == 0) null else cursor_copy).local_cursor) orelse "";
     var gather_owns_state = false;
     defer if (!gather_owns_state) Walk.free(state, shard.allocator);
 
@@ -295,39 +333,33 @@ pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: 
         const lc: []const u8 = if (first) local_copy else "";
         const skip: u32 = if (first) begin.skip else 0;
         if (s == shard.id) {
-            const page_buf = shard.allocator.alloc(u8, Entries.max_size) catch return outOfMemory(shard, conn, req);
+            const page_buf = shard.allocator.alloc(u8, Entries.max_size) catch return .{ .refused = OUT_OF_MEMORY };
             defer shard.allocator.free(page_buf);
-            const v = ownPage(shard, op, req.namespace, req.key, if (lc.len == 0) null else lc, skip, limit, room, page_buf) catch |err| {
-                const r = refusal(err);
-                return shard.sendRefusal(conn, req.header.request_id, r.status, r.refusal);
-            };
-            const size = Response.encodedSize(v) catch return outOfMemory(shard, conn, req);
-            own = shard.allocator.alloc(u8, size) catch return outOfMemory(shard, conn, req);
+            const v = ownPage(shard, op, req.namespace, req.key, if (lc.len == 0) null else lc, skip, limit, room, page_buf) catch |err|
+                return .{ .refused = refusal(err) };
+            const size = Response.encodedSize(v) catch return .{ .refused = OUT_OF_MEMORY };
+            own = shard.allocator.alloc(u8, size) catch return .{ .refused = OUT_OF_MEMORY };
             _ = Response.encodeInto(own.?, v) catch unreachable; // sized above
             parts[i] = .{ .owner = s, .body = own.? };
         } else {
-            const body = Request.encodeInto(&bodies[i], .{ .op = op, .cursor = lc, .skip = skip, .limit = limit, .room = room }) catch return outOfMemory(shard, conn, req);
+            const body = Request.encodeInto(&bodies[i], .{ .op = op, .cursor = lc, .skip = skip, .limit = limit, .room = room }) catch return .{ .refused = OUT_OF_MEMORY };
             parts[i] = .{ .owner = s, .body = body, .op = @backingInt(OpCode.system_walk_page) };
         }
     }
     gather_owns_state = true;
-    shard.startGather(conn, req, parts[0..n], &Walk.gather_op, state) catch |err| return switch (err) {
-        error.GatherBusy => shard.sendRefusal(conn, req.header.request_id, .overloaded, .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this request was not run — retry" }),
-        error.OutOfMemory => outOfMemory(shard, conn, req),
-    };
-    conn.response_deferred = true;
+    shard.startGather(conn, req, parts[0..n], &Walk.gather_op, state) catch |err| return .{ .refused = switch (err) {
+        error.GatherBusy => .{ .status = .overloaded, .refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many requests across shards are under way; this request was not run — retry" } },
+        error.OutOfMemory => OUT_OF_MEMORY,
+    } };
+    return .asked;
 }
 
-fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64) void {
-    // [count:u32 = 0][has_more:u8 = 0][cursor_len:u16 = 0]
+/// A list's empty last page: [count:u32 = 0][has_more:u8 = 0][cursor_len:u16 = 0].
+pub fn answerEmpty(shard: *Shard, conn: *Connection, request_id: u64) void {
     const empty: [7]u8 = @splat(0);
     shard.sendOkResponse(conn, request_id, &empty);
 }
 
-fn outOfMemory(shard: *Shard, conn: *Connection, req: proto.Request) void {
-    outOfMemoryFor(shard, conn, req.header.request_id);
-}
-
 fn outOfMemoryFor(shard: *Shard, conn: *Connection, request_id: u64) void {
-    shard.sendRefusal(conn, request_id, .internal_error, .{ .reason = .internal, .ran = .no, .message = "internal error: out of memory" });
+    shard.sendRefusal(conn, request_id, OUT_OF_MEMORY.status, OUT_OF_MEMORY.refusal);
 }
