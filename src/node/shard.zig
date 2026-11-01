@@ -14262,6 +14262,61 @@ test "actions: the store is read again a chunk a tick, waking for times that pas
     try std.testing.expectEqual(at(n - 1), std.mem.max(u64, actions.due.items));
 }
 
+test "actions: a dropped time that comes due wakes on its own tick, not when a rebuild reaches its key" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("zzz"), 2, 1);
+    // The dropped time's key sorts after two chunks of others.
+    const base: u64 = 1 << 62;
+    const chunk = ActionsHandler.REBUILD_CHUNK;
+    var run: [16]u8 = undefined;
+    for (0..2 * chunk + 10) |k| _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run, "r{d:0>6}", .{k})), 3 + k, base + 1000 + k);
+    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("zzz", "late"), 3 + 2 * chunk + 10, base);
+    // Not yet due: the empty list starts a rebuild for it.
+    actions.dropped = base;
+    actions.wakeDue(&t.shard, base - 1);
+    try std.testing.expect(actions.rebuilding);
+    // Due while the rebuild is a chunk in.
+    var woke = actions.wake_local;
+    actions.wakeDue(&t.shard, base);
+    try std.testing.expect(actions.rebuilding);
+    try std.testing.expect(actions.wake_local != woke);
+    // And due before any rebuild began.
+    actions.rebuilding = false;
+    actions.dropped = base;
+    woke = actions.wake_local;
+    actions.wakeDue(&t.shard, base);
+    try std.testing.expect(actions.rebuilding);
+    try std.testing.expect(actions.wake_local != woke);
+}
+
+test "actions: a rebuild that fills the list leaves the earliest it dropped" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    const base: u64 = 1 << 62;
+    const chunk = ActionsHandler.REBUILD_CHUNK;
+    var run: [16]u8 = undefined;
+    for (0..chunk + 10) |k| _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run, "r{d:0>6}", .{k})), 2 + k, base + k);
+    // Held, all earlier: room for five more.
+    var i: u64 = 1;
+    while (i <= ActionsHandler.MAX_DUE - 5) : (i += 1) actions.noteDue(i);
+    actions.dropped = base;
+    actions.startRebuild();
+    actions.stepRebuild(&t.shard, 0);
+    actions.stepRebuild(&t.shard, 0);
+    try std.testing.expect(!actions.rebuilding);
+    try std.testing.expectEqual(ActionsHandler.MAX_DUE, actions.due.items.len);
+    try std.testing.expectEqual(@as(?u64, base + 5), actions.dropped);
+}
+
 test "actions: a list rebuilt once it drains keeps what it held, reading only what it dropped" {
     var t: ActionsTest = undefined;
     try t.init();

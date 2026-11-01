@@ -1741,6 +1741,9 @@ pub const ActionsHandler = struct {
             }
             ActionsHandler.wakeWorkers(shard);
         }
+        // A time not held may have come due: the earliest dropped, or one a
+        // running rebuild has yet to read. Woken for each tick until read.
+        if ((self.rebuilding and self.rebuild_from <= now) or (self.dropped orelse std.math.maxInt(u64)) <= now) ActionsHandler.wakeWorkers(shard);
         const first = self.dropped orelse return;
         if (!self.rebuilding and (first <= now or d.items.len < MAX_DUE / 2)) {
             self.startRebuild();
