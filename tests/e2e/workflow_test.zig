@@ -919,31 +919,12 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
         std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace),
     });
 
-    if (!await_result.succeeded()) {
-        std.debug.print("[TEST] Worker await failed - workflow may be using stub mode\n", .{});
-        // If await fails, check if workflow completed via stub mode
-        var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
-        defer status.deinit();
-        try stdx.testing.assertSucceeded(status);
-        // Stub mode returns immediate success, so workflow should be completed
-        return;
-    }
-
+    // The workflow's step invoked the action: a worker takes its run.
+    try stdx.testing.assertSucceeded(await_result);
     const output = std.mem.trim(u8, await_result.stdout, &std.ascii.whitespace);
-    if (output.len == 0 or std.mem.eql(u8, output, "(no tasks)")) {
-        std.debug.print("[TEST] No task received - checking workflow status\n", .{});
-        var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
-        defer status.deinit();
-        try stdx.testing.assertSucceeded(status);
-        return;
-    }
-
-    // 6. Extract task_id from await output and complete it
-    // The await output contains the task info - we need to parse the task_id
-    // For now, use the run_id pattern from the action result
     const task_id = extractTaskId(output) orelse {
-        std.debug.print("[TEST] Could not extract task_id from await output\n", .{});
-        return;
+        std.debug.print("[TEST] no task in await output: '{s}'\n", .{output});
+        return error.AssertionFailed;
     };
 
     std.debug.print("[TEST] Worker completing task: {s}\n", .{task_id});
@@ -956,9 +937,8 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
     defer complete_result.deinit();
     try stdx.testing.assertSucceeded(complete_result);
 
-    // 7. Give the workflow a moment to process completion, then check status
-    @import("stdx").time.sleep(100 * std.time.ns_per_ms);
-
+    // 7. The run resumes once the completion applies, and completes.
+    try expectRunCompletes(ctx, run_id, 5000);
     var final_status = try ctx.cli.run(&.{ "workflow", "status", run_id });
     defer final_status.deinit();
     try stdx.testing.assertSucceeded(final_status);
@@ -969,7 +949,9 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
 
     // 8. Query the action run to verify the workflow created a visible run
     //    in the actions handler via invokeByName.
-    var action_status = try ctx.cli.run(&.{ "action", "status", task_id });
+    // A task id starts with its run's id.
+    const action_run = task_id[0 .. std.mem.indexOfScalar(u8, task_id, ':') orelse task_id.len];
+    var action_status = try ctx.cli.run(&.{ "action", "status", action_run });
     defer action_status.deinit();
     try stdx.testing.assertSucceeded(action_status);
 
@@ -978,6 +960,65 @@ test "e2e/workflow: full workflow -> action -> worker integration" {
 
     // The action run should be completed (worker marked it done in step 6)
     try stdx.testing.assertContains(action_status, "completed");
+}
+
+/// Waits up to `ms` for workflow run `run_id` to complete.
+fn expectRunCompletes(ctx: anytype, run_id: []const u8, ms: u64) !void {
+    for (0..ms / 100) |_| {
+        var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
+        defer status.deinit();
+        if (status.exit_code == 0 and status.contains("completed")) return;
+        @import("stdx").time.sleep(100 * std.time.ns_per_ms);
+    }
+    var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
+    defer status.deinit();
+    std.debug.print("[TEST] run {s} never completed: {s}\n", .{ run_id, status.stdout });
+    return error.AssertionFailed;
+}
+
+// On a node of several shards, a workflow run and the action its step
+// invokes are often on different shards: the step resumes when that shard
+// says the run finished.
+test "e2e/workflow: on many shards, a step whose action another shard owns resumes its run when the action completes" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    const N = 8;
+    var name_bufs: [N][16]u8 = undefined;
+    var run_bufs: [N][16]u8 = undefined;
+    var names: [N][]const u8 = undefined;
+    var runs: [N][]const u8 = undefined;
+    for (0..N) |i| {
+        const action = try std.fmt.bufPrint(&name_bufs[i], "xs-act-{d}", .{i});
+        names[i] = action;
+        try ctx.exec(&.{ "action", "register", action });
+        var builder = YamlBuilder.init(testing.allocator);
+        defer builder.deinit();
+        var wf_buf: [16]u8 = undefined;
+        const wf = try std.fmt.bufPrint(&wf_buf, "xs-wf-{d}", .{i});
+        _ = builder.workflow(wf, "1.0.0");
+        const target = try std.fmt.allocPrint(testing.allocator, "@actions/{s}", .{action});
+        defer testing.allocator.free(target);
+        _ = builder.start(target).onSuccess("flo.Completed").onFailure("flo.Failed");
+        const yaml = try builder.build();
+        defer testing.allocator.free(yaml);
+        var file_buf: [32]u8 = undefined;
+        const path = try writeTempYaml(testing.allocator, yaml, try std.fmt.bufPrint(&file_buf, "xs-wf-{d}.yaml", .{i}));
+        defer cleanupTempFile(testing.allocator, path);
+        try ctx.exec(&.{ "workflow", "create", "-f", path });
+        const run_id = try std.fmt.bufPrint(&run_bufs[i], "xs-run-{d}", .{i});
+        runs[i] = run_id;
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+    }
+    for (names) |action| {
+        var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "xs-w", "--block", "5000" });
+        defer taken.deinit();
+        try stdx.testing.assertSucceeded(taken);
+        const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+        try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "xs-w", "--result", "{}" });
+    }
+    // A run id the client chose names no shard: the action's shard is told
+    // which, so the step resumes at once, never at a 5 s ask.
+    for (runs) |run_id| try expectRunCompletes(ctx, run_id, 1500);
 }
 
 /// Extract task ID from worker await output.
@@ -3027,7 +3068,7 @@ test "e2e/workflow: steps.outcome resolves in input mapping" {
     defer a1.deinit();
     try stdx.testing.assertSucceeded(a1);
     const t1 = extractTaskId(a1.stdoutTrimmed()) orelse return error.AssertionFailed;
-    try ctx.exec(&.{ "worker", "complete", t1, "--worker-id", "aw", "--action", "audit-s1", "--result", "{}" });
+    try ctx.exec(&.{ "worker", "complete", t1, "--worker-id", "aw", "--result", "{}" });
 
     @import("stdx").time.sleep(300 * std.time.ns_per_ms);
 

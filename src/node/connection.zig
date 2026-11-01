@@ -291,6 +291,11 @@ pub const Connection = struct {
     write_overflow: bool = false,
     /// What `reserveWrite` handed out and `commitWrite` hasn't taken back.
     reserved: ?usize = null,
+    /// Bytes ever queued to send, flushed or not, and of them those queued
+    /// as deferred answers: whether a request answered itself while it ran,
+    /// though a deferred answer's flush may have sent that answer already.
+    bytes_queued: u64 = 0,
+    deferred_queued: u64 = 0,
 
     /// Set when the connection must close; the shard closes it once the
     /// tick's events are handled, never while code up the stack still holds
@@ -442,7 +447,9 @@ pub const Connection = struct {
                 return 0;
             };
         }
-        return self.write_buf.write(data);
+        const n = self.write_buf.write(data);
+        self.bytes_queued += n;
+        return n;
     }
 
     /// Room for `n` bytes after the unsent ones, to write an answer in place
@@ -473,6 +480,7 @@ pub const Connection = struct {
     pub fn commitWrite(self: *Connection, used: usize) void {
         std.debug.assert(used <= self.reserved.?);
         self.write_buf.write_pos += used;
+        self.bytes_queued += used;
         self.reserved = null;
     }
 

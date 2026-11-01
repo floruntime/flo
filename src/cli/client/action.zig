@@ -158,143 +158,30 @@ pub fn workerRegister(
     return client.sendRequest(.worker_register, namespace, worker_id, value);
 }
 
-/// Await task (blocking)
-/// key = worker_id
-/// value = [count:u32][task_types...] + the block_ms option
-/// block_ms: null = the server's 30 s default, 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
-pub fn workerAwait(
-    client: *Client,
-    namespace: []const u8,
-    worker_id: []const u8,
-    task_types: []const []const u8,
-    block_ms: ?u32,
-) !Response {
-    var value_buf: [4096]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    // Write task_types count
-    try writer.writeInt(u32, @intCast(task_types.len), .little);
-
-    // Write each task type
-    for (task_types) |tt| {
-        try writer.writeInt(u16, @intCast(tt.len), .little);
-        try writer.writeAll(tt);
-    }
-
-    const value = fbs.buffered();
-
-    // Build options for block_ms
-    var options_buf: [32]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
-
-    if (block_ms) |b| {
-        try builder.addU32(.block_ms, b);
-        // Read for as long as the server waits, plus 5 s; 0 does not wait.
-        if (b > 0) client.setReadTimeoutSec(b / 1000 + 5);
-    }
-
-    return client.sendRequestWithOptions(.action_await, namespace, worker_id, value, builder.getOptions());
+/// Wait for a task of one of `task_types`, `block_ms` at most (null: the
+/// server's 30 s; 0: answer at once).
+pub fn workerAwait(client: *Client, namespace: []const u8, worker_id: []const u8, task_types: []const []const u8, block_ms: ?u32) !Response {
+    var names_buf: [action_ops.ActionNames.max_size]u8 = undefined;
+    const names = action_ops.actionNames(&names_buf, task_types) catch return error.InvalidRequest;
+    const ms: u64 = block_ms orelse 30_000;
+    // Read for as long as the server waits, plus 5 s.
+    if (ms > 0) client.setReadTimeoutSec(@intCast(ms / 1000 + 5));
+    return client.call(action_ops.op("action.await"), namespace, worker_id, .{ .actions = names, .block_ms = ms, .request_key = null });
 }
 
-/// Touch task (extend lease)
-/// key = worker_id
-/// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][extend_ms:u32]
-pub fn workerTouch(
-    client: *Client,
-    namespace: []const u8,
-    worker_id: []const u8,
-    action_name: []const u8,
-    task_id: []const u8,
-    extend_ms: ?u32,
-) !Response {
-    var value_buf: [512]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    // Write action_name
-    try writer.writeInt(u16, @intCast(action_name.len), .little);
-    try writer.writeAll(action_name);
-
-    // Write task_id
-    try writer.writeInt(u16, @intCast(task_id.len), .little);
-    try writer.writeAll(task_id);
-
-    // Write extend_ms
-    try writer.writeInt(u32, extend_ms orelse 30_000, .little);
-
-    const value = fbs.buffered();
-    return client.sendRequest(.action_touch, namespace, worker_id, value);
+/// Keep task `id`: its lease runs on.
+pub fn workerTouch(client: *Client, namespace: []const u8, worker_id: []const u8, id: action_ops.TaskId) !Response {
+    return client.call(action_ops.op("action.touch"), namespace, id.run, .{ .action = id.action, .worker = worker_id, .deliveries = id.deliveries, .term = id.term, .index = id.index });
 }
 
-/// Complete task successfully
-/// key = worker_id
-/// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][outcome_len:u16][outcome][result_len:u16][result]
-pub fn workerComplete(
-    client: *Client,
-    namespace: []const u8,
-    worker_id: []const u8,
-    action_name: []const u8,
-    task_id: []const u8,
-    result: []const u8,
-) !Response {
-    var value_buf: [8192]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    // Write action_name
-    try writer.writeInt(u16, @intCast(action_name.len), .little);
-    try writer.writeAll(action_name);
-
-    // Write task_id
-    try writer.writeInt(u16, @intCast(task_id.len), .little);
-    try writer.writeAll(task_id);
-
-    // Write outcome ("success")
-    const outcome = "success";
-    try writer.writeInt(u16, @intCast(outcome.len), .little);
-    try writer.writeAll(outcome);
-
-    // Write result
-    try writer.writeInt(u16, @intCast(result.len), .little);
-    try writer.writeAll(result);
-
-    const value = fbs.buffered();
-    return client.sendRequest(.action_complete, namespace, worker_id, value);
+/// Complete task `id` with `result`.
+pub fn workerComplete(client: *Client, namespace: []const u8, worker_id: []const u8, id: action_ops.TaskId, outcome: []const u8, result: []const u8) !Response {
+    return client.call(action_ops.op("action.complete"), namespace, id.run, .{ .action = id.action, .worker = worker_id, .deliveries = id.deliveries, .term = id.term, .index = id.index, .outcome = outcome, .result = result });
 }
 
-/// Fail task
-/// key = worker_id
-/// value = [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
-pub fn workerFail(
-    client: *Client,
-    namespace: []const u8,
-    worker_id: []const u8,
-    action_name: []const u8,
-    task_id: []const u8,
-    error_message: []const u8,
-    retry: bool,
-) !Response {
-    var value_buf: [8192]u8 = undefined;
-    var fbs: std.Io.Writer = .fixed(&value_buf);
-    const writer = &fbs;
-
-    // Write action_name
-    try writer.writeInt(u16, @intCast(action_name.len), .little);
-    try writer.writeAll(action_name);
-
-    // Write task_id
-    try writer.writeInt(u16, @intCast(task_id.len), .little);
-    try writer.writeAll(task_id);
-
-    // Write retry flag
-    try writer.writeByte(if (retry) 1 else 0);
-
-    // Write error_message
-    try writer.writeAll(error_message);
-
-    const value = fbs.buffered();
-    return client.sendRequest(.action_fail, namespace, worker_id, value);
+/// Fail task `id`; with `retry` its run is ready again while attempts are left.
+pub fn workerFail(client: *Client, namespace: []const u8, worker_id: []const u8, id: action_ops.TaskId, error_message: []const u8, retry: bool) !Response {
+    return client.call(action_ops.op("action.fail"), namespace, id.run, .{ .action = id.action, .worker = worker_id, .deliveries = id.deliveries, .term = id.term, .index = id.index, .retry = retry, .abandoned = false, .delay_ms = 0, .@"error" = error_message });
 }
 
 /// A page of the namespace's workers after `cursor` (empty: from the start).

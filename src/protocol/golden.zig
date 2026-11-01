@@ -49,7 +49,6 @@ pub const NO_VECTOR_YET = [_]proto.OpCode{
     .ts_write,                       .ts_read,             .ts_query,                  .ts_floql,
     .ts_list,                        .ts_delete,           .ts_retention,              .action_register,
     .action_invoke,                  .action_list,         .action_list_runs,          .action_delete,
-    .action_await,                   .action_complete,     .action_fail,               .action_touch,
     .worker_register,                .worker_heartbeat,    .worker_deregister,         .worker_drain,
     .workflow_create,                .workflow_start,      .workflow_signal,           .workflow_cancel,
     .workflow_status,                .workflow_history,    .workflow_list_runs,        .workflow_get_definition,
@@ -59,7 +58,7 @@ pub const NO_VECTOR_YET = [_]proto.OpCode{
 
 /// The most `NO_VECTOR_YET` may hold: lower it as the list shrinks, so an
 /// op added to the list fails the build.
-const NO_VECTOR_YET_CAP = 68;
+const NO_VECTOR_YET_CAP = 64;
 
 /// Every vector's name and bytes, for the table hash.
 pub fn hash(h: *std.hash.Wyhash) void {

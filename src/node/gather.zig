@@ -39,6 +39,9 @@ pub const Op = struct {
     merge: *const fn (shard: *Shard, conn: *Connection, request_id: u64, state: *anyopaque, bodies: []const []const u8) anyerror!void,
     /// Frees what the op kept. Called exactly once, however the gather ends.
     deinit: *const fn (state: *anyopaque, allocator: Allocator) void,
+    /// Every part answered ok, but the client went away first: for an op
+    /// whose parts took something (an await's task) to hand it back.
+    orphaned: ?*const fn (shard: *Shard, state: *anyopaque, bodies: []const []const u8) void = null,
 };
 
 /// One part of a gathered read. A gather has one part per owner at most:

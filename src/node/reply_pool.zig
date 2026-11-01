@@ -86,6 +86,9 @@ pub const ReplyPool = struct {
         /// A part of a gather (`gather.zig`): its answer goes there, not
         /// to the client.
         gather: ?GatherPart = null,
+        /// The request's op: an answer that took something (a task) and
+        /// found no one to take it is handed back by op.
+        op: u16 = 0,
     };
 
     pub const Ticket = struct { slot: u16, gen: u32 };
@@ -95,6 +98,12 @@ pub const ReplyPool = struct {
     pub const GatherPart = struct { index: u16, gen: u32, part: u16 };
 
     /// Mark a slot just taken as a gather's part.
+    pub fn tagOp(self: *ReplyPool, ticket: Ticket, op: u16) void {
+        const slot = &self.slots[ticket.slot];
+        std.debug.assert(slot.active and slot.gen == ticket.gen);
+        slot.op = op;
+    }
+
     pub fn tagGather(self: *ReplyPool, ticket: Ticket, part: GatherPart) void {
         const slot = &self.slots[ticket.slot];
         std.debug.assert(slot.active and slot.gen == ticket.gen);

@@ -232,7 +232,7 @@ pub const WorkerHandler = struct {
                 if (shard.worker_handler.handleDrain(req)) {
                     // Its parked awaits are answered now, not when they time
                     // out: they park here, where its registration is.
-                    shard.waiter_pool.notifyAny(.action_await, ActionsHandler.resolveActionAwaitFn, @ptrCast(shard));
+                    ActionsHandler.wakeLocal(shard);
                     shard.sendOkResponse(conn, req.header.request_id, "");
                 } else {
                     shard.sendErrorResponse(conn, req.header.request_id, .not_found, "worker not found");

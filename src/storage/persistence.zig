@@ -15,7 +15,7 @@
 //!
 //! Client write: propose, then park with the op's answer function, which
 //! reads only the entry's `Result`:
-//!   const p = try persistence.proposeEntry(shard, .action_register, Flags.NONE, namespace, key, value);
+//!   const p = try persistence.proposeEntry(shard, .processing_submit, Flags.NONE, namespace, key, value);
 //!   shard.park(conn, req, p, answerRegister);
 //!
 

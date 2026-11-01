@@ -217,9 +217,44 @@ test "e2e/action/worker: invoke and await task" {
         "2000",
     });
     defer await_result.deinit();
-    const want = try std.fmt.allocPrint(testing.allocator, "Task: {s}\nAction: {s}\nAttempt: 1\nPayload: {{\"task\":\"process-data\"}}\n", .{ run_id, action_name });
+    // Its task id names the run's first delivery: the term and log index
+    // its deliver was made at, then the action.
+    const id = action_ops.TaskId.parse(taskIdOf(await_result.stdout) orelse return error.NoTask) orelse return error.NoTask;
+    try testing.expect(id.term >= 1 and id.index >= 1);
+    const want = try std.fmt.allocPrint(testing.allocator, "Task: {s}:1:{d}:{d}:{s}\nAction: {s}\nAttempt: 1\nPayload: {{\"task\":\"process-data\"}}\n", .{ run_id, id.term, id.index, action_name, action_name });
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, await_result.stdout);
+}
+
+test "e2e/action/worker: a touch keeps a task, and a complete may name its outcome, at most 256 bytes" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "kept" });
+    const run_id = extractRunId(try ctx.execCapture(&.{ "action", "invoke", "kept", "{}" })) orelse return error.NoRunId;
+    var taken = try ctx.cli.run(&.{ "worker", "await", "kept", "--worker-id", "kw", "--block", "5000" });
+    defer taken.deinit();
+    try testing.expectEqual(@as(u8, 0), taken.exit_code);
+    const id = taskIdOf(taken.stdout) orelse return error.NoTask;
+
+    var touch = try ctx.cli.run(&.{ "worker", "touch", id, "--worker-id", "kw" });
+    defer touch.deinit();
+    try testing.expectEqual(@as(u8, 0), touch.exit_code);
+    try testing.expect(std.mem.startsWith(u8, touch.stdout, "Expires at: "));
+    // Another worker can't keep it.
+    var other = try ctx.cli.run(&.{ "worker", "touch", id, "--worker-id", "someone-else" });
+    defer other.deinit();
+    try testing.expectEqual(@as(u8, 3), other.exit_code);
+
+    const long: [257]u8 = @splat('o');
+    var too_long = try ctx.cli.run(&.{ "worker", "complete", id, "--worker-id", "kw", "--outcome", &long });
+    defer too_long.deinit();
+    try testing.expectEqual(@as(u8, 2), too_long.exit_code);
+    var done = try ctx.cli.run(&.{ "worker", "complete", id, "--worker-id", "kw", "--outcome", "approved", "--result", "{\"ok\":1}" });
+    defer done.deinit();
+    try testing.expectEqual(@as(u8, 0), done.exit_code);
+    var status = try ctx.cli.run(&.{ "action", "status", run_id });
+    defer status.deinit();
+    try testing.expect(status.contains("status: completed\n"));
 }
 
 // =============================================================================
@@ -279,13 +314,17 @@ test "e2e/worker: complete non-existent task" {
     // Try to complete a non-existent task
     var result = try ctx.cli.run(&.{
         "worker",      "complete",     "nonexistent-task-id",
-        "--worker-id", "error-worker", "--action",
-        "any",         "--result",     "{}",
+        "--worker-id", "error-worker", "--result",
+        "{}",
     });
     defer result.deinit();
 
-    // The task names no run: not found.
-    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    // Not a task id await printed: refused before anything is sent.
+    try testing.expectEqual(@as(u8, 2), result.exit_code);
+    // One that names no run: not found.
+    var missing = try ctx.cli.run(&.{ "worker", "complete", "act-0:1:1:1:any", "--worker-id", "error-worker", "--result", "{}" });
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
 }
 
 test "e2e/worker: fail non-existent task" {
@@ -298,18 +337,28 @@ test "e2e/worker: fail non-existent task" {
     // Try to fail a non-existent task
     var result = try ctx.cli.run(&.{
         "worker",      "fail",           "nonexistent-task-id-2",
-        "--worker-id", "error-worker-2", "--action",
-        "any",         "--error",        "test error",
+        "--worker-id", "error-worker-2", "--error",
+        "test error",
     });
     defer result.deinit();
 
-    // The task names no run: not found.
-    try testing.expectEqual(@as(u8, 1), result.exit_code);
+    // Not a task id await printed: refused before anything is sent.
+    try testing.expectEqual(@as(u8, 2), result.exit_code);
+    var missing = try ctx.cli.run(&.{ "worker", "fail", "act-0:1:1:1:any", "--worker-id", "error-worker-2", "--error", "test error" });
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.exit_code);
 }
 
 // =============================================================================
 // Full Result Flow (SDK-Ready Tests)
 // =============================================================================
+
+/// The task id an await printed ("Task: {id}").
+fn taskIdOf(output: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, output, "Task: ") orelse return null) + "Task: ".len;
+    const end = std.mem.indexOfScalarPos(u8, output, start, '\n') orelse output.len;
+    return if (end > start) output[start..end] else null;
+}
 
 /// Helper to extract run_id from invoke output ("Result: {run_id}")
 fn extractRunId(output: []const u8) ?[]const u8 {
@@ -430,11 +479,11 @@ test "e2e/action/worker: full result flow - invoke, await, complete, verify" {
     }
 
     // 6. Worker completes the task with result
-    std.debug.print("\n[TEST] Completing task {s} with result: {s}\n", .{ run_id, result_payload });
+    const task_id = taskIdOf(output) orelse return error.TestFailed;
     var complete_result = try ctx.cli.run(&.{
-        "worker",      "complete", run_id,
-        "--worker-id", worker_id,  "--action",
-        action_name,   "--result", result_payload,
+        "worker",       "complete", task_id,
+        "--worker-id",  worker_id,  "--result",
+        result_payload,
     });
     defer complete_result.deinit();
 
@@ -507,10 +556,9 @@ test "e2e/action/worker: worker fails task with retry" {
 
     // 5. Worker fails the task (with retry enabled)
     var fail_result = try ctx.cli.run(&.{
-        "worker",      "fail",    run_id,
-        "--worker-id", worker_id, "--action",
-        action_name,   "--error", "Temporary failure",
-        "--retry",
+        "worker",            "fail",    taskIdOf(await_result.stdout) orelse return error.TestFailed,
+        "--worker-id",       worker_id, "--error",
+        "Temporary failure", "--retry",
     });
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
@@ -562,9 +610,9 @@ test "e2e/action/worker: worker fails task permanently" {
 
     // 5. Worker fails the task (NO retry - permanent failure)
     var fail_result = try ctx.cli.run(&.{
-        "worker",      "fail",    run_id,
-        "--worker-id", worker_id, "--action",
-        action_name,   "--error", "Permanent failure: invalid input",
+        "worker",                           "fail",    taskIdOf(await_result.stdout) orelse return error.TestFailed,
+        "--worker-id",                      worker_id, "--error",
+        "Permanent failure: invalid input",
         // Note: no --retry flag
     });
     defer fail_result.deinit();
@@ -770,10 +818,12 @@ test "e2e/action/runs: completed run shows completed status" {
     }
 
     // 4. Worker completes the task
+    // The task is the run's delivery.
+    try testing.expect(std.mem.startsWith(u8, taskIdOf(await_result.stdout) orelse "", run_id));
     var complete_result = try ctx.cli.run(&.{
-        "worker",      "complete", run_id,
-        "--worker-id", worker_id,  "--action",
-        action_name,   "--result", "{\"done\":true}",
+        "worker",          "complete", taskIdOf(await_result.stdout) orelse return error.TestFailed,
+        "--worker-id",     worker_id,  "--result",
+        "{\"done\":true}",
     });
     defer complete_result.deinit();
     try stdx.testing.assertSucceeded(complete_result);
@@ -1214,8 +1264,8 @@ test "e2e/action: each await on one connection gets its own task and nothing els
     const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, ctx.getPort(), 1000);
     defer _ = std.c.close(fd);
 
-    // await value: [count:u32][type_len:u16][type]
-    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 4, 0 } ++ "once";
+    var await_buf: [64]u8 = undefined;
+    const await_value = try awaitBody(&await_buf, "once");
     var inputs: [2][]const u8 = undefined;
     var buf: [4096]u8 = undefined;
     var copies: [2][64]u8 = undefined;
@@ -1229,7 +1279,7 @@ test "e2e/action: each await on one connection gets its own task and nothing els
         const r = (try readFrame(fd, &buf, 3000)) orelse return error.NoAnswer;
         try testing.expectEqual(@as(u64, 100 + i), r.header.request_id);
         try testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
-        // The input closes the assignment body.
+        // The input closes the task.
         const input = if (std.mem.endsWith(u8, r.data, "first-input")) "first-input" else if (std.mem.endsWith(u8, r.data, "second-input")) "second-input" else return error.NoTask;
         @memcpy(copies[i][0..input.len], input);
         inputs[i] = copies[i][0..input.len];
@@ -1253,14 +1303,20 @@ fn rawCall(fd: std.c.fd_t, op: proto.OpCode, key: []const u8, value: []const u8,
     return (try readFrame(fd, buf, 5000)) orelse error.NoAnswer;
 }
 
-/// The payload that closes a task assignment with no caller.
+const action_ops = @import("src").protocol.action_ops;
+
+/// An await's body naming `action`, waiting the server's default.
+fn awaitBody(buf: []u8, action: []const u8) ![]const u8 {
+    var names: [action_ops.ActionName.max_size]u8 = undefined;
+    return action_ops.op("action.await").request.encodeInto(buf, .{ .actions = try action_ops.actionNames(&names, &.{action}), .block_ms = 30_000, .request_key = null });
+}
+
+/// The input of the task an await's answer carries, which must have no caller.
 fn assignedPayload(data: []const u8) ![]const u8 {
-    var pos: usize = 0;
-    pos += 2 + std.mem.readInt(u16, data[pos..][0..2], .little); // task id
-    pos += 2 + std.mem.readInt(u16, data[pos..][0..2], .little); // task type
-    pos += 8 + 4; // created_at, attempt
-    try testing.expectEqual(@as(u8, 0), data[pos]); // has_caller
-    return data[pos + 1 ..];
+    var diag: @import("src").protocol.schema.Diagnostic = .{};
+    const task = (try action_ops.op("action.await").response.decodeAll(data, &diag)).task orelse return error.NoTask;
+    try testing.expect(task.caller_run == null);
+    return task.input;
 }
 
 test "e2e/action: an invoke value is a has_labels byte, the labels if set, then the input, byte for byte" {
@@ -1281,8 +1337,8 @@ test "e2e/action: an invoke value is a has_labels byte, the labels if set, then 
     const plain = try rawCall(fd, .action_invoke, "layout", "\x00z", &buf);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), plain.header.status);
 
-    // await value: [count:u32][type_len:u16][type]
-    const await_value: []const u8 = [_]u8{ 1, 0, 0, 0, 6, 0 } ++ "layout";
+    var await_buf: [64]u8 = undefined;
+    const await_value = try awaitBody(&await_buf, "layout");
     const to_plain = try rawCall(fd, .action_await, "w-plain", await_value, &buf);
     try testing.expectEqual(@backingInt(proto.StatusCode.ok), to_plain.header.status);
     try testing.expectEqualStrings("z", try assignedPayload(to_plain.data));
@@ -1307,7 +1363,8 @@ test "e2e/action: a task held past its action's timeout goes back to pending, th
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "action", "register", "slow-task", "--timeout", "1000", "--retries", "2" });
+    // The shortest lease an action may have.
+    try ctx.exec(&.{ "action", "register", "slow-task", "--timeout", "5000", "--retries", "2" });
     try ctx.exec(&.{ "worker", "register", "slow-worker", "slow-task" });
     const run_id = extractRunId(try ctx.execCapture(&.{ "action", "invoke", "slow-task", "{}" })) orelse return error.TestFailed;
 
@@ -1317,8 +1374,8 @@ test "e2e/action: a task held past its action's timeout goes back to pending, th
         defer taken.deinit();
         try testing.expectEqual(@as(u8, 0), taken.exit_code);
         try testing.expect(taken.contains(run_id));
-        // The timeout plus a full extra sweep of slack.
-        stdx.time.sleep(3500 * std.time.ns_per_ms);
+        // The lease, plus slack for the duty's next tick.
+        stdx.time.sleep(7000 * std.time.ns_per_ms);
 
         var status = try ctx.cli.run(&.{ "action", "status", run_id });
         defer status.deinit();
