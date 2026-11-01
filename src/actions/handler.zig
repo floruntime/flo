@@ -170,17 +170,19 @@ pub const ActionsHandler = struct {
     /// memory; a new leader reads them from the store again.
     due: std.ArrayListUnmanaged(u64) = .empty,
     /// Reading due times from the store, `REBUILD_CHUNK` keys a tick: the
-    /// key it stopped after, or none at the start.
+    /// key it stopped after, or none at the start, and the earliest time
+    /// it looks for (those before it are held).
     rebuilding: bool = false,
     rebuild_after: std.ArrayListUnmanaged(u8) = .empty,
+    rebuild_from: u64 = 0,
     /// Counts wakes for runs ready here, and wakes from other shards: an
     /// await asking other shards when one it could use came asks again
     /// rather than wait out its block time.
     wake_local: u64 = 0,
     wake_peer: u64 = 0,
-    /// Whether later delays were dropped while `due` was full: it is read
-    /// from the store again once it drains.
-    due_full: bool = false,
+    /// The earliest due time dropped while `due` was full, if any: every
+    /// time held is before it, and any at or after it is dropped too.
+    dropped: ?u64 = null,
     /// Awaits woken this pass, to run again once the pass is over.
     reruns: std.ArrayListUnmanaged(Rerun) = .empty,
     /// How runs a workflow here waits on ended, sent by their own shards;
@@ -1351,19 +1353,21 @@ pub const ActionsHandler = struct {
 
     /// Keep `due_ns` if it is among the earliest `MAX_DUE`.
     pub fn noteDue(self: *ActionsHandler, due_ns: u64) void {
+        if (self.dropped) |first| if (due_ns >= first) return;
         const d = &self.due;
         if (d.items.len < MAX_DUE) {
-            d.append(self.allocator, due_ns) catch {
-                self.due_full = true;
-                return;
-            };
+            d.append(self.allocator, due_ns) catch return self.drop(due_ns);
             dueSiftUp(d.items, d.items.len - 1);
             return;
         }
-        self.due_full = true;
-        if (due_ns >= d.items[0]) return;
+        if (due_ns >= d.items[0]) return self.drop(due_ns);
+        self.drop(d.items[0]);
         d.items[0] = due_ns;
         dueSiftDown(d.items, 0);
+    }
+
+    fn drop(self: *ActionsHandler, due_ns: u64) void {
+        self.dropped = @min(self.dropped orelse due_ns, due_ns);
     }
 
     fn dueSiftUp(h: []u64, start: usize) void {
@@ -1389,33 +1393,41 @@ pub const ActionsHandler = struct {
         }
     }
 
-    /// Start reading the due times of ready runs from the store again.
+    /// Start reading the due times dropped from the store again: all of
+    /// them, the list cleared, if the earliest dropped is 0.
     pub fn startRebuild(self: *ActionsHandler) void {
-        self.due.clearRetainingCapacity();
-        self.due_full = false;
+        self.rebuild_from = self.dropped orelse return;
+        if (self.rebuild_from == 0) self.due.clearRetainingCapacity();
+        self.dropped = null;
         self.rebuilding = true;
         self.rebuild_after.clearRetainingCapacity();
     }
 
     /// Read the next `REBUILD_CHUNK` ready keys' due times, if rebuilding:
-    /// a large backlog is read over several ticks, never in one.
+    /// a large backlog is read over several ticks, never in one. A time
+    /// that passed while it read is woken for as it is found.
     pub fn stepRebuild(self: *ActionsHandler, shard: *Shard, now: u64) void {
         if (!self.rebuilding) return;
         var it = if (self.rebuild_after.items.len == 0) readOf(shard).range(machine.Ready, "") else readOf(shard).rangeAfter(machine.Ready, "", self.rebuild_after.items);
         var read: usize = 0;
+        var passed = false;
+        defer if (passed) ActionsHandler.wakeWorkers(shard);
         while (it.next() catch null) |item| {
             const k = item.key;
             const rest = k[1 + @as(usize, k[0]) ..];
             if (std.mem.indexOfScalar(u8, rest, 0)) |sep| if (rest.len >= sep + 9) {
                 const due = std.mem.readInt(u64, rest[sep + 1 ..][0..8], .big);
-                if (due > now) self.noteDue(due);
+                if (due >= self.rebuild_from) {
+                    if (due > now) self.noteDue(due) else passed = true;
+                }
             };
             read += 1;
             if (read == REBUILD_CHUNK) {
                 self.rebuild_after.clearRetainingCapacity();
                 self.rebuild_after.appendSlice(self.allocator, k) catch {
+                    // Read it all again next tick.
                     self.rebuilding = false;
-                    self.due_full = true;
+                    self.dropped = 0;
                 };
                 return;
             }
@@ -1669,6 +1681,7 @@ pub const ActionsHandler = struct {
             self.duty_since_ns = now;
             // Runs ready before this term had no leader to wake for them,
             // and those due later none to note when.
+            self.dropped = 0;
             self.startRebuild();
             self.stepRebuild(shard, now);
             ActionsHandler.wakeWorkers(shard);
@@ -1705,10 +1718,10 @@ pub const ActionsHandler = struct {
         return n;
     }
 
-    /// Wake awaits once a delayed retry is due. With later ones dropped,
-    /// the store is read again once the list drains to half: what it keeps
-    /// all come due before any it dropped.
-    fn wakeDue(self: *ActionsHandler, shard: *Shard, now: u64) void {
+    /// Wake awaits once a delayed retry is due. With some dropped, the
+    /// store is read again for them once the list drains to half, or the
+    /// earliest dropped comes due (0 when a read must start over).
+    pub fn wakeDue(self: *ActionsHandler, shard: *Shard, now: u64) void {
         self.stepRebuild(shard, now);
         const d = &self.due;
         var woke = false;
@@ -1728,7 +1741,8 @@ pub const ActionsHandler = struct {
             }
             ActionsHandler.wakeWorkers(shard);
         }
-        if (self.due_full and !self.rebuilding and d.items.len < MAX_DUE / 2) {
+        const first = self.dropped orelse return;
+        if (!self.rebuilding and (first <= now or d.items.len < MAX_DUE / 2)) {
             self.startRebuild();
             self.stepRebuild(shard, now);
         }
@@ -1778,7 +1792,7 @@ pub const ActionsHandler = struct {
         freeKeys(self.allocator, &self.reserved);
         freeKeys(self.allocator, &self.extending);
         self.due.clearRetainingCapacity();
-        self.due_full = false;
+        self.dropped = null;
         self.rebuilding = false;
         self.expiring = null;
         self.duty_term = 0;

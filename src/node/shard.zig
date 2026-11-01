@@ -14176,8 +14176,8 @@ test "actions: delayed retries' due times are read from the store on a new term,
     _ = try t.ok(.action_fail, run_id, try table_run.op("action.fail").request.encodeInto(&body, .{ .action = "act", .worker = "w1", .deliveries = task.deliveries, .term = task.term, .index = task.index, .retry = true, .abandoned = false, .delay_ms = 60_000, .@"error" = "" }));
     try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
     // Dropped while full: read again once there is room.
+    actions.dropped = actions.due.items[0];
     actions.due.clearRetainingCapacity();
-    actions.due_full = true;
     _ = actions.expireDue(&t.shard);
     try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
     // A new term reads them too.
@@ -14187,7 +14187,7 @@ test "actions: delayed retries' due times are read from the store on a new term,
     try std.testing.expectEqual(@as(usize, 1), actions.due.items.len);
 }
 
-test "actions: a full due list keeps the earliest, and the store is read again a chunk a tick" {
+test "actions: a full due list keeps the earliest, and holds nothing later than one it dropped" {
     var t: ActionsTest = undefined;
     try t.init();
     defer t.deinit();
@@ -14196,20 +14196,90 @@ test "actions: a full due list keeps the earliest, and the store is read again a
     // Latest first: each later arrival is earlier than all it holds.
     var i: u64 = ActionsHandler.MAX_DUE + 100;
     while (i > 0) : (i -= 1) actions.noteDue(i);
-    try std.testing.expect(actions.due_full);
     try std.testing.expectEqual(ActionsHandler.MAX_DUE, actions.due.items.len);
     try std.testing.expectEqual(@as(u64, ActionsHandler.MAX_DUE), std.mem.max(u64, actions.due.items));
+    try std.testing.expectEqual(@as(?u64, ActionsHandler.MAX_DUE + 1), actions.dropped);
+    // Wakes make room; a time after the earliest dropped still isn't held.
+    actions.wakeDue(&t.shard, 10);
+    try std.testing.expectEqual(ActionsHandler.MAX_DUE - 10, actions.due.items.len);
+    actions.noteDue(ActionsHandler.MAX_DUE + 50);
+    try std.testing.expectEqual(@as(u64, ActionsHandler.MAX_DUE), std.mem.max(u64, actions.due.items));
+    // The earliest dropped comes due: a wake, and the store read for it.
+    const woke = actions.wake_local;
+    actions.wakeDue(&t.shard, ActionsHandler.MAX_DUE + 1);
+    try std.testing.expect(actions.wake_local != woke);
+    try std.testing.expectEqual(@as(?u64, null), actions.dropped);
 
-    _ = try t.ok(.action_register, "act", "");
-    var key: [16]u8 = undefined;
-    for (0..ActionsHandler.REBUILD_CHUNK + 1) |n| _ = try t.ok(.action_invoke, "act", try std.fmt.bufPrint(&key, "\x00j{d}", .{n}));
-    // Due by now: none are noted, the keys are read all the same.
-    const now = std.math.maxInt(u64);
+    // A read that must start over reads it all, the list full or not.
+    i = ActionsHandler.MAX_DUE;
+    while (i > 0) : (i -= 1) actions.noteDue(ActionsHandler.MAX_DUE + i);
+    actions.dropped = 0;
+    actions.wakeDue(&t.shard, ActionsHandler.MAX_DUE + 1);
+    try std.testing.expectEqual(@as(usize, 0), actions.due.items.len);
+    try std.testing.expectEqual(@as(?u64, null), actions.dropped);
+}
+
+test "actions: the store is read again a chunk a tick, waking for times that passed meanwhile" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    // Ready runs due a second apart, in key order: three chunks.
+    const base: u64 = 1 << 62;
+    const chunk = ActionsHandler.REBUILD_CHUNK;
+    const n = 2 * chunk + 10;
+    var run: [16]u8 = undefined;
+    for (0..n) |k| _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run, "r{d:0>6}", .{k})), 2 + k, base + k * std.time.ns_per_s);
+    const at = struct {
+        fn f(k: usize) u64 {
+            return base + k * std.time.ns_per_s;
+        }
+    }.f;
+    actions.dropped = 0;
     actions.startRebuild();
-    actions.stepRebuild(&t.shard, now);
+    // The first key is due now: woken for, not held.
+    var woke = actions.wake_local;
+    actions.stepRebuild(&t.shard, at(0));
     try std.testing.expect(actions.rebuilding);
-    actions.stepRebuild(&t.shard, now);
+    try std.testing.expect(actions.wake_local != woke);
+    try std.testing.expectEqual(chunk - 1, actions.due.items.len);
+    try std.testing.expectEqual(at(chunk - 1), std.mem.max(u64, actions.due.items));
+    // Six of the next chunk's came due while it waited.
+    woke = actions.wake_local;
+    actions.stepRebuild(&t.shard, at(chunk + 5));
+    try std.testing.expect(actions.wake_local != woke);
+    try std.testing.expectEqual(2 * chunk - 7, actions.due.items.len);
+    try std.testing.expectEqual(at(2 * chunk - 1), std.mem.max(u64, actions.due.items));
+    try std.testing.expect(std.mem.indexOfScalar(u64, actions.due.items, at(chunk + 5)) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u64, actions.due.items, at(chunk + 6)) != null);
+    woke = actions.wake_local;
+    actions.stepRebuild(&t.shard, at(chunk + 5));
     try std.testing.expect(!actions.rebuilding);
+    try std.testing.expectEqual(woke, actions.wake_local);
+    try std.testing.expectEqual(2 * chunk + 3, actions.due.items.len);
+    try std.testing.expectEqual(at(n - 1), std.mem.max(u64, actions.due.items));
+}
+
+test "actions: a list rebuilt once it drains keeps what it held, reading only what it dropped" {
+    var t: ActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const actions = t.shard.actions_handler;
+    _ = actions.expireDue(&t.shard);
+    _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
+    const base: u64 = 1 << 62;
+    var run: [16]u8 = undefined;
+    for (0..4) |k| _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run, "r{d}", .{k})), 2 + k, base + k);
+    // The first two held, the rest dropped.
+    actions.noteDue(base);
+    actions.noteDue(base + 1);
+    actions.dropped = base + 2;
+    actions.wakeDue(&t.shard, base - 1);
+    try std.testing.expect(!actions.rebuilding);
+    try std.testing.expectEqual(@as(usize, 4), actions.due.items.len);
+    try std.testing.expectEqual(@as(?u64, null), actions.dropped);
 }
 
 test "actions: what a shard keeps of runs asked about, and runs it was asked to start, goes in time" {
