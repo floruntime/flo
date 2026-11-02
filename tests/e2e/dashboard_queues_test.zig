@@ -60,3 +60,37 @@ test "e2e/dashboard: queue enqueue produces a consumable message" {
     defer deq.deinit();
     try testing.expect(deq.contains("hello-dash"));
 }
+
+test "e2e/dashboard: a queue's ready and in-flight counts are exact after a dequeue" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    for ([_][]const u8{ "a", "b", "c" }) |m| try ctx.exec(&.{ "queue", "enqueue", "rq", m });
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "rq" });
+    defer deq.deinit();
+    try stdx.testing.assertSucceeded(deq);
+
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    // A dequeue takes its message for good (queues are at-most-once): its
+    // lease ends when the dequeue's ack applies, so it is in flight until then.
+    const want = "\"name\":\"rq\",\"namespace\":\"default\",\"ready\":2,\"inflight\":0,\"pending\":2,\"available\":2,\"enqueued\":3,\"dequeued\":1,";
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var resp = try http.get("/api/v1/queues?namespace=default");
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        if (std.mem.indexOf(u8, resp.body, want) != null) break;
+        if (attempt == 20) {
+            std.debug.print("want {s}\nin {s}\n", .{ want, resp.body });
+            return error.CountsNotExact;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    // And the CLI's list says the same.
+    var list = try ctx.cli.run(&.{ "queue", "list", "-o", "json" });
+    defer list.deinit();
+    try testing.expect(list.stdoutContains("\"ready\":2,\"leased\":0,\"enqueued\":3,\"dequeued\":1,"));
+}

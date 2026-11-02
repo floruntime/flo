@@ -101,6 +101,7 @@ pub const table = [_]ops.Op{
             // Why its last attempt failed.
             .{ .name = "error_message", .T = Optional(Bytes(MAX_ERROR)), .doc = "The error its last attempt failed with" },
             .{ .name = "worker_id", .T = Optional(Bytes(MAX_WORKER_ID)), .doc = "The worker that holds the run, or last held it" },
+            .{ .name = "outcome", .T = Optional(Bytes(MAX_OUTCOME)), .doc = "The outcome a completed run's worker named, which a workflow step follows; none for success" },
         }),
         .cli = .{ .expose = .hand, .render = .record, .examples = &.{"flo action status act-1a2b3c4d5e6f00-3"} },
         .doc = "A run's status, timestamps, attempts, worker, and its output or last error.",
@@ -185,7 +186,45 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .none, .key = .{ .name = "action" } },
         .doc = "A worker's shard asking an action's shard for a task of it.",
     },
+    .{
+        .name = "action.info",
+        .code = 0x30F,
+        .class = .read,
+        // On the action's shard, where its definition and runs are.
+        .route = .key,
+        .request = Record(&.{}),
+        .response = Record(&.{
+            .{ .name = "owner", .T = Bytes(MAX_OWNER), .doc = "Who registered it, as given" },
+            .{ .name = "version", .T = Int(u32), .doc = "Its version, counting registrations" },
+            .{ .name = "timeout_ms", .T = Int(u64), .doc = "How long a worker holds a run before it times out" },
+            .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
+            .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
+            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker: every one" },
+            .{ .name = "runs_scanned", .T = Int(u32), .doc = "The namespace's runs the counts below were taken over, from its first" },
+            .{ .name = "sampled", .T = schema.Bool, .doc = "The namespace has more runs than were scanned, so the counts below are of a sample" },
+            .{ .name = "running", .T = Int(u64), .doc = "Its scanned runs a worker holds" },
+            .{ .name = "completed", .T = Int(u64), .doc = "Its scanned runs that completed" },
+            .{ .name = "failed", .T = Int(u64), .doc = "Its scanned runs that failed for good" },
+            .{ .name = "timed_out", .T = Int(u64), .doc = "Its scanned runs whose last attempt timed out" },
+            // How long its completed scanned runs took, from a worker first
+            // taking one to its completion; none until one completes.
+            .{ .name = "latency_count", .T = Int(u64), .doc = "Completed scanned runs measured" },
+            .{ .name = "latency_avg_ms", .T = Optional(Int(u64)), .doc = "Their mean duration" },
+            .{ .name = "latency_p50_ms", .T = Optional(Int(u64)), .doc = "Their median duration" },
+            .{ .name = "latency_p95_ms", .T = Optional(Int(u64)), .doc = "Their 95th percentile duration" },
+            .{ .name = "latency_max_ms", .T = Optional(Int(u64)), .doc = "The longest" },
+        }),
+        .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
+        .doc = "An action's definition, its runs by status and how long completed runs took. Ready runs are counted exactly; the rest over the namespace's first 10,000 runs.",
+    },
 };
+
+/// The most runs `action.info` reads for its counts and latency, so one
+/// answer is bounded however many runs a namespace keeps.
+pub const RUNS_SCANNED: u32 = 10_000;
+
+/// The longest owner an action registers with.
+pub const MAX_OWNER: u32 = 256;
 
 pub const ActionNames = schema.BoundedList(ActionName, MAX_AWAIT_ACTIONS, MAX_AWAIT_ACTIONS * ActionName.max_size);
 

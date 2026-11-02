@@ -28,15 +28,22 @@ fn scanEntry(d: []const u8, pos: *usize) []const u8 {
     return name;
 }
 
-/// [name_len:u32][name][partition_count:u32]
+/// [name_len:u32][name][partition_count:u32][retention_age_s:u64][retention_count:u64]
 fn streamEntry(d: []const u8, pos: *usize) []const u8 {
     const n = std.mem.readInt(u32, d[pos.*..][0..4], .little);
     const name = d[pos.* + 4 ..][0..n];
-    pos.* += 4 + n + 4;
+    pos.* += 4 + n + 4 + 8 + 8;
     return name;
 }
 
-/// [name_len:u32][name][ns_len:u32][ns][pending,available,enqueued,dequeued,dlq:u64]
+/// [name_len:u16][name][series:u32][fields:u32][fields_capped:u8][points:u64]
+fn tsEntry(d: []const u8, pos: *usize) []const u8 {
+    const name = nameU16(d, pos);
+    pos.* += 4 + 4 + 1 + 8;
+    return name;
+}
+
+/// [name_len:u32][name][ns_len:u32][ns][ready,leased,enqueued,dequeued,dlq:u64]
 fn queueEntry(d: []const u8, pos: *usize) []const u8 {
     const n = std.mem.readInt(u32, d[pos.*..][0..4], .little);
     const name = d[pos.* + 4 ..][0..n];
@@ -159,9 +166,9 @@ test "e2e/list: every list family pages by cursor, each name once" {
 
     try expectPagesThrough(ctx, .stream_list, streamEntry, &NAMES);
     try expectPagesThrough(ctx, .queue_list, queueEntry, &NAMES);
-    try expectPagesThrough(ctx, .action_list, scanEntry, &NAMES);
+    try expectPagesThrough(ctx, .action_list, scanEntryWithValue, &NAMES);
     try expectPagesThrough(ctx, .kv_scan, scanEntry, &NAMES);
-    try expectPagesThrough(ctx, .ts_list, nameU16, &NAMES);
+    try expectPagesThrough(ctx, .ts_list, tsEntry, &NAMES);
     const ns_names = [_][]const u8{ "pg-a-ns", "pg-b-ns", "pg-c-ns", "pg-d-ns", "pg-e-ns", "pg-f-ns", "pg-g-ns" };
     try expectPagesThrough(ctx, .namespace_list, scanEntry, &ns_names);
 }
@@ -371,7 +378,7 @@ test "e2e/list: an action list with a prefix lists only the actions it names, on
         const count = std.mem.readInt(u32, d[0..4], .little);
         var pos: usize = 4;
         for (0..count) |_| {
-            const name = scanEntry(d, &pos);
+            const name = scanEntryWithValue(d, &pos);
             try testing.expect(std.mem.startsWith(u8, name, "ap-"));
             seen[try std.fmt.parseInt(usize, name["ap-".len..], 10)] += 1;
         }

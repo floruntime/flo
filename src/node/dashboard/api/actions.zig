@@ -35,7 +35,8 @@ const RECENT_RUNS: u32 = 20;
 /// read on the dashboard's one thread.
 const MAX_RUNS_PAGE: u64 = 100;
 
-/// `action_list`'s entry: `[key_len:u16][key][value_len:u32 = 0]`.
+/// `action_list`'s entry: `[key_len:u16][key][value_len:u32][value]`, the
+/// value as `ListedAction` reads it.
 const action_columns = [_]output.WireColumn{
     .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
     .{ .field = "value", .header = "", .field_type = .str_u32 },
@@ -48,19 +49,40 @@ const ActionLister = struct {
     }
 };
 
-/// The fields no op answers about an action yet, as null.
-fn writeUnknownMetadata(obj: anytype) !void {
-    try obj.nullField("type");
-    try obj.nullField("owner");
+/// An action's definition as its list entry carries it:
+/// `[version:u32][owner_len:u16][owner][timeout_ms:u64][max_attempts:u32][created_at_ms:i64]`.
+const ListedAction = struct {
+    version: u32,
+    owner: []const u8,
+    timeout_ms: u64,
+    max_attempts: u32,
+    created_at: i64,
+
+    fn decode(value: []const u8) ?ListedAction {
+        var r = WireReader.init(value);
+        const a: ListedAction = .{
+            .version = r.readU32() orelse return null,
+            .owner = r.readLengthPrefixed(u16) orelse return null,
+            .timeout_ms = r.readU64() orelse return null,
+            .max_attempts = r.readU32() orelse return null,
+            .created_at = r.readI64() orelse return null,
+        };
+        return if (r.remainingLen() == 0) a else null;
+    }
+};
+
+fn writeDefinition(obj: anytype, def: ListedAction) !void {
+    try obj.stringField("owner", def.owner);
     try obj.stringField("description", "");
-    try obj.nullField("version");
-    try obj.nullField("enabled");
-    try obj.nullField("timeout_ms");
-    try obj.nullField("max_retries");
+    try obj.intField("version", @as(i64, def.version));
+    try obj.intField("timeout_ms", @as(i64, @intCast(def.timeout_ms)));
+    try obj.intField("max_attempts", @as(i64, def.max_attempts));
+    try obj.intField("created_at", def.created_at);
 }
 
-/// GET /actions — The namespace's actions (`action_list`). The list
-/// answers names only: metadata, run counts and latency are null.
+/// GET /actions — The namespace's actions (`action_list`), each with its
+/// definition. Run counts and latency are each an `action.info`, a scan of
+/// runs, so only an action's detail answers them; here they are null.
 pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -81,15 +103,15 @@ pub fn getActions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     for (0..pages.count) |_| {
         // Each page's rows were checked whole as they were taken.
         const name = r.readLengthPrefixed(u16) orelse break;
-        _ = r.readLengthPrefixed(u32) orelse break;
+        const value = r.readLengthPrefixed(u32) orelse break;
+        // Deleted between the scan and its entry: not listed.
+        const def = ListedAction.decode(value) orelse continue;
         try arr.next();
         var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
         try obj.begin();
         try obj.stringField("name", name);
         try obj.stringField("namespace", ns);
-        try writeUnknownMetadata(&obj);
-        try obj.nullField("created_at");
-        try obj.nullField("updated_at");
+        try writeDefinition(&obj, def);
         try obj.nullField("latency");
         try obj.nullField("runs");
         try obj.end();
@@ -186,7 +208,7 @@ fn writeRun(reader: *loopback.Reader, writer: anytype, namespace: []const u8, ru
     };
     if (s.worker_id) |w| try obj.stringField("worker_id", w) else try obj.nullField("worker_id");
     if (s.error_message) |e| try obj.stringField("error", e) else try obj.nullField("error");
-    if (s.output) |o| try obj.stringField("outcome", o) else try obj.nullField("outcome");
+    if (s.outcome) |o| try obj.stringField("outcome", o) else if (s.status == .completed) try obj.stringField("outcome", "success") else try obj.nullField("outcome");
     try obj.nullField("input");
     // Cut to 2 KiB for the overview.
     if (s.output) |o| try obj.stringField("output", o[0..@min(o.len, 2048)]) else try obj.nullField("output");
@@ -196,14 +218,23 @@ fn writeRun(reader: *loopback.Reader, writer: anytype, namespace: []const u8, ru
     try obj.end();
 }
 
-/// GET /actions/:name — Action detail. No op answers an action's metadata,
-/// run counts or latency yet, so those are null. Its recent runs come from
-/// `action_list_runs` on the action's shard; its workers from `worker.list`.
+/// GET /actions/:name — Action detail: its definition, run counts and
+/// latency from `action.info`, its recent runs from `action_list_runs` on
+/// the action's shard, and its workers from `worker.list`. An action that
+/// isn't there is a 404.
 pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "action detail", err);
     defer reader.deinit();
+    const Info = action_ops.op("action.info");
+    var info_got = reader.call(Info, ns, name, .{}) catch |err| return try loopback.readFailed(allocator, "action detail", err);
+    defer info_got.deinit();
+    if (info_got.isNotFound()) return error.NotFound;
+    if (info_got.isError()) return try h.jsonError(allocator, info_got.errorMessage());
+    var diag: schema.Diagnostic = .{};
+    const info = Info.response.decodeAll(info_got.data, &diag) catch return try h.jsonError(allocator, "action detail: malformed answer");
+
     const client = reader.next() catch |err| return try loopback.readFailed(allocator, "action runs", err);
     var listed = client_mod.action.listRuns(client, ns, name, RECENT_RUNS) catch |err|
         return try loopback.readFailed(allocator, "action runs", err);
@@ -221,12 +252,31 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
     try obj.begin();
     try obj.stringField("name", name);
     try obj.stringField("namespace", ns);
-    try writeUnknownMetadata(&obj);
-    try obj.nullField("retry_delay_ms");
-    try obj.nullField("created_at");
-    try obj.nullField("updated_at");
-    try obj.nullField("latency");
-    try obj.nullField("runs");
+    try writeDefinition(&obj, .{ .version = info.version, .owner = info.owner, .timeout_ms = info.timeout_ms, .max_attempts = info.max_attempts, .created_at = info.created_at_ms });
+    {
+        var runs = try obj.objectField("runs");
+        try runs.begin();
+        try runs.intField("pending", @as(i64, @intCast(info.ready)));
+        try runs.intField("running", @as(i64, @intCast(info.running)));
+        try runs.intField("completed", @as(i64, @intCast(info.completed)));
+        try runs.intField("failed", @as(i64, @intCast(info.failed)));
+        try runs.intField("timed_out", @as(i64, @intCast(info.timed_out)));
+        // Every count but pending is over the namespace's first
+        // `runs_scanned` runs; `sampled` says there are more.
+        try runs.intField("runs_scanned", @as(i64, info.runs_scanned));
+        try runs.boolField("sampled", info.sampled);
+        try runs.end();
+    }
+    if (info.latency_count == 0) try obj.nullField("latency") else {
+        var lat = try obj.objectField("latency");
+        try lat.begin();
+        try lat.intField("count", @as(i64, @intCast(info.latency_count)));
+        try lat.intField("avg_ms", @as(i64, @intCast(info.latency_avg_ms.?)));
+        try lat.intField("p50_ms", @as(i64, @intCast(info.latency_p50_ms.?)));
+        try lat.intField("p95_ms", @as(i64, @intCast(info.latency_p95_ms.?)));
+        try lat.intField("max_ms", @as(i64, @intCast(info.latency_max_ms.?)));
+        try lat.end();
+    }
     {
         var recent_arr = try obj.arrayField("recent_runs");
         try recent_arr.begin();

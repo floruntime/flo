@@ -688,6 +688,7 @@ fn runListDefinitions(ctx: *commander.Context) commander.Error!void {
         .{ .field = "name", .header = "NAME", .field_type = .str_u16, .alignment = .left },
         .{ .field = "version", .header = "VERSION", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+        .{ .field = "enabled", .header = "ENABLED", .field_type = .enum_u8, .enum_labels = &.{ "no", "yes" } },
     };
     var pages = output.WirePages.init(ctx.allocator, columns);
     defer pages.deinit();

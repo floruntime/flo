@@ -16,9 +16,12 @@ const handler_mod = @import("../namespace/handler.zig");
 const Shard = @import("shard.zig").Shard;
 const Connection = @import("connection.zig").Connection;
 const StreamProjection = @import("../projection/stream.zig").StreamProjection;
+const StreamMetadata = @import("../projection/stream.zig").StreamMetadata;
+const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
+const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 
 const NameWalker = dispatcher_mod.NameWalker;
 const OpCode = proto.OpCode;
@@ -70,7 +73,9 @@ pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8
     for (page.items) |name| {
         var eb: [system_ops.MAX_ENTRY]u8 = undefined;
         var w: std.Io.Writer = .fixed(&eb);
-        try writeEntry(@fromBackingInt(@intCast(op)), ctx, namespace, name, &w);
+        if (shard.dispatcher.walk_entry[op]) |write| {
+            write(ctx, namespace, name, &w) catch return error.EntryTooLarge;
+        } else try writeEntry(@fromBackingInt(@intCast(op)), ctx, namespace, name, &w);
         const entry = w.buffered();
         // Out of room: the rest is the next page's.
         if (used + entry.len > room or !(entries.add(.{ .name = name, .entry = entry }) catch return error.EntryTooLarge)) {
@@ -90,34 +95,36 @@ fn writeEntry(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []const 
 
 fn writeEntryTo(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) (std.Io.Writer.Error || PageError)!void {
     switch (op) {
-        // [name_len:u32][name][partition_count:u32], partitions from the
-        // stream's metadata, keyed by the qualified name.
+        // [name_len:u32][name][partition_count:u32][retention_age_s:u64]
+        // [retention_count:u64], from the stream's metadata, keyed by the
+        // qualified name; 0 is no limit.
         .stream_list => {
             const stream: *const StreamProjection = @ptrCast(@alignCast(ctx));
             var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-            const pc = if (handler_mod.qualifyKey(&qbuf, namespace, name)) |q| stream.getPartitionCount(q) else |_| 1;
+            const meta: StreamMetadata = if (handler_mod.qualifyKey(&qbuf, namespace, name)) |q| stream.stream_metadata.get(q) orelse .{} else |_| .{};
             try w.writeInt(u32, @intCast(name.len), .little);
             try w.writeAll(name);
-            try w.writeInt(u32, pc, .little);
+            try w.writeInt(u32, meta.partition_count, .little);
+            try w.writeInt(u64, meta.retention_age_s, .little);
+            try w.writeInt(u64, meta.retention_count, .little);
         },
-        // [name_len:u32][name][ns_len:u32][ns][pending][available][enqueued][dequeued][dlq], u64 each.
+        // [name_len:u32][name][ns_len:u32][ns][ready][leased][enqueued][dequeued][dlq], u64 each.
         .queue_list => {
             const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
             const want_ns = if (namespace.len > 0) namespace else "default";
-            var meta: struct { ns: []const u8, enqueued: u64 = 0, dequeued: u64 = 0, dlq: u64 = 0 } = .{ .ns = namespace };
+            var meta: struct { ns: []const u8, live: QueueProjection.Live = .{}, enqueued: u64 = 0, dequeued: u64 = 0, dlq: u64 = 0 } = .{ .ns = namespace };
             var it = handler.queue.known_queues.iterator();
             while (it.next()) |entry| {
                 const m = entry.value_ptr;
                 if (!std.mem.eql(u8, m.name, name) or !std.mem.eql(u8, m.namespace, want_ns)) continue;
-                meta = .{ .ns = m.namespace, .enqueued = m.enqueued, .dequeued = m.dequeued, .dlq = @intCast(handler.queue.deadLetters(entry.key_ptr.*).len) };
+                meta = .{ .ns = m.namespace, .live = handler.queue.liveCounts(entry.key_ptr.*), .enqueued = m.enqueued, .dequeued = m.dequeued, .dlq = @intCast(handler.queue.deadLetters(entry.key_ptr.*).len) };
                 break;
             }
-            const pending = if (meta.enqueued > meta.dequeued) meta.enqueued - meta.dequeued else 0;
             try w.writeInt(u32, @intCast(name.len), .little);
             try w.writeAll(name);
             try w.writeInt(u32, @intCast(meta.ns.len), .little);
             try w.writeAll(meta.ns);
-            for ([_]u64{ pending, pending, meta.enqueued, meta.dequeued, meta.dlq }) |v| try w.writeInt(u64, v, .little);
+            for ([_]u64{ meta.live.ready, meta.live.leased, meta.enqueued, meta.dequeued, meta.dlq }) |v| try w.writeInt(u64, v, .little);
         },
         .processing_list => {
             const handler: *const ProcessingHandler = @ptrCast(@alignCast(ctx));
@@ -125,7 +132,7 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []cons
             if (ProcessingHandler.entrySize(job) > w.buffer.len) return error.EntryTooLarge;
             try ProcessingHandler.writeEntry(job, w);
         },
-        // [name_len:u16][name][version_len:u16][version][created_at:i64]
+        // [name_len:u16][name][version_len:u16][version][created_at:i64][enabled:u8]
         .workflow_list_definitions => {
             const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
             var it = handler.definitions.iterator();
@@ -142,15 +149,11 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []cons
                 try w.writeInt(u16, @intCast(def.version_owned.len), .little);
                 try w.writeAll(def.version_owned);
                 try w.writeInt(i64, def.created_at_ms, .little);
+                try w.writeByte(@intFromBool(!handler.disabled.contains(entry.key_ptr.*)));
                 return;
             }
         },
-        // [key_len:u16][key][value_len:u32 = 0]
-        .action_list => {
-            try w.writeInt(u16, @intCast(name.len), .little);
-            try w.writeAll(name);
-            try w.writeInt(u32, 0, .little);
-        },
+        .action_list => try ActionsHandler.writeListEntry(@ptrCast(@alignCast(ctx)), namespace, name, w),
         // [name_len:u16][name]
         else => {
             try w.writeInt(u16, @intCast(name.len), .little);

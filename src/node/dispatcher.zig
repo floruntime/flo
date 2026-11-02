@@ -139,6 +139,9 @@ pub const Dispatcher = struct {
     /// Each walk op's scan context: this shard's own, never another's. A
     /// walk asks the other shards for their pages.
     walk_context: [proto.MAX_OPCODES]?*anyopaque,
+    /// A walk op's entry, written from its scan context, when its family
+    /// writes it; without one an entry is the name alone.
+    walk_entry: [proto.MAX_OPCODES]?WalkEntryFn,
 
     /// Error callback for unknown opcodes.
     on_error: ?ErrorFn,
@@ -155,6 +158,7 @@ pub const Dispatcher = struct {
             .walk_fn = @as([proto.MAX_OPCODES]?NameWalker.LocalScanFn, @splat(null)),
             .walk_paged = @splat(false),
             .walk_context = @as([proto.MAX_OPCODES]?*anyopaque, @splat(null)),
+            .walk_entry = @splat(null),
             .on_error = null,
             .handler_count = 0,
         };
@@ -192,7 +196,18 @@ pub const Dispatcher = struct {
         }
         self.handlers[idx] = handler;
         self.walk_fn[idx] = scan_fn;
+        // Another scan's entry would read its own context.
+        self.walk_entry[idx] = null;
         // pre_route stays null — walk opcodes have no hash routing
+    }
+
+    /// One item's entry in a walk op's answer: `name`'s, in `namespace`,
+    /// read from the op's scan context. Nothing for a name with no entry.
+    pub const WalkEntryFn = *const fn (context: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void;
+
+    /// Set how a walk op's family writes its entries; after `registerWalk`.
+    pub fn setWalkEntry(self: *Dispatcher, opcode: proto.OpCode, entry: WalkEntryFn) void {
+        self.walk_entry[@backingInt(opcode)] = entry;
     }
 
     /// `registerWalk` for a scan that pages itself by its own cursor.
@@ -302,6 +317,7 @@ pub const Dispatcher = struct {
             self.walk_fn[idx] = null;
             self.walk_paged[idx] = false;
             self.walk_context[idx] = null;
+            self.walk_entry[idx] = null;
             self.handler_count -= 1;
         }
     }

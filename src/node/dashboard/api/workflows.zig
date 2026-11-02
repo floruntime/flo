@@ -105,11 +105,12 @@ pub fn handleWorkflowRequest(allocator: Allocator, method: Method, path: []const
 // Definitions
 // ---------------------------------------------------------------------------
 
-/// A `workflow_list_definitions` entry: [name:u16][version:u16][created_at:i64].
+/// A `workflow_list_definitions` entry: [name:u16][version:u16][created_at:i64][enabled:u8].
 const definition_columns: []const cli_output.WireColumn = &.{
     .{ .field = "name", .header = "", .field_type = .str_u16 },
     .{ .field = "version", .header = "", .field_type = .str_u16 },
     .{ .field = "created_at", .header = "", .field_type = .int_i64 },
+    .{ .field = "enabled", .header = "", .field_type = .enum_u8, .enum_labels = &.{ "no", "yes" } },
 };
 
 /// Asks for one page of a namespace's definitions, for `Reader.listAll`.
@@ -121,7 +122,7 @@ const DefinitionsAsker = struct {
     }
 };
 
-const Definition = struct { name: []const u8, version: []const u8, created_at: i64 };
+const Definition = struct { name: []const u8, version: []const u8, created_at: i64, enabled: bool };
 
 /// The definitions of a `[count:u32]entries` list, as `listAll` gathers it.
 const Definitions = struct {
@@ -140,7 +141,8 @@ const Definitions = struct {
         const name = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
         const version = self.reader.readLengthPrefixed(u16) orelse return error.Truncated;
         const created_at = self.reader.readI64() orelse return error.Truncated;
-        return .{ .name = name, .version = version, .created_at = created_at };
+        const enabled = self.reader.readU8() orelse return error.Truncated;
+        return .{ .name = name, .version = version, .created_at = created_at, .enabled = enabled != 0 };
     }
 };
 
@@ -152,8 +154,7 @@ const DEFINITIONS_WITH_METADATA: usize = 100;
 /// GET /workflow/definitions?namespace= (and /workflows) — a namespace's
 /// definitions, with the step metadata of each one's YAML. The dashboard asks
 /// each shard, as any client does: the list walk for name, version and
-/// created_at, then the YAML of the first `DEFINITIONS_WITH_METADATA`. No op
-/// says whether one is enabled, so `enabled` is null.
+/// created_at and enabled, then the YAML of the first `DEFINITIONS_WITH_METADATA`.
 fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -180,7 +181,7 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
             try obj.stringField("name", d.name);
             try obj.stringField("version", d.version);
             try obj.intField("created_at", d.created_at);
-            try obj.nullField("enabled");
+            try obj.boolField("enabled", d.enabled);
             for ([_][]const u8{ "step_count", "plan_count", "has_schedule", "has_trigger", "start_step", "terminals", "steps" }) |f| try obj.nullField(f);
             try obj.end();
             continue;
@@ -199,7 +200,7 @@ fn listDefinitions(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashbo
         try obj.stringField("name", d.name);
         try obj.stringField("version", d.version);
         try obj.intField("created_at", d.created_at);
-        try obj.nullField("enabled");
+        try obj.boolField("enabled", d.enabled);
         if (wf_parser.parseWorkflow(allocator, got.data, null)) |parsed| {
             var def = parsed;
             defer def.deinit(allocator);
@@ -262,8 +263,8 @@ fn createDefinition(allocator: Allocator, query_string: ?[]const u8, body: []con
 
 /// GET /workflow/definitions/:name?namespace= — one definition's YAML, with
 /// its version and created_at from the list walk. The dashboard asks each
-/// shard, as any client does. No op says whether it is enabled or how many
-/// runs it has had, so `enabled`, `status` and `run_count` are null.
+/// shard, as any client does. No op counts its runs, so `run_count` is
+/// null, shown as a dash until one does.
 fn getDefinition(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -284,6 +285,7 @@ fn getDefinition(allocator: Allocator, name: []const u8, query_string: ?[]const 
 
     if (got.isNotFound()) {
         try obj.stringField("status", "unknown");
+        try obj.nullField("enabled");
     } else {
         var pages = reader.listAll(allocator, definition_columns, DefinitionsAsker{ .namespace = ns }) catch |err|
             return try loopback.readFailed(allocator, "workflow definitions", err);
@@ -299,14 +301,16 @@ fn getDefinition(allocator: Allocator, name: []const u8, query_string: ?[]const 
         if (listed) |d| {
             try obj.stringField("version", d.version);
             try obj.intField("created_at", d.created_at);
+            try obj.stringField("status", if (d.enabled) "active" else "disabled");
+            try obj.boolField("enabled", d.enabled);
         } else {
             try obj.nullField("version");
             try obj.nullField("created_at");
+            try obj.nullField("status");
+            try obj.nullField("enabled");
         }
-        try obj.nullField("status");
         try obj.stringField("definition_yaml", got.data);
     }
-    try obj.nullField("enabled");
     try obj.nullField("run_count");
 
     try obj.end();

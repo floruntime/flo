@@ -165,6 +165,7 @@ pub const OpCode = enum(u16) {
     ts_list = 0x1A4,
     ts_delete = 0x1A5,
     ts_retention = 0x1A6,
+    ts_info = 0x1A7,
 
     // 0x1C0–0x2FF: data reserve (vectors, documents, geospatial, counters)
 
@@ -186,6 +187,7 @@ pub const OpCode = enum(u16) {
     action_fail = 0x30C,
     action_touch = 0x30D,
     action_deliver = 0x30E,
+    action_info = 0x30F,
 
     // ── Workers (0x320 – 0x33F) ──────────────────────────────────────────────
     worker_register = 0x320,

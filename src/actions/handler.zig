@@ -77,6 +77,7 @@ const DeliverRequest = table_run.op("action.deliver").request;
 const TouchResponse = table_run.op("action.touch").response;
 const EmptyResponse = table_run.op("action.complete").response;
 const StatusResponse = table_run.op("action.status").response;
+const InfoResponse = table_run.op("action.info").response;
 const Task = action_ops.Task.Value;
 
 comptime {
@@ -268,6 +269,7 @@ pub const ActionsHandler = struct {
         dispatcher.registerWithRoute(.action_invoke, dispatchAction, preRouteByAction);
         // The run id's bits name the partition the run lives on.
         dispatcher.registerWithRoute(.action_status, table_run.handler("action.status", ActionsHandler, runStatus), run_id_mod.preRouteByRunId);
+        dispatcher.registerWithRoute(.action_info, table_run.handler("action.info", ActionsHandler, runInfo), preRouteByAction);
         dispatcher.registerWalk(.action_list, dispatchAction, localScanActions);
         dispatcher.registerWithRoute(.action_delete, dispatchAction, preRouteByAction);
         dispatcher.registerWithRoute(.action_list_runs, dispatchAction, preRouteByAction);
@@ -414,8 +416,9 @@ pub const ActionsHandler = struct {
         return .{ .parked = proposed };
     }
 
-    /// `[count:u32]([key_len:u16][key][value_len:u32][type:u8][version:u32][enabled:u8])*[has_more:u8][cursor_len:u16]`:
-    /// the actions in the namespace whose names start with the key.
+    /// `[count:u32](entry)*[has_more:u8][cursor_len:u16]`, each entry as
+    /// `writeListEntry` writes it: the actions in the namespace whose names
+    /// start with the key.
     fn handleList(shard: *Shard, req: Request) CommandResult {
         var w: std.Io.Writer.Allocating = .init(shard.allocator);
         defer w.deinit();
@@ -433,17 +436,29 @@ pub const ActionsHandler = struct {
         while (try it.next()) |_| count += 1;
         try w.writeInt(u32, count, .little);
         it = readOf(shard).range(machine.Defs, p);
-        while (try it.next()) |item| {
-            const name = item.key[1 + ns.len ..];
-            try w.writeInt(u16, @intCast(name.len), .little);
-            try w.writeAll(name);
-            try w.writeInt(u32, 6, .little);
-            try w.writeByte(0); // user-hosted: the only type
-            try w.writeInt(u32, item.value.v.version, .little);
-            try w.writeByte(1);
-        }
+        while (try it.next()) |item| try writeEntry(item.key[1 + ns.len ..], item.value.v, w);
         try w.writeByte(0);
         try w.writeInt(u16, 0, .little);
+    }
+
+    /// One action as its list answers it: `[name_len:u16][name][value_len:u32]`
+    /// then `[version:u32][owner_len:u16][owner][timeout_ms:u64][max_attempts:u32][created_at_ms:i64]`.
+    /// Nothing for an action this shard doesn't hold.
+    pub fn writeListEntry(shard: *Shard, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const def = getDef(shard, homeOf(namespace), name) orelse return;
+        try writeEntry(name, def, w);
+    }
+
+    fn writeEntry(name: []const u8, def: machine.Def.Value, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeInt(u16, @intCast(name.len), .little);
+        try w.writeAll(name);
+        try w.writeInt(u32, @intCast(4 + 2 + def.owner.len + 8 + 4 + 8), .little);
+        try w.writeInt(u32, def.version, .little);
+        try w.writeInt(u16, @intCast(def.owner.len), .little);
+        try w.writeAll(def.owner);
+        try w.writeInt(u64, def.lease_ms, .little);
+        try w.writeInt(u32, def.max_attempts, .little);
+        try w.writeInt(i64, nsToMs(def.created_ns), .little);
     }
 
     /// The action walk's names: one shard's actions in the namespace that
@@ -538,7 +553,7 @@ pub const ActionsHandler = struct {
         const self = shard.actions_handler;
         const run = getRun(shard, homeOf(req.namespace), req.key) orelse return error.NotFound;
         const buf = self.status_buf orelse blk: {
-            const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR + action_ops.MAX_WORKER_ID);
+            const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR + action_ops.MAX_WORKER_ID + action_ops.MAX_OUTCOME);
             self.status_buf = b;
             break :blk b;
         };
@@ -546,6 +561,7 @@ pub const ActionsHandler = struct {
         const output: ?[]const u8 = if (run.status == .completed) try copyInto(buf, &used, run.result, action_ops.MAX_OUTPUT) else null;
         const error_message: ?[]const u8 = if (run.@"error".len == 0) null else try copyInto(buf, &used, run.@"error", action_ops.MAX_ERROR);
         const worker_id: ?[]const u8 = if (run.holder.len == 0) null else try copyInto(buf, &used, run.holder, action_ops.MAX_WORKER_ID);
+        const named_outcome: ?[]const u8 = if (run.status != .completed or run.outcome.len == 0) null else try copyInto(buf, &used, run.outcome, action_ops.MAX_OUTCOME);
         return .{
             .answer = .{
                 .status = @fromBackingInt(@backingInt(statusOf(run))),
@@ -558,7 +574,115 @@ pub const ActionsHandler = struct {
                 .output = output,
                 .error_message = error_message,
                 .worker_id = worker_id,
+                .outcome = named_outcome,
             },
+        };
+    }
+
+    // ── Info ────────────────────────────────────────────────────────────
+
+    /// An action's definition and its runs. Ready runs are its ready keys,
+    /// every one; the other counts and the latency are over the namespace's
+    /// first RUNS_SCANNED runs, since runs are kept and a namespace's grow
+    /// without bound.
+    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        const ns = homeOf(req.namespace);
+        const def = getDef(shard, ns, req.key) orelse
+            return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_ACTION } } };
+        var owner_buf: [action_ops.MAX_OWNER]u8 = undefined;
+        const owner = owner_buf[0..@min(def.owner.len, owner_buf.len)];
+        @memcpy(owner, def.owner[0..owner.len]);
+
+        var ready: u64 = 0;
+        var pb: [KEY_BUF]u8 = undefined;
+        var rb: [machine.MAX_KEY_LEN]u8 = undefined;
+        if (storeKey(&pb, ns, machine.readyPrefix(&rb, req.key))) |prefix| {
+            var it = readOf(shard).range(machine.Ready, prefix);
+            while (it.next() catch null) |_| ready += 1;
+        }
+
+        const durations = try shard.allocator.alloc(u64, action_ops.RUNS_SCANNED);
+        defer shard.allocator.free(durations);
+        const counts = countRuns(shard, ns, req.key, durations);
+        const lat = latencyOf(durations[0..counts.measured]);
+        return .{ .answer = .{
+            .owner = owner,
+            .version = def.version,
+            .timeout_ms = def.lease_ms,
+            .max_attempts = def.max_attempts,
+            .created_at_ms = nsToMs(def.created_ns),
+            .ready = ready,
+            .runs_scanned = counts.scanned,
+            .sampled = counts.sampled,
+            .running = counts.running,
+            .completed = counts.completed,
+            .failed = counts.failed,
+            .timed_out = counts.timed_out,
+            .latency_count = counts.measured,
+            .latency_avg_ms = if (lat) |l| l.avg_ms else null,
+            .latency_p50_ms = if (lat) |l| l.p50_ms else null,
+            .latency_p95_ms = if (lat) |l| l.p95_ms else null,
+            .latency_max_ms = if (lat) |l| l.max_ms else null,
+        } };
+    }
+
+    const RunCounts = struct {
+        scanned: u32 = 0,
+        sampled: bool = false,
+        running: u64 = 0,
+        completed: u64 = 0,
+        failed: u64 = 0,
+        timed_out: u64 = 0,
+        measured: usize = 0,
+    };
+
+    /// `action`'s runs by status among the first `durations.len` of the
+    /// namespace's, and the completed ones' durations in ms.
+    fn countRuns(shard: *Shard, ns: []const u8, action: []const u8, durations: []u64) RunCounts {
+        var c: RunCounts = .{};
+        var pb: [KEY_BUF]u8 = undefined;
+        const p = storeKey(&pb, ns, "") orelse return c;
+        var it = readOf(shard).range(machine.Runs, p);
+        while (it.next() catch null) |item| {
+            if (c.scanned == durations.len) {
+                c.sampled = true;
+                break;
+            }
+            c.scanned += 1;
+            const run = item.value.v;
+            if (!std.mem.eql(u8, run.action, action)) continue;
+            switch (run.status) {
+                .ready => {},
+                .leased => c.running += 1,
+                .failed => c.failed += 1,
+                .timed_out => c.timed_out += 1,
+                .completed => {
+                    c.completed += 1;
+                    // A run completed without a worker taking it has no
+                    // duration to measure.
+                    if (run.started_ns != 0 and run.completed_ns >= run.started_ns) {
+                        durations[c.measured] = (run.completed_ns - run.started_ns) / std.time.ns_per_ms;
+                        c.measured += 1;
+                    }
+                },
+            }
+        }
+        return c;
+    }
+
+    const Latency = struct { avg_ms: u64, p50_ms: u64, p95_ms: u64, max_ms: u64 };
+
+    /// Completed runs' durations' mean, median, 95th percentile and longest.
+    fn latencyOf(durations: []u64) ?Latency {
+        if (durations.len == 0) return null;
+        std.mem.sortUnstable(u64, durations, {}, std.sort.asc(u64));
+        var total: u128 = 0;
+        for (durations) |d| total += d;
+        return .{
+            .avg_ms = @intCast(total / durations.len),
+            .p50_ms = durations[(durations.len - 1) / 2],
+            .p95_ms = durations[(durations.len - 1) * 95 / 100],
+            .max_ms = durations[durations.len - 1],
         };
     }
 
@@ -1963,3 +2087,17 @@ const test_support = struct {
         return first.value.v;
     }
 };
+
+test "action info's latency: percentiles of the completed runs, none without one" {
+    try std.testing.expectEqual(@as(?ActionsHandler.Latency, null), ActionsHandler.latencyOf(&.{}));
+    var one = [_]u64{7};
+    const l1 = ActionsHandler.latencyOf(&one).?;
+    try std.testing.expectEqual(@as(u64, 7), l1.p95_ms);
+    var many: [100]u64 = undefined;
+    for (&many, 0..) |*d, i| d.* = 100 - i; // 100 down to 1
+    const l = ActionsHandler.latencyOf(&many).?;
+    try std.testing.expectEqual(@as(u64, 50), l.avg_ms);
+    try std.testing.expectEqual(@as(u64, 50), l.p50_ms);
+    try std.testing.expectEqual(@as(u64, 95), l.p95_ms);
+    try std.testing.expectEqual(@as(u64, 100), l.max_ms);
+}

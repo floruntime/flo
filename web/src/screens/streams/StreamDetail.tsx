@@ -135,7 +135,7 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
       <div className="ph">
         <h1 className="ph-t">{name}</h1>
         <div className="ph-s">
-          {detail?.namespace ?? ns} · {groupsKnown ? gpos.length : DASH} consumer group{gpos.length === 1 ? '' : 's'} · append-only log
+          {detail?.namespace ?? ns} · {groupsKnown ? gpos.length : DASH} consumer group{gpos.length === 1 ? '' : 's'} · retention {detail?.retention ?? '…'}
         </div>
       </div>
 

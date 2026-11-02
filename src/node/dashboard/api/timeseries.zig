@@ -19,10 +19,17 @@ const loopback = @import("loopback.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
 const output = @import("../../../cli/output.zig");
 const WireReader = @import("../../../util/wire.zig").WireReader;
+const ts_ops = @import("../../../protocol/ts_ops.zig");
+const schema = @import("../../../protocol/schema.zig");
 
-/// `ts_list`'s entry: `[name_len:u16][name]`.
+/// `ts_list`'s entry: `[name_len:u16][name][series:u32][fields:u32]
+/// [fields_capped:u8][points:u64]`.
 const measurement_columns = [_]output.WireColumn{
     .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
+    .{ .field = "series", .header = "", .field_type = .uint_u32 },
+    .{ .field = "fields", .header = "", .field_type = .uint_u32 },
+    .{ .field = "fields_capped", .header = "", .field_type = .enum_u8, .enum_labels = &.{ "no", "yes" } },
+    .{ .field = "points", .header = "", .field_type = .uint_u64 },
 };
 
 const MeasurementLister = struct {
@@ -32,8 +39,9 @@ const MeasurementLister = struct {
     }
 };
 
-/// GET /timeseries — The namespace's measurements (`ts_list`). No op
-/// answers a measurement's series, fields or points yet, so those are null.
+/// GET /timeseries — The namespace's measurements (`ts_list`), with their
+/// series, fields and points. A field count with `field_count_capped` is
+/// at least that many.
 pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -54,24 +62,40 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
     for (0..pages.count) |_| {
         // Each page's rows were checked whole as they were taken.
         const name = r.readLengthPrefixed(u16) orelse break;
+        const series = r.readU32() orelse break;
+        const fields = r.readU32() orelse break;
+        const capped = r.readU8() orelse break;
+        const points = r.readU64() orelse break;
         try arr.next();
         var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
         try obj.begin();
         try obj.stringField("name", name);
-        try obj.nullField("series_count");
-        try obj.nullField("field_count");
-        try obj.nullField("points");
+        try obj.intField("series_count", series);
+        try obj.intField("field_count", fields);
+        try obj.boolField("field_count_capped", capped != 0);
+        try obj.intField("points", points);
         try obj.end();
     }
     try arr.end();
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /timeseries/:measurement — Measurement detail. No op answers a
-/// measurement's fields or series yet, so those are null; nothing is read.
+/// GET /timeseries/:measurement — Measurement detail, from `ts.info` on
+/// the measurement's shard: its fields, series, points and their times. A
+/// measurement with no points is a 404. Each series' tags aren't answered
+/// by any op yet, so `series` is null.
 pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = ctx;
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "time-series info", err);
+    defer reader.deinit();
+    const Info = ts_ops.op("ts.info");
+    var got = reader.call(Info, ns, measurement, .{}) catch |err| return try loopback.readFailed(allocator, "time-series info", err);
+    defer got.deinit();
+    if (got.isNotFound()) return error.NotFound;
+    if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+    var diag: schema.Diagnostic = .{};
+    const info = Info.response.decodeAll(got.data, &diag) catch return try h.jsonError(allocator, "time-series info: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -81,11 +105,27 @@ pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query
     try obj.begin();
     try obj.stringField("name", measurement);
     try obj.stringField("namespace", ns);
-    try obj.nullField("field_count");
-    try obj.nullField("fields");
-    try obj.nullField("series_count");
+    try obj.intField("field_count", info.field_count);
+    try obj.boolField("field_count_capped", info.fields_capped);
+    {
+        var fields = try obj.arrayField("fields");
+        try fields.begin();
+        var it = info.fields.iterator();
+        while (it.next() catch null) |name| {
+            try fields.next();
+            var f = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try f.begin();
+            try f.stringField("name", name);
+            try f.stringField("type", "float");
+            try f.end();
+        }
+        try fields.end();
+    }
+    try obj.intField("series_count", info.series);
     try obj.nullField("series");
-    try obj.nullField("retention");
+    try obj.intField("points", info.points);
+    if (info.oldest_ms) |t| try obj.intField("oldest_ms", t) else try obj.nullField("oldest_ms");
+    if (info.newest_ms) |t| try obj.intField("newest_ms", t) else try obj.nullField("newest_ms");
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -281,7 +321,7 @@ test "getMeasurements says the list failed when the node can't be reached" {
     try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"time-series list"));
 }
 
-test "getMeasurementDetail answers what it knows and reads nothing" {
+test "getMeasurementDetail asks the node, and says so when none answers" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
@@ -289,8 +329,7 @@ test "getMeasurementDetail answers what it knows and reads nothing" {
 
     const result = try getMeasurementDetail(allocator, "cpu", null, &ctx);
     defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"cpu\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"fields\":null") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"time-series info"));
 }
 
 test "executeFloql parses the query before it asks the node" {

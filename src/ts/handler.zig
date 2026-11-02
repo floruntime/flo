@@ -45,6 +45,10 @@ const Request = proto.Request;
 const OpCode = proto.OpCode;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const table_run = @import("../node/table_run.zig");
+const schema = @import("../protocol/schema.zig");
+const ts_ops = @import("../protocol/ts_ops.zig");
+const InfoResponse = table_run.op("ts.info").response;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TSHandler
@@ -64,6 +68,8 @@ pub const TSHandler = struct {
     /// request overwrites it, so a refusal from it is sent at once, never
     /// parked.
     why_buf: [512]u8 = undefined,
+    /// An info answer's field names, encoded; written before it is sent.
+    info_buf: [ts_ops.MAX_INFO_FIELD_BYTES]u8 = undefined,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
         return .{
@@ -82,8 +88,45 @@ pub const TSHandler = struct {
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByQueryMeasurement);
         dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
+        dispatcher.setWalkEntry(.ts_list, writeListEntry);
         dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_info, table_run.handler("ts.info", TSHandler, runInfo), preRouteByMeasurement);
+    }
+
+    // ── Info ────────────────────────────────────────────────────────────
+
+    pub const Error = error{};
+
+    pub fn refusal(err: Error) table_run.Refused {
+        switch (err) {}
+    }
+
+    /// A measurement's summary from its series keys and block headers. One
+    /// that holds no points here is not found.
+    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        const self = shard.ts_handler;
+        var names: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+        const sum = self.ts.summarize(router.namespaceHash(req.namespace), req.key, &names);
+        if (sum.series == 0) return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such measurement" } } };
+        // Listed while they fit; the rest are counted, not named.
+        var w: schema.Writer = .{ .buf = &self.info_buf };
+        var listed: u32 = 0;
+        for (names[0..sum.fields]) |n| {
+            if (w.pos + 2 + n.len > ts_ops.MAX_INFO_FIELD_BYTES) break;
+            ts_ops.FieldName.encode(&w, n) catch break;
+            listed += 1;
+        }
+        const has_points = sum.points > 0;
+        return .{ .answer = .{
+            .series = sum.series,
+            .field_count = sum.fields,
+            .fields_capped = sum.fields_capped or listed < sum.fields,
+            .fields = .{ .bytes = self.info_buf[0..w.pos], .count = listed },
+            .points = sum.points,
+            .oldest_ms = if (has_points) @intCast(sum.oldest_ns / std.time.ns_per_ms) else null,
+            .newest_ms = if (has_points) @intCast(sum.newest_ns / std.time.ns_per_ms) else null,
+        } };
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────
@@ -120,6 +163,20 @@ pub const TSHandler = struct {
         const name_buf = dispatcher_mod.scanScratch(ts.buffers.count());
         const count = ts.scanMeasurementNames(router.namespaceHash(namespace), name_buf);
         return .{ .items = name_buf[0..count], .next_cursor = null };
+    }
+
+    /// A measurement as the list answers it:
+    /// `[name_len:u16][name][series:u32][fields:u32][fields_capped:u8][points:u64]`.
+    fn writeListEntry(ctx: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ts: *const TSProjection = @ptrCast(@alignCast(ctx));
+        var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+        const sum = ts.summarize(router.namespaceHash(namespace), name, &fields);
+        try w.writeInt(u16, @intCast(name.len), .little);
+        try w.writeAll(name);
+        try w.writeInt(u32, sum.series, .little);
+        try w.writeInt(u32, sum.fields, .little);
+        try w.writeByte(@intFromBool(sum.fields_capped));
+        try w.writeInt(u64, sum.points, .little);
     }
 
     fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -864,8 +921,9 @@ test "ts handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.ts_list));
     try testing.expect(dispatcher.hasHandler(OpCode.ts_delete));
     try testing.expect(dispatcher.hasHandler(OpCode.ts_retention));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_info));
 
-    try testing.expectEqual(@as(u16, 7), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 8), dispatcher.handler_count);
 }
 
 test "ts handler: write with string value" {

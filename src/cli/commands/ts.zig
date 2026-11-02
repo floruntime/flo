@@ -22,6 +22,8 @@ const wire = @import("../../util/wire.zig");
 const WireReader = wire.WireReader;
 const cli_config = @import("../config.zig");
 const line_protocol = @import("../../ts/line_protocol.zig");
+const gen = @import("../gen.zig");
+const ts_ops = @import("../../protocol/ts_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -35,7 +37,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Create the ts command tree
 pub fn createTsCommand(allocator: Allocator) !*commander.Command {
-    return try commander.newBuilder(allocator)
+    const ts = commander.newBuilder(allocator)
         .name("ts")
         .about("Time-series operations")
         .group("Data Commands")
@@ -145,18 +147,19 @@ pub fn createTsCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runRetention)),
         )
         .subcommand(
-            commander.newBuilder(allocator)
-                .name("floql")
-                .about("Execute a FloQL pipeline query")
-                .examples(&.{
-                    "flo ts floql 'cpu_usage{host=web-01}[1h] | window(5m) | avg()'",
-                    "flo ts floql 'requests[30m] | rate(1s)'",
-                    "flo ts floql 'temperature[24h] | window(1h) | max() | topk(3)'",
-                })
-                .arg("query", "FloQL query string")
-                .action(wrapHandler(runFloql)),
-        )
-        .build();
+        commander.newBuilder(allocator)
+            .name("floql")
+            .about("Execute a FloQL pipeline query")
+            .examples(&.{
+                "flo ts floql 'cpu_usage{host=web-01}[1h] | window(5m) | avg()'",
+                "flo ts floql 'requests[30m] | rate(1s)'",
+                "flo ts floql 'temperature[24h] | window(1h) | max() | topk(3)'",
+            })
+            .arg("query", "FloQL query string")
+            .action(wrapHandler(runFloql)),
+    );
+    gen.addCommands(allocator, ts, &ts_ops.table, &.{});
+    return try ts.build();
 }
 
 // ========================================================================
@@ -875,6 +878,8 @@ fn parseNamePage(
     const count = reader.readU32() orelse return error.Truncated;
     for (0..count) |_| {
         const name = reader.readLengthPrefixed(u16) orelse return error.Truncated;
+        // [series:u32][fields:u32][fields_capped:u8][points:u64]: `ts info` shows them.
+        _ = reader.readSlice(4 + 4 + 1 + 8) orelse return error.Truncated;
         if (name.len == 0 or names.items.len >= limit) continue;
         const owned = try allocator.dupe(u8, name);
         errdefer allocator.free(owned);
@@ -957,7 +962,9 @@ test "ts: query and floql answers parse, and cut-short ones are Truncated" {
 
 test "ts: a list page parses, and a cut-short one is Truncated" {
     const a = std.testing.allocator;
-    const page = "\x02\x00\x00\x00" ++ "\x03\x00cpu" ++ "\x03\x00mem" ++ "\x01" ++ "\x02\x00c1";
+    // Each name, then its [series:u32][fields:u32][fields_capped:u8][points:u64].
+    const stats = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "\x00" ++ "\x05\x00\x00\x00\x00\x00\x00\x00";
+    const page = "\x02\x00\x00\x00" ++ "\x03\x00cpu" ++ stats ++ "\x03\x00mem" ++ stats ++ "\x01" ++ "\x02\x00c1";
     var names: std.ArrayList([]const u8) = .empty;
     defer {
         for (names.items) |n| a.free(n);

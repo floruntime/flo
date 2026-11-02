@@ -447,8 +447,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             const name = reader.readSlice(name_len) orelse return outcome.malformed(ctx, "queue list");
             const ns_len = reader.readU32() orelse return outcome.malformed(ctx, "queue list");
             _ = reader.readSlice(ns_len) orelse return outcome.malformed(ctx, "queue list"); // namespace
-            _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // pending
-            _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // available
+            _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // ready
+            _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // leased
             _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // enqueued
             _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // dequeued
             _ = reader.readU64() orelse return outcome.malformed(ctx, "queue list"); // dlq
@@ -500,8 +500,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     output.printWireList(ctx, buf, "No queues found", &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u32 },
         .{ .field = "namespace", .header = "NAMESPACE", .field_type = .str_u32 },
-        .{ .field = "pending", .header = "PENDING", .field_type = .uint_u64, .alignment = .right },
-        .{ .field = "available", .header = "AVAILABLE", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "ready", .header = "READY", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "leased", .header = "LEASED", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "enqueued", .header = "ENQUEUED", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "dequeued", .header = "DEQUEUED", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "dlq", .header = "DLQ", .field_type = .uint_u64, .alignment = .right },

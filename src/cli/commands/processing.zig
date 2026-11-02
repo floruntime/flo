@@ -247,6 +247,15 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     const created_at = r.readI64() orelse return outcome.malformed(ctx, what);
     // Why the job failed; empty otherwise.
     const reason = r.readLengthPrefixed(u16) orelse return outcome.malformed(ctx, what);
+    // This node's runtime of it, then its definition.
+    const running = (r.readU8() orelse return outcome.malformed(ctx, what)) != 0;
+    const records_in = r.readU64() orelse return outcome.malformed(ctx, what);
+    const records_out = r.readU64() orelse return outcome.malformed(ctx, what);
+    _ = r.readI64() orelse return outcome.malformed(ctx, what); // watermark_ms
+    const tick_avg_us = r.readU64() orelse return outcome.malformed(ctx, what);
+    _ = r.readU64() orelse return outcome.malformed(ctx, what); // tick_max_us
+    const uptime_ms = r.readU64() orelse return outcome.malformed(ctx, what);
+    _ = r.readLengthPrefixed(u32) orelse return outcome.malformed(ctx, what); // yaml
     if (r.remainingLen() != 0) return outcome.malformed(ctx, what);
 
     ctx.print("Job:        {s}\n", .{job_id});
@@ -264,6 +273,7 @@ fn printProcessingJobStatus(ctx: *commander.Context, data: []const u8) commander
     ctx.print("Batch size: {d}\n", .{batch_size});
     ctx.print("Processed:  {d} records\n", .{records});
     ctx.print("Created:    {d}ms\n", .{created_at});
+    if (running) ctx.print("On this node: {d} in, {d} out over {d}ms; ticks avg {d}us\n", .{ records_in, records_out, uptime_ms, tick_avg_us });
 }
 
 fn runList(ctx: *commander.Context) commander.Error!void {
@@ -281,6 +291,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16, .alignment = .left },
         .{ .field = "status", .header = "STATUS", .field_type = .str_u16, .alignment = .left },
         .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
+        .{ .field = "batch_size", .header = "", .field_type = .uint_u32 },
+        .{ .field = "records_processed", .header = "RECORDS", .field_type = .uint_u64, .alignment = .right },
     };
     var pages = output.WirePages.init(ctx.allocator, columns);
     defer pages.deinit();

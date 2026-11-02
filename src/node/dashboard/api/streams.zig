@@ -52,7 +52,7 @@ fn streamCounts(ctx: *DashboardContext, namespace: []const u8, topic: []const u8
 /// A `stream_info` answer: [first_ts:u64][first_seq:u64][last_ts:u64]
 /// [last_seq:u64][count:u64][bytes:u64][partition_count:u32]
 /// [retention_age_s:u64][retention_count:u64][retention_bytes:u64].
-const StreamInfo = struct { count: u64, bytes: u64, partition_count: u32 };
+const StreamInfo = struct { count: u64, bytes: u64, partition_count: u32, retention: Retention };
 
 fn parseInfo(data: []const u8) ?StreamInfo {
     var r = WireReader.init(data);
@@ -60,8 +60,44 @@ fn parseInfo(data: []const u8) ?StreamInfo {
     const count = r.readU64() orelse return null;
     const bytes = r.readU64() orelse return null;
     const pc = r.readU32() orelse return null;
-    return .{ .count = count, .bytes = bytes, .partition_count = pc };
+    const age_s = r.readU64() orelse return null;
+    const max_count = r.readU64() orelse return null;
+    return .{ .count = count, .bytes = bytes, .partition_count = pc, .retention = .{ .age_s = age_s, .count = max_count } };
 }
+
+/// A stream's retention: the age and record count past which its oldest
+/// records go, 0 for no limit.
+const Retention = struct {
+    age_s: u64,
+    count: u64,
+
+    /// "1d", "36h", "1000 records", "1d, 1000 records", or "forever";
+    /// an age in the largest unit that divides it.
+    fn format(self: Retention, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        self.write(&w) catch return "";
+        return w.buffered();
+    }
+
+    fn write(self: Retention, w: *std.Io.Writer) !void {
+        if (self.age_s == 0 and self.count == 0) return w.writeAll("forever");
+        if (self.age_s > 0) {
+            const units = [_]struct { s: u64, name: u8 }{ .{ .s = 86_400, .name = 'd' }, .{ .s = 3600, .name = 'h' }, .{ .s = 60, .name = 'm' }, .{ .s = 1, .name = 's' } };
+            for (units) |u| if (self.age_s % u.s == 0) {
+                try w.print("{d}{c}", .{ self.age_s / u.s, u.name });
+                break;
+            };
+        }
+        if (self.count > 0) try w.print("{s}{d} records", .{ if (self.age_s > 0) ", " else "", self.count });
+    }
+
+    fn writeFields(self: Retention, obj: anytype) !void {
+        var buf: [64]u8 = undefined;
+        try obj.stringField("retention", self.format(&buf));
+        try obj.intField("retention_age_s", self.age_s);
+        try obj.intField("retention_count", self.count);
+    }
+};
 
 /// One stream's `stream_info`, or the JSON answer saying why there is none.
 fn streamInfo(allocator: Allocator, reader: *loopback.Reader, namespace: []const u8, stream: []const u8) !union(enum) { info: StreamInfo, answer: []const u8 } {
@@ -89,10 +125,13 @@ fn hasNul(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, 0) != null;
 }
 
-/// `stream_list` entries: [name_len:u32][name][partition_count:u32].
+/// `stream_list` entries: [name_len:u32][name][partition_count:u32]
+/// [retention_age_s:u64][retention_count:u64].
 const stream_list_columns = [_]output.WireColumn{
     .{ .field = "name", .header = "", .field_type = .str_u32 },
     .{ .field = "partitions", .header = "", .field_type = .uint_u32 },
+    .{ .field = "retention_age_s", .header = "", .field_type = .uint_u64 },
+    .{ .field = "retention_count", .header = "", .field_type = .uint_u64 },
 };
 
 const StreamListAsker = struct {
@@ -103,8 +142,7 @@ const StreamListAsker = struct {
 };
 
 /// GET /streams - A namespace's streams (?namespace=, default "default"),
-/// from `stream_list`, which asks every shard. Retention is null: it would
-/// take one `stream_info` per stream.
+/// from `stream_list`, which asks every shard, with each stream's retention.
 pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const effective_ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -129,6 +167,10 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     for (0..count) |_| {
         const name = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, "stream list: malformed answer");
         const partitions = r.readU32() orelse return try h.jsonError(allocator, "stream list: malformed answer");
+        const retention: Retention = .{
+            .age_s = r.readU64() orelse return try h.jsonError(allocator, "stream list: malformed answer"),
+            .count = r.readU64() orelse return try h.jsonError(allocator, "stream list: malformed answer"),
+        };
         const gop = try seen.getOrPut(name);
         if (gop.found_existing) continue;
         const counts = streamCounts(ctx, effective_ns, name);
@@ -142,7 +184,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
         // windowing across polls).
         try obj.intField("ingest_rate", counts.ingest);
         try obj.intField("reads", counts.reads);
-        try obj.nullField("retention");
+        try retention.writeFields(&obj);
         try obj.end();
     }
 
@@ -298,6 +340,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     try obj.stringField("namespace", ns_q);
     try obj.intField("total_count", info.count);
     try obj.intField("total_bytes", info.bytes);
+    try info.retention.writeFields(&obj);
 
     // Counts are the stream's, not each partition's: a partition's own
     // shows only when the stream has one.
@@ -588,4 +631,14 @@ test "stream info answers parse; a short one doesn't" {
     try std.testing.expectEqual(@as(u64, 99), info.bytes);
     try std.testing.expectEqual(@as(u32, 3), info.partition_count);
     try std.testing.expect(parseInfo(buf[0..40]) == null);
+}
+
+test "a stream's retention reads in the largest unit that divides its age" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("forever", (Retention{ .age_s = 0, .count = 0 }).format(&buf));
+    try std.testing.expectEqualStrings("1d", (Retention{ .age_s = 86_400, .count = 0 }).format(&buf));
+    try std.testing.expectEqualStrings("36h", (Retention{ .age_s = 36 * 3600, .count = 0 }).format(&buf));
+    try std.testing.expectEqualStrings("90s", (Retention{ .age_s = 90, .count = 0 }).format(&buf));
+    try std.testing.expectEqualStrings("1000 records", (Retention{ .age_s = 0, .count = 1000 }).format(&buf));
+    try std.testing.expectEqualStrings("2m, 5 records", (Retention{ .age_s = 120, .count = 5 }).format(&buf));
 }
