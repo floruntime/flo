@@ -149,6 +149,9 @@ pub const Scenario = struct {
     /// Once every core node halted, an operator's repair skips the entry,
     /// and every node goes on past it.
     repair_halt: bool = false,
+    /// Percent of workload ops that are action entries, made from the
+    /// proposing leader's own action state as its handler makes them.
+    action_percent: u8 = 0,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -260,6 +263,17 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The actions slice: same sampling as `fromSeed`, with a share of the
+    /// ops action entries, and a run long enough for leases to expire after
+    /// a new leader's grace.
+    pub fn actions(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        var prng = PRNG.init(std.hash.Wyhash.hash(0xAC71, std.mem.asBytes(&seed)));
+        s.action_percent = prng.random().intRangeAtMost(u8, 25, 60);
+        s.ticks_safety = @max(s.ticks_safety, prng.random().intRangeAtMost(u64, 30_000, 60_000));
+        return s;
+    }
+
     /// The deliberately-small-ring slice: same sampling as `fromSeed` but
     /// the ring is shrunk below the floor so eviction outruns replication
     /// and every repair of a lagging follower reads below the ring. A seed
@@ -352,10 +366,11 @@ pub const Scenario = struct {
         });
         // A second print: one format takes at most 32 arguments.
         try writer.print(
-            \\  "repair_halt": {}
+            \\  "repair_halt": {},
+            \\  "action_percent": {d}
             \\}}
             \\
-        , .{self.repair_halt});
+        , .{ self.repair_halt, self.action_percent });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -408,6 +423,7 @@ pub const Scenario = struct {
                 .bool => |b| b,
                 else => return error.InvalidField,
             } else false,
+            .action_percent = if (obj.get("action_percent") == null) 0 else try jsonInt(u8, obj, "action_percent"),
         };
     }
 };
@@ -550,8 +566,9 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 33), obj.count());
+    try testing.expectEqual(@as(usize, 34), obj.count());
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
+    try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
     try testing.expectEqual(@as(i64, s.outsider_permille), obj.get("outsider_permille").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.halt_op)), obj.get("halt_op").?.integer);
     try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);

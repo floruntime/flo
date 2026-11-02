@@ -14337,6 +14337,55 @@ test "actions: a list rebuilt once it drains keeps what it held, reading only wh
     try std.testing.expectEqual(@as(?u64, null), actions.dropped);
 }
 
+test "actions: however awaits, invokes and commits interleave, no two delivers in flight name one run" {
+    var prng = @import("stdx").PRNG.init(0x5E1EC7);
+    const r = prng.random();
+    for (0..8) |_| {
+        var t: ClusterActionsTest = undefined;
+        try t.init();
+        defer t.deinit();
+        try t.setUp(&.{ "r0", "r1" }, 0);
+        const actions = t.shard.actions_handler;
+        var run_buf: [16]u8 = undefined;
+        var b: [256]u8 = undefined;
+        var invoked: u64 = 2;
+        var most: usize = 0;
+        for (0..200) |step| {
+            switch (r.uintLessThan(u8, 10)) {
+                // A run ready at once, as an applied invoke leaves it.
+                0...1 => {
+                    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run_buf, "r{d}", .{invoked})), 100 + invoked, 1);
+                    invoked += 1;
+                },
+                // An await from one of a few workers: its deliver stays in
+                // flight until the peer acks.
+                2...7 => {
+                    const worker = try std.fmt.bufPrint(&run_buf, "w{d}", .{r.uintLessThan(u8, 6)});
+                    try ParkTest.send(&t.shard, t.c.conn, .action_await, 1000 + step, worker, try awaitOn(&b, &.{"act"}, 0));
+                },
+                else => try ParkTest.ack(&t.shard),
+            }
+            // Every deliver proposed and not yet applied names its own run.
+            var runs: [256][]const u8 = undefined;
+            var bufs: [256][256]u8 = undefined;
+            for (actions.pending.items, 0..) |pd, k| {
+                const e = t.shard.raft_node.log.getEntryCopy(pd.index, &bufs[k]) orelse return error.TestUnexpectedResult;
+                var diag: schema.Diagnostic = .{};
+                runs[k] = (try action_entries.Deliver.decodeAll(e.payload, &diag)).run;
+                for (runs[0..k]) |other| try std.testing.expect(!std.mem.eql(u8, other, runs[k]));
+            }
+            try std.testing.expectEqual(actions.pending.items.len, actions.reserved.count());
+            most = @max(most, actions.pending.items.len);
+            // Answers are drained so the client's socket never fills.
+            var sink: [8192]u8 = undefined;
+            while (std.c.read(t.c.pair[1], &sink, sink.len) > 0) {}
+        }
+        // Delivers were in flight together, more than one at a time.
+        errdefer std.debug.print("at most {d} in flight\n", .{most});
+        try std.testing.expect(most >= 3);
+    }
+}
+
 test "actions: what a shard keeps of runs asked about, and runs it was asked to start, goes in time" {
     var t: TwoShardActions = undefined;
     try t.init();

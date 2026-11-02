@@ -347,6 +347,28 @@ jobs:
         # the same entry, and the group still elects and changes members.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --halts --seed-timeout=120 --out-dir=/tmp/vopr-halts
         timeout-minutes: 20
+      - name: Swarm with action entries
+        # Action entries made from the leader's own state, some spoiled. It
+        # fails if no seed settles and expires a lease from an earlier term.
+        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
+        timeout-minutes: 10
+      - name: Mutant scenarios still fail
+        # Each row of src/vopr/mutants/README.md plants a bug the checker
+        # must catch with the invariant named; the scenario alone passes.
+        run: |
+          rows=$(grep -E '^\| `[A-Za-z0-9._-]+\.json` \|' src/vopr/mutants/README.md | tr -d '`' | awk -F'|' '{gsub(/ /,""); print $2" "$3" "$4}')
+          [ -n "$rows" ] || { echo "::error::src/vopr/mutants/README.md lists no rows"; exit 1; }
+          for f in $(echo "$rows" | awk '{print $1}' | sort -u); do
+            timeout 300 ./zig-out/bin/vopr --scenario-in="src/vopr/mutants/$f" > /tmp/mutant.log 2>&1 || {
+              tail -40 /tmp/mutant.log; echo "::error::$f fails with no mutant"; exit 1; }
+          done
+          echo "$rows" | while read -r f mutant want; do
+            if timeout 300 ./zig-out/bin/vopr --scenario-in="src/vopr/mutants/$f" --family-mutant="$mutant" > /tmp/mutant.log 2>&1; then
+              echo "::error::$f passed with $mutant planted"; exit 1
+            fi
+            grep -qE "^ *\[$want\]" /tmp/mutant.log || { tail -40 /tmp/mutant.log; echo "::error::$f with $mutant failed, but not with [$want]"; exit 1; }
+          done
+        timeout-minutes: 15
       - name: Regression seeds stay green
         # Each seed reaches a bug whose fix landed; it fails if the fix is
         # undone. A seed that fails here is a regression, not a flake.

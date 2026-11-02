@@ -90,6 +90,10 @@ pub const Workload = struct {
 
     acked_count: u64,
     lost_count: u64,
+    /// Action ops by the (term, index) they were proposed at. Their
+    /// payloads are made from the leader's state, not from (seed, op id),
+    /// and name only that state, so the op is found by where it went.
+    action_slots: std.AutoHashMapUnmanaged([2]u64, u64) = .empty,
 
     pub fn init(allocator: Allocator, scenario: *const Scenario) !Workload {
         return .{
@@ -106,6 +110,7 @@ pub const Workload = struct {
     }
 
     pub fn deinit(self: *Workload) void {
+        self.action_slots.deinit(self.allocator);
         self.ops.deinit(self.allocator);
         self.allocator.free(self.scratch);
     }
@@ -148,8 +153,7 @@ pub const Workload = struct {
             r.bytes(p[8..]);
             break :raw p;
         };
-        const hash = std.hash.Wyhash.hash(0x5EED, payload);
-        return .{ .entry_type = entry_type, .payload = payload, .hash = hash };
+        return .{ .entry_type = entry_type, .payload = payload, .hash = payloadHash(payload) };
     }
 
     /// A put of a slot's key, `len` bytes long where the encoding allows:
@@ -314,12 +318,52 @@ pub const Workload = struct {
         return .{ .id = id, .entry_type = gen.entry_type, .payload = gen.payload };
     }
 
+    /// An action op whose payload the leader made (`action_workload`): the
+    /// oracle keeps its hash, as it can't recompute it.
+    pub fn nextActionOp(self: *Workload, entry_type: EntryType, payload: []const u8) !u64 {
+        const id = self.next_op_id;
+        self.next_op_id += 1;
+        try self.ops.append(self.allocator, .{
+            .id = id,
+            .entry_type = entry_type,
+            .payload_len = @intCast(payload.len),
+            .payload_hash = payloadHash(payload),
+            .state = .pending,
+            .proposer = 0,
+            .term = 0,
+            .index = 0,
+        });
+        return id;
+    }
+
+    pub fn payloadHash(payload: []const u8) u64 {
+        return std.hash.Wyhash.hash(0x5EED, payload);
+    }
+
     /// Record where the accepting leader placed the op.
     pub fn recordProposal(self: *Workload, op_id: u64, proposer: u32, term: u64, index: u64) void {
         const op = &self.ops.items[op_id];
         op.proposer = proposer;
         op.term = term;
         op.index = index;
+        if (isAction(@backingInt(op.entry_type))) self.action_slots.put(self.allocator, .{ term, index }, op_id) catch @panic("sim OOM");
+    }
+
+    fn isAction(entry_type: u8) bool {
+        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire }) |t| {
+            if (entry_type == @backingInt(t)) return true;
+        }
+        return false;
+    }
+
+    /// The op an applied entry is: an action op by where it was proposed,
+    /// any other by its payload (`opIdFromPayload`). An action entry never
+    /// proposed as an op at that (term, index), or one whose op was never
+    /// acked, is still matched against what was proposed there; one with
+    /// no op is checked by the log alone.
+    pub fn opIdAt(self: *const Workload, term: u64, index: u64, entry_type: u8, payload: []const u8) ?u64 {
+        if (isAction(entry_type)) return self.action_slots.get(.{ term, index });
+        return opIdFromPayload(entry_type, payload);
     }
 
     /// Ack: the proposing leader's commit_index reached the op's index
