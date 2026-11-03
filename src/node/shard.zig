@@ -561,7 +561,9 @@ pub const Shard = struct {
     apply_behind: bool,
     /// What this tick's apply passes have spent, in `applyCost` units: the
     /// budget is the tick's, since every request and frame applies after it.
+    /// A call outside a tick (boot, a test) has a budget of its own.
     apply_tick_spent: u64,
+    in_tick: bool,
     /// Set by a cold boot (`cold_boot` in `init`) until this node's
     /// projections hold what its group committed; see `coldCaughtUp`.
     cold_gate: bool,
@@ -1107,6 +1109,7 @@ pub const Shard = struct {
             .applying = false,
             .apply_behind = false,
             .apply_tick_spent = 0,
+            .in_tick = false,
             // An empty log holds nothing it could serve wrongly.
             .cold_gate = cold_boot and !raft_node.log.isEmpty(),
             .last_entry_applied = true,
@@ -4282,7 +4285,7 @@ pub const Shard = struct {
     /// projection state for an entry it proposed.
     ///
     /// A tick's calls together apply up to `APPLY_PASS_NS` of `applyCost`,
-    /// its first at least one entry. A backlog (a cold boot's whole log, a
+    /// its first at least one entry; a call outside a tick, up to that much. A backlog (a cold boot's whole log, a
     /// follower far behind) drains over several ticks, so the shard still
     /// answers heartbeats and requests between them.
     pub fn applyCommitted(self: *Shard) bool {
@@ -4333,7 +4336,7 @@ pub const Shard = struct {
 
         const raft = self.raft_node;
         var all_applied = true;
-        var spent = self.apply_tick_spent;
+        var spent = if (self.in_tick) self.apply_tick_spent else 0;
         defer self.apply_tick_spent = spent;
         self.apply_behind = false;
         drain: while (true) {
@@ -4584,6 +4587,8 @@ pub const Shard = struct {
     /// Run one iteration of the event loop (for testing).
     pub fn tick(self: *Shard, timeout_ms: u32) !usize {
         self.apply_tick_spent = 0;
+        self.in_tick = true;
+        defer self.in_tick = false;
         // Lazily register acceptor pipe with reactor on first tick
         if (!self.pipe_registered) {
             try self.reactor.addSource(.{
@@ -13068,7 +13073,9 @@ test "Shard: a backlog applies in passes, each ending at its budget" {
 
     var passes: u64 = 0;
     while (raft.last_applied < raft.commit_index) : (passes += 1) {
-        // As `tick` does; a second call in the same tick applies nothing.
+        // Inside a tick, as the loop runs it: a second call applies nothing.
+        shard.in_tick = true;
+        defer shard.in_tick = false;
         shard.apply_tick_spent = 0;
         const before = raft.last_applied;
         try std.testing.expect(shard.applyCommitted());
