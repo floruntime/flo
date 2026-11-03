@@ -24,8 +24,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 3, .segment_version = 4, .entries = 0x3ff1b4bff4565f2 },
     // Namespace ids are dense and allocated by shard 0, not name hashes.
     .{ .format = 4, .segment_version = 4, .entries = 0x3ff1b4bff4565f2 },
-    // Action entries are schemas, and deliveries are logged.
-    .{ .format = 5, .segment_version = 5, .entries = 0x4e877d93503dc08 },
+    // Action entries are schemas, and deliveries are logged. Unreleased,
+    // so it is re-pinned in place while its layouts still change.
+    .{ .format = 5, .segment_version = 5, .entries = 0x8a485f4c721d6c8d },
 };
 
 comptime {

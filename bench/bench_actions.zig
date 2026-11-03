@@ -91,8 +91,8 @@ pub fn main() !void {
     // The rest, many a time: an apply's cost per lease grows with how many
     // it ends, as the key set's cover check scans every key it declares.
     var i: usize = settled + singles;
-    for ([_]u32{ 16, 64, ae.MAX_EXPIRE_ITEMS }) |per| {
-        const share = (RUNS - settled - singles) / 3;
+    for ([_]u32{ 16, ae.MAX_EXPIRE_ITEMS }) |per| {
+        const share = (RUNS - settled - singles) / 2;
         const end = i + share;
         var entries: u64 = 0;
         start = stdx.time.nanoTimestamp();

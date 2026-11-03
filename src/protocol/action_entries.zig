@@ -38,8 +38,10 @@ pub const MAX_LEASE_MS: u64 = 12 * 60 * 60 * 1000;
 pub const MAX_HOLD_MS: u64 = MAX_LEASE_MS;
 /// The longest a release may hold a run back before it is ready again.
 pub const MAX_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// The most leases one expire entry ends.
-pub const MAX_EXPIRE_ITEMS: u32 = 256;
+/// The most leases one expire entry ends: at about 2.4 µs a lease, 24
+/// apply in under a quarter of a single-node commit, and a backlog drains
+/// as one expire after another.
+pub const MAX_EXPIRE_ITEMS: u32 = 24;
 /// A retried await's key, so it gets the delivery the first one made.
 pub const MAX_REQUEST_KEY: u32 = 64;
 
