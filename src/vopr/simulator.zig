@@ -292,13 +292,7 @@ const SimNode = struct {
     /// The tick it applied each index at (index i at [i - 1]), for judging
     /// whether a crash could have erased what it applied.
     applied_ticks: std.ArrayListUnmanaged(u64) = .empty,
-    /// When this node first saw each index committed: its apply can come
-    /// later, while it is paused.
-    learned_ticks: std.ArrayListUnmanaged(u64) = .empty,
-    learned_through: u64 = 0,
-    /// Raft's `committed_conflicts` when this node's learned ticks were
-    /// last brought up to date.
-    seen_conflicts: u64 = 0,
+    learned: Learned = .{},
     /// The toy family it applies, and the index it last applied it at.
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
@@ -437,7 +431,7 @@ const SimIo = struct {
 
         pub fn stoppedLeading(r: *Replica, _: []const u8) void {
             of(r).sim.steps_down += 1;
-            of(r).ns.handler.stoppedLeading();
+            if (of(r).sim.options.family_mutant != .ns_keeps_alloc) of(r).ns.handler.stoppedLeading();
         }
     };
 };
@@ -467,6 +461,30 @@ const MISMATCH = blk: {
         "a replica rebuilt by replay holds other " ++ name ++ " than one that applied live",
     };
     break :blk out;
+};
+
+/// When a node first saw each index committed (index i at `ticks[i - 1]`):
+/// its apply can come later, while it is paused.
+const Learned = struct {
+    ticks: std.ArrayListUnmanaged(u64) = .empty,
+    through: u64 = 0,
+    /// Raft's `committed_conflicts` at the last `note`.
+    seen_conflicts: u64 = 0,
+
+    /// Brings the ticks up to `commit_index` as of `now`. An async rewind
+    /// lowers commit and raises it again in one append, so commit alone
+    /// never shows it: the indices from its cut are learned again.
+    fn note(self: *Learned, allocator: Allocator, commit_index: u64, committed_conflicts: u64, conflict_index: u64, now: u64) Allocator.Error!void {
+        if (committed_conflicts != self.seen_conflicts) {
+            self.seen_conflicts = committed_conflicts;
+            if (committed_conflicts > 0) self.through = @min(self.through, conflict_index - 1);
+        }
+        self.through = @min(self.through, commit_index);
+        while (self.through < commit_index) : (self.through += 1) {
+            if (self.ticks.items.len <= self.through) try self.ticks.append(allocator, 0);
+            self.ticks.items[self.through] = now;
+        }
+    }
 };
 
 /// What leaders did with the workload's namespace creates at submit.
@@ -935,7 +953,7 @@ pub const Simulator = struct {
             node.raft.deinit();
             node.disk.deinit();
             node.applied_ticks.deinit(self.allocator);
-            node.learned_ticks.deinit(self.allocator);
+            node.learned.ticks.deinit(self.allocator);
             node.counter.deinit(self.allocator);
             node.kv.deinit();
             node.actions.deinit();
@@ -1387,7 +1405,7 @@ pub const Simulator = struct {
             .detail = "a halted node was told a leader applied the entry it halted at",
         });
         const contradicted = node.raft.commit_index + 1;
-        const learned_at: ?u64 = if (contradicted <= node.learned_ticks.items.len) node.learned_ticks.items[contradicted - 1] else null;
+        const learned_at: ?u64 = if (contradicted <= node.learned.ticks.items.len) node.learned.ticks.items[contradicted - 1] else null;
         const erasable = self.scenario.durability == .async_flush and self.crashes > 0 and
             (learned_at == null or self.latest_crash_at + self.scenario.msg_delay_max_ms >= learned_at.?);
         if (!erasable) self.checker.fail(.{
@@ -1765,18 +1783,7 @@ pub const Simulator = struct {
             node.disk.flush();
             node.raft.markDurable(node.raft.log.lastIndex());
         }
-        // An async rewind lowers commit and raises it again in one append,
-        // so commit alone never shows it: the indices rewritten from the cut
-        // are learned again.
-        if (node.raft.committed_conflicts != node.seen_conflicts) {
-            node.seen_conflicts = node.raft.committed_conflicts;
-            if (node.raft.committed_conflicts > 0) node.learned_through = @min(node.learned_through, node.raft.conflict_index - 1);
-        }
-        node.learned_through = @min(node.learned_through, node.raft.commit_index);
-        while (node.learned_through < node.raft.commit_index) : (node.learned_through += 1) {
-            if (node.learned_ticks.items.len <= node.learned_through) node.learned_ticks.append(self.allocator, 0) catch @panic("sim OOM");
-            node.learned_ticks.items[node.learned_through] = self.now;
-        }
+        node.learned.note(self.allocator, node.raft.commit_index, node.raft.committed_conflicts, node.raft.conflict_index, self.now) catch @panic("sim OOM");
         // Paused only while faults run: convergence applies everything.
         if (self.phase == .safety and node.apply_paused_until > self.now) return;
         node.disk.applying = true;
@@ -2521,6 +2528,32 @@ test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuse
         try testing.expect(s.kv.field_deletes >= 2);
         try testing.expect(s.kv.staged_refusals >= 5);
     }
+}
+
+test "vopr sim: a node's learned commits are learned again from each rewind's cut" {
+    var l: Learned = .{};
+    defer l.ticks.deinit(testing.allocator);
+    try l.note(testing.allocator, 10, 0, 0, 100);
+    try testing.expectEqual(@as(u64, 10), l.through);
+    // A rewind cut at 6 and commit back to 10 in the same append: 6 to 10
+    // are learned now, 1 to 5 keep their tick.
+    try l.note(testing.allocator, 10, 1, 6, 200);
+    try testing.expectEqual(@as(u64, 10), l.through);
+    try testing.expectEqual(@as(u64, 100), l.ticks.items[4]);
+    for (l.ticks.items[5..10]) |t| try testing.expectEqual(@as(u64, 200), t);
+    // A second rewind inside that range, commit left below where it was.
+    try l.note(testing.allocator, 7, 2, 8, 300);
+    try testing.expectEqual(@as(u64, 7), l.through);
+    try testing.expectEqual(@as(u64, 200), l.ticks.items[6]);
+    try l.note(testing.allocator, 9, 2, 8, 400);
+    for (l.ticks.items[7..9]) |t| try testing.expectEqual(@as(u64, 400), t);
+    // A cut below commit_index with commit lower still: the lower wins.
+    try l.note(testing.allocator, 3, 3, 5, 500);
+    try testing.expectEqual(@as(u64, 3), l.through);
+    // A restarted Raft counts conflicts from 0 again.
+    try l.note(testing.allocator, 4, 0, 0, 600);
+    try testing.expectEqual(@as(u64, 4), l.through);
+    try testing.expectEqual(@as(u64, 600), l.ticks.items[3]);
 }
 
 test "vopr sim: KV's families are compared at a run's last index even when sampling passed over it" {

@@ -81,12 +81,15 @@ pub const Mutant = enum {
     /// term's entry, applied or not: what only a leader with an unapplied
     /// committed tail can show.
     ns_ready_on_commit,
+    /// A leader that steps down keeps its in-flight namespace id: won
+    /// again, it allocates past what the group created.
+    ns_keeps_alloc,
 
     /// Whether the bug is in the actions machine: a run with no action
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .ns_ungated, .ns_ready_on_commit => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }

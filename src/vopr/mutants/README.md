@@ -16,6 +16,7 @@ means the check stopped catching its bug.
 | `actions.json` | `action_node_clock` | `state_checksum` | `action.` |
 | `catching-up.json` | `ns_ungated` | `ns_stale_id` | `was refused for an id another create took` |
 | `catching-up.json` | `ns_ready_on_commit` | `ns_stale_id` | `was refused for an id another create took` |
+| `catching-up-alloc.json` | `ns_keeps_alloc` | `ns_dense_id` | `took an id past the next free one` |
 
 Mutants with no row, so CI's check that every mutant is accounted for
 passes:
