@@ -72,7 +72,10 @@ pub const Mutant = enum {
     /// Whether the bug is in the actions machine: a run with no action
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
-        return @backingInt(m) >= @backingInt(Mutant.deliver_ignores_due);
+        return switch (m) {
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits => false,
+            .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
+        };
     }
 };
 
@@ -426,7 +429,8 @@ pub const Actions = struct {
             },
         }
 
-        // The action an invoke or deliver names, as it stood.
+        // The action an invoke or deliver names, as it stood: whether it
+        // should have been refused.
         const def_before: ?action_machine.Def.Value = switch (kind) {
             .invoke => self.def("default", (ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt).action),
             .deliver => self.def("default", (ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt).action),
@@ -443,7 +447,7 @@ pub const Actions = struct {
             return .{ .kind = kind, .refused = true, .broke = refusedWrongly(e, stamp, touched.items, def_before) };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
-        effect.broke = self.check(e, stamp, touched.items, def_before, &effect.cross_term);
+        effect.broke = self.check(e, stamp, touched.items, &effect.cross_term);
         return effect;
     }
 
@@ -509,7 +513,7 @@ pub const Actions = struct {
 
     /// The rules an applied entry must keep, by the entry as it was
     /// proposed and the state either side of it.
-    fn check(self: *Actions, e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, def_before: ?action_machine.Def.Value, cross_term: *bool) ?[]const u8 {
+    fn check(self: *Actions, e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, cross_term: *bool) ?[]const u8 {
         var diag: schema.Diagnostic = .{};
         for (touched) |t| {
             const pre = t.before orelse continue;
@@ -528,7 +532,6 @@ pub const Actions = struct {
                     if (!std.meta.eql(post.request_key != null, p.request_key != null) or (p.request_key != null and !std.mem.eql(u8, post.request_key.?, p.request_key.?)))
                         return "a deliver leased a run other than to the delivery it names";
                     if (post.lease_ms != p.lease_ms or post.delivered_ns != stamp or post.expiry_ns != after(stamp, p.lease_ms)) return "a deliver's lease doesn't run from its stamp for its lease";
-                    if (def_before == null or p.lease_ms != def_before.?.lease_ms) return "a deliver's lease isn't its action's";
                 },
                 .settle => {
                     const p = ae.Settle.decodeAll(e.payload, &diag) catch unreachable;

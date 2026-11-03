@@ -581,6 +581,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // A swarm's children would each refuse it, and read as caught.
+    if (args.iterations != null and args.family_mutant.inActions() and !args.actions) {
+        std.debug.print("--family-mutant={t} is in the actions machine: run the swarm with --actions\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
+
     const ok = if (args.iterations != null)
         try runSwarm(init.gpa, args)
     else blk: {

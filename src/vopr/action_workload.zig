@@ -19,13 +19,7 @@ const families = @import("families.zig");
 const EntryType = entry_mod.EntryType;
 
 const NS = "default";
-/// Each action is always registered with the same lease and attempts, so
-/// a deliver's lease is its action's whichever register it read. One
-/// attempt for the first: its runs end at their first failure or expiry.
-const ACTIONS = [_]struct { name: []const u8, lease_ms: u64, max_attempts: u32 }{
-    .{ .name = "a0", .lease_ms = 5_000, .max_attempts = 1 },
-    .{ .name = "a1", .lease_ms = 7_000, .max_attempts = 3 },
-};
+const ACTIONS = [_][]const u8{ "a0", "a1" };
 /// Holders whose name starts so are workers that die holding the run:
 /// nothing reports for them, and their leases expire.
 const DEAD = "x";
@@ -57,8 +51,8 @@ const SPOIL = [_]u8{ 0, 0, 15, 15, 15, 15, 10, 15 };
 pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u8, max_len: usize) ?Made {
     const out = buf[0..@min(buf.len, max_len)];
     var have_def = false;
-    for (ACTIONS) |act| {
-        if (def(a, act.name) != null) have_def = true;
+    for (ACTIONS) |name| {
+        if (def(a, name) != null) have_def = true;
     }
     var roll = r.uintLessThan(u8, 100);
     // A leader that hasn't applied its actions yet registers one now and
@@ -81,16 +75,25 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
     } catch null;
 }
 
+/// An action registered, or registered again with another lease and
+/// attempts: a deliver in flight then carries the lease it was proposed
+/// with. Leases are short, so they expire within a run; a third allow one
+/// attempt, so a failure or an expiry ends the run.
 fn register(out: []u8, r: std.Random) !?Made {
-    const act = ACTIONS[r.uintLessThan(usize, ACTIONS.len)];
-    const p = try ae.Register.encodeInto(out, .{ .ns = NS, .name = act.name, .owner = "", .lease_ms = act.lease_ms, .max_attempts = act.max_attempts });
+    const p = try ae.Register.encodeInto(out, .{
+        .ns = NS,
+        .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
+        .owner = "",
+        .lease_ms = r.intRangeAtMost(u64, 5_000, 8_000),
+        .max_attempts = r.intRangeAtMost(u32, 1, 3),
+    });
     return .{ .entry_type = .action_register, .payload = p };
 }
 
 /// An action deleted: its runs stay, but none is delivered until it is
 /// registered again.
 fn delete(out: []u8, r: std.Random) !?Made {
-    const p = try ae.Delete.encodeInto(out, .{ .ns = NS, .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)].name });
+    const p = try ae.Delete.encodeInto(out, .{ .ns = NS, .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)] });
     return .{ .entry_type = .action_delete, .payload = p };
 }
 
@@ -101,7 +104,7 @@ fn invoke(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: []co
     const taken = if (spoil) pick(a, r, any, &ib) else null;
     const p = try ae.Invoke.encodeInto(out, .{
         .ns = NS,
-        .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)].name,
+        .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
         .run = if (taken) |t| t.id else try std.fmt.bufPrint(&rb, "r{s}", .{tag}),
         .input = tag,
         .labels = null,
