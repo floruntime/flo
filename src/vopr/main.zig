@@ -207,7 +207,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} family_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} warm_restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} family_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -220,6 +220,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.crashes,
             s.wipes,
             s.restarts,
+            s.warm_restarts,
             s.messages_delivered,
             s.messages_dropped,
             s.apply_stalls,

@@ -118,6 +118,8 @@ pub const Violation = struct {
 /// `on_append` hook; term and vote arrive through the node's own
 /// `HardStateSink`, before the node acts on them — the same contract as
 /// production's HARDSTATE file. Nothing else writes hard state here.
+const zero_commit: u64 = 0;
+
 const SimDisk = struct {
     allocator: Allocator,
     term: u64 = 0,
@@ -126,6 +128,12 @@ const SimDisk = struct {
     entries: std.ArrayListUnmanaged(DiskEntry) = .empty,
     /// entries[0..durable_len] survive a crash.
     durable_len: usize = 0,
+    /// The highest commit index a flush that wrote entries was taken
+    /// under, as production stamps each sealed segment: a restart applies
+    /// through it before any leader speaks.
+    watermark: u64 = 0,
+    /// The node's commit index, read at each flush.
+    commit_index: *const u64 = &zero_commit,
     last_flush: u64 = 0,
     /// Replication batches the log read from here, below its ring: a run
     /// that never does has not exercised catch-up. Applies read here too
@@ -174,6 +182,7 @@ const SimDisk = struct {
         }
         self.entries.shrinkRetainingCapacity(@intCast(@min(after_index, self.entries.items.len)));
         self.durable_len = @min(self.durable_len, self.entries.items.len);
+        self.watermark = @min(self.watermark, after_index);
     }
 
     /// The log reads below its ring from here: the production runtime's
@@ -220,7 +229,10 @@ const SimDisk = struct {
     }
 
     fn flush(self: *SimDisk) void {
+        // Nothing buffered seals nothing, so stamps nothing.
+        if (self.durable_len == self.entries.items.len) return;
         self.durable_len = self.entries.items.len;
+        self.watermark = @max(self.watermark, self.commit_index.*);
     }
 
     /// The disk is gone: log and hard state alike, as a replaced volume.
@@ -228,6 +240,7 @@ const SimDisk = struct {
         for (self.entries.items) |e| self.allocator.free(e.payload);
         self.entries.clearRetainingCapacity();
         self.durable_len = 0;
+        self.watermark = 0;
         self.last_flush = 0;
         self.term = 0;
         self.voted_for = 0;
@@ -763,6 +776,9 @@ pub const Summary = struct {
     elections_won: u64,
     crashes: u64,
     restarts: u64,
+    /// Of those, the ones that came up with commit past 0: a watermark
+    /// survived.
+    warm_restarts: u64,
     /// Crashes that also lost the disk, or its hard state.
     wipes: u64,
     /// Guarded nodes the convergence phase waited on to finish.
@@ -845,6 +861,7 @@ pub const Simulator = struct {
 
     crashes: u64 = 0,
     restarts: u64 = 0,
+    warm_restarts: u64 = 0,
     wipes: u64 = 0,
     /// KV entries by outcome, counted at the first apply of each index.
     kv_counts: families.Kv.Counts = .{},
@@ -1038,6 +1055,7 @@ pub const Simulator = struct {
         node.raft.log.on_truncate = SimDisk.onTruncate;
         node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
         node.raft.log_flush_sink = .{ .ctx = @ptrCast(&node.disk), .flush = SimDisk.flushLog };
+        node.disk.commit_index = &node.raft.commit_index;
         if (!self.options.volatile_hard_state) {
             node.raft.hard_state_sink = .{ .ctx = @ptrCast(&node.disk), .persist = SimDisk.persistHardState };
         }
@@ -1194,6 +1212,11 @@ pub const Simulator = struct {
         // Volatile mode keeps the demonstrator of a node with no hard state
         // at all: it restarts at term 0.
         node.raft.current_term = if (self.options.volatile_hard_state) node.disk.term else @max(node.disk.term, node.raft.log.lastTerm());
+        // What was flushed under a commit index is committed, as
+        // production's boot takes the segments' watermark; the rest waits
+        // for a leader.
+        node.raft.commit_index = @min(node.disk.watermark, node.disk.durable_len);
+        if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
         if (node.disk.lost_log) node.raft.resumeLostLog();
         self.attachDisk(node);
@@ -1228,6 +1251,9 @@ pub const Simulator = struct {
                 node.raft.halt_at = .{ .index = e.header.index, .term = e.header.term, .crc = e.header.crc32c };
             }
         };
+        // Applied through it before any leader speaks, as production's boot
+        // replays it, committing each config it applies.
+        self.applyCommitted(node);
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
                 .invariant = .term_monotonicity,
@@ -2274,6 +2300,7 @@ pub const Simulator = struct {
             .elections_won = self.elections_won,
             .crashes = self.crashes,
             .restarts = self.restarts,
+            .warm_restarts = self.warm_restarts,
             .wipes = self.wipes,
             .guards_watched = blk: {
                 var n: u64 = 0;
@@ -2540,6 +2567,39 @@ test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuse
     }
 }
 
+fn diskAppend(d: *SimDisk, index: u64) void {
+    var e = entry_mod.buildEntry(.raft_noop, 0, 1, index, index, "");
+    e.header.crc32c = e.computeCrc();
+    SimDisk.onAppend(@ptrCast(d), &e);
+}
+
+test "vopr sim: the disk's watermark is the commit index a flush that wrote was taken under" {
+    var commit: u64 = 0;
+    var d: SimDisk = .{ .allocator = testing.allocator, .commit_index = &commit };
+    defer d.deinit();
+    for (1..5) |i| diskAppend(&d, i);
+    commit = 3;
+    d.flush();
+    try testing.expectEqual(@as(u64, 3), d.watermark);
+    // Nothing buffered: no seal, so commit moving on stamps nothing.
+    commit = 4;
+    d.flush();
+    try testing.expectEqual(@as(u64, 3), d.watermark);
+    // Buffered but lost in a crash: neither the entries nor a stamp.
+    diskAppend(&d, 5);
+    d.crash();
+    try testing.expectEqual(@as(u64, 3), d.watermark);
+    try testing.expectEqual(@as(usize, 4), d.durable_len);
+    diskAppend(&d, 5);
+    d.flush();
+    try testing.expectEqual(@as(u64, 4), d.watermark);
+    // A truncation below it takes the stamp down with the entries.
+    SimDisk.onTruncate(@ptrCast(&d), 2);
+    try testing.expectEqual(@as(u64, 2), d.watermark);
+    d.wipe();
+    try testing.expectEqual(@as(u64, 0), d.watermark);
+}
+
 test "vopr sim: a node's learned commits are learned again from each rewind's cut" {
     var l: Learned = .{};
     defer l.ticks.deinit(testing.allocator);
@@ -2659,6 +2719,25 @@ fn hasViolation(sim: *const Simulator, invariant: Invariant) bool {
         if (v.invariant == invariant) return true;
     }
     return false;
+}
+
+test "vopr sim: a restarted node comes up committed and applied through its disk's watermark, with its config committed" {
+    var sim = try Simulator.init(testing.allocator, Scenario.calm(7), .{});
+    defer sim.deinit();
+    try runTicks(&sim, 3000);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    const f = sim.node_(if (l == 1) 2 else 1);
+    sim.crashNode(f);
+    const mark = @min(f.disk.watermark, f.disk.durable_len);
+    const warm = sim.warm_restarts;
+    try testing.expect(mark > 0);
+    try sim.restartNode(f);
+    // Before any leader has spoken to it.
+    try testing.expectEqual(@as(u64, mark), f.raft.commit_index);
+    try testing.expectEqual(f.raft.commit_index, f.raft.last_applied);
+    try testing.expect(f.raft.committed_config_index > 0);
+    try testing.expect(f.raft.committed_config_index <= mark);
+    try testing.expectEqual(warm + 1, sim.warm_restarts);
 }
 
 /// Three nodes. The leader commits entries while node y is down; then the
@@ -3101,7 +3180,7 @@ test "vopr sim: a truncated uncommitted config leaves the node with the members 
 
 /// Catching-up seeds that run long enough to create namespaces under every
 /// fault the swarm has.
-const CATCHING_UP_SEEDS = [_]u64{ 1, 2, 3, 4 };
+const CATCHING_UP_SEEDS = [_]u64{ 2, 3, 4, 6 };
 
 test "vopr sim: in every catching-up run, leaders refuse creates until ready, and no create loses its id" {
     for (CATCHING_UP_SEEDS) |seed| {
