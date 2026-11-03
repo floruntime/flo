@@ -675,13 +675,12 @@ pub const QueueHandler = struct {
                 @memcpy(buf[offset..][0..meta.namespace.len], meta.namespace);
                 offset += meta.namespace.len;
 
-                // pending (= enqueued - dequeued, approximate)
-                const pending = if (meta.enqueued > meta.dequeued) meta.enqueued - meta.dequeued else 0;
-                std.mem.writeInt(u64, buf[offset..][0..8], pending, .little);
+                // ready and leased, as the walk's entry has them: enqueued
+                // less dequeued stays high after a purge.
+                const live = self.queue.liveCounts(kv.key_ptr.*);
+                std.mem.writeInt(u64, buf[offset..][0..8], live.ready, .little);
                 offset += 8;
-
-                // available (same as pending for now)
-                std.mem.writeInt(u64, buf[offset..][0..8], pending, .little);
+                std.mem.writeInt(u64, buf[offset..][0..8], live.leased, .little);
                 offset += 8;
 
                 // enqueued

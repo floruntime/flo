@@ -484,14 +484,19 @@ pub const QueueProjection = struct {
             }
             self.shift(kv.value.queue_name_hash, kv.value.state, null);
             self.stats.acked += 1;
+            // An ack counts as a dequeue even of a message still ready:
+            // replicas never see leases (only the dequeuing leader holds
+            // them), so requiring one would leave every replica at 0.
             self.countDequeued(kv.value.queue_name_hash);
             if (self.known_queues.getPtr(kv.value.queue_name_hash)) |meta| meta.acked += 1;
         }
     }
 
-    /// A message taken and reported, which every replica applies: a
+    /// A message taken and reported. An ack applies on every replica; a
     /// dequeue itself runs only where it was asked, and isn't logged, so
-    /// counting there loses it on a restart and on every other replica.
+    /// counting there loses it on a restart and on every other replica. A
+    /// nack counts only where the message was leased: the leader that
+    /// dequeued it.
     fn countDequeued(self: *QueueProjection, queue_name_hash: u64) void {
         self.stats.dequeued += 1;
         if (self.known_queues.getPtr(queue_name_hash)) |meta| meta.dequeued += 1;
@@ -1102,4 +1107,15 @@ test "queue: a replica that only replays the log counts a queue's enqueues and d
         try testing.expectEqual(@as(u64, 1), meta.dequeued);
         try testing.expectEqual(@as(u64, 2), q.liveCounts(hash).ready);
     }
+}
+
+test "queue: a nack of a dequeued message counts it as dequeued, as an ack does" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000, .max_attempts = 5 });
+    defer q.deinit();
+    try q.registerQueue(42, "q", "default");
+    const seq = try q.enqueue(100, 0, 1000, 42, "m");
+    _ = (try q.dequeue(2000, 42)).?;
+    try q.nack(seq, 3000);
+    try testing.expectEqual(@as(u64, 1), q.known_queues.get(42).?.dequeued);
+    try testing.expectEqual(@as(u64, 1), q.stats.dequeued);
 }
