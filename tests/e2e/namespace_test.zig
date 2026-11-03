@@ -403,7 +403,7 @@ test "e2e/namespace: a read the leader answers in a namespace never created is r
     for (reads) |args| {
         var r = try ctx.cli.run(args);
         defer r.deinit();
-        if (!r.contains("no_namespace")) std.debug.print("{s}: {s}{s}\n", .{ args[0], r.stdout, r.stderr });
-        try testing.expect(r.contains("no_namespace"));
+        if (!r.contains("[no_namespace/")) std.debug.print("{s}: {s}{s}\n", .{ args[0], r.stdout, r.stderr });
+        try testing.expect(r.contains("[no_namespace/"));
     }
 }

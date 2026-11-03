@@ -18,7 +18,7 @@ pub const Reason = enum(u16) {
     field_too_long = 3,
     /// A number outside its declared range.
     out_of_range = 4,
-    /// The write found no leader to take it.
+    /// No leader took the request: none is known, or it can't be reached.
     leader_unknown = 5,
     /// The shard that owns the request is too busy to take it.
     shard_busy = 6,

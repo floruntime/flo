@@ -2936,7 +2936,7 @@ pub const Shard = struct {
         var buf: [FORWARD_PREFIX + FORWARD_FIELDS + MAX_REQUEST_SIZE + proto.DEFAULT_NAMESPACE.len + 2]u8 = undefined;
         const body_at = FORWARD_PREFIX + FORWARD_FIELDS;
         if (body_at + f.bytes.len > buf.len) {
-            self.finishForward(f, .internal_error, "request too large to forward");
+            self.finishForward(f, .internal_error, .internal, "request too large to forward");
             return;
         }
         std.mem.writeInt(u32, buf[0..4], f.id, .little);
@@ -2952,7 +2952,7 @@ pub const Shard = struct {
         @memcpy(buf[body_at..][0..f.bytes.len], f.bytes);
         switch (rn.sendForward(leader, .forward_write, self.id, buf[0 .. body_at + f.bytes.len], session)) {
             .queued => {},
-            .full => return self.finishForward(f, .overloaded, "overloaded: the link to the leader is full; this request was not run — retry"),
+            .full => return self.finishForward(f, .overloaded, .shard_busy, "overloaded: the link to the leader is full; this request was not run — retry"),
             .not_sent => return,
         }
         f.sent_to = leader;
@@ -2987,13 +2987,13 @@ pub const Shard = struct {
             }
             if (f.sent_to != 0) {
                 if (raft.current_term != f.sent_term or (leader != 0 and leader != f.sent_to)) {
-                    self.finishForward(f, .unavailable, "unavailable: lost leadership before commit — write may still apply");
+                    self.lostLeader(f, "unavailable: lost leadership before commit — write may still apply");
                 } else if (self.raft_network != null and self.raft_network.?.linkSession(f.sent_to) != f.sent_session) {
                     // Gone, or gone and back between two ticks: either way the
                     // link it went over is not the one up now.
-                    self.finishForward(f, .unavailable, "unavailable: lost the link to the leader — write may still apply");
+                    self.lostLeader(f, "unavailable: lost the link to the leader — write may still apply");
                 } else if (now -| f.sent_ms >= SENT_FORWARD_BACKSTOP_MS + f.wait_ms) {
-                    self.finishForward(f, .unavailable, "unavailable: no answer from the leader — write may still apply");
+                    self.lostLeader(f, "unavailable: no answer from the leader — write may still apply");
                 }
                 continue;
             }
@@ -3289,10 +3289,18 @@ pub const Shard = struct {
         }
     }
 
-    fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, message: []const u8) void {
+    /// A forward that went to a leader and won't be answered by it: a write
+    /// may still apply there; a read ran nowhere that matters, and is retried.
+    fn lostLeader(self: *Shard, f: *Forward, write_message: []const u8) void {
+        self.finishForward(f, .unavailable, .leader_unknown, if (f.read) "unavailable: lost the leader before it answered — retry" else write_message);
+    }
+
+    /// End a forward unanswered. A read's refusal says it didn't run, with
+    /// `reason`; a write's says what `message` does.
+    fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, reason: proto.Reason, message: []const u8) void {
         // An ask is a read: whatever ended it, nothing ran.
         if (f.ask) |name| self.failAsk(name, status, proto.notRun(ASK_FAILED)) else if (f.read)
-            self.deliverDeferredRefusal(f.reply_to, f.request_id, status, .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: lost the leader before it answered — retry" })
+            self.deliverDeferredRefusal(f.reply_to, f.request_id, status, .{ .reason = reason, .ran = .no, .message = message })
         else
             self.deliverDeferredError(f.reply_to, f.request_id, status, message);
         self.dropForward(f);
@@ -3431,13 +3439,15 @@ pub const Shard = struct {
             self.dropForward(f);
             return;
         }
-        if (self.raft_node.last_applied >= committed) {
+        // A write's answer waits for this node to apply what it committed,
+        // so its client reads its own write here; a read changed nothing.
+        if (f.read or self.raft_node.last_applied >= committed) {
             self.deliverDeferred(f.reply_to, bytes);
             self.dropForward(f);
             return;
         }
         f.reply = self.allocator.dupe(u8, bytes) catch {
-            self.finishForward(f, .internal_error, "could not hold the leader's answer");
+            self.finishForward(f, .internal_error, .internal, "could not hold the leader's answer");
             return;
         };
         f.applied_by = committed;
@@ -3993,7 +4003,7 @@ pub const Shard = struct {
                 self.deliverDeferred(f.reply_to, reply);
                 self.dropForward(f);
             } else {
-                self.finishForward(f, .unavailable, message);
+                self.finishForward(f, .unavailable, .unclassified, message);
             }
         }
     }
@@ -17898,6 +17908,16 @@ test "Shard: a read the leader answers, on a node that does not lead, waits for 
     shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.queue_peek, 6), .namespace = "default", .key = "q", .value = body }, .client);
     try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
     try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
+    // So are the hand-coded reads of leader memory: a group's info and
+    // pending entries, and the dead letters only the leasing leader makes.
+    for ([_]proto.OpCode{ .stream_group_info, .stream_group_pending, .queue_dlq_list }, 0..) |op, i| {
+        shard.runRequest(conn, .{ .header = proto.RequestHeader.init(op, 80 + i), .namespace = "default", .key = "q", .value = "" }, .client);
+        try std.testing.expectEqual(@as(u32, @intCast(2 + i)), shard.forward_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
+    for (shard.forwards) |*f| {
+        if (f.active and f.request_id >= 80) shard.dropForward(f);
+    }
 
     shard.sweepForwards(Shard.nowMs() + FORWARD_TIMEOUT_MS + 1);
     try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
@@ -17935,4 +17955,91 @@ test "a halted leader answers a read only it can, marked stale: a halt clears no
     const v = try Peek.response.decodeAll(resp.data, &diag);
     var it = v.messages.iterator();
     try std.testing.expectEqualStrings("kept", (try it.next()).?.payload);
+}
+
+test "Shard: a read the leader answers, unanswered by the shard it went to, is told it didn't run, as any read is" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    const peek = try Shard.serializeRequest(std.testing.allocator, .{ .header = proto.RequestHeader.init(.queue_peek, 61), .namespace = "default", .key = "q", .value = try Peek.request.encodeInto(&body_buf, .{ .limit = 5 }) });
+    defer std.testing.allocator.free(peek);
+    try forwardForTest(a, 1, c.conn, peek);
+    // Its slot is a read's.
+    for (a.reply_pool.slots) |*s| {
+        if (s.active) {
+            try std.testing.expect(!s.writes);
+            s.taken_ms = 0;
+            s.answer_due_ms = 0;
+        }
+    }
+    a.reply_sweep_ms = 0;
+    _ = try a.tick(0);
+    var out: [256]u8 = undefined;
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < @sizeOf(proto.ResponseHeader) and tries < 1000) : (tries += 1) {
+        const n = std.c.read(c.pair[1], out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    const told = try proto.Response.parse(out[0..got]);
+    try std.testing.expectEqual(@as(u64, 61), told.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), told.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try told.refused()).ran);
+}
+
+test "Shard: a forward lost after it went to the leader tells a read it didn't run, and a write it may still apply" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.queue_peek, 71), .namespace = "default", .key = "q", .value = try Peek.request.encodeInto(&body_buf, .{ .limit = 5 }) }, .client);
+    shard.runRequest(conn, testReq(.kv_put, 72, "", "k", "v", ""), .client);
+    try std.testing.expectEqual(@as(u32, 2), shard.forward_count);
+    // Both went to a leader, in a term that has since passed.
+    for (shard.forwards) |*f| {
+        if (!f.active) continue;
+        f.sent_to = 2;
+        f.sent_term = shard.raft_node.current_term + 1;
+    }
+    shard.sweepForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+
+    var out: [512]u8 = undefined;
+    var got: usize = 0;
+    var tries: usize = 0;
+    while (got < 2 * @sizeOf(proto.ResponseHeader) + 40 and tries < 1000) : (tries += 1) {
+        const n = std.c.read(pair[1], out[got..].ptr, out.len - got);
+        if (n > 0) got += @intCast(n);
+    }
+    var at: usize = 0;
+    for (0..2) |_| {
+        const r = try proto.Response.parse(out[at..got]);
+        at += @sizeOf(proto.ResponseHeader) + r.header.data_len;
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), r.header.status);
+        const why = try r.refused();
+        if (r.header.request_id == 71) {
+            try std.testing.expectEqual(proto.Ran.no, why.ran);
+            try std.testing.expectEqual(proto.Reason.leader_unknown, why.reason);
+            try std.testing.expect(std.mem.indexOf(u8, why.message, "lost the leader before it answered") != null);
+        } else {
+            try std.testing.expectEqual(@as(u64, 72), r.header.request_id);
+            try std.testing.expect(std.mem.indexOf(u8, why.message, "write may still apply") != null);
+        }
+    }
 }

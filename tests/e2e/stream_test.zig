@@ -3492,4 +3492,8 @@ test "e2e/cluster: a follower asked about a group answers the leader's members a
     defer testing.allocator.free(pending);
     if (std.mem.indexOf(u8, pending, "c-1") == null) std.debug.print("{s}\n", .{pending});
     try testing.expect(std.mem.indexOf(u8, pending, "c-1") != null);
+    const info = try cluster.execCaptureAnyOn(2, &.{ "stream", "group", "info", "lr", "--group", "g", "-o", "json" });
+    defer testing.allocator.free(info);
+    if (std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") == null) std.debug.print("{s}\n", .{info});
+    try testing.expect(std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") != null);
 }
