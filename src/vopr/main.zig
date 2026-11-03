@@ -27,6 +27,8 @@
 //!                                   expires a lease from an earlier term
 //!        [--family-mutant=NAME]     plant a family mutant (`families.Mutant`):
 //!                                   the run must fail
+//!        [--catching-up]            namespace creates, and nodes that fall
+//!                                   behind on applying and win elections
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -53,6 +55,7 @@ const Args = struct {
     halts: bool = false,
     actions: bool = false,
     family_mutant: vopr.families.Mutant = .none,
+    catching_up: bool = false,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -69,7 +72,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -102,6 +105,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.actions = true;
         } else if (std.mem.startsWith(u8, arg, "--family-mutant=")) {
             args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
+        } else if (std.mem.eql(u8, arg, "--catching-up")) {
+            args.catching_up = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
             var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
             while (it.next()) |n| {
@@ -164,6 +169,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.halting(seed)
     else if (args.actions)
         Scenario.actions(seed)
+    else if (args.catching_up)
+        Scenario.catchingUp(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
@@ -231,6 +238,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         },
     );
     if (scenario.action_percent > 0) printActionCounts(s.actions);
+    if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
         var vbuf: [16384]u8 = undefined;
@@ -249,7 +257,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
@@ -258,6 +266,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.membership) " --membership" else "",
                 if (args.byzantine) " --byzantine" else "",
                 if (args.halts) " --halts" else "",
+                if (args.catching_up) " --catching-up" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
@@ -335,6 +344,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.actions) try argv.append(allocator, "--actions");
     var mutant_arg: [64]u8 = undefined;
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
+    if (args.catching_up) try argv.append(allocator, "--catching-up");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -571,13 +581,13 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions/--catching-up (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) > 1) {
-        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts and --actions are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) > 1) {
+        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts, --actions and --catching-up are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 
