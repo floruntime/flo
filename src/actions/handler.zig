@@ -201,6 +201,9 @@ pub const ActionsHandler = struct {
     /// action.status copies a run's output and error here: the answer is
     /// encoded after the store may have moved.
     status_buf: ?[]u8 = null,
+    /// action.info copies the action's owner here: the answer is encoded
+    /// after the handler returns, so its own stack is gone.
+    info_owner_buf: [action_ops.MAX_OWNER]u8 = undefined,
 
     const Pending = struct {
         index: u64,
@@ -589,7 +592,7 @@ pub const ActionsHandler = struct {
         const ns = homeOf(req.namespace);
         const def = getDef(shard, ns, req.key) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_ACTION } } };
-        var owner_buf: [action_ops.MAX_OWNER]u8 = undefined;
+        const owner_buf = &shard.actions_handler.info_owner_buf;
         const owner = owner_buf[0..@min(def.owner.len, owner_buf.len)];
         @memcpy(owner, def.owner[0..owner.len]);
 

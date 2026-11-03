@@ -3,7 +3,8 @@
 
    Wired to the dashboard API. Actions are namespace-scoped server-side. The list
    answers each definition but not run counts or latency (those render "—"); the
-   detail answers them, over a capped scan of the namespace's runs. Invoke is a
+   detail answers them, unless the action's shard holds more than 10,000 of the
+   namespace's runs (then all but pending render "—"). Invoke is a
    real loopback write (async → run_id); Register is command-only (no dashboard
    endpoint). */
 import { useMemo, useState } from 'react'
@@ -23,9 +24,9 @@ const invCount = (r: ActionRunCounts): number | null => {
   const done = errCount(r)
   return done == null || r.running == null || r.completed == null ? null : r.pending + r.running + r.completed + done
 }
-/** Past a namespace's 10,000 runs only pending is counted; say why the rest show a dash. */
+/** Past 10,000 of the namespace's runs on the action's shard only pending is counted; say why the rest show a dash. */
 const scanSub = (r: ActionRunCounts | undefined, fallback: string): string =>
-  r?.too_many_runs ? 'too many runs in this namespace to count' : fallback
+  r?.too_many_runs ? "too many of this namespace's runs on the action's shard to count" : fallback
 const pendingText = (r: ActionRunCounts | undefined): string =>
   r ? (r.pending_capped ? '≥' : '') + afmtN(r.pending) : DASH
 const durMs = (run: ActionRun): number | null =>
@@ -320,7 +321,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                 </div>
                 {counts?.too_many_runs && (
                   <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
-                    The namespace holds more than 10,000 runs, so only pending is counted.
+                    This action&apos;s shard holds more than 10,000 of the namespace&apos;s runs, so only pending is counted.
                   </div>
                 )}
               </div>
@@ -494,7 +495,7 @@ function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => voi
                       {r.name}
                     </div>
                     <div className="desc">
-                      v{r.version} · {orDash(r.runs?.pending)} pending
+                      v{r.version} · {pendingText(r.runs ?? undefined)} pending
                     </div>
                   </div>
                   <span className="c r mono">{orDash(r.runs ? invCount(r.runs) : null, afmtN)}</span>

@@ -264,7 +264,8 @@ export interface TsFloqlResponse {
 export type ActionRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
 /** `pending` is counted up to 100,000 (`pending_capped`: at least that).
  *  The others read every run in the namespace, so they are null when it
- *  holds too many runs to count (`too_many_runs`). */
+ *  holds too many runs to count (`too_many_runs`: the action's shard holds
+ *  more than 10,000 of the namespace's runs). */
 export interface ActionRunCounts {
   pending: number
   pending_capped: boolean

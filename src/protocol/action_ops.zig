@@ -201,10 +201,10 @@ pub const table = [_]ops.Op{
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
             .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker, counted up to 100,000" },
             .{ .name = "ready_capped", .T = schema.Bool, .doc = "More runs are waiting than were counted: ready is at least that" },
-            // The counts below read every run in the namespace, so past
-            // 10,000 runs they aren't taken: a sample of the oldest would
-            // stop moving while new runs come and go.
-            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "The namespace holds more than 10,000 runs, so the counts and latency below are none" },
+            // The counts below read every run of the namespace's that the
+            // action's shard holds, so past 10,000 they aren't taken: a
+            // sample of the oldest would stop moving while new runs come and go.
+            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "The action's shard holds more than 10,000 of the namespace's runs, so the counts and latency below are none" },
             .{ .name = "running", .T = Optional(Int(u64)), .doc = "Its runs a worker holds" },
             .{ .name = "completed", .T = Optional(Int(u64)), .doc = "Its runs that completed" },
             .{ .name = "failed", .T = Optional(Int(u64)), .doc = "Its runs that failed for good" },
@@ -218,7 +218,7 @@ pub const table = [_]ops.Op{
             .{ .name = "latency_max_ms", .T = Optional(Int(u64)), .doc = "The longest" },
         }),
         .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
-        .doc = "An action's definition, its runs by status and how long completed runs took. Counts other than ready are none in a namespace of more than 10,000 runs.",
+        .doc = "An action's definition, its runs by status and how long completed runs took. Counts other than ready are none when the action's shard holds more than 10,000 of the namespace's runs.",
     },
 };
 

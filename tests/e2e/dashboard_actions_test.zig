@@ -39,6 +39,8 @@ test "e2e/dashboard: action owner + timeout_ms are persisted and surfaced" {
     // Detail endpoint too, plus its attempts (`--retries` sets them) and the latency.
     var detail = try http.get("/api/v1/actions/owned-action");
     defer detail.deinit();
+    if (detail.status != 200 or std.mem.indexOf(u8, detail.body, "\"owner\":\"myteam\"") == null)
+        std.debug.print("action detail: {d} {s}\n", .{ detail.status, detail.body });
     try testing.expectEqual(@as(u16, 200), detail.status);
     try testing.expect(std.mem.indexOf(u8, detail.body, "\"owner\":\"myteam\"") != null);
     try testing.expect(std.mem.indexOf(u8, detail.body, "\"timeout_ms\":60000") != null);

@@ -259,7 +259,7 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         try runs.intField("pending", @as(i64, @intCast(info.ready)));
         // Pending is at least that many.
         try runs.boolField("pending_capped", info.ready_capped);
-        // Null in a namespace of too many runs to count.
+        // Null when the action's shard holds too many of the namespace's runs to count.
         for ([_][]const u8{ "running", "completed", "failed", "timed_out" }, [_]?u64{ info.running, info.completed, info.failed, info.timed_out }) |field, v| {
             if (v) |n| try runs.intField(field, @as(i64, @intCast(n))) else try runs.nullField(field);
         }
