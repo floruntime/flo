@@ -128,10 +128,9 @@ const SimDisk = struct {
     entries: std.ArrayListUnmanaged(DiskEntry) = .empty,
     /// entries[0..durable_len] survive a crash.
     durable_len: usize = 0,
-    /// The highest commit index a flush that wrote entries was taken
-    /// under, as production stamps each sealed segment: a restart applies
-    /// through it before any leader speaks.
-    watermark: u64 = 0,
+    /// One per flush that wrote entries, as production seals a segment:
+    /// the last index it holds and the commit index it was taken under.
+    segments: std.ArrayListUnmanaged(Segment) = .empty,
     /// The node's commit index, read at each flush.
     commit_index: *const u64 = &zero_commit,
     last_flush: u64 = 0,
@@ -140,6 +139,8 @@ const SimDisk = struct {
     /// (a restarted node's log outgrows its ring) and are not counted.
     catch_up_reads: u64 = 0,
     applying: bool = false,
+
+    const Segment = struct { last: u64, stamp: u64 };
 
     const DiskEntry = struct {
         entry_type: u8,
@@ -152,6 +153,15 @@ const SimDisk = struct {
     fn deinit(self: *SimDisk) void {
         for (self.entries.items) |e| self.allocator.free(e.payload);
         self.entries.deinit(self.allocator);
+        self.segments.deinit(self.allocator);
+    }
+
+    /// The highest stamp any segment carries: what a restart applies
+    /// through before any leader speaks.
+    fn watermark(self: *const SimDisk) u64 {
+        var mark: u64 = 0;
+        for (self.segments.items) |seg| mark = @max(mark, seg.stamp);
+        return mark;
     }
 
     /// UAL fires this on every log append. Truncation reaches the disk
@@ -182,7 +192,17 @@ const SimDisk = struct {
         }
         self.entries.shrinkRetainingCapacity(@intCast(@min(after_index, self.entries.items.len)));
         self.durable_len = @min(self.durable_len, self.entries.items.len);
-        self.watermark = @min(self.watermark, after_index);
+        // As production's truncation: the segments above the cut go with
+        // their stamps, and the one it cuts through keeps min(stamp, cut).
+        var keep: usize = 0;
+        var first: u64 = 1;
+        for (self.segments.items) |seg| {
+            if (first > after_index) break;
+            self.segments.items[keep] = if (seg.last > after_index) .{ .last = after_index, .stamp = @min(seg.stamp, after_index) } else seg;
+            keep += 1;
+            first = seg.last + 1;
+        }
+        self.segments.shrinkRetainingCapacity(keep);
     }
 
     /// The log reads below its ring from here: the production runtime's
@@ -232,7 +252,7 @@ const SimDisk = struct {
         // Nothing buffered seals nothing, so stamps nothing.
         if (self.durable_len == self.entries.items.len) return;
         self.durable_len = self.entries.items.len;
-        self.watermark = @max(self.watermark, self.commit_index.*);
+        self.segments.append(self.allocator, .{ .last = self.entries.items.len, .stamp = self.commit_index.* }) catch @panic("sim disk OOM");
     }
 
     /// The disk is gone: log and hard state alike, as a replaced volume.
@@ -240,7 +260,7 @@ const SimDisk = struct {
         for (self.entries.items) |e| self.allocator.free(e.payload);
         self.entries.clearRetainingCapacity();
         self.durable_len = 0;
-        self.watermark = 0;
+        self.segments.clearRetainingCapacity();
         self.last_flush = 0;
         self.term = 0;
         self.voted_for = 0;
@@ -1215,7 +1235,7 @@ pub const Simulator = struct {
         // What was flushed under a commit index is committed, as
         // production's boot takes the segments' watermark; the rest waits
         // for a leader.
-        node.raft.commit_index = @min(node.disk.watermark, node.disk.durable_len);
+        node.raft.commit_index = @min(node.disk.watermark(), node.disk.durable_len);
         if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
         if (node.disk.lost_log) node.raft.resumeLostLog();
@@ -1252,8 +1272,10 @@ pub const Simulator = struct {
             }
         };
         // Applied through it before any leader speaks, as production's boot
-        // replays it, committing each config it applies.
+        // replays it, committing each config it applies. A boot that halts
+        // short of it commits only what it applied, as production's does.
         self.applyCommitted(node);
+        node.raft.commit_index = node.raft.last_applied;
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
                 .invariant = .term_monotonicity,
@@ -2580,24 +2602,43 @@ test "vopr sim: the disk's watermark is the commit index a flush that wrote was 
     for (1..5) |i| diskAppend(&d, i);
     commit = 3;
     d.flush();
-    try testing.expectEqual(@as(u64, 3), d.watermark);
+    try testing.expectEqual(@as(u64, 3), d.watermark());
     // Nothing buffered: no seal, so commit moving on stamps nothing.
     commit = 4;
     d.flush();
-    try testing.expectEqual(@as(u64, 3), d.watermark);
+    try testing.expectEqual(@as(u64, 3), d.watermark());
     // Buffered but lost in a crash: neither the entries nor a stamp.
     diskAppend(&d, 5);
     d.crash();
-    try testing.expectEqual(@as(u64, 3), d.watermark);
+    try testing.expectEqual(@as(u64, 3), d.watermark());
     try testing.expectEqual(@as(usize, 4), d.durable_len);
     diskAppend(&d, 5);
     d.flush();
-    try testing.expectEqual(@as(u64, 4), d.watermark);
+    try testing.expectEqual(@as(u64, 4), d.watermark());
     // A truncation below it takes the stamp down with the entries.
     SimDisk.onTruncate(@ptrCast(&d), 2);
-    try testing.expectEqual(@as(u64, 2), d.watermark);
+    try testing.expectEqual(@as(u64, 2), d.watermark());
     d.wipe();
-    try testing.expectEqual(@as(u64, 0), d.watermark);
+    try testing.expectEqual(@as(u64, 0), d.watermark());
+    // A cut through one segment drops the ones above it with their stamps:
+    // [1..20] stamped 5 and [21..40] stamped 30, cut at 14, leaves 5.
+    for (1..21) |i| diskAppend(&d, i);
+    commit = 5;
+    d.flush();
+    for (21..41) |i| diskAppend(&d, i);
+    commit = 30;
+    d.flush();
+    try testing.expectEqual(@as(u64, 30), d.watermark());
+    SimDisk.onTruncate(@ptrCast(&d), 14);
+    try testing.expectEqual(@as(u64, 5), d.watermark());
+    // A cut at a segment's end keeps it whole.
+    for (15..31) |i| diskAppend(&d, i);
+    commit = 25;
+    d.flush();
+    SimDisk.onTruncate(@ptrCast(&d), 14);
+    try testing.expectEqual(@as(u64, 5), d.watermark());
+    d.wipe();
+    try testing.expectEqual(@as(u64, 0), d.watermark());
 }
 
 test "vopr sim: a node's learned commits are learned again from each rewind's cut" {
@@ -2728,7 +2769,7 @@ test "vopr sim: a restarted node comes up committed and applied through its disk
     const l = leaderOf(&sim) orelse return error.NoLeader;
     const f = sim.node_(if (l == 1) 2 else 1);
     sim.crashNode(f);
-    const mark = @min(f.disk.watermark, f.disk.durable_len);
+    const mark = @min(f.disk.watermark(), f.disk.durable_len);
     const warm = sim.warm_restarts;
     try testing.expect(mark > 0);
     try sim.restartNode(f);
