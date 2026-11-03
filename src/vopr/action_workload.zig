@@ -20,9 +20,10 @@ const EntryType = entry_mod.EntryType;
 
 const NS = "default";
 /// Each action is always registered with the same lease and attempts, so
-/// a deliver's lease is its action's whichever register it read.
+/// a deliver's lease is its action's whichever register it read. One
+/// attempt for the first: its runs end at their first failure or expiry.
 const ACTIONS = [_]struct { name: []const u8, lease_ms: u64, max_attempts: u32 }{
-    .{ .name = "a0", .lease_ms = 5_000, .max_attempts = 2 },
+    .{ .name = "a0", .lease_ms = 5_000, .max_attempts = 1 },
     .{ .name = "a1", .lease_ms = 7_000, .max_attempts = 3 },
 };
 /// Holders whose name starts so are workers that die holding the run:
