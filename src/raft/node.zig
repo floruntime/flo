@@ -513,6 +513,9 @@ pub const RaftNode = struct {
     committed_conflicts: u64,
     /// The committed index the last such conflict was at, durable or not.
     conflict_index: u64 = 0,
+    /// A leader's append verified this node's log through that leader's
+    /// commit, at least once since boot.
+    reached_leader_commit: bool = false,
     /// Term of the config entry at `membership_index`, 0 when unknown.
     membership_term: u64 = 0,
     /// The most recent config entries appended, oldest first; a truncation
@@ -685,20 +688,27 @@ pub const RaftNode = struct {
     /// knows the group's committed membership.
     fn raiseCommit(self: *RaftNode, idx: u64) void {
         self.commit_index = @max(self.commit_index, idx);
+        self.commitConfigsThrough(self.commit_index);
+    }
+
+    /// The newest config in the log at or below `through` is the committed
+    /// one. Commit calls it; so does an async boot, which commits no data
+    /// before a leader speaks but knows which configs it flushed committed.
+    pub fn commitConfigsThrough(self: *RaftNode, through: u64) void {
         var i = self.config_record_count;
         while (i > 0) {
             i -= 1;
             const rec = &self.config_records[i];
-            if (rec.index > self.commit_index) continue;
+            if (rec.index > through) continue;
             self.commitMembership(&rec.config, rec.index);
             return;
         }
-        // Every record is above commit: configs the records evicted (more
+        // Every record is above `through`: configs the records evicted (more
         // were above the applied index at boot than they hold) lie between
         // the committed config and the oldest record. Read them from the
         // log, each index once.
         if (self.config_record_count == 0) return;
-        const upper = @min(self.commit_index, self.config_records[0].index - 1);
+        const upper = @min(through, self.config_records[0].index - 1);
         const lower = @max(self.committed_config_index, self.config_scanned_to) + 1;
         if (upper < lower) return;
         self.config_scanned_to = upper;
@@ -1392,6 +1402,7 @@ pub const RaftNode = struct {
         // duplicated in flight, verifies less than we may already hold.
         const last_new = req.prev_log_index + req.entries.len;
         self.raiseCommit(@min(req.leader_commit, last_new));
+        if (last_new >= req.leader_commit) self.reached_leader_commit = true;
 
         // Caught up: this node holds everything the leader had committed
         // when it sent this batch, so it refuses any candidate missing a

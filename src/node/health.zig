@@ -35,7 +35,9 @@ pub const ShardState = enum(u8) {
     loading,
     /// Replaying its log.
     replaying,
-    /// A member the leader has not yet seen caught up.
+    /// A member the leader has not yet seen caught up, or one booted with
+    /// async durability whose projections don't yet hold what its group
+    /// committed.
     catching_up,
     /// Asking to join; no config names this node yet.
     joining,

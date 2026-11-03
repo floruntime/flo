@@ -69,9 +69,17 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     defer allocator.free(ep);
     const cli = try CliRunner.init(allocator, node.flo_binary, ep);
     defer cli.deinit();
-    var get = try cli.run(&.{ "kv", "get", "kept" });
-    defer get.deinit();
-    try testing.expect(get.stdoutContains("through-force"));
+    // Under async durability a restarted member serves reads once it has
+    // applied what its group commits: here, once it has elected itself.
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        var get = try cli.run(&.{ "kv", "get", "kept" });
+        defer get.deinit();
+        if (get.stdoutContains("through-force")) break;
+        try testing.expect(get.contains("restarted and is catching up"));
+        if (tries == 40) return error.NeverCaughtUp;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
     var set = try cli.run(&.{ "kv", "set", "after", "force" });
     defer set.deinit();
     var after = try cli.run(&.{ "kv", "get", "after" });

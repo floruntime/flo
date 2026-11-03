@@ -88,5 +88,44 @@ pub fn main() !void {
         next_id += c.iters;
         (Run{ .name = c.name, .ops = c.iters, .ns = ns }).print();
     }
+
+    std.debug.print("\n=== A committed backlog, applied in passes ===\n\n", .{});
+    try backlog(&shard, "kv_put", 10_000, 1);
+    try backlog(&shard, "kv_batch of 32", 1_000, 32);
+    try backlog(&shard, "kv_batch of 256", 100, 256);
     std.debug.print("\n", .{});
+}
+
+/// `n` entries of `ops` puts each proposed with nothing applied, as a cold
+/// boot or a follower far behind meets its log, then drained one pass at a
+/// time. The worst pass is what the shard's other work waits on.
+fn backlog(shard: *Shard, name: []const u8, n: usize, ops: u16) !void {
+    const kv_entries = src.protocol.kv_entries;
+    const raft = shard.raft_node;
+    var payload: [64 * 1024]u8 = undefined;
+    var kbuf: [256][16]u8 = undefined;
+    var items: [256]kv_entries.BatchOp.Value = undefined;
+    for (0..n) |i| {
+        const body = if (ops == 1) try kv_entries.Put.encodeInto(&payload, .{ .key = try std.fmt.bufPrint(&kbuf[0], "bl-{d:0>6}", .{i % 4096}), .value = "value-padding-padding", .ttl_ms = null }) else b: {
+            for (items[0..ops], 0..) |*it, k| it.* = .{ .kind = .put, .key = try std.fmt.bufPrint(&kbuf[k], "bl-{d:0>6}", .{(i * ops + k) % 4096}), .value = "value-padding-padding", .ttl_ms = null, .delta = null };
+            var w = src.protocol.schema.Writer{ .buf = &payload };
+            try kv_entries.BatchOps.encodeSlice(&w, items[0..ops]);
+            break :b w.written();
+        };
+        // Into the log only: the apply below is the one being measured.
+        shard.applying = true;
+        _ = try raft.propose(if (ops == 1) .kv_put else .kv_batch, 0, body);
+        shard.applying = false;
+    }
+    raft.commit_index = raft.log.lastIndex();
+    var passes: u64 = 0;
+    var worst: u64 = 0;
+    const t0 = stdx.time.nanoTimestamp();
+    while (raft.last_applied < raft.commit_index) : (passes += 1) {
+        const p0 = stdx.time.nanoTimestamp();
+        _ = shard.applyCommitted();
+        worst = @max(worst, @as(u64, @intCast(stdx.time.nanoTimestamp() - p0)));
+    }
+    const total: u64 = @intCast(stdx.time.nanoTimestamp() - t0);
+    std.debug.print("  {s:<16} {d:>6} entries  {d:>4} passes   worst pass {d:>6} µs   total {d:>6} µs\n", .{ name, n, passes, worst / 1000, total / 1000 });
 }

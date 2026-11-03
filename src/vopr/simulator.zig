@@ -1237,8 +1237,13 @@ pub const Simulator = struct {
         node.raft.current_term = if (self.options.volatile_hard_state) node.disk.term else @max(node.disk.term, node.raft.log.lastTerm());
         // What was flushed under a commit index is committed, as
         // production's boot takes the segments' watermark; the rest waits
-        // for a leader.
-        node.raft.commit_index = @min(node.disk.watermark(), node.disk.durable_len);
+        // for a leader. Under async flush a crashed quorum can lose what
+        // this node kept, and a leader then rewrites it: an entry applied
+        // can't be taken back, so the data waits for a leader, as
+        // production's async boot does.
+        const mark = @min(node.disk.watermark(), node.disk.durable_len);
+        const cold = self.scenario.durability == .async_flush;
+        node.raft.commit_index = if (cold) 0 else mark;
         if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
         if (node.disk.lost_log) node.raft.resumeLostLog();
@@ -1279,6 +1284,11 @@ pub const Simulator = struct {
         // short of it commits only what it applied, as production's does.
         self.applyCommitted(node);
         node.raft.commit_index = node.raft.last_applied;
+        // A cold boot still commits the configs under the mark, as a warm
+        // one does: a removed node that forgot them answers vouch asks with
+        // its founding config, and a member stuck on an old one never hears
+        // the leader.
+        if (cold) node.raft.commitConfigsThrough(mark);
         if (node.raft.current_term < prev_term) {
             self.checker.fail(.{
                 .invariant = .term_monotonicity,
@@ -2844,6 +2854,30 @@ test "vopr sim: a core node repaired during convergence brings a healthy node in
         }
     }
     try testing.expect(converged);
+}
+
+test "vopr sim: under async flush a restarted node applies nothing before a leader speaks, and still commits its configs" {
+    var scenario = Scenario.calm(7);
+    scenario.durability = .async_flush;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    try runTicks(&sim, 3000);
+    const l = leaderOf(&sim) orelse return error.NoLeader;
+    const f = sim.node_(if (l == 1) 2 else 1);
+    f.disk.flush();
+    sim.crashNode(f);
+    const mark = @min(f.disk.watermark(), f.disk.durable_len);
+    try testing.expect(mark > 0);
+    const warm = sim.warm_restarts;
+    try sim.restartNode(f);
+    try testing.expectEqual(@as(u64, 0), f.raft.commit_index);
+    try testing.expectEqual(@as(u64, 0), f.raft.last_applied);
+    try testing.expect(f.raft.committed_config_index > 0);
+    try testing.expect(f.raft.committed_config_index <= mark);
+    try testing.expectEqual(warm, sim.warm_restarts);
+    // The leader's first append commits and applies it.
+    try runTicks(&sim, 2000);
+    try testing.expect(f.raft.last_applied >= mark);
 }
 
 /// Three nodes. The leader commits entries while node y is down; then the

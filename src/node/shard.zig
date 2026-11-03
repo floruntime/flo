@@ -556,6 +556,12 @@ pub const Shard = struct {
     /// True while `applyCommitted` is draining, so a waiter woken by an
     /// apply that proposes in turn cannot start a nested drain.
     applying: bool,
+    /// The last apply pass stopped at its budget with committed entries
+    /// left; the next poll does not wait, and the tick applies on.
+    apply_behind: bool,
+    /// Set by a cold boot (`cold_boot` in `init`) until this node's
+    /// projections hold what its group committed; see `coldCaughtUp`.
+    cold_gate: bool,
     /// Whether the last entry the apply loop took applied, and what its
     /// applier recorded: `park` answers from it, not from the whole pass's
     /// result.
@@ -785,6 +791,14 @@ pub const Shard = struct {
         var hard_state_store: ?*HardStateStore = null;
         // A node with no data dir has no hard state to lose.
         var had_hard_state = true;
+        // Under async flush a crashed quorum can lose committed entries
+        // this node kept on disk, and a leader then rewrites them. An entry
+        // applied can't be taken back, so a member's boot applies nothing
+        // before a leader commits it; the configs its segments were sealed
+        // under still commit (`bringUpGroup`). Alone, nothing can rewrite
+        // what this node flushed.
+        const cold_boot = durability == .async_flush and cluster_role != .single;
+        var config_mark: u64 = 0;
         // What boot found: losses counted along the way, and damage that
         // stopped replay (that shard then serves nothing on a lone node, or
         // takes no part in its group).
@@ -891,6 +905,7 @@ pub const Shard = struct {
             // Only entries at or below the segments' commit watermark reach
             // the projections; the rest is loaded into the log and drained
             // by `applyDeferredTail` (see `SegmentHeader.commit_index_at_seal`).
+            // A cold boot replays the log and applies none of it.
             //
             // A `.flseg.tmp` is a flush a crash cut short: the normal torn
             // tail, never part of the log. Any `.flseg` that will not read
@@ -908,7 +923,7 @@ pub const Shard = struct {
                     boot_damage = try collectSkips(allocator, files, watermark, &skips);
                     if (boot_damage != null) break :replay;
                     if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
-                    const replayed = replaySegments(allocator, files, partition, &replay_registry, watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
+                    const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
                     if (replayed.cancelled) return error.BootCancelled;
                     boot_damage = replayed.damage;
                     boot_halt = replayed.halt;
@@ -923,7 +938,10 @@ pub const Shard = struct {
             // what it applied is still ahead.
             marker.dropBelow(raft_node.log.start());
             if (marker.crashed) |*c| log.err("shard {d}: applying entry {d} crashed this node before the restart; it halts there instead of applying it again", .{ shard_id, c.index });
-            if (watermark == 0 and !raft_node.log.isEmpty()) {
+            if (cold_boot) {
+                config_mark = watermark;
+                if (!raft_node.log.isEmpty()) log.info("shard {d}: async durability: the {d} entries replayed apply once a leader commits them", .{ shard_id, raft_node.log.lastIndex() });
+            } else if (watermark == 0 and !raft_node.log.isEmpty()) {
                 log.warn("shard {d}: no segment carries a commit watermark; everything is applied at boot through the log instead of replay", .{shard_id});
             }
 
@@ -965,7 +983,7 @@ pub const Shard = struct {
                 log.err("shard {d}: {s}. This node's copy can no longer be trusted and it takes no part in the group. Stop it, move its data directory aside, and start it again with --join <a live member>", .{ shard_id, damage.reason() });
             }
         } else {
-            try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id, had_hard_state);
+            try bringUpGroup(raft_node, cluster_role, apply_buf, shard_id, node_id, had_hard_state, config_mark);
         }
 
         // Build dispatcher and register all handlers
@@ -1084,6 +1102,9 @@ pub const Shard = struct {
             .entry_buf = entry_buf,
             .scratch = scratch,
             .applying = false,
+            .apply_behind = false,
+            // An empty log holds nothing it could serve wrongly.
+            .cold_gate = cold_boot and !raft_node.log.isEmpty(),
             .last_entry_applied = true,
             .last_result = .{},
             .wake_workers = false,
@@ -1500,6 +1521,13 @@ pub const Shard = struct {
                 self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun(why));
                 return;
             }
+        }
+        // A cold node's projections are empty or behind its group's: a read
+        // it answered would miss what exists. Writes and leader reads go on
+        // to the leader.
+        if ((origin == .client or origin == .admin) and !self.coldCaughtUp() and !requestToLeader(req)) {
+            self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = COLD_READ_REFUSAL });
+            return;
         }
         // A read of a namespace no one created finds none; a client's read
         // is resolved here, once, before it goes anywhere.
@@ -2784,12 +2812,16 @@ pub const Shard = struct {
         // Inside the apply loop `applyCommitted` returns without draining:
         // a single node's write would be answered before its entry applied.
         std.debug.assert(!self.applying);
-        if (self.raft_node.commit_index >= proposed.index) {
-            // Up to this write's entry and no further: its answer is that
-            // entry's result, which the next entry's replaces. The dispatch
-            // that parked this applies the rest.
+        // Up to this write's entry and no further: its answer is that
+        // entry's result, which the next entry's replaces. The dispatch
+        // that parked this applies the rest. A pass that ends short of it,
+        // on a backlog, leaves it to wait in the table like any other.
+        const answered_here = self.raft_node.commit_index >= proposed.index and here: {
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
+            break :here !self.apply_behind or self.raft_node.last_applied >= proposed.index;
+        };
+        if (answered_here) {
             defer if (release) |r| r(self, ctx);
             if (self.halted) |*h| if (proposed.index >= h.index) {
                 // A membership change takes effect at commit, halted or not.
@@ -3882,6 +3914,25 @@ pub const Shard = struct {
 
     /// What this shard is doing, from the fields that decide it, so no
     /// path that changes one of them has to remember to publish.
+    pub const COLD_READ_REFUSAL = "unavailable: this node restarted and is catching up with its group's leader; retry, or read from another node";
+
+    /// Whether a cold boot's projections hold what the group committed: a
+    /// leader's append verified this node's log through that leader's
+    /// commit and the apply has caught up, or this node leads and has
+    /// applied its own log. Until then it serves no local reads and is not
+    /// ready. Once per boot: a node that falls behind later serves as
+    /// before, as a sync follower briefly behind always has, so a chunked
+    /// apply under load doesn't turn into refused reads.
+    fn coldCaughtUp(self: *Shard) bool {
+        if (!self.cold_gate) return true;
+        const raft = self.raft_node;
+        const caught_up = raft.leaderReady() or (raft.role != .leader and raft.reached_leader_commit and raft.last_applied >= raft.commit_index);
+        if (!caught_up) return false;
+        self.cold_gate = false;
+        log.info("shard {d}: caught up with the group after an async-durability boot (applied through {d}); serving reads", .{ self.id, raft.last_applied });
+        return true;
+    }
+
     fn healthState(self: *const Shard) health_mod.ShardState {
         if (self.removed_at_ms != null) return .removed;
         if (self.replica.diverged) return .diverged;
@@ -3894,6 +3945,7 @@ pub const Shard = struct {
         // counts on yet, and joining says what it waits for.
         if (self.raft_network != null and !raft.self_named) return .joining;
         if (raft.lost_log != .none) return .guarded;
+        if (self.cold_gate) return .catching_up;
         if (self.raft_network != null) {
             if (raft.latest_config.find(raft.id)) |m| {
                 if (!m.voter and !m.caught_up) return .catching_up;
@@ -4194,8 +4246,29 @@ pub const Shard = struct {
     /// hand, so the inner call is a no-op. That no-op returns true, which
     /// means "nothing failed", not "applied": a notification must not read
     /// projection state for an entry it proposed.
+    ///
+    /// One call applies a pass: entries up to `APPLY_PASS_NS` of
+    /// `applyCost`, at least one. A backlog (a cold boot's whole log, a
+    /// follower far behind) drains over several ticks, so the shard still
+    /// answers heartbeats and requests between passes.
     pub fn applyCommitted(self: *Shard) bool {
         return self.applyThrough(std.math.maxInt(u64));
+    }
+
+    /// The budget of one apply pass, in `applyCost` units.
+    const APPLY_PASS_NS: u64 = std.time.ns_per_ms;
+    const ENTRY_COST_NS: u64 = 1_400;
+    const OP_COST_NS: u64 = 2_500;
+
+    /// What applying `e` charges a pass: a stand-in for its time, never the
+    /// clock, so a pass ends at the same entry on every host and every
+    /// replay. Calibrated from bench_write_path's backlog (ReleaseFast,
+    /// Apple M-series): an entry of one op about 1.4 µs, each further op of
+    /// a transaction about 2.5 µs, and about 0.15 ns a byte. A pass can
+    /// overrun by its last entry, at most a full transaction.
+    fn applyCost(e: *const entry_mod.Entry) u64 {
+        const op_count: u64 = if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) kv_entries.batchOpCount(e.payload) else 1;
+        return ENTRY_COST_NS + (op_count -| 1) * OP_COST_NS + e.payload.len * 3 / 20;
     }
 
     /// `applyCommitted`, stopping after index `limit`.
@@ -4217,19 +4290,29 @@ pub const Shard = struct {
         // flushing first lets what that commits apply now.
         self.syncFlushIfNeeded();
         // Called after every request: nothing to apply is the common case.
-        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) return true;
+        if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) {
+            self.apply_behind = false;
+            return true;
+        }
         self.applying = true;
         defer self.applying = false;
 
         const raft = self.raft_node;
         var all_applied = true;
+        var spent: u64 = 0;
+        self.apply_behind = false;
         drain: while (true) {
             while (raft.last_applied < @min(raft.commit_index, limit)) {
+                if (spent >= APPLY_PASS_NS) {
+                    self.apply_behind = true;
+                    break :drain;
+                }
                 const next_idx = raft.last_applied + 1;
                 // Advanced before the apply: whatever a notification does, this
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
                 if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
+                    spent += applyCost(&e);
                     if (skippedHere(&self.skips, &e)) {
                         self.last_entry_applied = false;
                         self.last_result.reset(&e);
@@ -4525,6 +4608,7 @@ pub const Shard = struct {
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
         _ = self.applyCommitted();
+        _ = self.coldCaughtUp();
 
         // Shard 0: namespaces created this tick go to disk, then into the
         // node's table, and what waited for them is answered.
@@ -4569,7 +4653,7 @@ pub const Shard = struct {
         var failing = false;
         while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
-            const busy = self.more_work or self.resume_fds.items.len > 0;
+            const busy = self.more_work or self.apply_behind or self.resume_fds.items.len > 0;
             _ = self.tick(if (busy) 0 else 100) catch |err| {
                 // A shard whose tick keeps failing serves nothing: say so,
                 // not once per tick, and do not spin a core while it lasts.
@@ -6471,7 +6555,8 @@ const JOIN_ASK_INTERVAL_MS: u64 = 1000;
 
 /// Membership at boot comes from the log's latest config entry; a single
 /// node and a first member with nothing in the log lead at once.
-fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32, had_hard_state: bool) !void {
+/// `config_mark`: on a cold boot, the watermark its configs commit through.
+fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, node_id: u32, had_hard_state: bool, config_mark: u64) !void {
     // Everything replay put in the log came from disk.
     raft.markDurable(raft.log.lastIndex());
     const cfg_index = raft.log.last_config_index;
@@ -6520,6 +6605,10 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
         try raft.recordConfigsAbove(raft.last_applied, buf);
         raft.recordConfig(cfg_index, e.header.term, &cfg);
         if (cfg_index <= raft.last_applied) raft.commitMembership(&cfg, cfg_index);
+        // A removed node that forgot its committed configs would answer
+        // vouch asks with its founding one, and a member stuck on an old
+        // config would never hear the leader.
+        raft.commitConfigsThrough(config_mark);
         // What the segments flushed under a commit watermark is committed;
         // the rest of the log waits for a leader to say so.
         raft.commit_index = raft.last_applied;
@@ -12695,7 +12784,7 @@ test "a shard whose saved term or log runs past the term ceiling refuses to star
         e.header.crc32c = e.computeCrc();
         _ = try raft.log.append(&e);
         var buf: [1024]u8 = undefined;
-        try std.testing.expectError(error.TermSpaceExhausted, bringUpGroup(&raft, .join, &buf, 0, 1, true));
+        try std.testing.expectError(error.TermSpaceExhausted, bringUpGroup(&raft, .join, &buf, 0, 1, true, 0));
     }
 }
 
@@ -12728,7 +12817,7 @@ test "a shard brought up with configs above its applied index records each of th
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 8, .join, .{}, .{});
     defer shard.deinit();
     const r = shard.raft_node;
     try std.testing.expectEqual(@as(u64, 1), r.last_applied);
@@ -12816,6 +12905,120 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena));
     try std.testing.expectEqual(@as(u64, 3), buf[1].header.index);
     try std.testing.expectEqualStrings("q", entry_mod.CommandPayload.deserialize(buf[1].payload).?.key);
+}
+
+/// A member's segment, a config naming nodes 1 and 2 then `n` enqueues to
+/// "q" sealed under commit `mark`, and its hard state.
+fn writeMemberSegment(data_dir: []const u8, n: u64, mark: u64) !void {
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    try @import("stdx").fs.makePath(segs);
+    var w = SegmentWriter.init(std.testing.allocator, 0);
+    defer w.deinit();
+    var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    var cfg = entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 1, 1000, membership.encode(&membership.Config.ofVoters(&.{ 1, 2 }), &cfg_buf));
+    cfg.header.crc32c = cfg.computeCrc();
+    try w.addEntry(&cfg);
+    var i: u64 = 0;
+    while (i < n) : (i += 1) try w.addEntry(&testCommandEntry(.queue_enqueue, i + 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+    w.commit_index_at_seal = mark;
+    try w.writeToFile(segs);
+    // A member's hard state, so its boot has no vote to confirm first.
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    try hard_state_mod.save(shard_dir, .{ .node_id = 1, .term = 1, .voted_for = 0 });
+}
+
+test "Shard: with async durability a member's boot applies nothing until a leader commits it, and still commits its configs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    // Five entries, all sealed under commit: a sync boot would apply them.
+    try writeMemberSegment(data_dir, 4, 5);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    const raft = shard.raft_node;
+    try std.testing.expectEqual(@as(u64, 5), raft.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 0), raft.last_applied);
+    try std.testing.expectEqual(@as(u64, 0), raft.commit_index);
+    try std.testing.expectEqual(@as(u64, 0), shard.queue_handler.queue.countQueue(q));
+    // The config its segment was sealed under is committed.
+    try std.testing.expectEqual(@as(u64, 1), raft.committed_config_index);
+    try std.testing.expect(raft.committed_config.isVoter(2));
+    try std.testing.expectEqual(health_mod.ShardState.catching_up, shard.healthState());
+    try std.testing.expect(!shard.coldCaughtUp());
+
+    // A leader's heartbeat verifies the log through its commit.
+    const resp = try raft.handleAppendEntries(.{ .term = raft.current_term, .leader_id = 2, .prev_log_index = 5, .prev_log_term = 1, .leader_commit = 5, .entries = &.{} });
+    try std.testing.expect(resp.success);
+    try std.testing.expectEqual(@as(u64, 5), raft.commit_index);
+    // Committed but not yet applied: still not caught up.
+    try std.testing.expect(!shard.coldCaughtUp());
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(@as(u64, 4), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expect(shard.coldCaughtUp());
+    try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
+    // Once per boot: falling behind again doesn't close it.
+    raft.commit_index = 9;
+    try std.testing.expect(shard.coldCaughtUp());
+}
+
+test "Shard: with sync durability a member's boot applies what its segments were sealed under" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    try writeMemberSegment(data_dir, 4, 5);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .join, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    try std.testing.expectEqual(@as(u64, 5), shard.raft_node.last_applied);
+    try std.testing.expectEqual(@as(u64, 4), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expect(shard.coldCaughtUp());
+}
+
+test "Shard: a backlog applies in passes, each ending at its budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    // More entries than one pass takes, none applied at boot.
+    const n: u64 = 3 * (Shard.APPLY_PASS_NS / Shard.ENTRY_COST_NS);
+    try writeMemberSegment(data_dir, n, 0);
+
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .join, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const raft = shard.raft_node;
+    raft.commit_index = raft.log.lastIndex();
+
+    var passes: u64 = 0;
+    while (raft.last_applied < raft.commit_index) : (passes += 1) {
+        const before = raft.last_applied;
+        try std.testing.expect(shard.applyCommitted());
+        try std.testing.expect(raft.last_applied > before);
+        try std.testing.expectEqual(raft.last_applied < raft.commit_index, shard.apply_behind);
+    }
+    try std.testing.expect(passes >= 3 and passes <= 5);
+    const q = node_router.nameHash(node_router.namespaceHash(""), "q");
+    try std.testing.expectEqual(n, shard.queue_handler.queue.countQueue(q));
 }
 
 test "a truncated suffix is gone from the segments a restart replays" {
