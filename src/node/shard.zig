@@ -559,6 +559,9 @@ pub const Shard = struct {
     /// The last apply pass stopped at its budget with committed entries
     /// left; the next poll does not wait, and the tick applies on.
     apply_behind: bool,
+    /// What this tick's apply passes have spent, in `applyCost` units: the
+    /// budget is the tick's, since every request and frame applies after it.
+    apply_tick_spent: u64,
     /// Set by a cold boot (`cold_boot` in `init`) until this node's
     /// projections hold what its group committed; see `coldCaughtUp`.
     cold_gate: bool,
@@ -1103,6 +1106,7 @@ pub const Shard = struct {
             .scratch = scratch,
             .applying = false,
             .apply_behind = false,
+            .apply_tick_spent = 0,
             // An empty log holds nothing it could serve wrongly.
             .cold_gate = cold_boot and !raft_node.log.isEmpty(),
             .last_entry_applied = true,
@@ -1522,13 +1526,6 @@ pub const Shard = struct {
                 return;
             }
         }
-        // A cold node's projections are empty or behind its group's: a read
-        // it answered would miss what exists. Writes and leader reads go on
-        // to the leader.
-        if ((origin == .client or origin == .admin) and !self.coldCaughtUp() and !requestToLeader(req)) {
-            self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = COLD_READ_REFUSAL });
-            return;
-        }
         // A read of a namespace no one created finds none; a client's read
         // is resolved here, once, before it goes anywhere.
         if ((origin == .client or origin == .admin) and self.edgeMiss(conn, req, origin)) return;
@@ -1564,6 +1561,9 @@ pub const Shard = struct {
         if (op < proto.MAX_OPCODES and self.dispatcher.isWalkOp(op) and self.dispatcher.walk_context[op] != null) {
             const has_single_target = if (self.dispatcher.pre_route[op]) |f| f(req) != null else false;
             if (!has_single_target) {
+                // This shard's part is read here, not through `dispatchLocal`;
+                // the others' parts are gated where they run.
+                if (self.refusedCold(conn, req)) return;
                 self.executeWalk(conn, req, auth);
                 return;
             }
@@ -1575,8 +1575,14 @@ pub const Shard = struct {
         // A workflow run id the client chose names no shard: ask each which
         // holds the run (`RunFind`), and for a start that chooses one,
         // whether another workflow's run has it already.
-        if (self.runIdUnplaced(req)) return self.findRun(conn, req, auth, req.key, null);
-        if (self.startChoosesRunId(req)) |rid| return self.findRun(conn, req, auth, rid, self.startHome(req));
+        if (self.runIdUnplaced(req)) {
+            if (self.refusedCold(conn, req)) return;
+            return self.findRun(conn, req, auth, req.key, null);
+        }
+        if (self.startChoosesRunId(req)) |rid| {
+            if (self.refusedCold(conn, req)) return;
+            return self.findRun(conn, req, auth, rid, self.startHome(req));
+        }
 
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
@@ -1903,6 +1909,11 @@ pub const Shard = struct {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .shard_halted, .ran = .no, .message = self.haltedMessage(&buf) });
             return;
         }
+        // A read runs here, on the shard whose group holds its state, from
+        // whichever shard or node it came. Status and membership read Raft
+        // and config, not projections.
+        const exempt = status_op or req.header.op_code == @backingInt(proto.OpCode.ping);
+        if (!writes and !at_leader and !exempt and auth.origin != .peer and self.refusedCold(conn, req)) return;
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
@@ -1924,6 +1935,13 @@ pub const Shard = struct {
                 return;
             }
             self.forwardToLeader(conn, req);
+            return;
+        }
+        // A read the leader answers from its memory: a leader still applying
+        // what earlier terms committed would answer from part of it. A halted
+        // one answers, marked stale, as other reads are.
+        if (at_leader and self.halted == null and !self.raft_node.leaderReady()) {
+            self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
         }
         // A write that brings data into a namespace this shard has not seen
@@ -2897,15 +2915,20 @@ pub const Shard = struct {
         if (slot.release) |r| r(self, slot.ctx);
     }
 
+    /// A write that committed but hadn't applied, under a backlog applied
+    /// in passes, is told so rather than `message`, which speaks of commit.
     fn resolvePending(self: *Shard, message: []const u8) void {
         if (self.pending_count == 0) return;
         log.warn("shard {d}: {d} write(s) were waiting for commit; answering each: {s}", .{ self.id, self.pending_count, message });
         for (self.pending) |*slot| {
             if (!slot.active) continue;
-            self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, message);
+            const committed = slot.index <= self.raft_node.commit_index;
+            self.deliverDeferredError(slot.reply_to, slot.request_id, .unavailable, if (committed) COMMITTED_NOT_ANSWERED else message);
             self.endPending(slot);
         }
     }
+
+    pub const COMMITTED_NOT_ANSWERED = "unavailable: the write committed, but this node stopped before it could answer from it; it may have applied — check before resending";
 
     // ─── Writes on a node that does not lead ─────────────────────────────
 
@@ -3915,6 +3938,15 @@ pub const Shard = struct {
     /// What this shard is doing, from the fields that decide it, so no
     /// path that changes one of them has to remember to publish.
     pub const COLD_READ_REFUSAL = "unavailable: this node restarted and is catching up with its group's leader; retry, or read from another node";
+    pub const LEADER_NOT_READY_REFUSAL = "unavailable: the leader is still applying what earlier leaders committed; retry";
+
+    /// Refuses `req`, a read of this shard's state, while a cold boot keeps
+    /// its projections behind its group's (`coldCaughtUp`).
+    fn refusedCold(self: *Shard, conn: *Connection, req: proto.Request) bool {
+        if (self.coldCaughtUp()) return false;
+        self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = COLD_READ_REFUSAL });
+        return true;
+    }
 
     /// Whether a cold boot's projections hold what the group committed: a
     /// leader's append verified this node's log through that leader's
@@ -4074,7 +4106,9 @@ pub const Shard = struct {
         // asking again is answered by a leader only when it is not a
         // member.
         if (!raft.timer_enabled and quiet) return true;
-        return raft.membership_index > raft.commit_index and quiet;
+        // Its committed config, not commit: a cold boot commits configs
+        // through its watermark, and its data waits for a leader.
+        return raft.membership_index > @max(raft.commit_index, raft.committed_config_index) and quiet;
     }
 
     /// What a leader had in flight is no longer its to finish: parked
@@ -4247,15 +4281,15 @@ pub const Shard = struct {
     /// means "nothing failed", not "applied": a notification must not read
     /// projection state for an entry it proposed.
     ///
-    /// One call applies a pass: entries up to `APPLY_PASS_NS` of
-    /// `applyCost`, at least one. A backlog (a cold boot's whole log, a
+    /// A tick's calls together apply up to `APPLY_PASS_NS` of `applyCost`,
+    /// its first at least one entry. A backlog (a cold boot's whole log, a
     /// follower far behind) drains over several ticks, so the shard still
-    /// answers heartbeats and requests between passes.
+    /// answers heartbeats and requests between them.
     pub fn applyCommitted(self: *Shard) bool {
         return self.applyThrough(std.math.maxInt(u64));
     }
 
-    /// The budget of one apply pass, in `applyCost` units.
+    /// The apply budget of one tick, in `applyCost` units.
     const APPLY_PASS_NS: u64 = std.time.ns_per_ms;
     const ENTRY_COST_NS: u64 = 1_400;
     const OP_COST_NS: u64 = 2_500;
@@ -4299,7 +4333,8 @@ pub const Shard = struct {
 
         const raft = self.raft_node;
         var all_applied = true;
-        var spent: u64 = 0;
+        var spent = self.apply_tick_spent;
+        defer self.apply_tick_spent = spent;
         self.apply_behind = false;
         drain: while (true) {
             while (raft.last_applied < @min(raft.commit_index, limit)) {
@@ -4548,6 +4583,7 @@ pub const Shard = struct {
 
     /// Run one iteration of the event loop (for testing).
     pub fn tick(self: *Shard, timeout_ms: u32) !usize {
+        self.apply_tick_spent = 0;
         // Lazily register acceptor pipe with reactor on first tick
         if (!self.pipe_registered) {
             try self.reactor.addSource(.{
@@ -4595,8 +4631,10 @@ pub const Shard = struct {
 
         // Drive processing pipelines (poll sources → write sinks)
         // Producers run only where this shard leads: a follower that also
-        // proposed would write the same facts twice, in two logs.
-        const leads = self.raft_node.role == .leader and self.offline == null;
+        // proposed would write the same facts twice, in two logs. And only
+        // once it has applied what earlier terms committed: before, their
+        // cursors and counts are behind what the log says.
+        const leads = self.raft_node.leaderReady() and self.offline == null;
         if (leads) self.processing_handler.tickPipelines(self);
 
         // Drive workflow stream triggers (poll streams → start runs)
@@ -5697,6 +5735,8 @@ pub const Shard = struct {
             6
         else if (shard.raft_network != null and !raft.self_named)
             3
+        else if (shard.cold_gate and raft.role != .leader)
+            9
         else if (shard.raft_network != null and !raft.timer_enabled)
             7
         else switch (raft.role) {
@@ -12956,6 +12996,23 @@ test "Shard: with async durability a member's boot applies nothing until a leade
     try std.testing.expectEqual(health_mod.ShardState.catching_up, shard.healthState());
     try std.testing.expect(!shard.coldCaughtUp());
 
+    // A new leader's commit after a whole-cluster restart is 0, short of
+    // anything it committed in its own term: that proves nothing.
+    const first = try raft.handleAppendEntries(.{ .term = raft.current_term, .leader_id = 2, .prev_log_index = 5, .prev_log_term = 1, .leader_commit = 0, .entries = &.{} });
+    try std.testing.expect(first.success);
+    try std.testing.expect(!shard.coldCaughtUp());
+    // A read routed here from another shard is refused too: this shard's
+    // state is what it would read.
+    {
+        const conn_pipe = try @import("stdx").io.pipe();
+        defer _ = std.c.close(conn_pipe[1]);
+        const conn = try shard.addConnection(conn_pipe[0]);
+        defer shard.removeConnection(conn_pipe[0]);
+        shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.kv_get, 77), .namespace = "", .key = "k", .value = "" }, .shard);
+        var out: [512]u8 = undefined;
+        const refused = try proto.Response.parse(out[0..conn.write_buf.read(&out)]);
+        try std.testing.expect(std.mem.indexOf(u8, refused.data, "catching up") != null);
+    }
     // A leader's heartbeat verifies the log through its commit.
     const resp = try raft.handleAppendEntries(.{ .term = raft.current_term, .leader_id = 2, .prev_log_index = 5, .prev_log_term = 1, .leader_commit = 5, .entries = &.{} });
     try std.testing.expect(resp.success);
@@ -13011,10 +13068,17 @@ test "Shard: a backlog applies in passes, each ending at its budget" {
 
     var passes: u64 = 0;
     while (raft.last_applied < raft.commit_index) : (passes += 1) {
+        // As `tick` does; a second call in the same tick applies nothing.
+        shard.apply_tick_spent = 0;
         const before = raft.last_applied;
         try std.testing.expect(shard.applyCommitted());
         try std.testing.expect(raft.last_applied > before);
         try std.testing.expectEqual(raft.last_applied < raft.commit_index, shard.apply_behind);
+        if (shard.apply_behind) {
+            const at = raft.last_applied;
+            try std.testing.expect(shard.applyCommitted());
+            try std.testing.expectEqual(at, raft.last_applied);
+        }
     }
     try std.testing.expect(passes >= 3 and passes <= 5);
     const q = node_router.nameHash(node_router.namespaceHash(""), "q");

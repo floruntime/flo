@@ -71,3 +71,36 @@ test "e2e/async-boot: a lone survivor serves no reads until a quorum is back, th
     }
     try testing.expectEqualStrings("200 ready", ready(&cluster, 0, &buf) orelse "no answer");
 }
+
+test "e2e/async-boot: after a whole-cluster restart a member refuses reads until it has applied, and never answers missing" {
+    var cluster = try ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .async_flush, .metrics_enabled = true });
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "k", "kept-value" }, 20, 250);
+    for (0..3) |i| cluster.allocator.free(try cluster.pollUntilContains(i, &.{ "kv", "get", "k" }, "kept-value", 40, 250));
+    cluster.stopNode(1);
+    cluster.stopNode(2);
+    cluster.stopNode(0);
+
+    // Node 2 first, alone; then node 0 without the harness's settling
+    // pause, so the election and the new leader's first appends (commit 0,
+    // then its noop) happen while node 2 is read.
+    try cluster.restartNode(2);
+    try cluster.getServer(0).?.start();
+    var refusals: usize = 0;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        var got = try cluster.clis[2].?.run(&.{ "kv", "get", "k" });
+        defer got.deinit();
+        if (got.stdoutContains("kept-value")) break;
+        if (!got.contains("restarted and is catching up")) {
+            std.debug.print("node 2 answered: {s}{s}\n", .{ got.stdout, got.stderr });
+            return error.ReadNotRefused;
+        }
+        refusals += 1;
+        if (tries == 600) return error.NeverCaughtUp;
+        stdx.time.sleep(20 * std.time.ns_per_ms);
+    }
+    try testing.expect(refusals > 0);
+}

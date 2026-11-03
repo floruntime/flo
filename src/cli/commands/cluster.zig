@@ -186,6 +186,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         6 => "guarded: confirming the term",
         7 => "replica",
         8 => "removed",
+        9 => "catching up after a restart",
         else => "unknown",
     };
     // No leader is known while electing or joining.
@@ -208,6 +209,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         if (vouched_index != 0) ctx.print("\nThis node missed a membership change and is catching up: another member vouched for the config\ncommitted at index {d}. Until its own log reaches it, it also takes appends and vote requests from that config's members.\n", .{vouched_index});
         if (strangers_while_quiet) ctx.print("\nThis node is dropping frames from a node no config of its names, and has heard no leader:\nit may be stuck on an old membership config. Check that a member its last config names is reachable.\n", .{});
         if (state == 5 or state == 6) ctx.print("\nThis node has no log or no hard state of its own (new, or lost). It votes only once a leader has caught\nit up and the members have confirmed the term. If a majority lost their data, see flo server inspect / force-members.\n", .{});
+        if (state == 9) ctx.print("\nThis node restarted with async durability and applies its log only as a leader commits it.\nUntil it has caught up it serves no reads; writes go to the leader. With no leader (most of the group down),\nit waits for a majority to return, or see flo server force-members.\n", .{});
         if (state == 4) ctx.print("\nThis node's data diverged from the group and it takes no writes.\nStop it, move its data directory aside, and start it again with --join <a live member>.\nIt rejoins with no log and votes only once it has caught up.\n", .{});
         ctx.print("\n", .{});
     }

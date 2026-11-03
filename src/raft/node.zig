@@ -514,7 +514,8 @@ pub const RaftNode = struct {
     /// The committed index the last such conflict was at, durable or not.
     conflict_index: u64 = 0,
     /// A leader's append verified this node's log through that leader's
-    /// commit, at least once since boot.
+    /// commit, once that commit covered an entry of the leader's own term,
+    /// at least once since boot.
     reached_leader_commit: bool = false,
     /// Term of the config entry at `membership_index`, 0 when unknown.
     membership_term: u64 = 0,
@@ -1402,7 +1403,10 @@ pub const RaftNode = struct {
         // duplicated in flight, verifies less than we may already hold.
         const last_new = req.prev_log_index + req.entries.len;
         self.raiseCommit(@min(req.leader_commit, last_new));
-        if (last_new >= req.leader_commit) self.reached_leader_commit = true;
+        // As the lost-log rule below: a new leader's commit can sit below
+        // what earlier leaders committed (0, after a whole-cluster restart)
+        // until it commits an entry of its own term.
+        if (last_new >= req.leader_commit and self.commit_index > 0 and self.log.entryTerm(self.commit_index) == self.current_term) self.reached_leader_commit = true;
 
         // Caught up: this node holds everything the leader had committed
         // when it sent this batch, so it refuses any candidate missing a
