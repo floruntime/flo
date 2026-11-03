@@ -564,6 +564,8 @@ pub const Shard = struct {
     /// A call outside a tick (boot, a test) has a budget of its own.
     apply_tick_spent: u64,
     in_tick: bool,
+    /// Ticks that ran the producers (pipelines, triggers, schedules).
+    producer_ticks: u64,
     /// Set by a cold boot (`cold_boot` in `init`) until this node's
     /// projections hold what its group committed; see `coldCaughtUp`.
     cold_gate: bool,
@@ -1110,6 +1112,7 @@ pub const Shard = struct {
             .apply_behind = false,
             .apply_tick_spent = 0,
             .in_tick = false,
+            .producer_ticks = 0,
             // An empty log holds nothing it could serve wrongly.
             .cold_gate = cold_boot and !raft_node.log.isEmpty(),
             .last_entry_applied = true,
@@ -4640,6 +4643,7 @@ pub const Shard = struct {
         // once it has applied what earlier terms committed: before, their
         // cursors and counts are behind what the log says.
         const leads = self.raft_node.leaderReady() and self.offline == null;
+        if (leads) self.producer_ticks += 1;
         if (leads) self.processing_handler.tickPipelines(self);
 
         // Drive workflow stream triggers (poll streams → start runs)
@@ -5718,7 +5722,9 @@ pub const Shard = struct {
     /// is the leader of a one-member group. States: 0 follower, 1 electing,
     /// 2 leader, 3 joining (no seat yet), 4 diverged, 5 and 6 guarded (no
     /// log or no hard state of its own, new or lost): catching up, then
-    /// confirming the term; 7 replica, 8 removed. `vouched_index` is the
+    /// confirming the term; 7 replica, 8 removed; 9 a cold boot not yet
+    /// caught up (`coldCaughtUp`), shown for a candidate too, so an operator
+    /// sees why it serves no reads. `vouched_index` is the
     /// index of a committed membership config another member vouched for
     /// while this node is behind it (0 for none): it missed a membership
     /// change and is catching up, and also takes appends and vote requests
@@ -5740,6 +5746,7 @@ pub const Shard = struct {
             6
         else if (shard.raft_network != null and !raft.self_named)
             3
+            // Electing too: what keeps it from serving is its catch-up.
         else if (shard.cold_gate and raft.role != .leader)
             9
         else if (shard.raft_network != null and !raft.timer_enabled)
@@ -13090,6 +13097,59 @@ test "Shard: a backlog applies in passes, each ending at its budget" {
     try std.testing.expect(passes >= 3 and passes <= 5);
     const q = node_router.nameHash(node_router.namespaceHash(""), "q");
     try std.testing.expectEqual(n, shard.queue_handler.queue.countQueue(q));
+}
+
+test "Shard: a leader still applying earlier terms' entries refuses the reads it answers from memory" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(node_router.namespaceHash("default"), "q"), "here");
+    const conn_pipe = try @import("stdx").io.pipe();
+    defer _ = std.c.close(conn_pipe[1]);
+    const conn = try shard.addConnection(conn_pipe[0]);
+    defer shard.removeConnection(conn_pipe[0]);
+
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    const body = try Peek.request.encodeInto(&body_buf, .{ .limit = 5 });
+    const raft = shard.raft_node;
+    try std.testing.expect(raft.leaderReady());
+    // Elected with entries of earlier terms still to apply.
+    raft.ready_index = raft.log.lastIndex() + 100;
+    var out: [512]u8 = undefined;
+    for ([_]proto.OpCode{ .queue_peek, .queue_dlq_list, .stream_group_info }, 0..) |op, i| {
+        shard.runRequest(conn, .{ .header = proto.RequestHeader.init(op, 10 + i), .namespace = "default", .key = "q", .value = if (op == .queue_peek) body else "" }, .client);
+        const refused = try proto.Response.parse(out[0..conn.write_buf.read(&out)]);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
+        try std.testing.expect(std.mem.indexOf(u8, refused.data, "still applying what earlier leaders committed") != null);
+    }
+    // Ready, it answers from what it holds.
+    raft.ready_index = 0;
+    shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.queue_peek, 20), .namespace = "default", .key = "q", .value = body }, .client);
+    const got = try proto.Response.parse(out[0..conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, got.data, "here") != null);
+}
+
+test "Shard: a leader still applying earlier terms' entries runs no pipeline, trigger or schedule pass" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const raft = shard.raft_node;
+    // Elected with entries of earlier terms still to apply.
+    raft.ready_index = raft.log.lastIndex() + 100;
+    _ = try shard.tick(0);
+    _ = try shard.tick(0);
+    try std.testing.expectEqual(@as(u64, 0), shard.producer_ticks);
+    raft.ready_index = 0;
+    _ = try shard.tick(0);
+    try std.testing.expectEqual(@as(u64, 1), shard.producer_ticks);
 }
 
 test "a truncated suffix is gone from the segments a restart replays" {
