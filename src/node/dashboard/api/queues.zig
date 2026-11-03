@@ -24,12 +24,12 @@ const client_mod = @import("../../../cli/client/mod.zig");
 const WireReader = client_mod.WireReader;
 
 /// `queue_list` entries: [name_len:u32][name][ns_len:u32][ns]
-/// [pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64].
+/// [ready:u64][leased:u64][enqueued:u64][dequeued:u64][dlq:u64].
 const queue_list_columns = [_]output.WireColumn{
     .{ .field = "name", .header = "", .field_type = .str_u32 },
     .{ .field = "namespace", .header = "", .field_type = .str_u32 },
-    .{ .field = "pending", .header = "", .field_type = .uint_u64 },
-    .{ .field = "available", .header = "", .field_type = .uint_u64 },
+    .{ .field = "ready", .header = "", .field_type = .uint_u64 },
+    .{ .field = "leased", .header = "", .field_type = .uint_u64 },
     .{ .field = "enqueued", .header = "", .field_type = .uint_u64 },
     .{ .field = "dequeued", .header = "", .field_type = .uint_u64 },
     .{ .field = "dlq", .header = "", .field_type = .uint_u64 },
@@ -43,8 +43,8 @@ const QueueListAsker = struct {
 };
 
 /// GET /queues - Every namespace's queues, or `?namespace=`'s alone,
-/// from `queue_list`, which asks every shard. Its counts are enqueued less
-/// dequeued, so `ready`, `inflight` and `available` (ready alone) are null.
+/// from `queue_list`, which asks every shard: each queue's messages ready
+/// and leased (`inflight`), as the queue keeps them.
 pub fn getQueues(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue list", err);
     defer reader.deinit();
@@ -78,17 +78,17 @@ pub fn getQueues(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboar
             const ns = r.readLengthPrefixed(u32) orelse return try h.jsonError(allocator, malformed);
             var v: [5]u64 = undefined;
             for (&v) |*x| x.* = r.readU64() orelse return try h.jsonError(allocator, malformed);
-            const pending, _, const enqueued, const dequeued, const dlq = v;
+            const ready, const leased, const enqueued, const dequeued, const dlq = v;
             if (name.len > 0 and name[0] == '_') continue; // system queue
             try arr.next();
             var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
             try obj.begin();
             try obj.stringField("name", name);
             try obj.stringField("namespace", ns);
-            try obj.nullField("ready");
-            try obj.nullField("inflight");
-            try obj.intField("pending", pending);
-            try obj.nullField("available");
+            try obj.intField("ready", ready);
+            try obj.intField("inflight", leased);
+            try obj.intField("pending", ready + leased);
+            try obj.intField("available", ready);
             try obj.intField("enqueued", enqueued);
             try obj.intField("dequeued", dequeued);
             try obj.intField("dlq_count", dlq);

@@ -119,7 +119,11 @@ export interface StreamInfo {
   partitions: number
   ingest_rate: number
   reads: number
-  retention: string | null
+  /** Human form, e.g. "1d", "1000 records", "1d, 1000 records" or "forever". */
+  retention: string
+  /** 0 when unset. */
+  retention_age_s: number
+  retention_count: number
 }
 export interface StreamPartition {
   id: number
@@ -140,6 +144,9 @@ export interface StreamDetailInfo {
   total_count: number
   total_bytes: number
   partitions: StreamPartition[]
+  retention: string
+  retention_age_s: number
+  retention_count: number
   /** Null: no op lists a stream's groups yet. */
   consumer_groups: StreamConsumerGroup[] | null
 }
@@ -163,10 +170,12 @@ export interface StreamMessagesResponse {
 export interface QueueInfo {
   name: string
   namespace: string
-  ready: number | null
-  inflight: number | null
+  ready: number
+  inflight: number
+  /** ready + inflight. */
   pending: number
-  available: number | null
+  /** Same as ready. */
+  available: number
   enqueued: number
   dequeued: number
   dlq_count: number
@@ -198,13 +207,15 @@ export interface QueueMessagesResponse {
 // ── timeseries ──────────────────────────────────────────────
 // NB: the TS projection keys write buffers by `measurement\0field\0tag_hash`,
 // so tags ARE a series dimension — `series_count` counts distinct
-// measurement+field+tag-set series (no longer just fields), and `points` is the
-// buffered point total across them.
+// measurement+field+tag-set series (no longer just fields), and `points` counts
+// every point across them, flushed and buffered.
 export interface TsMeasurement {
   name: string
-  series_count: number | null
-  field_count: number | null
-  points: number | null
+  series_count: number
+  field_count: number
+  /** The server stops counting fields at a cap: field_count is then a lower bound. */
+  field_count_capped: boolean
+  points: number
 }
 export interface TsField {
   name: string
@@ -213,12 +224,14 @@ export interface TsField {
 export interface TsMeasurementDetail {
   name: string
   namespace: string
-  field_count: number | null
-  /** Null: no op answers a measurement's fields yet. */
-  fields: TsField[] | null
-  series_count: number | null
+  field_count: number
+  field_count_capped: boolean
+  fields: TsField[]
+  series_count: number
   series: unknown[] | null
-  retention: string | null
+  points: number
+  oldest_ms: number | null
+  newest_ms: number | null
 }
 export interface TsPoint {
   timestamp: number
@@ -249,29 +262,38 @@ export interface TsFloqlResponse {
 
 // ── actions ─────────────────────────────────────────────────
 export type ActionRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
+/** `pending` is counted up to 100,000 (`pending_capped`: at least that).
+ *  The others read every run in the namespace, so they are null when it
+ *  holds too many runs to count (`too_many_runs`: the action's shard holds
+ *  more than 10,000 of the namespace's runs). */
 export interface ActionRunCounts {
-  total: number
   pending: number
-  running: number
-  completed: number
-  failed: number
-  cancelled: number
-  timed_out: number
+  pending_capped: boolean
+  running: number | null
+  completed: number | null
+  failed: number | null
+  timed_out: number | null
+  too_many_runs: boolean
 }
-/** The list answers names only; every other field may be null (unknown). */
+/** Over the same runs as ActionRunCounts; null when they aren't counted. */
+export interface ActionLatency {
+  count: number
+  avg_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+}
+/** `runs` and `latency` are null in the list; the detail answers them. */
 export interface ActionInfo {
   name: string
   namespace: string
-  type: string | null
-  owner: string | null
+  owner: string
   description: string
-  version: number | null
-  enabled: boolean | null
-  timeout_ms: number | null
-  max_retries: number | null
-  created_at: number | null
-  updated_at: number | null
-  latency?: unknown
+  version: number
+  timeout_ms: number
+  max_attempts: number
+  created_at: number
+  latency: ActionLatency | null
   runs: ActionRunCounts | null
 }
 export interface ActionRun {
@@ -285,6 +307,7 @@ export interface ActionRun {
   completed_at: number | null
   worker_id: string | null
   error: string | null
+  /** The worker's named outcome, "success" for a completed run without one, else null. */
   outcome: string | null
   input: string | null
   output: string | null
@@ -292,21 +315,8 @@ export interface ActionRun {
   caller_run_id: string | null
   caller_workflow: string | null
 }
-export interface ActionDetailInfo {
-  name: string
-  namespace: string
-  type: string | null
-  owner: string | null
-  description: string
-  version: number | null
-  enabled: boolean | null
-  timeout_ms: number | null
-  max_retries: number | null
-  retry_delay_ms: number | null
-  created_at: number | null
-  updated_at: number | null
-  latency?: unknown
-  runs: ActionRunCounts | null
+export interface ActionDetailInfo extends Omit<ActionInfo, 'runs'> {
+  runs: ActionRunCounts
   recent_runs: ActionRun[]
   /** Workers running this action, as the worker list gives them. */
   workers: WorkerListItem[]
@@ -325,15 +335,30 @@ export interface ProcessingJobInfo {
   name: string
   namespace: string
   status: JobStatus
-  batch_size: number | null
+  batch_size: number
   created_at: number
+  records_processed: number
   /** Null in the list; the detail answers it. */
-  records_processed: number | null
-  metrics?: unknown
+  metrics: ProcessingJobMetrics | null
+}
+/** Since-start figures on the answering node. Not replicated: a restart or
+ *  leader change resets them. */
+export interface ProcessingJobMetrics {
+  running: boolean
+  records_in: number
+  records_out: number
+  throughput_per_sec: number
+  output_per_sec: number
+  latency_avg_ms: number
+  latency_max_ms: number
+  tick_avg_us: number
+  tick_max_us: number
+  watermark_ms: number | null
+  uptime_ms: number
 }
 export interface ProcessingJobDetail extends ProcessingJobInfo {
   /** Full submitted pipeline definition (parsed client-side into the DAG). */
-  yaml: string | null
+  yaml: string
   reason?: string | null
 }
 export interface ProcessingMutationResult {
@@ -356,8 +381,7 @@ export interface WorkflowDefInfo {
   name: string
   version: string
   created_at: number
-  /** Null: no op answers whether a definition is enabled yet. */
-  enabled: boolean | null
+  enabled: boolean
   step_count: number
   plan_count: number
   has_schedule: boolean
@@ -372,9 +396,11 @@ export interface WorkflowDefDetail {
   version: string | null
   created_at: number | null
   enabled: boolean | null
-  status: string | null
+  /** 'unknown' when the definition isn't there. */
+  status: 'active' | 'disabled' | 'unknown' | null
   definition_yaml: string
-  run_count: number | null
+  /** Planned; always null for now. */
+  run_count: null
 }
 /** One page of the run list, newest first. A page can end short of its
  *  limit with more after it: only `has_more` says the list is whole. */

@@ -57,11 +57,14 @@ test "e2e/dashboard: on many shards, lists hold every item of every namespace on
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
 
-    for (SPACES) |ns| {
+    // Each entry carries its item's own fields from its own shard: a
+    // queue's ready count (na's hold one message, nb's two) and an action's
+    // owner.
+    for (SPACES, 1..) |ns, records| {
         var path_buf: [96]u8 = undefined;
         try expectEachOnce(http, try std.fmt.bufPrint(&path_buf, "/api/v1/streams?namespace={s}", .{ns}), "\"name\":\"st-{d:0>2}\",\"namespace\":\"{s}\"", .{ns});
-        try expectEachOnce(http, try std.fmt.bufPrint(&path_buf, "/api/v1/queues?namespace={s}", .{ns}), "\"name\":\"q-{d:0>2}\",\"namespace\":\"{s}\"", .{ns});
-        try expectEachOnce(http, try std.fmt.bufPrint(&path_buf, "/api/v1/actions?namespace={s}", .{ns}), "\"name\":\"act-{d:0>2}\"", .{});
+        try expectEachOnce(http, try std.fmt.bufPrint(&path_buf, "/api/v1/queues?namespace={s}", .{ns}), "\"name\":\"q-{d:0>2}\",\"namespace\":\"{s}\",\"ready\":{d},\"inflight\":0,", .{ ns, records });
+        try expectEachOnce(http, try std.fmt.bufPrint(&path_buf, "/api/v1/actions?namespace={s}", .{ns}), "\"name\":\"act-{d:0>2}\",\"namespace\":\"{s}\",\"owner\":\"cli\"", .{ns});
     }
     // With no namespace asked, the queue list holds every namespace's.
     for (SPACES) |ns| try expectEachOnce(http, "/api/v1/queues", "\"name\":\"q-{d:0>2}\",\"namespace\":\"{s}\"", .{ns});

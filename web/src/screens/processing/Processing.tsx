@@ -1,18 +1,19 @@
 /* Flo Console v2 — Processing screen (live).
    Stream processing · pipeline DAG.
 
-   Wired to the dashboard API. Jobs are namespace-scoped server-side. The job
-   detail answers status, batch_size and records_processed; the list answers
-   neither count, and the submitted YAML (parsed here into the
-   source→operator→sink DAG) comes back null until an op answers it. It does NOT expose live rates, e2e latency, backpressure,
-   per-operator in/out counts, checkpoints or window metrics — those mock cards were
+   Wired to the dashboard API. Jobs are namespace-scoped server-side. The list
+   answers status, batch_size and records_processed; the detail adds the
+   submitted YAML (parsed here into the source→operator→sink DAG) and runtime
+   metrics. Those metrics are since-start figures on the answering node and
+   aren't replicated, so the UI labels them "on this node". Per-operator in/out
+   counts, backpressure and checkpoints aren't exposed — those mock cards were
    dropped, not faked. Submit / stop / cancel are real loopback writes. See API_INTEGRATION.md. */
 import { Fragment, useMemo, useState } from 'react'
 import { Button } from '@/components/buttons/Button'
 import { Crumb, PhSec, Stat, Stats } from '@/components/layout'
 import { StatusPill, OpPill } from '@/components'
 import { Modal } from '@/components/overlay/Modal'
-import { DASH, sumKnown } from '@/lib/format'
+import { DASH, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useJobs, useJobDetail, useSubmitJob, useStopJob, useCancelJob } from '@/lib/api/processing'
 import type { ProcessingJobInfo, ProcessingJobDetail, JobStatus } from '@/lib/api/types'
@@ -50,7 +51,10 @@ const pfmtN = (n: number): string =>
   n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : Math.round(n).toLocaleString()
 function pUp(createdMs: number): string {
   if (!createdMs) return '—'
-  const ms = Math.max(0, Date.now() - createdMs)
+  return pDur(Date.now() - createdMs)
+}
+function pDur(ms0: number): string {
+  const ms = Math.max(0, ms0)
   const h = Math.floor(ms / 3600000)
   if (h < 1) return Math.floor(ms / 60000) + 'm'
   if (h < 24) return h + 'h ' + Math.floor((ms % 3600000) / 60000) + 'm'
@@ -289,6 +293,8 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
   const records = d?.records_processed ?? job.records_processed
   const running = status === 'RUNNING'
   const pipe = useMemo(() => parsePipeline(d?.yaml ?? ''), [d?.yaml])
+  const m = d?.metrics ?? null
+  const fixed = (n: number, unit: string) => (n < 10 ? n.toFixed(1) : pfmtN(n)) + unit
   const [c, l] = P_ST[status] ?? P_ST.unknown
 
   return (
@@ -321,8 +327,14 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
       </div>
 
       <Stats>
-        <Stat label="Records processed" value={records == null ? DASH : pfmtN(records)} sub={running ? 'climbing' : 'final'} />
-        <Stat label="Batch size" value={d?.batch_size ?? job.batch_size ?? DASH} sub="per tick" />
+        <Stat label="Records processed" value={pfmtN(records)} sub={running ? 'climbing' : 'final'} />
+        <Stat
+          label="Throughput"
+          value={m ? pfmtN(m.throughput_per_sec) : DASH}
+          unit={m ? 'rec/s' : undefined}
+          sub="on this node, since start"
+        />
+        <Stat label="Batch size" value={d?.batch_size ?? job.batch_size} sub="per tick" />
         <Stat label="Uptime" value={pUp(d?.created_at ?? job.created_at)} sub="since submit" />
       </Stats>
 
@@ -345,15 +357,39 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
             Failed to load job.
           </div>
         ) : tab === 'overview' ? (
-          <div className="card card-p">
-            <PhSec icon={PSEC.layers} title="Pipeline topology" />
-            <Topology pipe={pipe} records={records} running={running} />
-            <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 10 }}>
-              {d && d.yaml == null
-                ? 'The pipeline definition isn’t available yet, so its operators can’t be drawn.'
-                : 'Edge counts aren’t exposed per-operator — only the source record total is live.'}
+          <>
+            <div className="card card-p">
+              <PhSec icon={PSEC.layers} title="Pipeline topology" />
+              <Topology pipe={pipe} records={records} running={running} />
+              <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 10 }}>
+                Edge counts aren’t exposed per-operator — only the source record total is live.
+              </div>
             </div>
-          </div>
+            <div className="card card-p" style={{ marginTop: 16 }}>
+              <PhSec icon={PSEC.info} title="Runtime · on this node" />
+              {(
+                [
+                  ['Running on this node', m ? (m.running ? 'yes' : 'no') : DASH],
+                  ['Records in · out', m ? `${pfmtN(m.records_in)} · ${pfmtN(m.records_out)}` : DASH],
+                  ['Output rate', m ? fixed(m.output_per_sec, ' rec/s') : DASH],
+                  ['Latency avg · max', m ? `${fixed(m.latency_avg_ms, 'ms')} · ${fixed(m.latency_max_ms, 'ms')}` : DASH],
+                  ['Tick avg · max', m ? `${fixed(m.tick_avg_us, 'µs')} · ${fixed(m.tick_max_us, 'µs')}` : DASH],
+                  ['Watermark', m?.watermark_ms != null ? tfmt(m.watermark_ms) : DASH],
+                  ['Uptime on this node', m ? pDur(m.uptime_ms) : DASH],
+                ] as [string, string][]
+              ).map(([k, v]) => (
+                <div className="kvrow2" key={k}>
+                  <span>{k}</span>
+                  <span className="mono" style={{ color: 'var(--tx)' }}>
+                    {v}
+                  </span>
+                </div>
+              ))}
+              <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
+                Since start on the node that answered; not replicated, so a restart or leader change resets them.
+              </div>
+            </div>
+          </>
         ) : (
           <div className="card card-p">
             <PhSec icon={PSEC.info} title="Submitted definition" />
@@ -361,7 +397,7 @@ function JobDetail({ ns, job, onBack }: { ns: string; job: ProcessingJobInfo; on
               <pre className="code" dangerouslySetInnerHTML={{ __html: pYamlHL(d.yaml) }} />
             ) : (
               <div className="mono" style={{ fontSize: 12.5, color: 'var(--tx-faint)' }}>
-                {q.isLoading ? 'Loading…' : 'The submitted definition isn’t available yet.'}
+                {q.isLoading ? 'Loading…' : 'Empty definition.'}
               </div>
             )}
           </div>
@@ -381,8 +417,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
   const [submit, setSubmit] = useState(false)
 
   const running = jobs.filter((j) => j.status === 'RUNNING').length
-  // The list answers no record counts: an unknown total, not 0.
-  const records = sumKnown(jobs.map((j) => j.records_processed))
+  const records = jobs.reduce((a, j) => a + j.records_processed, 0)
   const notRunning = jobs.length - running
   const filtered =
     tab === 'all' ? jobs : tab === 'running' ? jobs.filter((j) => j.status === 'RUNNING') : jobs.filter((j) => j.status !== 'RUNNING')
@@ -406,7 +441,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
       <Stats>
         <Stat label="Jobs" value={q.isLoading ? '…' : jobs.length} sub={`${running} running · in ${ns}`} />
         <Stat label="Running" value={running} sub="active pipelines" />
-        <Stat label="Records processed" value={records == null ? DASH : pfmtN(records)} sub={records == null ? 'open a job to see its count' : 'across jobs'} />
+        <Stat label="Records processed" value={pfmtN(records)} sub="across jobs" />
         <Stat label="Not running" value={notRunning} valueColor={notRunning ? 'var(--warn)' : undefined} sub="stopped / cancelled" />
       </Stats>
 
@@ -454,7 +489,7 @@ function JobsList({ ns, onOpen }: { ns: string; onOpen: (job: ProcessingJobInfo)
                   <span>
                     <StatusPill color={c} label={l} />
                   </span>
-                  <span className="c r mono">{j.records_processed == null ? DASH : pfmtN(j.records_processed)}</span>
+                  <span className="c r mono">{pfmtN(j.records_processed)}</span>
                   <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
                     {pUp(j.created_at)}
                   </span>

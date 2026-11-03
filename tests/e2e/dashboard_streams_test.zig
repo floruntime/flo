@@ -16,9 +16,6 @@ const stdx = @import("stdx");
 // ── Part 2: real list fields ────────────────────────────────────────────────
 
 test "e2e/dashboard: streams list surfaces real retention, not fabricated 7d" {
-    // The stream list doesn't carry retention yet (null, shown as "—"); a
-    // wider list entry brings it back.
-    if (true) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });

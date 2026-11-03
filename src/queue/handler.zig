@@ -1343,9 +1343,8 @@ test "queue handler: a listing gives each queue its own dead-letter count" {
         try q.registerQueue(hash, c.name, "default");
         for (0..c.dead) |i| {
             const seq = try q.enqueue(100 + i, 0, 1, hash, "x");
-            const msg = q.messages.getPtr(seq).?;
-            msg.state = .leased;
-            msg.attempts = q.max_attempts;
+            try std.testing.expectEqual(seq, (try q.dequeue(1, hash)).?.seq);
+            q.messages.getPtr(seq).?.attempts = q.max_attempts;
             try q.nack(seq, 2);
         }
     }

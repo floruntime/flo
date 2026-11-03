@@ -9,15 +9,13 @@
    are fully applied — partial sets, `!=`, and `=~`/`!~` globs all select series
    via the projection's tag dictionary.
    Ingest is command-only (no write endpoint); measurements are namespace-scoped
-   server-side (`?namespace=`). No op answers a measurement's series, fields or
-   points yet: those come back null and render "—", and the detail charts a
-   field the viewer names, since /data still answers one. See API_INTEGRATION.md. */
+   server-side (`?namespace=`). The server stops counting fields at a cap, so a
+   capped field count renders as "≥N". See API_INTEGRATION.md. */
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { Modal } from '@/components/overlay/Modal'
 import { Crumb, Stats, Stat } from '@/components/layout'
 import { Button } from '@/components/buttons/Button'
-import { Field } from '@/components'
-import { cfmt, DASH, orDash, sumKnown } from '@/lib/format'
+import { cfmt, DASH, orDash, sumKnown, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import { useMeasurements, useMeasurementDetail, useSeriesData, useFloql } from '@/lib/api/ts'
 import type { TsMeasurement } from '@/lib/api/types'
@@ -483,17 +481,20 @@ function FieldChart({ ns, measurement, field }: { ns: string; measurement: strin
   )
 }
 
+/** Field count, as a lower bound when the server hit its counting cap. */
+const fmtFields = (n: number, capped: boolean): string => (capped ? '≥' + n : String(n))
+const fieldsLabel = (n: number, capped: boolean): string =>
+  !capped && n === 1 ? 'single field' : fmtFields(n, capped) + ' fields'
+
 /* ======================= measurement detail ======================= */
 function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBack: () => void }) {
   const q = useMeasurementDetail(ns, row.name)
   const detail = q.data
-  const fieldsKnown = detail?.fields != null
   const fields = detail?.fields ?? []
-  const fieldCount = detail ? (detail.field_count ?? row.field_count) : row.field_count
-  const seriesCount = detail ? (detail.series_count ?? row.series_count) : row.series_count
-  // With no field list, /data still answers a named field ("value" by default).
-  const [askField, setAskField] = useState('value')
-  const [shownField, setShownField] = useState('value')
+  const src = detail ?? row
+  const fieldCount = fmtFields(src.field_count, src.field_count_capped)
+  const span =
+    detail?.oldest_ms != null && detail.newest_ms != null ? `${tfmt(detail.oldest_ms)} → ${tfmt(detail.newest_ms)}` : DASH
 
   return (
     <div className="wrap fade">
@@ -503,7 +504,7 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
           <div>
             <h1 className="ph-t">{row.name}</h1>
             <div className="ph-s">
-              {fieldCount == null ? `${DASH} fields` : fieldCount === 1 ? 'single field' : fieldCount + ' fields'} ·{' '}
+              {fieldsLabel(src.field_count, src.field_count_capped)} ·{' '}
               {detail ? `namespace ${detail.namespace}` : 'columnar engine'}
             </div>
           </div>
@@ -511,10 +512,10 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
       </div>
 
       <Stats>
-        <Stat label="Series" value={orDash(seriesCount)} sub={`${orDash(fieldCount)} fields`} />
-        <Stat label="Datapoints" value={orDash(row.points, cfmt)} sub="buffered" />
-        <Stat label="Fields" value={orDash(fieldCount)} sub="per measurement" />
-        <Stat label="Retention" value={detail?.retention ?? DASH} sub={detail?.retention ? 'policy' : 'not available yet'} />
+        <Stat label="Series" value={src.series_count} sub={`${fieldCount} fields`} />
+        <Stat label="Datapoints" value={cfmt(src.points)} sub="flushed and buffered" />
+        <Stat label="Fields" value={fieldCount} sub="per measurement" />
+        <Stat label="Newest point" value={detail?.newest_ms != null ? tfmt(detail.newest_ms) : DASH} sub={span} />
       </Stats>
 
       {q.isError ? (
@@ -524,28 +525,6 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
       ) : q.isLoading ? (
         <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '40px 0' }}>
           Loading…
-        </div>
-      ) : !fieldsKnown ? (
-        <div className="sec">
-          <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '24px 0', marginBottom: 16 }}>
-            Field details not available yet.
-          </div>
-          <form
-            style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 12 }}
-            onSubmit={(e) => {
-              e.preventDefault()
-              if (askField.trim()) setShownField(askField.trim())
-            }}
-          >
-            <span className="set-h" style={{ padding: 0 }}>
-              Chart field
-            </span>
-            <Field className="mono" wrapStyle={{ width: 200 }} value={askField} onChange={(e) => setAskField(e.target.value)} />
-            <Button type="submit" style={{ flex: 'none' }}>
-              Show
-            </Button>
-          </form>
-          <FieldChart key={shownField} ns={ns} measurement={row.name} field={shownField} />
         </div>
       ) : (
         <>
@@ -600,6 +579,7 @@ export function TimeSeries() {
 
   const totSeries = sumKnown(meas.map((m) => m.series_count))
   const totFields = sumKnown(meas.map((m) => m.field_count))
+  const anyCapped = meas.some((m) => m.field_count_capped)
   const totPoints = sumKnown(meas.map((m) => m.points))
 
   return (
@@ -619,8 +599,8 @@ export function TimeSeries() {
       <Stats>
         <Stat label="Measurements" value={q.isLoading ? '…' : meas.length} sub={`in ${ns}`} />
         <Stat label="Series" value={orDash(totSeries, cfmt)} sub="measurement + field" />
-        <Stat label="Fields" value={orDash(totFields, cfmt)} sub="numeric columns" />
-        <Stat label="Datapoints" value={orDash(totPoints, cfmt)} sub="buffered · Raft-replicated" />
+        <Stat label="Fields" value={orDash(totFields, (n) => (anyCapped ? '≥' : '') + cfmt(n))} sub="numeric columns" />
+        <Stat label="Datapoints" value={orDash(totPoints, cfmt)} sub="flushed and buffered · Raft-replicated" />
       </Stats>
 
       <FloQLConsole ns={ns} measurements={meas} />
@@ -658,14 +638,14 @@ export function TimeSeries() {
                     {m.name}
                   </div>
                   <div className="desc">
-                    columnar · {m.field_count == null ? `${DASH} fields` : m.field_count === 1 ? 'single field' : m.field_count + ' fields'}
+                    columnar · {fieldsLabel(m.field_count, m.field_count_capped)}
                   </div>
                 </div>
-                <span className="c r mono">{orDash(m.series_count)}</span>
+                <span className="c r mono">{m.series_count}</span>
                 <span className="c r mono" style={{ color: 'var(--tx-3)' }}>
-                  {orDash(m.field_count)}
+                  {fmtFields(m.field_count, m.field_count_capped)}
                 </span>
-                <span className="c r mono">{orDash(m.points, cfmt)}</span>
+                <span className="c r mono">{cfmt(m.points)}</span>
               </div>
             ))}
           </div>

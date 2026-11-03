@@ -15,7 +15,7 @@ import { Button } from '@/components/buttons/Button'
 import { Crumb, PhSec, Stat, Stats } from '@/components/layout'
 import { StatusPill, OpPill } from '@/components'
 import { Modal } from '@/components/overlay/Modal'
-import { DASH, jhl, tfmt } from '@/lib/format'
+import { DASH, jhl, orDash, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
 import {
   useWorkflows,
@@ -252,8 +252,6 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
   const [tab, setTab] = useState<'runs' | 'definition'>('runs')
   const [start, setStart] = useState(false)
   const detail = q.data
-  // Null: no op answers whether a definition is enabled yet. Unknown is not
-  // disabled — Start stays on, and both Enable and Disable are offered.
   const enabled = detail?.enabled ?? def.enabled
   const myRuns = useMemo(() => runs.filter((r) => r.workflow === def.name), [runs, def.name])
 
@@ -273,20 +271,9 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
             </div>
           </div>
           <div style={{ display: 'flex', gap: 9 }}>
-            {enabled == null ? (
-              <>
-                <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: true })}>
-                  Enable
-                </Button>
-                <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: false })}>
-                  Disable
-                </Button>
-              </>
-            ) : (
-              <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: !enabled })}>
-                {enabled ? 'Disable' : 'Enable'}
-              </Button>
-            )}
+            <Button style={{ flex: 'none' }} disabled={toggle.isPending} onClick={() => toggle.mutate({ name: def.name, enable: !enabled })}>
+              {enabled ? 'Disable' : 'Enable'}
+            </Button>
             <Button variant="accent" style={{ flex: 'none' }} disabled={enabled === false} onClick={() => setStart(true)}>
               Start run
             </Button>
@@ -297,26 +284,17 @@ function DefDetail({ ns, def, runs, onBack, onOpenRun }: { ns: string; def: Work
             {String((toggle.error as Error)?.message ?? 'Toggle failed')}
           </div>
         )}
-        {toggle.isSuccess && enabled == null && (
-          <div className="mono" style={{ fontSize: 12, color: 'var(--tx-faint)', marginTop: 8 }}>
-            {toggle.variables?.enable ? 'enabled' : 'disabled'} · the current state isn’t answered yet
-          </div>
-        )}
       </div>
 
       <Stats>
-        <Stat
-          label="Runs"
-          value={detail?.run_count ?? myRuns.length}
-          sub={detail?.run_count != null ? 'all time' : 'listed'}
-        />
+        <Stat label="Runs" value={myRuns.length} sub={`listed · ${orDash(detail?.run_count)} all time`} />
         <Stat label="Steps" value={def.step_count} sub={`${def.plan_count} plans`} />
         <Stat label="Version" value={'v' + def.version} sub={detail?.status ?? '—'} />
         <Stat
           label="Status"
-          value={enabled == null ? DASH : enabled ? 'enabled' : 'disabled'}
-          valueColor={enabled === false ? 'var(--warn)' : undefined}
-          sub={enabled == null ? 'not available yet' : enabled ? 'accepts runs' : 'refuses runs'}
+          value={enabled ? 'enabled' : 'disabled'}
+          valueColor={enabled ? undefined : 'var(--warn)'}
+          sub={enabled ? 'accepts runs' : 'refuses runs'}
         />
       </Stats>
 
@@ -405,7 +383,6 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
     return m
   }, [runs])
 
-  const enabledKnown = defs.every((d) => d.enabled != null)
   const enabledCount = defs.filter((d) => d.enabled === true).length
   const disabledCount = defs.filter((d) => d.enabled === false).length
   const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'waiting' || r.status === 'pending').length
@@ -421,10 +398,10 @@ function WorkflowsList({ ns, onOpen }: { ns: string; onOpen: (d: WorkflowDefInfo
       </div>
 
       <Stats>
-        <Stat label="Workflows" value={q.isLoading ? '…' : defs.length} sub={`${enabledKnown ? enabledCount : DASH} enabled · in ${ns}`} />
+        <Stat label="Workflows" value={q.isLoading ? '…' : defs.length} sub={`${enabledCount} enabled · in ${ns}`} />
         <Stat label="Runs" value={runsQ.isLoading ? '…' : `${runs.length}${runsQ.data?.has_more ? '+' : ''}`} sub={runsQ.data?.has_more ? 'newest shown' : 'all time'} />
         <Stat label="Active" value={activeRuns} valueColor={activeRuns ? '#6F9BD1' : undefined} sub="running / waiting" />
-        <Stat label="Disabled" value={enabledKnown ? disabledCount : DASH} sub="blocked" />
+        <Stat label="Disabled" value={disabledCount} sub="blocked" />
       </Stats>
 
       <div className="sec">

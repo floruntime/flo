@@ -20,6 +20,7 @@ const cli_config = @import("../config.zig");
 const schema = @import("../../protocol/schema.zig");
 const action_ops = @import("../../protocol/action_ops.zig");
 const worker_ops = @import("../../protocol/worker_ops.zig");
+const gen = @import("../gen.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -33,7 +34,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Create the action command tree
 pub fn createActionCommand(allocator: Allocator) !*commander.Command {
-    return try commander.newBuilder(allocator)
+    const action = commander.newBuilder(allocator)
         .name("action")
         .about("Action & workflow operations")
         .group("Data Commands")
@@ -96,15 +97,16 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .action(wrapHandler(runDelete)),
         )
         .subcommand(
-            commander.newBuilder(allocator)
-                .name("runs")
-                .about("List action runs/tasks")
-                .aliases(&.{"tasks"})
-                .arg("name", "Action name")
-                .uintFlag("limit", 'l', 50, "Maximum runs to show")
-                .action(wrapHandler(runRuns)),
-        )
-        .build();
+        commander.newBuilder(allocator)
+            .name("runs")
+            .about("List action runs/tasks")
+            .aliases(&.{"tasks"})
+            .arg("name", "Action name")
+            .uintFlag("limit", 'l', 50, "Maximum runs to show")
+            .action(wrapHandler(runRuns)),
+    );
+    gen.addCommands(allocator, action, &action_ops.table, &.{});
+    return try action.build();
 }
 
 /// Create the worker command tree

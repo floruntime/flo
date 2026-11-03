@@ -2,14 +2,15 @@
    Durable task types · worker-hosted · retries, timeouts, dead-letter.
 
    Wired to the dashboard API. Actions are namespace-scoped server-side. The list
-   answers names only; type, version, enabled, retries, timeout, run counts and
-   latency come back null (unknown) and render "—". Recent runs and workers are
-   answered. Invoke is a real loopback write (async → run_id); Register is
-   command-only (no dashboard endpoint). */
+   answers each definition but not run counts or latency (those render "—"); the
+   detail answers them, unless the action's shard holds more than 10,000 of the
+   namespace's runs (then all but pending render "—"). Invoke is a
+   real loopback write (async → run_id); Register is command-only (no dashboard
+   endpoint). */
 import { useMemo, useState } from 'react'
-import { DASH, jhl, orDash, sumKnown } from '@/lib/format'
+import { DASH, jhl, orDash, sumKnown, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
-import { Button, Crumb, Stats, Stat, OpPill, Modal, Field } from '@/components'
+import { Button, Crumb, Stats, Stat, Modal, Field } from '@/components'
 import { useActions, useActionDetail, useActionRuns, useInvokeAction } from '@/lib/api/actions'
 import type { ActionInfo, ActionRun, ActionRunCounts } from '@/lib/api/types'
 import { ASvc, MapPill, afmtN, A_RUNST } from './shared'
@@ -17,10 +18,20 @@ import './compute.css'
 
 type Tab = 'overview' | 'runs'
 
-const errCount = (r: ActionRunCounts): number => r.failed + r.timed_out
+const errCount = (r: ActionRunCounts): number | null =>
+  r.failed == null || r.timed_out == null ? null : r.failed + r.timed_out
+const invCount = (r: ActionRunCounts): number | null => {
+  const done = errCount(r)
+  return done == null || r.running == null || r.completed == null ? null : r.pending + r.running + r.completed + done
+}
+/** Past 10,000 of the namespace's runs on the action's shard only pending is counted; say why the rest show a dash. */
+const scanSub = (r: ActionRunCounts | undefined, fallback: string): string =>
+  r?.too_many_runs ? "too many of this namespace's runs on the action's shard to count" : fallback
+const pendingText = (r: ActionRunCounts | undefined): string =>
+  r ? (r.pending_capped ? '≥' : '') + afmtN(r.pending) : DASH
 const durMs = (run: ActionRun): number | null =>
   run.completed_at != null && run.started_at != null ? run.completed_at - run.started_at : null
-const fmtDur = (ms: number): string => (ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's')
+const fmtDur = (ms: number): string => (ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's')
 function tryJsonHl(s: string | null): { __html: string } | null {
   if (!s) return null
   try {
@@ -75,7 +86,7 @@ function RegisterModal({ ns, onClose }: { ns: string; onClose: () => void }) {
       </div>
       <div className="ts-frow">
         <div className="set-h" style={{ padding: 0 }}>
-          Max retries
+          Retries
         </div>
         <Field
           className="mono"
@@ -184,9 +195,10 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
   const a = q.data
   const runs = runsQ.data ?? []
   const counts = a?.runs
-  // No op answers run counts yet: null counts render "—", never 0.
+  const inv = counts ? invCount(counts) : null
   const errs = counts ? errCount(counts) : null
-  const errRate = counts && errs != null ? (counts.total ? ((errs / counts.total) * 100).toFixed(2) : '0') + '% rate' : 'not available yet'
+  const errRate = inv != null && errs != null ? (inv ? ((errs / inv) * 100).toFixed(2) : '0') + '% rate' : DASH
+  const lat = a?.latency
 
   const inputHl = runSel ? tryJsonHl(runSel.input) : null
   const outputHl = runSel ? tryJsonHl(runSel.output) : null
@@ -197,16 +209,11 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
       <div className="ph">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
           <div>
-            <h1 className="ph-t" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              {name}
-              {a?.enabled === false && <OpPill color="var(--warn)">disabled</OpPill>}
-            </h1>
-            <div className="ph-s">
-              {a ? `${a.type ?? DASH} · v${a.version ?? DASH} · ${a.namespace}` : 'loading…'}
-            </div>
+            <h1 className="ph-t">{name}</h1>
+            <div className="ph-s">{a ? `v${a.version} · ${a.namespace}` : 'loading…'}</div>
           </div>
           <div style={{ display: 'flex', gap: 9 }}>
-            <Button variant="accent" style={{ flex: 'none' }} disabled={!a || a.enabled === false} onClick={() => setInvoke(true)}>
+            <Button variant="accent" style={{ flex: 'none' }} disabled={!a} onClick={() => setInvoke(true)}>
               Invoke
             </Button>
           </div>
@@ -214,13 +221,13 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
       </div>
 
       <Stats>
-        <Stat label="Invocations" value={orDash(counts?.total, afmtN)} sub="all time" />
-        <Stat label="Completed" value={orDash(counts?.completed, afmtN)} sub={`${orDash(counts?.pending)} pending`} />
+        <Stat label="Invocations" value={orDash(inv, afmtN)} sub={scanSub(counts, 'all time')} />
+        <Stat label="Completed" value={orDash(counts?.completed, afmtN)} sub={`${pendingText(counts)} pending`} />
         <Stat
           label="Errors"
           value={orDash(errs)}
           valueColor={errs ? 'var(--crit)' : undefined}
-          sub={errRate}
+          sub={counts?.too_many_runs ? scanSub(counts, '') : errRate}
         />
         <Stat label="Workers" value={a?.workers?.length ?? 0} sub="handling this action" />
       </Stats>
@@ -250,11 +257,12 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                 <ASvc icon="info" title="Configuration" />
                 {(
                   [
-                    ['Type', a?.type ?? '—'],
                     ['Namespace', a?.namespace ?? ns],
-                    ['Version', a?.version != null ? 'v' + a.version : DASH],
-                    ['Max retries', a?.max_retries ?? DASH],
-                    ['Enabled', a?.enabled == null ? DASH : a.enabled ? 'yes' : 'no'],
+                    ['Version', a ? 'v' + a.version : DASH],
+                    ['Owner', a?.owner || DASH],
+                    ['Timeout', a ? fmtDur(a.timeout_ms) : DASH],
+                    ['Max attempts', a?.max_attempts ?? DASH],
+                    ['Created', a ? tfmt(a.created_at) : DASH],
                   ] as [string, string | number][]
                 ).map(([k, v]) => (
                   <div className="kvrow2" key={k}>
@@ -264,9 +272,11 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     </span>
                   </div>
                 ))}
-                <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
-                  type, version, retries, timeout and owner aren’t answered yet.
-                </div>
+                {a?.description && (
+                  <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
+                    {a.description}
+                  </div>
+                )}
               </div>
               <div className="card card-p">
                 <ASvc icon="cpu" title="Execution" />
@@ -275,6 +285,8 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     ['Model', 'user-hosted workers'],
                     ['Dispatch', 'long-poll await'],
                     ['Workers', String(a?.workers?.length ?? 0)],
+                    ['Latency p50 · p95', lat ? `${fmtDur(lat.p50_ms)} · ${fmtDur(lat.p95_ms)}` : DASH],
+                    ['Latency avg · max', lat ? `${fmtDur(lat.avg_ms)} · ${fmtDur(lat.max_ms)}` : DASH],
                   ] as [string, string][]
                 ).map(([k, v]) => (
                   <div className="kvrow2" key={k}>
@@ -289,7 +301,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                   <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {counts &&
                       (['pending', 'running', 'completed', 'failed', 'timed_out'] as const)
-                        .filter((s) => counts[s] > 0)
+                        .filter((s) => (counts[s] ?? 0) > 0)
                         .map((s) => (
                           <span key={s} className="tag">
                             {A_RUNST[s]?.[1] ?? s} {counts[s]}
@@ -300,13 +312,18 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                         {DASH}
                       </span>
                     )}
-                    {counts && counts.total === 0 && (
+                    {inv === 0 && (
                       <span className="mono" style={{ color: 'var(--tx-faint)' }}>
                         no runs
                       </span>
                     )}
                   </span>
                 </div>
+                {counts?.too_many_runs && (
+                  <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
+                    This action&apos;s shard holds more than 10,000 of the namespace&apos;s runs, so only pending is counted.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -319,9 +336,10 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                 </div>
               ) : (
                 <div className="list">
-                  <div className="li head" style={{ gridTemplateColumns: '1.4fr 110px 80px 90px' }}>
+                  <div className="li head" style={{ gridTemplateColumns: '1.4fr 110px 100px 80px 90px' }}>
                     <div className="c">Run</div>
                     <div className="c">Status</div>
+                    <div className="c">Outcome</div>
                     <div className="c r">Source</div>
                     <div className="c r">Duration</div>
                   </div>
@@ -332,7 +350,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                         className="li"
                         key={r.run_id}
                         style={{
-                          gridTemplateColumns: '1.4fr 110px 80px 90px',
+                          gridTemplateColumns: '1.4fr 110px 100px 80px 90px',
                           background: runSel?.run_id === r.run_id ? 'var(--hover)' : undefined,
                         }}
                         onClick={() => setRunSel(r)}
@@ -342,6 +360,9 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                         </span>
                         <span>
                           <MapPill map={A_RUNST} s={r.status} />
+                        </span>
+                        <span className="mono nw" style={{ fontSize: 11.5, color: 'var(--tx-2)' }}>
+                          {r.outcome ?? DASH}
                         </span>
                         <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
                           {r.source ?? DASH}
@@ -386,6 +407,12 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                       — {runSel.status === 'pending' ? 'pending — awaiting a worker' : 'no output'} —
                     </div>
                   )}
+                  <div className="kvrow2" style={{ marginTop: 10 }}>
+                    <span>Outcome</span>
+                    <span className="mono" style={{ color: 'var(--tx-2)' }}>
+                      {runSel.outcome ?? DASH}
+                    </span>
+                  </div>
                   {runSel.worker_id && (
                     <div className="kvrow2" style={{ marginTop: 10 }}>
                       <span>Worker</span>
@@ -407,23 +434,15 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
 }
 
 /* ======================= list ======================= */
-type ListTab = 'all' | 'enabled' | 'disabled'
-
 function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => void }) {
   const q = useActions(ns)
   const rows = useMemo<ActionInfo[]>(() => q.data ?? [], [q.data])
-  const [tab, setTab] = useState<ListTab>('all')
   const [reg, setReg] = useState(false)
 
-  // Null runs / enabled mean unknown: a total over an unknown is unknown, and
-  // an unknown action is neither enabled nor disabled.
-  const totalInv = sumKnown(rows.map((r) => r.runs?.total))
+  // The list leaves runs null (the detail answers them): a total over an
+  // unknown is unknown, never 0.
+  const totalInv = sumKnown(rows.map((r) => (r.runs ? invCount(r.runs) : null)))
   const totalErr = sumKnown(rows.map((r) => (r.runs ? errCount(r.runs) : null)))
-  const enabledKnown = rows.every((r) => r.enabled != null)
-  const enabledCount = rows.filter((r) => r.enabled === true).length
-  const disabledCount = rows.filter((r) => r.enabled === false).length
-  const filtered =
-    tab === 'all' ? rows : tab === 'enabled' ? rows.filter((r) => r.enabled === true) : rows.filter((r) => r.enabled === false)
 
   return (
     <div className="wrap fade">
@@ -439,40 +458,26 @@ function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => voi
         </div>
       </div>
 
-      <Stats>
-        <Stat label="Actions" value={q.isLoading ? '…' : rows.length} sub={`${enabledKnown ? enabledCount : DASH} enabled · in ${ns}`} />
-        <Stat label="Invocations" value={orDash(totalInv, afmtN)} sub="all time" />
+      <Stats columns={3}>
+        <Stat label="Actions" value={q.isLoading ? '…' : rows.length} sub={`in ${ns}`} />
+        <Stat label="Invocations" value={orDash(totalInv, afmtN)} sub={totalInv == null ? 'per action, in its detail' : 'all time'} />
         <Stat
           label="Errors"
           value={orDash(totalErr)}
           valueColor={totalErr ? 'var(--crit)' : undefined}
-          sub={totalErr == null ? 'not available yet' : totalErr ? 'failed + timed out' : 'all clear'}
+          sub={totalErr == null ? 'per action, in its detail' : totalErr ? 'failed + timed out' : 'all clear'}
         />
-        <Stat label="Disabled" value={enabledKnown ? disabledCount : DASH} sub="blocked" />
       </Stats>
 
       <div className="sec">
-        <div className="wtabs">
-          {(
-            [
-              ['all', 'All · ' + rows.length],
-              ['enabled', 'Enabled'],
-              ['disabled', 'Disabled'],
-            ] as [ListTab, string][]
-          ).map(([id, l]) => (
-            <button key={id} className={'wtab' + (tab === id ? ' on' : '')} onClick={() => setTab(id)}>
-              {l}
-            </button>
-          ))}
-        </div>
 
         {q.isError ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--crit)', padding: '40px 0' }}>
             Failed to load actions. Is the server running?
           </div>
-        ) : filtered.length === 0 ? (
+        ) : rows.length === 0 ? (
           <div className="card card-p" style={{ textAlign: 'center', color: 'var(--tx-3)', padding: '40px 0' }}>
-            {q.isLoading ? 'Loading…' : `No ${tab === 'all' ? '' : tab + ' '}actions in ${ns}.`}
+            {q.isLoading ? 'Loading…' : `No actions in ${ns}.`}
           </div>
         ) : (
           <div className="list">
@@ -481,24 +486,19 @@ function ActionsList({ ns, onOpen }: { ns: string; onOpen: (name: string) => voi
               <div className="c r">Invocations</div>
               <div className="c r">Errors</div>
             </div>
-            {filtered.map((r) => {
+            {rows.map((r) => {
               const errs = r.runs ? errCount(r.runs) : null
               return (
                 <div className="li" key={r.name} style={{ gridTemplateColumns: '1.5fr 100px 70px' }} onClick={() => onOpen(r.name)}>
                   <div style={{ minWidth: 0 }}>
-                    <div className="mono nw" style={{ fontWeight: 500, color: r.enabled === false ? 'var(--tx-3)' : 'var(--tx)' }}>
+                    <div className="mono nw" style={{ fontWeight: 500, color: 'var(--tx)' }}>
                       {r.name}
-                      {r.enabled === false && (
-                        <span style={{ marginLeft: 8 }}>
-                          <OpPill color="var(--warn)">off</OpPill>
-                        </span>
-                      )}
                     </div>
                     <div className="desc">
-                      {r.type ?? DASH} · {orDash(r.runs?.pending)} pending
+                      v{r.version} · {pendingText(r.runs ?? undefined)} pending
                     </div>
                   </div>
-                  <span className="c r mono">{orDash(r.runs?.total, afmtN)}</span>
+                  <span className="c r mono">{orDash(r.runs ? invCount(r.runs) : null, afmtN)}</span>
                   <span
                     className="c r mono"
                     style={{ color: errs == null ? 'var(--tx-3)' : errs > 20 ? 'var(--crit)' : errs > 0 ? 'var(--warn)' : 'var(--tx-3)' }}

@@ -72,9 +72,6 @@ test "e2e/dashboard: a processing job's detail counts the records it processed" 
 }
 
 test "e2e/dashboard: processing job surfaces real runtime metrics" {
-    // No op answers a job's runtime metrics yet (null, shown as "—"); a
-    // wider processing status brings them back.
-    if (true) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });

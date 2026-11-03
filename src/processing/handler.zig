@@ -178,8 +178,12 @@ pub const ProcessingHandler = struct {
         // ── Live runtime metrics (ephemeral; reset on submit/restart) ──
         // Surfaced per-job on the dashboard Metrics tab (issue #27). All cheap
         // counters updated on the hot tick path; no persistence.
+        /// Records read from the source since this pipeline started here.
+        records_in: u64 = 0,
         /// Records emitted from the operator chain into the sink stage.
         records_out: u64 = 0,
+        /// When this node started the pipeline, in Unix milliseconds.
+        started_ms: i64 = 0,
         /// Records read on the last productive tick (vs batch_size → saturation).
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
@@ -717,11 +721,14 @@ pub const ProcessingHandler = struct {
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [batch_size:u32][records_processed:u64][created_at:i64]
             // [reason_len:u16][reason] — a failed job's reason, "held here:
-            // <why>" for a running one this node holds, or empty.
+            // <why>" for a running one this node holds, or empty —
+            // then this node's runtime of the job, `Runtime`, and
+            // [yaml_len:u32][yaml], the submitted definition.
             // Sized to the job. The id is 32 bytes and the name came from a
             // submit entry under 64 KiB, so both lengths fit u16.
             const note = noteOf(job);
-            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8 + 2 + note.reasonLen();
+            const runtime = self.runtimeOf(job.job_id_owned, @import("stdx").time.milliTimestamp());
+            const size = 2 + job.job_id_owned.len + 2 + job.name_owned.len + 1 + 4 + 8 + 8 + 2 + note.reasonLen() + Runtime.SIZE + 4 + job.yaml_owned.len;
             const buf = self.allocator.alloc(u8, size) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "out of memory");
                 return;
@@ -739,10 +746,69 @@ pub const ProcessingHandler = struct {
             w.writeInt(i64, job.created_at_ms, .little) catch unreachable;
             w.writeInt(u16, @intCast(note.reasonLen()), .little) catch unreachable;
             note.writeReason(w);
+            runtime.write(w) catch unreachable;
+            w.writeInt(u32, @intCast(job.yaml_owned.len), .little) catch unreachable;
+            w.writeAll(job.yaml_owned) catch unreachable;
             shard.sendOkResponse(conn, req.header.request_id, fbs.buffered());
         } else {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
         }
+    }
+
+    /// A job's pipelines on this node, summed: what they read and wrote
+    /// since this node started them, and how long their ticks took. None
+    /// of it is replicated, so it starts again with the node or a new
+    /// leader.
+    pub const Runtime = struct {
+        running: bool = false,
+        records_in: u64 = 0,
+        records_out: u64 = 0,
+        watermark_ms: i64 = 0,
+        tick_avg_us: u64 = 0,
+        tick_max_us: u64 = 0,
+        /// Since the earliest of them started.
+        uptime_ms: u64 = 0,
+
+        /// `[running:u8][records_in:u64][records_out:u64][watermark_ms:i64]`
+        /// `[tick_avg_us:u64][tick_max_us:u64][uptime_ms:u64]`
+        pub const SIZE = 1 + 8 * 6;
+
+        fn write(self: Runtime, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.writeByte(@intFromBool(self.running));
+            try w.writeInt(u64, self.records_in, .little);
+            try w.writeInt(u64, self.records_out, .little);
+            try w.writeInt(i64, self.watermark_ms, .little);
+            try w.writeInt(u64, self.tick_avg_us, .little);
+            try w.writeInt(u64, self.tick_max_us, .little);
+            try w.writeInt(u64, self.uptime_ms, .little);
+        }
+    };
+
+    /// Job `job_id`'s pipelines on this node: the job's id, or `id\0n`
+    /// for each of a multi-source job's sources.
+    fn runtimeOf(self: *const ProcessingHandler, job_id: []const u8, now_ms: i64) Runtime {
+        var r: Runtime = .{};
+        var started: i64 = std.math.maxInt(i64);
+        var tick_sum: u64 = 0;
+        var ticks: u64 = 0;
+        var it = self.pipelines.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            const base = if (std.mem.indexOfScalar(u8, key, 0)) |nul| key[0..nul] else key;
+            if (!std.mem.eql(u8, base, job_id)) continue;
+            const p = e.value_ptr;
+            r.running = true;
+            r.records_in += p.records_in;
+            r.records_out += p.records_out;
+            r.watermark_ms = @max(r.watermark_ms, p.watermark_ms);
+            r.tick_max_us = @max(r.tick_max_us, p.tick_ns_max / std.time.ns_per_us);
+            tick_sum += p.tick_ns_sum;
+            ticks += p.tick_count;
+            started = @min(started, p.started_ms);
+        }
+        if (ticks > 0) r.tick_avg_us = tick_sum / ticks / std.time.ns_per_us;
+        if (r.running) r.uptime_ms = @intCast(@max(0, now_ms - started));
+        return r;
     }
 
     // ── List ─────────────────────────────────────────────────────────────
@@ -794,10 +860,11 @@ pub const ProcessingHandler = struct {
     }
 
     pub fn entrySize(j: *const JobRecord) usize {
-        return 2 + j.name_owned.len + 2 + j.job_id_owned.len + 2 + statusLen(j) + 8;
+        return 2 + j.name_owned.len + 2 + j.job_id_owned.len + 2 + statusLen(j) + 8 + 4 + 8;
     }
 
-    /// One job as the list answer lists it.
+    /// One job as the list answer lists it: `[name_len:u16][name][job_id_len:u16][job_id]`
+    /// `[status_len:u16][status][created_at_ms:i64][batch_size:u32][records_processed:u64]`.
     pub fn writeEntry(j: *const JobRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeInt(u16, @intCast(j.name_owned.len), .little);
         try w.writeAll(j.name_owned);
@@ -806,6 +873,8 @@ pub const ProcessingHandler = struct {
         try w.writeInt(u16, @intCast(statusLen(j)), .little);
         writeStatus(j, w);
         try w.writeInt(i64, j.created_at_ms, .little);
+        try w.writeInt(u32, j.batch_size, .little);
+        try w.writeInt(u64, j.records_processed, .little);
     }
 
     /// The job `job_id` in `namespace` (empty is "default"), if this shard
@@ -1403,6 +1472,7 @@ pub const ProcessingHandler = struct {
     /// an empty target or separator is a different job.
     fn makePipeState(allocator: Allocator, src: *const definition.SourceSpec, sinks: []const definition.SinkSpec, tag_hash: u64) !PipelineState {
         var pipe: PipelineState = .{
+            .started_ms = @import("stdx").time.milliTimestamp(),
             .source_kind = src.kind,
             .src_measurement = "",
             .src_field = "",
@@ -1543,6 +1613,7 @@ pub const ProcessingHandler = struct {
             if (ts_ms > pipe.watermark_ms) pipe.watermark_ms = ts_ms;
 
             job.records_processed += 1;
+            pipe.records_in += 1;
         }
         // As a stream source does: a restart resumes here, not from the
         // measurement's first point.
@@ -1591,6 +1662,7 @@ pub const ProcessingHandler = struct {
             }
 
             job.records_processed += 1;
+            pipe.records_in += 1;
         }
 
         // Advance cursor to last StreamID read

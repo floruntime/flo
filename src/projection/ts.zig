@@ -894,6 +894,87 @@ pub const TSProjection = struct {
         return result_count;
     }
 
+    /// The most field names a summary lists; past it, `fields` stops
+    /// counting and `fields_capped` is set.
+    pub const MAX_SUMMARY_FIELDS = 256;
+
+    pub const Summary = struct {
+        /// Each field of each tag set is one series.
+        series: u32 = 0,
+        fields: u32 = 0,
+        fields_capped: bool = false,
+        points: u64 = 0,
+        /// maxInt and 0 when there are no points.
+        oldest_ns: u64 = std.math.maxInt(u64),
+        newest_ns: u64 = 0,
+    };
+
+    /// A listed measurement's series, distinct fields and points.
+    pub const ListCounts = struct { series: u32 = 0, fields: u32 = 0, points: u64 = 0 };
+
+    /// `names`' counts into `out`, one per name, in one pass over the
+    /// shard's series keys and block headers, so a list page costs one pass
+    /// however many names it holds.
+    pub fn listCounts(self: *const TSProjection, namespace_hash: u32, names: []const []const u8, allocator: Allocator, out: []ListCounts) error{OutOfMemory}!void {
+        std.debug.assert(out.len == names.len);
+        @memset(out, .{});
+        var index = std.StringHashMap(u32).init(allocator);
+        defer index.deinit();
+        try index.ensureTotalCapacity(@intCast(names.len));
+        for (names, 0..) |n, i| index.putAssumeCapacity(n, @intCast(i));
+        // A series key up to its field names one measurement's field.
+        var fields_seen = std.StringHashMap(void).init(allocator);
+        defer fields_seen.deinit();
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (keyNsHash(key) != namespace_hash) continue;
+            const meas = keyMeasurement(key);
+            const i = index.get(meas) orelse continue;
+            const c = &out[i];
+            c.series += 1;
+            const field_end = NS_PREFIX + meas.len + 1 + keyFieldName(key).len;
+            if (!(try fields_seen.getOrPut(key[0..@min(field_end, key.len)])).found_existing) c.fields += 1;
+            c.points += kv.value_ptr.len();
+            if (self.blocks.get(key)) |blocks| for (blocks.items) |b| {
+                c.points += b.point_count;
+            };
+        }
+    }
+
+    /// One measurement's series, fields and points, from its series keys,
+    /// block headers and buffered points: no block's points are read. Field
+    /// names go into `field_buf`, at most `MAX_SUMMARY_FIELDS` of them, and
+    /// are borrowed from the keys, valid until the projection changes.
+    /// A pass over the shard's series keys, as listing them is.
+    pub fn summarize(self: *const TSProjection, namespace_hash: u32, measurement: []const u8, field_buf: *[MAX_SUMMARY_FIELDS][]const u8) Summary {
+        var total: Summary = .{};
+        var it = self.buffers.iterator();
+        while (it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (keyNsHash(key) != namespace_hash or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
+            total.series += 1;
+            const field = keyFieldName(key);
+            for (field_buf[0..total.fields]) |seen| {
+                if (std.mem.eql(u8, seen, field)) break;
+            } else if (total.fields < MAX_SUMMARY_FIELDS) {
+                field_buf[total.fields] = field;
+                total.fields += 1;
+            } else total.fields_capped = true;
+            for (kv.value_ptr.points.items) |p| {
+                total.oldest_ns = @min(total.oldest_ns, p.timestamp_ns);
+                total.newest_ns = @max(total.newest_ns, p.timestamp_ns);
+            }
+            total.points += kv.value_ptr.len();
+            if (self.blocks.get(key)) |blocks| for (blocks.items) |b| {
+                total.points += b.point_count;
+                total.oldest_ns = @min(total.oldest_ns, b.min_timestamp_ns);
+                total.newest_ns = @max(total.newest_ns, b.max_timestamp_ns);
+            };
+        }
+        return total;
+    }
+
     /// Return unique measurement names from the write buffers.
     /// Caller owns the returned slices and must free them.
     pub fn listMeasurements(self: *const TSProjection, namespace_hash: u32, allocator: Allocator) ![][]const u8 {
@@ -1662,4 +1743,48 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
         const untagged = try ts.queryRange(1, "temp", "value", 0, 0, 10000, &buf);
         try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
     }
+}
+
+test "ts: a list page's counts come from one pass, each name's its own" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
+    defer ts.deinit();
+    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(0, "cpu", "usage", 1, t, t, "host=a");
+    try ts.insert(0, "cpu", "usage", 1, 500, 4, "host=b");
+    try ts.insert(0, "cpu", "idle", 1, 4000, 5, "host=a");
+    try ts.insert(0, "mem", "used", 1, 9000, 6, "");
+    try ts.insert(7, "cpu", "usage", 1, 9000, 7, "");
+
+    const names = [_][]const u8{ "mem", "cpu", "disk" };
+    var out: [names.len]TSProjection.ListCounts = undefined;
+    try ts.listCounts(0, &names, testing.allocator, &out);
+    try testing.expectEqual(TSProjection.ListCounts{ .series = 1, .fields = 1, .points = 1 }, out[0]);
+    // Its series agree with the summary's, flushed block and all.
+    var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+    const sum = ts.summarize(0, "cpu", &fields);
+    try testing.expectEqual(TSProjection.ListCounts{ .series = sum.series, .fields = sum.fields, .points = sum.points }, out[1]);
+    try testing.expectEqual(TSProjection.ListCounts{}, out[2]);
+}
+
+test "ts: a measurement's summary counts its series, fields and points, flushed or buffered" {
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
+    defer ts.deinit();
+    // Three points of one series: a block of two, one buffered.
+    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(0, "cpu", "usage", 1, t, t, "host=a");
+    try ts.insert(0, "cpu", "usage", 1, 500, 4, "host=b");
+    try ts.insert(0, "cpu", "idle", 1, 4000, 5, "host=a");
+    // Another measurement, and the same one in another namespace.
+    try ts.insert(0, "mem", "used", 1, 9000, 6, "");
+    try ts.insert(7, "cpu", "usage", 1, 9000, 7, "");
+
+    var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+    const s = ts.summarize(0, "cpu", &fields);
+    try testing.expectEqual(@as(u32, 3), s.series);
+    try testing.expectEqual(@as(u32, 2), s.fields);
+    try testing.expect(!s.fields_capped);
+    try testing.expectEqual(@as(u64, 5), s.points);
+    try testing.expectEqual(@as(u64, 500), s.oldest_ns);
+    try testing.expectEqual(@as(u64, 4000), s.newest_ns);
+    const none = ts.summarize(0, "disk", &fields);
+    try testing.expectEqual(@as(u64, 0), none.points);
+    try testing.expectEqual(@as(u32, 0), none.series);
 }

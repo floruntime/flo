@@ -29,12 +29,14 @@ fn loopbackConnect(allocator: Allocator, ctx: *DashboardContext) !client_mod.Cli
 }
 
 /// `processing_list`'s entry: `[name_len:u16][name][job_id_len:u16][job_id]
-/// [status_len:u16][status][created_at:i64]`.
+/// [status_len:u16][status][created_at:i64][batch_size:u32][records_processed:u64]`.
 const job_columns = [_]output.WireColumn{
     .{ .field = "name", .header = "NAME", .field_type = .str_u16 },
     .{ .field = "job_id", .header = "JOB ID", .field_type = .str_u16 },
     .{ .field = "status", .header = "STATUS", .field_type = .str_u16 },
     .{ .field = "created_at_ms", .header = "", .field_type = .int_i64 },
+    .{ .field = "batch_size", .header = "", .field_type = .uint_u32 },
+    .{ .field = "records_processed", .header = "", .field_type = .uint_u64 },
 };
 
 const JobLister = struct {
@@ -95,7 +97,9 @@ pub fn handleProcessingRequest(allocator: Allocator, method: Method, path: []con
 
 /// `processing_status`'s answer: [job_id_len:u16][job_id][name_len:u16][name]
 /// [status:u8][batch_size:u32][records_processed:u64][created_at:i64]
-/// [reason_len:u16][reason].
+/// [reason_len:u16][reason], this node's runtime of it ([running:u8]
+/// [records_in:u64][records_out:u64][watermark_ms:i64][tick_avg_us:u64]
+/// [tick_max_us:u64][uptime_ms:u64]) and [yaml_len:u32][yaml].
 const JobStatus = struct {
     id: []const u8,
     name: []const u8,
@@ -104,6 +108,14 @@ const JobStatus = struct {
     records: u64,
     created_at: i64,
     reason: []const u8,
+    running: bool,
+    records_in: u64,
+    records_out: u64,
+    watermark_ms: i64,
+    tick_avg_us: u64,
+    tick_max_us: u64,
+    uptime_ms: u64,
+    yaml: []const u8,
 
     fn decode(data: []const u8) ?JobStatus {
         var r = WireReader.init(data);
@@ -115,13 +127,47 @@ const JobStatus = struct {
             .records = r.readU64() orelse return null,
             .created_at = r.readI64() orelse return null,
             .reason = r.readLengthPrefixed(u16) orelse return null,
+            .running = (r.readU8() orelse return null) != 0,
+            .records_in = r.readU64() orelse return null,
+            .records_out = r.readU64() orelse return null,
+            .watermark_ms = r.readI64() orelse return null,
+            .tick_avg_us = r.readU64() orelse return null,
+            .tick_max_us = r.readU64() orelse return null,
+            .uptime_ms = r.readU64() orelse return null,
+            .yaml = r.readLengthPrefixed(u32) orelse return null,
         };
         return if (r.remainingLen() == 0) st else null;
     }
+
+    /// Records per second over `count`, since this node started the job.
+    fn perSec(self: JobStatus, count: u64) u64 {
+        if (self.uptime_ms == 0) return 0;
+        return count * std.time.ms_per_s / self.uptime_ms;
+    }
+
+    /// Since-start figures on this node: a restart or a new leader starts
+    /// them again, as none is replicated.
+    fn writeMetrics(self: JobStatus, obj: anytype) !void {
+        var m = try obj.objectField("metrics");
+        try m.begin();
+        try m.boolField("running", self.running);
+        try m.intField("records_in", self.records_in);
+        try m.intField("records_out", self.records_out);
+        try m.intField("throughput_per_sec", self.perSec(self.records_in));
+        try m.intField("output_per_sec", self.perSec(self.records_out));
+        try m.intField("latency_avg_ms", self.tick_avg_us / std.time.us_per_ms);
+        try m.intField("latency_max_ms", self.tick_max_us / std.time.us_per_ms);
+        try m.intField("tick_avg_us", self.tick_avg_us);
+        try m.intField("tick_max_us", self.tick_max_us);
+        if (self.watermark_ms > 0) try m.intField("watermark_ms", self.watermark_ms) else try m.nullField("watermark_ms");
+        try m.intField("uptime_ms", self.uptime_ms);
+        try m.end();
+    }
 };
 
-/// GET /processing/jobs — The namespace's jobs (`processing_list`). The
-/// list answers no counts or live metrics, so those are null.
+/// GET /processing/jobs — The namespace's jobs (`processing_list`), with
+/// their batch sizes and records read. Live metrics are each job's status,
+/// a read per job, so only a job's detail answers them; here they are null.
 fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -145,6 +191,8 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
         const job_id = r.readLengthPrefixed(u16) orelse break;
         const status = r.readLengthPrefixed(u16) orelse break;
         const created_at = r.readI64() orelse break;
+        const batch_size = r.readU32() orelse break;
+        const records = r.readU64() orelse break;
         try arr.next();
         var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
         try obj.begin();
@@ -152,9 +200,9 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
         try obj.stringField("name", name);
         try obj.stringField("namespace", ns);
         try obj.stringField("status", statusWord(status));
-        try obj.nullField("batch_size");
+        try obj.intField("batch_size", @as(i64, batch_size));
         try obj.intField("created_at", created_at);
-        try obj.nullField("records_processed");
+        try obj.intField("records_processed", records);
         try obj.nullField("metrics");
         try obj.end();
     }
@@ -163,8 +211,7 @@ fn listJobs(allocator: Allocator, query_string: ?[]const u8, ctx: *DashboardCont
 }
 
 /// GET /processing/jobs/:id?namespace= — One job (`processing_status`, on
-/// the job's shard). Its definition and live metrics are null: no op
-/// answers them yet.
+/// the job's shard): its definition, and its live metrics on this node.
 fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -194,8 +241,8 @@ fn getJobDetail(allocator: Allocator, job_id: []const u8, query_string: ?[]const
     try obj.intField("batch_size", @as(i64, st.batch_size));
     try obj.intField("created_at", st.created_at);
     try obj.intField("records_processed", @as(i64, @intCast(st.records)));
-    try obj.nullField("metrics");
-    try obj.nullField("yaml");
+    try st.writeMetrics(&obj);
+    try obj.stringField("yaml", st.yaml);
     try obj.end();
     return try json_aw.toOwnedSlice();
 }
@@ -323,13 +370,24 @@ test "processing: a listed status reads as its first word, and a status answer d
     try std.testing.expectEqualStrings("RUNNING", statusWord("RUNNING (held here: x)"));
     try std.testing.expectEqualStrings("STOPPED", statusWord("STOPPED"));
 
-    const answer = [_]u8{ 1, 0, 'j', 1, 0, 'n', 3, 10, 0, 0, 0 } ++ [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 2, 0, 'n', 'o' };
+    const u64le = struct {
+        fn of(comptime v: u64) [8]u8 {
+            return std.mem.toBytes(std.mem.nativeToLittle(u64, v));
+        }
+    }.of;
+    // Running on this node for 2 s: 40 in, 10 out, ticks of 1500 us on average.
+    const runtime = [_]u8{1} ++ u64le(40) ++ u64le(10) ++ u64le(5) ++ u64le(1500) ++ u64le(3000) ++ u64le(2000);
+    const answer = [_]u8{ 1, 0, 'j', 1, 0, 'n', 3, 10, 0, 0, 0 } ++ u64le(7) ++ u64le(9) ++ [_]u8{ 2, 0, 'n', 'o' } ++ runtime ++ [_]u8{ 2, 0, 0, 0, 'a', ':' };
     const st = JobStatus.decode(&answer).?;
     try std.testing.expectEqualStrings("j", st.id);
     try std.testing.expectEqualStrings("FAILED", statusName(st.status));
     try std.testing.expectEqual(@as(u32, 10), st.batch_size);
     try std.testing.expectEqual(@as(u64, 7), st.records);
     try std.testing.expectEqualStrings("no", st.reason);
+    try std.testing.expect(st.running);
+    try std.testing.expectEqual(@as(u64, 20), st.perSec(st.records_in));
+    try std.testing.expectEqual(@as(u64, 5), st.perSec(st.records_out));
+    try std.testing.expectEqualStrings("a:", st.yaml);
     try std.testing.expect(JobStatus.decode(answer[0 .. answer.len - 1]) == null);
 }
 

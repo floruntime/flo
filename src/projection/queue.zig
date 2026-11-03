@@ -152,6 +152,11 @@ pub const QueueProjection = struct {
     /// Known queue metadata: queue_name_hash → QueueMeta.
     known_queues: std.AutoHashMap(u64, QueueMeta),
 
+    /// Each queue's live messages by state, kept as messages move, so a
+    /// list answers them without a pass over the partition's messages. An
+    /// entry exists only while its queue has a ready or leased message.
+    live: std.AutoHashMap(u64, Live),
+
     /// Next sequence number.
     next_seq: u64,
     /// Last applied UAL index.
@@ -184,6 +189,8 @@ pub const QueueProjection = struct {
             self.dlq.deinit(allocator);
         }
     };
+
+    pub const Live = struct { ready: u64 = 0, leased: u64 = 0 };
 
     pub const QueueMeta = struct {
         name: []const u8,
@@ -222,6 +229,7 @@ pub const QueueProjection = struct {
             .lease_heap = .empty,
             .dlq_limit = config.dlq_limit,
             .known_queues = std.AutoHashMap(u64, QueueMeta).init(allocator),
+            .live = std.AutoHashMap(u64, Live).init(allocator),
             .next_seq = 1,
             .applied_index = 0,
             .max_attempts = config.max_attempts,
@@ -249,6 +257,31 @@ pub const QueueProjection = struct {
             self.allocator.free(kv.value_ptr.namespace);
         }
         self.known_queues.deinit();
+        self.live.deinit();
+    }
+
+    /// A message of `queue` leaves state `from` (null: it is new) for `to`
+    /// (null: it is gone). Ready and leased are counted; dead letters are
+    /// the lane's. A move into ready or leased finds the entry already
+    /// there: only `enqueue`, which makes it first, adds a message.
+    fn shift(self: *QueueProjection, queue: u64, from: ?MessageState, to: ?MessageState) void {
+        const c = self.live.getPtr(queue) orelse return;
+        if (from) |f| switch (f) {
+            .ready => c.ready -= 1,
+            .leased => c.leased -= 1,
+            .dlq => {},
+        };
+        if (to) |t| switch (t) {
+            .ready => c.ready += 1,
+            .leased => c.leased += 1,
+            .dlq => {},
+        };
+        if (c.ready == 0 and c.leased == 0) _ = self.live.remove(queue);
+    }
+
+    /// One queue's ready and leased messages.
+    pub fn liveCounts(self: *const QueueProjection, queue_name_hash: u64) Live {
+        return self.live.get(queue_name_hash) orelse .{};
     }
 
     fn clearLanes(self: *QueueProjection) void {
@@ -309,6 +342,7 @@ pub const QueueProjection = struct {
         for (seqs.items) |seq| {
             if (self.messages.fetchRemove(seq)) |removed| {
                 if (removed.value.payload.len > 0) self.allocator.free(removed.value.payload);
+                self.shift(removed.value.queue_name_hash, removed.value.state, null);
             }
         }
         if (self.lanes.getPtr(queue_name_hash)) |l| {
@@ -345,9 +379,15 @@ pub const QueueProjection = struct {
             .payload = payload_copy,
         };
 
+        const counted = try self.live.getOrPut(queue_name_hash);
+        if (!counted.found_existing) counted.value_ptr.* = .{};
+        errdefer if (counted.value_ptr.ready == 0 and counted.value_ptr.leased == 0) {
+            _ = self.live.remove(queue_name_hash);
+        };
         try self.messages.put(seq, msg);
         errdefer _ = self.messages.remove(seq);
         try self.pushReady(&msg);
+        counted.value_ptr.ready += 1;
 
         // Update known-queue stats
         if (self.known_queues.getPtr(queue_name_hash)) |meta| {
@@ -406,6 +446,7 @@ pub const QueueProjection = struct {
                 l.ready.push(self.allocator, item) catch {};
                 return err;
             };
+            self.shift(msg.queue_name_hash, .ready, .leased);
             msg.state = .leased;
             msg.attempts += 1;
             msg.lease_expiry_ns = now_ns + self.default_lease_ns;
@@ -446,6 +487,7 @@ pub const QueueProjection = struct {
             if (kv.value.payload.len > 0) {
                 self.allocator.free(kv.value.payload);
             }
+            self.shift(kv.value.queue_name_hash, kv.value.state, null);
             self.stats.acked += 1;
             if (self.known_queues.getPtr(kv.value.queue_name_hash)) |meta| meta.acked += 1;
         }
@@ -463,9 +505,10 @@ pub const QueueProjection = struct {
                 try self.moveToDLQ(msg, now_ns);
             } else {
                 // Re-enqueue
+                try self.pushReady(msg);
+                self.shift(msg.queue_name_hash, .leased, .ready);
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
-                try self.pushReady(msg);
             }
             self.stats.nacked += 1;
             if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.nacked += 1;
@@ -535,6 +578,7 @@ pub const QueueProjection = struct {
                 if (msg.lease_expiry_ns != top.expiry_ns) continue; // stale
 
                 // Return to ready
+                self.shift(msg.queue_name_hash, .leased, .ready);
                 msg.state = .ready;
                 msg.lease_expiry_ns = 0;
                 self.pushReady(msg) catch {};
@@ -558,6 +602,7 @@ pub const QueueProjection = struct {
             .queue_name_hash = msg.queue_name_hash,
         });
 
+        self.shift(msg.queue_name_hash, msg.state, .dlq);
         msg.state = .dlq;
         self.stats.dlq_count += 1;
         if (self.known_queues.getPtr(msg.queue_name_hash)) |meta| meta.dead_lettered += 1;
@@ -988,4 +1033,33 @@ test "queue: a nack applied twice queues the message once and counts one attempt
     const d = (try q.dequeue(4000, 42)).?;
     try testing.expectEqual(@as(u32, 2), d.attempts);
     try testing.expect(try q.dequeue(4001, 42) == null);
+}
+
+test "queue: each queue's ready and leased counts match its messages through every move" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000, .max_attempts = 2, .dlq_limit = 2 });
+    defer q.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var now: u64 = 1;
+    var held: std.ArrayList(u64) = .empty;
+    defer held.deinit(testing.allocator);
+    for (0..2000) |_| {
+        now += r.uintLessThan(u64, 400);
+        const queue: u64 = r.uintLessThan(u64, 3);
+        switch (r.uintLessThan(u8, 6)) {
+            0, 1 => _ = try q.enqueue(now, 0, now, queue, "m"),
+            2 => if (try q.dequeue(now, queue)) |d| try held.append(testing.allocator, d.seq),
+            3 => if (held.items.len > 0) try q.ack(held.swapRemove(r.uintLessThan(usize, held.items.len))),
+            4 => if (held.items.len > 0) try q.nack(held.swapRemove(r.uintLessThan(usize, held.items.len)), now),
+            else => if (r.uintLessThan(u8, 20) == 0) {
+                _ = try q.purgeQueue(queue);
+            } else q.expireLeases(now),
+        }
+        for (0..3) |n| {
+            const want = q.queueCounts(n);
+            const got = q.liveCounts(n);
+            try testing.expectEqual(@as(u64, want.ready), got.ready);
+            try testing.expectEqual(@as(u64, want.leased), got.leased);
+        }
+    }
 }

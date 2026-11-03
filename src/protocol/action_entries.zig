@@ -29,7 +29,7 @@ pub const RunId = Bytes(MAX_RUN_ID);
 pub const Holder = Bytes(action_ops.MAX_WORKER_ID);
 pub const MAX_INPUT: u32 = 64 * 1024;
 pub const MAX_LABELS: u32 = 4096;
-pub const MAX_OWNER: u32 = 256;
+pub const MAX_OWNER: u32 = action_ops.MAX_OWNER;
 /// A lease's floor, above three election timeouts, so a new leader's
 /// grace never outlasts it; and its ceiling, which also bounds how long
 /// one delivery may be held, however often it's touched.

@@ -19,9 +19,6 @@ fn extractRunId(output: []const u8) ?[]const u8 {
 }
 
 test "e2e/dashboard: action owner + timeout_ms are persisted and surfaced" {
-    // No op answers an action's owner and timeout yet (null, shown as "—"); an action info op
-    // brings it back.
-    if (true) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
@@ -39,20 +36,19 @@ test "e2e/dashboard: action owner + timeout_ms are persisted and surfaced" {
     try testing.expect(std.mem.indexOf(u8, list.body, "\"owner\":\"myteam\"") != null);
     try testing.expect(std.mem.indexOf(u8, list.body, "\"timeout_ms\":60000") != null);
 
-    // Detail endpoint too, plus max_retries and the latency object.
+    // Detail endpoint too, plus its attempts (`--retries` sets them) and the latency.
     var detail = try http.get("/api/v1/actions/owned-action");
     defer detail.deinit();
+    if (detail.status != 200 or std.mem.indexOf(u8, detail.body, "\"owner\":\"myteam\"") == null)
+        std.debug.print("action detail: {d} {s}\n", .{ detail.status, detail.body });
     try testing.expectEqual(@as(u16, 200), detail.status);
     try testing.expect(std.mem.indexOf(u8, detail.body, "\"owner\":\"myteam\"") != null);
     try testing.expect(std.mem.indexOf(u8, detail.body, "\"timeout_ms\":60000") != null);
-    try testing.expect(std.mem.indexOf(u8, detail.body, "\"max_retries\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, detail.body, "\"max_attempts\":5") != null);
     try testing.expect(std.mem.indexOf(u8, detail.body, "\"latency\"") != null);
 }
 
 test "e2e/dashboard: action latency reflects a completed run" {
-    // No op answers an action's run counts and latency yet (null, shown as "—"); an action info op
-    // brings it back.
-    if (true) return error.SkipZigTest;
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
@@ -85,7 +81,10 @@ test "e2e/dashboard: action latency reflects a completed run" {
     defer detail.deinit();
     try testing.expectEqual(@as(u16, 200), detail.status);
 
-    // One completed run → latency has a single real sample (was always absent).
-    try testing.expect(std.mem.indexOf(u8, detail.body, "\"latency\"") != null);
-    try testing.expect(std.mem.indexOf(u8, detail.body, "\"count\":1") != null);
+    // One completed run → latency has a single real sample, and the run
+    // counts say so: completed, with the worker's outcome on the run.
+    try testing.expect(std.mem.indexOf(u8, detail.body, "\"latency\":{\"count\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, detail.body, "\"completed\":1,") != null);
+    try testing.expect(std.mem.indexOf(u8, detail.body, "\"pending\":0,") != null);
+    try testing.expect(std.mem.indexOf(u8, detail.body, "\"outcome\":\"success\"") != null);
 }

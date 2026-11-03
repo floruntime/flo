@@ -45,6 +45,10 @@ const Request = proto.Request;
 const OpCode = proto.OpCode;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const table_run = @import("../node/table_run.zig");
+const schema = @import("../protocol/schema.zig");
+const ts_ops = @import("../protocol/ts_ops.zig");
+const InfoResponse = table_run.op("ts.info").response;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TSHandler
@@ -64,6 +68,8 @@ pub const TSHandler = struct {
     /// request overwrites it, so a refusal from it is sent at once, never
     /// parked.
     why_buf: [512]u8 = undefined,
+    /// An info answer's field names, encoded; written before it is sent.
+    info_buf: [ts_ops.MAX_INFO_FIELD_BYTES]u8 = undefined,
 
     pub fn init(allocator: Allocator, ts: *TSProjection) TSHandler {
         return .{
@@ -82,8 +88,45 @@ pub const TSHandler = struct {
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByQueryMeasurement);
         dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
+        dispatcher.setWalkEntries(.ts_list, writeListEntries);
         dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
+        dispatcher.registerWithRoute(.ts_info, table_run.handler("ts.info", TSHandler, runInfo), preRouteByMeasurement);
+    }
+
+    // ── Info ────────────────────────────────────────────────────────────
+
+    pub const Error = error{};
+
+    pub fn refusal(err: Error) table_run.Refused {
+        switch (err) {}
+    }
+
+    /// A measurement's summary from its series keys and block headers. One
+    /// with no series here is not found.
+    fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
+        const self = shard.ts_handler;
+        var names: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
+        const sum = self.ts.summarize(router.namespaceHash(req.namespace), req.key, &names);
+        if (sum.series == 0) return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such measurement" } } };
+        // Listed while they fit; the rest are counted, not named.
+        var w: schema.Writer = .{ .buf = &self.info_buf };
+        var listed: u32 = 0;
+        for (names[0..sum.fields]) |n| {
+            if (w.pos + 2 + n.len > ts_ops.MAX_INFO_FIELD_BYTES) break;
+            ts_ops.FieldName.encode(&w, n) catch break;
+            listed += 1;
+        }
+        const has_points = sum.points > 0;
+        return .{ .answer = .{
+            .series = sum.series,
+            .field_count = sum.fields,
+            .fields_capped = sum.fields_capped or listed < sum.fields,
+            .fields = .{ .bytes = self.info_buf[0..w.pos], .count = listed },
+            .points = sum.points,
+            .oldest_ms = if (has_points) @intCast(sum.oldest_ns / std.time.ns_per_ms) else null,
+            .newest_ms = if (has_points) @intCast(sum.newest_ns / std.time.ns_per_ms) else null,
+        } };
     }
 
     // ── Pre-Route ───────────────────────────────────────────────────────
@@ -120,6 +163,30 @@ pub const TSHandler = struct {
         const name_buf = dispatcher_mod.scanScratch(ts.buffers.count());
         const count = ts.scanMeasurementNames(router.namespaceHash(namespace), name_buf);
         return .{ .items = name_buf[0..count], .next_cursor = null };
+    }
+
+    /// A page of measurements as the list answers them, each
+    /// `[name_len:u16][name][series:u32][fields:u32][fields_capped:u8][points:u64]`.
+    /// The counts are exact, so fields_capped is 0; ts.info's isn't.
+    fn writeListEntries(ctx: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void {
+        const ts: *const TSProjection = @ptrCast(@alignCast(ctx));
+        const counts = try allocator.alloc(TSProjection.ListCounts, names.len);
+        defer allocator.free(counts);
+        try ts.listCounts(router.namespaceHash(namespace), names, allocator, counts);
+        try ends.ensureTotalCapacity(allocator, names.len);
+        for (names, counts) |name, c| {
+            var head: [2]u8 = undefined;
+            std.mem.writeInt(u16, &head, @intCast(name.len), .little);
+            try out.appendSlice(allocator, &head);
+            try out.appendSlice(allocator, name);
+            var tail: [4 + 4 + 1 + 8]u8 = undefined;
+            std.mem.writeInt(u32, tail[0..4], c.series, .little);
+            std.mem.writeInt(u32, tail[4..8], c.fields, .little);
+            tail[8] = 0;
+            std.mem.writeInt(u64, tail[9..17], c.points, .little);
+            try out.appendSlice(allocator, &tail);
+            ends.appendAssumeCapacity(@intCast(out.items.len));
+        }
     }
 
     fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -864,8 +931,9 @@ test "ts handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.ts_list));
     try testing.expect(dispatcher.hasHandler(OpCode.ts_delete));
     try testing.expect(dispatcher.hasHandler(OpCode.ts_retention));
+    try testing.expect(dispatcher.hasHandler(OpCode.ts_info));
 
-    try testing.expectEqual(@as(u16, 7), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 8), dispatcher.handler_count);
 }
 
 test "ts handler: write with string value" {

@@ -826,6 +826,8 @@ fn runList(ctx: *commander.Context) commander.Error!void {
             const name_len = reader.readU32() orelse return outcome.malformed(ctx, "stream list");
             const name = reader.readSlice(name_len) orelse return outcome.malformed(ctx, "stream list");
             _ = reader.readU32() orelse return outcome.malformed(ctx, "stream list"); // partition_count
+            _ = reader.readU64() orelse return outcome.malformed(ctx, "stream list"); // retention_age_s
+            _ = reader.readU64() orelse return outcome.malformed(ctx, "stream list"); // retention_count
 
             const row_end = reader.pos;
 
@@ -876,6 +878,9 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     output.printWireList(ctx, buf, "No streams found", &.{
         .{ .field = "name", .header = "NAME", .field_type = .str_u32 },
         .{ .field = "partitions", .header = "PARTITIONS", .field_type = .uint_u32, .alignment = .right },
+        // 0: kept forever, or however many.
+        .{ .field = "retention_age_s", .header = "MAX AGE (S)", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "retention_count", .header = "MAX RECORDS", .field_type = .uint_u64, .alignment = .right },
     }) catch return outcome.malformed(ctx, "list");
 }
 
