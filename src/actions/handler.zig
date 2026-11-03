@@ -100,10 +100,6 @@ fn homeOf(namespace: []const u8) []const u8 {
     return if (namespace.len == 0) "default" else namespace;
 }
 
-fn wallNs() u64 {
-    return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
-}
-
 fn nsToMs(ns: u64) i64 {
     return @intCast(ns / std.time.ns_per_ms);
 }
@@ -1072,7 +1068,9 @@ pub const ActionsHandler = struct {
         if (request_key) |rk| if (again(shard, ns, action, holder, rk)) |task| return .{ .again = task };
         if (again_only) return .none;
         const def = getDef(shard, ns, action) orelse return .none;
-        const now = wallNs();
+        // The clock the deliver's stamp will read, so a run chosen as due
+        // is due when it applies.
+        const now = shard.raft_node.now();
         var pb: [KEY_BUF]u8 = undefined;
         var rb: [machine.MAX_KEY_LEN]u8 = undefined;
         const prefix = storeKey(&pb, ns, machine.readyPrefix(&rb, action)) orelse return .none;
@@ -1333,7 +1331,7 @@ pub const ActionsHandler = struct {
         var it = readOf(shard).range(machine.Ready, prefix);
         const first = (it.next() catch return false) orelse return false;
         const tail = first.key[prefix.len..];
-        return tail.len >= 8 and std.mem.readInt(u64, tail[0..8], .big) <= wallNs();
+        return tail.len >= 8 and std.mem.readInt(u64, tail[0..8], .big) <= shard.raft_node.now();
     }
 
     /// What a waiting await has left of its wait, at `now_ms`.
@@ -1391,7 +1389,7 @@ pub const ActionsHandler = struct {
         var kb: [KEY_BUF]u8 = undefined;
         const run_key = storeKey(&kb, homeOf(req.namespace), req.key) orelse return error.NotFound;
         const half = (run.lease_ms *| std.time.ns_per_ms) / 2;
-        if (run.expiry_ns -| wallNs() > half or self.extending.contains(run_key)) return .{ .answer = .{ .expires_at_ms = nsToMs(run.expiry_ns) } };
+        if (run.expiry_ns -| shard.raft_node.now() > half or self.extending.contains(run_key)) return .{ .answer = .{ .expires_at_ms = nsToMs(run.expiry_ns) } };
         try self.extending.ensureUnusedCapacity(self.allocator, 1);
         const owned = try self.allocator.dupe(u8, run_key);
         const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
@@ -1478,7 +1476,7 @@ pub const ActionsHandler = struct {
             .action_expire => {
                 if (self.expiring) |i| if (i == e.header.index) {
                     self.expiring = null;
-                    if (self.expiring_full and shard.raft_node.leaderReady()) _ = self.expireNext(shard, wallNs());
+                    if (self.expiring_full and shard.raft_node.leaderReady()) _ = self.expireNext(shard, shard.raft_node.now());
                 };
                 if (leads) shard.wake_workers = true;
                 if (leads) self.tellWorkflowsOfExpire(shard, e);
@@ -1820,7 +1818,10 @@ pub const ActionsHandler = struct {
         self.resend(shard);
         self.pruneAt(@import("stdx").time.monotonicMs());
         if (!shard.raft_node.leaderReady()) return 0;
-        const now = wallNs();
+        // The clock the expire's stamp will read: a key past due by the
+        // node's own clock but not by the stamp would apply as a no-op,
+        // and a full one chain into another at once.
+        const now = shard.raft_node.now();
         if (self.duty_term != shard.raft_node.current_term) {
             self.duty_term = shard.raft_node.current_term;
             self.duty_since_ns = now;
