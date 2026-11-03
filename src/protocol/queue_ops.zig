@@ -36,7 +36,7 @@ pub const table = [_]ops.Op{
         .code = 0x180,
         .class = .read,
         // On the queue's shard, answered by its leader, which holds its leases.
-        .writes = true,
+        .at_leader = true,
         .route = .key,
         .request = Record(&.{
             .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_PEEK), 20), .doc = "Most messages to show" },

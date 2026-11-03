@@ -208,6 +208,14 @@ pub fn writes(req: proto.Request) bool {
     return false;
 }
 
+/// Whether a table op is a read its leader answers.
+pub fn atLeader(req: proto.Request) bool {
+    inline for (table.op_table) |o| {
+        if (o.code == req.header.op_code) return o.at_leader;
+    }
+    return false;
+}
+
 // ── Gates ──────────────────────────────────────────────────────────────
 
 /// The test that exercises each request field of each table op, by its
@@ -305,7 +313,7 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "namespace.list", .field = "limit", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
     .{ .op = "namespace.list", .field = "cursor", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
     .{ .op = "worker.list", .field = "action", .tests = &.{"worker.list: an action filter pages only that action's workers, each page full, to the last"} },
-    .{ .op = "stream.group.members", .field = "group", .tests = &.{"Shard: stream.group.members answers the named group's members, and a group that isn't there is not found"} },
+    .{ .op = "stream.group.members", .field = "group", .tests = &.{"Shard: stream.group.members answers the named group's members by id, and a group that isn't there is not found"} },
     .{ .op = "queue.peek", .field = "limit", .tests = &.{"Shard: queue.peek shows as many of the next ready messages as its limit asks, and takes none"} },
 };
 

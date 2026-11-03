@@ -56,7 +56,7 @@ pub const table = [_]ops.Op{
         .class = .read,
         // On the stream's shard, answered by its leader, which alone holds
         // members and pending entries.
-        .writes = true,
+        .at_leader = true,
         .route = .key,
         .request = Record(&.{}),
         .response = Record(&.{
@@ -71,7 +71,7 @@ pub const table = [_]ops.Op{
         .name = "stream.group.members",
         .code = 0x15E,
         .class = .read,
-        .writes = true,
+        .at_leader = true,
         .route = .key,
         .request = Record(&.{
             .{ .name = "group", .T = Name, .doc = "The group" },

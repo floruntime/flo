@@ -1511,10 +1511,10 @@ pub const Shard = struct {
             // A node forwards only writes to its leader.
             .peer => if (!self.dispatcher.serves(req.header.op_code))
                 answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code)
-            else if (requestWrites(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published))
+            else if (requestToLeader(req) or req.header.op_code == @backingInt(proto.OpCode.namespace_published))
                 self.dispatchLocal(conn, req, auth)
             else
-                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, and a follower's ask about the namespaces, are forwarded to a leader")),
+                self.sendRefusal(conn, req.header.request_id, .bad_request, proto.notRun("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader")),
         }
     }
 
@@ -1723,7 +1723,21 @@ pub const Shard = struct {
         };
     }
 
-    /// Whether `req` goes to the leader: a write, or a table op inside a
+    /// Whether `req` goes to the leader: a write, or a read only the leader
+    /// can answer.
+    fn requestToLeader(req: proto.Request) bool {
+        return requestWrites(req) or requestAtLeader(req);
+    }
+
+    /// A read whose state lives only in the leader's memory. On a halted
+    /// leader it is answered, marked stale, as other reads are: a halt
+    /// stops applying, and clears none of that memory.
+    fn requestAtLeader(req: proto.Request) bool {
+        if (table.isOp(req.header.op_code)) return table_run.atLeader(req);
+        return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opReadsAtLeader(@fromBackingInt(@intCast(req.header.op_code)));
+    }
+
+    /// Whether `req` is a write: a write, or a table op inside a
     /// transaction.
     fn requestWrites(req: proto.Request) bool {
         if (table.isOp(req.header.op_code)) return table_run.writes(req);
@@ -1837,6 +1851,7 @@ pub const Shard = struct {
         // as one, so nothing tells the two apart.
         const internal_from_client = run_mod.internalFromClient(req.header.op_code, auth.origin);
         const writes = !internal_from_client and requestWrites(req);
+        const at_leader = !internal_from_client and !writes and requestAtLeader(req);
         const status_op = req.header.op_code == @backingInt(proto.OpCode.cluster_status) or req.header.op_code == @backingInt(proto.OpCode.cluster_members);
         if (self.removed_at_ms != null and !status_op) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(self.removed_message));
@@ -1863,7 +1878,7 @@ pub const Shard = struct {
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
-        if (self.raft_network != null and writes and (self.replica.diverged or self.raft_node.role != .leader)) {
+        if (self.raft_network != null and (writes or at_leader) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
                 const oom = if (self.diverged_damage) |d| d.out_of_memory else false;
                 self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(if (oom) OUT_OF_MEMORY_MESSAGE else DIVERGED_MESSAGE));
@@ -1877,7 +1892,7 @@ pub const Shard = struct {
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
-                self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("unavailable: electing a leader — retry"));
+                self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: electing a leader — retry" });
                 return;
             }
             self.forwardToLeader(conn, req);
@@ -2895,7 +2910,7 @@ pub const Shard = struct {
             self.sendErrorResponse(conn, req.header.request_id, .internal_error, "could not hold the request for the leader");
             return;
         };
-        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .wait_ms = wait_ms, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS };
+        slot.* = .{ .active = true, .id = self.next_forward_id, .reply_to = conn.replyTo(), .request_id = req.header.request_id, .bytes = bytes, .wait_ms = wait_ms, .deadline_ms = nowMs() + FORWARD_TIMEOUT_MS, .read = !requestWrites(req) };
         self.next_forward_id +%= 1;
         if (self.next_forward_id == 0) self.next_forward_id = FORWARD_ID_FIRST;
         self.forward_count += 1;
@@ -2998,7 +3013,7 @@ pub const Shard = struct {
             }
             // Never sent: it can't have run.
             if (now >= f.deadline_ms) {
-                const why = proto.notRun(if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry");
+                const why: proto.Refusal = .{ .reason = .leader_unknown, .ran = .no, .message = if (leader != 0) "unavailable: the leader is not reachable from this node — retry" else "unavailable: electing a leader — retry" };
                 if (f.ask) |name| self.failAsk(name, .unavailable, why) else self.deliverDeferredRefusal(f.reply_to, f.request_id, .unavailable, why);
                 self.dropForward(f);
             }
@@ -3276,7 +3291,10 @@ pub const Shard = struct {
 
     fn finishForward(self: *Shard, f: *Forward, status: proto.StatusCode, message: []const u8) void {
         // An ask is a read: whatever ended it, nothing ran.
-        if (f.ask) |name| self.failAsk(name, status, proto.notRun(ASK_FAILED)) else self.deliverDeferredError(f.reply_to, f.request_id, status, message);
+        if (f.ask) |name| self.failAsk(name, status, proto.notRun(ASK_FAILED)) else if (f.read)
+            self.deliverDeferredRefusal(f.reply_to, f.request_id, status, .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: lost the leader before it answered — retry" })
+        else
+            self.deliverDeferredError(f.reply_to, f.request_id, status, message);
         self.dropForward(f);
     }
 
@@ -6387,6 +6405,9 @@ const Forward = struct {
     /// published, the name it asks for (owned): its answer goes to the reads
     /// held for that name (`Shard.edge`), not to a client.
     ask: ?[]u8 = null,
+    /// A read the leader answers: lost on the way, it ran nowhere, and is
+    /// never answered from this node's memory.
+    read: bool = false,
 };
 const FORWARD_SLOTS: usize = 1024;
 /// Forward slots blocking reads may not take.
@@ -8848,14 +8869,16 @@ test "Shard: worker.list on a node of two shards lists both shards' workers, in 
     try f.expectSettled(0);
 }
 
-test "Shard: stream.group.members answers the named group's members, and a group that isn't there is not found" {
+test "Shard: stream.group.members answers the named group's members by id, and a group that isn't there is not found" {
     var f: MgetGatherFixture = undefined;
     try f.init(8);
     defer f.deinit();
     // Each shard holds the group: the request is answered by whichever owns the stream.
     for (&f.two.shards) |*s| {
         try s.stream_handler.stream.createGroup("s\x00g", 1_000_000);
-        _ = try s.stream_handler.stream.getGroup("s\x00g").?.join("c-1", 2_000_000);
+        const g = s.stream_handler.stream.getGroup("s\x00g").?;
+        // Joined out of order; listed by id.
+        for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }) |id| _ = try g.join(id, 2_000_000);
         try s.stream_handler.stream.createGroup("s\x00other", 1_000_000);
     }
     const a = &f.two.shards[0];
@@ -8874,9 +8897,11 @@ test "Shard: stream.group.members answers the named group's members, and a group
         var diag: schema.Diagnostic = .{};
         const v = try Members.response.decodeAll(resp.data, &diag);
         var it = v.members.iterator();
-        const m = (try it.next()).?;
-        try std.testing.expectEqualStrings("c-1", m.id);
-        try std.testing.expectEqual(@as(i64, 2), m.joined_at_ms);
+        for ([_][]const u8{ "c-1", "c-3", "c-5", "c-9" }) |want| {
+            const m = (try it.next()).?;
+            try std.testing.expectEqualStrings(want, m.id);
+            try std.testing.expectEqual(@as(i64, 2), m.joined_at_ms);
+        }
         try std.testing.expect((try it.next()) == null);
         try std.testing.expect(!v.more);
     }
@@ -11369,7 +11394,7 @@ test "Shard: a node forwards only writes to its leader; a forwarded read is refu
     const reply = rn.outbound.items[0].frame[transport.HEADER_SIZE..];
     const resp = try proto.Response.parse(reply[12..]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
-    try std.testing.expectEqualStrings("bad request: only writes, and a follower's ask about the namespaces, are forwarded to a leader", (try resp.refused()).message);
+    try std.testing.expectEqualStrings("bad request: only writes, reads the leader answers, and a follower's ask about the namespaces, are forwarded to a leader", (try resp.refused()).message);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
@@ -17848,4 +17873,66 @@ test "Shard: a lookup by a chosen run id two shards hold is refused as a conflic
     const got = try nextAnswer(c, &two.shards[0], &out);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), got.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
+}
+
+test "Shard: a read the leader answers, on a node that does not lead, waits for a leader and is refused, never answered from here" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 8, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 8, .join, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    // This node's own copy holds a message: a peek answered here would show it.
+    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(node_router.namespaceHash("default"), "q"), "here");
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    const body = try Peek.request.encodeInto(&body_buf, .{ .limit = 5 });
+    shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.queue_peek, 6), .namespace = "default", .key = "q", .value = body }, .client);
+    try std.testing.expectEqual(@as(u32, 1), shard.forward_count);
+    try std.testing.expectEqual(@as(usize, 0), conn.write_buf.readable());
+
+    shard.sweepForwards(Shard.nowMs() + FORWARD_TIMEOUT_MS + 1);
+    try std.testing.expectEqual(@as(u32, 0), shard.forward_count);
+    var out: [256]u8 = undefined;
+    const n = std.c.read(pair[1], &out, out.len);
+    try std.testing.expect(n > 0);
+    const resp = try proto.Response.parse(out[0..@intCast(n)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    const r = try resp.refused();
+    try std.testing.expectEqual(proto.Reason.leader_unknown, r.reason);
+    try std.testing.expectEqual(proto.Ran.no, r.ran);
+}
+
+test "a halted leader answers a read only it can, marked stale: a halt clears none of its memory" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(node_router.namespaceHash("default"), "q"), "kept");
+    haltForTest(&shard, shard.raft_node.log.lastIndex() + 1);
+
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.queue_peek, 7), .namespace = "default", .key = "q", .value = try Peek.request.encodeInto(&body_buf, .{ .limit = 5 }) }, .client);
+    const resp = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(resp.header.flags & proto.RESPONSE_STALE != 0);
+    var diag: schema.Diagnostic = .{};
+    const v = try Peek.response.decodeAll(resp.data, &diag);
+    var it = v.messages.iterator();
+    try std.testing.expectEqualStrings("kept", (try it.next()).?.payload);
 }

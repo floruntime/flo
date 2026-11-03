@@ -231,10 +231,19 @@ pub const StreamHandler = struct {
         const key = resolveGroupName(&q_buf, req.namespace, req.key, group) orelse return error.NameTooLong;
         const g = self.stream.getGroup(key) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
+        // By id, so a list that doesn't fit always shows the same first ones.
+        var sorted: std.ArrayList(*const stream_mod.Member) = .empty;
+        defer sorted.deinit(self.allocator);
+        var it = g.members.valueIterator();
+        while (it.next()) |m| try sorted.append(self.allocator, m);
+        std.mem.sort(*const stream_mod.Member, sorted.items, {}, struct {
+            fn lessThan(_: void, a: *const stream_mod.Member, b: *const stream_mod.Member) bool {
+                return std.mem.order(u8, a.id, b.id) == .lt;
+            }
+        }.lessThan);
         var out = stream_ops.Members.Builder.init(try self.answerBuf());
         var more = false;
-        var it = g.members.valueIterator();
-        while (it.next()) |m| {
+        for (sorted.items) |m| {
             const added = out.add(.{
                 .id = m.id,
                 .state = switch (m.state) {

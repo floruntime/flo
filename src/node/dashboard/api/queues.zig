@@ -62,7 +62,7 @@ pub fn getQueues(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboar
     }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
@@ -129,7 +129,7 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     const s: QueueStats = if (got.isNotFound()) .{ .enqueued = 0, .dequeued = 0, .ready = 0, .leased = 0, .dlq = 0 } else parseStats(got.data) orelse return try h.jsonError(allocator, "queue stats: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -162,7 +162,7 @@ pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_stri
     defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -222,7 +222,7 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
         return try h.jsonError(allocator, "queue dlq: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -268,7 +268,7 @@ pub fn requeueDLQEntry(allocator: Allocator, queue_name: []const u8, seq_str: []
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -304,7 +304,7 @@ pub fn purgeQueue(allocator: Allocator, queue_name: []const u8, query_string: ?[
     }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -337,7 +337,7 @@ pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []cons
     }
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();

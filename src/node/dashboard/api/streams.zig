@@ -155,7 +155,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
@@ -257,7 +257,7 @@ pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?
     const t = client_mod.stream.parseTrimmed(resp) orelse return try h.jsonError(allocator, "Malformed trim response");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -284,7 +284,7 @@ pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string:
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -307,7 +307,7 @@ pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -334,7 +334,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     };
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -401,7 +401,7 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -483,7 +483,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
         parseGroupInfo(got.data) orelse return try h.jsonError(allocator, "group info: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -524,7 +524,7 @@ pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "group members", err);
     defer reader.deinit();
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -545,16 +545,18 @@ fn writeGroups(allocator: Allocator, reader: *loopback.Reader, obj: anytype, wri
     const List = stream_ops.op("stream.group.list");
     var got = try reader.call(List, namespace, stream, .{});
     defer got.deinit();
+    // Refused before anything is written, so the caller's null stands alone.
+    if (got.isError() and !got.isNotFound()) return error.Refused;
+    var diag: schema.Diagnostic = .{};
+    const v = if (got.isNotFound()) null else List.response.decodeAll(got.data, &diag) catch return error.Refused;
     var arr = try obj.arrayField("consumer_groups");
     try arr.begin();
-    if (got.isNotFound()) {
+    // A namespace never created holds none.
+    const list = v orelse {
         try arr.end();
         return obj.boolField("consumer_groups_more", false);
-    }
-    if (got.isError()) return error.Refused;
-    var diag: schema.Diagnostic = .{};
-    const v = List.response.decodeAll(got.data, &diag) catch return error.Refused;
-    var it = v.groups.iterator();
+    };
+    var it = list.groups.iterator();
     while (it.next() catch return error.Refused) |g| {
         try arr.next();
         var gobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -570,7 +572,7 @@ fn writeGroups(allocator: Allocator, reader: *loopback.Reader, obj: anytype, wri
         try gobj.end();
     }
     try arr.end();
-    try obj.boolField("consumer_groups_more", v.more);
+    try obj.boolField("consumer_groups_more", list.more);
 }
 
 /// `members`: the group's members, and `members_more` when it has more
@@ -621,7 +623,7 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);

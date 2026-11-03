@@ -88,6 +88,8 @@ fn writeOp(jw: *Stringify, comptime op: ops.Op) Stringify.Error!void {
     try jw.write(@tagName(op.class));
     try jw.objectField("writes");
     try jw.write(comptime op.isWrite());
+    try jw.objectField("at_leader");
+    try jw.write(op.at_leader);
     try jw.objectField("creates");
     try jw.write(op.creates);
     try jw.objectField("route");
