@@ -22,6 +22,11 @@
 //!        [--byzantine]              a node with the secret but no seat sends
 //!                                   forged votes and appends
 //!        [--halts]                  one op halts every node that applies it
+//!        [--actions]                a share of the ops are action entries;
+//!                                   a swarm fails if no seed settles or
+//!                                   expires a lease from an earlier term
+//!        [--family-mutant=NAME]     plant a family mutant (`families.Mutant`):
+//!                                   the run must fail
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -46,6 +51,8 @@ const Args = struct {
     membership: bool = false,
     byzantine: bool = false,
     halts: bool = false,
+    actions: bool = false,
+    family_mutant: vopr.families.Mutant = .none,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -62,8 +69,8 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] " ++
-            "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] " ++
+            "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
 }
@@ -91,6 +98,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.byzantine = true;
         } else if (std.mem.eql(u8, arg, "--halts")) {
             args.halts = true;
+        } else if (std.mem.eql(u8, arg, "--actions")) {
+            args.actions = true;
+        } else if (std.mem.startsWith(u8, arg, "--family-mutant=")) {
+            args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
             var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
             while (it.next()) |n| {
@@ -151,9 +162,16 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.outsider(seed)
     else if (args.halts)
         Scenario.halting(seed)
+    else if (args.actions)
+        Scenario.actions(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
+    // A planted bug the run never reaches would pass, and say nothing.
+    if (args.family_mutant.inActions() and scenario.action_percent == 0) {
+        std.debug.print("--family-mutant={t} is in the actions machine: run it with --actions, or a scenario with action entries\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
 
     // The scenario prints before the run: a hang inside the unit under
     // test cannot be interrupted from in here, so the repro must already
@@ -170,6 +188,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
 
     var sim = try Simulator.init(allocator, scenario, .{
         .volatile_hard_state = args.volatile_mode or scenario.hard_state == .volatile_state,
+        .family_mutant = args.family_mutant,
         .verbose = args.verbose,
         .progress_every = if (args.log_path != null) 10_000 else 0,
     });
@@ -181,7 +200,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} kv_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} family_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -204,13 +223,14 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             sim.stranger_frames,
             s.state_checks,
             s.rebuilt_checks,
-            s.kv_checks,
+            s.family_checks,
             s.kv.refusals,
             s.kv.staged_refusals,
             s.kv.merges,
             s.kv.field_deletes,
         },
     );
+    if (scenario.action_percent > 0) printActionCounts(s.actions);
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
         var vbuf: [16384]u8 = undefined;
@@ -220,14 +240,19 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         std.debug.print("{s}", .{vw.buffered()});
         // A pinned run reproduces from the pin, not the seed — the file may
         // be hand-edited and no longer match fromSeed's sampling.
+        var mb: [64]u8 = undefined;
+        const mutant = if (args.family_mutant == .none) "" else std.fmt.bufPrint(&mb, " --family-mutant={t}", .{args.family_mutant}) catch "";
         if (args.scenario_in) |pin| {
-            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --scenario-in={s}{s}{s}\n", .{
                 pin,
+                mutant,
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
+                mutant,
+                if (args.actions) " --actions" else "",
                 if (args.small_ring) " --small-ring" else "",
                 if (args.wipes) " --wipes" else "",
                 if (args.membership) " --membership" else "",
@@ -238,6 +263,47 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         }
     }
     return s.ok;
+}
+
+const ActionCounts = vopr.families.Actions.Counts;
+/// How many seeds of an actions swarm must reach each takeover path.
+const MIN_TAKEOVER_SEEDS = 3;
+const ACTION_KINDS = std.enums.values(vopr.families.Actions.Kind);
+
+/// One line a parent can read back: each kind as applied/refused.
+fn printActionCounts(c: ActionCounts) void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("[vopr] actions:") catch {};
+    for (ACTION_KINDS, c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    w.print(" cross_term_settles={d} cross_term_expires={d}\n", .{ c.cross_term_settles, c.cross_term_expires }) catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
+
+/// A child's action counts, from its log.
+fn readActionCounts(allocator: std.mem.Allocator, log_path: []const u8) ?ActionCounts {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return null;
+    defer allocator.free(text);
+    const at = std.mem.indexOf(u8, text, "[vopr] actions:") orelse return null;
+    const line = text[at..(std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len)];
+    var c: ActionCounts = .{};
+    var it = std.mem.tokenizeScalar(u8, line["[vopr] actions:".len..], ' ');
+    while (it.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
+        const name = field[0..eq];
+        const value = field[eq + 1 ..];
+        if (std.mem.eql(u8, name, "cross_term_settles")) {
+            c.cross_term_settles = std.fmt.parseInt(u64, value, 10) catch return null;
+        } else if (std.mem.eql(u8, name, "cross_term_expires")) {
+            c.cross_term_expires = std.fmt.parseInt(u64, value, 10) catch return null;
+        } else {
+            const k = std.meta.stringToEnum(vopr.families.Actions.Kind, name) orelse return null;
+            const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+            c.applied[@backingInt(k)] = std.fmt.parseInt(u64, value[0..slash], 10) catch return null;
+            c.refused[@backingInt(k)] = std.fmt.parseInt(u64, value[slash + 1 ..], 10) catch return null;
+        }
+    }
+    return c;
 }
 
 // ── Swarm mode: one watchdogged child process per seed ─────────────────
@@ -266,6 +332,9 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.membership) try argv.append(allocator, "--membership");
     if (args.byzantine) try argv.append(allocator, "--byzantine");
     if (args.halts) try argv.append(allocator, "--halts");
+    if (args.actions) try argv.append(allocator, "--actions");
+    var mutant_arg: [64]u8 = undefined;
+    if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -344,6 +413,10 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     var skipped: u64 = 0;
     var excused_seeds: std.ArrayListUnmanaged(u64) = .empty;
     defer excused_seeds.deinit(allocator);
+    var action_totals: ActionCounts = .{};
+    var settle_seeds: u64 = 0;
+    var expire_seeds: u64 = 0;
+    var unread_counts: u64 = 0;
 
     while (next < iterations or running.items.len > 0) {
         // Top up the pool.
@@ -384,6 +457,13 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                     .ok => {
                         ok_count += 1;
                         std.debug.print("[vopr] seed={d} OK\n", .{r.seed});
+                        if (args.actions) {
+                            if (readActionCounts(allocator, r.log_path)) |c| {
+                                action_totals.add(c);
+                                if (c.cross_term_settles > 0) settle_seeds += 1;
+                                if (c.cross_term_expires > 0) expire_seeds += 1;
+                            } else unread_counts += 1;
+                        }
                         if (excused(allocator, r.log_path)) try excused_seeds.append(allocator, r.seed);
                     },
                     .failed, .timeout => {
@@ -435,7 +515,28 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         };
         std.debug.print("\n", .{});
     }
-    return failures.items.len == 0;
+    // A batch whose leases never outlive a leader tested none of the
+    // takeover paths: it fails, though every seed passed.
+    var covered = true;
+    if (args.actions) {
+        std.debug.print("[vopr] actions, applied/refused (refused share):", .{});
+        for (ACTION_KINDS, action_totals.applied, action_totals.refused) |k, a, rf| {
+            std.debug.print(" {t}={d}/{d} ({d}%)", .{ k, a, rf, if (a + rf == 0) 0 else rf * 100 / (a + rf) });
+        }
+        std.debug.print("\n[vopr] across a term change: {d} settles in {d} seeds, {d} expires in {d} seeds\n", .{ action_totals.cross_term_settles, settle_seeds, action_totals.cross_term_expires, expire_seeds });
+        if (unread_counts > 0) {
+            std.debug.print("[vopr] FAILED: {d} passing seeds printed no action counts\n", .{unread_counts});
+            covered = false;
+        }
+        // A few seeds, not one: a workload change that loses the path in
+        // most seeds should fail here, not pass on a lucky one.
+        const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
+        if (settle_seeds < want or expire_seeds < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired leases from an earlier term\n", .{want});
+            covered = false;
+        }
+    }
+    return failures.items.len == 0 and covered;
 }
 
 // std's default gpa is SafeAllocator in ReleaseSafe, which flo's own main
@@ -470,13 +571,19 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) > 1) {
-        std.debug.print("--small-ring, --wipes, --membership and --byzantine are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) > 1) {
+        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts and --actions are separate slices; pick one\n", .{});
+        std.process.exit(2);
+    }
+
+    // A swarm's children would each refuse it, and read as caught.
+    if (args.iterations != null and args.family_mutant.inActions() and !args.actions) {
+        std.debug.print("--family-mutant={t} is in the actions machine: run the swarm with --actions\n", .{args.family_mutant});
         std.process.exit(2);
     }
 

@@ -29,6 +29,7 @@ const transport = @import("../raft/transport.zig");
 const RaftFrame = @import("../raft/raft_queue.zig").Frame;
 const replica_mod = @import("../replica/replica.zig");
 const families = @import("families.zig");
+const action_workload = @import("action_workload.zig");
 const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
@@ -74,9 +75,13 @@ pub const Invariant = enum {
     /// that applied those entries live: apply read something besides the
     /// entry and the state.
     state_checksum,
-    /// An entry the KV machine refused changed a family anyway. Every
+    /// An entry a server machine refused changed a family anyway. Every
     /// replica would agree on it, so `state_checksum` can't see it.
     refusal_wrote,
+    /// An applied action entry broke a rule a lease must keep: delivered
+    /// early, ended by a stale report or key, a failure uncounted. Every
+    /// replica would apply the bug alike, so only the entry shows it.
+    action_rule,
     convergence,
     api_error, // error return from a public API on protocol-legal input
 };
@@ -281,6 +286,12 @@ const SimNode = struct {
     counter: families.Counter = .{},
     /// The server's KV machine on this replica's own store.
     kv: families.Kv,
+    /// The server's actions machine, likewise.
+    actions: families.Actions,
+    /// The term this node last proposed action entries in, and when it
+    /// first did: a leader's expire duty waits out a grace from then.
+    actions_term: u64 = 0,
+    actions_term_since_ns: u64 = 0,
     families_index: u64 = 0,
     /// Its apply rewound without a restart, so the family holds entries
     /// the log no longer does and cannot roll them back: the checker
@@ -414,18 +425,25 @@ const SimIo = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const Canon = struct { term: u64, hash: u64, op_id: ?u64, recorded_at: u64 };
-const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, kv: ?[families.Kv.FAMILIES.len]u64 };
+/// The server machines' families compared: KV's, then actions'.
+const SAMPLED = families.Kv.FAMILIES.len + families.Actions.FAMILIES.len;
+const Sums = [SAMPLED]u64;
+const StateCanon = struct { history: u64, checksum: u64, rebuilt: bool, sums: ?Sums };
 
-/// KV's families are compared at every index this divides: a checksum walks
-/// a whole family, so one at every index would cost the run's square. The
-/// indices are the same on every replica.
-const KV_SAMPLE = 16;
+/// The machines' families are compared at every index this divides: a
+/// checksum walks a whole family, so one at every index would cost the
+/// run's square. The indices are the same on every replica.
+const SAMPLE_EVERY = 16;
 
-/// What a KV checksum mismatch names, by family.
-const KV_MISMATCH = [families.Kv.FAMILIES.len][2][]const u8{
-    .{ "two replicas hold different kv.value after the same history", "a replica rebuilt by replay holds other kv.value than one that applied live" },
-    .{ "two replicas hold different kv.history after the same history", "a replica rebuilt by replay holds other kv.history than one that applied live" },
-    .{ "two replicas hold different kv.ns_counts after the same history", "a replica rebuilt by replay holds other kv.ns_counts than one that applied live" },
+/// What a checksum mismatch names, by family.
+const MISMATCH = blk: {
+    const names = [_][]const u8{ "kv.value", "kv.history", "kv.ns_counts" } ++ families.Actions.NAMES;
+    var out: [SAMPLED][2][]const u8 = undefined;
+    for (names, &out) |name, *m| m.* = .{
+        "two replicas hold different " ++ name ++ " after the same history",
+        "a replica rebuilt by replay holds other " ++ name ++ " than one that applied live",
+    };
+    break :blk out;
 };
 
 const Checker = struct {
@@ -468,7 +486,7 @@ const Checker = struct {
     state_checks: u64 = 0,
     rebuilt_checks: u64 = 0,
     /// Of those, the ones that compared KV's families too.
-    kv_checks: u64 = 0,
+    family_checks: u64 = 0,
 
     fn deinit(self: *Checker) void {
         self.canonical.deinit(self.allocator);
@@ -520,10 +538,10 @@ const Checker = struct {
         }
     }
 
-    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, kv: ?[families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
+    fn onState(self: *Checker, node: NodeId, idx: u64, history: u64, checksum: u64, sums: ?Sums, rebuilt: bool, tick: u64) void {
         while (self.states.items.len < idx) self.states.append(self.allocator, null) catch @panic("checker OOM");
         const slot = &self.states.items[idx - 1];
-        const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .kv = kv };
+        const here: StateCanon = .{ .history = history, .checksum = checksum, .rebuilt = rebuilt, .sums = sums };
         const canon = slot.* orelse {
             slot.* = here;
             return;
@@ -537,9 +555,9 @@ const Checker = struct {
         }
         self.state_checks += 1;
         if (canon.rebuilt != rebuilt) self.rebuilt_checks += 1;
-        if (canon.kv != null and kv != null) {
-            self.kv_checks += 1;
-            for (canon.kv.?, kv.?, KV_MISMATCH) |want, got, why| {
+        if (canon.sums != null and sums != null) {
+            self.family_checks += 1;
+            for (canon.sums.?, sums.?, MISMATCH) |want, got, why| {
                 if (want != got) self.fail(.{
                     .invariant = .state_checksum,
                     .node = node,
@@ -562,19 +580,20 @@ const Checker = struct {
         });
     }
 
-    /// Like `onState` for KV's families alone, at an index sampling passed
-    /// over: the first node there records them, later ones compare.
-    fn onFinalKv(self: *Checker, node: NodeId, idx: u64, history: u64, kv: [families.Kv.FAMILIES.len]u64, rebuilt: bool, tick: u64) void {
+    /// Like `onState` for the machines' families alone, at an index
+    /// sampling passed over: the first node there records them, later ones
+    /// compare.
+    fn onFinalSums(self: *Checker, node: NodeId, idx: u64, history: u64, sums: Sums, rebuilt: bool, tick: u64) void {
         if (idx > self.states.items.len) return;
         const slot = &(self.states.items[idx - 1] orelse return);
         if (slot.history != history) return;
-        const want = slot.kv orelse {
-            slot.kv = kv;
+        const want = slot.sums orelse {
+            slot.sums = sums;
             slot.rebuilt = rebuilt;
             return;
         };
-        self.kv_checks += 1;
-        for (want, kv, KV_MISMATCH) |w, got, why| {
+        self.family_checks += 1;
+        for (want, sums, MISMATCH) |w, got, why| {
             if (w != got) self.fail(.{
                 .invariant = .state_checksum,
                 .node = node,
@@ -598,7 +617,7 @@ const Checker = struct {
         latest_crash: u64,
     ) void {
         const hash = std.hash.Wyhash.hash(HASH_SEED, payload);
-        const op_id = if (is_op) Workload.opIdFromPayload(entry_type, payload) else null;
+        const op_id = if (is_op) workload.opIdAt(term, idx, entry_type, payload) else null;
         while (self.canonical.items.len < idx) {
             self.canonical.append(self.allocator, null) catch @panic("checker OOM");
         }
@@ -634,7 +653,10 @@ const Checker = struct {
             self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
         }
         // Applied-entry integrity: a workload payload must hash to what
-        // the oracle recorded when it was synthesized.
+        // the oracle recorded when it was synthesized, or for an action op
+        // when its leader made it. An action op is found by where it was
+        // proposed, so one never acked is checked only if its entry is the
+        // one that applied there; the durability check holds acked ones.
         if (op_id) |id| {
             if (id >= workload.ops.items.len or workload.ops.items[id].payload_hash != hash) {
                 self.fail(.{
@@ -708,9 +730,11 @@ pub const Summary = struct {
     /// replica rebuilt by replay against one that applied live.
     state_checks: u64,
     rebuilt_checks: u64,
-    kv_checks: u64,
+    family_checks: u64,
     /// What KV's machine did with the run's entries, each counted once.
     kv: families.Kv.Counts,
+    /// And the actions machine.
+    actions: families.Actions.Counts,
     violation_count: usize,
 };
 
@@ -763,6 +787,12 @@ pub const Simulator = struct {
     wipes: u64 = 0,
     /// KV entries by outcome, counted at the first apply of each index.
     kv_counts: families.Kv.Counts = .{},
+    /// Action entries likewise.
+    action_counts: families.Actions.Counts = .{},
+    /// Action entries draw from their own stream, so a scenario without
+    /// them replays as it did before they existed.
+    action_prng: PRNG,
+    action_buf: []u8,
     config_written: bool = false,
     /// What was acked when convergence began: every member must apply it.
     /// The probes acked after are the leader's to commit; the final
@@ -790,6 +820,8 @@ pub const Simulator = struct {
             .prng = PRNG.init(scenario.seed ^ 0x51D0_2A7E),
             .clock_prng = PRNG.init(scenario.seed ^ 0xC10C_5EED),
             .outsider_prng = PRNG.init(scenario.seed ^ 0x0075_1DE7),
+            .action_prng = PRNG.init(scenario.seed ^ 0x00AC_7105),
+            .action_buf = try allocator.alloc(u8, @as(usize, scenario.payload_max)),
             .nodes = try allocator.alloc(SimNode, scenario.node_count),
             .net = SimNetwork.init(allocator),
             .workload = try Workload.init(allocator, &scenario),
@@ -820,6 +852,7 @@ pub const Simulator = struct {
                 .disk = .{ .allocator = allocator },
                 .max_term_seen = 0,
                 .kv = families.Kv.init(allocator),
+                .actions = families.Actions.init(allocator),
             };
             // Drawn only with drift on, so a run without it replays as before.
             if (scenario.clock_drift_ppm > 0) {
@@ -849,6 +882,7 @@ pub const Simulator = struct {
             node.applied_ticks.deinit(self.allocator);
             node.counter.deinit(self.allocator);
             node.kv.deinit();
+            node.actions.deinit();
             self.allocator.free(node.replica.rpc_entries);
             self.allocator.free(node.replica.rpc_arena);
             self.allocator.free(node.replica.rpc_out);
@@ -861,6 +895,7 @@ pub const Simulator = struct {
         self.acked_at.deinit(self.allocator);
         self.crash_ticks.deinit(self.allocator);
         self.allocator.free(self.apply_buf);
+        self.allocator.free(self.action_buf);
         for (self.delivery.items) |*m| self.net.release(m);
         self.delivery.deinit(self.allocator);
     }
@@ -1095,6 +1130,7 @@ pub const Simulator = struct {
         node.replay_through = node.applied_ticks.items.len;
         node.counter.reset(self.allocator, @intCast(@min(node.disk.durable_len, std.math.maxInt(u32))));
         node.kv.reset();
+        node.actions.reset();
         node.families_index = 0;
         node.families_stale = false;
         node.history = 0;
@@ -1528,10 +1564,29 @@ pub const Simulator = struct {
         }
         if (n == 0) return;
         const target = self.node_(leaders[r.uintLessThan(usize, n)]);
+        if (self.scenario.action_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.action_percent) return self.submitActionOp(target);
         const op = try self.workload.nextOp();
         const res = target.raft.propose(op.entry_type, 0, op.payload) catch return;
         self.workload.recordProposal(op.id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, op.id);
+    }
+
+    /// An action entry, made from the leader's own applied action state as
+    /// its handler would make it.
+    fn submitActionOp(self: *Simulator, target: *SimNode) !void {
+        const now = target.raft.wall_clock.read();
+        if (target.actions_term != target.raft.current_term) {
+            target.actions_term = target.raft.current_term;
+            target.actions_term_since_ns = now;
+        }
+        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.actions_term_since_ns };
+        const op_id = self.workload.next_op_id;
+        const made = action_workload.make(&target.actions, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
+        const id = try self.workload.nextActionOp(made.entry_type, made.payload);
+        std.debug.assert(id == op_id);
+        const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
+        self.workload.recordProposal(id, target.id, res.term, res.index);
+        try self.pending_ops.append(self.allocator, id);
     }
 
     fn isIsolated(self: *const Simulator, id: NodeId) bool {
@@ -1608,7 +1663,7 @@ pub const Simulator = struct {
                 // An entry a repair skips is passed over: it applies nothing.
                 const passed_over = node.skipped and self.halt != null and idx == self.halt.?.index;
                 const is_op = !passed_over and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_noop) and e.header.entry_type != @backingInt(entry_mod.EntryType.raft_config) and e.header.entry_type != @backingInt(entry_mod.EntryType.repair_skip);
-                if (is_op and self.scenario.halt_op != 0 and Workload.opIdFromPayload(e.header.entry_type, e.payload) == self.scenario.halt_op - 1) {
+                if (is_op and self.scenario.halt_op != 0 and self.workload.opIdAt(e.header.term, idx, e.header.entry_type, e.payload) == self.scenario.halt_op - 1) {
                     self.haltNode(node, &e);
                     break;
                 }
@@ -1670,6 +1725,7 @@ pub const Simulator = struct {
         const replica: families.Replica = .{
             .mutant = mutant,
             .node_now = self.nodeNow(node),
+            .node_wall_ns = node.wall_ns,
             .leader = node.raft.role == .leader,
             .live = live,
         };
@@ -1695,8 +1751,28 @@ pub const Simulator = struct {
                 .detail = "the KV machine failed a workload entry it should apply",
             },
         });
-        const kv_sums = if (idx % KV_SAMPLE == 0) node.kv.checksums() else null;
-        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), kv_sums, !live, self.now);
+        if (is_op and families.Actions.owns(e.header.entry_type)) if (node.actions.apply(e, replica)) |effect| {
+            if (first) self.action_counts.count(effect);
+            if (effect.broke) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        } else |err| self.checker.fail(switch (err) {
+            error.RefusalChangedState => .{
+                .invariant = .refusal_wrote,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "an action entry the machine refused changed a family",
+            },
+            else => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the actions machine failed a workload entry it should apply",
+            },
+        });
+        const sampled = idx % SAMPLE_EVERY == 0;
+        if (sampled) if (node.actions.danglingRequest()) |why| self.checker.fail(.{ .invariant = .action_rule, .node = node.id, .index = idx, .tick = self.now, .detail = why });
+        self.checker.onState(node.id, idx, node.history, node.counter.checksum(mutant), if (sampled) sumsOf(node) else null, !live, self.now);
     }
 
     // ── Log durability (runs before fault injection) ───────────────────
@@ -1963,19 +2039,23 @@ pub const Simulator = struct {
             }
         }
         self.finalDurabilityCheck();
-        self.finalKvCheck();
+        self.finalSumsCheck();
         return self.summary();
     }
 
-    /// KV's families at the last index each node applied, which sampling
-    /// may have passed over: a divergence in a run's last entries is caught
-    /// too.
-    fn finalKvCheck(self: *Simulator) void {
+    /// The machines' families at the last index each node applied, which
+    /// sampling may have passed over: a divergence in a run's last entries
+    /// is caught too.
+    fn finalSumsCheck(self: *Simulator) void {
         for (self.nodes) |*node| {
             if (!node.up or node.families_stale or node.families_index == 0) continue;
-            if (node.families_index % KV_SAMPLE == 0) continue;
-            self.checker.onFinalKv(node.id, node.families_index, node.history, node.kv.checksums(), node.families_index <= node.replay_through, self.now);
+            if (node.families_index % SAMPLE_EVERY == 0) continue;
+            self.checker.onFinalSums(node.id, node.families_index, node.history, sumsOf(node), node.families_index <= node.replay_through, self.now);
         }
+    }
+
+    fn sumsOf(node: *SimNode) Sums {
+        return node.kv.checksums() ++ node.actions.checksums();
     }
 
     fn summary(self: *Simulator) Summary {
@@ -2025,8 +2105,9 @@ pub const Simulator = struct {
             .canonical_hash = h.final(),
             .state_checks = self.checker.state_checks,
             .rebuilt_checks = self.checker.rebuilt_checks,
-            .kv_checks = self.checker.kv_checks,
+            .family_checks = self.checker.family_checks,
             .kv = self.kv_counts,
+            .actions = self.action_counts,
             .violation_count = self.checker.violations.items.len,
         };
     }
@@ -2184,7 +2265,7 @@ fn restartingScenario(seed: u64) Scenario {
 test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family state after the same history" {
     var checks: u64 = 0;
     var rebuilt: u64 = 0;
-    var kv_checks: u64 = 0;
+    var family_checks: u64 = 0;
     for ([_]u64{ 77, 78, 79 }) |seed| {
         for ([_]scenario_mod.DurabilityMode{ .sync, .async_flush }) |durability| {
             var scenario = restartingScenario(seed);
@@ -2201,7 +2282,7 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
             try testing.expect(s.ok);
             checks += s.state_checks;
             rebuilt += s.rebuilt_checks;
-            kv_checks += s.kv_checks;
+            family_checks += s.family_checks;
             // Every replica's KV store fails an undeclared key, restarted
             // ones too.
             for (sim.nodes) |*node| try testing.expect(node.kv.store.strict_keys);
@@ -2209,7 +2290,7 @@ test "vopr sim: replicas, and replicas rebuilt by replay, hold the same family s
     }
     try testing.expect(checks >= 1000);
     try testing.expect(rebuilt >= 500);
-    try testing.expect(kv_checks >= 50);
+    try testing.expect(family_checks >= 50);
 }
 
 /// What `state_checksum` found under a mutant: any violation, and one
@@ -2266,19 +2347,22 @@ test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuse
 test "vopr sim: KV's families are compared at a run's last index even when sampling passed over it" {
     var checker: Checker = .{ .allocator = testing.allocator };
     defer checker.deinit();
-    const idx = KV_SAMPLE + 3;
+    const idx = SAMPLE_EVERY + 3;
     // Applied at an unsampled index: no KV checksums yet.
     checker.onState(1, idx, 42, 7, null, false, 0);
     checker.onState(2, idx, 42, 7, null, false, 0);
     // The first final records them, the next compares.
-    checker.onFinalKv(1, idx, 42, .{ 1, 2, 3 }, false, 0);
-    checker.onFinalKv(2, idx, 42, .{ 1, 2, 3 }, false, 0);
+    const same: Sums = .{ 1, 2, 3 } ++ @as([families.Actions.FAMILIES.len]u64, @splat(4));
+    var other = same;
+    other[1] = 9;
+    checker.onFinalSums(1, idx, 42, same, false, 0);
+    checker.onFinalSums(2, idx, 42, same, false, 0);
     try testing.expectEqual(@as(usize, 0), checker.violations.items.len);
-    checker.onFinalKv(3, idx, 42, .{ 1, 9, 3 }, true, 0);
+    checker.onFinalSums(3, idx, 42, other, true, 0);
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
     try testing.expectEqualStrings("a replica rebuilt by replay holds other kv.history than one that applied live", checker.violations.items[0].detail);
     // Another history at that index is not compared.
-    checker.onFinalKv(4, idx, 43, .{ 0, 0, 0 }, false, 0);
+    checker.onFinalSums(4, idx, 43, @splat(0), false, 0);
     try testing.expectEqual(@as(usize, 1), checker.violations.items.len);
 }
 
@@ -2289,6 +2373,48 @@ test "vopr sim: a contract that commits a refused entry's staged writes fails re
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
     const caught = try stateChecksumUnder(.kv_replay_skips_batches);
     try testing.expect(caught.rebuilt_vs_live and caught.kv);
+}
+
+/// A small, busy actions run: three nodes that crash and restart, most ops
+/// action entries, long enough for leases to expire.
+fn actionsTestScenario(seed: u64) Scenario {
+    var scenario = restartingScenario(seed);
+    scenario.ticks_safety = 15_000;
+    scenario.ticks_convergence = 5_000;
+    scenario.request_percent = 60;
+    scenario.action_percent = 70;
+    return scenario;
+}
+
+test "vopr sim: an actions run keeps every lease rule, and its replicas agree on action state" {
+    var sim = try Simulator.init(testing.allocator, actionsTestScenario(1), .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    if (!s.ok) {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        sim.printViolations(&w) catch {};
+        std.debug.print("{s}\n", .{w.buffered()});
+    }
+    try testing.expect(s.ok);
+    // Every kind ran, and some of each the machine can refuse was.
+    errdefer std.debug.print("{any}\n", .{s.actions});
+    for (std.enums.values(families.Actions.Kind)) |k| {
+        if (k == .delete) continue;
+        try testing.expect(s.actions.applied[@backingInt(k)] > 0);
+        if (k != .register and k != .expire) try testing.expect(s.actions.refused[@backingInt(k)] > 0);
+    }
+    try testing.expect(s.family_checks > 0);
+    for (sim.nodes) |*node| try testing.expect(node.actions.store.strict_keys);
+}
+
+test "vopr sim: action entries applied at the replica's own clock fail state_checksum on action state" {
+    var sim = try Simulator.init(testing.allocator, actionsTestScenario(1), .{ .family_mutant = .action_node_clock });
+    defer sim.deinit();
+    _ = try sim.run();
+    var caught = false;
+    for (sim.checker.violations.items) |v| caught = caught or (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, " action.") != null);
+    try testing.expect(caught);
 }
 
 fn runTicks(sim: *Simulator, n: u64) !void {
