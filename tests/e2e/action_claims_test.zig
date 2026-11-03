@@ -130,6 +130,20 @@ fn runStatus(fd: std.c.fd_t, run: []const u8) !Status {
     return s;
 }
 
+/// `runStatus`, asked again while a node that just became leader answers
+/// that it isn't ready yet, `retries` times at most.
+fn runStatusRetrying(fd: std.c.fd_t, run: []const u8, retries: u32) !Status {
+    var left = retries;
+    while (left > 0) : (left -= 1) {
+        var buf: [4096]u8 = undefined;
+        const r = try call(fd, .action_status, run, "", &buf, 5000);
+        if (r.header.status != @backingInt(proto.StatusCode.unavailable)) break;
+        if ((try r.refused()).reason != .leader_unknown) break;
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    }
+    return runStatus(fd, run);
+}
+
 /// A run invoked through the CLI: its id, from "Result: <id>".
 fn invoke(out: []const u8, buf: []u8) ![]const u8 {
     const prefix = "Result: ";
@@ -423,8 +437,10 @@ test "e2e/action/cluster: after a leader is killed, a lease longer than the new 
     defer _ = std.c.close(fd);
     // The new leader's grace ends about 30 s after it took over, well
     // before the deadline; until 4 s short of the deadline the run is held.
+    var first_read = true;
     while (stdx.time.milliTimestamp() - delivered_at < lease_ms - 4000) {
-        const s = try runStatus(fd, run);
+        const s = if (first_read) try runStatusRetrying(fd, run, 25) else try runStatus(fd, run);
+        first_read = false;
         if (s.status != .running) {
             std.debug.print("\nrun {s} is {t} {d} ms after its deliver, before its {d} ms lease ended\n", .{ run, s.status, stdx.time.milliTimestamp() - delivered_at, lease_ms });
             return error.TestUnexpectedResult;
