@@ -3,6 +3,7 @@
 19978	action_test
 260	answer_checksum_test
 28356	apply_crash_test
+92000	async_boot_test
 224	cli_flags_test
 9218	cluster_peering_test
 4397	cluster_secret_test
