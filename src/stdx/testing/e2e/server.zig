@@ -627,21 +627,8 @@ pub const ServerProcess = struct {
     /// Kill the server at once, as a crash would: no shutdown runs, and
     /// nothing it held in memory is written.
     pub fn kill(self: *Self) void {
-        if (self.process) |*proc| {
-            const pid = proc.id;
-            if (!self.tryReap(pid)) {
-                self.sent_kill = true;
-                if (std.c.kill(-pid, .KILL) != 0) _ = std.c.kill(pid, .KILL);
-                const kill_start = stdx.time.milliTimestamp();
-                while (!self.tryReap(pid) and stdx.time.milliTimestamp() - kill_start < 1000) stdx.time.sleep(10 * std.time.ns_per_ms);
-            }
-            stdx.time.sleep(POST_KILL_WAIT_MS * std.time.ns_per_ms);
-            self.joinLogThread();
-            self.checkExit();
-            self.releaseWatchdog();
-            self.process = null;
-        }
-        self.started = false;
+        self.forceKill();
+        self.checkExit();
     }
 
     fn releaseWatchdog(self: *Self) void {

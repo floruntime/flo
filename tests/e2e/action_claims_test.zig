@@ -139,6 +139,14 @@ fn invoke(out: []const u8, buf: []u8) ![]const u8 {
     return buf[0..id.len];
 }
 
+/// `t` naming the token (`term`, `index`) instead of its own.
+fn forgedAt(t: Task, term: u64, index: u64) Task {
+    var f = t;
+    f.term = term;
+    f.index = index;
+    return f;
+}
+
 fn connect(port: u16) !std.c.fd_t {
     return stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
 }
@@ -214,11 +222,12 @@ test "e2e/action/claims: once a run is given to another worker, the first's comp
     try testing.expectEqualStrings("stale report: the run was delivered again since", why.message);
     // The holder, the delivery count right, but another delivery's token:
     // the token alone tells them apart.
-    var forged = second.task;
-    forged.index = first.task.index;
-    const wrong = try complete(fd, "w2", forged, "forged", &buf);
-    try testing.expectEqual(@backingInt(proto.StatusCode.conflict), wrong.header.status);
-    try testing.expectEqualStrings("stale report: the run was delivered again since", (try wrong.refused()).message);
+    // Each half of the token on its own: another index, then another term.
+    for ([_]Task{ forgedAt(second.task, second.task.term, first.task.index), forgedAt(second.task, second.task.term + 1, second.task.index) }) |forged| {
+        const wrong = try complete(fd, "w2", forged, "forged", &buf);
+        try testing.expectEqual(@backingInt(proto.StatusCode.conflict), wrong.header.status);
+        try testing.expectEqualStrings("stale report: the run was delivered again since", (try wrong.refused()).message);
+    }
     // The holder's complete applies; neither other result was taken.
     try expectOk(try complete(fd, "w2", second.task, "on time", &buf));
     const s = try runStatus(fd, run);
