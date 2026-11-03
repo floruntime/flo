@@ -362,6 +362,12 @@ pub const ClusterContext = struct {
         }
     }
 
+    /// Kill a node at once, as a crash would.
+    pub fn killNode(self: *Self, node: usize) void {
+        if (node >= self.node_count) return;
+        if (self.servers[node]) |server| server.kill();
+    }
+
     /// Restart a previously stopped node
     pub fn restartNode(self: *Self, node: usize) !void {
         if (node >= self.node_count) return error.InvalidNodeIndex;

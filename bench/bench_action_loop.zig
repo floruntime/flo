@@ -33,7 +33,7 @@ pub fn main() !void {
 
     var times: [3][ROUNDS]u64 = undefined;
     for (0..WARMUP + ROUNDS) |i| {
-        var t = stdx.time.nanoTimestamp();
+        const t = stdx.time.nanoTimestamp();
         var inv = try client.action.invoke(&conn, "", "bench-act", "{\"n\":1}", null);
         if (inv.status != .ok) return error.NotOk;
         inv.deinit();
@@ -55,7 +55,6 @@ pub fn main() !void {
         times[0][i - WARMUP] = @intCast(t_invoke - t);
         times[1][i - WARMUP] = @intCast(t_await - t_invoke);
         times[2][i - WARMUP] = @intCast(t_done - t_await);
-        t = t_done;
     }
     std.debug.print("\n=== Action round trip ({d} runs, one at a time) ===\n\n", .{ROUNDS});
     for (std.enums.values(Step), &times) |step, *ts| {

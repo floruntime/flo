@@ -78,11 +78,24 @@ const Held = struct {
 /// `worker` asks for a task of `action`, waiting `block_ms` at most: the
 /// task, or null when the answer carried none.
 fn awaitTask(fd: std.c.fd_t, worker: []const u8, action: []const u8, block_ms: u64, held: *Held) !bool {
+    return awaitTaskRetrying(fd, worker, action, block_ms, held, 0);
+}
+
+/// `awaitTask`, asked again while the node answers that it has no leader
+/// ready yet, `retries` times at most.
+fn awaitTaskRetrying(fd: std.c.fd_t, worker: []const u8, action: []const u8, block_ms: u64, held: *Held, retries: u32) !bool {
     var names: [action_ops.ActionName.max_size]u8 = undefined;
     var body_buf: [512]u8 = undefined;
     const body = try action_ops.op("action.await").request.encodeInto(&body_buf, .{ .actions = try action_ops.actionNames(&names, &.{action}), .block_ms = block_ms, .request_key = null });
     var buf: [4096]u8 = undefined;
-    const r = try call(fd, .action_await, worker, body, &buf, @intCast(block_ms + 5000));
+    var left = retries;
+    const r = while (true) : (left -= 1) {
+        const got = try call(fd, .action_await, worker, body, &buf, @intCast(block_ms + 5000));
+        if (left == 0 or got.header.status != @backingInt(proto.StatusCode.unavailable)) break got;
+        const why = try got.refused();
+        if (why.reason != .leader_unknown) break got;
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    };
     try expectOk(r);
     var diag: schema.Diagnostic = .{};
     const task = (try action_ops.op("action.await").response.decodeAll(r.data, &diag)).task orelse return false;
@@ -130,6 +143,20 @@ fn connect(port: u16) !std.c.fd_t {
     return stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
 }
 
+/// The run's status once it is `want`, polled every 100 ms for `max_ms`.
+fn statusOnce(fd: std.c.fd_t, run: []const u8, want: action_ops.RunStatus, max_ms: u64) !Status {
+    var waited: u64 = 0;
+    while (true) : (waited += 100) {
+        const s = try runStatus(fd, run);
+        if (s.status == want) return s;
+        if (waited >= max_ms) {
+            std.debug.print("\nrun {s} is {t}, not {t}, after {d} ms\n", .{ run, s.status, want, max_ms });
+            return error.TestUnexpectedResult;
+        }
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
 test "e2e/action/claims: a complete from the holder after its lease expired is refused, saying so" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -143,8 +170,9 @@ test "e2e/action/claims: a complete from the holder after its lease expired is r
     var held: Held = undefined;
     try testing.expect(try awaitTask(fd, "w1", "lapse", 5000, &held));
     try testing.expectEqualStrings(run, held.task.run);
-    // The lease, and slack for the expire duty's next tick.
-    stdx.time.sleep(7000 * std.time.ns_per_ms);
+    // Ready again once the duty ends the lease: its one attempt spent.
+    const lapsed = try statusOnce(fd, run, .pending, 15_000);
+    try testing.expectEqual(@as(u32, 1), lapsed.attempt);
 
     var buf: [4096]u8 = undefined;
     const r = try complete(fd, "w1", held.task, "late", &buf);
@@ -153,10 +181,51 @@ test "e2e/action/claims: a complete from the holder after its lease expired is r
     try testing.expectEqual(proto.Reason.stale_report, why.reason);
     try testing.expectEqual(proto.Ran.no, why.ran);
     try testing.expectEqualStrings("stale report: the lease expired and the run moved on", why.message);
-    // Ready again, its first attempt spent, its result not taken.
+    // Its result not taken.
     const s = try runStatus(fd, run);
     try testing.expectEqual(action_ops.RunStatus.pending, s.status);
     try testing.expectEqual(@as(usize, 0), s.output_len);
+}
+
+test "e2e/action/claims: once a run is given to another worker, the first's complete names a delivery since replaced, and is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "again", "--timeout", "5000", "--retries", "3" });
+    var run_buf: [64]u8 = undefined;
+    const run = try invoke(try ctx.execCapture(&.{ "action", "invoke", "again", "{}" }), &run_buf);
+
+    const fd = try connect(ctx.getPort());
+    defer _ = std.c.close(fd);
+    var first: Held = undefined;
+    try testing.expect(try awaitTask(fd, "w1", "again", 5000, &first));
+    _ = try statusOnce(fd, run, .pending, 15_000);
+    // Delivered again, to another worker: a new token.
+    var second: Held = undefined;
+    try testing.expect(try awaitTask(fd, "w2", "again", 5000, &second));
+    try testing.expectEqualStrings(run, second.task.run);
+    try testing.expectEqual(@as(u32, 2), second.task.deliveries);
+    try testing.expect(second.task.index != first.task.index);
+
+    var buf: [4096]u8 = undefined;
+    const stale = try complete(fd, "w1", first.task, "late", &buf);
+    try testing.expectEqual(@backingInt(proto.StatusCode.conflict), stale.header.status);
+    const why = try stale.refused();
+    try testing.expectEqual(proto.Reason.stale_report, why.reason);
+    try testing.expectEqualStrings("stale report: the run was delivered again since", why.message);
+    // The holder, the delivery count right, but another delivery's token:
+    // the token alone tells them apart.
+    var forged = second.task;
+    forged.index = first.task.index;
+    const wrong = try complete(fd, "w2", forged, "forged", &buf);
+    try testing.expectEqual(@backingInt(proto.StatusCode.conflict), wrong.header.status);
+    try testing.expectEqualStrings("stale report: the run was delivered again since", (try wrong.refused()).message);
+    // The holder's complete applies; neither other result was taken.
+    try expectOk(try complete(fd, "w2", second.task, "on time", &buf));
+    const s = try runStatus(fd, run);
+    try testing.expectEqual(action_ops.RunStatus.completed, s.status);
+    try testing.expectEqual(@as(u32, 2), s.attempt);
+    try testing.expectEqualStrings("w2", s.worker_buf[0..s.worker_len]);
+    try testing.expectEqualStrings("on time", s.output_buf[0..s.output_len]);
 }
 
 test "e2e/action/claims: a complete resent after it applied answers ok again, and the run keeps the first" {
@@ -188,8 +257,9 @@ test "e2e/action/claims: on 4 shards, a worker whose shard isn't its action's is
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
     // A worker and an action on different shards, as the server routes
-    // them: by namespace and key, over its 4096 partitions.
-    const router = src.node.router.Router.init(4096, 4, 0);
+    // them: by namespace and key, over as many partitions as it picks for
+    // 4 shards when none are configured.
+    const router = src.node.router.Router.init(0, 4, 0);
     const shardOf = struct {
         fn f(r: src.node.router.Router, key: []const u8) u16 {
             return switch (r.route(src.node.router.hashKeyWithNamespace("default", key))) {
@@ -204,6 +274,7 @@ test "e2e/action/claims: on 4 shards, a worker whose shard isn't its action's is
         const name = try std.fmt.bufPrint(&name_buf, "xs-act-{d}", .{i});
         if (shardOf(router, name) != shardOf(router, worker)) break name;
     } else return error.NoAction;
+    try testing.expect(shardOf(router, action) != shardOf(router, worker));
     try ctx.exec(&.{ "action", "register", action });
 
     const fd = try connect(ctx.getPort());
@@ -267,7 +338,7 @@ fn leaderOf(cluster: *ClusterContext, skip: ?usize) !usize {
     return error.NoLeader;
 }
 
-test "e2e/action/cluster: a run claimed before its leader dies stays its worker's: same attempt, not given again, and its complete applies" {
+test "e2e/action/cluster: a run claimed before its leader is killed stays its worker's: same attempt, not given again, and its complete applies" {
     var cluster = try ClusterContext.initDefault(testing.allocator);
     defer cluster.deinit();
     errdefer cluster.printLogs();
@@ -290,18 +361,21 @@ test "e2e/action/cluster: a run claimed before its leader dies stays its worker'
     try testing.expectEqual(@as(u32, 1), held.task.attempt);
     try testing.expectEqual(@as(u32, 1), held.task.deliveries);
 
-    cluster.stopNode(first);
+    // A crash: no shutdown, nothing flushed on the way out.
+    cluster.killNode(first);
     const next = try leaderOf(&cluster, first);
     const fd = try connect(cluster.getServer(next).?.getPort());
     defer _ = std.c.close(fd);
-    // The new leader knows the run is held: another worker gets nothing.
+    // Another worker waits through three of the new leader's expire
+    // ticks: a takeover that ended or freed the lease would hand it the
+    // run, and wake it to say so.
     var other: Held = undefined;
-    try testing.expect(!try awaitTask(fd, "w2", "survive", 0, &other));
+    try testing.expect(!try awaitTaskRetrying(fd, "w2", "survive", 3000, &other, 25));
     const s = try runStatus(fd, run);
     try testing.expectEqual(action_ops.RunStatus.running, s.status);
     try testing.expectEqual(@as(u32, 1), s.attempt);
     try testing.expectEqualStrings("w1", s.worker_buf[0..s.worker_len]);
-    // The holder's complete, naming the delivery the old leader made, applies.
+    // The holder's complete, naming the delivery the dead leader made, applies.
     var buf: [4096]u8 = undefined;
     try expectOk(try complete(fd, "w1", held.task, "ok", &buf));
     const done = try runStatus(fd, run);
