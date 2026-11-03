@@ -26,15 +26,43 @@ pub fn key(buf: []u8, ns: []const u8, k: []const u8) error{NoSpaceLeft}![]u8 {
     return buf[0 .. 1 + ns.len + k.len];
 }
 
+/// A key within its family.
+const FamKey = struct {
+    fam: u16,
+    key: []const u8,
+
+    const Context = struct {
+        pub fn hash(_: Context, d: FamKey) u64 {
+            var h = std.hash.Wyhash.init(d.fam);
+            h.update(d.key);
+            return h.final();
+        }
+        pub fn eql(_: Context, a: FamKey, b: FamKey) bool {
+            return a.fam == b.fam and std.mem.eql(u8, a.key, b.key);
+        }
+    };
+
+    fn Map(comptime V: type) type {
+        return std.HashMapUnmanaged(FamKey, V, Context, std.hash_map.default_max_load_percentage);
+    }
+};
+
+/// Past this many keys a lookup hashes rather than scans: most entries
+/// touch a handful, and hashing them costs more than the scan saves; an
+/// expire of many leases touches hundreds, and a scan per access makes it
+/// quadratic.
+const SCAN_LIMIT = 8;
+
 /// Every key an entry may touch, from the entry alone: whole keys, and
 /// ranges by prefix. A range names its namespace, so no entry declares a
 /// whole family or every namespace.
 pub const KeySet = struct {
     allocator: Allocator,
-    exact: std.ArrayListUnmanaged(Declared) = .empty,
-    ranges: std.ArrayListUnmanaged(Declared) = .empty,
-
-    const Declared = struct { fam: u16, key: []const u8 };
+    exact: std.ArrayListUnmanaged(FamKey) = .empty,
+    /// `exact` hashed, once it holds more than `SCAN_LIMIT`.
+    exact_index: FamKey.Map(void) = .empty,
+    /// Scanned: an entry declares few ranges.
+    ranges: std.ArrayListUnmanaged(FamKey) = .empty,
 
     pub fn init(allocator: Allocator) KeySet {
         return .{ .allocator = allocator };
@@ -44,6 +72,11 @@ pub const KeySet = struct {
         const bytes = try self.allocator.alloc(u8, 1 + ns.len + k.len);
         _ = key(bytes, ns, k) catch unreachable;
         try self.exact.append(self.allocator, .{ .fam = fam, .key = bytes });
+        if (self.exact.items.len == SCAN_LIMIT + 1) {
+            for (self.exact.items) |d| try self.exact_index.put(self.allocator, d, {});
+        } else if (self.exact.items.len > SCAN_LIMIT + 1) {
+            try self.exact_index.put(self.allocator, .{ .fam = fam, .key = bytes }, {});
+        }
     }
 
     /// Every key of `fam` in namespace `ns` that starts with `prefix`.
@@ -57,7 +90,9 @@ pub const KeySet = struct {
     }
 
     pub fn covers(self: *const KeySet, fam: u16, k: []const u8) bool {
-        for (self.exact.items) |d| if (d.fam == fam and std.mem.eql(u8, d.key, k)) return true;
+        if (self.exact.items.len > SCAN_LIMIT) {
+            if (self.exact_index.contains(.{ .fam = fam, .key = k })) return true;
+        } else for (self.exact.items) |d| if (d.fam == fam and std.mem.eql(u8, d.key, k)) return true;
         for (self.ranges.items) |d| if (d.fam == fam and std.mem.startsWith(u8, k, d.key)) return true;
         return false;
     }
@@ -91,10 +126,11 @@ pub const View = struct {
     /// the next entry.
     arena: Allocator,
     declared: *const KeySet,
-    /// The entry's writes in the order made. Lookups scan them, so an
-    /// entry's cost grows with the square of its writes: fine for one
-    /// request's, worth an index for a large batch.
+    /// The entry's writes in the order made.
     ops: std.ArrayListUnmanaged(Op) = .empty,
+    /// Each key's last write in `ops`, once there are more than
+    /// `SCAN_LIMIT`, so a read or the commit finds it without a scan.
+    last: FamKey.Map(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
     strict: bool,
 
@@ -113,12 +149,34 @@ pub const View = struct {
         self.check(F.ID, k);
         var w: std.Io.Writer.Allocating = .init(self.arena);
         value.encode(&w.writer) catch return error.OutOfMemory;
-        try self.ops.append(self.arena, .{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = w.written() });
+        try self.stage(.{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = w.written() });
     }
 
     pub fn delete(self: *View, comptime F: type, k: []const u8) ApplyError!void {
         self.check(F.ID, k);
-        try self.ops.append(self.arena, .{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = null });
+        try self.stage(.{ .fam = F.ID, .key = try self.arena.dupe(u8, k), .value = null });
+    }
+
+    fn stage(self: *View, op: Op) Allocator.Error!void {
+        try self.ops.append(self.arena, op);
+        const n = self.ops.items.len;
+        if (n == SCAN_LIMIT + 1) {
+            for (self.ops.items, 0..) |o, i| try self.last.put(self.arena, .{ .fam = o.fam, .key = o.key }, i);
+        } else if (n > SCAN_LIMIT + 1) {
+            try self.last.put(self.arena, .{ .fam = op.fam, .key = op.key }, n - 1);
+        }
+    }
+
+    /// The index in `ops` of `k`'s last write, if this entry wrote it.
+    fn lastWrite(self: *const View, fam: u16, k: []const u8) ?usize {
+        if (self.ops.items.len > SCAN_LIMIT) return self.last.get(.{ .fam = fam, .key = k });
+        var i = self.ops.items.len;
+        while (i > 0) {
+            i -= 1;
+            const op = self.ops.items[i];
+            if (op.fam == fam and std.mem.eql(u8, op.key, k)) return i;
+        }
+        return null;
     }
 
     /// The family's keys starting with `prefix`, in key order, as this
@@ -142,12 +200,7 @@ pub const View = struct {
     }
 
     fn bytesOf(self: *View, fam: u16, k: []const u8) ?[]const u8 {
-        var i = self.ops.items.len;
-        while (i > 0) {
-            i -= 1;
-            const op = self.ops.items[i];
-            if (op.fam == fam and std.mem.eql(u8, op.key, k)) return op.value;
-        }
+        if (self.lastWrite(fam, k)) |i| return self.ops.items[i].value;
         return self.store.get(fam, k);
     }
 
@@ -169,11 +222,8 @@ pub const View = struct {
         // The last write per key. Each key is written once, so their order
         // doesn't matter.
         var plan: std.ArrayListUnmanaged(Step) = .empty;
-        var i = self.ops.items.len;
-        while (i > 0) {
-            i -= 1;
-            const op = self.ops.items[i];
-            if (indexOfStep(plan.items, op)) |_| continue;
+        for (self.ops.items, 0..) |op, i| {
+            if (self.lastWrite(op.fam, op.key).? != i) continue;
             try plan.append(self.arena, .{ .op = op });
         }
         var reserved: usize = 0;
@@ -218,11 +268,6 @@ pub const View = struct {
         } else if (s.node) |n| {
             self.store.unlink(fam, n);
         }
-    }
-
-    fn indexOfStep(steps: []const Step, op: Op) ?usize {
-        for (steps, 0..) |s, n| if (s.op.fam == op.fam and std.mem.eql(u8, s.op.key, op.key)) return n;
-        return null;
     }
 };
 
