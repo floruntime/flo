@@ -667,6 +667,9 @@ const Checker = struct {
         payload: []const u8,
         is_op: bool,
         tick: u64,
+        /// When this node first saw the entry committed: an apply paused
+        /// past a crash still learned it before.
+        learned_at: u64,
         latest_crash: u64,
     ) void {
         const hash = std.hash.Wyhash.hash(HASH_SEED, payload);
@@ -691,7 +694,7 @@ const Checker = struct {
                 if (erasable) {
                     // History at this index was legally erased; whatever
                     // is now being applied is the surviving version.
-                    self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
+                    self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = learned_at };
                 } else {
                     self.fail(.{
                         .invariant = .state_machine_safety,
@@ -703,7 +706,7 @@ const Checker = struct {
                 }
             }
         } else {
-            self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = tick };
+            self.canonical.items[idx - 1] = .{ .term = term, .hash = hash, .op_id = op_id, .recorded_at = learned_at };
         }
         // Applied-entry integrity: a workload payload must hash to what
         // the oracle recorded when it was synthesized, or for an action op
@@ -861,6 +864,10 @@ pub const Simulator = struct {
     /// (`leaderReady`). Keyed by op: under volatile hard state two leaders
     /// can share a term, and so a (term, index).
     ns_ready: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+    /// Each create entry (index, payload hash) counted and checked once.
+    /// By entry, not index: a create in history rewritten after an async
+    /// loss is another entry at the same index, and is checked too.
+    ns_seen: std.AutoHashMapUnmanaged([2]u64, void) = .empty,
     /// Apply pauses draw from their own stream, so a scenario without them
     /// replays as it did before they existed.
     lag_prng: PRNG,
@@ -970,6 +977,7 @@ pub const Simulator = struct {
         self.acked_at.deinit(self.allocator);
         self.crash_ticks.deinit(self.allocator);
         self.ns_ready.deinit(self.allocator);
+        self.ns_seen.deinit(self.allocator);
         self.allocator.free(self.apply_buf);
         self.allocator.free(self.action_buf);
         for (self.delivery.items) |*m| self.net.release(m);
@@ -1828,7 +1836,8 @@ pub const Simulator = struct {
                 while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
                 node.applied_ticks.items[idx - 1] = self.now;
                 node.raft.noteApplied(e.header.timestamp_ns);
-                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, self.latest_crash_at);
+                const learned_at = if (idx <= node.learned.ticks.items.len) @min(self.now, node.learned.ticks.items[idx - 1]) else self.now;
+                self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, learned_at, self.latest_crash_at);
                 // A config applied is committed, as production's applier
                 // records it.
                 if (e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config)) {
@@ -1920,18 +1929,19 @@ pub const Simulator = struct {
             },
         });
         if (is_op and families.Namespaces.owns(e.header.entry_type)) if (node.ns.apply(e)) |effect| {
+            const first_entry = !(self.ns_seen.getOrPut(self.allocator, .{ idx, std.hash.Wyhash.hash(HASH_SEED, e.payload) }) catch @panic("sim OOM")).found_existing;
             // A refused create may have spent the id its leader chose, so the
             // ids stay dense only while none is refused.
-            if (first and effect == .past_next and self.ns_counts.refusals == 0 and self.ns_counts.stale_ids == 0) self.checker.fail(.{
+            if (first_entry and effect == .past_next and self.ns_counts.refusals == 0 and self.ns_counts.stale_ids == 0) self.checker.fail(.{
                 .invariant = .ns_dense_id,
                 .node = node.id,
                 .index = idx,
                 .tick = self.now,
                 .detail = "a namespace create took an id past the next free one",
             });
-            if (first) self.ns_counts.count(effect);
+            if (first_entry) self.ns_counts.count(effect);
             // Every replica refuses it alike: once is enough.
-            if (first and effect == .stale_id) {
+            if (first_entry and effect == .stale_id) {
                 const op_id = Workload.opIdFromPayload(e.header.entry_type, e.payload);
                 const ready = if (op_id) |id| self.ns_ready.get(id) orelse false else false;
                 if (ready) self.ns_stale_from_ready += 1;

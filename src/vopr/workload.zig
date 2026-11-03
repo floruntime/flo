@@ -312,7 +312,6 @@ pub const Workload = struct {
         return buf[0..w.written().len];
     }
 
-    /// Whether op `op_id` creates a namespace.
     /// Op `op_id`'s create. The leader chooses the id when it proposes the
     /// create, so the payload's hash is recorded then (`recordPayload`).
     fn createOf(buf: []u8, op_id: u64) Synthesized {
@@ -321,6 +320,7 @@ pub const Workload = struct {
         return .{ .entry_type = .namespace_create, .payload = buf[0..out.len], .hash = std.hash.Wyhash.hash(0x5EED, out) };
     }
 
+    /// Whether op `op_id` creates a namespace.
     pub fn isCreate(seed: u64, op_id: u64) bool {
         return std.hash.Wyhash.hash(seed ^ CREATE_SALT, std.mem.asBytes(&op_id)) % CREATE_EVERY == 0;
     }
