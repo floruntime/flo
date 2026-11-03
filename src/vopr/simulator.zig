@@ -1497,6 +1497,27 @@ pub const Simulator = struct {
             self.divergences += 1;
             self.wipeNode(node);
             try self.restartNode(node);
+            if (self.phase == .convergence and self.core[node.id - 1]) try self.refillCore();
+        }
+    }
+
+    /// A core node repaired during convergence comes back under the
+    /// lost-log guard, whose acks no leader counts: the core takes healthy
+    /// nodes from outside it, lowest id first, until it holds a quorum
+    /// without the guarded ones. Isolated outside the core, they would
+    /// leave it unable to commit.
+    fn refillCore(self: *Simulator) !void {
+        const quorum = self.scenario.node_count / 2 + 1;
+        var whole: u8 = 0;
+        for (self.nodes, 0..) |*node, i| whole += @intFromBool(self.core[i] and !isLost(node));
+        for (self.nodes, 0..) |*node, i| {
+            if (whole >= quorum) break;
+            if (self.core[i] or isLost(node)) continue;
+            self.core[i] = true;
+            self.net.core = self.core;
+            self.net.unisolate(node.id);
+            if (!node.up) try self.restartNode(node);
+            whole += 1;
         }
     }
 
@@ -2790,6 +2811,39 @@ test "vopr sim: a restarted node comes up committed and applied through its disk
     try testing.expect(f.raft.committed_config_index > 0);
     try testing.expect(f.raft.committed_config_index <= mark);
     try testing.expectEqual(warm + 1, sim.warm_restarts);
+}
+
+test "vopr sim: a core node repaired during convergence brings a healthy node into the core" {
+    var sim = try Simulator.init(testing.allocator, Scenario.calm(7), .{});
+    defer sim.deinit();
+    try runTicks(&sim, 2000);
+    try sim.transitionToConvergence();
+    var outside: ?NodeId = null;
+    var inside: ?NodeId = null;
+    for (sim.nodes, 0..) |*node, i| {
+        if (sim.core[i]) inside = node.id else outside = node.id;
+    }
+    try testing.expect(sim.net.isolated[outside.? - 1]);
+    sim.node_(inside.?).replica.diverged = true;
+    try sim.repairDiverged();
+    // The repaired node is guarded and stays in the core; the outsider
+    // joins it, connected, so the core holds a quorum without the guard.
+    try testing.expect(Simulator.isLost(sim.node_(inside.?)));
+    try testing.expect(sim.core[inside.? - 1]);
+    try testing.expect(sim.core[outside.? - 1]);
+    try testing.expect(sim.net.core[outside.? - 1]);
+    try testing.expect(!sim.net.isolated[outside.? - 1]);
+    try testing.expect(sim.node_(outside.?).up);
+    // As `run` does: the convergence probes keep the target moving.
+    var converged = false;
+    for (0..20_000) |_| {
+        try sim.tick();
+        if (sim.converged()) {
+            converged = true;
+            break;
+        }
+    }
+    try testing.expect(converged);
 }
 
 /// Three nodes. The leader commits entries while node y is down; then the

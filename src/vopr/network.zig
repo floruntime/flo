@@ -192,6 +192,10 @@ pub const SimNetwork = struct {
     pub fn isolate(self: *SimNetwork, id: NodeId) void {
         self.isolated[id - 1] = true;
     }
+
+    pub fn unisolate(self: *SimNetwork, id: NodeId) void {
+        self.isolated[id - 1] = false;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
