@@ -4,12 +4,14 @@
 //!   flo queue enqueue <queue> <payload> [--priority <0-255>]
 //!   flo queue dequeue <queue> [--count <n>] [--block <ms>]
 //!   flo queue watch <queue>              - Continuously watch for messages
-//!   flo queue peek <queue> [--count <n>]
+//!   flo queue peek <queue> [--limit <n>]   - generated from the op table
 //!   flo queue ack <queue> <seq>...
 //!   flo queue nack <queue> <seq>...
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const gen = @import("../gen.zig");
+const queue_ops = @import("../../protocol/queue_ops.zig");
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
 const client_mod = @import("../client/mod.zig");
@@ -31,7 +33,7 @@ fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) c
 
 /// Create the queue command tree
 pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
-    return try commander.newBuilder(allocator)
+    const queue = commander.newBuilder(allocator)
         .name("queue")
         .about("Queue operations")
         .group("Data Commands")
@@ -79,14 +81,6 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
         )
         .subcommand(
             commander.newBuilder(allocator)
-                .name("peek")
-                .about("View messages without removing")
-                .arg("queue", "Queue name")
-                .uintFlag("count", 'c', 1, "Number of messages to peek")
-                .action(wrapHandler(runPeek)),
-        )
-        .subcommand(
-            commander.newBuilder(allocator)
                 .name("ack")
                 .about("Acknowledge message processing")
                 .aliases(&.{"complete"})
@@ -110,8 +104,10 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("list")
-                        .about("Show a queue's dead-letter count")
+                        .about("List a queue's dead letters, oldest first")
                         .arg("queue", "Queue name")
+                        .uintFlag("limit", 'l', 100, "Most to list (at most 100)")
+                        .uintFlag("after", 0, 0, "Start after this seq: the last one a page listed")
                         .action(wrapHandler(runDlqList)),
                 )
                 .subcommand(
@@ -124,14 +120,15 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
             ),
         )
         .subcommand(
-            commander.newBuilder(allocator)
-                .name("list")
-                .about("List all queues")
-                .aliases(&.{"ls"})
-                .uintFlag("limit", 'l', 100, "Maximum queues to list")
-                .action(wrapHandler(runList)),
-        )
-        .build();
+        commander.newBuilder(allocator)
+            .name("list")
+            .about("List all queues")
+            .aliases(&.{"ls"})
+            .uintFlag("limit", 'l', 100, "Maximum queues to list")
+            .action(wrapHandler(runList)),
+    );
+    gen.addCommands(allocator, queue, &queue_ops.table, &.{});
+    return try queue.build();
 }
 
 fn runEnqueue(ctx: *commander.Context) commander.Error!void {
@@ -256,34 +253,6 @@ fn runWatch(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-fn runPeek(ctx: *commander.Context) commander.Error!void {
-    const queue = ctx.getPositional("queue").?; // validated by commander
-
-    const count = ctx.getUint("count") orelse 1;
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.queue.peek(&client, namespace, queue, @intCast(count)) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    // A peek answers like a dequeue.
-    var messages = Messages.init(result.data) catch return outcome.malformed(ctx, "peek answer");
-    if (messages.remaining == 0) {
-        ctx.print("(no messages)\n", .{});
-        return;
-    }
-    while (messages.next() catch return outcome.malformed(ctx, "peek answer")) |payload| {
-        ctx.print("{s}\n", .{payload});
-    }
-}
-
 fn runAck(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
     const seq_str = ctx.getPositional("seq").?; // validated by commander
@@ -342,24 +311,19 @@ fn runDlqList(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.queue.dlqList(&client, namespace, queue) catch |err| return outcome.requestFailed(ctx, err);
+    const limit: u32 = @intCast(@min(ctx.getUint("limit") orelse 100, 100));
+    const after: ?u64 = if (ctx.getUint("after")) |a| (if (a == 0) null else a) else null;
+    var result = client_mod.queue.dlqList(&client, namespace, queue, limit, after) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
 
-    // Dequeue's layout, then [total_count:u64]: how many are dead-lettered,
-    // which a page may not list.
-    var messages = Messages.init(result.data) catch return outcome.malformed(ctx, "dead-letter list");
-    var listed = messages;
-    while (listed.next() catch return outcome.malformed(ctx, "dead-letter list")) |_| {}
-    const tail = listed.trailer();
-    if (tail.len != 8) return outcome.malformed(ctx, "dead-letter list");
-    const total = std.mem.readInt(u64, tail[0..8], .little);
-    ctx.print("Dead-letter queue for: {s} ({d} messages)\n", .{ queue, total });
-    if (messages.remaining == 0 and total == 0) ctx.print("(empty)\n", .{});
-    while (messages.next() catch return outcome.malformed(ctx, "dead-letter list")) |payload| {
-        ctx.print("{s}\n", .{payload});
-    }
+    const page = client_mod.queue.DlqPage.decode(result.data) orelse return outcome.malformed(ctx, "dead-letter list");
+    ctx.print("Dead-letter queue for: {s} ({d} messages)\n", .{ queue, page.total });
+    if (page.count == 0 and page.total == 0) ctx.print("(empty)\n", .{});
+    var it = page.iterator();
+    while (it.next()) |d| ctx.print("{d}  attempts={d}  {s}{s}\n", .{ d.seq, d.attempts, d.payload, if (d.size > d.payload.len) "…" else "" });
+    if (page.more) ctx.print("(more: --after {d})\n", .{page.last_seq});
 }
 
 fn runDlqRequeue(ctx: *commander.Context) commander.Error!void {

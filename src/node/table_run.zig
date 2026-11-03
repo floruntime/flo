@@ -305,6 +305,8 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "namespace.list", .field = "limit", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
     .{ .op = "namespace.list", .field = "cursor", .tests = &.{"namespace handler: list pages in name order, holding default from the start"} },
     .{ .op = "worker.list", .field = "action", .tests = &.{"worker.list: an action filter pages only that action's workers, each page full, to the last"} },
+    .{ .op = "stream.group.members", .field = "group", .tests = &.{"Shard: stream.group.members answers the named group's members, and a group that isn't there is not found"} },
+    .{ .op = "queue.peek", .field = "limit", .tests = &.{"Shard: queue.peek shows as many of the next ready messages as its limit asks, and takes none"} },
 };
 
 /// The files that bind table ops' functions: where `_ = field;` would

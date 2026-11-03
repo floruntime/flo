@@ -142,6 +142,8 @@ pub const OpCode = enum(u16) {
     stream_group_touch = 0x15A,
     stream_group_info = 0x15B,
     stream_group_delete = 0x15C,
+    stream_group_list = 0x15D,
+    stream_group_members = 0x15E,
 
     // ── Queues (0x170 – 0x19F) ───────────────────────────────────────────────
     queue_enqueue = 0x170,
@@ -152,9 +154,10 @@ pub const OpCode = enum(u16) {
     queue_dlq_delete = 0x177,
     queue_dlq_requeue = 0x178,
     queue_stats = 0x17B,
-    queue_peek = 0x17C,
+    // 0x17C was queue_peek before it moved onto the op table at 0x180.
     queue_purge = 0x17F,
 
+    queue_peek = 0x180,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ─────────────────────────────────────────

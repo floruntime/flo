@@ -88,6 +88,11 @@ pub fn opWrites(op: proto.OpCode) bool {
         .cluster_promote, .cluster_remove, .cluster_repair_skip => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
+        // Members and pending entries live in the leader's memory alone:
+        // a follower would answer none.
+        // (stream.group.list, stream.group.members and queue.peek are
+        // table ops, which say so in their declarations.)
+        .stream_group_info, .stream_group_pending => true,
         .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,

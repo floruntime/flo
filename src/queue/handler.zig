@@ -41,6 +41,11 @@ const OpCode = proto.OpCode;
 const OptionsBuilder = proto.OptionsBuilder;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const table_run = @import("../node/table_run.zig");
+const ops = @import("../protocol/ops.zig");
+const client_queue = @import("../cli/client/queue.zig");
+const queue_ops = @import("../protocol/queue_ops.zig");
+const PeekResponse = table_run.op("queue.peek").response;
 const waiter_pool_mod = @import("../node/waiter_pool.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +67,9 @@ pub const QueueHandler = struct {
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
 
+    /// A peek or DLQ page's answer, encoded after the handler returns.
+    answer_buf: ?[]u8 = null,
+
     const MAX_DEQUEUE_BATCH: u32 = 100;
     const DEFAULT_DEQUEUE_COUNT: u32 = 1;
 
@@ -75,6 +83,10 @@ pub const QueueHandler = struct {
         };
     }
 
+    pub fn deinit(self: *QueueHandler) void {
+        if (self.answer_buf) |b| self.allocator.free(b);
+    }
+
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -82,7 +94,7 @@ pub const QueueHandler = struct {
         dispatcher.registerWithRoute(.queue_dequeue, dispatchDequeue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_complete, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_fail, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_peek, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_peek, table_run.handler("queue.peek", QueueHandler, runPeek), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_stats, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_dlq_list, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_dlq_requeue, dispatchQueue, preRouteByQueue);
@@ -250,7 +262,6 @@ pub const QueueHandler = struct {
             .queue_dequeue => self.handleDequeue(req),
             .queue_complete => self.handleComplete(req),
             .queue_fail => self.handleFail(req),
-            .queue_peek => self.handlePeek(req),
             .queue_stats => self.handleStats(req),
             .queue_dlq_list => self.handleDlqList(req),
             .queue_dlq_requeue => self.handleDlqRequeue(req),
@@ -486,24 +497,45 @@ pub const QueueHandler = struct {
 
     // ── PEEK ────────────────────────────────────────────────────────────
 
-    fn handlePeek(self: *QueueHandler, req: Request) CommandResult {
-        _ = req;
+    pub const Error = error{OutOfMemory};
 
-        // Peek at the next ready message without leasing
-        const ready = self.queue.readyCount();
-        if (ready == 0) {
-            // Return empty result
-            const data = serializeDequeueResults(self.allocator, &[_]DequeueResult{}) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "peek serialization failed" } };
-            };
-            return .{ .queue_peek_messages = .{ .data = data } };
-        }
-
-        // We can't peek without the full dequeue API, so return stats instead
-        const data = serializeDequeueResults(self.allocator, &[_]DequeueResult{}) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "peek serialization failed" } };
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory for this answer; retry") },
         };
-        return .{ .queue_peek_messages = .{ .data = data } };
+    }
+
+    fn answerBuf(self: *QueueHandler) Error![]u8 {
+        if (self.answer_buf) |b| return b;
+        const b = try self.allocator.alloc(u8, queue_ops.PeekedList.byte_bound.?);
+        self.answer_buf = b;
+        return b;
+    }
+
+    /// The queue's next ready messages, as a dequeue would take them, and
+    /// none taken. A page stops where the next message wouldn't fit.
+    fn runPeek(shard: *Shard, _: *Connection, req: Request, limit: u32) Error!table_run.Outcome(PeekResponse) {
+        const self = shard.queue_handler;
+        var found: [QueueProjection.MAX_PEEK]*const queue_mod.Message = undefined;
+        const peeked = self.queue.peek(router.nameHash(router.namespaceHash(req.namespace), req.key), found[0..@min(limit, found.len)]);
+        var out = queue_ops.PeekedList.Builder.init(try self.answerBuf());
+        var more = peeked.more;
+        for (found[0..peeked.count]) |m| {
+            const shown = m.payload[0..@min(m.payload.len, queue_ops.MAX_PEEK_PAYLOAD)];
+            const added = out.add(.{
+                .seq = m.seq,
+                .priority = m.priority,
+                .attempts = m.attempts,
+                .enqueued_at_ms = @intCast(m.enqueued_at_ns / std.time.ns_per_ms),
+                .size = @intCast(m.payload.len),
+                .payload = shown,
+            }) catch false;
+            if (!added) {
+                more = true;
+                break;
+            }
+        }
+        return .{ .answer = .{ .messages = out.value(), .more = more } };
     }
 
     // ── STATS ───────────────────────────────────────────────────────────
@@ -542,8 +574,13 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         }
         const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
-        const dlq_count = self.queue.queueCounts(queue_hash).dead;
-        const data = serializeDlqSummary(self.allocator, dlq_count) catch {
+        // [limit:u32][after:u64]?, both optional: a page of up to 100, after
+        // the dead letter whose seq ends the page before.
+        var limit: u32 = MAX_DLQ_PAGE;
+        var after: ?u64 = null;
+        if (req.value.len >= 4) limit = std.math.clamp(std.mem.readInt(u32, req.value[0..4], .little), 1, MAX_DLQ_PAGE);
+        if (req.value.len >= 12) after = std.mem.readInt(u64, req.value[4..12], .little);
+        const data = serializeDlqPage(self.allocator, self.queue, queue_hash, limit, after) catch {
             return .{ .err = .{ .code = .internal_error, .message = "dlq list serialization failed" } };
         };
 
@@ -754,7 +791,6 @@ pub const QueueHandler = struct {
     pub fn freeResult(self: *QueueHandler, cmd_result: CommandResult) void {
         switch (cmd_result) {
             .queue_messages => |r| self.allocator.free(r.data),
-            .queue_peek_messages => |r| self.allocator.free(r.data),
             .queue_dlq_messages => |r| self.allocator.free(r.data),
             else => {},
         }
@@ -782,9 +818,6 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
             shard.sendOkResponse(conn, request_id, &seq_buf);
         },
         .queue_messages => |m| {
-            shard.sendOkResponse(conn, request_id, m.data);
-        },
-        .queue_peek_messages => |m| {
             shard.sendOkResponse(conn, request_id, m.data);
         },
         .queue_dlq_messages => |m| {
@@ -906,15 +939,59 @@ fn serializeStats(allocator: Allocator, stats: QueueProjection.Stats, ready: usi
 
 /// Serialize DLQ summary.
 /// Wire format: [count:u32][total_dlq:u64]
-fn serializeDlqSummary(allocator: Allocator, dlq_count: usize) ![]u8 {
-    const total: usize = 4 + 8;
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
+/// The most dead letters one page lists, and the most of each payload.
+const MAX_DLQ_PAGE: u32 = 100;
+const MAX_DLQ_PAYLOAD: usize = 4096;
+/// `[total:u64][has_more:u8][last_seq:u64]` after a page's entries.
+const DLQ_TRAILER: usize = 8 + 1 + 8;
 
-    std.mem.writeInt(u32, buf[0..4], 0, .little); // 0 entries in list (summary only)
-    std.mem.writeInt(u64, buf[4..12], @intCast(dlq_count), .little);
-
-    return buf;
+/// A page of a queue's dead letters, oldest first:
+///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
+///                [attempts:u32][priority:u8][moved_at_ms:i64])*
+///   [total:u64][has_more:u8][last_seq:u64]
+/// Each payload is cut to 4 KiB (`size` is its whole length). The page
+/// stops at `limit` or where the next entry wouldn't fit one answer. It
+/// starts after the entry whose seq is `after`; if that one was evicted
+/// since, from the oldest. The list is capped at the queue's DLQ limit, so
+/// finding it is bounded.
+fn serializeDlqPage(allocator: Allocator, q: *const QueueProjection, queue_hash: u64, limit: u32, after: ?u64) ![]u8 {
+    const dead = q.deadLetters(queue_hash);
+    var start: usize = 0;
+    if (after) |seq| for (dead, 0..) |d, i| {
+        if (d.seq == seq) {
+            start = i + 1;
+            break;
+        }
+    };
+    var w: std.Io.Writer.Allocating = .init(allocator);
+    errdefer w.deinit();
+    try w.writer.writeInt(u32, 0, .little);
+    var count: u32 = 0;
+    var last: u64 = 0;
+    var next = start;
+    while (next < dead.len and count < limit) : (next += 1) {
+        const d = dead[next];
+        const msg = q.messages.get(d.seq) orelse continue;
+        const shown = msg.payload[0..@min(msg.payload.len, MAX_DLQ_PAYLOAD)];
+        const size = 8 + 4 + 4 + shown.len + 8 + 4 + 1 + 8;
+        if (w.written().len + size + DLQ_TRAILER > ops.MAX_RESPONSE_BODY) break;
+        try w.writer.writeInt(u64, d.seq, .little);
+        try w.writer.writeInt(u32, @intCast(msg.payload.len), .little);
+        try w.writer.writeInt(u32, @intCast(shown.len), .little);
+        try w.writer.writeAll(shown);
+        try w.writer.writeInt(i64, @intCast(msg.enqueued_at_ns / std.time.ns_per_ms), .little);
+        try w.writer.writeInt(u32, d.attempts, .little);
+        try w.writer.writeInt(u8, @intCast(@min(msg.priority, 255)), .little);
+        try w.writer.writeInt(i64, @intCast(d.moved_at_ns / std.time.ns_per_ms), .little);
+        count += 1;
+        last = d.seq;
+    }
+    try w.writer.writeInt(u64, dead.len, .little);
+    try w.writer.writeByte(@intFromBool(next < dead.len));
+    try w.writer.writeInt(u64, last, .little);
+    const out = try w.toOwnedSlice();
+    std.mem.writeInt(u32, out[0..4], count, .little);
+    return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1235,24 +1312,6 @@ test "queue handler: pre-route by queue" {
     try testing.expect(QueueHandler.preRouteByQueue(req1) != QueueHandler.preRouteByQueue(req_ns));
 }
 
-test "queue handler: peek empty" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    const result = handler.handleCommand(makeRequest(.queue_peek, "q1", "", ""));
-    switch (result) {
-        .queue_peek_messages => |m| {
-            defer handler.freeResult(result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
 test "queue handler: an ack batch naming another queue's message is refused whole" {
     const allocator = testing.allocator;
     const partition = try initTestPartition(allocator);
@@ -1369,4 +1428,68 @@ test "queue handler: a listing gives each queue its own dead-letter count" {
         seen += 1;
     }
     try testing.expectEqual(@as(usize, 2), seen);
+}
+
+/// `n` messages of `size` bytes dead-lettered in queue 42 of `q`, the
+/// oldest first: each dequeued and nacked past its last attempt.
+fn deadLetter(q: *QueueProjection, n: usize, size: usize) !void {
+    q.max_attempts = 1;
+    const payload = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'p');
+    for (0..n) |i| {
+        const seq = try q.enqueue(i, 0, i, 42, payload);
+        _ = (try q.dequeue(i, 42)).?;
+        try q.nack(seq, 1000 + i);
+    }
+}
+
+test "queue handler: a dead-letter page lists oldest first, and the next starts after its last" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    const q = &partition.queue;
+    try deadLetter(q, 5, 3);
+
+    const first = try serializeDlqPage(allocator, q, 42, 2, null);
+    defer allocator.free(first);
+    const p1 = client_queue.DlqPage.decode(first).?;
+    try testing.expectEqual(@as(u32, 2), p1.count);
+    try testing.expectEqual(@as(u64, 5), p1.total);
+    try testing.expect(p1.more);
+    var it = p1.iterator();
+    try testing.expectEqual(@as(u64, 1), it.next().?.seq);
+    try testing.expectEqual(@as(u64, 2), it.next().?.seq);
+
+    const rest = try serializeDlqPage(allocator, q, 42, MAX_DLQ_PAGE, p1.last_seq);
+    defer allocator.free(rest);
+    const p2 = client_queue.DlqPage.decode(rest).?;
+    try testing.expectEqual(@as(u32, 3), p2.count);
+    try testing.expect(!p2.more);
+    var it2 = p2.iterator();
+    try testing.expectEqual(@as(u64, 3), it2.next().?.seq);
+
+    // Another queue's are its own.
+    const none = try serializeDlqPage(allocator, q, 7, MAX_DLQ_PAGE, null);
+    defer allocator.free(none);
+    try testing.expectEqual(@as(u64, 0), client_queue.DlqPage.decode(none).?.total);
+}
+
+test "queue handler: a dead-letter page of full-size payloads stops where one answer ends" {
+    const allocator = testing.allocator;
+    const partition = try initTestPartition(allocator);
+    defer deinitTestPartition(allocator, partition);
+    const q = &partition.queue;
+    try deadLetter(q, MAX_DLQ_PAGE, 2 * MAX_DLQ_PAYLOAD);
+
+    const page = try serializeDlqPage(allocator, q, 42, MAX_DLQ_PAGE, null);
+    defer allocator.free(page);
+    try testing.expect(page.len <= ops.MAX_RESPONSE_BODY);
+    const p = client_queue.DlqPage.decode(page).?;
+    try testing.expect(p.count > 0 and p.count < MAX_DLQ_PAGE);
+    try testing.expect(p.more);
+    var it = p.iterator();
+    const e = it.next().?;
+    try testing.expectEqual(@as(usize, MAX_DLQ_PAYLOAD), e.payload.len);
+    try testing.expectEqual(@as(u32, 2 * MAX_DLQ_PAYLOAD), e.size);
 }

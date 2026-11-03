@@ -1294,6 +1294,7 @@ pub const Shard = struct {
         self.allocator.destroy(self.kv_handler);
         self.stream_handler.deinit();
         self.allocator.destroy(self.stream_handler);
+        self.queue_handler.deinit();
         self.allocator.destroy(self.queue_handler);
         self.allocator.destroy(self.ts_handler);
 
@@ -8847,6 +8848,68 @@ test "Shard: worker.list on a node of two shards lists both shards' workers, in 
     try f.expectSettled(0);
 }
 
+test "Shard: stream.group.members answers the named group's members, and a group that isn't there is not found" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    // Each shard holds the group: the request is answered by whichever owns the stream.
+    for (&f.two.shards) |*s| {
+        try s.stream_handler.stream.createGroup("s\x00g", 1_000_000);
+        _ = try s.stream_handler.stream.getGroup("s\x00g").?.join("c-1", 2_000_000);
+        try s.stream_handler.stream.createGroup("s\x00other", 1_000_000);
+    }
+    const a = &f.two.shards[0];
+    const Members = table_run.op("stream.group.members");
+    var body_buf: [Members.request.max_size]u8 = undefined;
+    for ([_][]const u8{ "g", "nope" }, 0..) |group, i| {
+        const body = try Members.request.encodeInto(&body_buf, .{ .group = group });
+        a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.stream_group_members, 300 + i), .namespace = "default", .key = "s", .value = body }, .client);
+        f.two.settle();
+        const resp = try f.answer();
+        if (i == 1) {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), resp.header.status);
+            continue;
+        }
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+        var diag: schema.Diagnostic = .{};
+        const v = try Members.response.decodeAll(resp.data, &diag);
+        var it = v.members.iterator();
+        const m = (try it.next()).?;
+        try std.testing.expectEqualStrings("c-1", m.id);
+        try std.testing.expectEqual(@as(i64, 2), m.joined_at_ms);
+        try std.testing.expect((try it.next()) == null);
+        try std.testing.expect(!v.more);
+    }
+    try f.expectSettled(0);
+}
+
+test "Shard: queue.peek shows as many of the next ready messages as its limit asks, and takes none" {
+    var f: MgetGatherFixture = undefined;
+    try f.init(8);
+    defer f.deinit();
+    const q_hash = node_router.nameHash(node_router.namespaceHash("default"), "q");
+    for (&f.two.shards) |*s| {
+        for ([_][]const u8{ "m1", "m2", "m3" }, 0..) |m, i| _ = try s.defaultPartition().queue.enqueue(i + 1, 0, i + 1, q_hash, m);
+    }
+    const a = &f.two.shards[0];
+    const Peek = table_run.op("queue.peek");
+    var body_buf: [Peek.request.max_size]u8 = undefined;
+    const body = try Peek.request.encodeInto(&body_buf, .{ .limit = 2 });
+    a.runRequest(f.client.conn, .{ .header = proto.RequestHeader.init(.queue_peek, 400), .namespace = "default", .key = "q", .value = body }, .client);
+    f.two.settle();
+    const resp = try f.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const v = try Peek.response.decodeAll(resp.data, &diag);
+    var it = v.messages.iterator();
+    try std.testing.expectEqualStrings("m1", (try it.next()).?.payload);
+    try std.testing.expectEqualStrings("m2", (try it.next()).?.payload);
+    try std.testing.expect((try it.next()) == null);
+    try std.testing.expect(v.more);
+    for (&f.two.shards) |*s| try std.testing.expectEqual(@as(u64, 3), s.defaultPartition().queue.liveCounts(q_hash).ready);
+    try f.expectSettled(0);
+}
+
 test "Shard: a kv.mget of no keys on a node of several shards answers empty, with no gather" {
     var f: MgetGatherFixture = undefined;
     try f.init(8);
@@ -14440,9 +14503,9 @@ test "Shard: a handler answering its own request as deferred is caught, and answ
             sh.deliverDeferredOk(conn.replyTo(), req.header.request_id, "only-answer");
         }
     };
-    shard.dispatcher.register(.queue_peek, SelfDeferred.handle);
+    shard.dispatcher.register(.queue_stats, SelfDeferred.handle);
 
-    const frame = try testRequest(.queue_peek, 9, "q", "");
+    const frame = try testRequest(.queue_stats, 9, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;
@@ -14472,9 +14535,9 @@ test "Shard: a refusal longer than its frame is sent cut, under its id, and alon
             sh.sendErrorResponse(conn, req.header.request_id, .bad_request, stdx.repeat("€", 666) ++ "xx");
         }
     };
-    shard.dispatcher.register(.queue_peek, Long.handle);
+    shard.dispatcher.register(.queue_stats, Long.handle);
 
-    const frame = try testRequest(.queue_peek, 11, "q", "");
+    const frame = try testRequest(.queue_stats, 11, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;
@@ -14505,9 +14568,9 @@ test "Shard: a request whose handler answers nothing is answered internal_error 
     const Silent = struct {
         fn handle(_: *anyopaque, _: *anyopaque, _: proto.Request) void {}
     };
-    shard.dispatcher.register(.queue_peek, Silent.handle);
+    shard.dispatcher.register(.queue_stats, Silent.handle);
 
-    const frame = try testRequest(.queue_peek, 12, "q", "");
+    const frame = try testRequest(.queue_stats, 12, "q", "");
     defer std.testing.allocator.free(frame);
     _ = feedClient(c.pair[1], &shard, c.conn.fd, frame);
     var one: [1]proto.Response = undefined;

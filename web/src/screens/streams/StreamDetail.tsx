@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { DASH, cfmt, jhl, orDash, tfmt } from '@/lib/format'
 import { useNamespace } from '@/lib/namespace'
-import { useStreamDetail, useStreamMessages } from '@/lib/api/streams'
+import { useStreamDetail, useStreamGroupMembers, useStreamMessages } from '@/lib/api/streams'
 import { Crumb, Stats, Stat } from '@/components/layout'
 import { Button } from '@/components/buttons/Button'
 import { Pill, Dot } from '@/components/feedback'
@@ -12,6 +12,56 @@ type Tab = 'data' | 'groups' | 'pel'
 
 const CATS = ['var(--cat-2)', 'var(--cat-3)', 'var(--cat-4)', 'var(--cat-5)', 'var(--cat-6)', 'var(--cat-1)']
 
+// Members, pending entries and last-delivered times aren't replicated.
+const LEADER_NOTE = 'Members, pending and last-delivered are held on the stream’s leader; a leader change resets them.'
+
+/** "ms-seq" → [ms, seq]; [0, 0] when the group has had nothing delivered. */
+function parseId(id: string): [number, number] {
+  const [ms, seq] = id.split('-').map(Number)
+  return [Number.isFinite(ms) ? ms : 0, Number.isFinite(seq) ? seq : 0]
+}
+const cellNote = { padding: '28px 0', textAlign: 'center' as const, color: 'var(--tx-3)', fontSize: 13 }
+const footNote = { fontSize: 11.5, color: 'var(--tx-faint)', padding: '10px 0 0' }
+
+function GroupMembers({ ns, stream, group }: { ns: string; stream: string; group: string }) {
+  const q = useStreamGroupMembers(ns, stream, group)
+  const members = q.data?.members
+  const cols = 'minmax(150px,1.6fr) 80px 80px 130px 130px'
+  return (
+    <div style={{ padding: '4px 0 14px 22px' }}>
+      {q.isLoading ? (
+        <div style={footNote}>Loading members…</div>
+      ) : q.isError ? (
+        <div style={footNote}>{(q.error as Error)?.message || 'Members couldn’t be loaded'}</div>
+      ) : members == null ? (
+        <div style={footNote}>Members couldn’t be read.</div>
+      ) : members.length === 0 ? (
+        <div style={footNote}>No members.</div>
+      ) : (
+        <>
+          <div className="grow head" style={{ gridTemplateColumns: cols }}>
+            <div>Member</div>
+            <div>State</div>
+            <div className="r">Pending</div>
+            <div className="r">Joined</div>
+            <div className="r">Last delivered</div>
+          </div>
+          {members.map((m) => (
+            <div className="grow" key={m.id} style={{ gridTemplateColumns: cols }}>
+              <span className="mono" style={{ fontSize: 12.5, color: 'var(--tx-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.id}</span>
+              <span className="mono" style={{ fontSize: 12, color: m.state === 'leaving' ? 'var(--warn)' : 'var(--tx-3)' }}>{m.state}</span>
+              <span className="r mono" style={{ fontSize: 13, color: m.pending > 0 ? 'var(--warn)' : 'var(--tx-3)' }}>{m.pending}</span>
+              <span className="r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{tfmt(m.joined_at)}</span>
+              <span className="r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{orDash(m.last_delivered_at, tfmt)}</span>
+            </div>
+          ))}
+          {q.data?.members_more && <div style={footNote}>More members than shown.</div>}
+        </>
+      )}
+    </div>
+  )
+}
+
 export function StreamDetail({ name, onBack }: { name: string; onBack: () => void }) {
   const { ns } = useNamespace()
   const detailQ = useStreamDetail(ns, name)
@@ -19,13 +69,15 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
   const [tab, setTab] = useState<Tab>('data')
   const [cursor, setCursor] = useState(0)
   const [picked, setPicked] = useState<Rec | null>(null)
+  const [openGroup, setOpenGroup] = useState<string | null>(null)
   const seekRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<'s' | 'e' | 'c' | null>(null)
 
   const detail = detailQ.data
   const recordCount = detail?.total_count ?? msgsQ.data?.total_count ?? 0
-  // Null: no op lists a stream's groups yet. Unknown is not "no groups".
+  // Null only when the read was refused. Unknown is not "no groups".
   const groupsKnown = !detail || detail.consumer_groups != null
+  const groupsMore = detail?.consumer_groups_more ?? false
 
   // Build records (ascending) + bucket them by TIME (a real activity histogram:
   // bursts → tall bars, quiet stretches → short). Bar height = total bytes per
@@ -69,20 +121,24 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
     }
   }, [records, N])
 
-  // Map each consumer group onto a bucket by its last-delivered timestamp.
+  // Map each consumer group onto a bucket by its last-delivered id. Lag
+  // counts only the loaded window, so it's a floor on a long stream.
   const gpos = useMemo(() => {
     const groups = detail?.consumer_groups ?? []
     return groups.map((g, k) => {
+      const [ms, seq] = parseId(g.last_delivered_id)
+      const after = (r: Rec) => r.ts > ms || (r.ts === ms && r.seq > seq)
       let bucket = 0
       for (let i = 0; i < records.length; i++) {
-        if (records[i].ts <= g.last_delivered_ms) bucket = records[i].bucket
+        if (!after(records[i])) bucket = records[i].bucket
         else break
       }
-      if (g.last_delivered_ms === 0) bucket = 0
-      const lag = records.filter((r) => r.ts > g.last_delivered_ms).length
-      return { ...g, color: CATS[k % CATS.length], bucket, lag, pct: ((bucket + 0.5) / N) * 100 }
+      const lag = records.filter(after).length
+      return { ...g, last_ms: ms, color: CATS[k % CATS.length], bucket, lag, pct: ((bucket + 0.5) / N) * 100 }
     })
   }, [detail, records, N])
+  const groupCount = groupsKnown ? gpos.length + (groupsMore ? '+' : '') : DASH
+  const pendingTotal = gpos.reduce((a, g) => a + g.pending, 0)
 
   const maxBytes = Math.max(1, ...bucketBytes)
   const maxLag = Math.max(0, ...gpos.map((g) => g.lag))
@@ -135,18 +191,18 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
       <div className="ph">
         <h1 className="ph-t">{name}</h1>
         <div className="ph-s">
-          {detail?.namespace ?? ns} · {groupsKnown ? gpos.length : DASH} consumer group{gpos.length === 1 ? '' : 's'} · retention {detail?.retention ?? '…'}
+          {detail?.namespace ?? ns} · {groupCount} consumer group{gpos.length === 1 ? '' : 's'} · retention {detail?.retention ?? '…'}
         </div>
       </div>
 
       <Stats>
         <Stat label="Records" value={cfmt(recordCount)} sub="in stream" />
-        <Stat label="Consumer groups" value={groupsKnown ? gpos.length : DASH} sub={groupsKnown ? undefined : 'not available yet'} />
+        <Stat label="Consumer groups" value={groupCount} sub={groupsKnown ? (groupsMore ? `first ${gpos.length} shown` : undefined) : 'couldn’t be read'} />
         <Stat
           label="Max lag"
           value={groupsKnown ? cfmt(maxLag) : DASH}
           valueColor={maxLag > 0 ? 'var(--warn)' : undefined}
-          sub={!groupsKnown ? 'not available yet' : maxLag > 0 ? 'behind' : 'caught up'}
+          sub={!groupsKnown ? 'couldn’t be read' : maxLag > 0 ? 'behind, in loaded window' : 'caught up'}
         />
         <Stat label="Loaded" value={records.length} sub="recent window" />
       </Stats>
@@ -217,7 +273,7 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
           {(
             [
               ['data', 'Stream data' + (fullRange ? '' : ' · ' + inRange.length)],
-              ['groups', 'Consumer groups · ' + (groupsKnown ? gpos.length : DASH)],
+              ['groups', 'Consumer groups · ' + groupCount],
               ['pel', 'Pending'],
             ] as [Tab, string][]
           ).map(([id, lbl]) => (
@@ -272,9 +328,9 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
         {tab === 'groups' && (
           <div className="card card-p" style={{ padding: '6px 20px 12px' }}>
             {!groupsKnown ? (
-              <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--tx-3)', fontSize: 13 }}>Consumer groups not available yet.</div>
+              <div style={cellNote}>Consumer groups couldn’t be read.</div>
             ) : gpos.length === 0 ? (
-              <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--tx-3)', fontSize: 13 }}>No consumer groups.</div>
+              <div style={cellNote}>No consumer groups.</div>
             ) : (
               <>
                 <div className="grow head" style={{ gridTemplateColumns: 'minmax(150px,1.6fr) 90px 90px 90px 130px' }}>
@@ -285,19 +341,30 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
                   <div className="r">Last delivered</div>
                 </div>
                 {gpos.map((g) => (
-                  <div className="grow" key={g.name} style={{ gridTemplateColumns: 'minmax(150px,1.6fr) 90px 90px 90px 130px' }}>
-                    <span style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
-                      <Dot color={g.color} style={{ flex: 'none' }} />
-                      <span className="gn" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{g.name}</span>
-                    </span>
-                    <span className="r mono" style={{ color: 'var(--tx-2)', fontSize: 13 }}>{orDash(g.members)}</span>
-                    <span className="r mono" style={{ fontSize: 13, color: g.pending_count > 0 ? 'var(--warn)' : 'var(--tx-3)' }}>{g.pending_count}</span>
-                    <span className="r mono" style={{ fontSize: 13, color: g.lag > 0 ? 'var(--warn)' : 'var(--accent)' }}>{g.lag}</span>
-                    <span className="r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
-                      {g.last_delivered_ms ? tfmt(g.last_delivered_ms) : '—'}
-                    </span>
+                  <div key={g.name}>
+                    <div
+                      className="grow"
+                      style={{ gridTemplateColumns: 'minmax(150px,1.6fr) 90px 90px 90px 130px', cursor: 'pointer', background: openGroup === g.name ? 'var(--hover)' : undefined }}
+                      onClick={() => setOpenGroup(openGroup === g.name ? null : g.name)}
+                      title={`ack timeout ${g.ack_timeout_ms} ms · max deliver ${g.max_deliver || '∞'} · created ${tfmt(g.created_at)}`}
+                    >
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
+                        <Dot color={g.color} style={{ flex: 'none' }} />
+                        <span className="gn" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{g.name}</span>
+                      </span>
+                      <span className="r mono" style={{ color: 'var(--tx-2)', fontSize: 13 }}>{g.members}</span>
+                      <span className="r mono" style={{ fontSize: 13, color: g.pending > 0 ? 'var(--warn)' : 'var(--tx-3)' }}>{g.pending}</span>
+                      <span className="r mono" style={{ fontSize: 13, color: g.lag > 0 ? 'var(--warn)' : 'var(--accent)' }}>{g.lag}</span>
+                      <span className="r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>
+                        {g.last_ms ? tfmt(g.last_ms) : DASH}
+                      </span>
+                    </div>
+                    {openGroup === g.name && <GroupMembers ns={ns} stream={name} group={g.name} />}
                   </div>
                 ))}
+                <div style={footNote}>
+                  {groupsMore ? `First ${gpos.length} groups shown · ` : ''}Click a group for its members. {LEADER_NOTE}
+                </div>
               </>
             )}
           </div>
@@ -306,10 +373,11 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
         {tab === 'pel' && (
           <div className="card card-p" style={{ color: 'var(--tx-3)', fontSize: 13.5, textAlign: 'center', padding: '40px 24px' }}>
             {!groupsKnown
-              ? 'Pending entries not available yet.'
-              : gpos.reduce((a, g) => a + g.pending_count, 0) > 0
-              ? `${gpos.reduce((a, g) => a + g.pending_count, 0)} pending entries across ${gpos.length} group(s).`
+              ? 'Pending entries couldn’t be read.'
+              : pendingTotal > 0
+              ? `${pendingTotal} pending entries across ${gpos.length} group(s).`
               : 'No pending entries — all groups have acknowledged.'}
+            {groupsKnown && <div style={{ ...footNote, paddingTop: 12 }}>{LEADER_NOTE}</div>}
           </div>
         )}
       </div>

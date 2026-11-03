@@ -41,6 +41,10 @@ const wire = @import("../util/wire.zig");
 const ns_keys = @import("../namespace/handler.zig");
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
+const table_run = @import("../node/table_run.zig");
+const stream_ops = @import("../protocol/stream_ops.zig");
+const GroupListResponse = table_run.op("stream.group.list").response;
+const GroupMembersResponse = table_run.op("stream.group.members").response;
 
 const CommandResult = result_mod.CommandResult;
 const StreamProjection = stream_mod.StreamProjection;
@@ -98,6 +102,8 @@ pub const StreamHandler = struct {
     /// Backs a refusal message that names request values; sent before the
     /// next command runs.
     err_buf: [128]u8 = undefined,
+    /// A group list or members answer, encoded after the handler returns.
+    list_buf: ?[]u8 = null,
 
     /// Maximum number of messages in a single read response.
     pub const MAX_READ_BATCH: usize = proto.MAX_STREAM_READ_RECORDS;
@@ -119,7 +125,7 @@ pub const StreamHandler = struct {
     }
 
     pub fn deinit(self: *StreamHandler) void {
-        _ = self;
+        if (self.list_buf) |b| self.allocator.free(b);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -149,6 +155,102 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_group_touch, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_claim, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_configure_sweeper, dispatchStream, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_list, table_run.handler("stream.group.list", StreamHandler, runGroupList), preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_members, table_run.handler("stream.group.members", StreamHandler, runGroupMembers), preRouteByStream);
+    }
+
+    // ── Group list and members ──────────────────────────────────────────
+
+    pub const Error = error{ OutOfMemory, NameTooLong };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory to list this; retry") },
+            error.NameTooLong => .{ .status = .bad_request, .refusal = proto.notRun("bad request: stream or group name too long") },
+        };
+    }
+
+    fn answerBuf(self: *StreamHandler) Error![]u8 {
+        if (self.list_buf) |b| return b;
+        const b = try self.allocator.alloc(u8, @max(stream_ops.Groups.byte_bound.?, stream_ops.Members.byte_bound.?));
+        self.list_buf = b;
+        return b;
+    }
+
+    /// The stream's groups, a prefix scan of the partition's groups, keyed
+    /// `[ns\0]stream\0group`. A key whose rest holds another NUL is a
+    /// longer qualified stream's, never this one's.
+    fn runGroupList(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(GroupListResponse) {
+        const self = shard.stream_handler;
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const prefix = ns_keys.qualifyGroupKey(&q_buf, req.namespace, req.key, "") catch return error.NameTooLong;
+        // By name, so a list that doesn't fit always shows the same first ones.
+        const Named = struct { name: []const u8, g: *const stream_mod.ConsumerGroup };
+        var found: std.ArrayList(Named) = .empty;
+        defer found.deinit(self.allocator);
+        var it = self.stream.groups.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const name = key[prefix.len..];
+            if (std.mem.indexOfScalar(u8, name, 0) != null) continue;
+            try found.append(self.allocator, .{ .name = name, .g = e.value_ptr });
+        }
+        std.mem.sort(Named, found.items, {}, struct {
+            fn lessThan(_: void, a: Named, b: Named) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lessThan);
+        var out = stream_ops.Groups.Builder.init(try self.answerBuf());
+        var more = false;
+        for (found.items) |f| {
+            const name = f.name;
+            const g = f.g;
+            const added = out.add(.{
+                .name = name,
+                .members = @intCast(g.members.count()),
+                .pending = g.pel.count(),
+                .created_at_ms = @intCast(g.created_at_ns / std.time.ns_per_ms),
+                .ack_timeout_ms = g.ack_timeout_ms,
+                .max_deliver = g.max_deliver,
+                .last_delivered_ms = g.last_delivered_id.timestamp_ms,
+                .last_delivered_seq = g.last_delivered_id.sequence,
+            }) catch false;
+            if (!added) {
+                more = true;
+                break;
+            }
+        }
+        return .{ .answer = .{ .groups = out.value(), .more = more } };
+    }
+
+    /// A group's members. A group that isn't there is not found.
+    fn runGroupMembers(shard: *Shard, _: *Connection, req: Request, group: []const u8) Error!table_run.Outcome(GroupMembersResponse) {
+        const self = shard.stream_handler;
+        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+        const key = resolveGroupName(&q_buf, req.namespace, req.key, group) orelse return error.NameTooLong;
+        const g = self.stream.getGroup(key) orelse
+            return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
+        var out = stream_ops.Members.Builder.init(try self.answerBuf());
+        var more = false;
+        var it = g.members.valueIterator();
+        while (it.next()) |m| {
+            const added = out.add(.{
+                .id = m.id,
+                .state = switch (m.state) {
+                    .active => .active,
+                    .leaving => .leaving,
+                },
+                .pending = m.pending_count,
+                .joined_at_ms = @intCast(m.joined_at_ns / std.time.ns_per_ms),
+                .last_active_ms = if (m.last_active_ms == 0) null else @intCast(m.last_active_ms),
+            }) catch false;
+            if (!added) {
+                more = true;
+                break;
+            }
+        }
+        return .{ .answer = .{ .members = out.value(), .more = more } };
     }
 
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
@@ -2273,8 +2375,10 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.stream_alter));
 
     try testing.expect(dispatcher.hasHandler(OpCode.stream_delete));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_list));
+    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_members));
 
-    try testing.expectEqual(@as(u16, 20), dispatcher.handler_count);
+    try testing.expectEqual(@as(u16, 22), dispatcher.handler_count);
 }
 
 test "stream handler: append" {

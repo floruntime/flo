@@ -25,6 +25,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+/// The largest response a test reads: past it, a test fails loudly rather
+/// than check a cut-short body.
+const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+
 /// HTTP Response from a request
 pub const HttpResponse = struct {
     allocator: Allocator,
@@ -248,24 +252,22 @@ pub const HttpRunner = struct {
             _ = try stream.write(b);
         }
 
-        // Read response
-        var response_buf: [65536]u8 = undefined;
-        var total_read: usize = 0;
-
-        // Read until connection closes or we have a complete response
-        while (total_read < response_buf.len) {
-            const bytes_read = stream.read(response_buf[total_read..]) catch |err| switch (err) {
+        // Read the whole response, until the connection closes. A fixed
+        // buffer would cut a large one short and pass it off as whole.
+        var response: std.ArrayList(u8) = .empty;
+        defer response.deinit(self.allocator);
+        var chunk: [65536]u8 = undefined;
+        while (true) {
+            const bytes_read = stream.read(&chunk) catch |err| switch (err) {
                 error.ConnectionResetByPeer => break,
                 else => return err,
             };
             if (bytes_read == 0) break;
-            total_read += bytes_read;
+            if (response.items.len + bytes_read > MAX_RESPONSE) return error.ResponseTooLarge;
+            try response.appendSlice(self.allocator, chunk[0..bytes_read]);
         }
 
-        const response_data = response_buf[0..total_read];
-
-        // Parse response
-        return self.parseResponse(response_data);
+        return self.parseResponse(response.items);
     }
 
     fn hasHeader(headers: ?[]const [2][]const u8, name: []const u8) bool {

@@ -18,6 +18,8 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const loopback = @import("loopback.zig");
+const schema = @import("../../../protocol/schema.zig");
+const queue_ops = @import("../../../protocol/queue_ops.zig");
 const namespaces_api = @import("namespaces.zig");
 const output = @import("../../../cli/output.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
@@ -145,34 +147,79 @@ pub fn getQueueDetail(allocator: Allocator, queue_name: []const u8, query_string
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /queues/:name/messages - No op lists a queue's messages yet, so this
-/// says so rather than answer an empty list.
+/// GET /queues/:name/messages?namespace=&limit= - The queue's next ready
+/// messages, in the order a dequeue takes them, none taken (`queue.peek`,
+/// on the queue's leader). Up to `limit` (default 20, at most 100), fewer
+/// when their payloads fill the answer; `more` says more may follow.
 pub fn getQueueMessages(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = queue_name;
-    _ = query_string;
-    _ = ctx;
-    return try h.jsonError(allocator, "queue messages are not available yet");
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 20, 1, queue_ops.MAX_PEEK);
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue peek", err);
+    defer reader.deinit();
+    const Peek = queue_ops.op("queue.peek");
+    var got = reader.call(Peek, ns_q, queue_name, .{ .limit = limit }) catch |err| return try loopback.readFailed(allocator, "queue peek", err);
+    defer got.deinit();
+
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    try obj.stringField("queue", queue_name);
+    {
+        var arr = try obj.arrayField("messages");
+        try arr.begin();
+        // A namespace never created holds none.
+        if (!got.isNotFound()) {
+            if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
+            var diag: schema.Diagnostic = .{};
+            const page = Peek.response.decodeAll(got.data, &diag) catch return try h.jsonError(allocator, "queue peek: malformed answer");
+            var it = page.messages.iterator();
+            while (it.next() catch return try h.jsonError(allocator, "queue peek: malformed answer")) |m| {
+                try arr.next();
+                var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+                try mobj.begin();
+                try mobj.intField("seq", m.seq);
+                try mobj.intField("priority", m.priority);
+                try mobj.intField("attempts", m.attempts);
+                try mobj.intField("enqueued_at", m.enqueued_at_ms);
+                try mobj.intField("size", m.size);
+                try mobj.stringField("payload", m.payload);
+                try mobj.boolField("truncated", m.size > m.payload.len);
+                try mobj.end();
+            }
+            try arr.end();
+            try obj.boolField("more", page.more);
+            try obj.end();
+            return try json_aw.toOwnedSlice();
+        }
+        try arr.end();
+    }
+    try obj.boolField("more", false);
+    try obj.end();
+    return try json_aw.toOwnedSlice();
 }
 
-/// GET /queues/:name/dlq?namespace= - The queue's dead-letter count, from
-/// `queue_dlq_list`. No op lists the entries yet: `entries` is null.
+/// GET /queues/:name/dlq?namespace=&limit=&after= - A page of the queue's
+/// dead letters, oldest first (`queue_dlq_list`): up to `limit` (at most
+/// 100), after the entry whose seq is `after`, the last of the page before.
 pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    const limit = std.math.clamp(h.parseQueryParam(u32, query_string, "limit") orelse 100, 1, 100);
+    const after = h.parseQueryParam(u64, query_string, "after");
 
     var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "queue dlq", err);
     defer reader.deinit();
     const client = reader.next() catch |err| return try loopback.readFailed(allocator, "queue dlq", err);
-    var got = client_mod.queue.dlqList(client, ns_q, queue_name) catch |err|
+    var got = client_mod.queue.dlqList(client, ns_q, queue_name, limit, after) catch |err|
         return try loopback.readFailed(allocator, "queue dlq", err);
     defer got.deinit();
     if (got.isError() and !got.isNotFound()) return try h.jsonError(allocator, got.errorMessage());
-    // [count:u32 = 0][total_dlq:u64]: a summary, no entries. A namespace
-    // never created holds none.
-    var r = WireReader.init(got.data);
-    const total: u64 = if (got.isNotFound()) 0 else blk: {
-        _ = r.readU32() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
-        break :blk r.readU64() orelse return try h.jsonError(allocator, "queue dlq: malformed answer");
-    };
+    // A namespace never created holds none.
+    const empty: client_mod.queue.DlqPage = .{ .count = 0, .entries = "", .total = 0, .more = false, .last_seq = 0 };
+    const page = if (got.isNotFound()) empty else client_mod.queue.DlqPage.decode(got.data) orelse
+        return try h.jsonError(allocator, "queue dlq: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer json_aw.deinit();
@@ -180,8 +227,29 @@ pub fn getQueueDLQ(allocator: Allocator, queue_name: []const u8, query_string: ?
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
-    try obj.nullField("entries");
-    try obj.intField("count", total);
+    {
+        var arr = try obj.arrayField("entries");
+        try arr.begin();
+        var it = page.iterator();
+        while (it.next()) |d| {
+            try arr.next();
+            var e = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+            try e.begin();
+            try e.intField("seq", d.seq);
+            try e.intField("attempts", d.attempts);
+            try e.intField("priority", d.priority);
+            try e.intField("enqueued_at", d.enqueued_at_ms);
+            try e.intField("moved_at", d.moved_at_ms);
+            try e.intField("size", d.size);
+            try e.stringField("payload", d.payload);
+            try e.boolField("truncated", d.size > d.payload.len);
+            try e.end();
+        }
+        try arr.end();
+    }
+    try obj.intField("count", page.total);
+    try obj.boolField("has_more", page.more);
+    if (page.more) try obj.intField("next_after", page.last_seq) else try obj.nullField("next_after");
     try obj.stringField("queue", queue_name);
     try obj.end();
     return try json_aw.toOwnedSlice();
@@ -303,7 +371,7 @@ test "queue reads say the node didn't answer, never an empty list" {
     }
 }
 
-test "queue messages and DLQ deletes say they are not available yet" {
+test "queue messages say the node didn't answer, and DLQ deletes that they can't be done yet" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
@@ -314,7 +382,7 @@ test "queue messages and DLQ deletes say they are not available yet" {
 
     const msgs = try getQueueMessages(allocator, "q", null, &ctx);
     defer allocator.free(msgs);
-    try std.testing.expectEqualStrings("{\"error\":\"queue messages are not available yet\"}", msgs);
+    try std.testing.expect(std.mem.startsWith(u8, msgs, "{\"error\":\"queue peek failed"));
     const del = try deleteDLQEntry(allocator, "q", "1", &ctx);
     defer allocator.free(del);
     try std.testing.expectEqualStrings("{\"error\":\"DLQ entries can't be deleted yet\"}", del);
