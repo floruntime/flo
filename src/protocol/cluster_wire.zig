@@ -12,7 +12,8 @@ pub const Status = struct {
     term: u64,
     /// 0 follower, 1 candidate, 2 leader, 3 joining, 4 diverged, 5 guarded
     /// and catching up, 6 guarded and confirming the term, 7 replica,
-    /// 8 removed.
+    /// 8 removed, 9 catching up after an async-durability restart (not yet
+    /// leading, electing included).
     state: u8,
     member_count: u32,
     /// A committed membership config another member vouched for while this

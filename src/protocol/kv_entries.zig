@@ -53,6 +53,14 @@ pub const Expire = Record(&.{
     .{ .name = "ttl_ms", .T = TtlMs },
 });
 pub const Batch = Record(&.{.{ .name = "ops", .T = BatchOps }});
+
+/// A batch's op count, from its list prefix, without decoding the ops: what
+/// the apply budget charges it. A payload too short to hold one counts 1.
+pub fn batchOpCount(payload: []const u8) u32 {
+    const n = BatchOps.min_size;
+    if (payload.len < n) return 1;
+    return std.mem.readInt(@Int(.unsigned, n * 8), payload[0..n], .little);
+}
 /// A JSON document's change at `path`: set to `document`, or deleted when
 /// there is none. Merged with the key's value at apply, so a write that
 /// lands in between is not lost.
@@ -155,4 +163,20 @@ test "kv entries: a batch cut anywhere or with an unknown kind is refused whole"
     @memcpy(bad[0..whole.len], whole);
     bad[2 + 1 + 2 + 1 + 1 + 4 + 1 + 1 + 1] = 9;
     try testing.expectError(error.Refused, Batch.decodeAll(bad[0..whole.len], &diag));
+}
+
+test "kv entries: a batch's op count is read from its prefix" {
+    var buf: [512]u8 = undefined;
+    var w = schema.Writer{ .buf = &buf };
+    const ops = [_]BatchOp.Value{
+        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null },
+        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null },
+        .{ .kind = .put, .key = "c", .value = "3", .ttl_ms = null, .delta = null },
+    };
+    try BatchOps.encodeSlice(&w, &ops);
+    // A batch is its list and nothing else, so the prefix leads the payload.
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@as(u32, 3), (try Batch.decodeAll(w.written(), &diag)).ops.count);
+    try std.testing.expectEqual(@as(u32, 3), batchOpCount(w.written()));
+    try std.testing.expectEqual(@as(u32, 1), batchOpCount(""));
 }
