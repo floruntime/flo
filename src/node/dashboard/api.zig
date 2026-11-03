@@ -511,7 +511,7 @@ test "route workflows alias maps to workflow definitions" {
 }
 
 test "route queue messages" {
-    try expectRoutedTo("queues/myq/messages", "queue messages are not available yet");
+    try expectRoutedTo("queues/myq/messages", "queue peek");
 }
 
 test "route queue dlq" {

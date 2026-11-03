@@ -111,6 +111,10 @@ pub const Op = struct {
     scope: Scope = .namespace,
     /// Goes to the leader. Defaults from the class.
     writes: ?bool = null,
+    /// A read the leader answers: what it reads lives only in the leader's
+    /// memory (a group's members, a queue's leases). Routing alone; it is a
+    /// read in every other way, and safe to retry.
+    at_leader: bool = false,
     /// May create its namespace; needs `writes`.
     creates: bool = false,
     /// The answer carries leased or claimed items, so it isn't dropped at
@@ -215,6 +219,7 @@ fn opRule(comptime op: Op, comptime before: []const Op) ?[]const u8 {
         if (std.mem.eql(u8, other.name, op.name)) return "declared twice";
     }
     if (op.creates and !op.isWrite()) return "creates its namespace but doesn't write";
+    if (op.at_leader and op.isWrite()) return "at_leader is for reads; a write goes to the leader already";
     if (op.request.kind != .record) return "request is not a schema.Record";
     if (op.response.kind != .record) return "response is not a schema.Record";
     if (schema.fitsRule(op.request, MAX_REQUEST_BODY, "request")) |m| return m;
@@ -388,6 +393,7 @@ pub fn tableHash(comptime ops: []const Op, comptime entries: anytype) u64 {
             hashNum(&h, @backingInt(op.scope));
             hashNum(&h, @intFromBool(op.isWrite()));
             hashNum(&h, @intFromBool(op.creates));
+            hashNum(&h, @intFromBool(op.at_leader));
             hashNum(&h, @intFromBool(op.takes_items));
             hashNum(&h, @backingInt(op.fanout));
             hashStr(&h, @tagName(op.route));
@@ -657,7 +663,7 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0xdd45521c688656a9), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0xe179cd20ab48eb87), comptime tableHash(&test_table, NoEntries));
 }
 
 test "ops: the hash covers which field a route names and a wait's default" {

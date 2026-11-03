@@ -88,6 +88,41 @@ test "e2e/dashboard: on many shards, lists hold every item of every namespace on
         }
     }
 
+    // A stream's groups are its own: st-07's in each namespace, a group by
+    // the namespace's name and one both have, with a member in it. A
+    // default-namespace stream named like a namespace ("na") holds none of
+    // that namespace's groups, though their keys start with its name.
+    try ctx.exec(&.{ "stream", "append", "na", "x" });
+    for (SPACES) |ns| {
+        try ctx.exec(&.{ "stream", "group", "create", "st-07", "--group", ns, "-n", ns });
+        try ctx.exec(&.{ "stream", "group", "create", "st-07", "--group", "both", "-n", ns });
+        try ctx.exec(&.{ "stream", "group", "join", "st-07", "both", "c-1", "-n", ns });
+    }
+    for (SPACES, [_][]const u8{ "nb", "na" }) |ns, other| {
+        var path_buf: [96]u8 = undefined;
+        var want_buf: [64]u8 = undefined;
+        var resp = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/streams/st-07?namespace={s}", .{ns}));
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        // By name: "both" then the namespace's own.
+        const want = try std.fmt.bufPrint(&want_buf, "\"consumer_groups\":[{{\"name\":\"both\",\"members\":1,", .{});
+        if (std.mem.indexOf(u8, resp.body, want) == null) std.debug.print("{s}\n", .{resp.body});
+        try testing.expect(std.mem.indexOf(u8, resp.body, want) != null);
+        try testing.expectEqual(@as(usize, 1), count(resp.body, try std.fmt.bufPrint(&want_buf, "{{\"name\":\"{s}\",\"members\":0,", .{ns})));
+        try testing.expectEqual(@as(usize, 0), count(resp.body, try std.fmt.bufPrint(&want_buf, "\"name\":\"{s}\"", .{other})));
+
+        var members = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/streams/st-07/groups/both/members?namespace={s}", .{ns}));
+        defer members.deinit();
+        try testing.expectEqual(@as(u16, 200), members.status);
+        try testing.expect(std.mem.indexOf(u8, members.body, "{\"members\":[{\"id\":\"c-1\",\"state\":\"active\",\"pending\":0,") != null);
+        var none = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/streams/st-07/groups/{s}/members?namespace={s}", .{ other, ns }));
+        defer none.deinit();
+        try testing.expectEqual(@as(u16, 404), none.status);
+    }
+    var default_na = try http.get("/api/v1/streams/na?namespace=default");
+    defer default_na.deinit();
+    try testing.expect(std.mem.indexOf(u8, default_na.body, "\"consumer_groups\":[],") != null);
+
     // A stream no namespace holds is not found, not an empty one.
     var missing = try http.get("/api/v1/streams/no-such-stream?namespace=na");
     defer missing.deinit();

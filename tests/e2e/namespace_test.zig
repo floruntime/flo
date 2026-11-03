@@ -386,3 +386,24 @@ test "e2e/namespace/cluster: a namespace created through one node is readable th
         try testing.expect(std.mem.indexOf(u8, r.stderr, "[no_namespace/not_found]") != null);
     }
 }
+
+test "e2e/namespace: a read the leader answers in a namespace never created is refused no_namespace, as other reads are" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    // stream info and the DLQ list answered no_namespace already; peek and
+    // the group list, sent to the leader, answered empty before they were
+    // reads like these.
+    const reads = [_][]const []const u8{
+        &.{ "queue", "peek", "q1", "-n", "never-made" },
+        &.{ "stream", "group", "list", "s1", "-n", "never-made" },
+        &.{ "stream", "group", "members", "s1", "g1", "-n", "never-made" },
+        &.{ "queue", "dlq", "list", "q1", "-n", "never-made" },
+        &.{ "stream", "info", "s1", "-n", "never-made" },
+    };
+    for (reads) |args| {
+        var r = try ctx.cli.run(args);
+        defer r.deinit();
+        if (!r.contains("[no_namespace/")) std.debug.print("{s}: {s}{s}\n", .{ args[0], r.stdout, r.stderr });
+        try testing.expect(r.contains("[no_namespace/"));
+    }
+}

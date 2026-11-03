@@ -102,3 +102,50 @@ fn expectExactCounts(ctx: *stdx.testing.TestContext) !void {
     defer list.deinit();
     try testing.expect(list.stdoutContains("\"ready\":2,\"leased\":0,\"enqueued\":3,\"dequeued\":1,"));
 }
+
+test "e2e/dashboard: a queue's messages are the next a dequeue takes, and a page stops where one answer ends" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .dashboard_enabled = true },
+    });
+    defer ctx.deinit();
+
+    for ([_][]const u8{ "first", "second", "third" }) |m| try ctx.exec(&.{ "queue", "enqueue", "pk", m });
+    var http = try ctx.createDashboardHttp();
+    defer http.deinit();
+    {
+        var resp = try http.get("/api/v1/queues/pk/messages?namespace=default&limit=2");
+        defer resp.deinit();
+        try testing.expectEqual(@as(u16, 200), resp.status);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"payload\":\"first\"") != null);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"payload\":\"second\"") != null);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"payload\":\"third\"") == null);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"more\":true") != null);
+    }
+    // A peek takes nothing: the dequeue takes the first message peeked.
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "pk" });
+    defer deq.deinit();
+    try stdx.testing.assertSucceeded(deq);
+    try testing.expect(deq.stdoutContains("first"));
+    {
+        var resp = try http.get("/api/v1/queues/pk/messages?namespace=default");
+        defer resp.deinit();
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"payload\":\"first\"") == null);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"more\":false") != null);
+    }
+
+    // A hundred messages of 6 KB: each shows 4 KiB, and fewer than a
+    // hundred fit one answer, so the page says more follow.
+    const big = try testing.allocator.alloc(u8, 6000);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    for (0..100) |_| try ctx.exec(&.{ "queue", "enqueue", "big", big });
+    var resp = try http.get("/api/v1/queues/big/messages?namespace=default&limit=100");
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    var n: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, resp.body, at, "\"size\":6000,")) |i| : (at = i + 1) n += 1;
+    try testing.expect(n > 0 and n < 100);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"truncated\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"more\":true") != null);
+}

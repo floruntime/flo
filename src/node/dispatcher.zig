@@ -81,6 +81,17 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 /// acks what it takes, a group read commits its cursor, and a transaction
 /// buffers on the node that runs it — so the whole exchange happens where
 /// the log is written.
+/// A hand-coded read the leader answers: what it reads lives only in the
+/// leader's memory. Table ops say so as `at_leader`.
+pub fn opReadsAtLeader(op: proto.OpCode) bool {
+    return switch (op) {
+        .stream_group_info, .stream_group_pending => true,
+        // Only the leader that leased a message dead-letters it.
+        .queue_dlq_list => true,
+        else => false,
+    };
+}
+
 pub fn opWrites(op: proto.OpCode) bool {
     return switch (op) {
         // Membership changes are made by the leader; a follower carries
@@ -88,6 +99,8 @@ pub fn opWrites(op: proto.OpCode) bool {
         .cluster_promote, .cluster_remove, .cluster_repair_skip => true,
         .stream_append, .stream_trim, .stream_create, .stream_alter, .stream_delete => true,
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
+        // Members and pending entries live in the leader's memory alone:
+        // a follower would answer none.
         .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,

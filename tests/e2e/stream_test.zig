@@ -3462,3 +3462,38 @@ fn expectOneExactRecord(out: []const u8, payload: []const u8, header_val: []cons
     try testing.expectEqualStrings(payload, records[0].object.get("data").?.string);
     try testing.expectEqualStrings(header_val, records[0].object.get("headers").?.object.get("q").?.string);
 }
+
+test "e2e/cluster: a follower asked about a group answers the leader's members and pending entries" {
+    // Members, pending entries and leases live in the leader's memory: a
+    // follower that answered from its own would show none. Group reads go
+    // to the leader, as group writes do.
+    var cluster = ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync }) catch |err| {
+        std.debug.print("the three-node cluster did not form: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer cluster.deinit();
+
+    try cluster.execOnWithRetry(0, &.{ "stream", "append", "lr", "one" }, 5, 200);
+    try cluster.execOnWithRetry(0, &.{ "stream", "group", "create", "lr", "--group", "g" }, 5, 200);
+    try cluster.execOnWithRetry(0, &.{ "stream", "group", "join", "lr", "g", "c-1" }, 5, 200);
+    const read = try cluster.execCaptureAnyOn(0, &.{ "stream", "group", "read", "lr", "--group", "g", "--consumer", "c-1" });
+    defer testing.allocator.free(read);
+    try testing.expect(std.mem.indexOf(u8, read, "one") != null);
+
+    const groups = try cluster.execCaptureAnyOn(1, &.{ "stream", "group", "list", "lr", "-o", "json" });
+    defer testing.allocator.free(groups);
+    if (std.mem.indexOf(u8, groups, "\"name\":\"g\",\"members\":1,\"pending\":1,") == null) std.debug.print("{s}\n", .{groups});
+    try testing.expect(std.mem.indexOf(u8, groups, "\"name\":\"g\",\"members\":1,\"pending\":1,") != null);
+    const members = try cluster.execCaptureAnyOn(2, &.{ "stream", "group", "members", "lr", "g", "-o", "json" });
+    defer testing.allocator.free(members);
+    try testing.expect(std.mem.indexOf(u8, members, "\"id\":\"c-1\",\"state\":\"active\",\"pending\":1,") != null);
+    // The hand-coded group reads go there too.
+    const pending = try cluster.execCaptureAnyOn(1, &.{ "stream", "group", "pending", "lr", "--group", "g" });
+    defer testing.allocator.free(pending);
+    if (std.mem.indexOf(u8, pending, "c-1") == null) std.debug.print("{s}\n", .{pending});
+    try testing.expect(std.mem.indexOf(u8, pending, "c-1") != null);
+    const info = try cluster.execCaptureAnyOn(2, &.{ "stream", "group", "info", "lr", "--group", "g", "-o", "json" });
+    defer testing.allocator.free(info);
+    if (std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") == null) std.debug.print("{s}\n", .{info});
+    try testing.expect(std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") != null);
+}

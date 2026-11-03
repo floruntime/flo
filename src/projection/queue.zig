@@ -309,6 +309,82 @@ pub const QueueProjection = struct {
         try l.ready.push(self.allocator, .{ .seq = msg.seq, .priority = msg.priority });
     }
 
+    /// The most messages one peek answers.
+    pub const MAX_PEEK: usize = 100;
+    /// The most stale ready-heap entries one peek passes over: past it, it
+    /// answers what it found and says there may be more.
+    pub const MAX_PEEK_STALE: usize = 1024;
+
+    /// A queue's next ready messages in dequeue order, at most `out.len`
+    /// (≤ MAX_PEEK), without taking them. The lane's ready heap is a binary
+    /// heap, so its smallest items are found from the root: each one taken
+    /// puts its two children in a small frontier, O(k log k), never a pass
+    /// over the queue. Whether more may follow.
+    pub fn peek(self: *const QueueProjection, queue_name_hash: u64, out: []*const Message) struct { count: usize, more: bool } {
+        std.debug.assert(out.len <= MAX_PEEK);
+        const l = self.lanes.getPtr(queue_name_hash) orelse return .{ .count = 0, .more = false };
+        const items = l.ready.items;
+        const Frontier = struct {
+            idx: [MAX_PEEK + MAX_PEEK_STALE + 2]u32 = undefined,
+            len: usize = 0,
+            heap: []const HeapItem,
+
+            fn less(f: *const @This(), a: u32, b: u32) bool {
+                return heapCompare({}, f.heap[a], f.heap[b]) == .lt;
+            }
+            fn push(f: *@This(), i: u32) void {
+                var at = f.len;
+                f.idx[at] = i;
+                f.len += 1;
+                while (at > 0) {
+                    const up = (at - 1) / 2;
+                    if (!f.less(f.idx[at], f.idx[up])) break;
+                    std.mem.swap(u32, &f.idx[at], &f.idx[up]);
+                    at = up;
+                }
+            }
+            fn pop(f: *@This()) ?u32 {
+                if (f.len == 0) return null;
+                const top = f.idx[0];
+                f.len -= 1;
+                f.idx[0] = f.idx[f.len];
+                var at: usize = 0;
+                while (true) {
+                    var child = at * 2 + 1;
+                    if (child >= f.len) break;
+                    if (child + 1 < f.len and f.less(f.idx[child + 1], f.idx[child])) child += 1;
+                    if (!f.less(f.idx[child], f.idx[at])) break;
+                    std.mem.swap(u32, &f.idx[at], &f.idx[child]);
+                    at = child;
+                }
+                return top;
+            }
+        };
+        var f: Frontier = .{ .heap = items };
+        if (items.len > 0) f.push(0);
+        var n: usize = 0;
+        var stale: usize = 0;
+        while (n < out.len) {
+            const i = f.pop() orelse break;
+            for ([_]usize{ 2 * @as(usize, i) + 1, 2 * @as(usize, i) + 2 }) |c| {
+                if (c < items.len) f.push(@intCast(c));
+            }
+            const msg = self.messages.getPtr(items[i].seq) orelse {
+                stale += 1;
+                if (stale == MAX_PEEK_STALE) return .{ .count = n, .more = true };
+                continue;
+            };
+            if (msg.state != .ready) {
+                stale += 1;
+                if (stale == MAX_PEEK_STALE) return .{ .count = n, .more = true };
+                continue;
+            }
+            out[n] = msg;
+            n += 1;
+        }
+        return .{ .count = n, .more = f.len > 0 };
+    }
+
     /// One queue's dead letters, oldest first.
     pub fn deadLetters(self: *const QueueProjection, queue_name_hash: u64) []const DLQEntry {
         const l = self.lanes.getPtr(queue_name_hash) orelse return &.{};
@@ -1118,4 +1194,35 @@ test "queue: a nack of a dequeued message counts it as dequeued, as an ack does"
     try q.nack(seq, 3000);
     try testing.expectEqual(@as(u64, 1), q.known_queues.get(42).?.dequeued);
     try testing.expectEqual(@as(u64, 1), q.stats.dequeued);
+}
+
+test "queue: a peek answers the next ready messages in dequeue order, and takes none" {
+    var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1_000_000 });
+    defer q.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..300) |i| _ = try q.enqueue(i, prng.random().uintLessThan(u32, 5), i, 42, "m");
+    _ = try q.enqueue(1, 0, 1, 43, "other queue");
+    // Leased ones leave stale heap entries behind them.
+    for (0..20) |_| _ = try q.dequeue(1000, 42);
+
+    var out: [QueueProjection.MAX_PEEK]*const Message = undefined;
+    const got = q.peek(42, &out);
+    try testing.expectEqual(@as(usize, QueueProjection.MAX_PEEK), got.count);
+    try testing.expect(got.more);
+    // What dequeue would hand out next, in order.
+    for (out[0..got.count]) |m| {
+        try testing.expectEqual(MessageState.ready, m.state);
+        try testing.expectEqual(@as(u64, 42), m.queue_name_hash);
+    }
+    const seqs = try testing.allocator.alloc(u64, got.count);
+    defer testing.allocator.free(seqs);
+    for (out[0..got.count], seqs) |m, *s| s.* = m.seq;
+    for (seqs) |want| try testing.expectEqual(want, (try q.dequeue(1000, 42)).?.seq);
+
+    // A short peek of a queue with fewer messages says there are no more.
+    var few: [3]*const Message = undefined;
+    const other = q.peek(43, &few);
+    try testing.expectEqual(@as(usize, 1), other.count);
+    try testing.expect(!other.more);
+    try testing.expectEqual(@as(usize, 0), q.peek(99, &few).count);
 }

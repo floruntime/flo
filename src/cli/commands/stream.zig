@@ -31,6 +31,8 @@ const StreamID = @import("../../stream/stream_id.zig").StreamID;
 const MAX_BATCH_RECORDS = @import("../../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
+const gen = @import("../gen.zig");
+const stream_ops = @import("../../protocol/stream_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
 fn wrapHandler(comptime handler: fn (*commander.Context) commander.Error!void) commander.RunFn {
@@ -173,6 +175,8 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .name("group")
                 .about("Consumer group operations")
                 .aliases(&.{"cg"})
+                .subcommand(gen.command(allocator, stream_ops.op("stream.group.list")))
+                .subcommand(gen.command(allocator, stream_ops.op("stream.group.members")))
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("read")

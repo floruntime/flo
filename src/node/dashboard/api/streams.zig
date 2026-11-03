@@ -17,6 +17,8 @@ const h = @import("helpers.zig");
 const json = h.json;
 const DashboardContext = h.DashboardContext;
 const loopback = @import("loopback.zig");
+const schema = @import("../../../protocol/schema.zig");
+const stream_ops = @import("../../../protocol/stream_ops.zig");
 const output = @import("../../../cli/output.zig");
 const client_mod = @import("../../../cli/client/mod.zig");
 const StreamID = client_mod.StreamID;
@@ -153,7 +155,7 @@ pub fn getStreams(allocator: Allocator, query_string: ?[]const u8, ctx: *Dashboa
     defer pages.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var arr = json.ArrayBuilder(@TypeOf(writer)).init(writer);
@@ -255,7 +257,7 @@ pub fn trimStream(allocator: Allocator, stream_name: []const u8, query_string: ?
     const t = client_mod.stream.parseTrimmed(resp) orelse return try h.jsonError(allocator, "Malformed trim response");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -282,7 +284,7 @@ pub fn deleteStream(allocator: Allocator, stream_name: []const u8, query_string:
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -305,7 +307,7 @@ pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
     try obj.begin();
@@ -318,8 +320,9 @@ pub fn deleteGroup(allocator: Allocator, stream_name: []const u8, group_name: []
 }
 
 /// GET /streams/:name - Stream detail with partitions, from `stream_info`
-/// (answered by the shard that owns the stream). No op lists a stream's
-/// consumer groups yet: `consumer_groups` is null.
+/// (answered by the shard that owns the stream), and its consumer groups
+/// from `stream.group.list`, answered by that shard's leader: a leader
+/// change starts their members and pending entries again.
 pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
 
@@ -331,7 +334,7 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
     };
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -359,7 +362,10 @@ pub fn getStreamDetail(allocator: Allocator, stream_name: []const u8, query_stri
         }
         try parts_arr.end();
     }
-    try obj.nullField("consumer_groups");
+    writeGroups(allocator, &reader, &obj, writer, ns_q, stream_name) catch |err| switch (err) {
+        error.Refused => try obj.nullField("consumer_groups"),
+        else => return try loopback.readFailed(allocator, "stream groups", err),
+    };
 
     try obj.end();
     return try json_aw.toOwnedSlice();
@@ -395,7 +401,7 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
     if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -457,7 +463,8 @@ pub fn getStreamMessages(allocator: Allocator, stream_name: []const u8, query_st
 }
 
 /// GET /streams/:name/groups/:group - Consumer group detail, from
-/// `stream_group_info`. No op lists a group's members yet: `members` is null.
+/// `stream_group_info` and `stream.group.members`, both answered by the
+/// stream's leader.
 pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
     if (hasNul(stream_name) or hasNul(group_name)) return error.NotFound;
@@ -476,7 +483,7 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
         parseGroupInfo(got.data) orelse return try h.jsonError(allocator, "group info: malformed answer");
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -487,7 +494,16 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     try obj.intField("generation", 0);
     try obj.intField("partition_count", 1);
     try obj.intField("member_count", info.members);
-    try obj.nullField("members");
+    writeMembers(allocator, &reader, &obj, writer, ns_q, stream_name, group_name) catch |err| switch (err) {
+        error.Refused => try obj.nullField("members"),
+        // As its info answers it: an empty group.
+        error.NotFound => {
+            var none = try obj.arrayField("members");
+            try none.begin();
+            try none.end();
+        },
+        else => return try loopback.readFailed(allocator, "group members", err),
+    };
     {
         var assignments_arr = try obj.arrayField("assignments");
         try assignments_arr.begin();
@@ -498,14 +514,95 @@ pub fn getGroupDetail(allocator: Allocator, stream_name: []const u8, group_name:
     return try json_aw.toOwnedSlice();
 }
 
-/// GET /streams/:name/groups/:group/members - No op lists a group's members
-/// yet, so this says so rather than answer an empty list.
+/// GET /streams/:name/groups/:group/members - The group's members, from
+/// `stream.group.members` on the stream's leader. A group that isn't there
+/// is a 404.
 pub fn getGroupMembers(allocator: Allocator, stream_name: []const u8, group_name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
-    _ = stream_name;
-    _ = group_name;
-    _ = query_string;
-    _ = ctx;
-    return try h.jsonError(allocator, "group members are not available yet");
+    const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
+    if (hasNul(stream_name) or hasNul(group_name)) return error.NotFound;
+
+    var reader = loopback.Reader.open(allocator, ctx) catch |err| return try loopback.readFailed(allocator, "group members", err);
+    defer reader.deinit();
+    var json_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer json_aw.deinit();
+    const writer = &json_aw.writer;
+    var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+    try obj.begin();
+    writeMembers(allocator, &reader, &obj, writer, ns_q, stream_name, group_name) catch |err| switch (err) {
+        error.Refused => return try h.jsonError(allocator, "group members: refused"),
+        error.NotFound => return error.NotFound,
+        else => return try loopback.readFailed(allocator, "group members", err),
+    };
+    try obj.end();
+    return try json_aw.toOwnedSlice();
+}
+
+/// `consumer_groups`: the stream's groups, and `consumer_groups_more`
+/// when it has more than one answer holds. A namespace never created
+/// holds none; a refusal is `error.Refused`.
+fn writeGroups(allocator: Allocator, reader: *loopback.Reader, obj: anytype, writer: *std.Io.Writer, namespace: []const u8, stream: []const u8) !void {
+    _ = allocator;
+    const List = stream_ops.op("stream.group.list");
+    var got = try reader.call(List, namespace, stream, .{});
+    defer got.deinit();
+    // Refused before anything is written, so the caller's null stands alone.
+    if (got.isError() and !got.isNotFound()) return error.Refused;
+    var diag: schema.Diagnostic = .{};
+    const v = if (got.isNotFound()) null else List.response.decodeAll(got.data, &diag) catch return error.Refused;
+    var arr = try obj.arrayField("consumer_groups");
+    try arr.begin();
+    // A namespace never created holds none.
+    const list = v orelse {
+        try arr.end();
+        return obj.boolField("consumer_groups_more", false);
+    };
+    var it = list.groups.iterator();
+    while (it.next() catch return error.Refused) |g| {
+        try arr.next();
+        var gobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try gobj.begin();
+        try gobj.stringField("name", g.name);
+        try gobj.intField("members", g.members);
+        try gobj.intField("pending", g.pending);
+        try gobj.intField("created_at", g.created_at_ms);
+        try gobj.intField("ack_timeout_ms", g.ack_timeout_ms);
+        try gobj.intField("max_deliver", g.max_deliver);
+        var id_buf: [48]u8 = undefined;
+        try gobj.stringField("last_delivered_id", std.fmt.bufPrint(&id_buf, "{d}-{d}", .{ g.last_delivered_ms, g.last_delivered_seq }) catch "");
+        try gobj.end();
+    }
+    try arr.end();
+    try obj.boolField("consumer_groups_more", list.more);
+}
+
+/// `members`: the group's members, and `members_more` when it has more
+/// than one answer holds. `error.NotFound` for a group that isn't there.
+fn writeMembers(allocator: Allocator, reader: *loopback.Reader, obj: anytype, writer: *std.Io.Writer, namespace: []const u8, stream: []const u8, group: []const u8) !void {
+    _ = allocator;
+    const Members = stream_ops.op("stream.group.members");
+    var got = try reader.call(Members, namespace, stream, .{ .group = group });
+    defer got.deinit();
+    if (got.isNotFound()) return error.NotFound;
+    if (got.isError()) return error.Refused;
+    var diag: schema.Diagnostic = .{};
+    const v = Members.response.decodeAll(got.data, &diag) catch return error.Refused;
+    var arr = try obj.arrayField("members");
+    try arr.begin();
+    var it = v.members.iterator();
+    while (it.next() catch return error.Refused) |m| {
+        try arr.next();
+        var mobj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
+        try mobj.begin();
+        try mobj.stringField("id", m.id);
+        try mobj.stringField("state", @tagName(m.state));
+        try mobj.intField("pending", m.pending);
+        try mobj.intField("joined_at", m.joined_at_ms);
+        // When it was last delivered to; none is kept of a heartbeat.
+        if (m.last_active_ms) |t| try mobj.intField("last_delivered_at", t) else try mobj.nullField("last_delivered_at");
+        try mobj.end();
+    }
+    try arr.end();
+    try obj.boolField("members_more", v.more);
 }
 
 /// GET /streams/:name/groups/:group/pending - Pending messages, from
@@ -526,7 +623,7 @@ pub fn getGroupPending(allocator: Allocator, stream_name: []const u8, group_name
     defer got.deinit();
 
     var json_aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer json_aw.deinit();
+    defer json_aw.deinit();
     const writer = &json_aw.writer;
 
     var obj = json.ObjectBuilder(@TypeOf(writer)).init(writer);
@@ -598,7 +695,7 @@ test "stream reads say the node didn't answer, never an empty list" {
     }
 }
 
-test "stream group members say they are not available yet" {
+test "stream group members say the node didn't answer when none does" {
     const allocator = std.testing.allocator;
     var metrics = h.MetricsRegistry.init(allocator);
     defer metrics.deinit();
@@ -608,7 +705,7 @@ test "stream group members say they are not available yet" {
 
     const result = try getGroupMembers(allocator, "events", "g", null, &ctx);
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("{\"error\":\"group members are not available yet\"}", result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "{\"error\":\"group members failed"));
 }
 
 test "stream group reads refuse a name holding a NUL before they connect" {

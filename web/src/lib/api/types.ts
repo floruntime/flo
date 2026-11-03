@@ -131,12 +131,17 @@ export interface StreamPartition {
   record_count: number | null
   stored_bytes: number | null
 }
+/* A group's members, pending entries and last-delivered times live only on
+   the stream's leader and aren't replicated: a leader change resets them. */
 export interface StreamConsumerGroup {
   name: string
-  members: number | null
-  pending_count: number
-  /** Timestamp (ms) of the group's last-delivered record — its position on the log. */
-  last_delivered_ms: number
+  members: number
+  pending: number
+  created_at: number
+  ack_timeout_ms: number
+  max_deliver: number
+  /** "ms-seq" id of the last record delivered to the group — its position on the log. */
+  last_delivered_id: string
 }
 export interface StreamDetailInfo {
   name: string
@@ -147,8 +152,22 @@ export interface StreamDetailInfo {
   retention: string
   retention_age_s: number
   retention_count: number
-  /** Null: no op lists a stream's groups yet. */
+  /** Null only when the read was refused. At most 256; `consumer_groups_more` says there are more. */
   consumer_groups: StreamConsumerGroup[] | null
+  consumer_groups_more: boolean
+}
+export interface StreamGroupMember {
+  id: string
+  state: 'active' | 'leaving'
+  pending: number
+  joined_at: number
+  /** When the member was last delivered a record (there is no heartbeat). */
+  last_delivered_at: number | null
+}
+/** GET /streams/:name/groups/:group/members. */
+export interface StreamGroupMembersResponse {
+  members: StreamGroupMember[] | null
+  members_more: boolean
 }
 export interface StreamMessage {
   id_ms: number
@@ -181,26 +200,31 @@ export interface QueueInfo {
   dlq_count: number
 }
 export type QueueDetailInfo = QueueInfo
+/** A ready message as peeked: not taken. `payload` is cut at 4 KiB; `size` is the full length. */
 export interface QueueMessage {
   seq: number
   priority: number
-  state: 'ready' | 'leased' | 'dlq'
   attempts: number
   enqueued_at: number
-  lease_remaining_ms: number
   size: number
   payload: string
+  truncated: boolean
 }
-/** GET /queues/:name/dlq. `entries` is null until an op lists them; `count` is real. */
-export interface QueueDLQResponse {
-  entries: QueueMessage[] | null
-  count: number
-  queue: string
-}
+/** GET /queues/:name/messages: the next ready messages in dequeue order. */
 export interface QueueMessagesResponse {
+  queue: string
   messages: QueueMessage[]
+  more: boolean
+}
+export interface QueueDLQEntry extends QueueMessage {
+  moved_at: number
+}
+/** GET /queues/:name/dlq: oldest first, a page at a time; `count` is every dead letter. */
+export interface QueueDLQResponse {
+  entries: QueueDLQEntry[]
   count: number
-  total: number
+  has_more: boolean
+  next_after: number | null
   queue: string
 }
 

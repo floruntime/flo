@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { api } from './client'
 import type { QueueInfo, QueueDetailInfo, QueueDLQResponse, QueueMessagesResponse } from './types'
 
@@ -20,29 +20,27 @@ export function useQueueDetail(ns: string, name: string | null) {
   })
 }
 
-export function useQueueMessages(ns: string, name: string | null) {
+/** The next ready messages in dequeue order, peeked (not taken). No paging:
+    `more` only says others follow. */
+export function useQueueMessages(ns: string, name: string | null, limit = 100) {
   return useQuery({
-    queryKey: ['queues', ns, 'messages', name],
-    queryFn: () => api.get<QueueMessagesResponse>(`queues/${enc(name!)}/messages?namespace=${enc(ns)}&limit=2000`),
+    queryKey: ['queues', ns, 'messages', name, limit],
+    queryFn: () => api.get<QueueMessagesResponse>(`queues/${enc(name!)}/messages?namespace=${enc(ns)}&limit=${limit}`),
     enabled: !!name,
   })
 }
 
-/** The queue's dead letters: the count, and the entries once an op lists them. */
+/** The queue's dead letters, oldest first, a page at a time; `fetchNextPage`
+    loads the next while `hasNextPage`. */
 export function useQueueDLQ(ns: string, name: string | null) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: ['queues', ns, 'dlq', name],
-    queryFn: () => api.get<QueueDLQResponse>(`queues/${enc(name!)}/dlq?namespace=${enc(ns)}`),
+    initialPageParam: null as number | null,
+    queryFn: ({ pageParam }) =>
+      api.get<QueueDLQResponse>(
+        `queues/${enc(name!)}/dlq?namespace=${enc(ns)}&limit=100${pageParam != null ? `&after=${pageParam}` : ''}`,
+      ),
+    getNextPageParam: (last) => (last.has_more && last.next_after != null ? last.next_after : undefined),
     enabled: !!name,
-  })
-}
-
-/** Requeue a DLQ entry back to the queue (real loopback write). */
-export function useRequeueDLQ(ns: string) {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: ({ name, seq }: { name: string; seq: number }) =>
-      api.post(`queues/${enc(name)}/dlq/${seq}/requeue?namespace=${enc(ns)}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['queues'] }),
   })
 }
