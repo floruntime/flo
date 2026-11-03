@@ -161,8 +161,11 @@ pub const ActionsHandler = struct {
     /// Runs with an extend in flight, by store key: touches between answer
     /// with the lease as it stands.
     extending: std.StringHashMapUnmanaged(void) = .empty,
-    /// The expire proposed and not yet applied: one at a time.
+    /// The expire proposed and not yet applied: one at a time. A full one
+    /// leaves more past due, so the next is proposed when it applies, not
+    /// at the duty's next tick.
     expiring: ?u64 = null,
+    expiring_full: bool = false,
     /// The term the duty last ran in, and when it first ran in it.
     duty_term: u64 = 0,
     duty_since_ns: u64 = 0,
@@ -1475,6 +1478,7 @@ pub const ActionsHandler = struct {
             .action_expire => {
                 if (self.expiring) |i| if (i == e.header.index) {
                     self.expiring = null;
+                    if (self.expiring_full and shard.raft_node.leaderReady()) _ = self.expireNext(shard, wallNs());
                 };
                 if (leads) shard.wake_workers = true;
                 if (leads) self.tellWorkflowsOfExpire(shard, e);
@@ -1827,6 +1831,12 @@ pub const ActionsHandler = struct {
             self.stepRebuild(shard, now);
             ActionsHandler.wakeWorkers(shard);
         } else self.wakeDue(shard, now);
+        return self.expireNext(shard, now);
+    }
+
+    /// Propose an expire of the leases past their deadline at `now`, up to
+    /// a full entry, if none is in flight. Returns how many keys it named.
+    fn expireNext(self: *ActionsHandler, shard: *Shard, now: u64) u64 {
         if (self.expiring != null) return 0;
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
@@ -1856,6 +1866,7 @@ pub const ActionsHandler = struct {
             return 0;
         };
         self.expiring = proposed.index;
+        self.expiring_full = n == ae.MAX_EXPIRE_ITEMS;
         return n;
     }
 

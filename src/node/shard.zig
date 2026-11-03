@@ -13766,6 +13766,35 @@ test "actions: one expire is in flight at a time, and a new leader ends no lease
     try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, "default", "r1").?.status);
 }
 
+test "actions: an expire ends at most a full entry of leases, and the next is proposed as it applies, not at the next tick" {
+    var t: ClusterActionsTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // More leases long past their deadline than one expire holds.
+    const n = action_entries.MAX_EXPIRE_ITEMS + 6;
+    var names: [n][8]u8 = undefined;
+    var runs: [n][]const u8 = undefined;
+    for (&runs, &names, 0..) |*r, *b, i| r.* = try std.fmt.bufPrint(b, "r{d}", .{i});
+    try t.setUp(&runs, 0);
+    for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 100 + i, 2);
+    const actions = t.shard.actions_handler;
+    // Past this term's grace.
+    _ = actions.expireDue(&t.shard);
+    actions.duty_since_ns = 0;
+    try std.testing.expectEqual(@as(u64, action_entries.MAX_EXPIRE_ITEMS), actions.expireDue(&t.shard));
+    // It applies: the rest are proposed at once, with no duty tick.
+    try ParkTest.ack(&t.shard);
+    const next = actions.expiring orelse return error.TestExpectedEqual;
+    var buf: [64 * 1024]u8 = undefined;
+    const e = t.shard.raft_node.log.getEntryCopy(next, &buf) orelse return error.TestUnexpectedResult;
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@as(u32, 6), (try action_entries.Expire.decodeAll(e.payload, &diag)).items.count);
+    // A partial one leaves none past due: nothing follows it.
+    try ParkTest.ack(&t.shard);
+    try std.testing.expect(actions.expiring == null);
+    for (runs) |r| try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, "default", r).?.status);
+}
+
 test "actions: a touch while its extend is in flight answers the lease as it stands, proposing nothing" {
     var t: ClusterActionsTest = undefined;
     try t.init();
