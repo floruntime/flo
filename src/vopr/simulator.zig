@@ -895,6 +895,9 @@ pub const Simulator = struct {
     /// what their leaders did with them at submit.
     ns_counts: families.Namespaces.Counts = .{},
     ns_submits: NsSubmits = .{},
+    /// Acked ops not in canonical history once a violation had stopped the
+    /// run: how many, and the first.
+    durability_after_stop: ?struct { count: u64, term: u64, index: u64 } = null,
     /// Of the stale-id refusals, those whose leader said it was ready.
     ns_stale_from_ready: u64 = 0,
     /// Whether the leader that proposed each create op said it was ready
@@ -2158,6 +2161,10 @@ pub const Simulator = struct {
     /// async_flush, losing ops acked inside the flush window of a crash
     /// is the mode's documented contract, not a finding.
     fn finalDurabilityCheck(self: *Simulator) void {
+        // A run a violation stopped never applied what it acked last, so
+        // every such op would read as lost: they are summed in one
+        // secondary line instead, which keeps a real loss visible.
+        const stopped = self.checker.violations.items.len > 0;
         for (self.workload.ops.items) |op| {
             if (op.state != .acked) continue;
             // Past a halt nothing applies, so nothing records it; past a
@@ -2186,7 +2193,10 @@ pub const Simulator = struct {
                 const canon = self.checker.canonical.items[op.index - 1] orelse break :blk true;
                 break :blk canon.term != op.term or canon.op_id != op.id;
             };
-            if (bad) self.checker.fail(.{
+            if (!bad) continue;
+            if (stopped) {
+                if (self.durability_after_stop) |*d| d.count += 1 else self.durability_after_stop = .{ .count = 1, .term = op.term, .index = op.index };
+            } else self.checker.fail(.{
                 .invariant = .durability,
                 .node = op.proposer,
                 .index = op.index,
@@ -2363,6 +2373,7 @@ pub const Simulator = struct {
             try v.format(writer);
             try writer.print("\n", .{});
         }
+        if (self.durability_after_stop) |d| try writer.print("  durability (secondary, run stopped): {d} acked ops not in canonical history; first at (term {d}, index {d})\n", .{ d.count, d.term, d.index });
     }
 
     pub fn printNodeStates(self: *const Simulator, writer: anytype) !void {
@@ -3234,6 +3245,57 @@ test "vopr sim: in every catching-up run, leaders refuse creates until ready, an
         try testing.expect(s.ns_submits.catching_up >= 5);
         try testing.expectEqual(@as(u64, 0), s.ns.stale_ids);
     }
+}
+
+test "vopr sim: a run a violation stopped sums its unapplied acked ops in one secondary line, not as durability violations" {
+    var seen_secondary = false;
+    for (CATCHING_UP_SEEDS) |seed| {
+        var sim = try Simulator.init(testing.allocator, Scenario.catchingUp(seed), .{ .family_mutant = .ns_ungated });
+        defer sim.deinit();
+        _ = try sim.run();
+        try testing.expect(hasViolation(&sim, .ns_stale_id));
+        try testing.expect(!hasViolation(&sim, .durability));
+        const d = sim.durability_after_stop orelse continue;
+        seen_secondary = true;
+        var buf: [16 * 1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try sim.printViolations(&w);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "durability (secondary, run stopped):") != null);
+        try testing.expect(d.count > 0);
+    }
+    try testing.expect(seen_secondary);
+}
+
+/// A calm run's first acked op, taken out of the canonical history.
+fn dropAnAckedOp(sim: *Simulator) !void {
+    for (sim.workload.ops.items) |op| {
+        if (op.state != .acked) continue;
+        sim.checker.canonical.items[op.index - 1] = null;
+        return;
+    }
+    return error.NothingAcked;
+}
+
+test "vopr sim: a converged run that lost an acked op fails durability" {
+    var sim = try Simulator.init(testing.allocator, Scenario.calm(7), .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    try testing.expect(s.ok);
+    try dropAnAckedOp(&sim);
+    sim.finalDurabilityCheck();
+    try testing.expect(hasViolation(&sim, .durability));
+    try testing.expectEqual(@as(@TypeOf(sim.durability_after_stop), null), sim.durability_after_stop);
+}
+
+test "vopr sim: the same loss after a violation is one secondary line, and no durability violation" {
+    var sim = try Simulator.init(testing.allocator, Scenario.calm(7), .{});
+    defer sim.deinit();
+    _ = try sim.run();
+    try dropAnAckedOp(&sim);
+    sim.checker.fail(.{ .invariant = .convergence, .node = 0, .index = 0, .tick = sim.now, .detail = "planted" });
+    sim.finalDurabilityCheck();
+    try testing.expect(!hasViolation(&sim, .durability));
+    try testing.expectEqual(@as(u64, 1), sim.durability_after_stop.?.count);
 }
 
 fn staleIdUnder(mutant: families.Mutant) !void {
