@@ -624,6 +624,13 @@ pub const ServerProcess = struct {
         self.started = false;
     }
 
+    /// Kill the server at once, as a crash would: no shutdown runs, and
+    /// nothing it held in memory is written.
+    pub fn kill(self: *Self) void {
+        self.forceKill();
+        self.checkExit();
+    }
+
     fn releaseWatchdog(self: *Self) void {
         if (self.watchdog) |w| w.release();
         self.watchdog = null;
