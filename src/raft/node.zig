@@ -51,6 +51,8 @@ pub const MAX_TERM: u64 = std.math.maxInt(u64) >> 1;
 /// elections is gone in every other way too; a larger jump is a term it
 /// can't plausibly have reached.
 pub const MAX_TERM_STEP: u64 = 1 << 20;
+/// How often one sender's implausible terms are warned of.
+const IMPLAUSIBLE_WARN_MS: u64 = 30_000;
 
 /// Per-peer replication tracking (leader-only state).
 pub const PeerState = struct {
@@ -517,6 +519,9 @@ pub const RaftNode = struct {
     /// drops those it cuts.
     config_records: [4]ConfigRecord = undefined,
     config_record_count: u8 = 0,
+
+    /// When each recent sender of an implausible term was last warned of.
+    implausible_warned: [8]struct { from: NodeId = 0, at_ms: u64 = 0 } = @splat(.{}),
 
     // ── Lost-log guard ─────────────────────────────────────────────────
     lost_log: LostLog = .none,
@@ -1067,6 +1072,36 @@ pub const RaftNode = struct {
         return term <= MAX_TERM and term <= self.current_term +| MAX_TERM_STEP;
     }
 
+    /// A term a leader's log or a member's term-check answer may move this
+    /// node to. A node with no history of its own (an empty log, or a lost
+    /// log being rebuilt) takes any term up to `MAX_TERM`: its own term
+    /// says nothing about the cluster's, and the window would strand it
+    /// below a long-lived cluster for good. Every other node keeps the
+    /// window. A node moved up this way wins nothing it couldn't before:
+    /// its own requests at that term still meet its peers' windows.
+    fn termTakeable(self: *const RaftNode, term: u64) bool {
+        if (self.log.lastIndex() == 0 or self.lost_log != .none) return term <= MAX_TERM;
+        return self.termPlausible(term);
+    }
+
+    /// Whether to warn now of an implausible term from `from`: at most
+    /// every 30 s for each sender, so a leader resending can't flood the
+    /// log.
+    fn warnImplausible(self: *RaftNode, from: NodeId) bool {
+        const now_ms = self.current_time_ms;
+        var oldest: usize = 0;
+        for (&self.implausible_warned, 0..) |*w, i| {
+            if (w.from == from) {
+                if (w.at_ms != 0 and now_ms -| w.at_ms < IMPLAUSIBLE_WARN_MS) return false;
+                w.at_ms = now_ms;
+                return true;
+            }
+            if (w.at_ms < self.implausible_warned[oldest].at_ms) oldest = i;
+        }
+        self.implausible_warned[oldest] = .{ .from = from, .at_ms = now_ms };
+        return true;
+    }
+
     /// Why `termPlausible` refused `term`.
     fn implausibleWhy(term: u64) []const u8 {
         return if (term > MAX_TERM) "it is past the highest term a node takes" else "it is more than 2^20 ahead of ours";
@@ -1226,8 +1261,8 @@ pub const RaftNode = struct {
     }
 
     fn appendEntries(self: *RaftNode, req: AppendRequest) !AppendResponse {
-        if (!self.termPlausible(req.term)) {
-            log.warn("Raft: AppendEntries for term {d} rejected: {s} (our term {d})", .{ req.term, implausibleWhy(req.term), self.current_term });
+        if (!self.termTakeable(req.term)) {
+            if (self.warnImplausible(req.leader_id)) log.warn("Raft: AppendEntries from node {d} for term {d} rejected: {s} (our term {d})", .{ req.leader_id, req.term, implausibleWhy(req.term), self.current_term });
             return .{ .term = self.current_term, .success = false, .match_index = self.log.lastIndex(), .from = self.id };
         }
         // If request term > current, step down
@@ -1838,7 +1873,7 @@ pub const RaftNode = struct {
     /// check; an answer from a non-guarded member counts in every set it
     /// is in. Within the boot wait nothing counts.
     pub fn handleTermCheckResponse(self: *RaftNode, resp: TermCheckResponse) void {
-        if (self.lost_log != .confirming or !self.termPlausible(resp.term)) return;
+        if (self.lost_log != .confirming or !self.termTakeable(resp.term)) return;
         if (self.holding()) return;
         if (resp.term > self.current_term) {
             self.stepDown(resp.term);
@@ -5026,4 +5061,37 @@ test "raft node: a vote answer reaches only a candidate; a leader or follower it
     _ = leader.handleVoteResponse(.{ .term = standing + 3, .vote_granted = false, .from = 2 });
     try testing.expectEqual(standing + 3, leader.current_term);
     try testing.expectEqual(Role.follower, leader.role);
+}
+
+test "raft node: the term window is 2^20 a frame" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 4096, .{});
+    defer node.deinit();
+    node.current_term = 100;
+    try testing.expect(node.termPlausible(100 + (1 << 20)));
+    try testing.expect(!node.termPlausible(100 + (1 << 20) + 1));
+}
+
+test "raft node: a node with no log takes a leader's term past the window; one with data refuses it" {
+    const far: u64 = (1 << 20) + 7;
+    // Fresh: term 0, nothing logged.
+    var fresh = try RaftNode.init(testing.allocator, 2, 1, 4096, .{});
+    defer fresh.deinit();
+    const r = try fresh.handleAppendEntries(.{ .term = far, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(r.success);
+    try testing.expectEqual(far, fresh.current_term);
+    // Past MAX_TERM nothing is taken, fresh or not.
+    var fresh2 = try RaftNode.init(testing.allocator, 3, 1, 4096, .{});
+    defer fresh2.deinit();
+    _ = try fresh2.handleAppendEntries(.{ .term = MAX_TERM + 1, .leader_id = 1, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expectEqual(@as(u64, 0), fresh2.current_term);
+
+    // With data: a bootstrapped node keeps the window.
+    var node = try RaftNode.init(testing.allocator, 4, 1, 4096, .{});
+    defer node.deinit();
+    try node.bootstrap();
+    const before = node.current_term;
+    try testing.expect(node.log.lastIndex() > 0);
+    const refused = try node.handleAppendEntries(.{ .term = before + far, .leader_id = 2, .prev_log_index = 0, .prev_log_term = 0, .entries = &.{}, .leader_commit = 0 });
+    try testing.expect(!refused.success);
+    try testing.expectEqual(before, node.current_term);
 }
