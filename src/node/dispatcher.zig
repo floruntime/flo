@@ -139,9 +139,9 @@ pub const Dispatcher = struct {
     /// Each walk op's scan context: this shard's own, never another's. A
     /// walk asks the other shards for their pages.
     walk_context: [proto.MAX_OPCODES]?*anyopaque,
-    /// A walk op's entry, written from its scan context, when its family
-    /// writes it; without one an entry is the name alone.
-    walk_entry: [proto.MAX_OPCODES]?WalkEntryFn,
+    /// A walk op's entries for one page, written from its scan context,
+    /// when its family writes them; without one an entry is the name alone.
+    walk_entry: [proto.MAX_OPCODES]?WalkEntriesFn,
 
     /// Error callback for unknown opcodes.
     on_error: ?ErrorFn,
@@ -201,13 +201,17 @@ pub const Dispatcher = struct {
         // pre_route stays null — walk opcodes have no hash routing
     }
 
-    /// One item's entry in a walk op's answer: `name`'s, in `namespace`,
-    /// read from the op's scan context. Nothing for a name with no entry.
-    pub const WalkEntryFn = *const fn (context: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void;
+    /// A page's entries in a walk op's answer, one per name, read from the
+    /// op's scan context in one go: each appended to `out`, its end in
+    /// `ends`. An empty one for a name with no entry.
+    pub const WalkEntriesFn = *const fn (context: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void;
 
-    /// Set how a walk op's family writes its entries; after `registerWalk`.
-    pub fn setWalkEntry(self: *Dispatcher, opcode: proto.OpCode, entry: WalkEntryFn) void {
-        self.walk_entry[@backingInt(opcode)] = entry;
+    /// Set how a walk op's family writes its entries. `registerWalk` clears
+    /// it, since another scan's entries would read its own context, so it
+    /// comes after.
+    pub fn setWalkEntries(self: *Dispatcher, opcode: proto.OpCode, entries: WalkEntriesFn) void {
+        std.debug.assert(self.walk_fn[@backingInt(opcode)] != null);
+        self.walk_entry[@backingInt(opcode)] = entries;
     }
 
     /// `registerWalk` for a scan that pages itself by its own cursor.

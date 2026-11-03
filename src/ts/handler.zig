@@ -88,7 +88,7 @@ pub const TSHandler = struct {
         dispatcher.registerWithRoute(.ts_query, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_floql, dispatchTS, preRouteByQueryMeasurement);
         dispatcher.registerWalk(.ts_list, dispatchTS, localScanMeasurements);
-        dispatcher.setWalkEntry(.ts_list, writeListEntry);
+        dispatcher.setWalkEntries(.ts_list, writeListEntries);
         dispatcher.registerWithRoute(.ts_delete, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_retention, dispatchTS, preRouteByMeasurement);
         dispatcher.registerWithRoute(.ts_info, table_run.handler("ts.info", TSHandler, runInfo), preRouteByMeasurement);
@@ -103,7 +103,7 @@ pub const TSHandler = struct {
     }
 
     /// A measurement's summary from its series keys and block headers. One
-    /// that holds no points here is not found.
+    /// with no series here is not found.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const self = shard.ts_handler;
         var names: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
@@ -165,18 +165,28 @@ pub const TSHandler = struct {
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
-    /// A measurement as the list answers it:
+    /// A page of measurements as the list answers them, each
     /// `[name_len:u16][name][series:u32][fields:u32][fields_capped:u8][points:u64]`.
-    fn writeListEntry(ctx: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    /// The counts are exact, so fields_capped is 0; ts.info's isn't.
+    fn writeListEntries(ctx: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void {
         const ts: *const TSProjection = @ptrCast(@alignCast(ctx));
-        var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
-        const sum = ts.summarize(router.namespaceHash(namespace), name, &fields);
-        try w.writeInt(u16, @intCast(name.len), .little);
-        try w.writeAll(name);
-        try w.writeInt(u32, sum.series, .little);
-        try w.writeInt(u32, sum.fields, .little);
-        try w.writeByte(@intFromBool(sum.fields_capped));
-        try w.writeInt(u64, sum.points, .little);
+        const counts = try allocator.alloc(TSProjection.ListCounts, names.len);
+        defer allocator.free(counts);
+        try ts.listCounts(router.namespaceHash(namespace), names, allocator, counts);
+        try ends.ensureTotalCapacity(allocator, names.len);
+        for (names, counts) |name, c| {
+            var head: [2]u8 = undefined;
+            std.mem.writeInt(u16, &head, @intCast(name.len), .little);
+            try out.appendSlice(allocator, &head);
+            try out.appendSlice(allocator, name);
+            var tail: [4 + 4 + 1 + 8]u8 = undefined;
+            std.mem.writeInt(u32, tail[0..4], c.series, .little);
+            std.mem.writeInt(u32, tail[4..8], c.fields, .little);
+            tail[8] = 0;
+            std.mem.writeInt(u64, tail[9..17], c.points, .little);
+            try out.appendSlice(allocator, &tail);
+            ends.appendAssumeCapacity(@intCast(out.items.len));
+        }
     }
 
     fn dispatchTS(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {

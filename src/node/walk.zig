@@ -67,16 +67,28 @@ pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8
     const page = walker.localPage(ctx, namespace, filter, cursor, skip, std.math.clamp(limit, 1, system_ops.MAX_PAGE));
     if (dispatcher_mod.takeScanShort()) return error.ScanShort;
 
+    // A family that writes its own entries writes the page's at once.
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(shard.allocator);
+    var ends: std.ArrayList(u32) = .empty;
+    defer ends.deinit(shard.allocator);
+    const by_family = shard.dispatcher.walk_entry[op];
+    if (by_family) |write| write(ctx, namespace, page.items, shard.allocator, &written, &ends) catch return error.ScanShort;
+
     var entries = Entries.Builder.init(buf);
     var more = page.more;
     var used: usize = 0;
-    for (page.items) |name| {
+    for (page.items, 0..) |name, i| {
         var eb: [system_ops.MAX_ENTRY]u8 = undefined;
         var w: std.Io.Writer = .fixed(&eb);
-        if (shard.dispatcher.walk_entry[op]) |write| {
-            write(ctx, namespace, name, &w) catch return error.EntryTooLarge;
-        } else try writeEntry(@fromBackingInt(@intCast(op)), ctx, namespace, name, &w);
-        const entry = w.buffered();
+        const entry = if (by_family != null) blk: {
+            const e = written.items[if (i == 0) 0 else ends.items[i - 1]..ends.items[i]];
+            if (e.len > system_ops.MAX_ENTRY) return error.EntryTooLarge;
+            break :blk e;
+        } else blk: {
+            try writeEntry(@fromBackingInt(@intCast(op)), ctx, namespace, name, &w);
+            break :blk w.buffered();
+        };
         // Out of room: the rest is the next page's.
         if (used + entry.len > room or !(entries.add(.{ .name = name, .entry = entry }) catch return error.EntryTooLarge)) {
             more = true;

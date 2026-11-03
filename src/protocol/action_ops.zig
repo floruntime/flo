@@ -199,29 +199,34 @@ pub const table = [_]ops.Op{
             .{ .name = "timeout_ms", .T = Int(u64), .doc = "How long a worker holds a run before it times out" },
             .{ .name = "max_attempts", .T = Int(u32), .doc = "Attempts a run gets before it fails" },
             .{ .name = "created_at_ms", .T = Int(i64), .doc = "When it was first registered, in Unix milliseconds" },
-            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker: every one" },
-            .{ .name = "runs_scanned", .T = Int(u32), .doc = "The namespace's runs the counts below were taken over, from its first" },
-            .{ .name = "sampled", .T = schema.Bool, .doc = "The namespace has more runs than were scanned, so the counts below are of a sample" },
-            .{ .name = "running", .T = Int(u64), .doc = "Its scanned runs a worker holds" },
-            .{ .name = "completed", .T = Int(u64), .doc = "Its scanned runs that completed" },
-            .{ .name = "failed", .T = Int(u64), .doc = "Its scanned runs that failed for good" },
-            .{ .name = "timed_out", .T = Int(u64), .doc = "Its scanned runs whose last attempt timed out" },
-            // How long its completed scanned runs took, from a worker first
-            // taking one to its completion; none until one completes.
-            .{ .name = "latency_count", .T = Int(u64), .doc = "Completed scanned runs measured" },
+            .{ .name = "ready", .T = Int(u64), .doc = "Its runs waiting for a worker, counted up to 100,000" },
+            .{ .name = "ready_capped", .T = schema.Bool, .doc = "More runs are waiting than were counted: ready is at least that" },
+            // The counts below read every run in the namespace, so past
+            // 10,000 runs they aren't taken: a sample of the oldest would
+            // stop moving while new runs come and go.
+            .{ .name = "too_many_runs", .T = schema.Bool, .doc = "The namespace holds more than 10,000 runs, so the counts and latency below are none" },
+            .{ .name = "running", .T = Optional(Int(u64)), .doc = "Its runs a worker holds" },
+            .{ .name = "completed", .T = Optional(Int(u64)), .doc = "Its runs that completed" },
+            .{ .name = "failed", .T = Optional(Int(u64)), .doc = "Its runs that failed for good" },
+            .{ .name = "timed_out", .T = Optional(Int(u64)), .doc = "Its runs whose last attempt timed out" },
+            // How long its completed runs took, from a worker first taking
+            // one to its completion; none until one completes.
+            .{ .name = "latency_count", .T = Optional(Int(u64)), .doc = "Completed runs measured" },
             .{ .name = "latency_avg_ms", .T = Optional(Int(u64)), .doc = "Their mean duration" },
             .{ .name = "latency_p50_ms", .T = Optional(Int(u64)), .doc = "Their median duration" },
             .{ .name = "latency_p95_ms", .T = Optional(Int(u64)), .doc = "Their 95th percentile duration" },
             .{ .name = "latency_max_ms", .T = Optional(Int(u64)), .doc = "The longest" },
         }),
         .cli = .{ .expose = .command, .key = .{ .name = "action", .doc = "The action's name" }, .render = .record, .examples = &.{"flo action info send-email"} },
-        .doc = "An action's definition, its runs by status and how long completed runs took. Ready runs are counted exactly; the rest over the namespace's first 10,000 runs.",
+        .doc = "An action's definition, its runs by status and how long completed runs took. Counts other than ready are none in a namespace of more than 10,000 runs.",
     },
 };
 
 /// The most runs `action.info` reads for its counts and latency, so one
 /// answer is bounded however many runs a namespace keeps.
 pub const RUNS_SCANNED: u32 = 10_000;
+/// The most ready runs `action.info` counts.
+pub const READY_COUNTED: u64 = 100_000;
 
 /// The longest owner an action registers with.
 pub const MAX_OWNER: u32 = 256;

@@ -17,11 +17,17 @@ import './compute.css'
 
 type Tab = 'overview' | 'runs'
 
-const errCount = (r: ActionRunCounts): number => r.failed + r.timed_out
-const invCount = (r: ActionRunCounts): number => r.pending + r.running + r.completed + r.failed + r.timed_out
-/** The counts beyond `pending` stop at a scan cap; say so when they hit it. */
+const errCount = (r: ActionRunCounts): number | null =>
+  r.failed == null || r.timed_out == null ? null : r.failed + r.timed_out
+const invCount = (r: ActionRunCounts): number | null => {
+  const done = errCount(r)
+  return done == null || r.running == null || r.completed == null ? null : r.pending + r.running + r.completed + done
+}
+/** Past a namespace's 10,000 runs only pending is counted; say why the rest show a dash. */
 const scanSub = (r: ActionRunCounts | undefined, fallback: string): string =>
-  r?.sampled ? `of the first ${r.runs_scanned.toLocaleString()} runs in this namespace` : fallback
+  r?.too_many_runs ? 'too many runs in this namespace to count' : fallback
+const pendingText = (r: ActionRunCounts | undefined): string =>
+  r ? (r.pending_capped ? '≥' : '') + afmtN(r.pending) : DASH
 const durMs = (run: ActionRun): number | null =>
   run.completed_at != null && run.started_at != null ? run.completed_at - run.started_at : null
 const fmtDur = (ms: number): string => (ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's')
@@ -215,12 +221,12 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
 
       <Stats>
         <Stat label="Invocations" value={orDash(inv, afmtN)} sub={scanSub(counts, 'all time')} />
-        <Stat label="Completed" value={orDash(counts?.completed, afmtN)} sub={`${orDash(counts?.pending)} pending`} />
+        <Stat label="Completed" value={orDash(counts?.completed, afmtN)} sub={`${pendingText(counts)} pending`} />
         <Stat
           label="Errors"
           value={orDash(errs)}
           valueColor={errs ? 'var(--crit)' : undefined}
-          sub={counts?.sampled ? `${errRate} · ${scanSub(counts, '')}` : errRate}
+          sub={counts?.too_many_runs ? scanSub(counts, '') : errRate}
         />
         <Stat label="Workers" value={a?.workers?.length ?? 0} sub="handling this action" />
       </Stats>
@@ -294,7 +300,7 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                   <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {counts &&
                       (['pending', 'running', 'completed', 'failed', 'timed_out'] as const)
-                        .filter((s) => counts[s] > 0)
+                        .filter((s) => (counts[s] ?? 0) > 0)
                         .map((s) => (
                           <span key={s} className="tag">
                             {A_RUNST[s]?.[1] ?? s} {counts[s]}
@@ -312,9 +318,9 @@ function ActionDetail({ ns, name, onBack }: { ns: string; name: string; onBack: 
                     )}
                   </span>
                 </div>
-                {counts?.sampled && (
+                {counts?.too_many_runs && (
                   <div className="mono" style={{ fontSize: 11, color: 'var(--tx-faint)', marginTop: 8 }}>
-                    Counts and latency are {scanSub(counts, '')}; pending is exact.
+                    The namespace holds more than 10,000 runs, so only pending is counted.
                   </div>
                 )}
               </div>

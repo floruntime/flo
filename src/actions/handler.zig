@@ -582,9 +582,9 @@ pub const ActionsHandler = struct {
     // ── Info ────────────────────────────────────────────────────────────
 
     /// An action's definition and its runs. Ready runs are its ready keys,
-    /// every one; the other counts and the latency are over the namespace's
-    /// first RUNS_SCANNED runs, since runs are kept and a namespace's grow
-    /// without bound.
+    /// up to READY_COUNTED. The other counts and the latency read every run
+    /// in the namespace, so they are none past RUNS_SCANNED: runs are kept,
+    /// and a namespace's grow without bound.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const ns = homeOf(req.namespace);
         const def = getDef(shard, ns, req.key) orelse
@@ -594,17 +594,25 @@ pub const ActionsHandler = struct {
         @memcpy(owner, def.owner[0..owner.len]);
 
         var ready: u64 = 0;
+        var ready_capped = false;
         var pb: [KEY_BUF]u8 = undefined;
         var rb: [machine.MAX_KEY_LEN]u8 = undefined;
         if (storeKey(&pb, ns, machine.readyPrefix(&rb, req.key))) |prefix| {
             var it = readOf(shard).range(machine.Ready, prefix);
-            while (it.next() catch null) |_| ready += 1;
+            while (it.next() catch null) |_| {
+                if (ready == action_ops.READY_COUNTED) {
+                    ready_capped = true;
+                    break;
+                }
+                ready += 1;
+            }
         }
 
         const durations = try shard.allocator.alloc(u64, action_ops.RUNS_SCANNED);
         defer shard.allocator.free(durations);
         const counts = countRuns(shard, ns, req.key, durations);
-        const lat = latencyOf(durations[0..counts.measured]);
+        const lat = if (counts.sampled) null else latencyOf(durations[0..counts.measured]);
+        const counted = !counts.sampled;
         return .{ .answer = .{
             .owner = owner,
             .version = def.version,
@@ -612,13 +620,13 @@ pub const ActionsHandler = struct {
             .max_attempts = def.max_attempts,
             .created_at_ms = nsToMs(def.created_ns),
             .ready = ready,
-            .runs_scanned = counts.scanned,
-            .sampled = counts.sampled,
-            .running = counts.running,
-            .completed = counts.completed,
-            .failed = counts.failed,
-            .timed_out = counts.timed_out,
-            .latency_count = counts.measured,
+            .ready_capped = ready_capped,
+            .too_many_runs = counts.sampled,
+            .running = if (counted) counts.running else null,
+            .completed = if (counted) counts.completed else null,
+            .failed = if (counted) counts.failed else null,
+            .timed_out = if (counted) counts.timed_out else null,
+            .latency_count = if (counted) counts.measured else null,
             .latency_avg_ms = if (lat) |l| l.avg_ms else null,
             .latency_p50_ms = if (lat) |l| l.p50_ms else null,
             .latency_p95_ms = if (lat) |l| l.p95_ms else null,
@@ -672,6 +680,11 @@ pub const ActionsHandler = struct {
 
     const Latency = struct { avg_ms: u64, p50_ms: u64, p95_ms: u64, max_ms: u64 };
 
+    /// The index of the `pct`th percentile of `n` sorted values: ceil(pct·n/100) − 1.
+    fn nearestRank(n: usize, pct: usize) usize {
+        return (pct * n + 99) / 100 - 1;
+    }
+
     /// Completed runs' durations' mean, median, 95th percentile and longest.
     fn latencyOf(durations: []u64) ?Latency {
         if (durations.len == 0) return null;
@@ -680,8 +693,9 @@ pub const ActionsHandler = struct {
         for (durations) |d| total += d;
         return .{
             .avg_ms = @intCast(total / durations.len),
-            .p50_ms = durations[(durations.len - 1) / 2],
-            .p95_ms = durations[(durations.len - 1) * 95 / 100],
+            // Nearest rank: the smallest value at or above that share.
+            .p50_ms = durations[nearestRank(durations.len, 50)],
+            .p95_ms = durations[nearestRank(durations.len, 95)],
             .max_ms = durations[durations.len - 1],
         };
     }
@@ -2090,6 +2104,10 @@ const test_support = struct {
 
 test "action info's latency: percentiles of the completed runs, none without one" {
     try std.testing.expectEqual(@as(?ActionsHandler.Latency, null), ActionsHandler.latencyOf(&.{}));
+    // Two runs: the 95th percentile is the slower one, not the faster.
+    var two = [_]u64{ 59, 6433 };
+    try std.testing.expectEqual(@as(u64, 6433), ActionsHandler.latencyOf(&two).?.p95_ms);
+    try std.testing.expectEqual(@as(u64, 59), ActionsHandler.latencyOf(&two).?.p50_ms);
     var one = [_]u64{7};
     const l1 = ActionsHandler.latencyOf(&one).?;
     try std.testing.expectEqual(@as(u64, 7), l1.p95_ms);

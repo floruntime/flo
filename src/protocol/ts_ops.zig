@@ -36,7 +36,7 @@ pub const table = [_]ops.Op{
             .{ .name = "newest_ms", .T = Optional(Int(i64)), .doc = "Its newest point's time" },
         }),
         .cli = .{ .expose = .command, .key = .{ .name = "measurement", .doc = "The measurement's name" }, .render = .record, .examples = &.{"flo ts info cpu"} },
-        .doc = "A measurement's series, fields, points and the times of its oldest and newest points.",
+        .doc = "A measurement's series, fields, points and the times of its oldest and newest points. A measurement with no series is not found.",
     },
 };
 

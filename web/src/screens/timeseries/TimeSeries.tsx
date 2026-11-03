@@ -513,7 +513,7 @@ function MeasDetail({ ns, row, onBack }: { ns: string; row: TsMeasurement; onBac
 
       <Stats>
         <Stat label="Series" value={src.series_count} sub={`${fieldCount} fields`} />
-        <Stat label="Datapoints" value={cfmt(src.points)} sub="buffered" />
+        <Stat label="Datapoints" value={cfmt(src.points)} sub="flushed and buffered" />
         <Stat label="Fields" value={fieldCount} sub="per measurement" />
         <Stat label="Newest point" value={detail?.newest_ms != null ? tfmt(detail.newest_ms) : DASH} sub={span} />
       </Stats>
@@ -600,7 +600,7 @@ export function TimeSeries() {
         <Stat label="Measurements" value={q.isLoading ? '…' : meas.length} sub={`in ${ns}`} />
         <Stat label="Series" value={orDash(totSeries, cfmt)} sub="measurement + field" />
         <Stat label="Fields" value={orDash(totFields, (n) => (anyCapped ? '≥' : '') + cfmt(n))} sub="numeric columns" />
-        <Stat label="Datapoints" value={orDash(totPoints, cfmt)} sub="buffered · Raft-replicated" />
+        <Stat label="Datapoints" value={orDash(totPoints, cfmt)} sub="flushed and buffered · Raft-replicated" />
       </Stats>
 
       <FloQLConsole ns={ns} measurements={meas} />

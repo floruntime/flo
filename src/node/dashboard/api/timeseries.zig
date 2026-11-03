@@ -82,7 +82,7 @@ pub fn getMeasurements(allocator: Allocator, query_string: ?[]const u8, ctx: *Da
 
 /// GET /timeseries/:measurement — Measurement detail, from `ts.info` on
 /// the measurement's shard: its fields, series, points and their times. A
-/// measurement with no points is a 404. Each series' tags aren't answered
+/// measurement with no series is a 404. Each series' tags aren't answered
 /// by any op yet, so `series` is null.
 pub fn getMeasurementDetail(allocator: Allocator, measurement: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";

@@ -257,20 +257,19 @@ pub fn getActionDetail(allocator: Allocator, name: []const u8, query_string: ?[]
         var runs = try obj.objectField("runs");
         try runs.begin();
         try runs.intField("pending", @as(i64, @intCast(info.ready)));
-        try runs.intField("running", @as(i64, @intCast(info.running)));
-        try runs.intField("completed", @as(i64, @intCast(info.completed)));
-        try runs.intField("failed", @as(i64, @intCast(info.failed)));
-        try runs.intField("timed_out", @as(i64, @intCast(info.timed_out)));
-        // Every count but pending is over the namespace's first
-        // `runs_scanned` runs; `sampled` says there are more.
-        try runs.intField("runs_scanned", @as(i64, info.runs_scanned));
-        try runs.boolField("sampled", info.sampled);
+        // Pending is at least that many.
+        try runs.boolField("pending_capped", info.ready_capped);
+        // Null in a namespace of too many runs to count.
+        for ([_][]const u8{ "running", "completed", "failed", "timed_out" }, [_]?u64{ info.running, info.completed, info.failed, info.timed_out }) |field, v| {
+            if (v) |n| try runs.intField(field, @as(i64, @intCast(n))) else try runs.nullField(field);
+        }
+        try runs.boolField("too_many_runs", info.too_many_runs);
         try runs.end();
     }
-    if (info.latency_count == 0) try obj.nullField("latency") else {
+    if ((info.latency_count orelse 0) == 0) try obj.nullField("latency") else {
         var lat = try obj.objectField("latency");
         try lat.begin();
-        try lat.intField("count", @as(i64, @intCast(info.latency_count)));
+        try lat.intField("count", @as(i64, @intCast(info.latency_count.?)));
         try lat.intField("avg_ms", @as(i64, @intCast(info.latency_avg_ms.?)));
         try lat.intField("p50_ms", @as(i64, @intCast(info.latency_p50_ms.?)));
         try lat.intField("p95_ms", @as(i64, @intCast(info.latency_p95_ms.?)));

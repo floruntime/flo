@@ -207,8 +207,8 @@ export interface QueueMessagesResponse {
 // ── timeseries ──────────────────────────────────────────────
 // NB: the TS projection keys write buffers by `measurement\0field\0tag_hash`,
 // so tags ARE a series dimension — `series_count` counts distinct
-// measurement+field+tag-set series (no longer just fields), and `points` is the
-// buffered point total across them.
+// measurement+field+tag-set series (no longer just fields), and `points` counts
+// every point across them, flushed and buffered.
 export interface TsMeasurement {
   name: string
   series_count: number
@@ -262,18 +262,19 @@ export interface TsFloqlResponse {
 
 // ── actions ─────────────────────────────────────────────────
 export type ActionRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
-/** `pending` is exact; the other counts cover only the first `runs_scanned`
- *  runs in the namespace, and `sampled` says that cap was hit. */
+/** `pending` is counted up to 100,000 (`pending_capped`: at least that).
+ *  The others read every run in the namespace, so they are null when it
+ *  holds too many runs to count (`too_many_runs`). */
 export interface ActionRunCounts {
   pending: number
-  running: number
-  completed: number
-  failed: number
-  timed_out: number
-  runs_scanned: number
-  sampled: boolean
+  pending_capped: boolean
+  running: number | null
+  completed: number | null
+  failed: number | null
+  timed_out: number | null
+  too_many_runs: boolean
 }
-/** Over the same scanned runs as ActionRunCounts. */
+/** Over the same runs as ActionRunCounts; null when they aren't counted. */
 export interface ActionLatency {
   count: number
   avg_ms: number
@@ -394,7 +395,8 @@ export interface WorkflowDefDetail {
   version: string | null
   created_at: number | null
   enabled: boolean | null
-  status: 'active' | 'disabled' | null
+  /** 'unknown' when the definition isn't there. */
+  status: 'active' | 'disabled' | 'unknown' | null
   definition_yaml: string
   /** Planned; always null for now. */
   run_count: null
