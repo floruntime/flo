@@ -61,7 +61,7 @@ test "e2e/dashboard: queue enqueue produces a consumable message" {
     try testing.expect(deq.contains("hello-dash"));
 }
 
-test "e2e/dashboard: a queue's ready and in-flight counts are exact after a dequeue" {
+test "e2e/dashboard: a queue's counts are exact after a dequeue, and after a restart" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
@@ -72,6 +72,14 @@ test "e2e/dashboard: a queue's ready and in-flight counts are exact after a dequ
     defer deq.deinit();
     try stdx.testing.assertSucceeded(deq);
 
+    try expectExactCounts(ctx);
+    // A restart rebuilds the queue from the log alone: the same counts.
+    try ctx.restartServer();
+    try expectExactCounts(ctx);
+}
+
+/// rq's counts once its three enqueues and one dequeue have applied.
+fn expectExactCounts(ctx: *stdx.testing.TestContext) !void {
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
     // A dequeue takes its message for good (queues are at-most-once): its
