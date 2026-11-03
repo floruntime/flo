@@ -271,6 +271,10 @@ pub const Scenario = struct {
         var prng = PRNG.init(std.hash.Wyhash.hash(0xAC71, std.mem.asBytes(&seed)));
         s.action_percent = prng.random().intRangeAtMost(u8, 25, 60);
         s.ticks_safety = @max(s.ticks_safety, prng.random().intRangeAtMost(u64, 30_000, 60_000));
+        // Leaders that last: a lease outlives one only if the next stays
+        // up through its grace, a lease long, after taking over.
+        s.crash_permille = @min(s.crash_permille, 1);
+        s.partition_permille = @min(s.partition_permille, 2);
         return s;
     }
 

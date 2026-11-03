@@ -14337,41 +14337,87 @@ test "actions: a list rebuilt once it drains keeps what it held, reading only wh
     try std.testing.expectEqual(@as(?u64, null), actions.dropped);
 }
 
-test "actions: however awaits, invokes and commits interleave, no two delivers in flight name one run" {
+test "actions: however awaits, invokes, refusals, step-downs and commits interleave, the leader picks each due run once" {
     var prng = @import("stdx").PRNG.init(0x5E1EC7);
     const r = prng.random();
+    const view = @import("../contract/view.zig");
     for (0..8) |_| {
         var t: ClusterActionsTest = undefined;
         try t.init();
         defer t.deinit();
         try t.setUp(&.{ "r0", "r1" }, 0);
         const actions = t.shard.actions_handler;
-        var run_buf: [16]u8 = undefined;
+        const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
+        var name_buf: [16]u8 = undefined;
         var b: [256]u8 = undefined;
+        var store_index: u64 = 100;
         var invoked: u64 = 2;
         var most: usize = 0;
-        for (0..200) |step| {
-            switch (r.uintLessThan(u8, 10)) {
-                // A run ready at once, as an applied invoke leaves it.
-                0...1 => {
-                    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&run_buf, "r{d}", .{invoked})), 100 + invoked, 1);
+        var refused: u32 = 0;
+        var agains: u32 = 0;
+        for (0..300) |step| {
+            store_index += 1;
+            switch (r.uintLessThan(u8, 20)) {
+                // A run, as an applied invoke leaves it: most due at once,
+                // some not for an hour.
+                0...3 => {
+                    const later = r.uintLessThan(u8, 4) == 0;
+                    _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", try std.fmt.bufPrint(&name_buf, "r{d}", .{invoked})), store_index, if (later) now + std.time.ns_per_hour else 1);
                     invoked += 1;
                 },
-                // An await from one of a few workers: its deliver stays in
-                // flight until the peer acks.
-                2...7 => {
-                    const worker = try std.fmt.bufPrint(&run_buf, "w{d}", .{r.uintLessThan(u8, 6)});
-                    try ParkTest.send(&t.shard, t.c.conn, .action_await, 1000 + step, worker, try awaitOn(&b, &.{"act"}, 0));
+                // An await from one of a few workers, now and then with a
+                // request key; its deliver stays in flight until the ack.
+                4...12 => {
+                    var wb: [8]u8 = undefined;
+                    const worker = try std.fmt.bufPrint(&wb, "w{d}", .{r.uintLessThan(u8, 6)});
+                    var kb: [4]u8 = undefined;
+                    const key: ?[]const u8 = if (r.uintLessThan(u8, 3) == 0) try std.fmt.bufPrint(&kb, "k{d}", .{r.uintLessThan(u8, 2)}) else null;
+                    // A key whose delivery its worker still holds is given
+                    // that delivery again, not a new one.
+                    var held = false;
+                    if (key) |k| {
+                        var rb: [64]u8 = undefined;
+                        var sk: [128]u8 = undefined;
+                        const rec_key = try view.key(&sk, "default", action_machine.requestKey(&rb, worker, k));
+                        if (t.shard.defaultPartition().store.get(action_machine.Requests.ID, rec_key)) |bytes| {
+                            const rec = (try action_machine.Requests.Value.decode(bytes)).v;
+                            if (ActionsHandler.for_tests.run(&t.shard, "default", rec.run)) |run| held = run.status == .leased and run.token.term == rec.term and run.token.index == rec.index;
+                        }
+                    }
+                    const before = actions.pending.items.len;
+                    try ParkTest.send(&t.shard, t.c.conn, .action_await, 1000 + step, worker, try ActionsHandler.for_tests.awaitBody(&b, &.{"act"}, 0, key));
+                    if (held) {
+                        agains += 1;
+                        try std.testing.expectEqual(before, actions.pending.items.len);
+                    }
                 },
+                // A rival delivery of a run in flight lands first: that
+                // deliver is refused when it applies.
+                13...14 => if (actions.pending.items.len > 0) {
+                    var eb: [256]u8 = undefined;
+                    const pd = actions.pending.items[r.uintLessThan(usize, actions.pending.items.len)];
+                    const e = t.shard.raft_node.log.getEntryCopy(pd.index, &eb) orelse return error.TestUnexpectedResult;
+                    var diag: schema.Diagnostic = .{};
+                    const d = try action_entries.Deliver.decodeAll(e.payload, &diag);
+                    var rb: [16]u8 = undefined;
+                    @memcpy(rb[0..d.run.len], d.run);
+                    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = rb[0..d.run.len], .due_ns = d.due_ns, .holder = "rival", .request_key = null, .lease_ms = 5000 }, store_index, now);
+                    refused += 1;
+                },
+                // This node steps down, and leads again.
+                15 => actions.stoppedLeading(&t.shard),
                 else => try ParkTest.ack(&t.shard),
             }
-            // Every deliver proposed and not yet applied names its own run.
+            // Every deliver proposed and not yet applied names its own run,
+            // due when it was proposed; only those runs are held back.
             var runs: [256][]const u8 = undefined;
             var bufs: [256][256]u8 = undefined;
             for (actions.pending.items, 0..) |pd, k| {
                 const e = t.shard.raft_node.log.getEntryCopy(pd.index, &bufs[k]) orelse return error.TestUnexpectedResult;
                 var diag: schema.Diagnostic = .{};
-                runs[k] = (try action_entries.Deliver.decodeAll(e.payload, &diag)).run;
+                const d = try action_entries.Deliver.decodeAll(e.payload, &diag);
+                try std.testing.expect(d.due_ns <= e.header.timestamp_ns);
+                runs[k] = d.run;
                 for (runs[0..k]) |other| try std.testing.expect(!std.mem.eql(u8, other, runs[k]));
             }
             try std.testing.expectEqual(actions.pending.items.len, actions.reserved.count());
@@ -14380,9 +14426,10 @@ test "actions: however awaits, invokes and commits interleave, no two delivers i
             var sink: [8192]u8 = undefined;
             while (std.c.read(t.c.pair[1], &sink, sink.len) > 0) {}
         }
-        // Delivers were in flight together, more than one at a time.
-        errdefer std.debug.print("at most {d} in flight\n", .{most});
-        try std.testing.expect(most >= 3);
+        // Delivers were in flight together, some were refused, and some
+        // keys found their delivery.
+        errdefer std.debug.print("at most {d} in flight, {d} refused, {d} given again\n", .{ most, refused, agains });
+        try std.testing.expect(most >= 3 and refused > 0 and agains > 0);
     }
 }
 

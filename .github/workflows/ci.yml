@@ -349,25 +349,35 @@ jobs:
         timeout-minutes: 20
       - name: Swarm with action entries
         # Action entries made from the leader's own state, some spoiled. It
-        # fails if no seed settles and expires a lease from an earlier term.
-        run: ./zig-out/bin/vopr --iterations=10 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
+        # fails if fewer than 3 seeds settle and expire leases from an
+        # earlier term.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
         timeout-minutes: 10
       - name: Mutant scenarios still fail
         # Each row of src/vopr/mutants/README.md plants a bug the checker
-        # must catch with the invariant named; the scenario alone passes.
+        # must catch, with the invariant and the words named; the scenario
+        # alone passes. Every families.Mutant is named there, in a row or
+        # in the list of those with none.
         run: |
-          rows=$(grep -E '^\| `[A-Za-z0-9._-]+\.json` \|' src/vopr/mutants/README.md | tr -d '`' | awk -F'|' '{gsub(/ /,""); print $2" "$3" "$4}')
-          [ -n "$rows" ] || { echo "::error::src/vopr/mutants/README.md lists no rows"; exit 1; }
-          for f in $(echo "$rows" | awk '{print $1}' | sort -u); do
+          readme=src/vopr/mutants/README.md
+          for m in $(sed -n '/pub const Mutant = enum {/,/^};/p' src/vopr/families.zig | grep -oE '^    [a-z_]+,' | tr -d ' ,'); do
+            [ "$m" = none ] || grep -qF "\`$m\`" "$readme" || { echo "::error::families.Mutant.$m is in no row of $readme, nor in its list"; exit 1; }
+          done
+          rows=$(grep -E '^\| `[A-Za-z0-9._-]+\.json` \|' "$readme")
+          [ -n "$rows" ] || { echo "::error::$readme lists no rows"; exit 1; }
+          trim() { sed -E 's/^ *`?//; s/`? *$//' <<< "$1"; }
+          for f in $(cut -d'|' -f2 <<< "$rows" | tr -d '` ' | sort -u); do
             timeout 300 ./zig-out/bin/vopr --scenario-in="src/vopr/mutants/$f" > /tmp/mutant.log 2>&1 || {
               tail -40 /tmp/mutant.log; echo "::error::$f fails with no mutant"; exit 1; }
           done
-          echo "$rows" | while read -r f mutant want; do
+          while IFS='|' read -r _ f mutant want says _; do
+            f=$(trim "$f"); mutant=$(trim "$mutant"); want=$(trim "$want"); says=$(trim "$says")
             if timeout 300 ./zig-out/bin/vopr --scenario-in="src/vopr/mutants/$f" --family-mutant="$mutant" > /tmp/mutant.log 2>&1; then
               echo "::error::$f passed with $mutant planted"; exit 1
             fi
-            grep -qE "^ *\[$want\]" /tmp/mutant.log || { tail -40 /tmp/mutant.log; echo "::error::$f with $mutant failed, but not with [$want]"; exit 1; }
-          done
+            grep -E "^ *\[$want\]" /tmp/mutant.log | grep -qF -- "$says" || {
+              tail -40 /tmp/mutant.log; echo "::error::$f with $mutant failed, but not with [$want] saying '$says'"; exit 1; }
+          done <<< "$rows"
         timeout-minutes: 15
       - name: Regression seeds stay green
         # Each seed reaches a bug whose fix landed; it fails if the fix is

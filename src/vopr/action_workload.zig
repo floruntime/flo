@@ -19,7 +19,12 @@ const families = @import("families.zig");
 const EntryType = entry_mod.EntryType;
 
 const NS = "default";
-const ACTIONS = [_][]const u8{ "a0", "a1" };
+/// Each action is always registered with the same lease and attempts, so
+/// a deliver's lease is its action's whichever register it read.
+const ACTIONS = [_]struct { name: []const u8, lease_ms: u64, max_attempts: u32 }{
+    .{ .name = "a0", .lease_ms = 5_000, .max_attempts = 2 },
+    .{ .name = "a1", .lease_ms = 7_000, .max_attempts = 3 },
+};
 /// Holders whose name starts so are workers that die holding the run:
 /// nothing reports for them, and their leases expire.
 const DEAD = "x";
@@ -37,21 +42,22 @@ pub const Leader = struct {
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
 
-const Kind = enum { register, invoke, deliver, settle, release, extend, expire };
-/// Out of 100. Reports need leases, so delivers come often.
-const WEIGHTS = [_]u8{ 3, 25, 27, 13, 12, 8, 12 };
+const Kind = enum { register, delete, invoke, deliver, settle, release, extend, expire };
+/// Out of 100. Reports need leases, so delivers come often; an action is
+/// deleted now and then, and registered again.
+const WEIGHTS = [_]u8{ 3, 1, 25, 27, 12, 12, 8, 12 };
 /// Percent of entries spoiled, by kind: enough that each kind the machine
 /// can refuse is refused a fifth to a third of the time, counting those a
 /// lagging leader's state spoils on its own.
-const SPOIL = [_]u8{ 0, 25, 15, 15, 15, 20, 15 };
+const SPOIL = [_]u8{ 0, 0, 15, 15, 15, 15, 10, 15 };
 
 /// An action entry for op `op_id`, in `buf`, at most `max_len` bytes; null
 /// when the leader has nothing of the kind drawn to propose.
 pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u8, max_len: usize) ?Made {
     const out = buf[0..@min(buf.len, max_len)];
     var have_def = false;
-    for (ACTIONS) |name| {
-        if (def(a, name) != null) have_def = true;
+    for (ACTIONS) |act| {
+        if (def(a, act.name) != null) have_def = true;
     }
     var roll = r.uintLessThan(u8, 100);
     // A leader that hasn't applied its actions yet registers one now and
@@ -66,6 +72,7 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
     const tag = std.fmt.bufPrint(&hex, "{x}", .{op_id}) catch unreachable;
     return switch (kind) {
         .register => register(out, r),
+        .delete => delete(out, r),
         .invoke => invoke(a, out, r, spoil, tag),
         .deliver => deliver(a, out, l, r, spoil, tag),
         .settle, .release, .extend => report(a, out, kind, l, r, spoil, tag),
@@ -74,14 +81,16 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
 }
 
 fn register(out: []u8, r: std.Random) !?Made {
-    const p = try ae.Register.encodeInto(out, .{
-        .ns = NS,
-        .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
-        .owner = "",
-        .lease_ms = r.intRangeAtMost(u64, 5_000, 15_000),
-        .max_attempts = r.intRangeAtMost(u32, 1, 4),
-    });
+    const act = ACTIONS[r.uintLessThan(usize, ACTIONS.len)];
+    const p = try ae.Register.encodeInto(out, .{ .ns = NS, .name = act.name, .owner = "", .lease_ms = act.lease_ms, .max_attempts = act.max_attempts });
     return .{ .entry_type = .action_register, .payload = p };
+}
+
+/// An action deleted: its runs stay, but none is delivered until it is
+/// registered again.
+fn delete(out: []u8, r: std.Random) !?Made {
+    const p = try ae.Delete.encodeInto(out, .{ .ns = NS, .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)].name });
+    return .{ .entry_type = .action_delete, .payload = p };
 }
 
 /// A new run; spoiled, one with a taken id.
@@ -91,7 +100,7 @@ fn invoke(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: []co
     const taken = if (spoil) pick(a, r, any, &ib) else null;
     const p = try ae.Invoke.encodeInto(out, .{
         .ns = NS,
-        .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
+        .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)].name,
         .run = if (taken) |t| t.id else try std.fmt.bufPrint(&rb, "r{s}", .{tag}),
         .input = tag,
         .labels = null,
@@ -157,9 +166,9 @@ fn deliver(a: *families.Actions, out: []u8, l: Leader, r: std.Random, spoil: boo
         .action = p.run.action,
         .run = p.id,
         .due_ns = if (spoil and p.run.status == .ready and r.boolean()) p.run.due_ns + 1 else p.run.due_ns,
-        .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 3)) {
-            0 => DEAD,
-            1 => SLOW,
+        .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 5)) {
+            0, 1 => DEAD,
+            2 => SLOW,
             else => "w",
         }, tag }),
         .request_key = if (r.uintLessThan(u8, 3) == 0) try std.fmt.bufPrint(&kb, "k{d}", .{r.uintLessThan(u8, 4)}) else null,
@@ -186,9 +195,16 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
     var holder = v.holder;
     var deliveries = v.deliveries;
     var token = v.token;
+    // An extend names no delivery count, so it is spoiled another way:
+    // not its delivery's own start.
+    var held_since = v.delivered_ns;
     if (spoil and !resend) switch (r.uintLessThan(u8, 3)) {
         0 => token.index -|= 1,
-        1 => deliveries -|= 1,
+        1 => if (kind == .extend) {
+            held_since += 1;
+        } else {
+            deliveries -|= 1;
+        },
         else => holder = "w-other",
     };
     const stale_seen = kind == .extend and r.uintLessThan(u8, 4) == 0;
@@ -229,8 +245,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             // A leader that saw an older expiry: the extend applies, and
             // leaves the lease's real key behind, stale once it moves.
             .expiry_ns = if (stale_seen) v.expiry_ns - 1 else v.expiry_ns,
-            // Spoiled another way too: not its delivery's own start.
-            .held_since_ns = if (spoil and r.boolean()) v.delivered_ns + 1 else v.delivered_ns,
+            .held_since_ns = held_since,
             .lease_ms = v.lease_ms,
         }),
     };

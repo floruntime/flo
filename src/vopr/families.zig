@@ -68,6 +68,12 @@ pub const Mutant = enum {
     extend_ignores_held_since,
     /// Action entries apply at the replica's own clock.
     action_node_clock,
+
+    /// Whether the bug is in the actions machine: a run with no action
+    /// entries never reaches it.
+    pub fn inActions(m: Mutant) bool {
+        return @backingInt(m) >= @backingInt(Mutant.deliver_ignores_due);
+    }
 };
 
 /// What a family is told about the replica applying an entry. Only a
@@ -420,6 +426,13 @@ pub const Actions = struct {
             },
         }
 
+        // The action an invoke or deliver names, as it stood.
+        const def_before: ?action_machine.Def.Value = switch (kind) {
+            .invoke => self.def("default", (ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt).action),
+            .deliver => self.def("default", (ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt).action),
+            else => null,
+        };
+
         const applied = try self.rewritten(e, r);
         var out: persistence.Result = .{};
         out.reset(&applied);
@@ -427,11 +440,49 @@ pub const Actions = struct {
         try machine_mod.applyEntry(&action_machine.machine, &self.store, &self.scratch, &applied, &out);
         if (out.refused() != null) {
             if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
-            return .{ .kind = kind, .refused = true };
+            return .{ .kind = kind, .refused = true, .broke = refusedWrongly(e, stamp, touched.items, def_before) };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
-        effect.broke = self.check(e, stamp, touched.items, &effect.cross_term);
+        effect.broke = self.check(e, stamp, touched.items, def_before, &effect.cross_term);
         return effect;
+    }
+
+    /// An action's definition, if it has one.
+    fn def(self: *Actions, ns: []const u8, name: []const u8) ?action_machine.Def.Value {
+        var b: [1 + 255 + ae.MAX_ACTION_NAME]u8 = undefined;
+        const k = view_mod.key(&b, ns, name) catch return null;
+        const got = self.read().get(action_machine.Defs, k) catch return null;
+        return if (got) |d| d.v else null;
+    }
+
+    /// Why an entry the machine refused should have applied, if it should.
+    fn refusedWrongly(e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, def_before: ?action_machine.Def.Value) ?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        const pre = if (touched.len == 1) touched[0].before else null;
+        switch (kindOf(e.header.entry_type)) {
+            .invoke => if (def_before != null and pre == null) return "an invoke of a registered action and a new run was refused",
+            .deliver => {
+                const p = ae.Deliver.decodeAll(e.payload, &diag) catch return null;
+                const v = pre orelse return null;
+                if (def_before != null and v.status == .ready and v.due_ns == p.due_ns and p.due_ns <= stamp and std.mem.eql(u8, v.action, p.action))
+                    return "a deliver of a ready run, due, was refused";
+            },
+            .settle => {
+                const p = ae.Settle.decodeAll(e.payload, &diag) catch return null;
+                if (pre) |v| if (holdsDelivery(v, p.holder, p.deliveries, p.token) and std.mem.eql(u8, v.action, p.action)) return "a settle naming the live delivery was refused";
+            },
+            .release => {
+                const p = ae.Release.decodeAll(e.payload, &diag) catch return null;
+                if (pre) |v| if (holdsDelivery(v, p.holder, p.deliveries, p.token) and std.mem.eql(u8, v.action, p.action)) return "a release naming the live delivery was refused";
+            },
+            .extend => {
+                const p = ae.Extend.decodeAll(e.payload, &diag) catch return null;
+                if (pre) |v| if (holdsDelivery(v, p.holder, v.deliveries, p.token) and std.mem.eql(u8, v.action, p.action) and p.lease_ms == v.lease_ms and p.held_since_ns == v.delivered_ns)
+                    return "an extend naming the live delivery and its own lease was refused";
+            },
+            else => {},
+        }
+        return null;
     }
 
     fn note(self: *Actions, ba: Allocator, touched: *std.ArrayListUnmanaged(Touched), ns: []const u8, id: []const u8) Allocator.Error!void {
@@ -448,13 +499,17 @@ pub const Actions = struct {
         return c;
     }
 
+    fn after(stamp_ns: u64, millis: u64) u64 {
+        return stamp_ns +| (millis *| std.time.ns_per_ms);
+    }
+
     fn holdsDelivery(run_: action_machine.Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
         return run_.status == .leased and run_.deliveries == deliveries and run_.token.term == token.term and run_.token.index == token.index and std.mem.eql(u8, run_.holder, holder);
     }
 
     /// The rules an applied entry must keep, by the entry as it was
     /// proposed and the state either side of it.
-    fn check(self: *Actions, e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, cross_term: *bool) ?[]const u8 {
+    fn check(self: *Actions, e: *const entry_mod.Entry, stamp: u64, touched: []const Touched, def_before: ?action_machine.Def.Value, cross_term: *bool) ?[]const u8 {
         var diag: schema.Diagnostic = .{};
         for (touched) |t| {
             const pre = t.before orelse continue;
@@ -467,21 +522,47 @@ pub const Actions = struct {
                     if (pre.status != .ready or pre.due_ns != p.due_ns) return "a deliver applied to a run that wasn't ready at its due time";
                     if (pre.due_ns > stamp) return "a run was delivered before it was due";
                     if (pre.failures >= pre.max_attempts) return "a run that spent its attempts was delivered again";
+                    // What it wrote is what it names, its lease the action's.
+                    if (post.status != .leased or !std.mem.eql(u8, post.holder, p.holder) or post.token.term != e.header.term or post.token.index != e.header.index or post.deliveries != pre.deliveries + 1)
+                        return "a deliver leased a run other than to the delivery it names";
+                    if (!std.meta.eql(post.request_key != null, p.request_key != null) or (p.request_key != null and !std.mem.eql(u8, post.request_key.?, p.request_key.?)))
+                        return "a deliver leased a run other than to the delivery it names";
+                    if (post.lease_ms != p.lease_ms or post.delivered_ns != stamp or post.expiry_ns != after(stamp, p.lease_ms)) return "a deliver's lease doesn't run from its stamp for its lease";
+                    if (def_before == null or p.lease_ms != def_before.?.lease_ms) return "a deliver's lease isn't its action's";
                 },
-                .settle => if (changed) {
+                .settle => {
                     const p = ae.Settle.decodeAll(e.payload, &diag) catch unreachable;
-                    if (!holdsDelivery(pre, p.holder, p.deliveries, p.token)) return "a settle that names no live delivery completed a run";
-                    cross_term.* = cross_term.* or pre.token.term < e.header.term;
+                    if (holdsDelivery(pre, p.holder, p.deliveries, p.token)) {
+                        if (post.status != .completed or post.ended != .settled or !std.mem.eql(u8, post.result, p.result) or !std.mem.eql(u8, post.outcome, p.outcome))
+                            return "a settle naming the live delivery didn't complete the run with its result";
+                        cross_term.* = cross_term.* or pre.token.term < e.header.term;
+                    } else if (changed) return "a settle that names no live delivery completed a run";
                 },
-                .release => if (changed) {
+                .release => {
                     const p = ae.Release.decodeAll(e.payload, &diag) catch unreachable;
-                    if (!holdsDelivery(pre, p.holder, p.deliveries, p.token)) return "a release that names no live delivery ended one";
-                    if (!p.abandoned) failed = 1;
+                    if (holdsDelivery(pre, p.holder, p.deliveries, p.token)) {
+                        if (!p.abandoned) failed = 1;
+                        if (post.failures != pre.failures + failed) return "a run's failures don't count the deliveries that failed";
+                        const spent = !p.abandoned and (!p.retry or pre.failures + 1 >= pre.max_attempts);
+                        if (post.ended != (if (p.abandoned) action_machine.Ended.abandoned else .released)) return "a release naming the live delivery didn't end it as it said";
+                        if (spent) {
+                            if (post.status != .failed) return "a release that spent the run's attempts didn't fail it";
+                        } else if (post.status != .ready or post.due_ns != after(stamp, p.delay_ms)) return "a released run isn't ready again after its delay";
+                    } else if (changed) return "a release that names no live delivery ended one";
                 },
-                .extend => if (changed) {
+                .extend => {
                     const p = ae.Extend.decodeAll(e.payload, &diag) catch unreachable;
-                    if (!holdsDelivery(pre, p.holder, pre.deliveries, p.token)) return "an extend that names no live delivery moved a lease";
-                    if (post.expiry_ns > pre.delivered_ns +| ae.MAX_HOLD_MS * std.time.ns_per_ms) return "a delivery is held past the hold ceiling";
+                    if (holdsDelivery(pre, p.holder, pre.deliveries, p.token)) {
+                        // The lease moves unless more than half of it is
+                        // left, or the ceiling stops it.
+                        const lease_ns = pre.lease_ms *| std.time.ns_per_ms;
+                        const to = @min(after(stamp, p.lease_ms), after(pre.delivered_ns, ae.MAX_HOLD_MS));
+                        const want = if (pre.expiry_ns -| stamp > lease_ns / 2 or to <= pre.expiry_ns) pre.expiry_ns else to;
+                        if (post.expiry_ns != want) {
+                            if (post.expiry_ns > after(pre.delivered_ns, ae.MAX_HOLD_MS)) return "a delivery is held past the hold ceiling";
+                            return "an extend naming the live delivery didn't move its lease as it should";
+                        }
+                    } else if (changed) return "an extend that names no live delivery moved a lease";
                 },
                 .expire => if (pre.status == .leased and post.status != .leased) {
                     // The lease ended: an item named its live deadline, due.

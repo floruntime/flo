@@ -70,7 +70,7 @@ fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
             "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] " ++
-            "[--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
+            "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
 }
@@ -167,6 +167,11 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
+    // A planted bug the run never reaches would pass, and say nothing.
+    if (args.family_mutant.inActions() and scenario.action_percent == 0) {
+        std.debug.print("--family-mutant={t} is in the actions machine: run it with --actions, or a scenario with action entries\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
 
     // The scenario prints before the run: a hang inside the unit under
     // test cannot be interrupted from in here, so the repro must already
@@ -261,6 +266,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
 }
 
 const ActionCounts = vopr.families.Actions.Counts;
+/// How many seeds of an actions swarm must reach each takeover path.
+const MIN_TAKEOVER_SEEDS = 3;
 const ACTION_KINDS = std.enums.values(vopr.families.Actions.Kind);
 
 /// One line a parent can read back: each kind as applied/refused.
@@ -521,8 +528,11 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no action counts\n", .{unread_counts});
             covered = false;
         }
-        if (ok_count > 0 and (settle_seeds == 0 or expire_seeds == 0)) {
-            std.debug.print("[vopr] FAILED: no seed settled and expired leases from an earlier term\n", .{});
+        // A few seeds, not one: a workload change that loses the path in
+        // most seeds should fail here, not pass on a lucky one.
+        const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
+        if (settle_seeds < want or expire_seeds < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired leases from an earlier term\n", .{want});
             covered = false;
         }
     }
