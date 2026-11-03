@@ -1,4 +1,5 @@
 # <ms>	<file>: e2e time per file from CI run 40828254974 (scripts/e2e-shard-times.sh).
+115000	action_claims_test
 19978	action_test
 260	answer_checksum_test
 28356	apply_crash_test

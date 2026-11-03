@@ -130,6 +130,20 @@ fn runStatus(fd: std.c.fd_t, run: []const u8) !Status {
     return s;
 }
 
+/// `runStatus`, asked again while a node that just became leader answers
+/// that it isn't ready yet, `retries` times at most.
+fn runStatusRetrying(fd: std.c.fd_t, run: []const u8, retries: u32) !Status {
+    var left = retries;
+    while (left > 0) : (left -= 1) {
+        var buf: [4096]u8 = undefined;
+        const r = try call(fd, .action_status, run, "", &buf, 5000);
+        if (r.header.status != @backingInt(proto.StatusCode.unavailable)) break;
+        if ((try r.refused()).reason != .leader_unknown) break;
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    }
+    return runStatus(fd, run);
+}
+
 /// A run invoked through the CLI: its id, from "Result: <id>".
 fn invoke(out: []const u8, buf: []u8) ![]const u8 {
     const prefix = "Result: ";
@@ -391,4 +405,55 @@ test "e2e/action/cluster: a run claimed before its leader is killed stays its wo
     try testing.expectEqual(action_ops.RunStatus.completed, done.status);
     try testing.expectEqual(@as(u32, 1), done.attempt);
     try testing.expectEqualStrings("ok", done.output_buf[0..done.output_len]);
+}
+
+test "e2e/action/cluster: after a leader is killed, a lease longer than the new leader's grace runs to its own deadline, then ends" {
+    var cluster = try ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try leaderOf(&cluster, null);
+    // Longer than the 30 s the new leader's grace is capped at, so the
+    // grace ends before the deadline: only the deadline may end the lease.
+    const lease_ms = 40_000;
+    try cluster.execOn(first, &.{ "action", "register", "outlast", "--timeout", "40000", "--retries", "3" });
+    var run_buf: [64]u8 = undefined;
+    const invoked = try cluster.execCaptureOn(first, &.{ "action", "invoke", "outlast", "{}" });
+    defer cluster.allocator.free(invoked);
+    const run = try invoke(invoked, &run_buf);
+
+    var held: Held = undefined;
+    {
+        const fd = try connect(cluster.getServer(first).?.getPort());
+        defer _ = std.c.close(fd);
+        try testing.expect(try awaitTask(fd, "w1", "outlast", 5000, &held));
+    }
+    // The deliver committed at most this long ago.
+    const delivered_at = stdx.time.milliTimestamp();
+    try testing.expectEqual(@as(u64, lease_ms), held.task.lease_ms);
+
+    cluster.killNode(first);
+    const next = try leaderOf(&cluster, first);
+    const fd = try connect(cluster.getServer(next).?.getPort());
+    defer _ = std.c.close(fd);
+    // The new leader's grace ends about 30 s after it took over, well
+    // before the deadline; until 4 s short of the deadline the run is held.
+    var first_read = true;
+    while (stdx.time.milliTimestamp() - delivered_at < lease_ms - 4000) {
+        const s = if (first_read) try runStatusRetrying(fd, run, 25) else try runStatus(fd, run);
+        first_read = false;
+        if (s.status != .running) {
+            std.debug.print("\nrun {s} is {t} {d} ms after its deliver, before its {d} ms lease ended\n", .{ run, s.status, stdx.time.milliTimestamp() - delivered_at, lease_ms });
+            return error.TestUnexpectedResult;
+        }
+        try testing.expectEqualStrings("w1", s.worker_buf[0..s.worker_len]);
+        stdx.time.sleep(500 * std.time.ns_per_ms);
+    }
+    // Then the deadline ends it, as a failure, and the run is ready again.
+    const ended = try statusOnce(fd, run, .pending, 15_000);
+    try testing.expectEqual(@as(u32, 1), ended.attempt);
+    // The holder hears that its lease is gone.
+    var buf: [4096]u8 = undefined;
+    const late = try complete(fd, "w1", held.task, "late", &buf);
+    try testing.expectEqual(@backingInt(proto.StatusCode.conflict), late.header.status);
+    try testing.expectEqualStrings("stale report: the lease expired and the run moved on", (try late.refused()).message);
 }
