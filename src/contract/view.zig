@@ -47,15 +47,17 @@ const FamKey = struct {
     }
 };
 
-/// Past this many keys a lookup hashes rather than scans: most entries
-/// touch a handful, and hashing them costs more than the scan saves; an
-/// expire of many leases touches hundreds, and a scan per access makes it
-/// quadratic.
-const SCAN_LIMIT = 8;
+/// Past this many keys a lookup hashes rather than scans. Below it a scan
+/// is as fast or faster (measured: a KV put, batches up to 64 ops, an
+/// expire of up to about 30 leases); above it a scan per access grows with
+/// the square of the entry, as a full KV transaction (256 ops) or a large
+/// expire does.
+const SCAN_LIMIT = 128;
 
 /// Every key an entry may touch, from the entry alone: whole keys, and
 /// ranges by prefix. A range names its namespace, so no entry declares a
-/// whole family or every namespace.
+/// whole family or every namespace. After `add` fails the set is partial,
+/// its index perhaps behind its list: the caller drops the entry.
 pub const KeySet = struct {
     allocator: Allocator,
     exact: std.ArrayListUnmanaged(FamKey) = .empty,
@@ -120,6 +122,9 @@ pub fn Family(comptime id: u16, comptime name: []const u8, comptime V: type) typ
 /// A staged write: a value's bytes, or null for a delete.
 const Op = struct { fam: u16, key: []const u8, value: ?[]const u8 };
 
+/// One entry's staged reads and writes. After any of its calls fails, the
+/// view is partial (a write staged but not indexed) and must not be read
+/// or committed: the machine drops the entry and its view.
 pub const View = struct {
     store: *Store,
     /// The entry's scratch: staged bytes and the key set live here until
@@ -219,12 +224,23 @@ pub const View = struct {
     /// first; only then is anything linked, which can't fail. Out of
     /// memory, state is as it was.
     pub fn commit(self: *View) ApplyError!void {
-        // The last write per key. Each key is written once, so their order
-        // doesn't matter.
+        // The last write per key. Each key is written once, so the order
+        // doesn't change the state; it does shape the store's tree, and every
+        // replica of a build commits in the same order.
         var plan: std.ArrayListUnmanaged(Step) = .empty;
-        for (self.ops.items, 0..) |op, i| {
-            if (self.lastWrite(op.fam, op.key).? != i) continue;
-            try plan.append(self.arena, .{ .op = op });
+        if (self.ops.items.len > SCAN_LIMIT) {
+            for (self.ops.items, 0..) |op, i| {
+                if (self.last.get(.{ .fam = op.fam, .key = op.key }).? != i) continue;
+                try plan.append(self.arena, .{ .op = op });
+            }
+        } else {
+            var i = self.ops.items.len;
+            while (i > 0) {
+                i -= 1;
+                const op = self.ops.items[i];
+                if (indexOfStep(plan.items, op)) |_| continue;
+                try plan.append(self.arena, .{ .op = op });
+            }
         }
         var reserved: usize = 0;
         errdefer for (plan.items[0..reserved]) |*s| self.release(s);
@@ -243,6 +259,11 @@ pub const View = struct {
         fresh: ?*store_mod.Record = null,
         value: ?[]u8 = null,
     };
+
+    fn indexOfStep(steps: []const Step, op: Op) ?usize {
+        for (steps, 0..) |s, n| if (s.op.fam == op.fam and std.mem.eql(u8, s.op.key, op.key)) return n;
+        return null;
+    }
 
     fn reserve(self: *View, s: *Step) Allocator.Error!void {
         s.node = self.store.find(s.op.fam, s.op.key);
@@ -345,4 +366,13 @@ pub fn ReadRange(comptime F: type) type {
             return .{ .key = rec.key(), .value = try F.Value.decode(rec.value) };
         }
     };
+}
+
+test "a key in one family is never the same key in another, whatever their hashes" {
+    // The family seeds the hash, so two families' keys rarely meet in a
+    // bucket; equality must still tell them apart when they do.
+    const ctx: FamKey.Context = .{};
+    try std.testing.expect(!ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 2, .key = "\x01tk" }));
+    try std.testing.expect(ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 1, .key = "\x01tk" }));
+    try std.testing.expect(!ctx.eql(.{ .fam = 1, .key = "\x01tk" }, .{ .fam = 1, .key = "\x01tj" }));
 }

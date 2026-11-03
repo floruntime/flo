@@ -141,5 +141,44 @@ pub fn main() !void {
             report(std.fmt.bufPrint(&name, "entry of {d} keys", .{n}) catch unreachable, entries, start);
         }
     }
+
+    {
+        // The KV machine's own batch entry (a committed transaction), as
+        // large as one is: each op declares its value, its history range
+        // and its namespace's counts.
+        const kvm = src.kv.machine;
+        const kve = src.protocol.kv_entries;
+        var store = contract.store.Store.init(allocator);
+        defer store.deinit();
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const obuf = try allocator.alloc(u8, kve.BatchOps.byte_bound.?);
+        defer allocator.free(obuf);
+        const pbuf = try allocator.alloc(u8, kve.Batch.max_size);
+        defer allocator.free(pbuf);
+        var name: [40]u8 = undefined;
+        var index: u64 = 0;
+        for ([_]u16{ 8, 24, 64, 256 }) |n| {
+            const entries: u64 = 20_000 / n;
+            var elapsed: u64 = 0;
+            for (0..entries) |j| {
+                var ops = kve.BatchOps.Builder.init(obuf);
+                var keybufs: [256][32]u8 = undefined;
+                for (0..n) |i| {
+                    const k = std.fmt.bufPrint(&keybufs[i], "default\x00b-{d}-{d}-{d}", .{ n, j, i }) catch unreachable;
+                    _ = try ops.add(.{ .kind = .put, .key = k, .value = "v", .ttl_ms = null, .delta = null });
+                }
+                const payload = try kve.Batch.encodeInto(pbuf, .{ .ops = ops.value() });
+                index += 1;
+                const e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, index, index, payload);
+                var out: persistence.Result = .{};
+                out.reset(&e);
+                const start = stdx.time.nanoTimestamp();
+                try contract.machine.applyEntry(&kvm.machine, &store, &scratch, &e, &out);
+                elapsed += @intCast(stdx.time.nanoTimestamp() - start);
+            }
+            std.debug.print("  {s:<28} {d:>6} ns/op  ({d} ops)\n", .{ std.fmt.bufPrint(&name, "kv batch of {d} puts", .{n}) catch unreachable, elapsed / entries, entries });
+        }
+    }
     std.debug.print("\n", .{});
 }

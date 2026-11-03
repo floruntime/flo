@@ -397,8 +397,8 @@ test "contract: a key set covers what it declares, whether it holds a few keys o
     var f = Fixture.init(testing.allocator);
     defer f.deinit();
     // Below, at, just past and well past the count at which lookups hash
-    // instead of scanning.
-    for ([_]usize{ 3, 5, 8, 9, 40 }) |n| {
+    // instead of scanning (128).
+    for ([_]usize{ 3, 127, 128, 129, 300 }) |n| {
         var keys = view_mod.KeySet.init(f.scratch.allocator());
         var nb: [16]u8 = undefined;
         for (0..n) |i| try keys.add(Counters.ID, NS, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable);
@@ -416,10 +416,10 @@ test "contract: a key set covers what it declares, whether it holds a few keys o
 }
 
 test "contract: a view reads an entry's last write to a key, and commits only that, however many keys the entry writes" {
-    // The index is built when the writes pass 8: after the first writes
-    // (n = 5 crosses among the rewrites, n = 8 at the first rewrite), or
-    // never (n = 3).
-    for ([_]usize{ 3, 5, 8, 9, 40 }) |n| {
+    // The index is built when the writes pass 128: after the first writes
+    // (n = 129, 300), among the rewrites (n = 100), at the first rewrite
+    // (n = 128), or never (n = 3).
+    for ([_]usize{ 3, 100, 128, 129, 300 }) |n| {
         var f = Fixture.init(testing.allocator);
         defer f.deinit();
         var keys = view_mod.KeySet.init(f.scratch.allocator());
