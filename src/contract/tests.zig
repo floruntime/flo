@@ -392,3 +392,55 @@ test "contract: a cleared store builds the trees a new one would" {
     try shape(&y.store, Counters.ID, &ys);
     try testing.expectEqualSlices(u64, xs.items, ys.items);
 }
+
+test "contract: a key set covers what it declares, whether it holds a few keys or many" {
+    var f = Fixture.init(testing.allocator);
+    defer f.deinit();
+    // Below, at, just past and well past the count at which lookups hash
+    // instead of scanning (128).
+    for ([_]usize{ 3, 127, 128, 129, 300 }) |n| {
+        var keys = view_mod.KeySet.init(f.scratch.allocator());
+        var nb: [16]u8 = undefined;
+        for (0..n) |i| try keys.add(Counters.ID, NS, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable);
+        // Declared twice is declared once.
+        try keys.add(Counters.ID, NS, "k0");
+        try keys.addRange(Counters.ID, NS, "r/");
+        var kb: [64]u8 = undefined;
+        for (0..n) |i| try testing.expect(keys.covers(Counters.ID, keyOf(&kb, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable)));
+        try testing.expect(!keys.covers(Counters.ID, keyOf(&kb, "k-undeclared")));
+        // Another family's key, and another namespace's, aren't this one's.
+        try testing.expect(!keys.covers(Counters.ID + 1, keyOf(&kb, "k1")));
+        try testing.expect(!keys.covers(Counters.ID, try view_mod.key(&kb, "u", "k1")));
+        try testing.expect(keys.covers(Counters.ID, keyOf(&kb, "r/anything")));
+    }
+}
+
+test "contract: a view reads an entry's last write to a key, and commits only that, however many keys the entry writes" {
+    // The index is built when the writes pass 128: after the first writes
+    // (n = 129, 300), among the rewrites (n = 100), at the first rewrite
+    // (n = 128), or never (n = 3).
+    for ([_]usize{ 3, 100, 128, 129, 300 }) |n| {
+        var f = Fixture.init(testing.allocator);
+        defer f.deinit();
+        var keys = view_mod.KeySet.init(f.scratch.allocator());
+        try keys.addRange(Counters.ID, NS, "");
+        var view = View.init(&f.store, f.scratch.allocator(), &keys);
+        var kb: [64]u8 = undefined;
+        var nb: [16]u8 = undefined;
+        // Each key written, then written again, and every third deleted.
+        for (0..n) |i| try view.put(Counters, keyOf(&kb, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable), .{ .n = i });
+        for (0..n) |i| {
+            const k = keyOf(&kb, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable);
+            if (i % 3 == 0) try view.delete(Counters, k) else try view.put(Counters, k, .{ .n = 100 + i });
+        }
+        for (0..n) |i| {
+            const got = try view.get(Counters, keyOf(&kb, std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable));
+            if (i % 3 == 0) try testing.expectEqual(null, got) else try testing.expectEqual(@as(u64, 100 + i), got.?.n);
+        }
+        try view.commit();
+        for (0..n) |i| {
+            const want: ?u64 = if (i % 3 == 0) null else 100 + i;
+            try testing.expectEqual(want, f.count(std.fmt.bufPrint(&nb, "k{d}", .{i}) catch unreachable));
+        }
+    }
+}
