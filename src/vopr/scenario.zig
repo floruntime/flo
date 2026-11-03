@@ -152,6 +152,16 @@ pub const Scenario = struct {
     /// Percent of workload ops that are action entries, made from the
     /// proposing leader's own action state as its handler makes them.
     action_percent: u8 = 0,
+    /// About one workload op in sixteen creates a namespace, through shard
+    /// 0's own create path. Off, the workload is what it was before
+    /// creates existed.
+    namespace_creates: bool = false,
+    /// Per-tick per-mille chance an up node stops applying for up to
+    /// `apply_lag_max_ms`, so its committed tail runs ahead of what it has
+    /// applied, and it can win an election that way. At 0, nothing is
+    /// drawn for it.
+    apply_lag_permille: u16 = 0,
+    apply_lag_max_ms: u32 = 0,
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -246,6 +256,18 @@ pub const Scenario = struct {
         var prng = PRNG.init(std.hash.Wyhash.hash(0x4A17, std.mem.asBytes(&seed)));
         s.halt_op = prng.intRange(u64, 1, 64);
         s.repair_halt = prng.boolean();
+        return s;
+    }
+
+    /// The catching-up slice: same sampling as `fromSeed`, with namespace
+    /// creates, and nodes that fall behind on applying long enough to win
+    /// an election before they catch up: what a leader must wait out
+    /// before it chooses a namespace id.
+    pub fn catchingUp(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        s.namespace_creates = true;
+        s.apply_lag_permille = 2;
+        s.apply_lag_max_ms = @intCast(2 * s.election_timeout_max_ms);
         return s;
     }
 
@@ -371,10 +393,13 @@ pub const Scenario = struct {
         // A second print: one format takes at most 32 arguments.
         try writer.print(
             \\  "repair_halt": {},
-            \\  "action_percent": {d}
+            \\  "action_percent": {d},
+            \\  "namespace_creates": {},
+            \\  "apply_lag_permille": {d},
+            \\  "apply_lag_max_ms": {d}
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent });
+        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -428,6 +453,12 @@ pub const Scenario = struct {
                 else => return error.InvalidField,
             } else false,
             .action_percent = if (obj.get("action_percent") == null) 0 else try jsonInt(u8, obj, "action_percent"),
+            .namespace_creates = if (obj.get("namespace_creates")) |v| switch (v) {
+                .bool => |b| b,
+                else => return error.InvalidField,
+            } else false,
+            .apply_lag_permille = if (obj.get("apply_lag_permille") == null) 0 else try jsonInt(u16, obj, "apply_lag_permille"),
+            .apply_lag_max_ms = if (obj.get("apply_lag_max_ms") == null) 0 else try jsonInt(u32, obj, "apply_lag_max_ms"),
         };
     }
 };
@@ -570,9 +601,12 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 34), obj.count());
+    try testing.expectEqual(@as(usize, 37), obj.count());
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
+    try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);
+    try testing.expectEqual(@as(i64, s.apply_lag_permille), obj.get("apply_lag_permille").?.integer);
+    try testing.expectEqual(@as(i64, s.apply_lag_max_ms), obj.get("apply_lag_max_ms").?.integer);
     try testing.expectEqual(@as(i64, s.outsider_permille), obj.get("outsider_permille").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.halt_op)), obj.get("halt_op").?.integer);
     try testing.expectEqual(@as(i64, s.config_change_permille), obj.get("config_change_permille").?.integer);
@@ -586,4 +620,15 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     try testing.expectEqual(@as(i64, @intCast(s.partition_min_ms)), obj.get("partition_min_ms").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.partition_max_ms)), obj.get("partition_max_ms").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.rpc_timeout_ms)), obj.get("rpc_timeout_ms").?.integer);
+}
+
+test "vopr scenario: the catching-up slice creates namespaces and lags, and round-trips; other slices do neither" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const s = Scenario.catchingUp(9);
+    try testing.expect(s.namespace_creates and s.apply_lag_permille > 0 and s.apply_lag_max_ms > 0);
+    try s.writeJson(&w);
+    try testing.expectEqual(s, try Scenario.fromJsonSlice(testing.allocator, w.buffered()));
+    const plain = Scenario.fromSeed(9);
+    try testing.expect(!plain.namespace_creates and plain.apply_lag_permille == 0);
 }

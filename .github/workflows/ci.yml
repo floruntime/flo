@@ -350,6 +350,11 @@ jobs:
         # earlier term.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
         timeout-minutes: 10
+      - name: Swarm with namespace creates and lagging applies
+        # Nodes fall behind on applying and win elections that way; no
+        # namespace create may lose its id to another.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --catching-up --seed-timeout=120 --out-dir=/tmp/vopr-catching-up
+        timeout-minutes: 20
       - name: Mutant scenarios still fail
         # Each row of src/vopr/mutants/README.md plants a bug the checker
         # must catch, with the invariant and the words named; the scenario
