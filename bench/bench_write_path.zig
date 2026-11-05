@@ -9,6 +9,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const Shard = src.node.shard.Shard;
 const Partition = src.storage.partition.Partition;
@@ -57,6 +58,7 @@ fn drive(shard: *Shard, conn: *src.node.connection.Connection, op: proto.OpCode,
 }
 
 pub fn main() !void {
+    mode.print();
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

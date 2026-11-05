@@ -126,6 +126,5 @@ pub const auth = @import("auth/mod.zig");
 // =============================================================================
 pub const cli_client = @import("cli/client/mod.zig");
 
-/// How this module was built. A bench's root mode can differ from this module's,
-/// so it prints both.
+/// The mode this module was built in, which a bench prints.
 pub const optimize_mode = @import("builtin").mode;

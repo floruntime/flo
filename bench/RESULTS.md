@@ -10,7 +10,10 @@
 | RAM | 16+ GB |
 | OS | macOS |
 | Zig | 0.16.0 |
-| Build | ReleaseFast |
+| Build | Unverified |
+
+These figures predate today's bench build, which is ReleaseSafe in every module. They ran on Zig 0.16
+and were labelled ReleaseFast, but how they were built can't be verified, so a run today won't compare directly.
 
 ## Results
 
@@ -56,7 +59,7 @@
 ## How to Run
 
 ```bash
-# Build benchmarks (ReleaseFast)
+# Build benchmarks (ReleaseSafe, what a release ships; each prints its modes)
 zig build bench
 
 # Run individually

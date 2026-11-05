@@ -5,6 +5,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const Inbox = src.node.inbox.Inbox;
 const Message = src.node.inbox.Message;
@@ -25,6 +26,7 @@ fn makeMsg(seq: u64) Message {
 }
 
 pub fn main() !void {
+    mode.print();
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

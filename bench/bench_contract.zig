@@ -9,6 +9,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const contract = src.contract;
 const entry_mod = src.storage.ual.entry;
@@ -78,8 +79,8 @@ fn report(name: []const u8, n: u64, start: i128) void {
 }
 
 pub fn main() !void {
+    mode.print();
     const allocator = std.heap.c_allocator;
-    std.debug.print("bench {s}, measured code {s}\n", .{ @tagName(@import("builtin").mode), @tagName(src.optimize_mode) });
     var kbuf: [32]u8 = undefined;
     std.debug.print("\n=== Contract apply ===\n\n", .{});
 

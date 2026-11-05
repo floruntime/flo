@@ -7,6 +7,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const client = src.cli_client;
 const action_ops = src.protocol.action_ops;
@@ -22,6 +23,7 @@ fn percentile(sorted: []const u64, p: u64) u64 {
 }
 
 pub fn main() !void {
+    mode.printForClient();
     const allocator = std.heap.c_allocator;
     const endpoint = std.mem.span(std.c.getenv("FLO_BENCH_ENDPOINT") orelse return error.Usage);
     var conn = client.Client.init(allocator, endpoint);
