@@ -719,8 +719,9 @@ pub fn generateDefaultConfig() []const u8 {
     \\# What one transaction may hold: ops, 1 to 256, and key and value bytes,
     \\# up to 1 MiB. Set the same values on every node: the leader's decide.
     \\# The shard does nothing else while it applies a transaction, so raising
-    \\# them costs latency, not correctness: a full one takes about 85 us at
-    \\# these defaults and about 525 us at 256 ops and 1 MiB.
+    \\# them costs latency, not correctness: a full one took about 85 us at
+    \\# these defaults and about 525 us at 256 ops and 1 MiB (ReleaseSafe, on a
+    \\# shared Apple-silicon Mac under load; your hardware will differ).
     \\# max_txn_ops = 32
     \\# max_txn_bytes = 262144
     \\

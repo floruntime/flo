@@ -126,6 +126,6 @@ pub const auth = @import("auth/mod.zig");
 // =============================================================================
 pub const cli_client = @import("cli/client/mod.zig");
 
-/// How this module was built. A bench's own root module is ReleaseFast whatever
-/// the build's flags; the code it measures is built by this, so it prints it.
+/// How this module was built. A bench's root mode can differ from this module's,
+/// so it prints both.
 pub const optimize_mode = @import("builtin").mode;

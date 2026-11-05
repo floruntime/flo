@@ -22,7 +22,8 @@ pub const MAX_OPS_PER_TXN: u16 = 256;
 /// The most ops one KV transaction buffers unless the operator says otherwise
 /// (`[kv] max_txn_ops`). A full transaction is one log entry, and the shard
 /// does nothing else while it applies one: 37-39 µs at this many small ops,
-/// 311-344 µs at the built-in most (`zig build bench -Drelease`).
+/// 311-344 µs at the built-in most (`zig build bench -Drelease`: ReleaseSafe,
+/// on a shared Apple-silicon Mac under load).
 pub const DEFAULT_MAX_OPS_PER_TXN: u16 = 32;
 
 /// The most key and value bytes a KV transaction can hold, whatever the
@@ -36,7 +37,8 @@ pub const MAX_PAYLOAD_PER_TXN: usize = 1024 * 1024;
 /// plain set takes, with the longest key (`kv/txn.zig` checks it). A full
 /// transaction applies in 80-89 µs at this and the default ops, 217-234 µs at
 /// 32 ops and 1 MiB, and 518-536 µs at both built-in mosts
-/// (`zig build bench -Drelease`).
+/// (`zig build bench -Drelease`: ReleaseSafe, on a shared Apple-silicon Mac
+/// under load).
 pub const DEFAULT_MAX_BYTES_PER_TXN: usize = 256 * 1024;
 
 /// The largest log entry payload any family proposes: a full KV
