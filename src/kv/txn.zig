@@ -21,8 +21,12 @@
 //!
 //! ## Caps
 //!
-//! - `MAX_OPS_PER_TXN` (256): number of buffered ops
-//! - `MAX_PAYLOAD_PER_TXN` (1 MiB): total buffered key+value bytes
+//! - `TxnTable.max_ops` (`[kv] max_txn_ops`, 32 unless set, at most
+//!   `MAX_OPS_PER_TXN`): number of buffered ops. Checked as ops are buffered,
+//!   on the leader, and never at apply: replicas with other values must apply
+//!   what a leader committed.
+//! - `TxnTable.max_bytes` (`[kv] max_txn_bytes`, 256 KiB unless set, at most
+//!   `MAX_PAYLOAD_PER_TXN`): total buffered key+value bytes, the same way.
 //! - `MAX_OPEN_TXNS` (1024): per-shard concurrent txns
 //! - `IDLE_TIMEOUT_MS` (30 s): a txn no request has used for this long is
 //!   dropped
@@ -147,6 +151,8 @@ fn randomCounter() u64 {
 
 pub const TxnTable = struct {
     allocator: Allocator,
+    max_ops: u16 = limits.DEFAULT_MAX_OPS_PER_TXN,
+    max_bytes: usize = limits.DEFAULT_MAX_BYTES_PER_TXN,
     /// Active transactions keyed by txn_id.
     map: std.AutoHashMap(u64, TxnState),
     /// Counts this table's transactions: the low bits of their ids. It
@@ -207,8 +213,8 @@ pub const TxnTable = struct {
         ttl_ms: u64,
     ) AppendError!void {
         const txn = self.map.getPtr(txn_id) orelse return error.TxnTooLarge; // unreachable in practice — caller checks
-        if (txn.ops.items.len >= MAX_OPS_PER_TXN) return error.TxnTooLarge;
-        if (txn.payload_bytes + key.len + value.len > MAX_PAYLOAD_PER_TXN) return error.TxnTooLarge;
+        if (txn.ops.items.len >= self.max_ops) return error.TxnTooLarge;
+        if (txn.payload_bytes + key.len + value.len > self.max_bytes) return error.TxnTooLarge;
 
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
@@ -372,10 +378,42 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     try t.expectEqual(@as(?*const TxnOp, null), tt.lastOpForKey(id, "ns\x00missing"));
 }
 
+test "TxnTable: by default a transaction holds the largest value a plain set takes, under the longest key" {
+    const t = std.testing;
+    comptime std.debug.assert(limits.MAX_QUALIFIED_KEY + @import("../protocol/kv_ops.zig").MAX_VALUE <= limits.DEFAULT_MAX_BYTES_PER_TXN);
+    var tt = TxnTable.init(t.allocator);
+    defer tt.deinit();
+    const id = try tt.begin(1, 0);
+    const key = try t.allocator.alloc(u8, limits.MAX_QUALIFIED_KEY);
+    defer t.allocator.free(key);
+    @memset(key, 'k');
+    const value = try t.allocator.alloc(u8, @import("../protocol/kv_ops.zig").MAX_VALUE);
+    defer t.allocator.free(value);
+    @memset(value, 'v');
+    try tt.appendOp(id, .put, key, value, 0);
+}
+
+test "TxnTable: max_bytes and max_ops move their refusal points" {
+    const t = std.testing;
+    var tt = TxnTable.init(t.allocator);
+    defer tt.deinit();
+    tt.max_bytes = 10;
+    const a = try tt.begin(1, 0);
+    try tt.appendOp(a, .put, "k", "123456789", 0);
+    try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "1", 0));
+    tt.max_bytes = limits.MAX_PAYLOAD_PER_TXN;
+    tt.max_ops = 2;
+    const b = try tt.begin(2, 0);
+    try tt.appendOp(b, .put, "a", "", 0);
+    try tt.appendOp(b, .put, "b", "", 0);
+    try t.expectError(error.TxnTooLarge, tt.appendOp(b, .put, "c", "", 0));
+}
+
 test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     const t = std.testing;
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
+    tt.max_bytes = MAX_PAYLOAD_PER_TXN;
 
     const id = try tt.begin(1, 0);
     const big = try t.allocator.alloc(u8, MAX_PAYLOAD_PER_TXN);

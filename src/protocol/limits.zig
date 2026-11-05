@@ -15,13 +15,28 @@ pub const MAX_QUALIFIED_KEY: usize = 4096;
 /// The longest namespace name.
 pub const MAX_NAMESPACE_NAME: usize = 63;
 
-/// The most ops one KV transaction buffers.
+/// The most ops a KV transaction can hold, whatever the operator sets: what
+/// the entry's format and the buffers are sized for.
 pub const MAX_OPS_PER_TXN: u16 = 256;
 
-/// The most key and value bytes one KV transaction buffers, summed over its
-/// ops. A transaction gathers them over many requests, so its commit entry
-/// is several times the request frame.
+/// The most ops one KV transaction buffers unless the operator says otherwise
+/// (`[kv] max_txn_ops`). A full transaction is one log entry, and past about
+/// 38 small ops applying it takes over 66 µs, a quarter of a commit, during
+/// which the shard does nothing else.
+pub const DEFAULT_MAX_OPS_PER_TXN: u16 = 32;
+
+/// The most key and value bytes a KV transaction can hold, whatever the
+/// operator sets, summed over its ops: what the entry's format and the buffers
+/// are sized for. A transaction gathers them over many requests, so its commit
+/// entry is several times the request frame.
 pub const MAX_PAYLOAD_PER_TXN: usize = 1024 * 1024;
+
+/// The most key and value bytes one KV transaction buffers unless the operator
+/// says otherwise (`[kv] max_txn_bytes`). Large enough for the largest value a
+/// plain set takes, with the longest key (`kv/txn.zig` checks it): at this and
+/// the default ops a full transaction applies in about 80 µs, a little over
+/// the 66 µs target. At the 1 MiB most, about 200 µs.
+pub const DEFAULT_MAX_BYTES_PER_TXN: usize = 256 * 1024;
 
 /// The largest log entry payload any family proposes: a full KV
 /// transaction (`kv_entries.MAX_PAYLOAD`, which checks it equals this). The

@@ -2,6 +2,7 @@
 //! Parses TOML config and converts to RuntimeConfig
 
 const std = @import("std");
+const limits = @import("../protocol/limits.zig");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const toml = @import("toml.zig");
@@ -51,6 +52,14 @@ pub const WorkersConfig = struct {
     remove_after_ms: u64 = 600_000,
 };
 
+/// KV limits an operator sets.
+pub const KvConfig = struct {
+    /// The most ops one transaction may buffer, on this node when it leads.
+    max_txn_ops: u16 = limits.DEFAULT_MAX_OPS_PER_TXN,
+    /// The most key and value bytes one transaction may buffer, likewise.
+    max_txn_bytes: u32 = limits.DEFAULT_MAX_BYTES_PER_TXN,
+};
+
 /// Server configuration loaded from flo.toml
 pub const ServerConfig = struct {
     // [server] section
@@ -81,6 +90,9 @@ pub const ServerConfig = struct {
 
     // [workers] section
     workers: WorkersConfig = .{},
+
+    // [kv] section
+    kv: KvConfig = .{},
 
     // [admin] section: where the admin socket listens; null for admin.sock
     // in the data dir.
@@ -160,6 +172,8 @@ pub const ServerConfig = struct {
             .admin_socket = self.admin_socket,
             .worker_heartbeat_timeout_ms = self.workers.heartbeat_timeout_ms,
             .worker_remove_after_ms = self.workers.remove_after_ms,
+            .max_txn_ops = self.kv.max_txn_ops,
+            .max_txn_bytes = self.kv.max_txn_bytes,
         };
     }
 
@@ -232,6 +246,10 @@ const sections = [_]Section{
     .{ .name = "admin", .keys = &.{
         .{ .name = "socket", .kind = .string },
     } },
+    .{ .name = "kv", .keys = &.{
+        .{ .name = "max_txn_ops", .kind = .integer, .min = 1, .max = limits.MAX_OPS_PER_TXN },
+        .{ .name = "max_txn_bytes", .kind = .integer, .min = 1, .max = limits.MAX_PAYLOAD_PER_TXN },
+    } },
     .{ .name = "workers", .keys = &.{
         .{ .name = "heartbeat_timeout_ms", .kind = .integer, .min = 1000 },
         .{ .name = "remove_after_ms", .kind = .integer, .min = 1000 },
@@ -244,7 +262,7 @@ const removed = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "auth", .why = "[auth] was removed: clients aren't authenticated yet. Remove the section, and keep the client port on a private interface." },
     .{ .name = "websocket", .why = "[websocket] was removed along with the WebSocket endpoint. Remove the section." },
     .{ .name = "background_tasks", .why = "[background_tasks] was removed: namespace delete is refused, so there is no deletion task to tune. Remove the section." },
-    .{ .name = "kv", .why = "[kv] expose_internal_keys was never read: internal keys stay hidden. Remove the section." },
+    .{ .name = "kv.expose_internal_keys", .why = "[kv] expose_internal_keys was never read: internal keys stay hidden. Remove the line." },
     .{ .name = "storage.max_local_segments", .why = "[storage] max_local_segments isn't wired up: nothing reads it. Remove the line." },
     .{ .name = "storage.enable_wal_truncation", .why = "[storage] enable_wal_truncation isn't wired up: nothing reads it. Remove the line." },
 };
@@ -435,6 +453,12 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
                 return error.InvalidSetting;
             };
         }
+    }
+
+    // Parse [kv] section
+    if (table.getTable("kv")) |kv| {
+        if (kv.getInt("max_txn_ops")) |n| config.kv.max_txn_ops = @intCast(n);
+        if (kv.getInt("max_txn_bytes")) |n| config.kv.max_txn_bytes = @intCast(n);
     }
 
     // Parse [workers] section
@@ -691,6 +715,15 @@ pub fn generateDefaultConfig() []const u8 {
     \\# A worker silent this long is removed. At least heartbeat_timeout_ms.
     \\# remove_after_ms = 600000
     \\
+    \\[kv]
+    \\# What one transaction may hold: ops, 1 to 256, and key and value bytes,
+    \\# up to 1 MiB. Set the same values on every node: the leader's decide.
+    \\# The shard does nothing else while it applies a transaction, so raising
+    \\# them costs latency, not correctness: a full one takes about 80 us at
+    \\# these defaults and about 450 us at 256 ops.
+    \\# max_txn_ops = 32
+    \\# max_txn_bytes = 262144
+    \\
     ;
 }
 
@@ -817,6 +850,10 @@ test "config: what flo.toml can't hold is refused, not ignored" {
         .{ .body = "[logging]\nformat = \"xml\"\n", .err = error.InvalidSetting },
         .{ .body = "[dashboard]\nenabled = \"yes\"\n", .err = error.InvalidSetting },
         .{ .body = "[cluster]\nseeds = [9500]\n", .err = error.InvalidSetting },
+        .{ .body = "[kv]\nmax_txn_ops = 0\n", .err = error.InvalidSetting },
+        .{ .body = "[kv]\nmax_txn_ops = 257\n", .err = error.InvalidSetting },
+        .{ .body = "[kv]\nmax_txn_bytes = 0\n", .err = error.InvalidSetting },
+        .{ .body = "[kv]\nmax_txn_bytes = 1048577\n", .err = error.InvalidSetting },
         .{ .body = "[workers]\nheartbeat_timeout_ms = 10\n", .err = error.InvalidSetting },
         .{ .body = "[workers]\nheartbeat_timeout_ms = 5000\nremove_after_ms = 2000\n", .err = error.InvalidSetting },
     }) |c| {
