@@ -79,6 +79,7 @@ fn report(name: []const u8, n: u64, start: i128) void {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
+    std.debug.print("bench {s}, measured code {s}\n", .{ @tagName(@import("builtin").mode), @tagName(src.optimize_mode) });
     var kbuf: [32]u8 = undefined;
     std.debug.print("\n=== Contract apply ===\n\n", .{});
 
@@ -166,10 +167,12 @@ pub fn main() !void {
             .{ .ops = 40, .total = 0 },
             .{ .ops = 44, .total = 0 },
             .{ .ops = 48, .total = 0 },
+            .{ .ops = 56, .total = 0 },
             .{ .ops = 64, .total = 0 },
             .{ .ops = 256, .total = 0 },
             .{ .ops = 32, .total = 256 * 1024 },
             .{ .ops = 32, .total = 1024 * 1024 },
+            .{ .ops = 256, .total = 1024 * 1024 },
         };
         for (cases) |c| {
             var store = contract.store.Store.init(allocator);

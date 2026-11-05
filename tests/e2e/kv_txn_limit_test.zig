@@ -216,7 +216,7 @@ fn expectData(cluster: *ClusterContext, node: usize, count: usize) !void {
 test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader committed, and the leader's value decides" {
     var cluster = try ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync, .node_config = .{
         "[kv]\nmax_txn_ops = 64\n",
-        "[kv]\nmax_txn_ops = 32\n",
+        "[kv]\nmax_txn_ops = 24\n",
         "[kv]\nmax_txn_ops = 16\n",
         null,
         null,
@@ -249,7 +249,7 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
     // A node with a lower value takes over: the same size is now refused, at
     // its own value. Leadership moves until each of the two has led, so a
     // joiner's value can't go unread because the other won.
-    const LIMITS = [_]usize{ 64, 32, 16 };
+    const LIMITS = [_]usize{ 64, 24, 16 };
     cluster.killNode(0);
     var down: usize = 0;
     var led: [3]bool = .{ true, false, false };
