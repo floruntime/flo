@@ -20,9 +20,9 @@ pub const MAX_NAMESPACE_NAME: usize = 63;
 pub const MAX_OPS_PER_TXN: u16 = 256;
 
 /// The most ops one KV transaction buffers unless the operator says otherwise
-/// (`[kv] max_txn_ops`). A full transaction is one log entry, and past about
-/// 38 small ops applying it takes over 66 µs, a quarter of a commit, during
-/// which the shard does nothing else.
+/// (`[kv] max_txn_ops`). A full transaction is one log entry, and the shard
+/// does nothing else while it applies one: about 47 µs at this many small ops
+/// (bench_contract), passing 66 µs, a quarter of a commit, near 40.
 pub const DEFAULT_MAX_OPS_PER_TXN: u16 = 32;
 
 /// The most key and value bytes a KV transaction can hold, whatever the
@@ -33,9 +33,9 @@ pub const MAX_PAYLOAD_PER_TXN: usize = 1024 * 1024;
 
 /// The most key and value bytes one KV transaction buffers unless the operator
 /// says otherwise (`[kv] max_txn_bytes`). Large enough for the largest value a
-/// plain set takes, with the longest key (`kv/txn.zig` checks it): at this and
-/// the default ops a full transaction applies in about 80 µs, a little over
-/// the 66 µs target. At the 1 MiB most, about 200 µs.
+/// plain set takes, with the longest key (`kv/txn.zig` checks it). At this and
+/// the default ops a full transaction applies in about 85 µs; at the 1 MiB
+/// most, about 220 µs (bench_contract).
 pub const DEFAULT_MAX_BYTES_PER_TXN: usize = 256 * 1024;
 
 /// The largest log entry payload any family proposes: a full KV

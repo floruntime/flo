@@ -400,7 +400,8 @@ test "TxnTable: max_bytes and max_ops move their refusal points" {
     tt.max_bytes = 10;
     const a = try tt.begin(1, 0);
     try tt.appendOp(a, .put, "k", "123456789", 0);
-    try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "1", 0));
+    // One byte over.
+    try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "", 0));
     tt.max_bytes = limits.MAX_PAYLOAD_PER_TXN;
     tt.max_ops = 2;
     const b = try tt.begin(2, 0);

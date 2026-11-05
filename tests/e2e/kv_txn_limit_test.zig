@@ -13,8 +13,8 @@ const TOO_LARGE = "/txn_too_large]";
 
 /// A transaction begun through `cli`, its id in `buf`. Null if the node
 /// refused, as it does with no leader.
-fn begin(cli: *CliRunner, buf: []u8) !?[]const u8 {
-    var out = try cli.run(&.{ "kv", "txn", "begin", "r" });
+fn begin(cli: *CliRunner, routing: []const u8, buf: []u8) !?[]const u8 {
+    var out = try cli.run(&.{ "kv", "txn", "begin", routing });
     defer out.deinit();
     const prefix = "txn: ";
     const at = std.mem.indexOf(u8, out.stdout, prefix) orelse return null;
@@ -27,13 +27,13 @@ const Fill = struct { accepted: usize, too_large: bool };
 
 /// Puts `<prefix><i>` = `v<i>` into the transaction until `want` are in or one
 /// is refused for the transaction's size. Null on any other refusal.
-fn fill(cli: *CliRunner, txn: []const u8, prefix: []const u8, want: usize) !?Fill {
+fn fill(cli: *CliRunner, txn: []const u8, routing: []const u8, prefix: []const u8, want: usize) !?Fill {
     for (0..want) |i| {
         var key_buf: [32]u8 = undefined;
         var val_buf: [16]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "{s}{d}", .{ prefix, i });
         const val = try std.fmt.bufPrint(&val_buf, "v{d}", .{i});
-        var out = try cli.run(&.{ "kv", "set", key, val, "--routing-key", "r", "--txn", txn });
+        var out = try cli.run(&.{ "kv", "set", key, val, "--routing-key", routing, "--txn", txn });
         defer out.deinit();
         if (out.contains(TOO_LARGE)) return .{ .accepted = i, .too_large = true };
         if (out.exit_code == 0) continue;
@@ -47,8 +47,8 @@ fn fill(cli: *CliRunner, txn: []const u8, prefix: []const u8, want: usize) !?Fil
 /// and commits what it took.
 fn expectLimit(cli: *CliRunner, limit: usize) !void {
     var buf: [32]u8 = undefined;
-    const txn = (try begin(cli, &buf)) orelse return error.BeginRefused;
-    const got = (try fill(cli, txn, "k", limit + 1)) orelse return error.PutRefused;
+    const txn = (try begin(cli, "r", &buf)) orelse return error.BeginRefused;
+    const got = (try fill(cli, txn, "r", "k", limit + 1)) orelse return error.PutRefused;
     try testing.expectEqual(limit, got.accepted);
     try testing.expect(got.too_large);
     var commit = try cli.run(&.{ "kv", "txn", "commit", txn });
@@ -108,7 +108,7 @@ fn expectBytes(config: ServerProcess.ServerConfig, size: usize, fits: usize) !vo
     defer testing.allocator.free(value);
     @memset(value, 'x');
     var buf: [32]u8 = undefined;
-    const txn = (try begin(cli, &buf)) orelse return error.BeginRefused;
+    const txn = (try begin(cli, "r", &buf)) orelse return error.BeginRefused;
     for (0..fits + 1) |i| {
         var key_buf: [16]u8 = undefined;
         var out = try cli.run(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "b{d}", .{i}), value, "--routing-key", "r", "--txn", txn });
@@ -144,6 +144,48 @@ test "e2e/kv/txn-limit: a max_txn_bytes outside 1 byte to 1 MiB is refused at st
     try expectRefused(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_bytes = 1048577\n" }, "[kv] max_txn_bytes = 1048577: must be 1 to 1048576");
     try expectRefused(.{ .shards = 1, .extra_args = &.{ "--max-txn-bytes", "0" } }, "--max-txn-bytes 0: must be 1 to 1048576");
     try expectRefused(.{ .shards = 1, .extra_args = &.{ "--max-txn-bytes", "1048577" } }, "--max-txn-bytes 1048577: must be 1 to 1048576");
+}
+
+test "e2e/kv/txn-limit: every shard of a node takes both settings" {
+    const node = try ServerProcess.initWithConfig(testing.allocator, .{ .shards = 4, .extra_config = "[kv]\nmax_txn_ops = 3\nmax_txn_bytes = 2048\n" });
+    defer node.deinit();
+    try node.start();
+    errdefer node.dumpLogTail();
+    const ep = try node.getEndpoint(testing.allocator);
+    defer testing.allocator.free(ep);
+    const cli = try CliRunner.init(testing.allocator, node.flo_binary, ep);
+    defer cli.deinit();
+    const value = try testing.allocator.alloc(u8, 1500);
+    defer testing.allocator.free(value);
+    @memset(value, 'x');
+
+    // Routing keys until a transaction has been refused on each shard, which
+    // a transaction's id names in its top 16 bits.
+    var seen: [4]bool = @splat(false);
+    var attempt: usize = 0;
+    while (std.mem.indexOfScalar(bool, &seen, false) != null) : (attempt += 1) {
+        if (attempt == 64) return error.ShardNeverReached;
+        var routing_buf: [16]u8 = undefined;
+        const routing = try std.fmt.bufPrint(&routing_buf, "r{d}", .{attempt});
+        var buf: [32]u8 = undefined;
+        const txn = (try begin(cli, routing, &buf)) orelse return error.BeginRefused;
+        const shard: usize = @intCast((try std.fmt.parseInt(u64, txn, 10)) >> 48);
+        if (seen[shard]) continue;
+        seen[shard] = true;
+        // Ops: three small ones, and the fourth refused.
+        const got = (try fill(cli, txn, routing, "s", 4)) orelse return error.PutRefused;
+        try testing.expectEqual(@as(usize, 3), got.accepted);
+        try testing.expect(got.too_large);
+        // Bytes: one large value, and the next refused.
+        var byte_buf: [32]u8 = undefined;
+        const bytes = (try begin(cli, routing, &byte_buf)) orelse return error.BeginRefused;
+        var first = try cli.run(&.{ "kv", "set", "l0", value, "--routing-key", routing, "--txn", bytes });
+        defer first.deinit();
+        try testing.expectEqual(@as(u8, 0), first.exit_code);
+        var second = try cli.run(&.{ "kv", "set", "l1", value, "--routing-key", routing, "--txn", bytes });
+        defer second.deinit();
+        try testing.expect(second.contains(TOO_LARGE));
+    }
 }
 
 test "e2e/kv/txn-limit: a max_txn_ops outside 1 to 256 is refused at start, not clamped" {
@@ -195,8 +237,8 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
 
     // More ops than either follower's value allows.
     var buf: [32]u8 = undefined;
-    const txn = (try begin(cluster.clis[0].?, &buf)) orelse return error.BeginRefused;
-    const got = (try fill(cluster.clis[0].?, txn, "m", 40)) orelse return error.PutRefused;
+    const txn = (try begin(cluster.clis[0].?, "r", &buf)) orelse return error.BeginRefused;
+    const got = (try fill(cluster.clis[0].?, txn, "r", "m", 40)) orelse return error.PutRefused;
     try testing.expectEqual(@as(usize, 40), got.accepted);
     var commit = try cluster.clis[0].?.run(&.{ "kv", "txn", "commit", txn });
     defer commit.deinit();
@@ -204,24 +246,39 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
     try testing.expect(commit.stdoutContains("ops: 40"));
     for (0..3) |node| try expectData(&cluster, node, 40);
 
-    // A node with a lower value takes over: the same size is now refused.
+    // A node with a lower value takes over: the same size is now refused, at
+    // its own value. Leadership moves until each of the two has led, so a
+    // joiner's value can't go unread because the other won.
+    const LIMITS = [_]usize{ 64, 32, 16 };
     cluster.killNode(0);
+    var down: usize = 0;
+    var led: [3]bool = .{ true, false, false };
     var tries: usize = 0;
-    const limit: usize = while (true) : (tries += 1) {
-        if (tries == 80) return error.NoNewLeader;
+    while (!(led[1] and led[2])) : (tries += 1) {
+        if (tries == 400) return error.NodeNeverLed;
         stdx.time.sleep(250 * std.time.ns_per_ms);
-        const leader: usize = if (isLeader(&cluster, 1)) 1 else if (isLeader(&cluster, 2)) 2 else continue;
-        var again_buf: [32]u8 = undefined;
-        const again = (try begin(cluster.clis[leader].?, &again_buf)) orelse continue;
-        // A leader still settling refuses otherwise: try again.
-        const next = (try fill(cluster.clis[leader].?, again, "n", 40)) orelse continue;
-        try testing.expect(next.too_large);
-        try testing.expectEqual(@as(usize, if (leader == 1) 32 else 16), next.accepted);
-        var rollback = try cluster.clis[leader].?.run(&.{ "kv", "txn", "rollback", again });
-        defer rollback.deinit();
-        break next.accepted;
-    };
-    try testing.expect(limit < 40);
-    // What the old leader committed is all still there.
-    for (1..3) |node| try expectData(&cluster, node, 40);
+        const leader: usize = for (0..3) |n| {
+            if (n != down and isLeader(&cluster, n)) break n;
+        } else continue;
+        if (!led[leader]) {
+            var again_buf: [32]u8 = undefined;
+            const again = (try begin(cluster.clis[leader].?, "r", &again_buf)) orelse continue;
+            // A leader still settling refuses otherwise: try again.
+            const next = (try fill(cluster.clis[leader].?, again, "r", "n", 40)) orelse continue;
+            // If leadership moved meanwhile, this measured another node.
+            if (!isLeader(&cluster, leader)) continue;
+            try testing.expect(next.too_large);
+            try testing.expectEqual(LIMITS[leader], next.accepted);
+            var rollback = try cluster.clis[leader].?.run(&.{ "kv", "txn", "rollback", again });
+            defer rollback.deinit();
+            led[leader] = true;
+            // What the old leader committed is all still there.
+            for (0..3) |n| if (n != down) try expectData(&cluster, n, 40);
+        }
+        if (led[1] and led[2]) break;
+        // The node that was down comes back, and this leader goes.
+        try cluster.restartNode(down);
+        cluster.stopNode(leader);
+        down = leader;
+    }
 }

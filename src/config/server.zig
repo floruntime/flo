@@ -719,8 +719,8 @@ pub fn generateDefaultConfig() []const u8 {
     \\# What one transaction may hold: ops, 1 to 256, and key and value bytes,
     \\# up to 1 MiB. Set the same values on every node: the leader's decide.
     \\# The shard does nothing else while it applies a transaction, so raising
-    \\# them costs latency, not correctness: a full one takes about 80 us at
-    \\# these defaults and about 450 us at 256 ops.
+    \\# them costs latency, not correctness: a full one takes about 85 us at
+    \\# these defaults and about 410 us at 256 small ops.
     \\# max_txn_ops = 32
     \\# max_txn_bytes = 262144
     \\
@@ -728,6 +728,14 @@ pub fn generateDefaultConfig() []const u8 {
 }
 
 // Tests
+test "a transaction's limits default to 32 ops and 256 KiB, and reach the runtime" {
+    var config = ServerConfig.init(std.testing.allocator);
+    defer config.deinit();
+    const runtime = config.toRuntimeConfig();
+    try std.testing.expectEqual(@as(u16, 32), runtime.max_txn_ops);
+    try std.testing.expectEqual(@as(u32, 262144), runtime.max_txn_bytes);
+}
+
 test "load default config" {
     const allocator = std.testing.allocator;
     var config = ServerConfig.init(allocator);
