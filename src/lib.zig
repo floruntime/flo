@@ -125,3 +125,7 @@ pub const auth = @import("auth/mod.zig");
 // server. Does NOT pull in the heavier `cli` commander/commands tree.
 // =============================================================================
 pub const cli_client = @import("cli/client/mod.zig");
+
+/// How this module was built. A bench's root mode can differ from this module's,
+/// so it prints both.
+pub const optimize_mode = @import("builtin").mode;

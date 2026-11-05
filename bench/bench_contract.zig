@@ -79,6 +79,7 @@ fn report(name: []const u8, n: u64, start: i128) void {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
+    std.debug.print("bench {s}, measured code {s}\n", .{ @tagName(@import("builtin").mode), @tagName(src.optimize_mode) });
     var kbuf: [32]u8 = undefined;
     std.debug.print("\n=== Contract apply ===\n\n", .{});
 
@@ -148,36 +149,67 @@ pub fn main() !void {
         // and its namespace's counts.
         const kvm = src.kv.machine;
         const kve = src.protocol.kv_entries;
-        var store = contract.store.Store.init(allocator);
-        defer store.deinit();
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
         const obuf = try allocator.alloc(u8, kve.BatchOps.byte_bound.?);
         defer allocator.free(obuf);
         const pbuf = try allocator.alloc(u8, kve.Batch.max_size);
         defer allocator.free(pbuf);
+        const big = try allocator.alloc(u8, 256 * 1024);
+        defer allocator.free(big);
+        @memset(big, 'x');
         var name: [40]u8 = undefined;
-        var index: u64 = 0;
-        for ([_]u16{ 8, 24, 64, 256 }) |n| {
-            const entries: u64 = 20_000 / n;
+        // Small ops, then full ones: the limits' defaults, and the built-in
+        // most. Each case has a store of its own, so its order doesn't matter.
+        const cases = [_]struct { ops: u16, total: usize }{
+            .{ .ops = 8, .total = 0 },
+            .{ .ops = 24, .total = 0 },
+            .{ .ops = 32, .total = 0 },
+            .{ .ops = 36, .total = 0 },
+            .{ .ops = 40, .total = 0 },
+            .{ .ops = 44, .total = 0 },
+            .{ .ops = 48, .total = 0 },
+            .{ .ops = 56, .total = 0 },
+            .{ .ops = 64, .total = 0 },
+            .{ .ops = 256, .total = 0 },
+            .{ .ops = 32, .total = 256 * 1024 },
+            .{ .ops = 32, .total = 1024 * 1024 },
+            .{ .ops = 256, .total = 1024 * 1024 },
+        };
+        for (cases) |c| {
+            var store = contract.store.Store.init(allocator);
+            defer store.deinit();
+            var scratch = std.heap.ArenaAllocator.init(allocator);
+            defer scratch.deinit();
+            const n = c.ops;
+            // Small entries put about 20k keys in; full ones, what memory allows.
+            const entries: u64 = if (c.total == 0) 20_000 / n else 100;
             var elapsed: u64 = 0;
             for (0..entries) |j| {
                 var ops = kve.BatchOps.Builder.init(obuf);
                 var keybufs: [256][32]u8 = undefined;
+                var left = c.total;
                 for (0..n) |i| {
                     const k = std.fmt.bufPrint(&keybufs[i], "default\x00b-{d}-{d}-{d}", .{ n, j, i }) catch unreachable;
-                    _ = try ops.add(.{ .kind = .put, .key = k, .value = "v", .ttl_ms = null, .delta = null });
+                    // Equal shares of a full transaction's bytes.
+                    const value = if (c.total == 0) "v" else blk: {
+                        const len = (left / (n - i)) -| k.len;
+                        left -= k.len + len;
+                        break :blk big[0..len];
+                    };
+                    _ = try ops.add(.{ .kind = .put, .key = k, .value = value, .ttl_ms = null, .delta = null });
                 }
                 const payload = try kve.Batch.encodeInto(pbuf, .{ .ops = ops.value() });
-                index += 1;
-                const e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, index, index, payload);
+                const e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, j + 1, j + 1, payload);
                 var out: persistence.Result = .{};
                 out.reset(&e);
                 const start = stdx.time.nanoTimestamp();
                 try contract.machine.applyEntry(&kvm.machine, &store, &scratch, &e, &out);
                 elapsed += @intCast(stdx.time.nanoTimestamp() - start);
             }
-            std.debug.print("  {s:<28} {d:>6} ns/op  ({d} ops)\n", .{ std.fmt.bufPrint(&name, "kv batch of {d} puts", .{n}) catch unreachable, elapsed / entries, entries });
+            const label = if (c.total == 0)
+                std.fmt.bufPrint(&name, "kv batch of {d} puts", .{n}) catch unreachable
+            else
+                std.fmt.bufPrint(&name, "kv batch of {d} puts, {d} KiB", .{ n, c.total / 1024 }) catch unreachable;
+            std.debug.print("  {s:<28} {d:>6} ns/op  ({d} ops)\n", .{ label, elapsed / entries, entries });
         }
     }
     std.debug.print("\n", .{});

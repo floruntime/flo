@@ -83,6 +83,8 @@ pub const ClusterConfig = struct {
     /// Environment added to each node's, by node: one node's build behaving
     /// unlike the others'.
     node_env: [MAX_NODES][]const [2][]const u8 = @splat(&.{}),
+    /// Config file text added to each node's, by node.
+    node_config: [MAX_NODES]?[]const u8 = @splat(null),
 };
 
 /// Multi-node cluster context for e2e testing
@@ -124,6 +126,7 @@ pub const ClusterContext = struct {
             .log_level = config.log_level,
             .cluster_enabled = true, // Seed node needs Raft listener
             .metrics_enabled = config.metrics_enabled,
+            .extra_config = config.node_config[0],
         });
         self.servers[0].?.extra_env = config.node_env[0];
         // Covers every node created so far. A per-iteration `errdefer` in the
@@ -149,6 +152,7 @@ pub const ClusterContext = struct {
                 .log_level = config.log_level,
                 .join_addresses = seed_endpoint,
                 .metrics_enabled = config.metrics_enabled,
+                .extra_config = config.node_config[i],
             });
             self.servers[i].?.extra_env = config.node_env[i];
             startServerWithRetry(self.servers[i].?) catch |err| {

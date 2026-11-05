@@ -13,6 +13,7 @@ const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const commander = @import("../commander/mod.zig");
 const outcome = @import("../outcome.zig");
+const limits = @import("../../protocol/limits.zig");
 const output = @import("../output.zig");
 const build_info = @import("../../build_info.zig");
 const server_config = @import("../../config/mod.zig").server;
@@ -91,6 +92,8 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("durability", 0, "", "Storage durability: sync or async_flush")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
                 .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
+                .uintFlag("max-txn-ops", 0, 0, "Most ops one KV transaction may hold, 1 to 256 (default: 32); more costs latency")
+                .uintFlag("max-txn-bytes", 0, 0, "Most key and value bytes one KV transaction may hold, up to 1048576 (default: 262144); more costs latency")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
                 .stringFlag("log-format", 0, "", "Log format: text, json")
                 .stringFlag("bind", 0, "", "Address to listen on (default: 0.0.0.0)")
@@ -472,6 +475,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // not truncated on the way in.
     const shards = ctx.getChangedUint("shards");
     const partitions = ctx.getChangedUint("partitions");
+    const max_txn_ops = ctx.getChangedUint("max-txn-ops");
+    const max_txn_bytes = ctx.getChangedUint("max-txn-bytes");
     const log_level = ctx.getString("log-level");
     const log_format = ctx.getString("log-format");
     const durability = ctx.getString("durability");
@@ -515,6 +520,15 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
         return error.Usage;
     };
     defer config.deinit();
+
+    if (max_txn_ops) |n| {
+        if (n < 1 or n > limits.MAX_OPS_PER_TXN) return outcome.usage(ctx, "--max-txn-ops {d}: must be 1 to {d}", .{ n, limits.MAX_OPS_PER_TXN });
+        config.kv.max_txn_ops = @intCast(n);
+    }
+    if (max_txn_bytes) |n| {
+        if (n < 1 or n > limits.MAX_PAYLOAD_PER_TXN) return outcome.usage(ctx, "--max-txn-bytes {d}: must be 1 to {d}", .{ n, limits.MAX_PAYLOAD_PER_TXN });
+        config.kv.max_txn_bytes = @intCast(n);
+    }
 
     // Apply cluster CLI overrides
     if (cluster_first) config.cluster.enabled = true;

@@ -251,6 +251,8 @@ pub const ServerProcess = struct {
         bind: ?[]const u8 = null,
         /// Appended to the generated flo.toml as is.
         extra_config: ?[]const u8 = null,
+        /// More flags for `server start`.
+        extra_args: []const []const u8 = &.{},
         /// Start with `--config` naming a file that doesn't exist.
         config_file_missing: bool = false,
     };
@@ -479,6 +481,8 @@ pub const ServerProcess = struct {
         if (self.config.bind) |bind| {
             try argv_list.appendSlice(self.allocator, &.{ "--bind", bind });
         }
+
+        try argv_list.appendSlice(self.allocator, self.config.extra_args);
 
         var child = stdx.process.Child.init(argv_list.items, self.allocator);
         var env: ?std.process.Environ.Map = null;

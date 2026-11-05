@@ -116,6 +116,8 @@ pub const RuntimeConfig = struct {
     admin_socket: ?[]const u8 = null,
     /// A worker silent this long is unhealthy; this long, removed.
     worker_heartbeat_timeout_ms: u64 = 90_000,
+    max_txn_ops: u16 = @import("../protocol/limits.zig").DEFAULT_MAX_OPS_PER_TXN,
+    max_txn_bytes: u32 = @import("../protocol/limits.zig").DEFAULT_MAX_BYTES_PER_TXN,
     worker_remove_after_ms: u64 = 600_000,
 
     // =========================================================================
@@ -809,6 +811,8 @@ pub const Runtime = struct {
         // Also wire shard back-pointers for handlers that need Raft access.
         for (0..self.shard_count) |i| {
             shards[i].worker_handler.heartbeat_timeout_ms = self.config.worker_heartbeat_timeout_ms;
+            shards[i].kv_handler.txn_table.max_ops = self.config.max_txn_ops;
+            shards[i].kv_handler.txn_table.max_bytes = self.config.max_txn_bytes;
             shards[i].worker_handler.remove_after_ms = self.config.worker_remove_after_ms;
             shards[i].registerBackgroundTasks();
             shards[i].wireHandlerShardPtrs();

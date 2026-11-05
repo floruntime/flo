@@ -269,13 +269,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
     };
 
+    // The root module's mode drives the optimizer for the whole program, so a
+    // bench is always optimized. With a release flag every module is what a
+    // release ships; plain, the measured code keeps Debug's safety checks.
+    const bench_optimize: std.lang.Optimize = if (optimize == .debug) .fast else optimize;
     for (bench_sources) |def| {
         const bench_exe = b.addExecutable(.{
             .name = def.name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(def.source),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = bench_optimize,
                 .link_libc = true,
             }),
         });
