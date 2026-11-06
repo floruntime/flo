@@ -29,6 +29,8 @@
 //!                                   the run must fail
 //!        [--catching-up]            namespace creates, and nodes that fall
 //!                                   behind on applying and win elections
+//!        [--txn-limits]             each node has its own limit on the KV
+//!                                   batches it proposes, some up to the most
 //!        [--scenario-out=PATH]      write the scenario JSON, then run
 //!        [--scenario-in=PATH]       run a pinned scenario instead of a seed
 //!        [--verbose]
@@ -56,6 +58,7 @@ const Args = struct {
     actions: bool = false,
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
+    txn_limits: bool = false,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -72,7 +75,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -107,6 +110,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--catching-up")) {
             args.catching_up = true;
+        } else if (std.mem.eql(u8, arg, "--txn-limits")) {
+            args.txn_limits = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
             var it = std.mem.splitScalar(u8, arg["--skip=".len..], ',');
             while (it.next()) |n| {
@@ -171,10 +176,16 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.actions(seed)
     else if (args.catching_up)
         Scenario.catchingUp(seed)
+    else if (args.txn_limits)
+        Scenario.txnLimits(seed)
     else
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
     // A planted bug the run never reaches would pass, and say nothing.
+    if (args.family_mutant == .kv_refuses_over_own_limit and !scenario.hasTxnLimits()) {
+        std.debug.print("--family-mutant={t} refuses by a node's limit: run it with --txn-limits, or a scenario that has them\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
     if (args.family_mutant.inActions() and scenario.action_percent == 0) {
         std.debug.print("--family-mutant={t} is in the actions machine: run it with --actions, or a scenario with action entries\n", .{args.family_mutant});
         std.process.exit(2);
@@ -239,6 +250,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         },
     );
     if (scenario.action_percent > 0) printActionCounts(s.actions);
+    if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
     if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
@@ -258,7 +270,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
@@ -268,6 +280,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.byzantine) " --byzantine" else "",
                 if (args.halts) " --halts" else "",
                 if (args.catching_up) " --catching-up" else "",
+                if (args.txn_limits) " --txn-limits" else "",
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         }
@@ -316,6 +329,37 @@ fn readActionCounts(allocator: std.mem.Allocator, log_path: []const u8) ?ActionC
     return c;
 }
 
+const TxnCounts = vopr.families.TxnCounts;
+/// How many seeds of a limits swarm must reach each path.
+const MIN_TXN_SEEDS = 3;
+
+/// One line a parent can read back.
+fn printTxnCounts(c: TxnCounts) void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("[vopr] txn:") catch {};
+    inline for (comptime std.meta.fieldNames(TxnCounts)) |name| w.print(" {s}={d}", .{ name, @field(c, name) }) catch {};
+    std.debug.print("{s}\n", .{w.buffered()});
+}
+
+/// A child's transaction counts, from its log.
+fn readTxnCounts(allocator: std.mem.Allocator, log_path: []const u8) ?TxnCounts {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return null;
+    defer allocator.free(text);
+    const at = std.mem.indexOf(u8, text, "[vopr] txn:") orelse return null;
+    const line = text[at..(std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len)];
+    var c: TxnCounts = .{};
+    var it = std.mem.tokenizeScalar(u8, line["[vopr] txn:".len..], ' ');
+    while (it.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
+        const value = std.fmt.parseInt(u64, field[eq + 1 ..], 10) catch return null;
+        inline for (comptime std.meta.fieldNames(TxnCounts)) |name| {
+            if (std.mem.eql(u8, field[0..eq], name)) @field(c, name) = value;
+        }
+    }
+    return c;
+}
+
 // ── Swarm mode: one watchdogged child process per seed ─────────────────
 
 const Outcome = enum { ok, failed, timeout };
@@ -346,6 +390,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     var mutant_arg: [64]u8 = undefined;
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
     if (args.catching_up) try argv.append(allocator, "--catching-up");
+    if (args.txn_limits) try argv.append(allocator, "--txn-limits");
     if (args.verbose) try argv.append(allocator, "--verbose");
 
     var child = stdx.process.Child.init(argv.items, allocator);
@@ -428,6 +473,8 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     var settle_seeds: u64 = 0;
     var expire_seeds: u64 = 0;
     var unread_counts: u64 = 0;
+    var txn_totals: TxnCounts = .{};
+    var txn_seeds: struct { large: u64 = 0, replayed: u64 = 0, over_own: u64 = 0, across_leaders: u64 = 0 } = .{};
 
     while (next < iterations or running.items.len > 0) {
         // Top up the pool.
@@ -473,6 +520,15 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                                 action_totals.add(c);
                                 if (c.cross_term_settles > 0) settle_seeds += 1;
                                 if (c.cross_term_expires > 0) expire_seeds += 1;
+                            } else unread_counts += 1;
+                        }
+                        if (args.txn_limits) {
+                            if (readTxnCounts(allocator, r.log_path)) |c| {
+                                txn_totals.add(c);
+                                if (c.over_half > 0) txn_seeds.large += 1;
+                                if (c.over_own_replayed > 0) txn_seeds.replayed += 1;
+                                if (c.over_own_live > 0) txn_seeds.over_own += 1;
+                                if (c.over_own_across_leaders > 0) txn_seeds.across_leaders += 1;
                             } else unread_counts += 1;
                         }
                         if (excused(allocator, r.log_path)) try excused_seeds.append(allocator, r.seed);
@@ -544,6 +600,20 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
         const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
         if (settle_seeds < want or expire_seeds < want) {
             std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired leases from an earlier term\n", .{want});
+            covered = false;
+        }
+    }
+    // Limits that no batch ever went past tested nothing: it fails, as above.
+    if (args.txn_limits) {
+        printTxnCounts(txn_totals);
+        std.debug.print("[vopr] seeds reaching: large batches {d}, past a replica's own limit {d}, the same on replay {d}, at a later leader below the batch {d}\n", .{ txn_seeds.large, txn_seeds.over_own, txn_seeds.replayed, txn_seeds.across_leaders });
+        if (unread_counts > 0) {
+            std.debug.print("[vopr] FAILED: {d} passing seeds printed no transaction counts\n", .{unread_counts});
+            covered = false;
+        }
+        const want = @min(MIN_TXN_SEEDS, ok_count);
+        if (txn_seeds.large < want or txn_seeds.over_own < want or txn_seeds.replayed < want or txn_seeds.across_leaders < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds took large batches past a replica's limit, live, on replay and across a leader change\n", .{want});
             covered = false;
         }
     }

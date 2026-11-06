@@ -50,10 +50,20 @@ pub const DurabilityMode = enum {
     }
 };
 
+const MAX_NODES = @import("network.zig").MAX_NODES;
+
 /// AppendEntries batch ceiling. Payload and ring-capacity sampling are
 /// constrained against this so a single batch can never evict its own
 /// head mid-apply.
 pub const MAX_BATCH: u32 = 64;
+
+/// The most payload a scenario with transaction limits gives an entry: room
+/// for a transaction of the built-in most ops, on a ring where `MAX_BATCH` of
+/// them still fill only half (`TXN_LOG_CAPACITY`).
+pub const TXN_PAYLOAD_MAX: u32 = 8192;
+pub const TXN_LOG_CAPACITY: usize = TXN_PAYLOAD_MAX * MAX_BATCH * 2;
+/// What a node's limit is drawn from: the built-in default, and either side.
+const TXN_LIMIT_CHOICES = [_]u16{ 8, 16, 32, 64, 128, 256 };
 
 /// The outsider takes the id after the members', within the network's 8.
 pub const MAX_NODES_WITH_OUTSIDER: u8 = 7;
@@ -162,6 +172,11 @@ pub const Scenario = struct {
     /// drawn for it.
     apply_lag_permille: u16 = 0,
     apply_lag_max_ms: u32 = 0,
+    /// Each node's own limit on a KV transaction's ops, indexed by id - 1: a
+    /// model of `[kv] max_txn_ops`. A leader proposes only batches within its
+    /// own, and every replica applies whatever committed. All 0, the workload
+    /// is what it was before limits existed: no large batches, no gate.
+    txn_limits: [MAX_NODES]u16 = @splat(0),
 
     /// Derive a complete scenario from a seed. Every run samples a
     /// different point in fault space; the constraints below keep the
@@ -269,6 +284,41 @@ pub const Scenario = struct {
         s.apply_lag_permille = 2;
         s.apply_lag_max_ms = @intCast(2 * s.election_timeout_max_ms);
         return s;
+    }
+
+    /// The transaction-limit slice: same sampling as `fromSeed`, with the
+    /// limits on, and a shorter safety phase, since every restart replays
+    /// each large batch.
+    pub fn txnLimits(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        s.addTxnLimits();
+        s.ticks_safety = @min(s.ticks_safety, 20_000);
+        return s;
+    }
+
+    /// Draw each node a limit, with one node at the built-in most, and another
+    /// at or below the default, so a batch that one leader may propose is
+    /// always above another node's own limit. Payloads and the ring grow to
+    /// hold batches that large.
+    pub fn addTxnLimits(s: *Scenario) void {
+        var prng = PRNG.init(std.hash.Wyhash.hash(0x7A71, std.mem.asBytes(&s.seed)));
+        const r = prng.random();
+        for (s.txn_limits[0..s.node_count]) |*limit| limit.* = TXN_LIMIT_CHOICES[r.uintLessThan(usize, TXN_LIMIT_CHOICES.len)];
+        const high = r.uintLessThan(u8, s.node_count);
+        const low = (high + 1 + r.uintLessThan(u8, s.node_count - 1)) % s.node_count;
+        s.txn_limits[high] = TXN_LIMIT_CHOICES[TXN_LIMIT_CHOICES.len - 1];
+        s.txn_limits[low] = @min(s.txn_limits[low], 32);
+        s.log_capacity = TXN_LOG_CAPACITY;
+        s.payload_max = TXN_PAYLOAD_MAX;
+    }
+
+    pub fn hasTxnLimits(s: *const Scenario) bool {
+        return s.txn_limits[0] != 0;
+    }
+
+    /// The node's own limit; 0 when the scenario has none.
+    pub fn txnLimit(s: *const Scenario, id: u32) u16 {
+        return s.txn_limits[id - 1];
     }
 
     /// The lost-disk slice: same sampling as `fromSeed`, with crashes that
@@ -396,10 +446,11 @@ pub const Scenario = struct {
             \\  "action_percent": {d},
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
-            \\  "apply_lag_max_ms": {d}
+            \\  "apply_lag_max_ms": {d},
+            \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms });
+        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -459,9 +510,22 @@ pub const Scenario = struct {
             } else false,
             .apply_lag_permille = if (obj.get("apply_lag_permille") == null) 0 else try jsonInt(u16, obj, "apply_lag_permille"),
             .apply_lag_max_ms = if (obj.get("apply_lag_max_ms") == null) 0 else try jsonInt(u32, obj, "apply_lag_max_ms"),
+            .txn_limits = try jsonTxnLimits(obj),
         };
     }
 };
+
+/// Absent in a scenario recorded before limits existed: none.
+fn jsonTxnLimits(obj: std.json.ObjectMap) ![MAX_NODES]u16 {
+    var limits: [MAX_NODES]u16 = @splat(0);
+    const v = obj.get("txn_limits") orelse return limits;
+    if (v != .array or v.array.items.len != MAX_NODES) return error.InvalidField;
+    for (v.array.items, &limits) |item, *limit| {
+        if (item != .integer or item.integer < 0 or item.integer > 256) return error.InvalidField;
+        limit.* = @intCast(item.integer);
+    }
+    return limits;
+}
 
 fn jsonU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
     const v = obj.get(key) orelse return error.MissingField;
@@ -504,6 +568,29 @@ test "vopr scenario: different seeds differ beyond the seed field" {
     const b = Scenario.fromSeed(2);
     a.seed = b.seed;
     try testing.expect(!std.meta.eql(a, b));
+}
+
+test "vopr scenario: a limits scenario gives each node a limit, some high and some low, and round-trips" {
+    for (1..200) |seed| {
+        const s = Scenario.txnLimits(seed);
+        var lowest: u16 = 256;
+        var highest: u16 = 0;
+        for (s.txn_limits[0..s.node_count]) |limit| {
+            lowest = @min(lowest, limit);
+            highest = @max(highest, limit);
+        }
+        try testing.expectEqual(@as(u16, 256), highest);
+        try testing.expect(lowest > 0 and lowest <= 32);
+        for (s.txn_limits[s.node_count..]) |limit| try testing.expectEqual(@as(u16, 0), limit);
+        // A full batch of max-size payloads must fit in half the ring.
+        try testing.expect(@as(usize, s.payload_max) * MAX_BATCH <= s.log_capacity / 2);
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try s.writeJson(&w);
+        const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
+        try testing.expectEqualSlices(u16, &s.txn_limits, &back.txn_limits);
+    }
+    try testing.expect(!Scenario.fromSeed(1).hasTxnLimits());
 }
 
 test "vopr scenario: swarm bounds and batch/ring constraint" {
@@ -601,7 +688,8 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 37), obj.count());
+    try testing.expectEqual(@as(usize, 38), obj.count());
+    try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
     try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);

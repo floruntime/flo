@@ -18,6 +18,7 @@ const PRNG = @import("stdx").PRNG;
 const entry_mod = @import("../storage/ual/entry.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
+const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
 const Scenario = @import("scenario.zig").Scenario;
 
@@ -58,7 +59,16 @@ const CREATE_EVERY = 16;
 const CREATE_SALT: u64 = 0x6E73_C2EA_7E00_0001;
 /// The largest payload a scenario draws: the size of the KV encoder's
 /// scratch.
-pub const MAX_PAYLOAD = 4096;
+pub const MAX_PAYLOAD = 8192;
+/// With transaction limits on, payloads grow to hold large batches; the other
+/// ops stay the size they'd be without them.
+const OTHER_OPS_PAYLOAD_MAX = 2048;
+/// The keys a transaction writes: more than the most ops one holds, so a large
+/// one declares far more keys than any other op, and overlaps the others'.
+const TXN_KEYS = 1024;
+/// A transaction's counters: only transactions touch them, so an add is never
+/// refused for a put's raw bytes.
+const TXN_COUNTERS = 16;
 
 pub const OpState = enum {
     /// Proposed to a leader; commit outcome not yet observed.
@@ -92,6 +102,7 @@ pub const Workload = struct {
     payload_min: u32,
     payload_max: u32,
     creates: bool,
+    large_batches: bool,
     next_op_id: u64,
     /// Indexed by op id — ids are dense from 0.
     ops: std.ArrayListUnmanaged(Op),
@@ -113,6 +124,7 @@ pub const Workload = struct {
             .payload_min = scenario.payload_min,
             .payload_max = scenario.payload_max,
             .creates = scenario.namespace_creates,
+            .large_batches = scenario.hasTxnLimits(),
             .next_op_id = 0,
             .ops = .empty,
             .scratch = try allocator.alloc(u8, scenario.payload_max),
@@ -122,7 +134,7 @@ pub const Workload = struct {
     }
 
     fn draws(self: *const Workload) Draws {
-        return .{ .seed = self.seed, .payload_min = self.payload_min, .payload_max = self.payload_max, .creates = self.creates };
+        return .{ .seed = self.seed, .payload_min = self.payload_min, .payload_max = self.payload_max, .creates = self.creates, .large_batches = self.large_batches };
     }
 
     pub fn deinit(self: *Workload) void {
@@ -155,14 +167,14 @@ pub const Workload = struct {
         var prng = PRNG.init(seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
         var entry_type = OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)];
-        const len = r.intRangeAtMost(u32, payload_min, payload_max);
+        const len = r.intRangeAtMost(u32, payload_min, d.otherOpsMax());
         const kv: ?[]u8 = switch (entry_type) {
             .kv_put => if (r.uintLessThan(u8, 3) == 0) patch: {
                 entry_type = .kv_json_patch;
                 const shape = PatchShape.draw(r);
                 break :patch kvPatch(buf[0..payload_max], d, op_id, shape, len, r);
             } else kvPut(buf[0..payload_max], op_id, len, r),
-            .kv_batch => kvDelete(buf[0..payload_max], op_id, r),
+            .kv_batch => if (d.large_batches) kvTxn(buf[0..payload_max], op_id, r) else kvDelete(buf[0..payload_max], op_id, r),
             else => null,
         };
         const payload = kv orelse raw: {
@@ -222,7 +234,18 @@ pub const Workload = struct {
     };
 
     /// What an op's synthesis depends on besides its id.
-    pub const Draws = struct { seed: u64, payload_min: u32, payload_max: u32, creates: bool = false };
+    pub const Draws = struct {
+        seed: u64,
+        payload_min: u32,
+        payload_max: u32,
+        creates: bool = false,
+        large_batches: bool = false,
+
+        /// The most any op but a large batch draws.
+        fn otherOpsMax(d: Draws) u32 {
+            return if (d.large_batches) @min(d.payload_max, OTHER_OPS_PAYLOAD_MAX) else d.payload_max;
+        }
+    };
 
     /// Op `op_id`'s patch shape, from the same draws `synthesize` makes;
     /// null when it isn't a JSON patch.
@@ -231,7 +254,7 @@ pub const Workload = struct {
         var prng = PRNG.init(d.seed ^ (op_id *% 0x9E37_79B9_7F4A_7C15) ^ 0xF10F_10F1);
         const r = prng.random();
         if (OP_TYPES[r.uintLessThan(usize, OP_TYPES.len)] != .kv_put) return null;
-        _ = r.intRangeAtMost(u32, d.payload_min, d.payload_max);
+        _ = r.intRangeAtMost(u32, d.payload_min, d.otherOpsMax());
         if (r.uintLessThan(u8, 3) != 0) return null;
         return PatchShape.draw(r);
     }
@@ -309,6 +332,43 @@ pub const Workload = struct {
         const plain = [_]kv_entries.BatchOp.Value{ all[0], all[2] };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, if (with_incr) &all else &plain) catch return null;
+        return buf[0..w.written().len];
+    }
+
+    /// A transaction as a client commits one: up to the built-in most ops,
+    /// its size a pure function of the op, so whether a leader may propose it
+    /// is the leader's own limit's to say. Most stay within the default, since
+    /// every restart replays each one; a quarter go past it, and 15% past half
+    /// the most. It opens by tombstoning the op's marker key,
+    /// so it names its op. One in eight also adds to a key puts write, which
+    /// refuses the whole batch if a put's raw bytes are there.
+    fn kvTxn(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
+        const size = r.uintLessThan(u8, 100);
+        const count: usize = if (size < 60)
+            r.intRangeAtMost(usize, 2, limits.DEFAULT_MAX_OPS_PER_TXN)
+        else if (size < 85)
+            r.intRangeAtMost(usize, limits.DEFAULT_MAX_OPS_PER_TXN + 1, limits.MAX_OPS_PER_TXN / 2)
+        else
+            r.intRangeAtMost(usize, limits.MAX_OPS_PER_TXN / 2 + 1, limits.MAX_OPS_PER_TXN);
+        var marker_buf: [MARKER_PREFIX.len + 16]u8 = undefined;
+        var key_bufs: [limits.MAX_OPS_PER_TXN][16]u8 = undefined;
+        var ops: [limits.MAX_OPS_PER_TXN]kv_entries.BatchOp.Value = undefined;
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &value, op_id, .little);
+        const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
+        ops[0] = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null };
+        for (ops[1..count], key_bufs[1..count]) |*op, *key_buf| {
+            const slot = r.uintLessThan(u16, TXN_KEYS);
+            const key = std.fmt.bufPrint(key_buf, "{s}t{x:0>3}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
+            op.* = switch (r.uintLessThan(u8, 3)) {
+                0 => .{ .kind = .put, .key = key, .value = &value, .ttl_ms = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null, .delta = null },
+                1 => .{ .kind = .delete, .key = key, .value = null, .ttl_ms = null, .delta = null },
+                else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, "c{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1 },
+            };
+        }
+        if (r.uintLessThan(u8, 8) == 0) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1 };
+        var w: schema.Writer = .{ .buf = buf };
+        kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
         return buf[0..w.written().len];
     }
 
@@ -514,6 +574,30 @@ test "vopr workload: synthesis is deterministic and self-verifying" {
         try testing.expectEqualSlices(u8, a.payload, b.payload);
         try testing.expectEqual(@as(u64, id), Workload.opIdFromPayload(@backingInt(a.entry_type), a.payload).?);
     }
+}
+
+test "vopr workload: with limits on, batches reach the built-in most ops, within the payload limit, and name their op" {
+    const d: Workload.Draws = .{ .seed = 7, .payload_min = 16, .payload_max = @import("scenario.zig").TXN_PAYLOAD_MAX, .large_batches = true };
+    var buf: [MAX_PAYLOAD]u8 = undefined;
+    var largest: u32 = 0;
+    var past_half: u64 = 0;
+    var batches: u64 = 0;
+    for (0..4000) |id| {
+        const gen = Workload.synthesize(d, id, &buf);
+        try testing.expectEqual(@as(u64, id), Workload.opIdFromPayload(@backingInt(gen.entry_type), gen.payload).?);
+        if (gen.entry_type != .kv_batch) {
+            try testing.expect(gen.payload.len <= OTHER_OPS_PAYLOAD_MAX + 256);
+            continue;
+        }
+        const ops = kv_entries.batchOpCount(gen.payload);
+        var diag: schema.Diagnostic = .{};
+        try testing.expectEqual(ops, (try kv_entries.Batch.decodeAll(gen.payload, &diag)).ops.count);
+        batches += 1;
+        largest = @max(largest, ops);
+        if (ops > limits.MAX_OPS_PER_TXN / 2) past_half += 1;
+    }
+    try testing.expectEqual(@as(u32, limits.MAX_OPS_PER_TXN), largest);
+    try testing.expect(batches > 500 and past_half * 10 > batches);
 }
 
 test "vopr workload: different seeds produce different payloads" {

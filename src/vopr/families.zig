@@ -73,6 +73,10 @@ pub const Mutant = enum {
     extend_ignores_held_since,
     /// Action entries apply at the replica's own clock.
     action_node_clock,
+    /// A replica refuses a KV batch above its own transaction limit at apply,
+    /// not only at its leader's gate: replicas with lower limits than the
+    /// leader that proposed it then drop what the others applied.
+    kv_refuses_over_own_limit,
     /// Shard 0's leader proposes a create before it has applied every
     /// earlier term's entry, so it may choose an id an earlier leader's
     /// create already took.
@@ -89,7 +93,7 @@ pub const Mutant = enum {
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }
@@ -104,6 +108,8 @@ pub const Replica = struct {
     node_wall_ns: u64 = 0,
     leader: bool,
     live: bool,
+    /// The replica's own transaction limit; 0 for none.
+    txn_limit: u16 = 0,
 };
 
 pub const Outcome = enum { ok, refused };
@@ -260,6 +266,7 @@ pub const Kv = struct {
     /// entry must never meet.
     pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
+        if (r.mutant == .kv_refuses_over_own_limit and r.txn_limit != 0 and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch) and kv_entries.batchOpCount(e.payload) > r.txn_limit) return .staged_refused;
         var out: persistence.Result = .{};
         out.reset(e);
         const before = self.commits();
@@ -306,6 +313,36 @@ pub const Kv = struct {
         var sums: [FAMILIES.len]u64 = undefined;
         for (FAMILIES, &sums) |fam, *sum| sum.* = store_mod.checksum(&self.store, fam);
         return sums;
+    }
+};
+
+/// How far a run's KV batches went past the limits of the nodes they reached.
+pub const TxnCounts = struct {
+    /// Batches a leader refused, above its own limit: never proposed.
+    leader_refused: u64 = 0,
+    /// Batches applied, each counted once however many replicas apply it.
+    applied: u64 = 0,
+    /// Of those, above the default limit, and above half the built-in most.
+    over_default: u64 = 0,
+    over_half: u64 = 0,
+    /// The most ops any batch applied.
+    largest: u64 = 0,
+    /// Applies of a batch above half the built-in most by a replica rebuilding.
+    large_replayed: u64 = 0,
+    /// Applies by a replica whose own limit is below the batch: live, and
+    /// rebuilding.
+    over_own_live: u64 = 0,
+    over_own_replayed: u64 = 0,
+    /// Of the live ones, by a leader, of an earlier term's batch: it came
+    /// across a leader change, to a node that would have refused to propose it.
+    over_own_across_leaders: u64 = 0,
+
+    pub fn add(self: *TxnCounts, other: TxnCounts) void {
+        inline for (comptime std.meta.fieldNames(TxnCounts)) |name| {
+            if (comptime std.mem.eql(u8, name, "largest")) continue;
+            @field(self, name) += @field(other, name);
+        }
+        self.largest = @max(self.largest, other.largest);
     }
 };
 

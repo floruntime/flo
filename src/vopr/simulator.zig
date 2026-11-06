@@ -31,6 +31,8 @@ const replica_mod = @import("../replica/replica.zig");
 const families = @import("families.zig");
 const action_workload = @import("action_workload.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
+const kv_entries = @import("../protocol/kv_entries.zig");
+const limits = @import("../protocol/limits.zig");
 const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 const log = @import("stdx").log;
 
@@ -827,6 +829,8 @@ pub const Summary = struct {
     kv: families.Kv.Counts,
     /// And the actions machine.
     actions: families.Actions.Counts,
+    /// How far KV batches went past the nodes' own limits.
+    txn: families.TxnCounts,
     /// What the workload's namespace creates came to: at submit, and at
     /// apply, each counted once.
     ns_submits: NsSubmits,
@@ -885,6 +889,7 @@ pub const Simulator = struct {
     wipes: u64 = 0,
     /// KV entries by outcome, counted at the first apply of each index.
     kv_counts: families.Kv.Counts = .{},
+    txn_counts: families.TxnCounts = .{},
     /// Action entries likewise.
     action_counts: families.Actions.Counts = .{},
     /// Action entries draw from their own stream, so a scenario without
@@ -1755,6 +1760,13 @@ pub const Simulator = struct {
         if (self.scenario.action_percent > 0 and self.action_prng.random().uintLessThan(u8, 100) < self.scenario.action_percent) return self.submitActionOp(target);
         const op = try self.workload.nextOp();
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
+        // The model of `[kv] max_txn_ops`: a leader takes a transaction only
+        // within its own limit, whatever the node it came from allows.
+        if (op.entry_type == .kv_batch and self.scenario.hasTxnLimits() and kv_entries.batchOpCount(op.payload) > self.scenario.txnLimit(target.id)) {
+            self.workload.markRefused(op.id);
+            self.txn_counts.leader_refused += 1;
+            return;
+        }
         const res = target.raft.propose(op.entry_type, 0, op.payload) catch return;
         self.workload.recordProposal(op.id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, op.id);
@@ -1776,6 +1788,26 @@ pub const Simulator = struct {
         const res = target.raft.propose(made.entry_type, 0, made.payload) catch return;
         self.workload.recordProposal(id, target.id, res.term, res.index);
         try self.pending_ops.append(self.allocator, id);
+    }
+
+    fn countTxn(self: *Simulator, node: *const SimNode, e: *const entry_mod.Entry, first: bool, live: bool) void {
+        const c = &self.txn_counts;
+        const ops = kv_entries.batchOpCount(e.payload);
+        const large = ops > limits.MAX_OPS_PER_TXN / 2;
+        if (first) {
+            c.applied += 1;
+            if (ops > limits.DEFAULT_MAX_OPS_PER_TXN) c.over_default += 1;
+            if (large) c.over_half += 1;
+            c.largest = @max(c.largest, ops);
+        }
+        if (large and !live) c.large_replayed += 1;
+        if (ops <= self.scenario.txnLimit(node.id)) return;
+        if (!live) {
+            c.over_own_replayed += 1;
+            return;
+        }
+        c.over_own_live += 1;
+        if (node.raft.role == .leader and e.header.term < node.raft.current_term) c.over_own_across_leaders += 1;
     }
 
     /// A workload create, proposed as shard 0's leader proposes one: the
@@ -1968,11 +2000,13 @@ pub const Simulator = struct {
             .node_wall_ns = node.wall_ns,
             .leader = node.raft.role == .leader,
             .live = live,
+            .txn_limit = if (self.scenario.hasTxnLimits()) self.scenario.txnLimit(node.id) else 0,
         };
         if (is_op and families.Counter.owns(e.header.entry_type)) _ = node.counter.apply(self.allocator, e, replica);
         // Counted where the first replica reaches the index, so an entry
         // counts once, not once per replica and replay.
         const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
+        if (self.scenario.hasTxnLimits() and is_op and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.countTxn(node, e, first, live);
         if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
             if (first) self.kv_counts.count(effect);
         } else |err| self.checker.fail(switch (err) {
@@ -2391,6 +2425,7 @@ pub const Simulator = struct {
             .family_checks = self.checker.family_checks,
             .kv = self.kv_counts,
             .actions = self.action_counts,
+            .txn = self.txn_counts,
             .ns_submits = self.ns_submits,
             .ns = self.ns_counts,
             .ns_stale_from_ready = self.ns_stale_from_ready,
@@ -2737,6 +2772,36 @@ test "vopr sim: KV's families are compared at a run's last index even when sampl
 
 test "vopr sim: a contract that commits a refused entry's staged writes fails refusal_wrote, though every replica agrees" {
     try testing.expect((try stateChecksumUnder(.kv_refused_commits)).refusal);
+}
+
+test "vopr sim: with limits on, replicas converge on large batches past their own limits, across restarts" {
+    var total: families.TxnCounts = .{};
+    var family_checks: u64 = 0;
+    for ([_]u64{ 11, 12 }) |seed| {
+        var scenario = restartingScenario(seed);
+        scenario.addTxnLimits();
+        // Debug: each restart replays every batch so far.
+        scenario.ticks_safety = 2_500;
+        var sim = try Simulator.init(testing.allocator, scenario, .{});
+        defer sim.deinit();
+        const s = try sim.run();
+        try testing.expect(s.ok);
+        total.add(s.txn);
+        family_checks += s.family_checks;
+    }
+    try testing.expect(total.over_half > 0 and total.over_own_live > 0 and total.leader_refused > 0 and total.over_own_replayed > 0);
+    try testing.expect(family_checks > 0);
+}
+
+test "vopr sim: a replica that refuses a batch above its own limit at apply fails state_checksum on KV's families" {
+    var scenario = restartingScenario(11);
+    scenario.addTxnLimits();
+    var sim = try Simulator.init(testing.allocator, scenario, .{ .family_mutant = .kv_refuses_over_own_limit });
+    defer sim.deinit();
+    _ = try sim.run();
+    var kv = false;
+    for (sim.checker.violations.items) |v| kv = kv or (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, " kv.") != null);
+    try testing.expect(kv);
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
