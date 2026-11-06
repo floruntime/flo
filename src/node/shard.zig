@@ -2494,7 +2494,7 @@ pub const Shard = struct {
         switch (msg.tag) {
             .shutdown => self.shutdown(),
             .action_start => self.startActionRun(msg),
-            .action_finished, .action_result_ask, .action_abandon, .worker_report => self.actionMessage(msg),
+            .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => self.actionMessage(msg),
             .kv_sink_put => self.runKvSinkPut(msg),
             .reply => self.deliverReply(msg),
             .forward_request => self.runForwardedRequest(msg),
@@ -2552,6 +2552,8 @@ pub const Shard = struct {
             .action_result_ask => self.actions_handler.resultAskFromInbox(self, msg.src_shard, bytes),
             .action_abandon => self.actions_handler.abandonFromInbox(self, bytes),
             .worker_report => ActionsHandler.reportFromInbox(self, bytes),
+            .action_held => self.actions_handler.heldFromInbox(bytes),
+            .action_unhold => self.actions_handler.cancelHeld(self, self.id, bytes),
             else => unreachable,
         }
     }
@@ -4862,7 +4864,7 @@ pub const Shard = struct {
                     self.deliverDeferredRefusal(reply_to, request_id, .unavailable, proto.notRun(SHUTTING_DOWN_NOT_RUN));
                 },
                 .reply => self.deliverReply(msg),
-                .action_start, .kv_sink_put, .action_finished, .action_result_ask, .action_abandon, .worker_report => {
+                .action_start, .kv_sink_put, .action_finished, .action_result_ask, .action_abandon, .worker_report, .action_held, .action_unhold => {
                     const bytes = inboxPayload(msg);
                     if (bytes.len > 0) self.allocator.free(bytes);
                 },
@@ -14966,12 +14968,15 @@ test "actions: a shard asked about a run says nothing until its leader is ready,
     actions.resultAskFromInbox(there, 0, bytes);
     raft.ready_index = ready;
     try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
-    // Asked to start it: starting, not lost.
+    // Asked to start it, its action not registered: held, not lost. The
+    // workflow's shard is told why it waits, and asking gets no answer.
     var start_buf: [256]u8 = undefined;
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-xy", "nope", "{}", "wf-run", "wf") orelse return error.OutOfMemory;
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-xy", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
     _ = &start_buf;
     actions.startRunFromInbox(there, 0, start);
+    try std.testing.expectEqual(@as(usize, 1), t.two.shards[0].mailbox.inbox.pending());
+    t.two.settle();
     actions.resultAskFromInbox(there, 0, bytes);
     try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
     // Never started, and not starting: lost.
@@ -15375,7 +15380,7 @@ test "actions: what a shard keeps of runs asked about, and runs it was asked to 
     const here = &t.two.shards[0];
     const actions = here.actions_handler;
     actions.askResult(here, 1, "default", "act-old");
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", "nope", "{}", "wf-run", "wf") orelse return error.OutOfMemory;
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
     actions.startRunFromInbox(here, 1, start);
     actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
