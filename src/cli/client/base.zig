@@ -7,6 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const stdx_net = @import("stdx").net;
 const proto = @import("../../protocol/proto.zig");
 const ops = @import("../../protocol/ops.zig");
 const RequestBuilder = @import("../../protocol/request_builder.zig").RequestBuilder;
@@ -170,16 +171,16 @@ pub const Client = struct {
         const stream = self.stream.?;
         const read_timeout = posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
         const write_timeout = posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
-        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&read_timeout)) catch {};
-        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&write_timeout)) catch {};
+        stdx_net.setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&read_timeout));
+        stdx_net.setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&write_timeout));
     }
 
     /// Connect to a node's admin socket at `path`.
     pub fn connectUnix(self: *Self, path: []const u8) !void {
         self.stream = try @import("stdx").net.unixConnectOwned(path);
         const timeout = posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
-        posix.setsockopt(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-        posix.setsockopt(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        stdx_net.setConnectionOption(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        stdx_net.setConnectionOption(self.stream.?.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
     }
 
     /// Set socket read timeout in seconds. Use 0 to disable (wait forever).
@@ -189,10 +190,10 @@ pub const Client = struct {
         if (seconds == 0) {
             // Disable timeout (wait forever)
             const zero_tv = posix.timeval{ .sec = 0, .usec = 0 };
-            posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&zero_tv)) catch {};
+            stdx_net.setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&zero_tv));
         } else {
             const tv = posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
-            posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+            stdx_net.setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
         }
     }
 
@@ -202,7 +203,7 @@ pub const Client = struct {
         const stream = self.stream orelse return;
         const at_least = @max(ms, 1);
         const tv = posix.timeval{ .sec = @intCast(at_least / 1000), .usec = @intCast((at_least % 1000) * 1000) };
-        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        stdx_net.setConnectionOption(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
     }
 
     /// Send a request and receive response (low-level)
