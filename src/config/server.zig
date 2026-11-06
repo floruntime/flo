@@ -52,6 +52,13 @@ pub const WorkersConfig = struct {
     remove_after_ms: u64 = 600_000,
 };
 
+/// Workflow settings an operator sets.
+pub const WorkflowsConfig = struct {
+    /// How long a step waits for its action to be registered, on the node
+    /// leading the action's shard; 0 fails it at once.
+    missing_action_wait_ms: u64 = 600_000,
+};
+
 /// KV limits an operator sets.
 pub const KvConfig = struct {
     /// The most ops one transaction may buffer, on this node when it leads.
@@ -90,6 +97,7 @@ pub const ServerConfig = struct {
 
     // [workers] section
     workers: WorkersConfig = .{},
+    workflows: WorkflowsConfig = .{},
 
     // [kv] section
     kv: KvConfig = .{},
@@ -172,6 +180,7 @@ pub const ServerConfig = struct {
             .admin_socket = self.admin_socket,
             .worker_heartbeat_timeout_ms = self.workers.heartbeat_timeout_ms,
             .worker_remove_after_ms = self.workers.remove_after_ms,
+            .missing_action_wait_ms = self.workflows.missing_action_wait_ms,
             .max_txn_ops = self.kv.max_txn_ops,
             .max_txn_bytes = self.kv.max_txn_bytes,
         };
@@ -253,6 +262,9 @@ const sections = [_]Section{
     .{ .name = "workers", .keys = &.{
         .{ .name = "heartbeat_timeout_ms", .kind = .integer, .min = 1000 },
         .{ .name = "remove_after_ms", .kind = .integer, .min = 1000 },
+    } },
+    .{ .name = "workflows", .keys = &.{
+        .{ .name = "missing_action_wait_ms", .kind = .integer, .min = 0 },
     } },
 };
 
@@ -469,6 +481,10 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
             log.err("[workers] remove_after_ms = {d} is below heartbeat_timeout_ms = {d}: a worker would be removed before it is marked unhealthy", .{ config.workers.remove_after_ms, config.workers.heartbeat_timeout_ms });
             return error.InvalidSetting;
         }
+    }
+
+    if (table.getTable("workflows")) |w| {
+        if (w.getInt("missing_action_wait_ms")) |t| config.workflows.missing_action_wait_ms = @intCast(t);
     }
 
     if (table.getTable("admin")) |a| {
@@ -715,6 +731,11 @@ pub fn generateDefaultConfig() []const u8 {
     \\# A worker silent this long is removed. At least heartbeat_timeout_ms.
     \\# remove_after_ms = 600000
     \\
+    \\[workflows]
+    \\# How long a workflow step waits for its action to be registered before
+    \\# it takes its target_not_found outcome. 0 fails it at once.
+    \\# missing_action_wait_ms = 600000
+    \\
     \\[kv]
     \\# What one transaction may hold: ops, 1 to 256, and key and value bytes,
     \\# up to 1 MiB. Set the same values on every node: the leader's decide.
@@ -896,6 +917,27 @@ test "config: the file config init writes loads, and a named file that is missin
     @import("stdx").fs.closeFile(f);
     var config = try load(allocator, path);
     defer config.deinit();
+}
+
+test "config: [workflows] missing_action_wait_ms reaches the runtime config, and defaults to ten minutes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, "[workflows]\nmissing_action_wait_ms = 0\n");
+    @import("stdx").fs.closeFile(f);
+    var set = try load(allocator, path);
+    defer set.deinit();
+    try std.testing.expectEqual(@as(u64, 0), set.toRuntimeConfig().missing_action_wait_ms);
+
+    var defaults = ServerConfig.init(allocator);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u64, 600_000), defaults.toRuntimeConfig().missing_action_wait_ms);
 }
 
 test "config: [workers] timeouts reach the runtime config, and default when absent" {
