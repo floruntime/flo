@@ -333,12 +333,35 @@ fn extractKeyFromPayload(payload: []const u8) ?[]const u8 {
 
 /// Set TCP_NODELAY on a socket.
 fn setTcpNodelay(fd: i32) void {
-    std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    @import("stdx").net.setConnectionOption(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
+
+test "Acceptor: socket options on a closed connection are ignored" {
+    const c = std.c;
+    const listener = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    defer _ = c.close(listener);
+    var addr: c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.sockaddr.in)));
+    try std.testing.expectEqual(@as(c_int, 0), c.listen(listener, 1));
+    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(listener, @ptrCast(&addr), &len));
+
+    const dialer = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    try std.testing.expectEqual(@as(c_int, 0), c.connect(dialer, @ptrCast(&addr), @sizeOf(c.sockaddr.in)));
+    const no_linger = extern struct { onoff: c_int, linger: c_int }{ .onoff = 1, .linger = 0 };
+    _ = c.setsockopt(dialer, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &no_linger, @sizeOf(@TypeOf(no_linger)));
+    _ = c.close(dialer);
+    @import("stdx").time.sleep(20 * std.time.ns_per_ms);
+
+    const accepted = c.accept(listener, null, null);
+    try std.testing.expect(accepted >= 0);
+    defer _ = c.close(accepted);
+    setTcpNodelay(accepted);
+}
 
 test "Acceptor: round-robin routing" {
     var pipes: [2]i32 = .{ -1, -1 }; // dummy pipe fds

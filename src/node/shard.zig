@@ -5205,11 +5205,17 @@ pub const Shard = struct {
             }
             const room = @min(tmp_buf.len, conn.read_buf.writable());
 
-            const n = posix.read(fd, tmp_buf[0..room]) catch |err| {
-                if (err == error.WouldBlock) return;
-                self.closeConnection(fd);
-                return;
+            // Any failure ends the connection.
+            const rc = std.c.read(fd, tmp_buf.ptr, room);
+            if (rc < 0) switch (posix.errno(rc)) {
+                .AGAIN => return,
+                .INTR => continue,
+                else => {
+                    self.closeConnection(fd);
+                    return;
+                },
             };
+            const n: usize = @intCast(rc);
             if (n == 0) {
                 // EOF — peer closed
                 self.closeConnection(fd);

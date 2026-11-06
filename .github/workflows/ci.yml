@@ -105,6 +105,16 @@ jobs:
       # install.sh and the packages' preinstall each check the CPU floor;
       # their flag lists must not drift apart. (The release compares the
       # Homebrew formula's too.)
+      - name: Socket calls go through stdx.net
+        # Listeners set their options before they accept; pipes and stdin are
+        # read directly. Everything on a connection uses stdx.net or std.c.
+        run: |
+          options=$(grep -rnE 'posix\.setsockopt\(' src --include='*.zig' | grep -vE '^src/(node/acceptor|metrics/http_server|node/dashboard/http_server|raft/network)\.zig:[0-9]+:.*SO\.REUSEADDR' || true)
+          reads=$(grep -rnE 'posix\.read\(' src --include='*.zig' | grep -vE '^src/(cli/commands|stdx/testing|vopr)/|^src/node/(reactor|acceptor)\.zig:|^src/node/shard\.zig:[0-9]+:.*acceptor_pipe_rd' || true)
+          if [ -n "$options$reads" ]; then
+            echo "$options$reads"
+            echo "::error::a connection's socket calls go through stdx.net"; exit 1
+          fi
       - name: The CPU floor lists match
         run: scripts/check-cpu-floor.sh
 

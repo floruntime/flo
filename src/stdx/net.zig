@@ -476,6 +476,12 @@ pub fn sysConnect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.so
     if (std.c.connect(fd, addr, len) != 0) return error.ConnectFailed;
 }
 
+/// Set a socket option on a connection, ignoring the result: its next read or
+/// write reports any failure that matters.
+pub fn setConnectionOption(fd: posix.socket_t, level: i32, name: u32, value: []const u8) void {
+    _ = std.c.setsockopt(fd, level, name, value.ptr, @intCast(value.len));
+}
+
 pub fn sysAccept(
     fd: posix.socket_t,
     addr: ?*posix.sockaddr,
