@@ -29,7 +29,7 @@
 1459	http_test
 4492	kv_key_nul_test
 117061	kv_test
-67000	kv_txn_limit_test
+89000	kv_txn_limit_test
 214	large_request_test
 3800	list_paging_test
 30507	membership_test

@@ -70,16 +70,16 @@ fn expectLimitOn(config: ServerProcess.ServerConfig, limit: usize) !void {
     try expectLimit(cli, limit);
 }
 
-test "e2e/kv/txn-limit: a transaction holds 32 ops unless the config says otherwise, lower or higher" {
-    try expectLimitOn(.{ .shards = 1 }, 32);
+test "e2e/kv/txn-limit: a transaction holds 64 ops unless the config says otherwise, lower or higher" {
+    try expectLimitOn(.{ .shards = 1 }, 64);
     try expectLimitOn(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_ops = 8\n" }, 8);
-    try expectLimitOn(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_ops = 40\n" }, 40);
+    try expectLimitOn(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_ops = 72\n" }, 72);
 }
 
 test "e2e/kv/txn-limit: --max-txn-ops moves the limit, and beats the config file" {
     try expectLimitOn(.{ .shards = 1, .extra_args = &.{ "--max-txn-ops", "4" } }, 4);
-    try expectLimitOn(.{ .shards = 1, .extra_args = &.{ "--max-txn-ops", "36" } }, 36);
-    try expectLimitOn(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_ops = 40\n", .extra_args = &.{ "--max-txn-ops", "6" } }, 6);
+    try expectLimitOn(.{ .shards = 1, .extra_args = &.{ "--max-txn-ops", "68" } }, 68);
+    try expectLimitOn(.{ .shards = 1, .extra_config = "[kv]\nmax_txn_ops = 72\n", .extra_args = &.{ "--max-txn-ops", "6" } }, 6);
 }
 
 fn expectRefused(config: ServerProcess.ServerConfig, says: []const u8) !void {
@@ -215,7 +215,7 @@ fn expectData(cluster: *ClusterContext, node: usize, count: usize) !void {
 
 test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader committed, and the leader's value decides" {
     var cluster = try ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync, .node_config = .{
-        "[kv]\nmax_txn_ops = 64\n",
+        "[kv]\nmax_txn_ops = 96\n",
         "[kv]\nmax_txn_ops = 24\n",
         "[kv]\nmax_txn_ops = 16\n",
         null,
@@ -235,21 +235,22 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
         stdx.time.sleep(1500 * std.time.ns_per_ms);
     }
 
-    // More ops than either follower's value allows.
+    // More ops than the default, so this leader's own value is what lets it
+    // through, and more than either follower's value allows.
     var buf: [32]u8 = undefined;
     const txn = (try begin(cluster.clis[0].?, "r", &buf)) orelse return error.BeginRefused;
-    const got = (try fill(cluster.clis[0].?, txn, "r", "m", 40)) orelse return error.PutRefused;
-    try testing.expectEqual(@as(usize, 40), got.accepted);
+    const got = (try fill(cluster.clis[0].?, txn, "r", "m", 72)) orelse return error.PutRefused;
+    try testing.expectEqual(@as(usize, 72), got.accepted);
     var commit = try cluster.clis[0].?.run(&.{ "kv", "txn", "commit", txn });
     defer commit.deinit();
     try testing.expectEqual(@as(u8, 0), commit.exit_code);
-    try testing.expect(commit.stdoutContains("ops: 40"));
-    for (0..3) |node| try expectData(&cluster, node, 40);
+    try testing.expect(commit.stdoutContains("ops: 72"));
+    for (0..3) |node| try expectData(&cluster, node, 72);
 
     // A node with a lower value takes over: the same size is now refused, at
     // its own value. Leadership moves until each of the two has led, so a
     // joiner's value can't go unread because the other won.
-    const LIMITS = [_]usize{ 64, 24, 16 };
+    const LIMITS = [_]usize{ 96, 24, 16 };
     cluster.killNode(0);
     var down: usize = 0;
     var led: [3]bool = .{ true, false, false };
@@ -264,7 +265,7 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
             var again_buf: [32]u8 = undefined;
             const again = (try begin(cluster.clis[leader].?, "r", &again_buf)) orelse continue;
             // A leader still settling refuses otherwise: try again.
-            const next = (try fill(cluster.clis[leader].?, again, "r", "n", 40)) orelse continue;
+            const next = (try fill(cluster.clis[leader].?, again, "r", "n", 72)) orelse continue;
             // If leadership moved meanwhile, this measured another node.
             if (!isLeader(&cluster, leader)) continue;
             try testing.expect(next.too_large);
@@ -273,7 +274,7 @@ test "e2e/kv/txn-limit: nodes with different max_txn_ops apply what a leader com
             defer rollback.deinit();
             led[leader] = true;
             // What the old leader committed is all still there.
-            for (0..3) |n| if (n != down) try expectData(&cluster, n, 40);
+            for (0..3) |n| if (n != down) try expectData(&cluster, n, 72);
         }
         if (led[1] and led[2]) break;
         // The node that was down comes back, and this leader goes.
