@@ -269,6 +269,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-actions", .source = "bench/bench_actions.zig" },
         .{ .name = "bench-action-loop", .source = "bench/bench_action_loop.zig" },
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
+        .{ .name = "bench-txn-latency", .source = "bench/bench_txn_latency.zig" },
     };
 
     // A figure is only worth having for what a release ships, so a bench takes
