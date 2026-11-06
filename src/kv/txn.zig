@@ -21,7 +21,7 @@
 //!
 //! ## Caps
 //!
-//! - `TxnTable.max_ops` (`[kv] max_txn_ops`, 32 unless set, at most
+//! - `TxnTable.max_ops` (`[kv] max_txn_ops`, 64 unless set, at most
 //!   `MAX_OPS_PER_TXN`): number of buffered ops. Checked as ops are buffered,
 //!   on the leader, and never at apply: replicas with other values must apply
 //!   what a leader committed.

@@ -92,7 +92,7 @@ pub fn createServerCommand(allocator: Allocator) !*commander.Command {
                 .stringFlag("durability", 0, "", "Storage durability: sync or async_flush")
                 .uintFlag("shards", 's', 0, "Number of data shards (0=auto)")
                 .uintFlag("partitions", 0, 0, "Number of virtual partitions, at most 16384 (0=auto: max(4096, shards×32))")
-                .uintFlag("max-txn-ops", 0, 0, "Most ops one KV transaction may hold, 1 to 256 (default: 32); more costs latency")
+                .uintFlag("max-txn-ops", 0, 0, "Most ops one KV transaction may hold, 1 to 256 (default: 64); more costs latency")
                 .uintFlag("max-txn-bytes", 0, 0, "Most key and value bytes one KV transaction may hold, up to 1048576 (default: 262144); more costs latency")
                 .stringFlag("log-level", 'l', "", "Log level: debug, info, warn, error")
                 .stringFlag("log-format", 0, "", "Log format: text, json")

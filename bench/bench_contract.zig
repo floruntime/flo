@@ -173,6 +173,8 @@ pub fn main() !void {
             .{ .ops = 256, .total = 0 },
             .{ .ops = 32, .total = 256 * 1024 },
             .{ .ops = 32, .total = 1024 * 1024 },
+            .{ .ops = 64, .total = 256 * 1024 },
+            .{ .ops = 64, .total = 1024 * 1024 },
             .{ .ops = 256, .total = 1024 * 1024 },
         };
         for (cases) |c| {
