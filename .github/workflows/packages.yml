@@ -54,6 +54,9 @@ jobs:
         run: |
           zig build --release=safe -Dtarget=x86_64-linux -Dcpu=x86_64_v2 -Drequire-hw-crc -Dversion="$VERSION"
           cp zig-out/bin/flo flo
+          if ./flo version --verbose | grep -qF 'plant='; then
+            echo "::error::the packaged binary says it carries a VOPR plant"; exit 1
+          fi
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
           mkdir -p dist
           "$(go env GOPATH)/bin/nfpm" package -f packaging/nfpm.yaml -p deb -t "dist/flo_${VERSION}_${ARCH}.deb"

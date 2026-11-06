@@ -42,6 +42,9 @@ pub fn build(b: *std.Build) void {
     // shard). Off unless asked for, so no release or image carries them.
     const test_faults = b.option(bool, "test-faults", "Compile in the faults e2e tests drive; never for a release") orelse false;
     build_options.addOption(bool, "test_faults", test_faults);
+    // An undo of a fix a VOPR seed guards (src/plant.zig). None unless asked
+    // for, so no release or image carries one.
+    build_options.addOption([]const u8, "vopr_plant", b.option([]const u8, "vopr-plant", "Undo a fix a VOPR regression seed guards; never for a release") orelse "none");
 
     // ── Dashboard Assets ──
     // Generate assets.zig by scanning src/node/dashboard/dist at configure time.
@@ -248,6 +251,12 @@ pub fn build(b: *std.Build) void {
     vopr_exe.root_module.addImport("src", src_module);
     vopr_exe.root_module.addImport("stdx", stdx_module);
     b.installArtifact(vopr_exe);
+    // The simulator alone, for building it once per plant.
+    const vopr_build_step = b.step("vopr-build", "Build only the deterministic cluster simulator");
+    vopr_build_step.dependOn(&b.addInstallArtifact(vopr_exe, .{}).step);
+    // Analysed, with no code made: enough to know a plant still compiles.
+    const vopr_compile = b.addExecutable(.{ .name = "vopr", .root_module = vopr_exe.root_module });
+    b.step("vopr-compile", "Check the deterministic cluster simulator compiles").dependOn(&vopr_compile.step);
 
     const run_vopr = b.addRunArtifact(vopr_exe);
     run_vopr.step.dependOn(b.getInstallStep());

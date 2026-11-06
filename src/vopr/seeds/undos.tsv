@@ -1,0 +1,13 @@
+# seed file	plant	slice flag for recording, or -	scenario values to set, or -	first invariant it fails with, or crash	what its output must also match (an extended regex)
+eviction-wedge.json	no_catch_up	--small-ring	-	message_storm	catch_up_reads=0 
+stale-suffix-commit.json	commit_past_verified	-	-	state_machine_safety	applied entry differs from the canonical entry
+stale-ack-chains.json	any_ack_frees_peer	--byzantine	-	message_storm	delivered more messages
+stale-member-wedge.json	no_vouches	-	-	convergence	vouches_taken=0 stranger_frames=[1-9]
+stale-member-wedge-small-ring.json	no_vouches	--small-ring	-	convergence	vouches_taken=0 stranger_frames=[1-9]
+stale-member-wedge-membership.json	no_vouches	--membership	-	convergence	vouches_taken=0 stranger_frames=[1-9]
+truncate-evict-hang.json	truncate_keeps_write_pos	--small-ring	-	crash	 in append 
+paused-apply-erasure.json	erasure_from_apply	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
+async-boot-applies-erased.json	async_boot_applies	--catching-up	-	state_machine_safety	applied entry differs from the canonical entry
+async-boot-applies-erased-123.json	async_boot_applies	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
+async-boot-applies-erased-190.json	async_boot_applies	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
+halt-removed-member.json	repair_waits_on_removed	--halts	-	convergence	stranger_frames=[1-9]

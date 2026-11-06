@@ -116,6 +116,9 @@ jobs:
           if zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
             echo "::error::the release binary says it carries the test faults"; exit 1
           fi
+          if zig-out/bin/flo version --verbose | grep -qF 'plant='; then
+            echo "::error::the release binary says it carries a VOPR plant"; exit 1
+          fi
 
       - name: Package
         env:

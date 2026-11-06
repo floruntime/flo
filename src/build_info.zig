@@ -25,11 +25,12 @@ pub fn deinit() void {
 /// The line says so, so a test can refuse a build without them, and a
 /// release check can refuse one with them.
 pub const test_faults = @import("build_options").test_faults;
+const plant = @import("plant.zig");
 
 /// e.g. "zig 0.17.0, safe, alloc=libc", with ", test-faults" when they
-/// are compiled in.
-pub const line = std.fmt.comptimePrint("zig {s}, {t}, alloc={s}{s}", .{ builtin.zig_version_string, builtin.mode, allocator_name, if (test_faults) ", test-faults" else "" });
+/// are compiled in, and ", plant=<name>" when a VOPR seed's undo is.
+pub const line = std.fmt.comptimePrint("zig {s}, {t}, alloc={s}{s}{s}", .{ builtin.zig_version_string, builtin.mode, allocator_name, if (test_faults) ", test-faults" else "", if (plant.active == .none) "" else ", plant=" ++ @tagName(plant.active) });
 
 test "build_info: the line names the test faults exactly when they are compiled in" {
-    try std.testing.expectEqual(test_faults, std.mem.endsWith(u8, line, ", test-faults"));
+    try std.testing.expectEqual(test_faults, std.mem.indexOf(u8, line, ", test-faults") != null);
 }
