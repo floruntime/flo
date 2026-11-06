@@ -4302,7 +4302,7 @@ pub const Shard = struct {
 
     /// What applying `e` charges a pass: a stand-in for its time, never the
     /// clock, so a pass ends at the same entry on every host and every
-    /// replay. Calibrated from bench_write_path's backlog (ReleaseFast,
+    /// replay. Calibrated from bench_write_path's backlog (on
     /// Apple M-series): an entry of one op about 1.4 µs, each further op of
     /// a transaction about 2.5 µs, and about 0.15 ns a byte. A pass can
     /// overrun by its last entry, at most a full transaction.

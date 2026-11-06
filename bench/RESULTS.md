@@ -12,8 +12,9 @@
 | Zig | 0.16.0 |
 | Build | Unverified |
 
-These figures predate today's bench build, which is ReleaseSafe in every module. They ran on Zig 0.16
-and were labelled ReleaseFast, but how they were built can't be verified, so a run today won't compare directly.
+The tables under Results predate today's bench build, which is ReleaseSafe in every module. They ran on
+Zig 0.16 and were labelled ReleaseFast, but how they were built can't be verified, so a run today won't
+compare directly.
 
 ## Results
 
@@ -42,6 +43,9 @@ and were labelled ReleaseFast, but how they were built can't be verified, so a r
 | Send-only | 15.4M | 64 | 1M ring, no drain |
 
 ## Comparison with Old Architecture
+
+The New column is older than the tables above: its figures come from Zig 0.15.2, with their build also
+unverified.
 
 | Metric | Old (zflo) | New (flo) | Improvement |
 |--------|-----------|-----------|-------------|

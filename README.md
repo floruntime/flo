@@ -188,7 +188,7 @@ All writes go through the **Unified Append Log (UAL)**. The Raft consensus log a
 
 ### Performance
 
-Benchmarked on the new architecture (Apple M-series, single core). These figures predate today's bench build, on Zig 0.16, and their build mode is unverified:
+Benchmarked on the new architecture (Apple M-series, single core). These figures predate today's bench build, on Zig 0.15.2, and their build mode is unverified:
 
 | Benchmark | Throughput | Latency |
 |-----------|-----------|--------|
