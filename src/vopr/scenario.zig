@@ -160,7 +160,7 @@ pub const Scenario = struct {
     /// apply, as an applier bug would; 0 for none. Every node must halt at
     /// the same entry.
     halt_op: u64 = 0,
-    /// Once every core node halted, an operator's repair skips the entry,
+    /// Once every core member the leader knows halted, an operator's repair skips the entry,
     /// and every node goes on past it.
     repair_halt: bool = false,
     /// Percent of workload ops that are action entries, made from the
