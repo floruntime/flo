@@ -220,7 +220,7 @@ function LayoutSection() {
         </Card>
       </Block>
       <Block title="PageHead" col>
-        <PageHead title="KV Store" subtitle="Versioned · strongly consistent · MVCC time-travel" />
+        <PageHead title="KV Store" subtitle="Versioned · MVCC time-travel" />
       </Block>
       <Block title="Section · Crumb" col>
         <Crumb root="Streams" current="user-clicks" />

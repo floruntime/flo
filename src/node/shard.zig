@@ -1199,11 +1199,12 @@ pub const Shard = struct {
         writer.first_unbuffered = null;
     }
 
-    /// Apply what replay loaded into the log above the commit watermark.
-    /// Called once the shard is at its final address and before it serves
-    /// anything, so no read observes the gap. A shard that bootstrapped
-    /// re-established commit at the tip and drains the whole tail; one
-    /// that follows has nothing to drain until a leader speaks.
+    /// Start applying what replay loaded into the log above the commit
+    /// watermark, once the shard is at its final address. A shard that
+    /// bootstrapped re-established commit at the tip and takes one pass of
+    /// the tail here; ticks apply the rest, and its reads are refused until
+    /// they have (`refusedRead`). One that follows has nothing to apply until
+    /// a leader speaks.
     pub fn applyDeferredTail(self: *Shard) void {
         const raft = self.raft_node;
         const pending = raft.commit_index -| raft.last_applied;
@@ -1569,7 +1570,7 @@ pub const Shard = struct {
             if (!has_single_target) {
                 // This shard's part is read here, not through `dispatchLocal`;
                 // the others' parts are gated where they run.
-                if (self.refusedCold(conn, req)) return;
+                if (self.refusedRead(conn, req)) return;
                 self.executeWalk(conn, req, auth);
                 return;
             }
@@ -1582,11 +1583,11 @@ pub const Shard = struct {
         // holds the run (`RunFind`), and for a start that chooses one,
         // whether another workflow's run has it already.
         if (self.runIdUnplaced(req)) {
-            if (self.refusedCold(conn, req)) return;
+            if (self.refusedRead(conn, req)) return;
             return self.findRun(conn, req, auth, req.key, null);
         }
         if (self.startChoosesRunId(req)) |rid| {
-            if (self.refusedCold(conn, req)) return;
+            if (self.refusedRead(conn, req)) return;
             return self.findRun(conn, req, auth, rid, self.startHome(req));
         }
 
@@ -1919,7 +1920,7 @@ pub const Shard = struct {
         // whichever shard or node it came. Status and membership read Raft
         // and config, not projections.
         const exempt = status_op or req.header.op_code == @backingInt(proto.OpCode.ping);
-        if (!writes and !at_leader and !exempt and auth.origin != .peer and self.refusedCold(conn, req)) return;
+        if (!writes and !at_leader and !exempt and !internal_from_client and auth.origin != .peer and self.refusedRead(conn, req)) return;
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
@@ -1943,10 +1944,12 @@ pub const Shard = struct {
             self.forwardToLeader(conn, req);
             return;
         }
-        // A read the leader answers from its memory: a leader still applying
-        // what earlier terms committed would answer from part of it. A halted
-        // one answers, marked stale, as other reads are.
-        if (at_leader and self.halted == null and !self.raft_node.leaderReady()) {
+        // A read the leader answers from its memory, or one inside a
+        // transaction, which falls through to the leader's state: a leader
+        // still applying what earlier terms committed would answer from part
+        // of it. A halted one answers the former, marked stale, as other reads
+        // are.
+        if ((at_leader or table_run.readsInTxn(req)) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
         }
@@ -3158,7 +3161,7 @@ pub const Shard = struct {
         if (nh.creating(name)) return false;
         if (self.raft_network == null or self.raft_node.role == .leader) {
             // A new leader may not have applied its predecessor's creates.
-            if (!self.raft_node.leaderReady()) self.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(handler_mod.NamespaceHandler.PUBLISHED_NOT_READY)) else self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
+            if (!self.raft_node.leaderReady()) self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = handler_mod.NamespaceHandler.PUBLISHED_NOT_READY }) else self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
             return true;
         }
         const now = nowMs();
@@ -3946,12 +3949,27 @@ pub const Shard = struct {
     pub const COLD_READ_REFUSAL = "unavailable: this node restarted and is catching up with its group's leader; retry, or read from another node";
     pub const LEADER_NOT_READY_REFUSAL = "unavailable: the leader is still applying what earlier leaders committed; retry";
 
-    /// Refuses `req`, a read of this shard's state, while a cold boot keeps
-    /// its projections behind its group's (`coldCaughtUp`).
-    fn refusedCold(self: *Shard, conn: *Connection, req: proto.Request) bool {
-        if (self.coldCaughtUp()) return false;
-        self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = COLD_READ_REFUSAL });
+    /// Refuses `req`, a read of this shard's state, while that state is behind
+    /// what its group committed: a cold boot's (`coldCaughtUp`), or a new
+    /// leader's, which may not have applied what earlier terms committed. A
+    /// write acknowledged by the old leader would read as missing.
+    fn refusedRead(self: *Shard, conn: *Connection, req: proto.Request) bool {
+        const message = if (!self.coldCaughtUp())
+            COLD_READ_REFUSAL
+        else if (self.leaderApplying())
+            LEADER_NOT_READY_REFUSAL
+        else
+            return false;
+        self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = message });
         return true;
+    }
+
+    /// This node leads and hasn't applied what earlier terms committed. A
+    /// halted leader won't until a repair resumes it, and answers marked stale
+    /// instead.
+    fn leaderApplying(self: *const Shard) bool {
+        const raft = self.raft_node;
+        return raft.role == .leader and self.halted == null and !raft.leaderReady();
     }
 
     /// Whether a cold boot's projections hold what the group committed: a
@@ -13138,6 +13156,194 @@ test "Shard: a leader still applying earlier terms' entries refuses the reads it
     const got = try proto.Response.parse(out[0..conn.write_buf.read(&out)]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
     try std.testing.expect(std.mem.indexOf(u8, got.data, "here") != null);
+}
+
+test "Shard: a new leader refuses plain reads until it has applied earlier terms, then answers them" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    var body_buf: [64]u8 = undefined;
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "the-value") }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+    const run_id = "chosen-run";
+    _ = try applyActionEntry(&shard, .action_register, testRegister("echo"), shard.raft_node.last_applied + 1, 1);
+    _ = try applyActionEntry(&shard, .action_invoke, testInvoke("echo", run_id), shard.raft_node.last_applied + 1, 1000 * std.time.ns_per_ms);
+
+    const get: proto.Request = .{ .header = proto.RequestHeader.init(.kv_get, 2), .namespace = "", .key = "k", .value = try kv_ops.plainGetBody(&body_buf) };
+    const status: proto.Request = .{ .header = proto.RequestHeader.init(.action_status, 3), .namespace = "", .key = run_id, .value = "" };
+    const raft = shard.raft_node;
+    try std.testing.expect(raft.leaderReady());
+    // Elected with entries of earlier terms still to apply.
+    raft.ready_index = raft.log.lastIndex() + 100;
+
+    // Asked by a client and by another shard, both are refused, retryably.
+    for ([_]proto.Request{ get, status }) |req| for ([_]@import("run.zig").Origin{ .client, .shard }) |origin| {
+        shard.runRequest(c.conn, req, origin);
+        const refused = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), refused.header.status);
+        const why = try refused.refused();
+        try std.testing.expectEqual(@import("../protocol/reason.zig").Reason.leader_unknown, why.reason);
+        try std.testing.expectEqual(proto.Ran.no, why.ran);
+        try std.testing.expectEqualStrings(Shard.LEADER_NOT_READY_REFUSAL, why.message);
+    };
+    // What reads no projection still answers.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.ping, 4), .namespace = "", .key = "", .value = "" }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.cluster_status, 5), .namespace = "", .key = "", .value = "" }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+
+    // Ready, both answer what the log holds.
+    raft.ready_index = raft.last_applied;
+    shard.runRequest(c.conn, get, .client);
+    const got = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), got.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, got.data, "the-value") != null);
+    shard.runRequest(c.conn, status, .client);
+    const answered = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), answered.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, (try table_run.op("action.status").response.decodeAll(answered.data, &diag)).status);
+}
+
+/// `resp` is the refusal a leader still applying earlier terms gives.
+fn expectLeaderNotReady(resp: proto.Response) !void {
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), resp.header.status);
+    const why = try resp.refused();
+    try std.testing.expectEqual(@import("../protocol/reason.zig").Reason.leader_unknown, why.reason);
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expectEqualStrings(Shard.LEADER_NOT_READY_REFUSAL, why.message);
+}
+
+test "Shard: a read inside a transaction on a leader still applying earlier terms is refused" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    var body_buf: [64]u8 = undefined;
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "the-value") }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), node_router.namespaceHash(""));
+    const get = txnGet(&body_buf, id);
+    var exists_buf: [64]u8 = undefined;
+    const exists_body = try table_run.op("kv.exists").request.encodeInto(&exists_buf, .{ .routing_key = null, .txn = id });
+    const exists: proto.Request = .{ .header = proto.RequestHeader.init(.kv_exists, 10), .namespace = "", .key = "k", .value = exists_body };
+
+    const raft = shard.raft_node;
+    raft.ready_index = raft.log.lastIndex() + 100;
+    for ([_]proto.Request{ get, exists }) |req| {
+        shard.runRequest(c.conn, req, .client);
+        try expectLeaderNotReady(try nextAnswer(c, &shard, &out));
+    }
+    raft.ready_index = raft.last_applied;
+    shard.runRequest(c.conn, get, .client);
+    try std.testing.expect(std.mem.indexOf(u8, (try nextAnswer(c, &shard, &out)).data, "the-value") != null);
+}
+
+test "Shard: a shard still applying earlier terms refuses a walk, a chosen run id and a start choosing one, before asking another shard" {
+    var f: WalkFixture = undefined;
+    try f.init(&.{"a"}, &.{"b"}, false);
+    defer f.deinit();
+    const a = &f.two.shards[0];
+    a.raft_node.ready_index = a.raft_node.log.lastIndex() + 100;
+
+    var walk_body: [64]u8 = undefined;
+    std.mem.writeInt(u32, walk_body[0..4], 10, .little);
+    @memset(walk_body[4..6], 0);
+    var start_body: [64]u8 = undefined;
+    // name "flow", no idempotency key, then the run id it chooses.
+    const start = std.fmt.bufPrint(&start_body, "\x04\x00flow\x00\x01\x06\x00chosen", .{}) catch unreachable;
+    try std.testing.expectEqualStrings("chosen", @import("../workflow/handler.zig").WorkflowHandler.startChosenRunId(start).?);
+    for ([_]proto.Request{
+        .{ .header = proto.RequestHeader.init(.ts_list, 1), .namespace = "default", .key = "", .value = walk_body[0..6] },
+        .{ .header = proto.RequestHeader.init(.workflow_status, 2), .namespace = "default", .key = "chosen", .value = "" },
+        .{ .header = proto.RequestHeader.init(.workflow_start, 3), .namespace = "default", .key = "flow", .value = start },
+    }) |req| {
+        a.runRequest(f.client.conn, req, .client);
+        f.two.settle();
+        try expectLeaderNotReady(try nextAnswer(f.client, a, f.out));
+    }
+    try std.testing.expectEqual(@as(u32, 0), f.lists[0].scans + f.lists[1].scans);
+}
+
+test "Shard: a gather with a part on a shard still applying earlier terms is refused whole, not answered in part" {
+    var walk: WalkFixture = undefined;
+    try walk.init(&.{"a"}, &.{"b"}, false);
+    defer walk.deinit();
+    const other = &walk.two.shards[1];
+    other.raft_node.ready_index = other.raft_node.log.lastIndex() + 100;
+    var walk_body: [64]u8 = undefined;
+    std.mem.writeInt(u32, walk_body[0..4], 10, .little);
+    @memset(walk_body[4..6], 0);
+    const a = &walk.two.shards[0];
+    a.runRequest(walk.client.conn, .{ .header = proto.RequestHeader.init(.ts_list, 1), .namespace = "default", .key = "", .value = walk_body[0..6] }, .client);
+    walk.two.settle();
+    try expectLeaderNotReady(try nextAnswer(walk.client, a, walk.out));
+
+    var mget: MgetGatherFixture = undefined;
+    try mget.init(8);
+    defer mget.deinit();
+    const far = &mget.two.shards[1];
+    far.raft_node.ready_index = far.raft_node.log.lastIndex() + 100;
+    try mget.ask(1, &mget.keys);
+    mget.two.settle();
+    try expectLeaderNotReady(try nextAnswer(mget.client, &mget.two.shards[0], mget.out));
+}
+
+test "Shard: an internal op from a client on a leader still applying earlier terms is still answered as an unknown one" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    shard.raft_node.ready_index = shard.raft_node.log.lastIndex() + 100;
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [256]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.send(&shard, conn, .namespace_ensure, 1, "fresh", "");
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(proto.Reason.unknown_op, (try one[0].refused()).reason);
+}
+
+test "Shard: a namespace a leader still applying earlier terms doesn't know of is refused for a retry, with the reason" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    shard.raft_node.ready_index = shard.raft_node.log.lastIndex() + 100;
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_get, 1), .namespace = "unheard-of", .key = "k", .value = try kv_ops.plainGetBody(&body_buf) }, .client);
+    const resp = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), resp.header.status);
+    const why = try resp.refused();
+    try std.testing.expectEqual(@import("../protocol/reason.zig").Reason.leader_unknown, why.reason);
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
 }
 
 test "Shard: a leader still applying earlier terms' entries runs no pipeline, trigger or schedule pass" {

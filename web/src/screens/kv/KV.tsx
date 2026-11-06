@@ -80,7 +80,7 @@ export function KV() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
           <div>
             <h1 className="ph-t">KV Store</h1>
-            <div className="ph-s">Versioned · strongly consistent · MVCC time-travel</div>
+            <div className="ph-s">Versioned · MVCC time-travel</div>
           </div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <Field
