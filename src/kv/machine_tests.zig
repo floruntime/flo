@@ -350,7 +350,7 @@ test "kv machine: live keys are counted per namespace as apply makes and removes
         .{ .entry = testEntry(&bufs[7], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 8, STAMP), .orders = 2, .default = 1 },
         .{ .entry = testEntry(&bufs[8], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 9, STAMP), .orders = 2, .default = 1 },
         .{ .entry = b.entry, .orders = 3, .default = 1 },
-        // A TTL that runs out removes nothing: the key counts until deleted.
+        // A TTL that runs out removes nothing: the key counts until overwritten.
         .{ .entry = putEntry(&bufs[9], "plain", "t", 11, STAMP, 1), .orders = 3, .default = 1 },
         .{ .entry = testEntry(&bufs[10], .kv_expire, .{ .key = "orders\x00a", .ttl_ms = 1, .cas_version = null }, 12, STAMP + std.time.ns_per_s), .orders = 3, .default = 1 },
     };

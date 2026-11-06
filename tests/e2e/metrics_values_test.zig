@@ -227,6 +227,38 @@ test "e2e/metrics: a JSON write counts as a set, a whole-document delete as a de
     try testing.expectEqual(@as(?u64, 1), seriesValue(resp.body, "flo_kv_delete_ops_total", "default"));
 }
 
+test "e2e/metrics: a refused write counts as neither a set nor a delete, nor does a delete of nothing" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "kv", "set", "k", "v" });
+    for ([_][]const []const u8{
+        &.{ "kv", "set", "k", "no", "--if-absent" },
+        &.{ "kv", "set", "k", "no", "--cas-version", "9" },
+        &.{ "kv", "delete", "k", "--cas-version", "9" },
+    }) |args| {
+        var refused = try ctx.cli.run(args);
+        defer refused.deinit();
+        try testing.expect(refused.exit_code != 0);
+    }
+    try ctx.exec(&.{ "kv", "delete", "never-written" });
+
+    var http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    {
+        var resp = try http.get("/metrics");
+        defer resp.deinit();
+        try testing.expectEqual(@as(?u64, 1), seriesValue(resp.body, "flo_kv_set_ops_total", "default"));
+        try testing.expectEqual(@as(?u64, 0), seriesValue(resp.body, "flo_kv_delete_ops_total", "default"));
+    }
+    try ctx.exec(&.{ "kv", "delete", "k" });
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+    try testing.expectEqual(@as(?u64, 1), seriesValue(resp.body, "flo_kv_delete_ops_total", "default"));
+}
+
 test "e2e/metrics: tiered log hit counters carry real values" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .metrics_enabled = true },

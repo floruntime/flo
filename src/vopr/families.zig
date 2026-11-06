@@ -58,6 +58,11 @@ pub const Mutant = enum {
     /// A condition is decided by the replica: the leader writes what every
     /// other replica refuses.
     kv_condition_local,
+    /// `if_absent` always holds, on every replica: they agree on the wrong
+    /// answer, so no comparison sees it, and `Kv.apply` works it out itself.
+    kv_if_absent_holds,
+    /// A batch's conditions and versions are ignored, on every replica.
+    kv_batch_conditions_ignored,
     // Bugs in the actions machine, each planted by rewriting the entry it
     // applies (`Actions.apply` checks the entry as it was): every replica
     // applies the same rewrite, so only the entry checks see them.
@@ -111,7 +116,7 @@ pub const Mutant = enum {
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }
@@ -227,8 +232,10 @@ pub const Kv = struct {
         refused,
         /// A batch refused, which has staged writes by then.
         staged_refused,
-        /// A put or batch refused for its condition or cas_version.
+        /// A put refused for its condition or cas_version.
         condition_refused,
+        /// A batch refused for one of those, which has staged writes by then.
+        batch_condition_refused,
         /// A put with a condition or cas_version that held.
         condition_held,
         /// A JSON patch merged into the value: a set below `$`.
@@ -245,6 +252,9 @@ pub const Kv = struct {
         field_deletes: u64 = 0,
         condition_refusals: u64 = 0,
         conditions_held: u64 = 0,
+        batch_condition_refusals: u64 = 0,
+        /// Counted by the simulator, which knows what a batch asked.
+        batch_conditions_held: u64 = 0,
 
         pub fn count(self: *Counts, o: Effect) void {
             switch (o) {
@@ -257,6 +267,12 @@ pub const Kv = struct {
                 .condition_refused => {
                     self.refusals += 1;
                     self.condition_refusals += 1;
+                },
+                .batch_condition_refused => {
+                    self.refusals += 1;
+                    self.staged_refusals += 1;
+                    self.condition_refusals += 1;
+                    self.batch_condition_refusals += 1;
                 },
                 .condition_held => self.conditions_held += 1,
                 .merged => self.merges += 1,
@@ -291,9 +307,12 @@ pub const Kv = struct {
 
     /// Apply `e` as the shard does. A refusal is an answer, not an error,
     /// but it must leave every family as it was: `RefusalChangedState` if
-    /// one moved. Any other error (a halt, out of memory) is one a workload
-    /// entry must never meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
+    /// one moved. `ConditionDecidedWrong` if a put's condition came out other
+    /// than the key as it stood says. Any other error (a halt, out of memory)
+    /// is one a workload entry must never meet.
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong })!Effect {
+        // Every replica may agree on a wrong decision, so no checksum sees it.
+        const holds: ?bool = if (r.mutant == .kv_condition_local) null else if (conditionalPut(e)) |p| self.conditionHolds(p, e.header.timestamp_ns) else null;
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
         if (r.mutant == .kv_refuses_over_own_limit and r.txn_limit != 0 and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch) and kv_entries.batchOpCount(e.payload) > r.txn_limit) return .staged_refused;
         if (r.mutant == .kv_refuses_large and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch) and kv_entries.batchOpCount(e.payload) > limits.MAX_OPS_PER_TXN / 2) return .staged_refused;
@@ -307,7 +326,12 @@ pub const Kv = struct {
             var short = e.*;
             short.payload = firstHalf(e.payload, &buf) orelse return error.Halt;
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, &short, &out);
-        } else if (r.mutant == .kv_condition_local and r.leader and conditionalPut(e) != null) {
+        } else if (r.mutant == .kv_batch_conditions_ignored and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) {
+            var buf: [8192]u8 = undefined;
+            var plain = e.*;
+            plain.payload = withoutConditions(e.payload, &buf) orelse return error.Halt;
+            try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, &plain, &out);
+        } else if (ignoresCondition(e, r)) {
             var buf: [8192]u8 = undefined;
             var body = conditionalPut(e).?;
             body.condition = .always;
@@ -318,11 +342,36 @@ pub const Kv = struct {
         } else {
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
         }
+        if (holds) |h| if (h != (out.refused() == null)) return error.ConditionDecidedWrong;
         const refusal = out.refused() orelse
             return if (conditionalPut(e) != null) .condition_held else patchEffect(e);
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
-        if (refusal.refusal.reason == .cas_mismatch or refusal.refusal.reason == .condition_failed) return .condition_refused;
-        return if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) .staged_refused else .refused;
+        const is_batch = e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch);
+        if (refusal.refusal.reason == .cas_mismatch or refusal.refusal.reason == .condition_failed) return if (is_batch) .batch_condition_refused else .condition_refused;
+        return if (is_batch) .staged_refused else .refused;
+    }
+
+    /// Whether a mutant has this replica write `e` as a plain put.
+    fn ignoresCondition(e: *const entry_mod.Entry, r: Replica) bool {
+        const p = conditionalPut(e) orelse return false;
+        return (r.mutant == .kv_condition_local and r.leader) or (r.mutant == .kv_if_absent_holds and p.condition == .if_absent);
+    }
+
+    /// The batch with no op asking anything, for `kv_batch_conditions_ignored`.
+    fn withoutConditions(payload: []const u8, buf: []u8) ?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
+        var ops: [limits.MAX_OPS_PER_TXN]kv_entries.BatchOp.Value = undefined;
+        var n: usize = 0;
+        var it = batch.ops.iterator();
+        while (it.next() catch return null) |op| : (n += 1) {
+            ops[n] = op;
+            ops[n].condition = .always;
+            ops[n].cas_version = null;
+        }
+        var w: schema.Writer = .{ .buf = buf };
+        kv_entries.BatchOps.encodeSlice(&w, ops[0..n]) catch return null;
+        return w.written();
     }
 
     /// The batch's first half of its ops, for `kv_stops_batch_short`.
@@ -345,6 +394,20 @@ pub const Kv = struct {
         const current = kv_machine.Current.decode(bytes) catch return 0;
         if (current.tombstone or current.value.len != 8) return 0;
         return std.mem.readInt(i64, current.value[0..8], .little);
+    }
+
+    /// What `p` should be answered at `at_ns`, from the key as it stands.
+    fn conditionHolds(self: *Kv, p: kv_entries.Put.Value, at_ns: u64) bool {
+        var kb: [kv_machine.MAX_KEY]u8 = undefined;
+        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(p.key)));
+        const current: ?kv_machine.Current = if (bytes) |b| (kv_machine.Current.decode(b) catch null) else null;
+        const version: ?u64 = if (current) |c| (if (c.tombstone or c.expiredAt(at_ns)) null else c.version) else null;
+        if (p.cas_version) |want| if (want != (version orelse 0)) return false;
+        return switch (p.condition) {
+            .always => true,
+            .if_absent => version == null,
+            .if_present => version != null,
+        };
     }
 
     /// `e` as a put that asks something of its key.

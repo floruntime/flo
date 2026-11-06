@@ -14,6 +14,8 @@ means the check stopped catching its bug.
 | `actions.json` | `release_counts_nothing` | `action_rule` | `a run's failures don't count the deliveries that failed` |
 | `actions.json` | `settle_keeps_request` | `action_rule` | `a request record names a delivery that isn't live` |
 | `actions.json` | `action_node_clock` | `state_checksum` | `action.` |
+| `txn-limits.json` | `kv_if_absent_holds` | `applied_integrity` | `decided a put's condition` |
+| `txn-limits.json` | `kv_batch_conditions_ignored` | `applied_integrity` | `a condition that can't hold` |
 | `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
 | `txn-limits.json` | `kv_refuses_large` | `applied_integrity` | `none of whose ops can be refused` |
 | `txn-limits.json` | `kv_stops_batch_short` | `applied_integrity` | `without reaching its last op` |

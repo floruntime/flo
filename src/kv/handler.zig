@@ -338,7 +338,7 @@ pub const KVHandler = struct {
     }
 
     /// The transaction a request names, if any. Looked up before any other
-    /// check: a request refused for its key or condition still uses the
+    /// check: a request refused for its key still uses the
     /// transaction, and one that is gone is answered as gone.
     fn txnOf(shard: *Shard, req: Request, txn: ?u64, routing_key: ?[]const u8) Error!?*txn_mod.TxnState {
         return if (txn) |id| try openTxn(shard, req, id, routing_key) else null;

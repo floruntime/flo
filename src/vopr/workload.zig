@@ -326,10 +326,70 @@ pub const Workload = struct {
         return buf[0..out.len];
     }
 
-    /// A batch writing the op's marker key, then deleting a slot's key. A third
-    /// also add 1 to another slot's key: on a put's raw bytes that refuses the
-    /// whole batch after its marker is staged, the refusal that must drop
-    /// staged writes.
+    /// What a batch asks of the op's marker key, which nothing else writes, so
+    /// how it comes out is known from the entry alone (`batchAnswer`). The first
+    /// put must find the key absent; the second holds only if it sees the first,
+    /// staged. Most then name the version staged on a delete or an expire. One
+    /// in eight asks what can't hold, which refuses the batch with writes staged.
+    const MARKER_OPS = 3;
+    const MARKER_VERSION = 2;
+    /// Live at any version, so this is wrong however many puts came first.
+    const MARKER_WRONG_VERSION = 0;
+
+    fn markerOps(ops: *[MARKER_OPS]kv_entries.BatchOp.Value, marker: []const u8, r: std.Random) usize {
+        const plain: kv_entries.BatchOp.Value = .{ .kind = .put, .key = marker, .value = "m", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
+        const delete: kv_entries.BatchOp.Value = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = MARKER_VERSION };
+        const expire: kv_entries.BatchOp.Value = .{ .kind = .expire, .key = marker, .value = null, .ttl_ms = 3_600_000, .delta = null, .condition = .always, .cas_version = MARKER_VERSION };
+        ops[0] = plain;
+        ops[0].condition = .if_absent;
+        ops[1] = plain;
+        ops[1].condition = .if_present;
+        ops[2] = switch (r.uintLessThan(u8, 8)) {
+            0 => switch (r.uintLessThan(u8, 3)) {
+                0 => ops[0],
+                1 => wrong: {
+                    var op = delete;
+                    op.cas_version = MARKER_WRONG_VERSION;
+                    break :wrong op;
+                },
+                else => wrong: {
+                    var op = expire;
+                    op.cas_version = MARKER_WRONG_VERSION;
+                    break :wrong op;
+                },
+            },
+            1, 2, 3 => expire,
+            4, 5 => delete,
+            else => return 2,
+        };
+        return MARKER_OPS;
+    }
+
+    fn markerOpRefuses(op: kv_entries.BatchOp.Value) bool {
+        return op.condition == .if_absent or op.cas_version == MARKER_WRONG_VERSION;
+    }
+
+    pub const BatchAnswer = enum { holds, refuses };
+
+    /// How what a batch asks of its marker key comes out (`markerOps`), or null
+    /// if it asks nothing.
+    pub fn batchAnswer(payload: []const u8) ?BatchAnswer {
+        var diag: schema.Diagnostic = .{};
+        const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
+        var it = batch.ops.iterator();
+        const first = (it.next() catch return null) orelse return null;
+        if (first.condition != .if_absent or !std.mem.startsWith(u8, first.key, MARKER_PREFIX)) return null;
+        while (it.next() catch return null) |op| {
+            if (!std.mem.eql(u8, op.key, first.key)) continue;
+            if (markerOpRefuses(op)) return .refuses;
+        }
+        return .holds;
+    }
+
+    /// A batch asking of the op's marker key (`markerOps`), then deleting a
+    /// slot's key. A third also add 1 to another slot's key: on a put's raw bytes
+    /// that refuses the whole batch after its marker is staged, the refusal that
+    /// must drop staged writes.
     fn kvDelete(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
         var key_buf: [16]u8 = undefined;
         var counter_buf: [16]u8 = undefined;
@@ -338,14 +398,23 @@ pub const Workload = struct {
         const slot = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
         const with_incr = r.uintLessThan(u8, 3) == 0;
         const counter = slotKey(&counter_buf, r.uintLessThan(u8, KV_SLOTS));
-        const all = [_]kv_entries.BatchOp.Value{
-            .{ .kind = .put, .key = marker, .value = "m", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
-            .{ .kind = .delete, .key = slot, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
-            .{ .kind = .incr, .key = counter, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null },
-        };
-        const plain = [_]kv_entries.BatchOp.Value{ all[0], all[1] };
+        const delete: kv_entries.BatchOp.Value = .{ .kind = .delete, .key = slot, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
+        const incr: kv_entries.BatchOp.Value = .{ .kind = .incr, .key = counter, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
+        var ops: [MARKER_OPS + 2]kv_entries.BatchOp.Value = undefined;
+        const asked = markerOps(ops[0..MARKER_OPS], marker, r);
+        ops[asked] = delete;
+        ops[asked + 1] = incr;
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, if (with_incr) &all else &plain) catch return null;
+        if (kv_entries.BatchOps.encodeSlice(&w, ops[0 .. asked + @as(usize, if (with_incr) 2 else 1)])) |_| {
+            return buf[0..w.written().len];
+        } else |_| {}
+        // The smallest payloads hold three ops: keep what names the op, then a
+        // refusal for its condition if one was drawn, or else for an add.
+        const can_refuse = asked == MARKER_OPS and markerOpRefuses(ops[2]);
+        ops[1] = if (can_refuse) ops[2] else delete;
+        ops[2] = if (can_refuse) delete else incr;
+        w = .{ .buf = buf };
+        kv_entries.BatchOps.encodeSlice(&w, ops[0..if (can_refuse or with_incr) 3 else 2]) catch return null;
         return buf[0..w.written().len];
     }
 
@@ -353,13 +422,13 @@ pub const Workload = struct {
     /// its size a pure function of the op, so whether a leader may propose it
     /// is the leader's own limit's to say. 60% stay within the default, since
     /// every restart replays each one; 40% go past it, 15% of them all past
-    /// half the most. It opens by tombstoning the op's marker key, so it names
-    /// its op. One in eight also adds to a key puts write, which
+    /// half the most. It opens by asking of the op's marker key (`markerOps`), so
+    /// it names its op. One in eight also adds to a key puts write, which
     /// refuses the whole batch if a put's raw bytes are there.
     fn kvTxn(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
         const size = r.uintLessThan(u8, 100);
         const count: usize = if (size < 60)
-            r.intRangeAtMost(usize, 2, limits.DEFAULT_MAX_OPS_PER_TXN)
+            r.intRangeAtMost(usize, MARKER_OPS + 1, limits.DEFAULT_MAX_OPS_PER_TXN)
         else if (size < 85)
             r.intRangeAtMost(usize, limits.DEFAULT_MAX_OPS_PER_TXN + 1, limits.MAX_OPS_PER_TXN / 2)
         else
@@ -370,8 +439,8 @@ pub const Workload = struct {
         var value: [8]u8 = undefined;
         std.mem.writeInt(u64, &value, op_id, .little);
         const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
-        ops[0] = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
-        for (ops[1 .. count - 1], key_bufs[1 .. count - 1]) |*op, *key_buf| {
+        const asked = markerOps(ops[0..MARKER_OPS], marker, r);
+        for (ops[asked .. count - 1], key_bufs[asked .. count - 1]) |*op, *key_buf| {
             const slot = r.uintLessThan(u16, TXN_KEYS);
             const key = std.fmt.bufPrint(key_buf, "{s}t{x:0>3}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
             op.* = switch (r.uintLessThan(u8, 3)) {
@@ -380,17 +449,18 @@ pub const Workload = struct {
                 else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, TXN_COUNTER_PREFIX ++ "{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null },
             };
         }
-        if (r.uintLessThan(u8, 8) == 0 and count > 2) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
+        if (r.uintLessThan(u8, 8) == 0 and count - 1 > asked) ops[asked + (count - 1 - asked) / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
         ops[count - 1] = .{ .kind = .incr, .key = TXN_APPLIED_KEY, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
         return buf[0..w.written().len];
     }
 
-    /// Whether anything in a `kvTxn` batch can refuse it: only an add to a key
-    /// puts write. Every replica refuses alike, so the checksums can't tell a
+    /// Whether anything in a `kvTxn` batch can refuse it: only a condition its
+    /// marker key can't meet, or an add to a key puts write. Every replica refuses alike, so the checksums can't tell a
     /// machine that refuses a batch for its size; this can, at any size.
     pub fn txnCanRefuse(payload: []const u8) bool {
+        if (batchAnswer(payload) == .refuses) return true;
         var diag: schema.Diagnostic = .{};
         const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return true;
         var it = batch.ops.iterator();
@@ -628,7 +698,7 @@ test "vopr workload: with limits on, batches reach the built-in most ops, within
     try testing.expect(batches > 500 and past_half * 10 > batches);
 }
 
-test "vopr workload: only a batch with an add to a key puts write can be refused" {
+test "vopr workload: only a batch with a condition it can't meet or an add to a key puts write can be refused" {
     const d: Workload.Draws = .{ .seed = 7, .payload_min = 16, .payload_max = @import("scenario.zig").TXN_PAYLOAD_MAX, .large_batches = true };
     var buf: [MAX_PAYLOAD]u8 = undefined;
     var can: u64 = 0;
@@ -638,8 +708,8 @@ test "vopr workload: only a batch with an add to a key puts write can be refused
         if (gen.entry_type != .kv_batch) continue;
         if (Workload.txnCanRefuse(gen.payload)) can += 1 else cannot += 1;
     }
-    // One in eight.
-    try testing.expect(can > 0 and can * 4 < cannot);
+    // One in eight of each.
+    try testing.expect(can > 0 and can * 2 < cannot);
 }
 
 test "vopr workload: different seeds produce different payloads" {

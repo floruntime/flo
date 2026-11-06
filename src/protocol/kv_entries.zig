@@ -106,7 +106,7 @@ pub fn Payload(comptime type_code: u8) type {
 pub const MAX_PAYLOAD: usize = Batch.max_size;
 
 /// What's wrong with a batch op, or null: each kind carries exactly the
-/// fields it uses. A put's TTL is optional; a delete carries nothing more.
+/// fields it uses. A put's TTL is optional; a delete carries at most a cas_version.
 pub fn batchOpRule(op: BatchOp.Value) ?[]const u8 {
     const ok = switch (op.kind) {
         .put => op.value != null and op.delta == null,
@@ -116,9 +116,9 @@ pub fn batchOpRule(op: BatchOp.Value) ?[]const u8 {
     };
     return if (ok) null else switch (op.kind) {
         .put => "a put carries a value and no delta",
-        .delete => "a delete carries only its key",
+        .delete => "a delete carries only its key and cas_version",
         .incr => "an incr carries only its key and delta",
-        .expire => "an expire carries only its key and TTL",
+        .expire => "an expire carries only its key, TTL and cas_version",
     };
 }
 

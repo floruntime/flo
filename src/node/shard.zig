@@ -4511,8 +4511,12 @@ pub const Shard = struct {
                 const key = kv_entries.Key.decode(&r, "key") catch return;
                 if (self.metrics_registry) |mr| {
                     if (mr.registerKVNamespace(kv_state.Qualified.of(key).ns)) |km| switch (etype) {
-                        .kv_put => km.recordSet(),
-                        .kv_delete => km.recordDelete(),
+                        .kv_put => if (result.refused() == null) km.recordSet(),
+                        // A delete of nothing is answered and changes nothing.
+                        .kv_delete => if (result.refused() == null) {
+                            var answer = result.reader();
+                            if (answer.int(u8) == 1) km.recordDelete();
+                        },
                         // A whole document deleted is a delete; any other
                         // change, a set. A refused patch changed nothing.
                         .kv_json_patch => if (result.refused() != null) {} else if (kv_entries.JsonPatch.decodeAll(entry.payload, &diag)) |p| {
@@ -11917,6 +11921,30 @@ test "Shard: a transaction's condition is answered at commit, not at the op, and
     try std.testing.expectEqualStrings("the transaction's op 2: conflict: the condition didn't hold; nothing in the transaction applied", (try resp.refused()).message);
     try std.testing.expect(c.held("other") == null);
     try std.testing.expectEqualStrings("v1", c.held("k").?.value);
+}
+
+test "Shard: a delete or expire in a transaction keeps its cas_version: a wrong one is refused at commit" {
+    inline for (.{ "kv.delete", "kv.expire" }, .{ proto.OpCode.kv_delete, proto.OpCode.kv_expire }) |name, op| {
+        var c: CondTest = undefined;
+        try c.init();
+        defer c.deinit();
+        try c.set(c.t.conn, 1, "k", "v1", .always, null, null);
+        try ParkTest.ack(&c.t.shard);
+        _ = try c.answer();
+
+        const id = try c.t.shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""));
+        const body: table_run.op(name).request.Value = if (op == .kv_delete)
+            .{ .cas_version = 9, .routing_key = "rk", .txn = id }
+        else
+            .{ .ttl_ms = 1000, .cas_version = 9, .routing_key = "rk", .txn = id };
+        try c.send(c.t.conn, op, 2, "k", name, body);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+        try c.send(c.t.conn, .kv_commit_txn, 3, "", "kv.txn.commit", .{ .txn = id });
+        try ParkTest.ack(&c.t.shard);
+        try CondTest.expectConflict(try c.answer(), .cas_mismatch);
+        try std.testing.expectEqualStrings("v1", c.held("k").?.value);
+        try std.testing.expectEqual(@as(u64, 0), c.held("k").?.expiry_ns);
+    }
 }
 
 test "Shard: a delete or expire of a missing key goes through the log, and is answered as it applies" {

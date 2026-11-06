@@ -91,9 +91,14 @@ fn race(cluster: *ClusterContext, mode: Mode, want: proto.Reason) !void {
     tb.join();
     try testing.expect(!a.failed and !b.failed);
 
+    var decided: usize = 0;
     for (a.answers, b.answers, 0..) |x, y, i| {
         const winners = @as(u32, @intFromBool(x.status == .ok)) + @intFromBool(y.status == .ok);
         errdefer std.debug.print("round {d}: {any} {any}\n", .{ i, x, y });
+        try testing.expect(winners <= 1);
+        // An election mid-race: that writer's answer says nothing of the key.
+        if (x.status == .unavailable or y.status == .unavailable) continue;
+        decided += 1;
         try testing.expectEqual(@as(u32, 1), winners);
         const loser = if (x.status == .ok) y else x;
         try testing.expectEqual(proto.StatusCode.conflict, loser.status);
@@ -105,6 +110,7 @@ fn race(cluster: *ClusterContext, mode: Mode, want: proto.Reason) !void {
         const value = if (x.status == .ok) a.value else b.value;
         if (i % 25 == 0) for (0..3) |n| cluster.allocator.free(try cluster.pollUntilContains(n, &.{ "kv", "get", key }, value, 40, 100));
     }
+    try testing.expect(decided >= ROUNDS / 2);
 }
 
 test "e2e/kv-conditions: two writers racing to set a key if absent: one wins, the other gets conflict" {

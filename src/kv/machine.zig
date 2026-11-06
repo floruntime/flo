@@ -134,7 +134,7 @@ pub const Version = struct {
 /// A namespace's counts.
 pub const Counts = struct {
     /// Keys written and not deleted. A key past its TTL counts until it is
-    /// deleted or overwritten.
+    /// overwritten: a delete of it writes nothing.
     live: u64 = 0,
     /// Key and current value bytes, tombstones and expired values
     /// included; history excluded.
