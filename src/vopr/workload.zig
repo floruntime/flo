@@ -17,6 +17,7 @@ const std = @import("std");
 const PRNG = @import("stdx").PRNG;
 const entry_mod = @import("../storage/ual/entry.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const kv_ops = @import("../protocol/kv_ops.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
@@ -201,19 +202,28 @@ pub const Workload = struct {
         var key_buf: [16]u8 = undefined;
         const key = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
         const ttl_ms: ?u64 = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null;
+        // A quarter ask something of the key, as it stands when they apply. The
+        // low versions are the ones a slot's key reaches in a run.
+        var condition: kv_ops.Condition = .always;
+        var cas_version: ?u64 = null;
+        if (r.uintLessThan(u8, 4) == 0) switch (r.uintLessThan(u8, 3)) {
+            0 => condition = .if_absent,
+            1 => condition = .if_present,
+            else => cas_version = r.uintLessThan(u64, 8),
+        };
         var value_buf: [MAX_PAYLOAD]u8 = undefined;
         // The value that brings the payload to `len`, but at least the op id.
         var value_len: usize = 8;
-        const base = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..8], .ttl_ms = ttl_ms }) catch return null;
+        const base = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..8], .ttl_ms = ttl_ms, .condition = condition, .cas_version = cas_version }) catch return null;
         if (len > base) value_len += len - base;
         while (value_len > 8) : (value_len -= 1) {
-            const size = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..value_len], .ttl_ms = ttl_ms }) catch return null;
+            const size = kv_entries.Put.encodedSize(.{ .key = key, .value = value_buf[0..value_len], .ttl_ms = ttl_ms, .condition = condition, .cas_version = cas_version }) catch return null;
             if (size <= len) break;
         }
         const value = value_buf[0..value_len];
         std.mem.writeInt(u64, value[0..8], op_id, .little);
         r.bytes(value[8..]);
-        const body: kv_entries.Put.Value = .{ .key = key, .value = value, .ttl_ms = ttl_ms };
+        const body: kv_entries.Put.Value = .{ .key = key, .value = value, .ttl_ms = ttl_ms, .condition = condition, .cas_version = cas_version };
         if ((kv_entries.Put.encodedSize(body) catch return null) > buf.len) return null;
         const out = kv_entries.Put.encodeInto(buf, body) catch return null;
         return buf[0..out.len];
@@ -316,10 +326,10 @@ pub const Workload = struct {
         return buf[0..out.len];
     }
 
-    /// A batch deleting a slot's key and tombstoning the op's marker key.
-    /// A third also add 1 to another slot's key between the two: on a put's
-    /// raw bytes that refuses the whole batch after its delete is staged,
-    /// the refusal that must drop staged writes.
+    /// A batch writing the op's marker key, then deleting a slot's key. A third
+    /// also add 1 to another slot's key: on a put's raw bytes that refuses the
+    /// whole batch after its marker is staged, the refusal that must drop
+    /// staged writes.
     fn kvDelete(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
         var key_buf: [16]u8 = undefined;
         var counter_buf: [16]u8 = undefined;
@@ -329,11 +339,11 @@ pub const Workload = struct {
         const with_incr = r.uintLessThan(u8, 3) == 0;
         const counter = slotKey(&counter_buf, r.uintLessThan(u8, KV_SLOTS));
         const all = [_]kv_entries.BatchOp.Value{
-            .{ .kind = .delete, .key = slot, .value = null, .ttl_ms = null, .delta = null },
-            .{ .kind = .incr, .key = counter, .value = null, .ttl_ms = null, .delta = 1 },
-            .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null },
+            .{ .kind = .put, .key = marker, .value = "m", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+            .{ .kind = .delete, .key = slot, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+            .{ .kind = .incr, .key = counter, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null },
         };
-        const plain = [_]kv_entries.BatchOp.Value{ all[0], all[2] };
+        const plain = [_]kv_entries.BatchOp.Value{ all[0], all[1] };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, if (with_incr) &all else &plain) catch return null;
         return buf[0..w.written().len];
@@ -360,18 +370,18 @@ pub const Workload = struct {
         var value: [8]u8 = undefined;
         std.mem.writeInt(u64, &value, op_id, .little);
         const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
-        ops[0] = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null };
+        ops[0] = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
         for (ops[1 .. count - 1], key_bufs[1 .. count - 1]) |*op, *key_buf| {
             const slot = r.uintLessThan(u16, TXN_KEYS);
             const key = std.fmt.bufPrint(key_buf, "{s}t{x:0>3}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
             op.* = switch (r.uintLessThan(u8, 3)) {
-                0 => .{ .kind = .put, .key = key, .value = &value, .ttl_ms = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null, .delta = null },
-                1 => .{ .kind = .delete, .key = key, .value = null, .ttl_ms = null, .delta = null },
-                else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, TXN_COUNTER_PREFIX ++ "{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1 },
+                0 => .{ .kind = .put, .key = key, .value = &value, .ttl_ms = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null, .delta = null, .condition = .always, .cas_version = null },
+                1 => .{ .kind = .delete, .key = key, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+                else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, TXN_COUNTER_PREFIX ++ "{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null },
             };
         }
-        if (r.uintLessThan(u8, 8) == 0 and count > 2) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1 };
-        ops[count - 1] = .{ .kind = .incr, .key = TXN_APPLIED_KEY, .value = null, .ttl_ms = null, .delta = 1 };
+        if (r.uintLessThan(u8, 8) == 0 and count > 2) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
+        ops[count - 1] = .{ .kind = .incr, .key = TXN_APPLIED_KEY, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
         return buf[0..w.written().len];

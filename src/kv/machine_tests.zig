@@ -25,7 +25,7 @@ fn testEntry(buf: []u8, comptime entry_type: entry_mod.EntryType, payload: kv_en
 
 /// A put of `value` at `key`, with a TTL unless it is 0.
 fn putEntry(buf: []u8, key: []const u8, value: []const u8, index: u64, stamp: u64, ttl_ms: u64) Entry {
-    return testEntry(buf, .kv_put, .{ .key = key, .value = value, .ttl_ms = if (ttl_ms == 0) null else ttl_ms }, index, stamp);
+    return testEntry(buf, .kv_put, .{ .key = key, .value = value, .ttl_ms = if (ttl_ms == 0) null else ttl_ms, .condition = .always, .cas_version = null }, index, stamp);
 }
 
 const TestReadClock = struct {
@@ -62,15 +62,15 @@ test "kv machine: an apply answers from what it did: the version set, whether a 
     try testing.expectEqual(@as(?u64, 2), rd.int(u64));
 
     // A delete says whether the key was there when it applied.
-    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k" }, 3, STAMP));
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = null }, 3, STAMP));
     rd = r.reader();
     try testing.expectEqual(@as(?u8, 1), rd.int(u8));
-    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k" }, 4, STAMP));
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = null }, 4, STAMP));
     rd = r.reader();
     try testing.expectEqual(@as(?u8, 0), rd.int(u8));
     // One whose TTL ran out by the delete's stamp wasn't there either.
     _ = try kv.apply(&putEntry(&buf, "t", "v", 5, STAMP, 1_000));
-    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "t" }, 6, STAMP + 2 * std.time.ns_per_s));
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "t", .cas_version = null }, 6, STAMP + 2 * std.time.ns_per_s));
     rd = r.reader();
     try testing.expectEqual(@as(?u8, 0), rd.int(u8));
 
@@ -93,7 +93,7 @@ test "kv machine: an apply answers from what it did: the version set, whether a 
     try testing.expectEqual(@as(?u64, 1), rd.int(u64));
     try testing.expectEqual(@as(?i64, 5), rd.int(i64));
     // An expire of a key that's gone is refused as not found.
-    r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "gone", .ttl_ms = 10 }, 12, STAMP));
+    r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "gone", .ttl_ms = 10, .cas_version = null }, 12, STAMP));
     try testing.expectEqual(proto.StatusCode.not_found, r.refused().?.status);
 }
 
@@ -125,7 +125,7 @@ test "kv machine: a delete keeps the history, the live value before it included"
     defer kv.deinit();
     var buf: [64]u8 = undefined;
     try kv.put("k", "v1", 100);
-    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k" }, 2, 200));
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = null }, 2, 200));
 
     var hist: [10]Version = undefined;
     try testing.expectEqual(@as(usize, 2), historyOf(&kv, "k", null, &hist));
@@ -192,7 +192,7 @@ test "kv machine: a namespace's counts follow its keys: live keys, bytes and his
     try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 10 }, kv.state().countsOf("ns"));
     try kv.put("ns\x00a", "x", 0);
     try testing.expectEqual(machine.Counts{ .live = 1, .bytes = 5, .history_bytes = 6 + kv_ops.HISTORY_ENTRY_COST }, kv.state().countsOf("ns"));
-    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "ns\x00a" }, 3, 0));
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "ns\x00a", .cas_version = null }, 3, 0));
     try testing.expectEqual(machine.Counts{ .live = 0, .bytes = 4, .history_bytes = 7 + 2 * kv_ops.HISTORY_ENTRY_COST }, kv.state().countsOf("ns"));
     try testing.expectEqual(machine.Counts{}, kv.state().countsOf("default"));
 }
@@ -217,11 +217,11 @@ test "kv machine: a TTL runs out a TTL after the stamp of the entry that set it,
 
     // An expire counts from its own entry's stamp; a TTL of 0 clears it.
     _ = try kv.apply(&putEntry(&buf, "t", "v", 2, STAMP, 1_000));
-    _ = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 3, STAMP + 500 * std.time.ns_per_ms));
+    _ = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000, .cas_version = null }, 3, STAMP + 500 * std.time.ns_per_ms));
     try testing.expectEqual(STAMP + 60_500 * std.time.ns_per_ms, st.getRaw("t").?.expiry_ns);
     // An expire is no new version.
     try testing.expectEqual(@as(u64, 1), st.getRaw("t").?.version);
-    _ = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 0 }, 4, STAMP + std.time.ns_per_s));
+    _ = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 0, .cas_version = null }, 4, STAMP + std.time.ns_per_s));
     try testing.expectEqual(@as(u64, 0), st.getRaw("t").?.expiry_ns);
 }
 
@@ -241,7 +241,7 @@ test "kv machine: a key whose TTL ran out by an entry's stamp is gone to that en
     try testing.expectEqual(@as(u64, 0), st.getRaw("c").?.expiry_ns);
 
     _ = try kv.apply(&putEntry(&buf, "t", "v", 5, STAMP, 1_000));
-    const r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000 }, 6, STAMP + std.time.ns_per_s));
+    const r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "t", .ttl_ms = 60_000, .cas_version = null }, 6, STAMP + std.time.ns_per_s));
     try testing.expect(r.refused() != null);
     try testing.expectEqual(STAMP + std.time.ns_per_s, st.getRaw("t").?.expiry_ns);
 }
@@ -312,8 +312,8 @@ test "kv machine: a batch that doesn't decode whole, or breaks a kind's rule, ap
     var buf: [64]u8 = undefined;
     var w: schema.Writer = .{ .buf = &buf };
     try kv_entries.BatchOps.encodeSlice(&w, &.{
-        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null },
-        .{ .kind = .delete, .key = "b", .value = "x", .ttl_ms = null, .delta = null },
+        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .delete, .key = "b", .value = "x", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
     });
     try testing.expectError(error.Halt, kv.apply(&entry_mod.buildEntry(.kv_batch, 0, 1, 1, 0, w.written())));
     try testing.expect(kv.state().get("a") == null);
@@ -343,16 +343,16 @@ test "kv machine: live keys are counted per namespace as apply makes and removes
         .{ .entry = putEntry(&bufs[0], "orders\x00a", "1", 1, STAMP, 0), .orders = 1, .default = 0 },
         .{ .entry = putEntry(&bufs[1], "orders\x00a", "2", 2, STAMP, 0), .orders = 1, .default = 0 }, // overwrite
         .{ .entry = putEntry(&bufs[2], "plain", "1", 3, STAMP, 0), .orders = 1, .default = 1 },
-        .{ .entry = testEntry(&bufs[3], .kv_delete, .{ .key = "orders\x00missing" }, 4, STAMP), .orders = 1, .default = 1 },
-        .{ .entry = testEntry(&bufs[4], .kv_delete, .{ .key = "orders\x00a" }, 5, STAMP), .orders = 0, .default = 1 },
-        .{ .entry = testEntry(&bufs[5], .kv_delete, .{ .key = "orders\x00a" }, 6, STAMP), .orders = 0, .default = 1 }, // again
+        .{ .entry = testEntry(&bufs[3], .kv_delete, .{ .key = "orders\x00missing", .cas_version = null }, 4, STAMP), .orders = 1, .default = 1 },
+        .{ .entry = testEntry(&bufs[4], .kv_delete, .{ .key = "orders\x00a", .cas_version = null }, 5, STAMP), .orders = 0, .default = 1 },
+        .{ .entry = testEntry(&bufs[5], .kv_delete, .{ .key = "orders\x00a", .cas_version = null }, 6, STAMP), .orders = 0, .default = 1 }, // again
         .{ .entry = putEntry(&bufs[6], "orders\x00a", "3", 7, STAMP, 0), .orders = 1, .default = 1 }, // back from a tombstone
         .{ .entry = testEntry(&bufs[7], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 8, STAMP), .orders = 2, .default = 1 },
         .{ .entry = testEntry(&bufs[8], .kv_incr, .{ .key = "orders\x00n", .delta = 1 }, 9, STAMP), .orders = 2, .default = 1 },
         .{ .entry = b.entry, .orders = 3, .default = 1 },
         // A TTL that runs out removes nothing: the key counts until deleted.
         .{ .entry = putEntry(&bufs[9], "plain", "t", 11, STAMP, 1), .orders = 3, .default = 1 },
-        .{ .entry = testEntry(&bufs[10], .kv_expire, .{ .key = "orders\x00a", .ttl_ms = 1 }, 12, STAMP + std.time.ns_per_s), .orders = 3, .default = 1 },
+        .{ .entry = testEntry(&bufs[10], .kv_expire, .{ .key = "orders\x00a", .ttl_ms = 1, .cas_version = null }, 12, STAMP + std.time.ns_per_s), .orders = 3, .default = 1 },
     };
     for (steps) |step| {
         _ = try kv.apply(&step.entry);
@@ -380,7 +380,7 @@ test "kv machine: out of memory at any allocation leaves every family as it was"
             defer kv.deinit();
             var buf: [96]u8 = undefined;
             try kv.put("ns\x00a", "1", STAMP);
-            _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "ns\x00a" }, kv.index + 1, STAMP));
+            _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "ns\x00a", .cas_version = null }, kv.index + 1, STAMP));
             try kv.put("ns\x00a", "2", STAMP);
             try kv.put("ns\x00b", "1", STAMP);
             std.testing.expectEqual(recountLive(&kv, "ns"), kv.state().liveKeys("ns")) catch @panic("count disagrees with the keys");
@@ -465,9 +465,9 @@ test "kv machine: random entries keep every namespace's counts equal to a recoun
             std.mem.writeInt(i64, &delta, rand.intRangeAtMost(i64, -3, 3), .little);
             switch (rand.uintLessThan(u8, 6)) {
                 0, 1 => _ = try kv.apply(&putEntry(buf, qkey, big[0..rand.uintLessThan(usize, big.len)], kv.index + 1, stamp, if (rand.boolean()) 0 else 1_500)),
-                2 => _ = try kv.apply(&testEntry(buf, .kv_delete, .{ .key = qkey }, kv.index + 1, stamp)),
+                2 => _ = try kv.apply(&testEntry(buf, .kv_delete, .{ .key = qkey, .cas_version = null }, kv.index + 1, stamp)),
                 3 => _ = try kv.apply(&testEntry(buf, .kv_incr, .{ .key = qkey, .delta = std.mem.readInt(i64, &delta, .little) }, kv.index + 1, stamp)),
-                4 => _ = try kv.apply(&testEntry(buf, .kv_expire, .{ .key = qkey, .ttl_ms = rand.uintLessThan(u32, 3_000) }, kv.index + 1, stamp)),
+                4 => _ = try kv.apply(&testEntry(buf, .kv_expire, .{ .key = qkey, .ttl_ms = rand.uintLessThan(u32, 3_000), .cas_version = null }, kv.index + 1, stamp)),
                 else => {
                     const b = try batchEntry(&.{
                         .{ .kind = .put, .key = @constCast(qkey), .value = big[0..rand.uintLessThan(usize, 4_000)], .ttl_ms = 0 },
@@ -650,4 +650,218 @@ test "kv machine: a JSON patch finds an expired or deleted key missing, clears a
     try testing.expectEqual(v, kv.state().get("arr").?.version);
     // A path's missing parents aren't created.
     try testing.expectEqual(proto.Reason.not_found, (try patchAt(&kv, "arr", "$.new.x", "1", later)).refused().?.refusal.reason);
+}
+
+/// `r` was refused as conflict/`reason`, having run nothing.
+fn expectConflict(r: *const @import("../storage/persistence.zig").Result, reason: proto.Reason) !void {
+    const refusal = r.refused() orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(proto.StatusCode.conflict, refusal.status);
+    try testing.expectEqual(reason, refusal.refusal.reason);
+    try testing.expectEqual(proto.Ran.no, refusal.refusal.ran);
+}
+
+fn condPut(buf: []u8, key: []const u8, value: []const u8, condition: kv_ops.Condition, cas_version: ?u64, index: u64, stamp: u64) Entry {
+    return testEntry(buf, .kv_put, .{ .key = key, .value = value, .ttl_ms = null, .condition = condition, .cas_version = cas_version }, index, stamp);
+}
+
+test "kv machine: a put's condition and cas_version are decided as it applies, and a refusal changes nothing" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [128]u8 = undefined;
+
+    var r = try kv.apply(&condPut(&buf, "k", "v", .if_present, null, 1, STAMP));
+    try expectConflict(&r, .condition_failed);
+    try testing.expect(kv.state().get("k") == null);
+    try testing.expectEqual(@as(u64, 0), kv.state().liveKeys("default"));
+
+    r = try kv.apply(&condPut(&buf, "k", "v1", .if_absent, null, 2, STAMP));
+    try testing.expect(r.refused() == null);
+    r = try kv.apply(&condPut(&buf, "k", "no", .if_absent, null, 3, STAMP));
+    try expectConflict(&r, .condition_failed);
+    r = try kv.apply(&condPut(&buf, "k", "no", .always, 9, 4, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+    r = try kv.apply(&condPut(&buf, "k", "no", .always, 0, 5, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+
+    // None of those wrote: same version, itself the only one, one key.
+    const held = kv.state().get("k").?;
+    try testing.expectEqualStrings("v1", held.value);
+    try testing.expectEqual(@as(u64, 1), held.version);
+    var versions: [4]Version = undefined;
+    try testing.expectEqual(@as(usize, 1), historyOf(&kv, "k", null, &versions));
+    try testing.expectEqual(@as(u64, 1), kv.state().liveKeys("default"));
+
+    r = try kv.apply(&condPut(&buf, "k", "v2", .if_present, 1, 6, STAMP));
+    try testing.expect(r.refused() == null);
+    try testing.expectEqual(@as(u64, 2), kv.state().get("k").?.version);
+    // Both asked: the cas_version is weighed first.
+    r = try kv.apply(&condPut(&buf, "k", "no", .if_absent, 9, 7, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+    // cas_version 0 asks that the key not be there.
+    r = try kv.apply(&condPut(&buf, "fresh", "v", .always, 0, 8, STAMP));
+    try testing.expect(r.refused() == null);
+}
+
+test "kv machine: a key whose TTL ran out by the entry's stamp, or deleted, is absent to a condition" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try kv.apply(&putEntry(&buf, "t", "v", 1, STAMP, 1_000));
+
+    // Live by the stamp, whatever the replica's clock says.
+    const before = STAMP + 999 * std.time.ns_per_ms;
+    var r = try kv.apply(&condPut(&buf, "t", "no", .if_absent, null, 2, before));
+    try expectConflict(&r, .condition_failed);
+    r = try kv.apply(&condPut(&buf, "t", "no", .always, 0, 3, before));
+    try expectConflict(&r, .cas_mismatch);
+
+    const after = STAMP + 2 * std.time.ns_per_s;
+    r = try kv.apply(&condPut(&buf, "t", "no", .if_present, null, 4, after));
+    try expectConflict(&r, .condition_failed);
+    r = try kv.apply(&condPut(&buf, "t", "no", .always, 1, 5, after));
+    try expectConflict(&r, .cas_mismatch);
+    r = try kv.apply(&condPut(&buf, "t", "back", .if_absent, null, 6, after));
+    try testing.expect(r.refused() == null);
+    try testing.expectEqualStrings("back", kv.state().get("t").?.value);
+
+    _ = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "t", .cas_version = null }, 7, after));
+    r = try kv.apply(&condPut(&buf, "t", "no", .if_present, null, 8, after));
+    try expectConflict(&r, .condition_failed);
+    r = try kv.apply(&condPut(&buf, "t", "again", .if_absent, 0, 9, after));
+    try testing.expect(r.refused() == null);
+}
+
+test "kv machine: a delete's cas_version is decided as it applies, and deleting nothing writes nothing" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [128]u8 = undefined;
+
+    // A key never seen: no tombstone, no history, no bytes.
+    var r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "gone", .cas_version = null }, 1, STAMP));
+    var rd = r.reader();
+    try testing.expectEqual(@as(?u8, 0), rd.int(u8));
+    try testing.expect(kv.state().getRaw("gone") == null);
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "gone", .cas_version = 3 }, 2, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "gone", .cas_version = 0 }, 3, STAMP));
+    try testing.expect(r.refused() == null);
+
+    _ = try kv.apply(&putEntry(&buf, "k", "v", 4, STAMP, 0));
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = 9 }, 5, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+    try testing.expectEqualStrings("v", kv.state().get("k").?.value);
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = 1 }, 6, STAMP));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u8, 1), rd.int(u8));
+    try testing.expect(kv.state().get("k") == null);
+    try testing.expectEqual(@as(u64, 0), kv.state().liveKeys("default"));
+
+    // Deleted already: the tombstone and its version stay where they are.
+    var versions: [4]Version = undefined;
+    const kept = historyOf(&kv, "k", null, &versions);
+    r = try kv.apply(&testEntry(&buf, .kv_delete, .{ .key = "k", .cas_version = null }, 7, STAMP));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u8, 0), rd.int(u8));
+    try testing.expectEqual(kept, historyOf(&kv, "k", null, &versions));
+    r = try kv.apply(&putEntry(&buf, "k", "w", 8, STAMP, 0));
+    rd = r.reader();
+    try testing.expectEqual(@as(?u64, 3), rd.int(u64));
+}
+
+test "kv machine: an expire's cas_version is decided as it applies, and a missing key is not found first" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [128]u8 = undefined;
+
+    var r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "none", .ttl_ms = 1_000, .cas_version = 9 }, 1, STAMP));
+    try testing.expectEqual(proto.Reason.not_found, r.refused().?.refusal.reason);
+
+    _ = try kv.apply(&putEntry(&buf, "k", "v", 2, STAMP, 0));
+    r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "k", .ttl_ms = 1_000, .cas_version = 9 }, 3, STAMP));
+    try expectConflict(&r, .cas_mismatch);
+    try testing.expectEqual(@as(u64, 0), kv.state().get("k").?.expiry_ns);
+    r = try kv.apply(&testEntry(&buf, .kv_expire, .{ .key = "k", .ttl_ms = 1_000, .cas_version = 1 }, 4, STAMP));
+    try testing.expect(r.refused() == null);
+    try testing.expect(kv.state().getRaw("k").?.expiry_ns != 0);
+}
+
+test "kv machine: a condition in a transaction sees the ops before it, and one that fails applies none of the batch" {
+    var kv = TestKv.init(testing.allocator);
+    defer kv.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try kv.apply(&putEntry(&buf, "held", "v", 1, STAMP, 0));
+    const put = struct {
+        fn op(key: []const u8, condition: kv_ops.Condition, cas_version: ?u64) txn.TxnOp {
+            return .{ .kind = .put, .key = @constCast(key), .value = @constCast("x"), .ttl_ms = 0, .condition = condition, .cas_version = cas_version };
+        }
+    }.op;
+
+    // Each passes only because of the op before it.
+    var b = try batchEntry(&.{
+        put("a", .always, null),
+        put("a", .if_present, 1),
+        .{ .kind = .delete, .key = @constCast("held"), .value = @constCast(""), .ttl_ms = 0, .cas_version = 1 },
+        put("held", .if_absent, null),
+    }, 2, STAMP);
+    var r = try kv.apply(&b.entry);
+    testing.allocator.free(b.payload);
+    try testing.expect(r.refused() == null);
+    try testing.expectEqual(@as(u64, 2), kv.state().get("a").?.version);
+    try testing.expectEqual(@as(u64, 3), kv.state().get("held").?.version);
+
+    // Fails only because of the op before it, and takes that op with it.
+    const live = kv.state().liveKeys("default");
+    b = try batchEntry(&.{ put("c", .always, null), put("c", .if_absent, null) }, 3, STAMP);
+    r = try kv.apply(&b.entry);
+    testing.allocator.free(b.payload);
+    try expectConflict(&r, .condition_failed);
+    try testing.expectEqualStrings("the transaction's op 2: conflict: the condition didn't hold; nothing in the transaction applied", r.refused().?.refusal.message);
+    try testing.expect(kv.state().get("c") == null);
+    try testing.expectEqual(live, kv.state().liveKeys("default"));
+
+    b = try batchEntry(&.{
+        put("c", .always, null),
+        .{ .kind = .expire, .key = @constCast("held"), .value = @constCast(""), .ttl_ms = 10, .cas_version = 9 },
+    }, 4, STAMP);
+    r = try kv.apply(&b.entry);
+    testing.allocator.free(b.payload);
+    try expectConflict(&r, .cas_mismatch);
+    try testing.expect(kv.state().get("c") == null);
+    try testing.expectEqual(@as(u64, 0), kv.state().get("held").?.expiry_ns);
+
+    b = try batchEntry(&.{.{ .kind = .delete, .key = @constCast("held"), .value = @constCast(""), .ttl_ms = 0, .cas_version = 9 }}, 5, STAMP);
+    r = try kv.apply(&b.entry);
+    testing.allocator.free(b.payload);
+    try expectConflict(&r, .cas_mismatch);
+    try testing.expectEqualStrings("x", kv.state().get("held").?.value);
+}
+
+test "kv machine: replaying conditional entries refuses the same ones and holds the same state" {
+    var a = TestKv.init(testing.allocator);
+    defer a.deinit();
+    var b = TestKv.init(testing.allocator);
+    defer b.deinit();
+    var buf: [128]u8 = undefined;
+    const steps = [_]struct { key: []const u8, condition: kv_ops.Condition, cas: ?u64, stamp: u64, refused: bool }{
+        .{ .key = "k", .condition = .if_present, .cas = null, .stamp = STAMP, .refused = true },
+        .{ .key = "k", .condition = .if_absent, .cas = null, .stamp = STAMP, .refused = false },
+        .{ .key = "k", .condition = .if_absent, .cas = null, .stamp = STAMP, .refused = true },
+        .{ .key = "k", .condition = .always, .cas = 1, .stamp = STAMP, .refused = false },
+        .{ .key = "k", .condition = .always, .cas = 1, .stamp = STAMP, .refused = true },
+    };
+    for ([_]*TestKv{ &a, &b }) |kv| {
+        for (steps, 1..) |s, i| {
+            const r = try kv.apply(&condPut(&buf, s.key, "v", s.condition, s.cas, i, s.stamp));
+            try testing.expectEqual(s.refused, r.refused() != null);
+        }
+    }
+    try testing.expectEqual(a.state().get("k").?.version, b.state().get("k").?.version);
+    try testing.expectEqual(a.state().get("k").?.lsn, b.state().get("k").?.lsn);
+    try testing.expectEqual(a.state().liveKeys("default"), b.state().liveKeys("default"));
+    var ha: [4]Version = undefined;
+    var hb: [4]Version = undefined;
+    const n = historyOf(&a, "k", null, &ha);
+    try testing.expectEqual(n, historyOf(&b, "k", null, &hb));
+    // Only the two writes that passed left a version.
+    try testing.expectEqual(@as(usize, 2), n);
 }

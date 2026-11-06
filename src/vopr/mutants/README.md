@@ -28,7 +28,7 @@ passes:
 - `extend_ignores_held_since`: a hold reaches its 12 h ceiling in no
   simulated run, so `families.zig`'s tests catch it on one replica.
 - `node_clock`, `local_refusal`, `map_order`, `live_only_effect`,
-  `kv_replay_skips_batches`, `kv_refused_commits`: `simulator.zig`'s tests
+  `kv_replay_skips_batches`, `kv_refused_commits`, `kv_condition_local`: `simulator.zig`'s tests
   plant them in fixed runs.
 
 A scenario is re-recorded from a fresh swarm (`vopr --iterations=N --actions

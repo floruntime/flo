@@ -2690,7 +2690,7 @@ test "vopr sim: an effect only live apply runs fails state_checksum between a re
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
 }
 
-test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuses batches after staging" {
+test "vopr sim: in every run, KV merges JSON patches, deletes fields, refuses batches after staging, and decides conditions both ways" {
     // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
     // run is checked on its own, not summed, and each entry counts once
     // however many replicas apply it.
@@ -2703,6 +2703,8 @@ test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuse
         try testing.expect(s.kv.merges >= 5);
         try testing.expect(s.kv.field_deletes >= 2);
         try testing.expect(s.kv.staged_refusals >= 5);
+        try testing.expect(s.kv.condition_refusals >= 5);
+        try testing.expect(s.kv.conditions_held >= 5);
     }
 }
 
@@ -2842,6 +2844,17 @@ test "vopr sim: a replica that refuses a batch above its own limit at apply fail
     var kv = false;
     for (sim.checker.violations.items) |v| kv = kv or (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, " kv.") != null);
     try testing.expect(kv);
+}
+
+test "vopr sim: a KV condition one replica decides differently fails state_checksum on KV's families" {
+    var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(1), .{ .family_mutant = .kv_condition_local });
+    defer sim.deinit();
+    _ = try sim.run();
+    var caught = false;
+    for (sim.checker.violations.items) |v| {
+        if (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, "different kv.value") != null) caught = true;
+    }
+    try testing.expect(caught);
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {

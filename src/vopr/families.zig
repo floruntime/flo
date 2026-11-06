@@ -55,6 +55,9 @@ pub const Mutant = enum {
     /// every replica: no comparison sees it, so `Kv.apply` checks refusals
     /// itself.
     kv_refused_commits,
+    /// A condition is decided by the replica: the leader writes what every
+    /// other replica refuses.
+    kv_condition_local,
     // Bugs in the actions machine, each planted by rewriting the entry it
     // applies (`Actions.apply` checks the entry as it was): every replica
     // applies the same rewrite, so only the entry checks see them.
@@ -108,7 +111,7 @@ pub const Mutant = enum {
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }
@@ -224,6 +227,10 @@ pub const Kv = struct {
         refused,
         /// A batch refused, which has staged writes by then.
         staged_refused,
+        /// A put or batch refused for its condition or cas_version.
+        condition_refused,
+        /// A put with a condition or cas_version that held.
+        condition_held,
         /// A JSON patch merged into the value: a set below `$`.
         merged,
         /// A JSON patch that deleted a field.
@@ -236,6 +243,8 @@ pub const Kv = struct {
         staged_refusals: u64 = 0,
         merges: u64 = 0,
         field_deletes: u64 = 0,
+        condition_refusals: u64 = 0,
+        conditions_held: u64 = 0,
 
         pub fn count(self: *Counts, o: Effect) void {
             switch (o) {
@@ -245,6 +254,11 @@ pub const Kv = struct {
                     self.refusals += 1;
                     self.staged_refusals += 1;
                 },
+                .condition_refused => {
+                    self.refusals += 1;
+                    self.condition_refusals += 1;
+                },
+                .condition_held => self.conditions_held += 1,
                 .merged => self.merges += 1,
                 .field_deleted => self.field_deletes += 1,
             }
@@ -293,11 +307,21 @@ pub const Kv = struct {
             var short = e.*;
             short.payload = firstHalf(e.payload, &buf) orelse return error.Halt;
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, &short, &out);
+        } else if (r.mutant == .kv_condition_local and r.leader and conditionalPut(e) != null) {
+            var buf: [8192]u8 = undefined;
+            var body = conditionalPut(e).?;
+            body.condition = .always;
+            body.cas_version = null;
+            const bytes = kv_entries.Put.encodeInto(&buf, body) catch return error.Halt;
+            const plain = entry_mod.buildEntry(.kv_put, e.header.flags, e.header.term, e.header.index, e.header.timestamp_ns, bytes);
+            try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, &plain, &out);
         } else {
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
         }
-        if (out.refused() == null) return patchEffect(e);
+        const refusal = out.refused() orelse
+            return if (conditionalPut(e) != null) .condition_held else patchEffect(e);
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
+        if (refusal.refusal.reason == .cas_mismatch or refusal.refusal.reason == .condition_failed) return .condition_refused;
         return if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) .staged_refused else .refused;
     }
 
@@ -321,6 +345,14 @@ pub const Kv = struct {
         const current = kv_machine.Current.decode(bytes) catch return 0;
         if (current.tombstone or current.value.len != 8) return 0;
         return std.mem.readInt(i64, current.value[0..8], .little);
+    }
+
+    /// `e` as a put that asks something of its key.
+    fn conditionalPut(e: *const entry_mod.Entry) ?kv_entries.Put.Value {
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_put)) return null;
+        var diag: schema.Diagnostic = .{};
+        const p = kv_entries.Put.decodeAll(e.payload, &diag) catch return null;
+        return if (p.condition != .always or p.cas_version != null) p else null;
     }
 
     /// An applied JSON patch: merged into the value (a set below `$`), or a
@@ -951,7 +983,7 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     defer kv.deinit();
     try testing.expect(kv.store.strict_keys);
     var body_buf: [64]u8 = undefined;
-    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = "k", .value = "v", .ttl_ms = null });
+    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
     var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
     e.header.crc32c = e.computeCrc();
     const empty = kv.checksums();

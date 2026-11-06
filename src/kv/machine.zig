@@ -262,6 +262,8 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 
 // ─── Apply ───────────────────────────────────────────────────────────────
 
+pub const CAS_MISMATCH = "conflict: cas_version isn't the key's version";
+pub const CONDITION_FAILED = "conflict: the condition didn't hold";
 pub const INCR_OVERFLOW = "bad request: delta would take the counter past an i64";
 pub const NOT_A_COUNTER = "bad request: the key's value isn't an 8-byte counter";
 pub const PATH_NOT_FOUND = "not found: nothing at that path in the document";
@@ -302,12 +304,16 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type)))) {
         .kv_put => {
             const p = kv_entries.Put.decodeAll(e.payload, &diag) catch return error.Halt;
-            const version = try put(view, try split(p.key), p.value, .string, at, time_units.expiryAfter(at.ns, p.ttl_ms orelse 0));
+            const q = try split(p.key);
+            check(view, q, p.condition, p.cas_version, at) catch |err| return refused(out, err, "");
+            const version = try put(view, q, p.value, .string, at, time_units.expiryAfter(at.ns, p.ttl_ms orelse 0));
             out.putInt(u64, version);
         },
         .kv_delete => {
             const p = kv_entries.Delete.decodeAll(e.payload, &diag) catch return error.Halt;
-            out.putInt(u8, @intFromBool(try delete(view, try split(p.key), at)));
+            const q = try split(p.key);
+            check(view, q, .always, p.cas_version, at) catch |err| return refused(out, err, "");
+            out.putInt(u8, @intFromBool(try delete(view, q, at)));
         },
         .kv_incr => {
             const p = kv_entries.Incr.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -317,7 +323,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .kv_expire => {
             const p = kv_entries.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
-            expire(view, try split(p.key), time_units.expiryAfter(at.ns, p.ttl_ms), at) catch |err| return refused(out, err, "");
+            expire(view, try split(p.key), time_units.expiryAfter(at.ns, p.ttl_ms), p.cas_version, at) catch |err| return refused(out, err, "");
         },
         .kv_json_patch => {
             const p = kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -326,9 +332,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .kv_batch => {
             // Decoded and checked whole before any op applies.
             const batch = kv_entries.Batch.decodeAll(e.payload, &diag) catch return error.Halt;
-            var check = batch.ops.iterator();
+            var all = batch.ops.iterator();
             var ops: u16 = 0;
-            while (check.next() catch return error.Halt) |op| {
+            while (all.next() catch return error.Halt) |op| {
                 if (kv_entries.batchOpRule(op) != null) return error.Halt;
                 _ = try split(op.key);
                 ops += 1;
@@ -337,17 +343,13 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var n: u16 = 0;
             while (it.next() catch return error.Halt) |op| : (n += 1) {
                 const q = try split(op.key);
+                // An expire weighs its own cas_version: an absent key is not_found first.
+                check(view, q, op.condition, if (op.kind == .expire) null else op.cas_version, at) catch |err| return refusedOp(out, err, n);
                 switch (op.kind) {
                     .put => _ = try put(view, q, op.value.?, .string, at, time_units.expiryAfter(at.ns, op.ttl_ms orelse 0)),
                     .delete => _ = try delete(view, q, at),
-                    .incr => _ = incr(view, q, op.delta.?, at) catch |err| {
-                        var buf: [48]u8 = undefined;
-                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n + 1}) catch "");
-                    },
-                    .expire => expire(view, q, time_units.expiryAfter(at.ns, op.ttl_ms.?), at) catch |err| {
-                        var buf: [48]u8 = undefined;
-                        return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n + 1}) catch "");
-                    },
+                    .incr => _ = incr(view, q, op.delta.?, at) catch |err| return refusedOp(out, err, n),
+                    .expire => expire(view, q, time_units.expiryAfter(at.ns, op.ttl_ms.?), op.cas_version, at) catch |err| return refusedOp(out, err, n),
                 }
             }
             out.putInt(u16, ops);
@@ -356,13 +358,37 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     }
 }
 
+/// Whether a write's condition and `cas_version` hold on `q`. A key deleted, or
+/// whose TTL ran out by this entry's stamp, is absent, at version 0. A plain
+/// write reads nothing here.
+fn check(view: *View, q: Qualified, condition: kv_ops.Condition, cas_version: ?u64, at: Stamp) (ApplyError || error{ CasMismatch, ConditionFailed })!void {
+    if (condition == .always and cas_version == null) return;
+    var kb: [MAX_KEY]u8 = undefined;
+    const cur = try view.get(Values, valueKey(&kb, q));
+    const version: ?u64 = if (cur) |c| (if (c.tombstone or c.expiredAt(at.ns)) null else c.version) else null;
+    if (cas_version) |want| if ((version orelse 0) != want) return error.CasMismatch;
+    switch (condition) {
+        .always => {},
+        .if_absent => if (version != null) return error.ConditionFailed,
+        .if_present => if (version == null) return error.ConditionFailed,
+    }
+}
+
 /// Refuse `out` for an op's own failure; any other error is returned.
 fn refused(out: *Result, err: anyerror, prefix: []const u8) ApplyError!void {
     if (refuseOp(out, err, prefix)) |e| return e;
 }
 
+/// Refuse `out` for the failure of the transaction's op `n`, counted from 0.
+fn refusedOp(out: *Result, err: anyerror, n: u16) ApplyError!void {
+    var buf: [48]u8 = undefined;
+    return refused(out, err, std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{n + 1}) catch "");
+}
+
 fn refuseOp(out: *Result, err: anyerror, prefix: []const u8) ?ApplyError {
     const why: struct { status: @import("../protocol/proto.zig").StatusCode, reason: @import("../protocol/proto.zig").Reason, text: []const u8 } = switch (err) {
+        error.CasMismatch => .{ .status = .conflict, .reason = .cas_mismatch, .text = CAS_MISMATCH },
+        error.ConditionFailed => .{ .status = .conflict, .reason = .condition_failed, .text = CONDITION_FAILED },
         error.Overflow => .{ .status = .bad_request, .reason = .out_of_range, .text = INCR_OVERFLOW },
         error.NotACounter => .{ .status = .bad_request, .reason = .wrong_type, .text = NOT_A_COUNTER },
         error.NotFound => .{ .status = .not_found, .reason = .not_found, .text = "not found" },
@@ -445,26 +471,22 @@ fn put(view: *View, q: Qualified, value: []const u8, value_type: ValueType, at: 
 fn delete(view: *View, q: Qualified, at: Stamp) ApplyError!bool {
     var kb: [MAX_KEY]u8 = undefined;
     const vk = valueKey(&kb, q);
+    // Nothing to delete, nothing changes: no tombstone, version or history.
+    const cur = (try view.get(Values, vk)) orelse return false;
+    if (cur.tombstone or cur.expiredAt(at.ns)) return false;
     var c = try counts(view, q.ns);
     var next: Current = .{ .version = 1, .lsn = at.index, .term = at.term, .timestamp_ns = at.ns, .expiry_ns = 0, .tombstone = true, .value_type = .string, .history_count = 0, .history_bytes = 0, .value = "" };
-    var existed = false;
-    if (try view.get(Values, vk)) |cur| {
-        existed = !cur.tombstone and !cur.expiredAt(at.ns);
-        if (!cur.tombstone) c.live -|= 1;
-        c.bytes -|= cur.value.len;
-        const h = try pushVersion(view, q, cur, &c);
-        next.version = cur.version + 1;
-        next.expiry_ns = cur.expiry_ns;
-        next.value_type = cur.value_type;
-        next.history_count = h.count;
-        next.history_bytes = h.bytes;
-    } else {
-        // A tombstone for a key never seen here.
-        c.bytes += q.keyBytes();
-    }
+    c.live -|= 1;
+    c.bytes -|= cur.value.len;
+    const h = try pushVersion(view, q, cur, &c);
+    next.version = cur.version + 1;
+    next.expiry_ns = cur.expiry_ns;
+    next.value_type = cur.value_type;
+    next.history_count = h.count;
+    next.history_bytes = h.bytes;
     try view.put(Values, vk, next);
     try putCounts(view, q.ns, c);
-    return existed;
+    return true;
 }
 
 /// Add `delta` to `q`'s counter, made at 0 if it has none (or one whose
@@ -527,11 +549,12 @@ fn refusedPatch(out: *Result, err: anyerror) ApplyError!u64 {
 }
 
 /// Set `q`'s TTL without a new version: a TTL isn't a value. 0 clears it.
-fn expire(view: *View, q: Qualified, expiry_ns: u64, at: Stamp) (ApplyError || error{NotFound})!void {
+fn expire(view: *View, q: Qualified, expiry_ns: u64, cas_version: ?u64, at: Stamp) (ApplyError || error{ NotFound, CasMismatch })!void {
     var kb: [MAX_KEY]u8 = undefined;
     const vk = valueKey(&kb, q);
     var cur = (try view.get(Values, vk)) orelse return error.NotFound;
     if (cur.tombstone or cur.expiredAt(at.ns)) return error.NotFound;
+    if (cas_version) |want| if (cur.version != want) return error.CasMismatch;
     cur.expiry_ns = expiry_ns;
     cur.lsn = at.index;
     cur.term = at.term;
@@ -587,7 +610,7 @@ pub const TestKv = struct {
 
     /// A put of `value` at `qkey`, as the next entry, stamped `stamp`.
     pub fn put(self: *TestKv, qkey: []const u8, value: []const u8, stamp: u64) !void {
-        const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null };
+        const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
         const buf = try self.store.allocator.alloc(u8, try kv_entries.Put.encodedSize(body));
         defer self.store.allocator.free(buf);
         const p = try kv_entries.Put.encodeInto(buf, body);

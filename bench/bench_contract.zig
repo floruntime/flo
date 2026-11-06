@@ -198,7 +198,7 @@ pub fn main() !void {
                         left -= k.len + len;
                         break :blk big[0..len];
                     };
-                    _ = try ops.add(.{ .kind = .put, .key = k, .value = value, .ttl_ms = null, .delta = null });
+                    _ = try ops.add(.{ .kind = .put, .key = k, .value = value, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null });
                 }
                 const payload = try kve.Batch.encodeInto(pbuf, .{ .ops = ops.value() });
                 const e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, j + 1, j + 1, payload);
@@ -214,6 +214,57 @@ pub fn main() !void {
                 std.fmt.bufPrint(&name, "kv batch of {d} puts, {d} KiB", .{ n, c.total / 1024 }) catch unreachable;
             std.debug.print("  {s:<28} {d:>6} ns/op  ({d} ops)\n", .{ label, elapsed / entries, entries });
         }
+        // One write through the KV machine: what a condition adds to a plain
+        // put, and what a write it refuses costs.
+        try kvWrite(allocator, "kv put", .plain);
+        try kvWrite(allocator, "kv put if_absent, held", .if_absent_held);
+        try kvWrite(allocator, "kv put cas_version, held", .cas_held);
+        try kvWrite(allocator, "kv put if_absent, refused", .if_absent_refused);
+        try kvWrite(allocator, "kv put cas_version, refused", .cas_refused);
+        try kvWrite(allocator, "kv delete of nothing", .delete_nothing);
     }
     std.debug.print("\n", .{});
+}
+
+const KvWrite = enum { plain, if_absent_held, cas_held, if_absent_refused, cas_refused, delete_nothing };
+
+fn kvWrite(allocator: std.mem.Allocator, label: []const u8, what: KvWrite) !void {
+    const kvm = src.kv.machine;
+    const kve = src.protocol.kv_entries;
+    var store = contract.store.Store.init(allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const entries: u64 = 20_000;
+    var pbuf: [128]u8 = undefined;
+    var kbuf: [32]u8 = undefined;
+    var elapsed: u64 = 0;
+    for (0..entries) |i| {
+        const same = what == .cas_held or what == .if_absent_refused or what == .cas_refused;
+        const key = if (same) "default\x00same" else std.fmt.bufPrint(&kbuf, "default\x00w-{d}", .{i}) catch unreachable;
+        const refused = what == .if_absent_refused or what == .cas_refused;
+        // The first of a refused run makes the key the rest are refused over.
+        const payload = if (what == .delete_nothing)
+            try kve.Delete.encodeInto(&pbuf, .{ .key = key, .cas_version = null })
+        else
+            try kve.Put.encodeInto(&pbuf, .{
+                .key = key,
+                .value = "v",
+                .ttl_ms = null,
+                .condition = if (what == .if_absent_held or (what == .if_absent_refused and i > 0)) .if_absent else .always,
+                .cas_version = switch (what) {
+                    .cas_held => i,
+                    .cas_refused => if (i > 0) 999 else null,
+                    else => null,
+                },
+            });
+        const e = entry_mod.buildEntry(if (what == .delete_nothing) .kv_delete else .kv_put, entry_mod.Flags.NONE, 1, i + 1, i + 1, payload);
+        var out: persistence.Result = .{};
+        out.reset(&e);
+        const start = stdx.time.nanoTimestamp();
+        try contract.machine.applyEntry(&kvm.machine, &store, &scratch, &e, &out);
+        elapsed += @intCast(stdx.time.nanoTimestamp() - start);
+        std.debug.assert((out.refused() != null) == (refused and i > 0));
+    }
+    std.debug.print("  {s:<28} {d:>6} ns/op  ({d} ops)\n", .{ label, elapsed / entries, entries });
 }

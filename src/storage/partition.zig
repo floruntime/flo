@@ -374,7 +374,7 @@ test "partition: apply and read entries" {
 
     // Apply a KV put
     var payload_buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "key1", .value = "val1", .ttl_ms = null }, 1, 1000);
+    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
     const idx1 = try part.apply(&e1);
     try testing.expectEqual(@as(u64, 1), idx1);
 

@@ -201,7 +201,7 @@ fn countLiveImpl(self: *const KvState) u64 {
 /// as a committed entry would be, outside any log.
 fn putForTestImpl(self: *KvState, qkey: []const u8, value: []const u8) !void {
     const allocator = self.store.allocator;
-    const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null };
+    const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
     const buf = try allocator.alloc(u8, try kv_entries.Put.encodedSize(body));
     defer allocator.free(buf);
     const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(buf, body));
