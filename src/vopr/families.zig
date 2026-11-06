@@ -25,6 +25,7 @@ const machine_mod = @import("../contract/machine.zig");
 const kv_machine = @import("../kv/machine.zig");
 const view_mod = @import("../contract/view.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
 const action_machine = @import("../actions/machine.zig");
 const ae = @import("../protocol/action_entries.zig");
@@ -77,6 +78,11 @@ pub const Mutant = enum {
     /// not only at its leader's gate: replicas with lower limits than the
     /// leader that proposed it then drop what the others applied.
     kv_refuses_over_own_limit,
+    /// A leader proposes a batch above its own limit.
+    leader_ignores_limit,
+    /// The machine refuses a large batch on every replica, as a size check
+    /// in its apply would: no comparison sees it.
+    kv_refuses_large,
     /// Shard 0's leader proposes a create before it has applied every
     /// earlier term's entry, so it may choose an id an earlier leader's
     /// create already took.
@@ -89,11 +95,17 @@ pub const Mutant = enum {
     /// again, it allocates past what the group created.
     ns_keeps_alloc,
 
+    /// Whether the bug is in a node's transaction limit: a run with none
+    /// never reaches it.
+    pub fn needsTxnLimits(m: Mutant) bool {
+        return m == .kv_refuses_over_own_limit or m == .leader_ignores_limit or m == .kv_refuses_large;
+    }
+
     /// Whether the bug is in the actions machine: a run with no action
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }
@@ -267,6 +279,7 @@ pub const Kv = struct {
     pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{RefusalChangedState})!Effect {
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
         if (r.mutant == .kv_refuses_over_own_limit and r.txn_limit != 0 and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch) and kv_entries.batchOpCount(e.payload) > r.txn_limit) return .staged_refused;
+        if (r.mutant == .kv_refuses_large and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch) and kv_entries.batchOpCount(e.payload) > limits.MAX_OPS_PER_TXN / 2) return .staged_refused;
         var out: persistence.Result = .{};
         out.reset(e);
         const before = self.commits();
@@ -317,17 +330,22 @@ pub const Kv = struct {
 };
 
 /// How far a run's KV batches went past the limits of the nodes they reached.
+/// Every count but the two refusals is of batches the machine applied: one it
+/// refused left nothing behind, on any replica, so it reached nothing.
 pub const TxnCounts = struct {
     /// Batches a leader refused, above its own limit: never proposed.
     leader_refused: u64 = 0,
+    /// Batches the machine refused at apply, each counted once.
+    machine_refused: u64 = 0,
     /// Batches applied, each counted once however many replicas apply it.
     applied: u64 = 0,
-    /// Of those, above the default limit, and above half the built-in most.
+    /// Of those, above the default limit, and above half the built-in most:
+    /// "large" from here on.
     over_default: u64 = 0,
     over_half: u64 = 0,
     /// The most ops any batch applied.
     largest: u64 = 0,
-    /// Applies of a batch above half the built-in most by a replica rebuilding.
+    /// Applies of a large batch by a replica rebuilding.
     large_replayed: u64 = 0,
     /// Applies by a replica whose own limit is below the batch: live, and
     /// rebuilding.
@@ -336,6 +354,9 @@ pub const TxnCounts = struct {
     /// Of the live ones, by a leader, of an earlier term's batch: it came
     /// across a leader change, to a node that would have refused to propose it.
     over_own_across_leaders: u64 = 0,
+    /// The same two, of large batches only.
+    large_over_own_live: u64 = 0,
+    large_across_leaders: u64 = 0,
 
     pub fn add(self: *TxnCounts, other: TxnCounts) void {
         inline for (comptime std.meta.fieldNames(TxnCounts)) |name| {

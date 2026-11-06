@@ -69,6 +69,7 @@ const TXN_KEYS = 1024;
 /// A transaction's counters: only transactions touch them, so an add is never
 /// refused for a put's raw bytes.
 const TXN_COUNTERS = 16;
+const TXN_COUNTER_PREFIX = "c";
 
 pub const OpState = enum {
     /// Proposed to a leader; commit outcome not yet observed.
@@ -337,10 +338,10 @@ pub const Workload = struct {
 
     /// A transaction as a client commits one: up to the built-in most ops,
     /// its size a pure function of the op, so whether a leader may propose it
-    /// is the leader's own limit's to say. Most stay within the default, since
-    /// every restart replays each one; a quarter go past it, and 15% past half
-    /// the most. It opens by tombstoning the op's marker key,
-    /// so it names its op. One in eight also adds to a key puts write, which
+    /// is the leader's own limit's to say. 60% stay within the default, since
+    /// every restart replays each one; 40% go past it, 15% of them all past
+    /// half the most. It opens by tombstoning the op's marker key, so it names
+    /// its op. One in eight also adds to a key puts write, which
     /// refuses the whole batch if a put's raw bytes are there.
     fn kvTxn(buf: []u8, op_id: u64, r: std.Random) ?[]u8 {
         const size = r.uintLessThan(u8, 100);
@@ -363,13 +364,26 @@ pub const Workload = struct {
             op.* = switch (r.uintLessThan(u8, 3)) {
                 0 => .{ .kind = .put, .key = key, .value = &value, .ttl_ms = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null, .delta = null },
                 1 => .{ .kind = .delete, .key = key, .value = null, .ttl_ms = null, .delta = null },
-                else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, "c{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1 },
+                else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, TXN_COUNTER_PREFIX ++ "{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1 },
             };
         }
         if (r.uintLessThan(u8, 8) == 0) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1 };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
         return buf[0..w.written().len];
+    }
+
+    /// Whether anything in a `kvTxn` batch can refuse it: only an add to a key
+    /// puts write. Every replica refuses alike, so the checksums can't tell a
+    /// machine that refuses a batch for its size; this can, at any size.
+    pub fn txnCanRefuse(payload: []const u8) bool {
+        var diag: schema.Diagnostic = .{};
+        const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return true;
+        var it = batch.ops.iterator();
+        while (it.next() catch return true) |op| {
+            if (op.kind == .incr and !std.mem.startsWith(u8, op.key, TXN_COUNTER_PREFIX)) return true;
+        }
+        return false;
     }
 
     /// Op `op_id`'s create. The leader chooses the id when it proposes the
@@ -598,6 +612,20 @@ test "vopr workload: with limits on, batches reach the built-in most ops, within
     }
     try testing.expectEqual(@as(u32, limits.MAX_OPS_PER_TXN), largest);
     try testing.expect(batches > 500 and past_half * 10 > batches);
+}
+
+test "vopr workload: only a batch with an add to a key puts write can be refused" {
+    const d: Workload.Draws = .{ .seed = 7, .payload_min = 16, .payload_max = @import("scenario.zig").TXN_PAYLOAD_MAX, .large_batches = true };
+    var buf: [MAX_PAYLOAD]u8 = undefined;
+    var can: u64 = 0;
+    var cannot: u64 = 0;
+    for (0..4000) |id| {
+        const gen = Workload.synthesize(d, id, &buf);
+        if (gen.entry_type != .kv_batch) continue;
+        if (Workload.txnCanRefuse(gen.payload)) can += 1 else cannot += 1;
+    }
+    // One in eight.
+    try testing.expect(can > 0 and can * 4 < cannot);
 }
 
 test "vopr workload: different seeds produce different payloads" {

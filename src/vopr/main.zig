@@ -182,8 +182,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.fromSeed(seed);
     if (args.volatile_mode) scenario.hard_state = .volatile_state;
     // A planted bug the run never reaches would pass, and say nothing.
-    if (args.family_mutant == .kv_refuses_over_own_limit and !scenario.hasTxnLimits()) {
-        std.debug.print("--family-mutant={t} refuses by a node's limit: run it with --txn-limits, or a scenario that has them\n", .{args.family_mutant});
+    if (args.family_mutant.needsTxnLimits() and !scenario.hasTxnLimits()) {
+        std.debug.print("--family-mutant={t} is in a node's transaction limit: run it with --txn-limits, or a scenario that has them\n", .{args.family_mutant});
         std.process.exit(2);
     }
     if (args.family_mutant.inActions() and scenario.action_percent == 0) {
@@ -474,7 +474,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     var expire_seeds: u64 = 0;
     var unread_counts: u64 = 0;
     var txn_totals: TxnCounts = .{};
-    var txn_seeds: struct { large: u64 = 0, replayed: u64 = 0, over_own: u64 = 0, across_leaders: u64 = 0 } = .{};
+    var txn_seeds: struct { refused: u64 = 0, large: u64 = 0, past_own: u64 = 0, replayed: u64 = 0, across_leaders: u64 = 0 } = .{};
 
     while (next < iterations or running.items.len > 0) {
         // Top up the pool.
@@ -525,10 +525,11 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                         if (args.txn_limits) {
                             if (readTxnCounts(allocator, r.log_path)) |c| {
                                 txn_totals.add(c);
+                                if (c.leader_refused > 0) txn_seeds.refused += 1;
                                 if (c.over_half > 0) txn_seeds.large += 1;
-                                if (c.over_own_replayed > 0) txn_seeds.replayed += 1;
-                                if (c.over_own_live > 0) txn_seeds.over_own += 1;
-                                if (c.over_own_across_leaders > 0) txn_seeds.across_leaders += 1;
+                                if (c.large_over_own_live > 0) txn_seeds.past_own += 1;
+                                if (c.large_replayed > 0) txn_seeds.replayed += 1;
+                                if (c.large_across_leaders > 0) txn_seeds.across_leaders += 1;
                             } else unread_counts += 1;
                         }
                         if (excused(allocator, r.log_path)) try excused_seeds.append(allocator, r.seed);
@@ -606,14 +607,14 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     // Limits that no batch ever went past tested nothing: it fails, as above.
     if (args.txn_limits) {
         printTxnCounts(txn_totals);
-        std.debug.print("[vopr] seeds reaching: large batches {d}, past a replica's own limit {d}, the same on replay {d}, at a later leader below the batch {d}\n", .{ txn_seeds.large, txn_seeds.over_own, txn_seeds.replayed, txn_seeds.across_leaders });
+        std.debug.print("[vopr] seeds reaching: a leader's refusal {d}; large batches applied {d}, past a replica's own limit {d}, replayed {d}, at a later leader below them {d}\n", .{ txn_seeds.refused, txn_seeds.large, txn_seeds.past_own, txn_seeds.replayed, txn_seeds.across_leaders });
         if (unread_counts > 0) {
             std.debug.print("[vopr] FAILED: {d} passing seeds printed no transaction counts\n", .{unread_counts});
             covered = false;
         }
         const want = @min(MIN_TXN_SEEDS, ok_count);
-        if (txn_seeds.large < want or txn_seeds.over_own < want or txn_seeds.replayed < want or txn_seeds.across_leaders < want) {
-            std.debug.print("[vopr] FAILED: fewer than {d} seeds took large batches past a replica's limit, live, on replay and across a leader change\n", .{want});
+        if (txn_seeds.refused < want or txn_seeds.large < want or txn_seeds.past_own < want or txn_seeds.replayed < want or txn_seeds.across_leaders < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds had a leader refuse a batch, and applied large ones past a replica's limit, on replay and at a later leader below them\n", .{want});
             covered = false;
         }
     }
@@ -652,17 +653,21 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions/--catching-up (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up or args.txn_limits)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions/--catching-up/--txn-limits (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) > 1) {
-        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts, --actions and --catching-up are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) + @intFromBool(args.txn_limits) > 1) {
+        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts, --actions, --catching-up and --txn-limits are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 
-    // A swarm's children would each refuse it, and read as caught.
+    // A swarm's children would each refuse these, and read as caught.
+    if (args.iterations != null and args.family_mutant.needsTxnLimits() and !args.txn_limits) {
+        std.debug.print("--family-mutant={t} is in a node's transaction limit: run the swarm with --txn-limits\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
     if (args.iterations != null and args.family_mutant.inActions() and !args.actions) {
         std.debug.print("--family-mutant={t} is in the actions machine: run the swarm with --actions\n", .{args.family_mutant});
         std.process.exit(2);

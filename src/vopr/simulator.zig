@@ -86,6 +86,8 @@ pub const Invariant = enum {
     /// early, ended by a stale report or key, a failure uncounted. Every
     /// replica would apply the bug alike, so only the entry shows it.
     action_rule,
+    /// A leader proposed a KV batch above its own transaction limit.
+    txn_gate,
     /// A namespace create was refused because another create took its id:
     /// its leader chose the id from state behind what was committed, which
     /// the readiness gate is there to prevent.
@@ -1762,7 +1764,7 @@ pub const Simulator = struct {
         if (op.entry_type == .namespace_create) return self.submitCreate(target, op.id, op.payload);
         // The model of `[kv] max_txn_ops`: a leader takes a transaction only
         // within its own limit, whatever the node it came from allows.
-        if (op.entry_type == .kv_batch and self.scenario.hasTxnLimits() and kv_entries.batchOpCount(op.payload) > self.scenario.txnLimit(target.id)) {
+        if (op.entry_type == .kv_batch and self.scenario.hasTxnLimits() and self.options.family_mutant != .leader_ignores_limit and kv_entries.batchOpCount(op.payload) > self.scenario.txnLimit(target.id)) {
             self.workload.markRefused(op.id);
             self.txn_counts.leader_refused += 1;
             return;
@@ -1790,9 +1792,34 @@ pub const Simulator = struct {
         try self.pending_ops.append(self.allocator, id);
     }
 
-    fn countTxn(self: *Simulator, node: *const SimNode, e: *const entry_mod.Entry, first: bool, live: bool) void {
+    /// What a batch did at this replica, after the machine answered: one it
+    /// refused reached nothing. Its proposer's limit is checked either way.
+    fn countTxn(self: *Simulator, node: *const SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, live: bool, effect: families.Kv.Effect) void {
         const c = &self.txn_counts;
         const ops = kv_entries.batchOpCount(e.payload);
+        if (self.workload.opIdAt(e.header.term, idx, e.header.entry_type, e.payload)) |id| {
+            const proposer = self.workload.ops.items[id].proposer;
+            if (proposer != 0 and ops > self.scenario.txnLimit(proposer)) self.checker.fail(.{
+                .invariant = .txn_gate,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "a leader proposed a batch above its own transaction limit",
+            });
+        }
+        if (effect == .staged_refused or effect == .refused) {
+            if (first) c.machine_refused += 1;
+            // The planted refusal diverges a replica, which is the checksums'
+            // to catch, not this check's.
+            if (self.options.family_mutant != .kv_refuses_over_own_limit and !Workload.txnCanRefuse(e.payload)) self.checker.fail(.{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the KV machine refused a batch none of whose ops can be refused",
+            });
+            return;
+        }
         const large = ops > limits.MAX_OPS_PER_TXN / 2;
         if (first) {
             c.applied += 1;
@@ -1807,7 +1834,11 @@ pub const Simulator = struct {
             return;
         }
         c.over_own_live += 1;
-        if (node.raft.role == .leader and e.header.term < node.raft.current_term) c.over_own_across_leaders += 1;
+        if (large) c.large_over_own_live += 1;
+        if (node.raft.role == .leader and e.header.term < node.raft.current_term) {
+            c.over_own_across_leaders += 1;
+            if (large) c.large_across_leaders += 1;
+        }
     }
 
     /// A workload create, proposed as shard 0's leader proposes one: the
@@ -2006,9 +2037,9 @@ pub const Simulator = struct {
         // Counted where the first replica reaches the index, so an entry
         // counts once, not once per replica and replay.
         const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
-        if (self.scenario.hasTxnLimits() and is_op and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.countTxn(node, e, first, live);
         if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
             if (first) self.kv_counts.count(effect);
+            if (self.scenario.hasTxnLimits() and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.countTxn(node, e, idx, first, live, effect);
         } else |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{
                 .invariant = .refusal_wrote,

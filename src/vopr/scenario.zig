@@ -63,7 +63,8 @@ pub const MAX_BATCH: u32 = 64;
 pub const TXN_PAYLOAD_MAX: u32 = 8192;
 pub const TXN_LOG_CAPACITY: usize = TXN_PAYLOAD_MAX * MAX_BATCH * 2;
 /// What a node's limit is drawn from: the built-in default, and either side.
-const TXN_LIMIT_CHOICES = [_]u16{ 8, 16, 32, 64, 128, 256 };
+const TXN_LIMIT_CHOICES = [_]u16{ 8, 16, 32, 64, 128, TXN_LIMIT_MOST };
+const TXN_LIMIT_MOST: u16 = 256;
 
 /// The outsider takes the id after the members', within the network's 8.
 pub const MAX_NODES_WITH_OUTSIDER: u8 = 7;
@@ -306,14 +307,26 @@ pub const Scenario = struct {
         for (s.txn_limits[0..s.node_count]) |*limit| limit.* = TXN_LIMIT_CHOICES[r.uintLessThan(usize, TXN_LIMIT_CHOICES.len)];
         const high = r.uintLessThan(u8, s.node_count);
         const low = (high + 1 + r.uintLessThan(u8, s.node_count - 1)) % s.node_count;
-        s.txn_limits[high] = TXN_LIMIT_CHOICES[TXN_LIMIT_CHOICES.len - 1];
+        s.txn_limits[high] = TXN_LIMIT_MOST;
         s.txn_limits[low] = @min(s.txn_limits[low], 32);
         s.log_capacity = TXN_LOG_CAPACITY;
         s.payload_max = TXN_PAYLOAD_MAX;
     }
 
     pub fn hasTxnLimits(s: *const Scenario) bool {
-        return s.txn_limits[0] != 0;
+        return std.mem.max(u16, &s.txn_limits) != 0;
+    }
+
+    /// Limits a run can do something with, as `addTxnLimits` draws them: each
+    /// node has one, one is at the built-in most, one is below it, and payloads
+    /// hold a batch that large. Anything else would pass having tested nothing.
+    pub fn validTxnLimits(s: *const Scenario) bool {
+        if (!s.hasTxnLimits()) return true;
+        if (s.node_count > s.txn_limits.len) return false;
+        for (s.txn_limits[s.node_count..]) |limit| if (limit != 0) return false;
+        const own = s.txn_limits[0..s.node_count];
+        if (std.mem.min(u16, own) == 0 or std.mem.min(u16, own) == TXN_LIMIT_MOST or std.mem.max(u16, own) != TXN_LIMIT_MOST) return false;
+        return s.payload_max >= TXN_PAYLOAD_MAX and @as(usize, s.payload_max) * MAX_BATCH <= s.log_capacity / 2;
     }
 
     /// The node's own limit; 0 when the scenario has none.
@@ -465,7 +478,7 @@ pub const Scenario = struct {
         const durability: DurabilityMode = if (try jsonEnum(obj, "durability", &.{ "sync", "async_flush" })) .sync else .async_flush;
         const small_ring_v = obj.get("small_ring") orelse return error.MissingField;
         if (small_ring_v != .bool) return error.InvalidField;
-        return .{
+        const scenario: Scenario = .{
             .seed = try jsonU64(obj, "seed"),
             .node_count = try jsonInt(u8, obj, "node_count"),
             .log_capacity = try jsonInt(usize, obj, "log_capacity"),
@@ -512,6 +525,8 @@ pub const Scenario = struct {
             .apply_lag_max_ms = if (obj.get("apply_lag_max_ms") == null) 0 else try jsonInt(u32, obj, "apply_lag_max_ms"),
             .txn_limits = try jsonTxnLimits(obj),
         };
+        if (!scenario.validTxnLimits()) return error.InvalidField;
+        return scenario;
     }
 };
 
@@ -521,7 +536,7 @@ fn jsonTxnLimits(obj: std.json.ObjectMap) ![MAX_NODES]u16 {
     const v = obj.get("txn_limits") orelse return limits;
     if (v != .array or v.array.items.len != MAX_NODES) return error.InvalidField;
     for (v.array.items, &limits) |item, *limit| {
-        if (item != .integer or item.integer < 0 or item.integer > 256) return error.InvalidField;
+        if (item != .integer or item.integer < 0 or item.integer > TXN_LIMIT_MOST) return error.InvalidField;
         limit.* = @intCast(item.integer);
     }
     return limits;
@@ -591,6 +606,47 @@ test "vopr scenario: a limits scenario gives each node a limit, some high and so
         try testing.expectEqualSlices(u16, &s.txn_limits, &back.txn_limits);
     }
     try testing.expect(!Scenario.fromSeed(1).hasTxnLimits());
+}
+
+test "vopr scenario: limits that would test nothing don't load" {
+    const load = struct {
+        fn of(s: Scenario) !Scenario {
+            var buf: [4096]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            try s.writeJson(&w);
+            return Scenario.fromJsonSlice(testing.allocator, w.buffered());
+        }
+    }.of;
+    var good = Scenario.txnLimits(1);
+    good.node_count = 3;
+    good.txn_limits = @splat(0);
+    good.txn_limits[0] = 8;
+    good.txn_limits[2] = 256;
+    good.txn_limits[1] = 32;
+    _ = try load(good);
+    _ = try load(Scenario.fromSeed(1));
+
+    var bad = good;
+    bad.txn_limits[0] = 0; // the first node has none
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.txn_limits[1] = 0; // a node would refuse every batch
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.txn_limits[3] = 8; // past the group
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.txn_limits[2] = 128; // no node reaches the most
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.txn_limits = .{ 256, 256, 256, 0, 0, 0, 0, 0 }; // no node is below a batch
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.payload_max = 256; // payloads can't hold a large batch
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.log_capacity = 64 * 1024; // a replication batch wouldn't fit the ring
+    try testing.expectError(error.InvalidField, load(bad));
 }
 
 test "vopr scenario: swarm bounds and batch/ring constraint" {
