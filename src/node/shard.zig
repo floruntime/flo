@@ -1569,7 +1569,7 @@ pub const Shard = struct {
             if (!has_single_target) {
                 // This shard's part is read here, not through `dispatchLocal`;
                 // the others' parts are gated where they run.
-                if (self.refusedCold(conn, req)) return;
+                if (self.refusedRead(conn, req)) return;
                 self.executeWalk(conn, req, auth);
                 return;
             }
@@ -1582,11 +1582,11 @@ pub const Shard = struct {
         // holds the run (`RunFind`), and for a start that chooses one,
         // whether another workflow's run has it already.
         if (self.runIdUnplaced(req)) {
-            if (self.refusedCold(conn, req)) return;
+            if (self.refusedRead(conn, req)) return;
             return self.findRun(conn, req, auth, req.key, null);
         }
         if (self.startChoosesRunId(req)) |rid| {
-            if (self.refusedCold(conn, req)) return;
+            if (self.refusedRead(conn, req)) return;
             return self.findRun(conn, req, auth, rid, self.startHome(req));
         }
 
@@ -1919,7 +1919,7 @@ pub const Shard = struct {
         // whichever shard or node it came. Status and membership read Raft
         // and config, not projections.
         const exempt = status_op or req.header.op_code == @backingInt(proto.OpCode.ping);
-        if (!writes and !at_leader and !exempt and auth.origin != .peer and self.refusedCold(conn, req)) return;
+        if (!writes and !at_leader and !exempt and !internal_from_client and auth.origin != .peer and self.refusedRead(conn, req)) return;
         const was_stale = proto.answering_stale;
         proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
         defer proto.answering_stale = was_stale;
@@ -1946,7 +1946,7 @@ pub const Shard = struct {
         // A read the leader answers from its memory: a leader still applying
         // what earlier terms committed would answer from part of it. A halted
         // one answers, marked stale, as other reads are.
-        if (at_leader and self.halted == null and !self.raft_node.leaderReady()) {
+        if (at_leader and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
         }
@@ -3946,12 +3946,26 @@ pub const Shard = struct {
     pub const COLD_READ_REFUSAL = "unavailable: this node restarted and is catching up with its group's leader; retry, or read from another node";
     pub const LEADER_NOT_READY_REFUSAL = "unavailable: the leader is still applying what earlier leaders committed; retry";
 
-    /// Refuses `req`, a read of this shard's state, while a cold boot keeps
-    /// its projections behind its group's (`coldCaughtUp`).
-    fn refusedCold(self: *Shard, conn: *Connection, req: proto.Request) bool {
-        if (self.coldCaughtUp()) return false;
-        self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = COLD_READ_REFUSAL });
+    /// Refuses `req`, a read of this shard's state, while that state is behind
+    /// what its group committed: a cold boot's (`coldCaughtUp`), or a new
+    /// leader's, which may not have applied what earlier terms committed. A
+    /// write acknowledged by the old leader would read as missing.
+    fn refusedRead(self: *Shard, conn: *Connection, req: proto.Request) bool {
+        const message = if (!self.coldCaughtUp())
+            COLD_READ_REFUSAL
+        else if (self.leaderApplying())
+            LEADER_NOT_READY_REFUSAL
+        else
+            return false;
+        self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = message });
         return true;
+    }
+
+    /// This node leads and hasn't applied what earlier terms committed. A
+    /// halted leader never will, and answers marked stale instead.
+    fn leaderApplying(self: *const Shard) bool {
+        const raft = self.raft_node;
+        return raft.role == .leader and self.halted == null and !raft.leaderReady();
     }
 
     /// Whether a cold boot's projections hold what the group committed: a
@@ -13132,6 +13146,60 @@ test "Shard: a leader still applying earlier terms' entries refuses the reads it
     const got = try proto.Response.parse(out[0..conn.write_buf.read(&out)]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), got.header.status);
     try std.testing.expect(std.mem.indexOf(u8, got.data, "here") != null);
+}
+
+test "Shard: a new leader refuses plain reads until it has applied earlier terms, then answers them" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    var body_buf: [64]u8 = undefined;
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "the-value") }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+    const run_id = "chosen-run";
+    _ = try applyActionEntry(&shard, .action_register, testRegister("echo"), shard.raft_node.last_applied + 1, 1);
+    _ = try applyActionEntry(&shard, .action_invoke, testInvoke("echo", run_id), shard.raft_node.last_applied + 1, 1000 * std.time.ns_per_ms);
+
+    const get: proto.Request = .{ .header = proto.RequestHeader.init(.kv_get, 2), .namespace = "", .key = "k", .value = try kv_ops.plainGetBody(&body_buf) };
+    const status: proto.Request = .{ .header = proto.RequestHeader.init(.action_status, 3), .namespace = "", .key = run_id, .value = "" };
+    const raft = shard.raft_node;
+    try std.testing.expect(raft.leaderReady());
+    // Elected with entries of earlier terms still to apply.
+    raft.ready_index = raft.log.lastIndex() + 100;
+
+    // Asked by a client and by another shard, both are refused, retryably.
+    for ([_]proto.Request{ get, status }) |req| for ([_]@import("run.zig").Origin{ .client, .shard }) |origin| {
+        shard.runRequest(c.conn, req, origin);
+        const refused = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), refused.header.status);
+        const why = try refused.refused();
+        try std.testing.expectEqual(@import("../protocol/reason.zig").Reason.leader_unknown, why.reason);
+        try std.testing.expectEqual(proto.Ran.no, why.ran);
+        try std.testing.expectEqualStrings(Shard.LEADER_NOT_READY_REFUSAL, why.message);
+    };
+    // What reads no projection still answers.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.ping, 4), .namespace = "", .key = "", .value = "" }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.cluster_status, 5), .namespace = "", .key = "", .value = "" }, .client);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
+
+    // Ready, both answer what the log holds.
+    raft.ready_index = raft.last_applied;
+    shard.runRequest(c.conn, get, .client);
+    const got = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), got.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, got.data, "the-value") != null);
+    shard.runRequest(c.conn, status, .client);
+    const answered = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), answered.header.status);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, (try table_run.op("action.status").response.decodeAll(answered.data, &diag)).status);
 }
 
 test "Shard: a leader still applying earlier terms' entries runs no pipeline, trigger or schedule pass" {
