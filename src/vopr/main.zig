@@ -59,6 +59,7 @@ const Args = struct {
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
     txn_limits: bool = false,
+    max_delivered: u64 = 0,
     skip: [8]u64 = undefined,
     skip_len: usize = 0,
     scenario_out: ?[]const u8 = null,
@@ -75,7 +76,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -110,6 +111,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--catching-up")) {
             args.catching_up = true;
+        } else if (std.mem.startsWith(u8, arg, "--max-delivered=")) {
+            args.max_delivered = try std.fmt.parseInt(u64, arg["--max-delivered=".len..], 10);
         } else if (std.mem.eql(u8, arg, "--txn-limits")) {
             args.txn_limits = true;
         } else if (std.mem.startsWith(u8, arg, "--skip=")) {
@@ -205,6 +208,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
 
     var sim = try Simulator.init(allocator, scenario, .{
+        .max_delivered = args.max_delivered,
         .volatile_hard_state = args.volatile_mode or scenario.hard_state == .volatile_state,
         .family_mutant = args.family_mutant,
         .verbose = args.verbose,
@@ -670,6 +674,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    if (args.iterations != null and args.max_delivered != 0) {
+        std.debug.print("--max-delivered is for one run\n", .{});
+        std.process.exit(2);
+    }
     // A swarm's children would each refuse these, and read as caught.
     if (args.iterations != null and args.family_mutant.needsTxnLimits() and !args.txn_limits) {
         std.debug.print("--family-mutant={t} is in a node's transaction limit: run the swarm with --txn-limits\n", .{args.family_mutant});

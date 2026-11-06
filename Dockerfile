@@ -58,6 +58,7 @@ RUN case "${TARGETPLATFORM}" in \
       *)            echo "unsupported platform ${TARGETPLATFORM}" >&2; exit 1 ;; \
     esac && \
     zig build -Drelease -Dtarget=${ZIG_TARGET} -Dcpu=${ZIG_CPU} -Drequire-hw-crc -Dversion=${FLO_VERSION} && \
+    if grep -qa ', plant=' zig-out/bin/flo; then echo "the image's flo carries a VOPR plant" >&2; exit 1; fi && \
     if grep -qa 'flo-test-fault-' zig-out/bin/flo; then echo "the image's flo carries the test faults" >&2; exit 1; fi
 
 # Stage 3: Runtime image

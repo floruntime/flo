@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const log = @import("stdx").log;
+const plant = @import("../plant.zig");
 const RaftNode = @import("../raft/node.zig").RaftNode;
 const raft_node_mod = @import("../raft/node.zig");
 const RaftFrame = @import("../raft/raft_queue.zig").Frame;
@@ -401,6 +402,7 @@ pub fn Replica(comptime Io: type) type {
         /// for a committed config newer than this node's and than the
         /// vouch it holds.
         fn takeVouch(self: *Self, resp: raft_node_mod.TermCheckResponse) void {
+            if (comptime plant.active == .no_vouches) return;
             if (resp.committed_index == 0 or resp.guarded) return;
             // A config committed in a term later than the responder's own is
             // no history it has: taking it would hold a vouch no honest
