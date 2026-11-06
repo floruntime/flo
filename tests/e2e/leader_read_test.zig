@@ -21,6 +21,7 @@ const Conn = struct {
     fd: std.c.fd_t,
     buf: [8192]u8 = undefined,
     got: usize = 0,
+    next_id: u64 = 1,
 
     fn open(port: u16) !Conn {
         return .{ .fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 2000) };
@@ -33,16 +34,27 @@ const Conn = struct {
     const Answer = struct { status: u8, reason: proto.Reason = .unclassified, role: u8 = 0, term: u64 = 0, found: bool = false };
 
     /// One request, and its answer: only what the test reads, as the next call
-    /// reuses the buffer.
+    /// reuses the buffer. A late answer to a call that gave up is dropped.
     fn call(self: *Conn, op: proto.OpCode, key: []const u8, value: []const u8) !Answer {
-        const req: proto.Request = .{ .header = proto.RequestHeader.init(op, 1), .namespace = "", .key = key, .value = value, .options = "" };
+        const id = self.next_id;
+        self.next_id += 1;
+        const req: proto.Request = .{ .header = proto.RequestHeader.init(op, id), .namespace = "", .key = key, .value = value, .options = "" };
         var frame_buf: [256]u8 = undefined;
         const frame = try req.serialize(&frame_buf);
         if (std.c.write(self.fd, frame.ptr, frame.len) != @as(isize, @intCast(frame.len))) return error.ShortWrite;
-        self.got = 0;
         const deadline = stdx.time.milliTimestamp() + 5000;
         while (true) {
             if (proto.Response.parse(self.buf[0..self.got])) |r| {
+                const total = @sizeOf(proto.ResponseHeader) + r.data.len;
+                if (r.header.request_id != id) {
+                    std.mem.copyForwards(u8, self.buf[0..], self.buf[total..self.got]);
+                    self.got -= total;
+                    continue;
+                }
+                defer {
+                    std.mem.copyForwards(u8, self.buf[0..], self.buf[total..self.got]);
+                    self.got -= total;
+                }
                 var a: Answer = .{ .status = r.header.status };
                 if (r.header.status != @backingInt(proto.StatusCode.ok)) {
                     a.reason = (try r.refused()).reason;

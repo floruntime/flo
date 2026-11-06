@@ -394,7 +394,7 @@ test "e2e/action/cluster: a run claimed before its leader is killed stays its wo
     // run, and wake it to say so.
     var other: Held = undefined;
     try testing.expect(!try awaitTaskRetrying(fd, "w2", "survive", 3000, &other, 25));
-    const s = try runStatus(fd, run);
+    const s = try runStatusRetrying(fd, run, 25);
     try testing.expectEqual(action_ops.RunStatus.running, s.status);
     try testing.expectEqual(@as(u32, 1), s.attempt);
     try testing.expectEqualStrings("w1", s.worker_buf[0..s.worker_len]);

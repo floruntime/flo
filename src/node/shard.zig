@@ -1947,7 +1947,8 @@ pub const Shard = struct {
         // A read the leader answers from its memory, or one inside a
         // transaction, which falls through to the leader's state: a leader
         // still applying what earlier terms committed would answer from part
-        // of it. A halted one answers, marked stale, as other reads are.
+        // of it. A halted one answers the former, marked stale, as other reads
+        // are.
         if ((at_leader or table_run.readsInTxn(req)) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
