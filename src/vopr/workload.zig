@@ -17,6 +17,7 @@ const std = @import("std");
 const PRNG = @import("stdx").PRNG;
 const entry_mod = @import("../storage/ual/entry.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const proto = @import("../protocol/proto.zig");
 const kv_ops = @import("../protocol/kv_ops.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const limits = @import("../protocol/limits.zig");
@@ -369,7 +370,11 @@ pub const Workload = struct {
         return op.condition == .if_absent or op.cas_version == MARKER_WRONG_VERSION;
     }
 
-    pub const BatchAnswer = enum { holds, refuses };
+    pub const BatchAnswer = union(enum) {
+        holds,
+        /// By this op, counted from 0, for this reason.
+        refuses: struct { op: u16, reason: proto.Reason },
+    };
 
     /// How what a batch asks of its marker key comes out (`markerOps`), or null
     /// if it asks nothing.
@@ -379,9 +384,10 @@ pub const Workload = struct {
         var it = batch.ops.iterator();
         const first = (it.next() catch return null) orelse return null;
         if (first.condition != .if_absent or !std.mem.startsWith(u8, first.key, MARKER_PREFIX)) return null;
-        while (it.next() catch return null) |op| {
+        var n: u16 = 1;
+        while (it.next() catch return null) |op| : (n += 1) {
             if (!std.mem.eql(u8, op.key, first.key)) continue;
-            if (markerOpRefuses(op)) return .refuses;
+            if (markerOpRefuses(op)) return .{ .refuses = .{ .op = n, .reason = if (op.condition == .if_absent) .condition_failed else .cas_mismatch } };
         }
         return .holds;
     }
@@ -460,7 +466,7 @@ pub const Workload = struct {
     /// marker key can't meet, or an add to a key puts write. Every replica refuses alike, so the checksums can't tell a
     /// machine that refuses a batch for its size; this can, at any size.
     pub fn txnCanRefuse(payload: []const u8) bool {
-        if (batchAnswer(payload) == .refuses) return true;
+        if (batchAnswer(payload)) |answer| if (answer == .refuses) return true;
         var diag: schema.Diagnostic = .{};
         const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return true;
         var it = batch.ops.iterator();

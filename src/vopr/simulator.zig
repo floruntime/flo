@@ -1808,7 +1808,8 @@ pub const Simulator = struct {
         if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_batch)) return;
         const answer = Workload.batchAnswer(e.payload) orelse return;
         const refused = effect == .batch_condition_refused;
-        // A refusal for another reason is `countTxn`'s and the checksums' to judge.
+        // `Kv.apply` judges the reason and op of what the machine refuses, so
+        // `.staged_refused` on a batch that must refuse is a mutant refusing early.
         const wrong = if (answer == .holds) refused else !refused and effect != .staged_refused;
         if (wrong) self.checker.fail(.{
             .invariant = .applied_integrity,
@@ -2085,6 +2086,13 @@ pub const Simulator = struct {
                 .index = idx,
                 .tick = self.now,
                 .detail = "a KV entry the machine refused changed a family",
+            },
+            error.BatchRefusedWrong => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the KV machine refused a batch for another reason or op than its entry says",
             },
             error.ConditionDecidedWrong => .{
                 .invariant = .applied_integrity,

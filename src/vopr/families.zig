@@ -25,6 +25,7 @@ const machine_mod = @import("../contract/machine.zig");
 const kv_machine = @import("../kv/machine.zig");
 const view_mod = @import("../contract/view.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
+const Workload = @import("workload.zig").Workload;
 const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
 const action_machine = @import("../actions/machine.zig");
@@ -308,9 +309,10 @@ pub const Kv = struct {
     /// Apply `e` as the shard does. A refusal is an answer, not an error,
     /// but it must leave every family as it was: `RefusalChangedState` if
     /// one moved. `ConditionDecidedWrong` if a put's condition came out other
-    /// than the key as it stood says. Any other error (a halt, out of memory)
-    /// is one a workload entry must never meet.
-    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong })!Effect {
+    /// than the key as it stood says, and `BatchRefusedWrong` if a batch that
+    /// asks what can't hold was refused for another reason or op. Any other
+    /// error (a halt, out of memory) is one a workload entry must never meet.
+    pub fn apply(self: *Kv, e: *const entry_mod.Entry, r: Replica) (persistence.ApplyError || error{ RefusalChangedState, ConditionDecidedWrong, BatchRefusedWrong })!Effect {
         // Every replica may agree on a wrong decision, so no checksum sees it.
         const holds: ?bool = if (r.mutant == .kv_condition_local) null else if (conditionalPut(e)) |p| self.conditionHolds(p, e.header.timestamp_ns) else null;
         if (r.mutant == .kv_replay_skips_batches and !r.live and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) return .other;
@@ -347,6 +349,14 @@ pub const Kv = struct {
             return if (conditionalPut(e) != null) .condition_held else patchEffect(e);
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
         const is_batch = e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch);
+        if (is_batch) if (Workload.batchAnswer(e.payload)) |answer| switch (answer) {
+            .holds => {},
+            .refuses => |want| {
+                var buf: [48]u8 = undefined;
+                const prefix = std.fmt.bufPrint(&buf, "the transaction's op {d}: ", .{want.op + 1}) catch return error.Halt;
+                if (refusal.refusal.reason != want.reason or !std.mem.startsWith(u8, refusal.refusal.message, prefix)) return error.BatchRefusedWrong;
+            },
+        };
         if (refusal.refusal.reason == .cas_mismatch or refusal.refusal.reason == .condition_failed) return if (is_batch) .batch_condition_refused else .condition_refused;
         return if (is_batch) .staged_refused else .refused;
     }
@@ -401,7 +411,8 @@ pub const Kv = struct {
         var kb: [kv_machine.MAX_KEY]u8 = undefined;
         const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(p.key)));
         const current: ?kv_machine.Current = if (bytes) |b| (kv_machine.Current.decode(b) catch null) else null;
-        const version: ?u64 = if (current) |c| (if (c.tombstone or c.expiredAt(at_ns)) null else c.version) else null;
+        // Written out, not `expiredAt`: a bug there would be in both, and agree.
+        const version: ?u64 = if (current) |c| (if (c.tombstone or (c.expiry_ns > 0 and c.expiry_ns <= at_ns)) null else c.version) else null;
         if (p.cas_version) |want| if (want != (version orelse 0)) return false;
         return switch (p.condition) {
             .always => true,

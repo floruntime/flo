@@ -68,6 +68,8 @@ const Racer = struct {
             });
             defer r.deinit();
             self.answers[i] = .{ .status = r.status, .reason = r.reason() };
+            // Answered at once in an election: don't spend the rounds on it.
+            if (r.status == .unavailable) stdx.time.sleep(100 * std.time.ns_per_ms);
         }
     }
 };
