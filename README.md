@@ -38,14 +38,14 @@ Flo takes a different approach. All five primitives share one Raft consensus log
 ## Features
 
 - **Streams** — Partitioned, append-only commit log with consumer groups, configurable storage tiers, and exactly-once delivery
-- **Key-Value** — Strongly consistent, versioned storage with compare-and-swap (CAS), TTL, blocking gets, and prefix scans
+- **Key-Value** — Versioned storage with compare-and-swap (CAS), TTL, blocking gets, and prefix scans; writes are replicated before they're acknowledged
 - **Queues** — Priority queues with competing consumers and dead-letter support; delivery is currently at-most-once
 - **Time-Series** — Columnar write buffers with block index, InfluxDB line protocol ingest, and FloQL query language
 - **Actions** — Durable execution of external business logic with automatic retries, timeouts, and dead-letter handling
 - **Stream Processing** — Continuous YAML pipelines (filter, map, keyed aggregates, KV enrichment) over streams and time-series — no separate cluster needed
 - **Workflows** — Multi-step orchestration with YAML definitions, signals, timers, circuit breakers, and health-weighted routing
 - **Thread-per-Core** — Shared-nothing architecture with io_uring/kqueue per core. No locks, no GC pauses
-- **Raft Consensus** — Linearizable writes, tiered storage (hot RAM → warm disk), automatic leader election
+- **Raft Consensus** — Writes in one log order, tiered storage (hot RAM → warm disk), automatic leader election
 - **Built-in Dashboard** — Real-time web UI for monitoring streams, keys, queues, and cluster health
 
 ## Quick Start

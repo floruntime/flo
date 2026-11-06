@@ -68,7 +68,7 @@ export function KVNewKey({
   return (
     <Modal
       title={editing ? 'Edit value' : 'Create key'}
-      sub={editing ? 'Writes a new version' : 'Strongly-consistent · versioned · linearizable'}
+      sub={editing ? 'Writes a new version' : 'Versioned · replicated before acknowledged'}
       width="min(600px,94vw)"
       onClose={onClose}
       foot={
