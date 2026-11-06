@@ -91,7 +91,7 @@ pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     var batch: [256]Entry = undefined;
     var idx = sum.first_index;
     while (idx <= sum.last_index) {
-        const n = dl.readRange(idx, &batch, arena);
+        const n = dl.readRange(idx, &batch, arena).count;
         if (n == 0) return error.LogUnreadable;
         for (batch[0..n]) |*e| {
             sum.last_term = e.header.term;
@@ -167,7 +167,7 @@ pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena:
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
     var one: [1]Entry = undefined;
-    if (dl.readRange(index, &one, arena) != 1 or one[0].header.index != index) return error.NotInLog;
+    if (dl.readRange(index, &one, arena).count != 1 or one[0].header.index != index) return error.NotInLog;
     return one[0];
 }
 

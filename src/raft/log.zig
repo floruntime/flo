@@ -34,10 +34,19 @@ pub const TermRun = struct {
 /// durable log in production, the simulated disk under VOPR. Reads are
 /// contiguous from `start`, payloads packed into `arena`; the count may be
 /// short of `buf.len` when the source's run ends, never with a gap.
+/// What a read below the ring came to: how many entries were copied, and
+/// whether the source was blocked (a passing resource or IO failure) rather
+/// than out of entries. A blocked read is retried; it is never a hole.
+pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false };
+
 pub const CatchUpSource = struct {
     ctx: *anyopaque,
-    read_range: *const fn (ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) usize,
+    read_range: *const fn (ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult,
 };
+
+/// One entry read for the apply loop: found, genuinely not there (a hole,
+/// which is damage), or blocked (read it again later).
+pub const ApplyRead = union(enum) { found: Entry, absent, blocked };
 
 pub const RaftLog = struct {
     ual: UAL,
@@ -143,8 +152,22 @@ pub const RaftLog = struct {
         if (self.ual.readCopy(index, payload_buf)) |e| return e;
         const src = self.catch_up orelse return null;
         var one: [1]Entry = undefined;
-        if (src.read_range(src.ctx, index, &one, payload_buf) != 1) return null;
+        if (src.read_range(src.ctx, index, &one, payload_buf).count != 1) return null;
         return one[0];
+    }
+
+    /// Read one entry for the apply loop, telling a hole from a blocked read.
+    /// `getEntryCopy` folds both into null; the apply loop must not, because a
+    /// hole is damage and a blocked read is retried.
+    pub fn readForApply(self: *RaftLog, index: u64, payload_buf: []u8) ApplyRead {
+        if (index > self.last_idx or index < self.first_idx) return .absent;
+        if (self.ual.readCopy(index, payload_buf)) |e| return .{ .found = e };
+        const src = self.catch_up orelse return .absent;
+        var one: [1]Entry = undefined;
+        const r = src.read_range(src.ctx, index, &one, payload_buf);
+        if (r.blocked) return .blocked;
+        if (r.count != 1) return .absent;
+        return .{ .found = one[0] };
     }
 
     /// Get the term for a given index. Answered from the term index (survives
@@ -171,7 +194,9 @@ pub const RaftLog = struct {
         const from_ring = self.ual.readRangeCopy(start_index, end_exclusive, buf, payload_arena);
         if (from_ring > 0) return from_ring;
         const src = self.catch_up orelse return 0;
-        return src.read_range(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena);
+        // A blocked source returns 0 here; the batch is sent short and the
+        // follower asks again, as it would for any partial read.
+        return src.read_range(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena).count;
     }
 
     // ── Truncation ──────────────────────────────────────────────────────
@@ -718,6 +743,7 @@ test "raft log: resetToSnapshot forgets the log and continues past the hole" {
 
 /// A stand-in durable log: every entry ever appended, in order.
 const TestSource = struct {
+    blocked: bool = false,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     truncated_after: ?u64 = null,
@@ -734,8 +760,9 @@ const TestSource = struct {
         self.entries.deinit(allocator);
     }
 
-    fn readRange(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) usize {
+    fn readRange(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
         const self: *TestSource = @ptrCast(@alignCast(ctx));
+        if (self.blocked) return .{ .blocked = true };
         var n: usize = 0;
         var used: usize = 0;
         while (n < buf.len and start - 1 + n < self.entries.items.len) : (n += 1) {
@@ -745,7 +772,7 @@ const TestSource = struct {
             buf[n] = .{ .header = e.header, .payload = arena[used..][0..e.payload.len] };
             used += e.payload.len;
         }
-        return n;
+        return .{ .count = n };
     }
 
     fn onTruncate(ctx: *anyopaque, after: u64) void {
@@ -794,4 +821,38 @@ test "raft log: reads below the ring come from the catch-up source, bounded by t
     try testing.expectEqual(@as(u64, 5), source.truncated_after.?);
     try testing.expectEqual(@as(usize, 5), log.getRange(1, &buf, &arena));
     try testing.expectEqual(@as(usize, 0), log.getRange(6, &buf, &arena));
+}
+
+test "raft log: readForApply tells a blocked read from a hole, and getEntryCopy folds both to null" {
+    const allocator = testing.allocator;
+    var source = TestSource{};
+    defer source.deinit(allocator);
+    var log = try RaftLog.init(allocator, 512);
+    defer log.deinit();
+    log.catch_up = .{ .ctx = @ptrCast(&source), .read_range = TestSource.readRange };
+
+    for (1..41) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, stdx.repeat("0123456789", 4));
+        try source.record(allocator, &e);
+        _ = try log.append(&e);
+    }
+    try testing.expect(log.getEntry(1) == null); // evicted from the ring
+
+    var buf: [256]u8 = undefined;
+    // The source can serve it: found.
+    try testing.expect(log.readForApply(1, &buf) == .found);
+
+    // The source is blocked: not a hole, so not .absent, and getEntryCopy
+    // (which can't tell them apart) returns null.
+    source.blocked = true;
+    try testing.expect(log.readForApply(1, &buf) == .blocked);
+    try testing.expect(log.getEntryCopy(1, &buf) == null);
+
+    // Recovered: found again.
+    source.blocked = false;
+    try testing.expect(log.readForApply(1, &buf) == .found);
+
+    // Past the tip is a genuine hole whether or not the source is blocked.
+    source.blocked = true;
+    try testing.expect(log.readForApply(99, &buf) == .absent);
 }

@@ -105,7 +105,8 @@ const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
 const DurableLog = durable_log_mod.DurableLog;
-const RaftLog = @import("../raft/log.zig").RaftLog;
+const raft_log_mod = @import("../raft/log.zig");
+const RaftLog = raft_log_mod.RaftLog;
 const hard_state_mod = @import("../raft/hard_state.zig");
 const Durability = @import("../config/server.zig").Durability;
 const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
@@ -559,6 +560,12 @@ pub const Shard = struct {
     /// The last apply pass stopped at its budget with committed entries
     /// left; the next poll does not wait, and the tick applies on.
     apply_behind: bool,
+    /// A committed entry could not be read to apply it right now — a resource
+    /// or IO failure reading below the ring, not a hole. The shard holds it
+    /// unapplied and retries each tick; `apply_behind` is deliberately not set,
+    /// so the reactor keeps its normal poll wait and does not spin.
+    read_blocked: bool = false,
+    read_block_warn_ms: u64 = 0,
     /// What this tick's apply passes have spent, in `applyCost` units: the
     /// budget is the tick's, since every request and frame applies after it.
     /// A call outside a tick (boot, a test) has a budget of its own.
@@ -4370,74 +4377,97 @@ pub const Shard = struct {
                 // Advanced before the apply: whatever a notification does, this
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
-                if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
-                    spent += applyCost(&e);
-                    if (skippedHere(&self.skips, &e)) {
-                        self.last_entry_applied = false;
-                        self.last_result.reset(&e);
-                        self.defaultPartition().passOverSkipped(&e) catch |err| {
-                            self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                            self.damaged(localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ next_idx, @errorName(err) })));
-                            all_applied = false;
-                            break :drain;
-                        };
-                        // Its client is told it didn't run; the shard is
-                        // as the repair wants it.
-                        self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                        continue;
-                    }
-                    // The leader stamps each entry after the one before it,
-                    // so an entry that isn't is a bug every replica sees. A
-                    // skip never halts.
-                    if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp and !isSkip(&e)) {
-                        self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
+                switch (raft.log.readForApply(next_idx, self.apply_buf)) {
+                    .blocked => {
+                        // The entry's segment could not be read right now (out
+                        // of descriptors, IO): not a hole. Leave it unapplied
+                        // and retry on the next tick — never a busy loop,
+                        // because apply_behind is not set, so the poll waits.
+                        raft.last_applied = next_idx - 1;
+                        const now = nowMs();
+                        if (now -| self.read_block_warn_ms >= WARN_INTERVAL_MS) {
+                            self.read_block_warn_ms = now;
+                            if (!self.read_blocked) log.warn("shard {d}: cannot read committed entry {d} to apply it right now; holding, reads still served, will retry", .{ self.id, next_idx });
+                        }
+                        self.read_blocked = true;
                         all_applied = false;
                         break :drain;
-                    }
-                    self.last_result.reset(&e);
-                    const verdict = self.applyOne(&e, &self.last_result);
-                    switch (verdict) {
-                        .applied, .duplicate => {},
-                        .halt => |why| {
-                            self.halt(&e, "{s} (a Flo bug)", .{why});
-                            all_applied = false;
-                            break :drain;
-                        },
-                        .local => |damage| {
+                    },
+                    .found => |e| {
+                        if (self.read_blocked) {
+                            self.read_blocked = false;
+                            log.info("shard {d}: committed entries are readable again; applying from {d}", .{ self.id, next_idx });
+                        }
+                        spent += applyCost(&e);
+                        if (skippedHere(&self.skips, &e)) {
                             self.last_entry_applied = false;
+                            self.last_result.reset(&e);
+                            self.defaultPartition().passOverSkipped(&e) catch |err| {
+                                self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                                self.damaged(localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ next_idx, @errorName(err) })));
+                                all_applied = false;
+                                break :drain;
+                            };
+                            // Its client is told it didn't run; the shard is
+                            // as the repair wants it.
                             self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                            self.damaged(damage);
-                            all_applied = false;
-                            break :drain;
-                        },
-                    }
-                    raft.noteApplied(e.header.timestamp_ns);
-                    const applied = verdict == .applied;
-                    // A bug in an applier, never a valid request's doing:
-                    // every answer is sized for the longest key.
-                    if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
-                    if (!applied) all_applied = false;
-                    self.last_entry_applied = applied;
-                    self.answerPending(next_idx, e.header.term, applied, &self.last_result);
-                    // Last: it reads the entry it names into the same buffer.
-                    if (isSkip(&e)) {
-                        if (!self.checkSkip(&e)) {
+                            continue;
+                        }
+                        // The leader stamps each entry after the one before it,
+                        // so an entry that isn't is a bug every replica sees. A
+                        // skip never halts.
+                        if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp and !isSkip(&e)) {
+                            self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
                             all_applied = false;
                             break :drain;
                         }
-                        self.seal_skip = true;
-                    }
-                } else {
-                    self.last_entry_applied = false;
-                    self.last_result.index = next_idx;
-                    self.answerPending(next_idx, 0, false, &self.last_result);
-                    // A committed index is always within the log, in the ring
-                    // or below it in the durable log, and the buffer fits every
-                    // entry; an unreadable one is a bug or a damaged segment,
-                    // and nothing after it may apply over the hole.
-                    self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read back to apply", .{next_idx}));
-                    all_applied = false;
-                    break :drain;
+                        self.last_result.reset(&e);
+                        const verdict = self.applyOne(&e, &self.last_result);
+                        switch (verdict) {
+                            .applied, .duplicate => {},
+                            .halt => |why| {
+                                self.halt(&e, "{s} (a Flo bug)", .{why});
+                                all_applied = false;
+                                break :drain;
+                            },
+                            .local => |damage| {
+                                self.last_entry_applied = false;
+                                self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                                self.damaged(damage);
+                                all_applied = false;
+                                break :drain;
+                            },
+                        }
+                        raft.noteApplied(e.header.timestamp_ns);
+                        const applied = verdict == .applied;
+                        // A bug in an applier, never a valid request's doing:
+                        // every answer is sized for the longest key.
+                        if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
+                        if (!applied) all_applied = false;
+                        self.last_entry_applied = applied;
+                        self.answerPending(next_idx, e.header.term, applied, &self.last_result);
+                        // Last: it reads the entry it names into the same buffer.
+                        if (isSkip(&e)) {
+                            if (!self.checkSkip(&e)) {
+                                all_applied = false;
+                                break :drain;
+                            }
+                            self.seal_skip = true;
+                        }
+                    },
+                    .absent => {
+                        self.last_entry_applied = false;
+                        self.last_result.index = next_idx;
+                        self.answerPending(next_idx, 0, false, &self.last_result);
+                        // A committed index is always within the log, in the
+                        // ring or below it in the durable log, and the buffer
+                        // fits every entry; one that isn't there is a bug or a
+                        // damaged segment (a blocked read is handled above),
+                        // and nothing after it may apply over the hole.
+                        self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read back to apply", .{next_idx}));
+                        all_applied = false;
+                        break :drain;
+                    },
                 }
             }
             // Applying can propose (a workflow's next step); flushing that
@@ -6447,9 +6477,10 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     };
 }
 
-fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) usize {
+fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
     const dl: *DurableLog = @ptrCast(@alignCast(ctx));
-    return dl.readRange(start, buf, arena);
+    const r = dl.readRange(start, buf, arena);
+    return .{ .count = r.count, .blocked = r.blocked };
 }
 
 /// Raft log truncation, carried into the durable log.
@@ -12978,7 +13009,7 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     const src = shard.raft_node.log.catch_up.?;
     var buf: [4]entry_mod.Entry = undefined;
     var arena: [512]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena));
+    try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena).count);
     try std.testing.expectEqual(@as(u64, 3), buf[1].header.index);
     try std.testing.expectEqualStrings("q", entry_mod.CommandPayload.deserialize(buf[1].payload).?.key);
 }
@@ -13714,7 +13745,7 @@ test "Shard: an entry the writer could not buffer is buffered again from the log
     try std.testing.expect(writer.first_unbuffered == null);
     var got: [4]entry_mod.Entry = undefined;
     var arena: [256]u8 = undefined;
-    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena) == 1);
+    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena).count == 1);
 }
 
 test "Shard: with sync durability, entries after one the writer could not buffer reach disk once each, in order" {
@@ -13745,7 +13776,7 @@ test "Shard: with sync durability, entries after one the writer could not buffer
     try std.testing.expectEqual(first.index + 1, s.shard.raft_node.durable_index);
     var got: [4]entry_mod.Entry = undefined;
     var arena: [256]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena));
+    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena).count);
     try std.testing.expectEqual(first.index, got[0].header.index);
     try std.testing.expectEqual(first.index + 1, got[1].header.index);
 }

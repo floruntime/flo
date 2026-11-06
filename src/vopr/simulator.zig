@@ -19,6 +19,7 @@ const std = @import("std");
 const stdx = @import("stdx");
 const PRNG = @import("stdx").PRNG;
 const raft_node = @import("../raft/node.zig");
+const raft_log_mod = @import("../raft/log.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const repair = @import("../node/repair.zig");
 const plant = @import("../plant.zig");
@@ -215,7 +216,7 @@ const SimDisk = struct {
 
     /// The log reads below its ring from here: the production runtime's
     /// writer buffer plus sealed segments, as one array.
-    fn readRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) usize {
+    fn readRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
         const self: *SimDisk = @ptrCast(@alignCast(ctx));
         var n: usize = 0;
         var used: usize = 0;
@@ -234,7 +235,7 @@ const SimDisk = struct {
             used += de.payload.len;
         }
         if (!self.applying) self.catch_up_reads += 1;
-        return n;
+        return .{ .count = n };
     }
 
     /// RaftNode persists through this before granting a vote, adopting a
