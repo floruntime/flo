@@ -1637,18 +1637,22 @@ pub const Simulator = struct {
         return false;
     }
 
-    /// The operator's repair, once every core node halted: the leader
+    /// The operator's repair, once every core member the leader knows halted: the leader
     /// proposes the skip. One a later leader cut from the log is proposed
     /// again.
     fn repairHalt(self: *Simulator) !void {
         if (!self.scenario.repair_halt) return;
         const h = self.halt orelse return;
-        for (self.nodes, 0..) |*node, i| {
-            if (self.core[i] and (!node.up or node.halted_at != h.index)) return;
-        }
         const leader = for (self.nodes) |*node| {
             if (node.up and node.raft.role == .leader) break node;
         } else return;
+        // The members the leader knows: a node the group removed is never told,
+        // and never reaches the halt.
+        var ids: [membership.MAX_MEMBERS]u32 = undefined;
+        for (self.nodes, 0..) |*node, i| {
+            if (!self.core[i] or !membership.names(leader.raft.memberIds(&ids), node.id)) continue;
+            if (!node.up or node.halted_at != h.index) return;
+        }
         if (self.repair_at != 0) {
             if (leader.raft.log.getEntryCopy(self.repair_at, self.apply_buf)) |e| if (repair.Skip.decode(&e)) |sk| if (sk.index == h.index) return;
         }
