@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const raft_log = @import("log.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const membership = @import("membership.zig");
+const plant = @import("../plant.zig");
 const limits = @import("../protocol/limits.zig");
 
 const RaftLog = raft_log.RaftLog;
@@ -1402,7 +1403,7 @@ pub const RaftNode = struct {
         // Never move commit backwards — an older heartbeat, delayed or
         // duplicated in flight, verifies less than we may already hold.
         const last_new = req.prev_log_index + req.entries.len;
-        self.raiseCommit(@min(req.leader_commit, last_new));
+        self.raiseCommit(@min(req.leader_commit, if (comptime plant.active == .commit_past_verified) self.log.lastIndex() else last_new));
         // As the lost-log rule below: a new leader's commit can sit below
         // what earlier leaders committed (0, after a whole-cluster restart)
         // until it commits an entry of its own term.
@@ -1455,7 +1456,9 @@ pub const RaftNode = struct {
                 // and each answer would keep both going. A rejection always
                 // frees it, to retry from the hint; a lost answer is resent
                 // after the RPC timeout.
-                if (!resp.success or resp.match_index >= self.peers[i].batch_end) self.peers[i].inflight = false;
+                if (comptime plant.active == .any_ack_frees_peer) {
+                    self.peers[i].inflight = false;
+                } else if (!resp.success or resp.match_index >= self.peers[i].batch_end) self.peers[i].inflight = false;
                 self.peers[i].last_contact_ms = self.current_time_ms;
                 self.noteClock(i, resp.clock_ns);
                 self.peers[i].guarded = resp.guarded;

@@ -34,6 +34,7 @@
 //! The ring is non-overlapping: eviction must happen before write.
 
 const std = @import("std");
+const plant = @import("../../plant.zig");
 const stdx = @import("stdx");
 const entry_mod = @import("entry.zig");
 const log = @import("stdx").log;
@@ -345,7 +346,7 @@ pub const UAL = struct {
         }
 
         self.entry_count -= removed;
-        self.write_pos = new_write_pos;
+        if (comptime plant.active != .truncate_keeps_write_pos) self.write_pos = new_write_pos;
         self.max_index = after_index;
         if (self.entry_count == 0) {
             self.read_pos = self.write_pos;

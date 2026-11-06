@@ -21,6 +21,7 @@ const PRNG = @import("stdx").PRNG;
 const raft_node = @import("../raft/node.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
 const repair = @import("../node/repair.zig");
+const plant = @import("../plant.zig");
 const scenario_mod = @import("scenario.zig");
 const workload_mod = @import("workload.zig");
 const network_mod = @import("network.zig");
@@ -88,6 +89,9 @@ pub const Invariant = enum {
     action_rule,
     /// A leader proposed a KV batch above its own transaction limit.
     txn_gate,
+    /// More messages than a run has any reason to send: replication is going
+    /// round without getting anywhere. Checked only when asked for.
+    message_storm,
     /// A namespace create was refused because another create took its id:
     /// its leader chose the id from state behind what was committed, which
     /// the readiness gate is there to prevent.
@@ -784,6 +788,8 @@ pub const Options = struct {
     family_mutant: families.Mutant = .none,
     /// Print per-phase progress.
     verbose: bool = false,
+    /// Fail `message_storm` past this many delivered messages; 0 for no limit.
+    max_delivered: u64 = 0,
     /// Emit `progress tick=N` every N ticks (0 = never) — a swarm parent
     /// uses the last such line to tell a slow child from a hung one.
     progress_every: u64 = 0,
@@ -1083,7 +1089,7 @@ pub const Simulator = struct {
         node.raft.log.ual.on_append = SimDisk.onAppend;
         node.raft.log.on_truncate_ctx = @ptrCast(&node.disk);
         node.raft.log.on_truncate = SimDisk.onTruncate;
-        node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
+        if (comptime plant.active != .no_catch_up) node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
         node.raft.log_flush_sink = .{ .ctx = @ptrCast(&node.disk), .flush = SimDisk.flushLog };
         node.disk.commit_index = &node.raft.commit_index;
         if (!self.options.volatile_hard_state) {
@@ -1249,7 +1255,7 @@ pub const Simulator = struct {
         // can't be taken back, so the data waits for a leader, as
         // production's async boot does.
         const mark = @min(node.disk.watermark(), node.disk.durable_len);
-        const cold = self.scenario.durability == .async_flush;
+        const cold = self.scenario.durability == .async_flush and comptime plant.active != .async_boot_applies;
         node.raft.commit_index = if (cold) 0 else mark;
         if (node.raft.commit_index > 0) self.warm_restarts += 1;
         node.raft.voted_for = node.disk.voted_for;
@@ -1650,7 +1656,7 @@ pub const Simulator = struct {
         // and never reaches the halt.
         var ids: [membership.MAX_MEMBERS]u32 = undefined;
         for (self.nodes, 0..) |*node, i| {
-            if (!self.core[i] or !membership.names(leader.raft.memberIds(&ids), node.id)) continue;
+            if (!self.core[i] or (plant.active != .repair_waits_on_removed and !membership.names(leader.raft.memberIds(&ids), node.id))) continue;
             if (!node.up or node.halted_at != h.index) return;
         }
         if (self.repair_at != 0) {
@@ -1992,7 +1998,7 @@ pub const Simulator = struct {
                 while (node.applied_ticks.items.len < idx) node.applied_ticks.append(self.allocator, 0) catch @panic("sim OOM");
                 node.applied_ticks.items[idx - 1] = self.now;
                 node.raft.noteApplied(e.header.timestamp_ns);
-                const learned_at = if (idx <= node.learned.ticks.items.len) @min(self.now, node.learned.ticks.items[idx - 1]) else self.now;
+                const learned_at = if (comptime plant.active == .erasure_from_apply) self.now else if (idx <= node.learned.ticks.items.len) @min(self.now, node.learned.ticks.items[idx - 1]) else self.now;
                 self.checker.onApply(&self.workload, node.id, idx, e.header.term, e.header.entry_type, e.payload, is_op, self.now, learned_at, self.latest_crash_at);
                 // A config applied is committed, as production's applier
                 // records it.
@@ -2332,6 +2338,13 @@ pub const Simulator = struct {
         self.now += 1;
         self.setWallClocks();
         try self.deliverAll();
+        if (self.options.max_delivered != 0 and self.net.delivered > self.options.max_delivered) self.checker.fail(.{
+            .invariant = .message_storm,
+            .node = 0,
+            .index = 0,
+            .tick = self.now,
+            .detail = "delivered more messages than a run has any reason to send",
+        });
         try self.outsiderActs();
         self.tickNodes();
         try self.submitOps();

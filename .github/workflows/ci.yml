@@ -301,6 +301,33 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # A seed guards its fix only while it fails with the fix undone, and a change
+  # to what Raft sends, or what the state machines answer, can move it off the
+  # bug. The full check runs on dev and on a change that can move a seed; other
+  # pull requests only check the undos compile. It fails closed: if the change
+  # can't be read, the full check runs.
+  vopr-seed-undos:
+    name: vopr seed undos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The change a pull request makes: its merge commit against its base.
+          fetch-depth: 2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Each regression seed's undo still fails
+        run: |
+          mode=check
+          if [ "${{ github.event_name }}" = pull_request ] && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
+            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|namespace|protocol)/|src/node/repair\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
+              mode=compile
+            fi
+          fi
+          echo "running $mode"
+          scripts/vopr-seed-undos.sh "$mode"
+        timeout-minutes: 15
   # The simulator runs ReleaseSafe (-Drelease selects it) so any UB in the
   # unit under test traps instead of silently corrupting a run. Seeds 1-20
   # are the known-green set; the wider swarm finds real bugs and is run
@@ -335,6 +362,11 @@ jobs:
         run: |
           if ./zig-out/bin/flo version --verbose | grep -qF 'test-faults'; then
             echo "::error::a build without -Dtest-faults says it carries them"; exit 1
+          fi
+      - name: The binary carries no VOPR plant
+        run: |
+          if ./zig-out/bin/flo version --verbose | grep -qF 'plant='; then
+            echo "::error::a build without -Dvopr-plant says it carries one"; exit 1
           fi
       - name: Swarm
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --seed-timeout=120 --out-dir=/tmp/vopr
