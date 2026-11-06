@@ -10,7 +10,11 @@
 | RAM | 16+ GB |
 | OS | macOS |
 | Zig | 0.16.0 |
-| Build | ReleaseFast |
+| Build | Unverified |
+
+The tables under Results predate today's bench build, which is ReleaseSafe in every module. They ran on
+Zig 0.16 and were labelled ReleaseFast, but how they were built can't be verified, so a run today won't
+compare directly.
 
 ## Results
 
@@ -40,6 +44,9 @@
 
 ## Comparison with Old Architecture
 
+The New column is older than the tables above: its figures come from Zig 0.15.2, with their build also
+unverified.
+
 | Metric | Old (zflo) | New (flo) | Improvement |
 |--------|-----------|-----------|-------------|
 | KV Put throughput | ~500K ops/s | 4.4M ops/s | ~9x |
@@ -56,7 +63,7 @@
 ## How to Run
 
 ```bash
-# Build benchmarks (ReleaseFast)
+# Build benchmarks (ReleaseSafe, what a release ships; each prints its modes)
 zig build bench
 
 # Run individually

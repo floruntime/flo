@@ -8,6 +8,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const contract = src.contract;
 const entry_mod = src.storage.ual.entry;
@@ -49,6 +50,7 @@ fn report(name: []const u8, n: u64, start: i128) void {
 }
 
 pub fn main() !void {
+    mode.print();
     const allocator = std.heap.c_allocator;
     var b: Bench = .{ .store = contract.store.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator), .buf = try allocator.alloc(u8, ae.Expire.max_size) };
     defer b.store.deinit();

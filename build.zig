@@ -14,7 +14,9 @@ pub fn build(b: *std.Build) void {
     b.graph.poisonCache();
 
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
+    // The mode a release ships.
+    const release_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = release_optimize });
 
     // ── Modules ──
 
@@ -269,22 +271,35 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
     };
 
-    // The root module's mode drives the optimizer for the whole program, so a
-    // bench is always optimized. With a release flag every module is what a
-    // release ships; plain, the measured code keeps Debug's safety checks.
-    const bench_optimize: std.lang.Optimize = if (optimize == .debug) .fast else optimize;
+    // A figure is only worth having for what a release ships, so a bench takes
+    // that mode whatever this build's flags: its server code too, on modules of
+    // its own, since the shared ones are Debug unless a release flag is given.
+    const bench_stdx = b.createModule(.{
+        .root_source_file = b.path("src/stdx/mod.zig"),
+        .target = target,
+        .optimize = release_optimize,
+        .link_libc = true,
+    });
+    const bench_src = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = release_optimize,
+    });
+    bench_src.addImport("stdx", bench_stdx);
+    bench_src.addOptions("build_options", build_options);
+
     for (bench_sources) |def| {
         const bench_exe = b.addExecutable(.{
             .name = def.name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(def.source),
                 .target = target,
-                .optimize = bench_optimize,
+                .optimize = release_optimize,
                 .link_libc = true,
             }),
         });
-        bench_exe.root_module.addImport("src", src_module);
-        bench_exe.root_module.addImport("stdx", stdx_module);
+        bench_exe.root_module.addImport("src", bench_src);
+        bench_exe.root_module.addImport("stdx", bench_stdx);
         const install_bench = b.addInstallArtifact(bench_exe, .{});
         bench_step.dependOn(&install_bench.step);
     }

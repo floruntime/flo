@@ -178,6 +178,9 @@ test "nullIfZero: null input" {
     try std.testing.expect(result == null);
 }
 
+/// The mode this module was built in, which a bench prints.
+pub const optimize_mode = @import("builtin").mode;
+
 test {
     _ = log;
 }

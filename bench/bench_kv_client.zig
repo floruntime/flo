@@ -6,11 +6,13 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const KEYS = 10_000;
 const GETS = 50_000;
 
 pub fn main() !void {
+    mode.printForClient();
     const allocator = std.heap.c_allocator;
     const endpoint = std.mem.span(std.c.getenv("FLO_BENCH_ENDPOINT") orelse return error.Usage);
     var conn = src.cli_client.Client.init(allocator, endpoint);

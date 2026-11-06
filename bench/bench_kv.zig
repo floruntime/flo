@@ -7,6 +7,7 @@
 const std = @import("std");
 const src = @import("src");
 const stdx = @import("stdx");
+const mode = @import("mode.zig");
 
 const TestKv = src.kv.machine.TestKv;
 const entry_mod = src.storage.ual.entry;
@@ -28,6 +29,7 @@ fn report(name: []const u8, n: u64, start: i128, extra: []const u8) void {
 }
 
 pub fn main() !void {
+    mode.print();
     const allocator = std.heap.c_allocator;
     std.debug.print("\n=== KV Benchmark (the KV machine) ===\n\n", .{});
     var kv = TestKv.init(allocator);

@@ -192,7 +192,7 @@ Payloads are allocated on the heap, not embedded in the envelope. This keeps the
 
 ## Performance
 
-Benchmarked on the new architecture (Apple M-series, single core, ReleaseFast):
+Benchmarked on the new architecture (Apple M-series, single core). These figures predate today's bench build, on Zig 0.15.2, and their build mode is unverified:
 
 | Benchmark | Throughput | Latency |
 |-----------|-----------|--------|

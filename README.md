@@ -188,7 +188,7 @@ All writes go through the **Unified Append Log (UAL)**. The Raft consensus log a
 
 ### Performance
 
-Benchmarked on the new architecture (Apple M-series, single core, ReleaseFast):
+Benchmarked on the new architecture (Apple M-series, single core). These figures predate today's bench build, on Zig 0.15.2, and their build mode is unverified:
 
 | Benchmark | Throughput | Latency |
 |-----------|-----------|--------|
@@ -537,7 +537,7 @@ cd flo
 
 # Build
 zig build                              # Debug build
-zig build -Doptimize=ReleaseFast       # Release build
+zig build -Drelease                    # Release build (ReleaseSafe)
 
 # Run
 ./zig-out/bin/flo server start
@@ -552,7 +552,7 @@ zig build test-e2e --summary all           # E2E acceptance tests
 zig build test-e2e -Dtest-filter=kv -Dtest-filter=queue
 
 # Benchmarks
-zig build bench                        # Build benchmarks (ReleaseFast)
+zig build bench                        # Build benchmarks (ReleaseSafe)
 ./zig-out/bin/bench-ual                # UAL throughput
 ./zig-out/bin/bench-kv                 # KV projection ops/sec
 ./zig-out/bin/bench-inbox              # Inbox MPSC throughput
