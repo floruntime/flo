@@ -62,6 +62,9 @@ pub const MAX_BATCH: u32 = 64;
 /// them still fill only half (`TXN_LOG_CAPACITY`).
 pub const TXN_PAYLOAD_MAX: u32 = 8192;
 pub const TXN_LOG_CAPACITY: usize = TXN_PAYLOAD_MAX * MAX_BATCH * 2;
+/// The most payload any other op draws beside them, the size it would be
+/// without limits.
+pub const TXN_OTHER_OPS_PAYLOAD_MAX: u32 = 2048;
 /// What a node's limit is drawn from: the built-in default, and either side.
 const TXN_LIMIT_CHOICES = [_]u16{ 8, 16, 32, 64, 128, TXN_LIMIT_MOST };
 const TXN_LIMIT_MOST: u16 = 256;
@@ -326,7 +329,7 @@ pub const Scenario = struct {
         for (s.txn_limits[s.node_count..]) |limit| if (limit != 0) return false;
         const own = s.txn_limits[0..s.node_count];
         if (std.mem.min(u16, own) == 0 or std.mem.min(u16, own) == TXN_LIMIT_MOST or std.mem.max(u16, own) != TXN_LIMIT_MOST) return false;
-        return s.payload_max >= TXN_PAYLOAD_MAX and @as(usize, s.payload_max) * MAX_BATCH <= s.log_capacity / 2;
+        return s.payload_max >= TXN_PAYLOAD_MAX and s.payload_min <= TXN_OTHER_OPS_PAYLOAD_MAX and @as(usize, s.payload_max) * MAX_BATCH <= s.log_capacity / 2;
     }
 
     /// The node's own limit; 0 when the scenario has none.
@@ -646,6 +649,9 @@ test "vopr scenario: limits that would test nothing don't load" {
     try testing.expectError(error.InvalidField, load(bad));
     bad = good;
     bad.log_capacity = 64 * 1024; // a replication batch wouldn't fit the ring
+    try testing.expectError(error.InvalidField, load(bad));
+    bad = good;
+    bad.payload_min = TXN_OTHER_OPS_PAYLOAD_MAX + 1; // above what other ops draw
     try testing.expectError(error.InvalidField, load(bad));
 }
 

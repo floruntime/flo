@@ -80,6 +80,9 @@ pub const Mutant = enum {
     kv_refuses_over_own_limit,
     /// A leader proposes a batch above its own limit.
     leader_ignores_limit,
+    /// The machine applies only the first half of a batch, on every replica,
+    /// and calls it done: no comparison sees it.
+    kv_stops_batch_short,
     /// The machine refuses a large batch on every replica, as a size check
     /// in its apply would: no comparison sees it.
     kv_refuses_large,
@@ -98,14 +101,14 @@ pub const Mutant = enum {
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
     pub fn needsTxnLimits(m: Mutant) bool {
-        return m == .kv_refuses_over_own_limit or m == .leader_ignores_limit or m == .kv_refuses_large;
+        return m == .kv_refuses_over_own_limit or m == .leader_ignores_limit or m == .kv_refuses_large or m == .kv_stops_batch_short;
     }
 
     /// Whether the bug is in the actions machine: a run with no action
     /// entries never reaches it.
     pub fn inActions(m: Mutant) bool {
         return switch (m) {
-            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
+            .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
         };
     }
@@ -285,12 +288,39 @@ pub const Kv = struct {
         const before = self.commits();
         if (r.mutant == .kv_refused_commits) {
             try self.applyCommittingRefusals(e, &out);
+        } else if (r.mutant == .kv_stops_batch_short and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) {
+            var buf: [8192]u8 = undefined;
+            var short = e.*;
+            short.payload = firstHalf(e.payload, &buf) orelse return error.Halt;
+            try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, &short, &out);
         } else {
             try machine_mod.applyEntry(&kv_machine.machine, &self.store, &self.scratch, e, &out);
         }
         if (out.refused() == null) return patchEffect(e);
         if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
         return if (e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) .staged_refused else .refused;
+    }
+
+    /// The batch's first half of its ops, for `kv_stops_batch_short`.
+    fn firstHalf(payload: []const u8, buf: []u8) ?[]const u8 {
+        var diag: schema.Diagnostic = .{};
+        const batch = kv_entries.Batch.decodeAll(payload, &diag) catch return null;
+        var ops: [limits.MAX_OPS_PER_TXN]kv_entries.BatchOp.Value = undefined;
+        var n: usize = 0;
+        var it = batch.ops.iterator();
+        while (it.next() catch return null) |op| : (n += 1) ops[n] = op;
+        var w: schema.Writer = .{ .buf = buf };
+        kv_entries.BatchOps.encodeSlice(&w, ops[0 .. n / 2]) catch return null;
+        return w.written();
+    }
+
+    /// The counter at `qkey` on this replica, 0 if there is none.
+    pub fn counter(self: *Kv, qkey: []const u8) i64 {
+        var kb: [kv_machine.MAX_KEY]u8 = undefined;
+        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(qkey))) orelse return 0;
+        const current = kv_machine.Current.decode(bytes) catch return 0;
+        if (current.tombstone or current.value.len != 8) return 0;
+        return std.mem.readInt(i64, current.value[0..8], .little);
     }
 
     /// An applied JSON patch: merged into the value (a set below `$`), or a
@@ -337,7 +367,9 @@ pub const TxnCounts = struct {
     leader_refused: u64 = 0,
     /// Batches the machine refused at apply, each counted once.
     machine_refused: u64 = 0,
-    /// Batches applied, each counted once however many replicas apply it.
+    /// Batches applied, meaning the machine didn't refuse them, each counted
+    /// once however many replicas apply it. `countTxn` checks each applied in
+    /// full, by its last op.
     applied: u64 = 0,
     /// Of those, above the default limit, and above half the built-in most:
     /// "large" from here on.

@@ -20,7 +20,8 @@ const kv_entries = @import("../protocol/kv_entries.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
-const Scenario = @import("scenario.zig").Scenario;
+const scenario_mod = @import("scenario.zig");
+const Scenario = scenario_mod.Scenario;
 
 const Allocator = std.mem.Allocator;
 pub const EntryType = entry_mod.EntryType;
@@ -60,9 +61,7 @@ const CREATE_SALT: u64 = 0x6E73_C2EA_7E00_0001;
 /// The largest payload a scenario draws: the size of the KV encoder's
 /// scratch.
 pub const MAX_PAYLOAD = 8192;
-/// With transaction limits on, payloads grow to hold large batches; the other
-/// ops stay the size they'd be without them.
-const OTHER_OPS_PAYLOAD_MAX = 2048;
+const OTHER_OPS_PAYLOAD_MAX = scenario_mod.TXN_OTHER_OPS_PAYLOAD_MAX;
 /// The keys a transaction writes: more than the most ops one holds, so a large
 /// one declares far more keys than any other op, and overlaps the others'.
 const TXN_KEYS = 1024;
@@ -70,6 +69,10 @@ const TXN_KEYS = 1024;
 /// refused for a put's raw bytes.
 const TXN_COUNTERS = 16;
 const TXN_COUNTER_PREFIX = "c";
+/// Every transaction's last op adds 1 here, so one applied in full moves it by
+/// exactly 1, on every replica. Every replica applying the same part of a batch
+/// would agree on any checksum.
+pub const TXN_APPLIED_KEY = TXN_COUNTER_PREFIX ++ "applied";
 
 pub const OpState = enum {
     /// Proposed to a leader; commit outcome not yet observed.
@@ -358,7 +361,7 @@ pub const Workload = struct {
         std.mem.writeInt(u64, &value, op_id, .little);
         const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
         ops[0] = .{ .kind = .delete, .key = marker, .value = null, .ttl_ms = null, .delta = null };
-        for (ops[1..count], key_bufs[1..count]) |*op, *key_buf| {
+        for (ops[1 .. count - 1], key_bufs[1 .. count - 1]) |*op, *key_buf| {
             const slot = r.uintLessThan(u16, TXN_KEYS);
             const key = std.fmt.bufPrint(key_buf, "{s}t{x:0>3}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
             op.* = switch (r.uintLessThan(u8, 3)) {
@@ -367,7 +370,8 @@ pub const Workload = struct {
                 else => .{ .kind = .incr, .key = std.fmt.bufPrint(key_buf, TXN_COUNTER_PREFIX ++ "{x:0>2}", .{slot % TXN_COUNTERS}) catch unreachable, .value = null, .ttl_ms = null, .delta = 1 },
             };
         }
-        if (r.uintLessThan(u8, 8) == 0) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1 };
+        if (r.uintLessThan(u8, 8) == 0 and count > 2) ops[count / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1 };
+        ops[count - 1] = .{ .kind = .incr, .key = TXN_APPLIED_KEY, .value = null, .ttl_ms = null, .delta = 1 };
         var w: schema.Writer = .{ .buf = buf };
         kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
         return buf[0..w.written().len];

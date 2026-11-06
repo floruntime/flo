@@ -1794,7 +1794,7 @@ pub const Simulator = struct {
 
     /// What a batch did at this replica, after the machine answered: one it
     /// refused reached nothing. Its proposer's limit is checked either way.
-    fn countTxn(self: *Simulator, node: *const SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, live: bool, effect: families.Kv.Effect) void {
+    fn countTxn(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, live: bool, effect: families.Kv.Effect, txns_before: i64) void {
         const c = &self.txn_counts;
         const ops = kv_entries.batchOpCount(e.payload);
         if (self.workload.opIdAt(e.header.term, idx, e.header.entry_type, e.payload)) |id| {
@@ -1820,6 +1820,13 @@ pub const Simulator = struct {
             });
             return;
         }
+        if (node.kv.counter(workload_mod.TXN_APPLIED_KEY) != txns_before + 1) self.checker.fail(.{
+            .invariant = .applied_integrity,
+            .node = node.id,
+            .index = idx,
+            .tick = self.now,
+            .detail = "the KV machine applied a batch without reaching its last op",
+        });
         const large = ops > limits.MAX_OPS_PER_TXN / 2;
         if (first) {
             c.applied += 1;
@@ -2037,9 +2044,11 @@ pub const Simulator = struct {
         // Counted where the first replica reaches the index, so an entry
         // counts once, not once per replica and replay.
         const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
+        const is_txn = is_op and self.scenario.hasTxnLimits() and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch);
+        const txns_before = if (is_txn) node.kv.counter(workload_mod.TXN_APPLIED_KEY) else 0;
         if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
             if (first) self.kv_counts.count(effect);
-            if (self.scenario.hasTxnLimits() and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch)) self.countTxn(node, e, idx, first, live, effect);
+            if (is_txn) self.countTxn(node, e, idx, first, live, effect, txns_before);
         } else |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{
                 .invariant = .refusal_wrote,
