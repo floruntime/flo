@@ -169,7 +169,7 @@ fn connect(port: u16) !std.c.fd_t {
 fn statusOnce(fd: std.c.fd_t, run: []const u8, want: action_ops.RunStatus, max_ms: u64) !Status {
     var waited: u64 = 0;
     while (true) : (waited += 100) {
-        const s = try runStatus(fd, run);
+        const s = try runStatusRetrying(fd, run, 25);
         if (s.status == want) return s;
         if (waited >= max_ms) {
             std.debug.print("\nrun {s} is {t}, not {t}, after {d} ms\n", .{ run, s.status, want, max_ms });
@@ -437,10 +437,9 @@ test "e2e/action/cluster: after a leader is killed, a lease longer than the new 
     defer _ = std.c.close(fd);
     // The new leader's grace ends about 30 s after it took over, well
     // before the deadline; until 4 s short of the deadline the run is held.
-    var first_read = true;
     while (stdx.time.milliTimestamp() - delivered_at < lease_ms - 4000) {
-        const s = if (first_read) try runStatusRetrying(fd, run, 25) else try runStatus(fd, run);
-        first_read = false;
+        // Any election in this long wait refuses reads for a moment.
+        const s = try runStatusRetrying(fd, run, 25);
         if (s.status != .running) {
             std.debug.print("\nrun {s} is {t} {d} ms after its deliver, before its {d} ms lease ended\n", .{ run, s.status, stdx.time.milliTimestamp() - delivered_at, lease_ms });
             return error.TestUnexpectedResult;

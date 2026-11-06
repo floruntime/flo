@@ -208,6 +208,15 @@ pub fn writes(req: proto.Request) bool {
     return false;
 }
 
+/// Whether a table op is a read inside a transaction. It goes to the leader
+/// with the transaction's writes, but reads the leader's state past them.
+pub fn readsInTxn(req: proto.Request) bool {
+    inline for (table.op_table) |o| {
+        if (o.code == req.header.op_code) return !o.isWrite() and txnId(req) != null;
+    }
+    return false;
+}
+
 /// Whether a table op is a read its leader answers.
 pub fn atLeader(req: proto.Request) bool {
     inline for (table.op_table) |o| {
