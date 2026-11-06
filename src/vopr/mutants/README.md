@@ -14,6 +14,10 @@ means the check stopped catching its bug.
 | `actions.json` | `release_counts_nothing` | `action_rule` | `a run's failures don't count the deliveries that failed` |
 | `actions.json` | `settle_keeps_request` | `action_rule` | `a request record names a delivery that isn't live` |
 | `actions.json` | `action_node_clock` | `state_checksum` | `action.` |
+| `txn-limits.json` | `kv_refuses_over_own_limit` | `state_checksum` | `kv.value` |
+| `txn-limits.json` | `kv_refuses_large` | `applied_integrity` | `none of whose ops can be refused` |
+| `txn-limits.json` | `kv_stops_batch_short` | `applied_integrity` | `without reaching its last op` |
+| `txn-limits.json` | `leader_ignores_limit` | `txn_gate` | `a leader proposed a batch above its own transaction limit` |
 | `catching-up.json` | `ns_ungated` | `ns_stale_id` | `was refused for an id another create took` |
 | `catching-up.json` | `ns_ready_on_commit` | `ns_stale_id` | `was refused for an id another create took` |
 | `catching-up-alloc.json` | `ns_keeps_alloc` | `ns_dense_id` | `took an id past the next free one` |
@@ -28,5 +32,6 @@ passes:
   plant them in fixed runs.
 
 A scenario is re-recorded from a fresh swarm (`vopr --iterations=N --actions
---family-mutant=M`, or `--catching-up` for the namespace mutants) when a
+--family-mutant=M`, `--catching-up` for the namespace mutants, or
+`--txn-limits` for the limit mutants) when a
 change to the workload stops it reaching a bug.

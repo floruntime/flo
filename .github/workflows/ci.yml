@@ -365,6 +365,20 @@ jobs:
         # namespace create may lose its id to another.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --catching-up --seed-timeout=120 --out-dir=/tmp/vopr-catching-up
         timeout-minutes: 20
+      - name: Swarm with per-node transaction limits
+        # Each node has its own limit on the batches it proposes, up to the
+        # built-in most, and applies whatever committed. It fails unless at
+        # least 3 seeds each have a leader refuse a batch, and apply batches
+        # above half the most past a replica's limit and on replay, and 2 at a
+        # later leader below them.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --txn-limits --seed-timeout=120 --out-dir=/tmp/vopr-txn-limits
+        timeout-minutes: 10
+      - name: Swarm with frequent membership changes
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --membership --seed-timeout=120 --out-dir=/tmp/vopr-membership
+        timeout-minutes: 10
+      - name: Swarm with a ring too small to hold what followers need
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --small-ring --seed-timeout=120 --out-dir=/tmp/vopr-small-ring
+        timeout-minutes: 10
       - name: Mutant scenarios still fail
         # Each row of src/vopr/mutants/README.md plants a bug the checker
         # must catch, with the invariant and the words named; the scenario
