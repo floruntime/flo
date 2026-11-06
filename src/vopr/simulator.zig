@@ -1802,7 +1802,9 @@ pub const Simulator = struct {
         if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_batch)) return;
         const answer = Workload.batchAnswer(e.payload) orelse return;
         const refused = effect == .batch_condition_refused;
-        if (refused != (answer == .refuses)) self.checker.fail(.{
+        // A refusal for another reason is `countTxn`'s and the checksums' to judge.
+        const wrong = if (answer == .holds) refused else !refused and effect != .staged_refused;
+        if (wrong) self.checker.fail(.{
             .invariant = .applied_integrity,
             .node = node.id,
             .index = idx,
