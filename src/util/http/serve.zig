@@ -221,7 +221,6 @@ pub fn writeAll(fd: posix.socket_t, bytes: []const u8) error{WriteFailed}!void {
 /// A plain close: what was written is still sent, then FIN. The request was
 /// read whole first, so no unread input turns the close into a reset.
 fn close(allocator: std.mem.Allocator, c: *Conn) void {
-    // Raw std.c because the std wrapper panics on an fd the peer already reset.
     _ = std.c.close(c.fd);
     c.buf.deinit(allocator);
     c.* = .{};

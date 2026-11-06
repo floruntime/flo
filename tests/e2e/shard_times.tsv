@@ -9,6 +9,7 @@
 4397	cluster_secret_test
 410	cluster_test
 1996	config_test
+2000	connections_test
 926	dashboard_actions_test
 3896	dashboard_floql_test
 4560	dashboard_kv_test
