@@ -87,6 +87,20 @@ pub const WorkflowHandler = struct {
     /// step proposes, and the shard applies nothing in the middle of a
     /// module's work.
     started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
+    /// Runs parked on an action or a child, by their keys in `runs`: what
+    /// the duty looks at, so its cost follows the work in flight and not
+    /// every run ever started. Leader memory, like a step's state.
+    parked: std.StringHashMapUnmanaged(void) = .empty,
+    /// When a parked run's poll or signal wait is due, earliest first. An
+    /// entry is checked against the run when it comes due, so one outdated
+    /// by the run moving on is dropped then.
+    timers: std.PriorityQueue(Timer, void, timerCompare) = .empty,
+    /// An insert into `parked` or `timers` failed, and when to try again.
+    rewatch: bool = false,
+    rewatch_at_ms: i64 = 0,
+    /// Runs not yet finished, by "namespace:workflow": kept by the appliers,
+    /// so a schedule's `max_concurrent` needn't count them.
+    active_runs: std.StringHashMapUnmanaged(u32) = .empty,
 
     /// Completions a busy log refused, retried by the tick (`retryCompletions`).
     /// It drains only while this node leads; after a step-down and
@@ -265,6 +279,9 @@ pub const WorkflowHandler = struct {
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
         wait_timeout_at_ms: i64 = 0,
 
+        /// This run's key in `runs`, which owns it.
+        ns_key: []const u8 = "",
+
         /// Transition target to follow when wait times out.
         wait_timeout_target_owned: ?[]const u8 = null,
 
@@ -309,6 +326,12 @@ pub const WorkflowHandler = struct {
         last_trigger_ms: i64,
     };
 
+    const Timer = struct { at_ms: i64, ns_key: []const u8 };
+
+    fn timerCompare(_: void, a: Timer, b: Timer) std.math.Order {
+        return std.math.order(a.at_ms, b.at_ms);
+    }
+
     pub fn init(allocator: Allocator) WorkflowHandler {
         return .{
             .allocator = allocator,
@@ -350,6 +373,11 @@ pub const WorkflowHandler = struct {
         self.idem_index.deinit(self.allocator);
         for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.deinit(self.allocator);
+        self.parked.deinit(self.allocator);
+        self.timers.deinit(self.allocator);
+        var ak = self.active_runs.keyIterator();
+        while (ak.next()) |k| self.allocator.free(k.*);
+        self.active_runs.deinit(self.allocator);
 
         // Free disabled keys (ns-qualified)
         var diit = self.disabled.iterator();
@@ -1631,6 +1659,9 @@ pub const WorkflowHandler = struct {
                         }
                     }
 
+                    // A signal's match brings the run back here, so this is
+                    // how any wait ends too.
+                    self.clearWaitTimeout(run);
                     if (signal_found) {
                         // Signal already received — follow "success" transition
                         self.addHistoryEvent(run, "step_completed", step_label, now_ms);
@@ -1658,6 +1689,7 @@ pub const WorkflowHandler = struct {
                     if (wait_step.timeout_ms) |timeout_ms| {
                         // Saturating: a timeout past the clock never fires.
                         run.wait_timeout_at_ms = now_ms +| timeout_ms;
+                        self.armTimer(run, run.wait_timeout_at_ms);
                         if (wait_step.on_timeout) |target| {
                             if (run.wait_timeout_target_owned) |old| self.allocator.free(old);
                             run.wait_timeout_target_owned = self.allocator.dupe(u8, target) catch null;
@@ -1801,6 +1833,7 @@ pub const WorkflowHandler = struct {
     /// Park a workflow run waiting for a child workflow to reach a terminal state.
     fn parkForChild(self: *WorkflowHandler, run: *RunRecord, child_run_id: []const u8, step_label: []const u8, child_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
         run.status = .waiting;
+        self.watchParked(run);
         run.pending_index = index;
 
         if (run.pending_child_run_id_owned) |old| self.allocator.free(old);
@@ -2085,6 +2118,7 @@ pub const WorkflowHandler = struct {
     /// Park a workflow run waiting for an async action to complete.
     fn parkForAction(self: *WorkflowHandler, run: *RunRecord, action_run_id: []const u8, step_label: []const u8, action_name: []const u8, target_shard_id: u16, now_ms: i64, index: u64) void {
         run.status = .waiting;
+        self.watchParked(run);
         run.pending_index = index;
 
         // Store tracking info for checkPendingActions
@@ -2129,6 +2163,7 @@ pub const WorkflowHandler = struct {
                 @intCast(poll_cfg.calculateDelay(run.poll_attempt - 1));
             run.poll_attempt += 1;
             run.poll_next_at_ms = now_ms +| delay;
+            self.armTimer(run, run.poll_next_at_ms);
             run.status = .waiting;
             self.addHistoryEvent(run, "poll_scheduled", step_label, now_ms);
             return .parked;
@@ -2141,8 +2176,22 @@ pub const WorkflowHandler = struct {
         return .{ .proceed = definition.StepOutcome.timeout };
     }
 
-    /// Check all waiting runs for completed async actions and timed-out signals.
-    /// Called periodically by the shard's task scheduler.
+    fn watchParked(self: *WorkflowHandler, run: *const RunRecord) void {
+        self.parked.put(self.allocator, run.ns_key, {}) catch |err| {
+            log.err("workflow run {s}: can't watch its step: {s}; trying again", .{ run.ns_key, @errorName(err) });
+            self.rewatch = true;
+        };
+    }
+
+    fn armTimer(self: *WorkflowHandler, run: *const RunRecord, at_ms: i64) void {
+        self.timers.push(self.allocator, .{ .at_ms = at_ms, .ns_key = run.ns_key }) catch |err| {
+            log.err("workflow run {s}: can't keep its timer: {s}; trying again", .{ run.ns_key, @errorName(err) });
+            self.rewatch = true;
+        };
+    }
+
+    /// Check parked runs for finished actions and children, and the timers
+    /// now due. Called periodically by the shard's task scheduler.
     pub fn checkPendingActions(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -2152,26 +2201,35 @@ pub const WorkflowHandler = struct {
 
         // Collect keys of runs that need resuming (can't modify map while iterating)
         var resume_keys: [64][]const u8 = undefined;
-        var timeout_keys: [64][]const u8 = undefined;
+        var due_keys: [64][]const u8 = undefined;
         var child_keys: [64][]const u8 = undefined;
-        var poll_keys: [64][]const u8 = undefined;
         var resume_count: usize = 0;
-        var timeout_count: usize = 0;
+        var due_count: usize = 0;
         var child_count: usize = 0;
-        var poll_count: usize = 0;
 
-        var it = self.runs.iterator();
-        while (it.next()) |entry| {
-            const run = entry.value_ptr;
-            if (run.status != .waiting) continue;
+        if (self.rewatch and now_ms >= self.rewatch_at_ms) self.rewatchRuns(now_ms);
 
-            // Check due poll timers (a `poll:` step awaiting backoff re-invocation)
-            if (run.poll_next_at_ms > 0 and now_ms >= run.poll_next_at_ms) {
-                if (poll_count < poll_keys.len) {
-                    poll_keys[poll_count] = entry.key_ptr.*;
-                    poll_count += 1;
-                }
-                continue; // a polling run has no pending action/child/signal to check
+        // What's due and can't be taken this pass stays for the next.
+        while (self.timers.peek()) |top| {
+            if (top.at_ms > now_ms or due_count == due_keys.len) break;
+            _ = self.timers.popIndex(0);
+            const run = self.runs.getPtr(top.ns_key) orelse continue;
+            if (timerDue(run, now_ms) != .none) {
+                due_keys[due_count] = top.ns_key;
+                due_count += 1;
+            }
+        }
+
+        var it = self.parked.keyIterator();
+        while (it.next()) |key_ptr| {
+            const ns_key = key_ptr.*;
+            const run = self.runs.getPtr(ns_key) orelse {
+                self.parked.removeByPtr(key_ptr);
+                continue;
+            };
+            if (run.status != .waiting or (run.pending_action_run_id_owned == null and run.pending_child_run_id_owned == null)) {
+                self.parked.removeByPtr(key_ptr);
+                continue;
             }
 
             // Check async action completion
@@ -2180,33 +2238,22 @@ pub const WorkflowHandler = struct {
                     defer self.allocator.free(action);
                     self.addHistoryEvent(run, "action_not_registered", action, now_ms);
                 }
-                const done = if (getActionRunResult(shard, entry.key_ptr.*, run.pending_action_shard_id, action_rid)) |result|
+                const done = if (getActionRunResult(shard, ns_key, run.pending_action_shard_id, action_rid)) |result|
                     result.status == .completed or result.status == .failed or result.status == .timed_out or result.status == .cancelled
                 else
                     pendingLost(shard, run, run.pending_action_shard_id);
                 if (done and resume_count < resume_keys.len) {
-                    resume_keys[resume_count] = entry.key_ptr.*;
+                    resume_keys[resume_count] = ns_key;
                     resume_count += 1;
                 }
             }
 
             // Check child workflow completion
             if (run.pending_child_run_id_owned) |child_rid| {
-                if (self.childRunTerminal(shard, entry.key_ptr.*, child_rid, run)) {
+                if (self.childRunTerminal(shard, ns_key, child_rid, run)) {
                     if (child_count < child_keys.len) {
-                        child_keys[child_count] = entry.key_ptr.*;
+                        child_keys[child_count] = ns_key;
                         child_count += 1;
-                    }
-                }
-            }
-
-            // Check wait_for_signal timeouts
-            if (run.wait_timeout_at_ms > 0 and now_ms >= run.wait_timeout_at_ms) {
-                // Only timeout if not already handled as an action resume
-                if (run.pending_action_run_id_owned == null) {
-                    if (timeout_count < timeout_keys.len) {
-                        timeout_keys[timeout_count] = entry.key_ptr.*;
-                        timeout_count += 1;
                     }
                 }
             }
@@ -2222,22 +2269,56 @@ pub const WorkflowHandler = struct {
             self.resumeFromChild(shard, ns_key, now_ms);
         }
 
-        // Fire due poll timers — re-invoke the current step's action.
-        for (poll_keys[0..poll_count]) |ns_key| {
-            if (self.runs.getPtr(ns_key)) |r| {
-                r.poll_next_at_ms = 0;
-                r.status = .running;
-                if (r.wait_signal_type_owned) |s| self.allocator.free(s);
-                r.wait_signal_type_owned = null;
+        // A run can have two entries due at once, and what ran before this
+        // may have moved it on: each is asked again as it fires.
+        for (due_keys[0..due_count]) |ns_key| {
+            const r = self.runs.getPtr(ns_key) orelse continue;
+            switch (timerDue(r, now_ms)) {
+                .none => {},
+                // Re-invoke the current step's action.
+                .poll => {
+                    r.poll_next_at_ms = 0;
+                    r.status = .running;
+                    if (r.wait_signal_type_owned) |sig| self.allocator.free(sig);
+                    r.wait_signal_type_owned = null;
+                    const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
+                    self.advanceWorkflow(shard, ns_key, ns_key[0..ns_end]);
+                },
+                .wait => self.handleWaitTimeout(shard, ns_key, now_ms),
             }
-            const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
-            self.advanceWorkflow(shard, ns_key, ns_key[0..ns_end]);
         }
 
-        // Handle signal timeouts
-        for (timeout_keys[0..timeout_count]) |ns_key| {
-            self.handleWaitTimeout(shard, ns_key, now_ms);
+        // Its capacity is what the walk above costs.
+        if (self.parked.count() == 0 and self.parked.capacity() > 64) self.parked.clearAndFree(self.allocator);
+    }
+
+    /// Which of a run's timers has come due, if any.
+    fn timerDue(run: *const RunRecord, now_ms: i64) enum { none, poll, wait } {
+        if (run.status != .waiting) return .none;
+        if (run.poll_next_at_ms > 0 and now_ms >= run.poll_next_at_ms) return .poll;
+        if (run.wait_timeout_at_ms > 0 and now_ms >= run.wait_timeout_at_ms and run.pending_action_run_id_owned == null) return .wait;
+        return .none;
+    }
+
+    /// A wait is over: its deadline and target aren't the next wait's.
+    fn clearWaitTimeout(self: *WorkflowHandler, run: *RunRecord) void {
+        run.wait_timeout_at_ms = 0;
+        if (run.wait_timeout_target_owned) |t| self.allocator.free(t);
+        run.wait_timeout_target_owned = null;
+    }
+
+    /// An insert into `parked` or `timers` failed: what they should hold is
+    /// read from the runs again, at most once a second until it fits.
+    fn rewatchRuns(self: *WorkflowHandler, now_ms: i64) void {
+        self.rewatch = false;
+        var it = self.runs.valueIterator();
+        while (it.next()) |run| {
+            if (run.status != .waiting) continue;
+            if (run.pending_action_run_id_owned != null or run.pending_child_run_id_owned != null) self.watchParked(run);
+            if (run.poll_next_at_ms > 0) self.armTimer(run, run.poll_next_at_ms);
+            if (run.wait_timeout_at_ms > 0) self.armTimer(run, run.wait_timeout_at_ms);
         }
+        self.rewatch_at_ms = now_ms +| 1000;
     }
 
     /// Whether the child run referenced by a parent is in a terminal state.
@@ -3064,19 +3145,9 @@ pub const WorkflowHandler = struct {
             // Skip disabled workflows
             if (self.disabled.contains(entry.key_ptr.*)) continue;
 
-            // Check max_concurrent: count active (non-terminal) runs for this workflow
+            // Check max_concurrent
             if (schedule.max_concurrent > 0) {
-                var active_count: u32 = 0;
-                var rit = self.runs.iterator();
-                while (rit.next()) |rentry| {
-                    const run = rentry.value_ptr;
-                    if (!run.status.isTerminal() and
-                        std.mem.eql(u8, run.workflow_name_owned, schedule.workflow_name_owned))
-                    {
-                        active_count += 1;
-                    }
-                }
-                if (active_count >= schedule.max_concurrent) continue;
+                if ((self.active_runs.get(entry.key_ptr.*) orelse 0) >= schedule.max_concurrent) continue;
             }
 
             schedule.last_trigger_ms = now_ms;
@@ -3644,6 +3715,13 @@ pub const WorkflowHandler = struct {
         }
     }
 
+    fn noteRunFinished(self: *WorkflowHandler, run: *const RunRecord) void {
+        const ns_end = std.mem.indexOfScalar(u8, run.ns_key, ':') orelse return;
+        const key = self.makeNsKey(run.ns_key[0..ns_end], run.workflow_name_owned) orelse return;
+        defer self.allocator.free(key);
+        if (self.active_runs.getPtr(key)) |n| n.* -|= 1;
+    }
+
     /// Sets the run's terminal state from a workflow_complete value stamped
     /// `completed_at_ms`; the producer and replay both apply it here. A
     /// value cut short, or an allocation that fails, leaves the run as it
@@ -3652,6 +3730,7 @@ pub const WorkflowHandler = struct {
         const entry = CompleteEntry.parse(value) orelse return error.Halt;
         const built = try self.buildComplete(&entry);
 
+        if (!run.status.isTerminal()) self.noteRunFinished(run);
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
         run.status = entry.status;
@@ -3886,11 +3965,18 @@ pub const WorkflowHandler = struct {
             }
         }
 
+        run.ns_key = ns_key;
+        const active = self.activeRuns(namespace, wf_name) orelse {
+            self.freeRunRecord(&run);
+            self.allocator.free(ns_key);
+            return error.OutOfMemory;
+        };
         self.runs.put(ns_key, run) catch {
             self.freeRunRecord(&run);
             self.allocator.free(ns_key);
             return error.OutOfMemory;
         };
+        active.* += 1;
         out.putInt(u8, 1);
         out.putBytes(raw_run_id);
         if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
@@ -3902,6 +3988,18 @@ pub const WorkflowHandler = struct {
                 stored.search_tags_owned = self.buildSearchTags(def_ns_key, stored);
             }
         }
+    }
+
+    /// The count of `namespace`'s unfinished runs of a workflow, for the
+    /// caller to change at once.
+    fn activeRuns(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8) ?*u32 {
+        const key = self.makeNsKey(namespace, wf_name) orelse return null;
+        const got = self.active_runs.getOrPut(self.allocator, key) catch {
+            self.allocator.free(key);
+            return null;
+        };
+        if (got.found_existing) self.allocator.free(key) else got.value_ptr.* = 0;
+        return got.value_ptr;
     }
 
     /// Apply a workflow_complete entry. Updates the run's terminal status,
@@ -4138,6 +4236,13 @@ const test_workflow_json =
     \\"steps":{"step_b":{"run":"@actions/step-b","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}}
 ;
 
+/// Two waits: the first's timeout goes to the second, which has none.
+const test_two_waits_json =
+    \\{"kind":"Workflow","name":"two-waits","version":"1.0.0",
+    \\"start":{"wait_for_signal":{"type":"first","timeout_ms":3600000,"on_timeout":"second"},"transitions":{"success":"second"}},
+    \\"steps":{"second":{"wait_for_signal":{"type":"second"},"transitions":{"success":"flo.Completed"}}}}
+;
+
 /// Workflow with a wait_for_signal step
 const test_wait_workflow_json =
     \\{"kind":"Workflow","name":"wait-wf","version":"1.0.0",
@@ -4310,6 +4415,7 @@ fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const 
     };
 
     handler.runs.put(owned_ns, .{
+        .ns_key = owned_ns,
         .run_id_owned = owned_rid,
         .workflow_name_owned = owned_wf,
         .workflow_version_owned = owned_ver,
@@ -4357,6 +4463,7 @@ fn createTestRunWithInput(handler: *WorkflowHandler, ns_key: []const u8, run_id:
     };
 
     handler.runs.put(owned_ns, .{
+        .ns_key = owned_ns,
         .run_id_owned = owned_rid,
         .workflow_name_owned = owned_wf,
         .workflow_version_owned = owned_ver,
@@ -4878,6 +4985,240 @@ test "step executor: a plan's executor waits when the only other's breaker is op
     }
 }
 
+test "workflow duty: looks only at runs parked on an action or a child" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+
+    // A run that hasn't parked, and one parked and then done with: neither
+    // is walked.
+    createTestRun(&handler, "default:idle", "idle", "test-wf");
+    try testing.expectEqual(@as(u32, 0), handler.parked.count());
+    createTestRun(&handler, "default:p", "p", "test-wf");
+    handler.advanceWorkflow(&shard, "default:p", "default");
+    _ = shard.applyCommitted();
+    try testing.expectEqual(@as(u32, 1), handler.parked.count());
+    const run = handler.runs.getPtr("default:p").?;
+    run.status = .running;
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(@as(u32, 0), handler.parked.count());
+}
+
+test "workflow duty: a timer fires when due, and one the run moved past is dropped" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+
+    createTestRun(&handler, "default:due", "due", "test-wf");
+    createTestRun(&handler, "default:moved", "moved", "test-wf");
+    createTestRun(&handler, "default:later", "later", "test-wf");
+    const now = @import("stdx").time.milliTimestamp();
+    for ([_][]const u8{ "default:due", "default:moved", "default:later" }, [_]i64{ now - 1, now - 1, now + 3_600_000 }) |key, at| {
+        const run = handler.runs.getPtr(key).?;
+        run.status = .waiting;
+        run.wait_timeout_at_ms = at;
+        handler.armTimer(run, at);
+    }
+    handler.runs.getPtr("default:moved").?.status = .running;
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+
+    try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, handler.runs.get("default:due").?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:moved").?.status);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get("default:later").?.status);
+    // The later one's timer is still held.
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+}
+
+test "workflow duty: a run with two timers due fires once" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
+    createTestRun(&handler, "default:r", "r", "two-waits");
+    handler.advanceWorkflow(&shard, "default:r", "default");
+
+    // Parked on its first wait, whose timeout goes to a second with none.
+    // Two entries come due at once, as when an earlier wait's stays behind.
+    const run = handler.runs.getPtr("default:r").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    run.wait_timeout_at_ms = 1;
+    handler.armTimer(run, 1);
+    handler.armTimer(run, 1);
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+
+    const after = handler.runs.get("default:r").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, after.status);
+    try testing.expectEqualStrings("second", after.current_step_name_owned.?);
+    try testing.expectEqual(@as(i64, 0), after.wait_timeout_at_ms);
+}
+
+test "workflow duty: a wait with a timeout arms its timer, which holds until due" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
+    createTestRun(&handler, "default:r", "r", "two-waits");
+    handler.advanceWorkflow(&shard, "default:r", "default");
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+
+    const run = handler.runs.getPtr("default:r").?;
+    // Not due: it stays.
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try testing.expect(run.current_step_name_owned == null);
+}
+
+test "workflow duty: an entry from before doesn't fire a run's later timer" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    const later = @import("stdx").time.milliTimestamp() + 3_600_000;
+    createTestRun(&handler, "default:w", "w", "test-wf");
+    createTestRun(&handler, "default:p", "p", "test-wf");
+    const waits = handler.runs.getPtr("default:w").?;
+    waits.status = .waiting;
+    waits.wait_timeout_at_ms = later;
+    handler.armTimer(waits, 1);
+    const polls = handler.runs.getPtr("default:p").?;
+    polls.status = .waiting;
+    polls.poll_next_at_ms = later;
+    handler.armTimer(polls, 1);
+
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get("default:w").?.status);
+    try testing.expectEqual(later, handler.runs.get("default:p").?.poll_next_at_ms);
+    try testing.expectEqual(@as(usize, 0), handler.timers.count());
+}
+
+test "workflow duty: a signal already there ends a wait, and leaves no deadline or target for the next" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
+    createTestRun(&handler, "default:r", "r", "two-waits");
+    const run = handler.runs.getPtr("default:r").?;
+    // What an earlier wait left, and the signal the first wait wants.
+    run.wait_timeout_at_ms = 1;
+    run.wait_timeout_target_owned = try allocator.dupe(u8, "elsewhere");
+    try run.signals.append(allocator, .{ .signal_type_owned = try allocator.dupe(u8, "first"), .payload_owned = null, .received_at_ms = 0 });
+
+    handler.advanceWorkflow(&shard, "default:r", "default");
+    try testing.expectEqualStrings("second", run.current_step_name_owned.?);
+    try testing.expectEqual(@as(i64, 0), run.wait_timeout_at_ms);
+    try testing.expect(run.wait_timeout_target_owned == null);
+}
+
+test "workflow duty: a failed insert is made good from the runs" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
+    createTestRun(&handler, "default:r", "r", "two-waits");
+    createTestRun(&handler, "default:p", "p", "two-waits");
+    const timed = handler.runs.getPtr("default:r").?;
+    timed.status = .waiting;
+    timed.wait_timeout_at_ms = @import("stdx").time.milliTimestamp() + 3_600_000;
+    const parked = handler.runs.getPtr("default:p").?;
+    parked.status = .waiting;
+    parked.pending_action_run_id_owned = try allocator.dupe(u8, "gone");
+
+    // The inserts failed: nothing is held for either run.
+    handler.rewatch = true;
+    handler.checkPendingActions(&shard);
+    try testing.expect(!handler.rewatch);
+    try testing.expectEqual(@as(usize, 1), handler.timers.count());
+    try testing.expect(handler.parked.contains("default:p"));
+}
+
+test "workflow schedule: max_concurrent follows runs starting and finishing, each counted once, per namespace" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    var out: Result = .{};
+    var value: [64]u8 = undefined;
+    var off: usize = 0;
+    for ([_][]const u8{ "wf", "1" }) |p| {
+        std.mem.writeInt(u16, value[off..][0..2], @intCast(p.len), .little);
+        @memcpy(value[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    value[off] = @backingInt(WorkflowHandler.RunStatus.running);
+    off += 1;
+    @memset(value[off..][0..4], 0); // no event type, no idempotency key
+    off += 4;
+    try handler.replayStart("a:r1", value[0..off], 1, &out);
+    try handler.replayStart("a:r2", value[0..off], 1, &out);
+    try handler.replayStart("b:r1", value[0..off], 1, &out);
+    try testing.expectEqual(@as(?u32, 2), handler.active_runs.get("a:wf"));
+    try testing.expectEqual(@as(?u32, 1), handler.active_runs.get("b:wf"));
+    // A start applied again creates nothing.
+    try handler.replayStart("a:r1", value[0..off], 1, &out);
+    try testing.expectEqual(@as(?u32, 2), handler.active_runs.get("a:wf"));
+
+    handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 });
+    const runsOf = struct {
+        fn count(h: *WorkflowHandler, shard_: *Shard) usize {
+            h.schedules.getPtr("a:wf").?.last_trigger_ms = 0;
+            const before = shard_.raft_node.log.lastIndex();
+            h.tickSchedules(shard_);
+            return shard_.raft_node.log.lastIndex() - before;
+        }
+    }.count;
+    // Two unfinished here: it holds, though another namespace's run makes three.
+    try testing.expectEqual(@as(usize, 0), runsOf(&handler, &shard));
+
+    const run = handler.runs.getPtr("a:r1").?;
+    const c: WorkflowHandler.Completion = .{ .status = .cancelled, .output = null, .steps = &.{}, .history = &.{}, .last = .{ .event_type = "workflow_cancelled", .detail = "stop", .timestamp_ms = 7 }, .tags = null };
+    const record = try WorkflowHandler.encodeCompletion(allocator, c, WorkflowHandler.completionLimit("a:r1"));
+    defer allocator.free(record);
+    // The producer's copy and the commit's: one run finished.
+    try handler.applyComplete(run, record, 7);
+    try handler.applyComplete(run, record, 7);
+    try testing.expectEqual(@as(?u32, 1), handler.active_runs.get("a:wf"));
+    // Room now: it fires once.
+    try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+}
+
 test "step executor: failing action follows failure transition" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -5219,7 +5560,9 @@ test "step executor: checkPendingActions handles completed async action" {
             return;
         };
 
+        try handler.parked.put(alloc, ns_key, {});
         handler.runs.put(ns_key, .{
+            .ns_key = ns_key,
             .run_id_owned = rid,
             .workflow_name_owned = wf,
             .workflow_version_owned = ver,

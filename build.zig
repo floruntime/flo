@@ -277,6 +277,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-contract", .source = "bench/bench_contract.zig" },
         .{ .name = "bench-actions", .source = "bench/bench_actions.zig" },
         .{ .name = "bench-action-loop", .source = "bench/bench_action_loop.zig" },
+        .{ .name = "bench-workflow-idle", .source = "bench/bench_workflow_idle.zig" },
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
         .{ .name = "bench-txn-latency", .source = "bench/bench_txn_latency.zig" },
     };
