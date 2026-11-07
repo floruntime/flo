@@ -108,8 +108,8 @@ fn backlog(shard: *Shard, name: []const u8, n: usize, ops: u16) !void {
     var kbuf: [256][16]u8 = undefined;
     var items: [256]kv_entries.BatchOp.Value = undefined;
     for (0..n) |i| {
-        const body = if (ops == 1) try kv_entries.Put.encodeInto(&payload, .{ .key = try std.fmt.bufPrint(&kbuf[0], "bl-{d:0>6}", .{i % 4096}), .value = "value-padding-padding", .ttl_ms = null }) else b: {
-            for (items[0..ops], 0..) |*it, k| it.* = .{ .kind = .put, .key = try std.fmt.bufPrint(&kbuf[k], "bl-{d:0>6}", .{(i * ops + k) % 4096}), .value = "value-padding-padding", .ttl_ms = null, .delta = null };
+        const body = if (ops == 1) try kv_entries.Put.encodeInto(&payload, .{ .key = try std.fmt.bufPrint(&kbuf[0], "bl-{d:0>6}", .{i % 4096}), .value = "value-padding-padding", .ttl_ms = null, .condition = .always, .cas_version = null }) else b: {
+            for (items[0..ops], 0..) |*it, k| it.* = .{ .kind = .put, .key = try std.fmt.bufPrint(&kbuf[k], "bl-{d:0>6}", .{(i * ops + k) % 4096}), .value = "value-padding-padding", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
             var w = src.protocol.schema.Writer{ .buf = &payload };
             try kv_entries.BatchOps.encodeSlice(&w, items[0..ops]);
             break :b w.written();

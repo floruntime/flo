@@ -161,8 +161,6 @@ pub const KVHandler = struct {
         KeyTooLong,
         ReservedKey,
         NotFound,
-        CasMismatch,
-        ConditionFailed,
         NoSuchTransaction,
         WrongRoutingKey,
         TxnTooLarge,
@@ -173,8 +171,6 @@ pub const KVHandler = struct {
         TooManyProposals,
         TooLarge,
         AnswerTooLarge,
-        NotACounter,
-        CounterOverflow,
         PathNotFound,
         BadPath,
         NotADocument,
@@ -194,8 +190,6 @@ pub const KVHandler = struct {
             error.KeyTooLong => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key is too long: at most {d} bytes, namespace included", .{MAX_QUALIFIED_KEY})),
             error.ReservedKey => refused(.unauthorized, .reserved_key, "unauthorized: the key is in a prefix the server keeps for itself"),
             error.NotFound => refused(.not_found, .not_found, "not found"),
-            error.CasMismatch => refused(.conflict, .cas_mismatch, "conflict: cas_version isn't the key's version"),
-            error.ConditionFailed => refused(.conflict, .condition_failed, "conflict: the condition didn't hold"),
             error.NoSuchTransaction => refused(.not_found, .no_such_transaction, "not found: no such transaction — it committed, rolled back, or was begun in another namespace"),
             error.WrongRoutingKey => refused(.bad_request, .wrong_routing_key, "bad request: the routing key (the key, when none is given) isn't the one the transaction was begun with"),
             error.TxnTooLarge => refused(.bad_request, .txn_too_large, "bad request: the transaction holds as many ops or bytes as it may"),
@@ -206,8 +200,6 @@ pub const KVHandler = struct {
             error.TooManyProposals => refused(.overloaded, .too_many_proposals, persistence_mod.failureMessage(error.Overloaded, "")),
             error.AnswerTooLarge => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: the JSON at that path is more than an answer holds: at most {d} bytes", .{kv_ops.MAX_VALUE})),
             error.TooLarge => refused(.bad_request, .field_too_long, kv_machine.TOO_LARGE),
-            error.NotACounter => refused(.bad_request, .wrong_type, kv_machine.NOT_A_COUNTER),
-            error.CounterOverflow => refused(.bad_request, .out_of_range, kv_machine.INCR_OVERFLOW),
             error.PathNotFound => refused(.not_found, .not_found, kv_machine.PATH_NOT_FOUND),
             error.BadPath => refused(.bad_request, .malformed, kv_machine.BAD_PATH),
             error.NotADocument => refused(.bad_request, .wrong_type, kv_machine.NOT_A_DOCUMENT),
@@ -310,19 +302,12 @@ pub const KVHandler = struct {
         const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        const current = shard.kv_handler.*.kv.get(qkey);
-        if (cas_version) |want| if ((if (current) |e| e.version else 0) != want) return error.CasMismatch;
-        switch (condition) {
-            .always => {},
-            .if_absent => if (current != null) return error.ConditionFailed,
-            .if_present => if (current == null) return error.ConditionFailed,
-        }
         const ttl = ttl_ms orelse 0;
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .put, value, ttl);
+            try bufferInTxn(shard, t, qkey, .put, value, ttl, condition, cas_version);
             return .{ .answer = .{ .version = null } };
         }
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = if (ttl == 0) null else ttl }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = if (ttl == 0) null else ttl, .condition = condition, .cas_version = cas_version }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerSet } };
     }
@@ -353,7 +338,7 @@ pub const KVHandler = struct {
     }
 
     /// The transaction a request names, if any. Looked up before any other
-    /// check: a request refused for its key or condition still uses the
+    /// check: a request refused for its key still uses the
     /// transaction, and one that is gone is answered as gone.
     fn txnOf(shard: *Shard, req: Request, txn: ?u64, routing_key: ?[]const u8) Error!?*txn_mod.TxnState {
         return if (txn) |id| try openTxn(shard, req, id, routing_key) else null;
@@ -374,7 +359,7 @@ pub const KVHandler = struct {
         return txn_mod.idShard(table_run.txnId(req) orelse return null);
     }
 
-    const DeleteResponse = table_run.op("kv.delete").response;
+    pub const DeleteResponse = table_run.op("kv.delete").response;
     const ScanResponse = table_run.op("kv.scan").response;
     const HistoryResponse = table_run.op("kv.history").response;
     const MgetResponse = table_run.op("kv.mget").response;
@@ -401,14 +386,11 @@ pub const KVHandler = struct {
         const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        const current = shard.kv_handler.*.kv.get(qkey);
-        if (cas_version) |want| if ((if (current) |e| e.version else 0) != want) return error.CasMismatch;
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .delete, "", 0);
+            try bufferInTxn(shard, t, qkey, .delete, "", 0, .always, cas_version);
             return .{ .answer = .{ .existed = null } };
         }
-        if (current == null) return .{ .answer = .{ .existed = false } };
-        const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey, .cas_version = cas_version }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerDeleted } };
     }
 
@@ -622,15 +604,10 @@ pub const KVHandler = struct {
         const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        // A key whose TTL has run out is absent, as apply treats it.
-        if (shard.kv_handler.*.kv.get(qkey)) |e| {
-            if (e.value.len != 8) return error.NotACounter;
-            _ = std.math.add(i64, std.mem.readInt(i64, e.value[0..8], .little), delta) catch return error.CounterOverflow;
-        }
         var delta_bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &delta_bytes, delta, .little);
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .incr, &delta_bytes, 0);
+            try bufferInTxn(shard, t, qkey, .incr, &delta_bytes, 0, .always, null);
             return .{ .answer = .{ .version = null, .value = null } };
         }
         const proposed = proposeKV(shard, .kv_incr, .{ .key = qkey, .delta = delta }) catch |err| return proposeError(err);
@@ -661,13 +638,11 @@ pub const KVHandler = struct {
         const in_txn = try txnOf(shard, req, txn, routing_key);
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
         const qkey = try tableKey(&qbuf, req);
-        const current = shard.kv_handler.*.kv.get(qkey) orelse return error.NotFound;
-        if (cas_version) |want| if (current.version != want) return error.CasMismatch;
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .expire, "", ttl_ms);
+            try bufferInTxn(shard, t, qkey, .expire, "", ttl_ms, .always, cas_version);
             return .{ .answer = .{} };
         }
-        const proposed = proposeKV(shard, .kv_expire, .{ .key = qkey, .ttl_ms = ttl_ms }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_expire, .{ .key = qkey, .ttl_ms = ttl_ms, .cas_version = cas_version }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerExpired } };
     }
 
@@ -834,8 +809,10 @@ pub const KVHandler = struct {
         kind: txn_mod.TxnOpKind,
         value: []const u8,
         ttl_ms: u64,
+        condition: kv_ops.Condition,
+        cas_version: ?u64,
     ) Error!void {
-        shard.kv_handler.*.txn_table.appendOp(t.txn_id, kind, qkey, value, ttl_ms) catch |err| return switch (err) {
+        shard.kv_handler.*.txn_table.appendOp(t.txn_id, kind, qkey, value, ttl_ms, condition, cas_version) catch |err| return switch (err) {
             error.TxnTooLarge => error.TxnTooLarge,
             error.OutOfMemory => error.Internal,
         };
@@ -914,7 +891,7 @@ pub const KVHandler = struct {
     /// For tests: propose a put of `value` at `key` in the default
     /// namespace, as kv.set would.
     pub fn testProposePut(shard: *Shard, key: []const u8, value: []const u8) !@import("../raft/node.zig").ProposeResult {
-        return proposeKV(shard, .kv_put, .{ .key = key, .value = value, .ttl_ms = null });
+        return proposeKV(shard, .kv_put, .{ .key = key, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null });
     }
 
     fn encodeError(err: schema.EncodeError) error{ PayloadTooLarge, TtlTooLarge } {
@@ -983,7 +960,7 @@ pub const KVHandler = struct {
     pub fn sinkPropose(shard: *Shard, namespace: []const u8, qkey: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
         if (isReservedKey(kv_state.Qualified.of(qkey).key)) return "access to reserved key denied";
         shard.namespace_handler.proposeImplicitCreate(namespace, shard);
-        _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms }) catch |err| return switch (err) {
+        _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
             error.NotLeader => "this node doesn't lead its group",
             error.WritesStopped => "the shard stopped taking writes",
             error.Halted => "the shard is halted",
@@ -1053,7 +1030,7 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
     var kv: KvState = .{ .store = &store };
     var pbuf: [64]u8 = undefined;
     for ([_][2][]const u8{ .{ "b\x00k", "b-value" }, .{ "mine", "default-value" } }, 1..) |kvp, i| {
-        const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, i, i, try kv_entries.Put.encodeInto(&pbuf, .{ .key = kvp[0], .value = kvp[1], .ttl_ms = null }));
+        const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, i, i, try kv_entries.Put.encodeInto(&pbuf, .{ .key = kvp[0], .value = kvp[1], .ttl_ms = null, .condition = .always, .cas_version = null }));
         var out: Result = .{};
         out.reset(&e);
         try @import("../contract/machine.zig").applyEntry(&@import("machine.zig").machine, &store, &scratch, &e, &out);

@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const stdx_time = @import("stdx").time;
 const limits = @import("../protocol/limits.zig");
+const kv_ops = @import("../protocol/kv_ops.zig");
 const schema = @import("../protocol/schema.zig");
 const kv_entries = @import("../protocol/kv_entries.zig");
 
@@ -76,6 +77,9 @@ pub const TxnOp = struct {
     /// TTL in milliseconds, counted from the batch's stamp at apply: a
     /// put's (0 = none) or an expire's (0 = clear it).
     ttl_ms: u64,
+    /// Decided when the batch applies, seeing the ops before this one.
+    condition: kv_ops.Condition = .always,
+    cas_version: ?u64 = null,
 };
 
 // ─── Per-txn state ────────────────────────────────────────────────────────
@@ -211,6 +215,8 @@ pub const TxnTable = struct {
         key: []const u8,
         value: []const u8,
         ttl_ms: u64,
+        condition: kv_ops.Condition,
+        cas_version: ?u64,
     ) AppendError!void {
         const txn = self.map.getPtr(txn_id) orelse return error.TxnTooLarge; // unreachable in practice — caller checks
         if (txn.ops.items.len >= self.max_ops) return error.TxnTooLarge;
@@ -229,6 +235,8 @@ pub const TxnTable = struct {
             .key = owned_key,
             .value = owned_val,
             .ttl_ms = ttl_ms,
+            .condition = condition,
+            .cas_version = cas_version,
         });
         txn.payload_bytes += key.len + value.len;
     }
@@ -315,7 +323,7 @@ pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory
 }
 
 fn batchOp(op: TxnOp) kv_entries.BatchOp.Value {
-    var v: kv_entries.BatchOp.Value = .{ .kind = op.kind, .key = op.key, .value = null, .ttl_ms = null, .delta = null };
+    var v: kv_entries.BatchOp.Value = .{ .kind = op.kind, .key = op.key, .value = null, .ttl_ms = null, .delta = null, .condition = op.condition, .cas_version = op.cas_version };
     switch (op.kind) {
         .put => {
             v.value = op.value;
@@ -352,8 +360,8 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     const id = try tt.begin(0xDEADBEEF, 0xABCD);
     try t.expectEqual(@as(usize, 1), tt.count());
 
-    try tt.appendOp(id, .put, "default\x00k1", "v1", 0);
-    try tt.appendOp(id, .delete, "default\x00k2", "", 0);
+    try tt.appendOp(id, .put, "default\x00k1", "v1", 0, .always, null);
+    try tt.appendOp(id, .delete, "default\x00k2", "", 0, .always, null);
     const txn = tt.get(id).?;
     try t.expectEqual(@as(usize, 2), txn.ops.items.len);
     try t.expectEqual(@as(u64, 0xDEADBEEF), txn.pinned_hash);
@@ -368,9 +376,9 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     defer tt.deinit();
 
     const id = try tt.begin(1, 0);
-    try tt.appendOp(id, .put, "ns\x00k", "v1", 0);
-    try tt.appendOp(id, .put, "ns\x00other", "x", 0);
-    try tt.appendOp(id, .put, "ns\x00k", "v2", 0);
+    try tt.appendOp(id, .put, "ns\x00k", "v1", 0, .always, null);
+    try tt.appendOp(id, .put, "ns\x00other", "x", 0, .always, null);
+    try tt.appendOp(id, .put, "ns\x00k", "v2", 0, .always, null);
 
     const op = tt.lastOpForKey(id, "ns\x00k").?;
     try t.expectEqualStrings("v2", op.value);
@@ -390,7 +398,7 @@ test "TxnTable: by default a transaction holds the largest value a plain set tak
     const value = try t.allocator.alloc(u8, @import("../protocol/kv_ops.zig").MAX_VALUE);
     defer t.allocator.free(value);
     @memset(value, 'v');
-    try tt.appendOp(id, .put, key, value, 0);
+    try tt.appendOp(id, .put, key, value, 0, .always, null);
 }
 
 test "TxnTable: max_bytes and max_ops move their refusal points" {
@@ -399,15 +407,15 @@ test "TxnTable: max_bytes and max_ops move their refusal points" {
     defer tt.deinit();
     tt.max_bytes = 10;
     const a = try tt.begin(1, 0);
-    try tt.appendOp(a, .put, "k", "123456789", 0);
+    try tt.appendOp(a, .put, "k", "123456789", 0, .always, null);
     // One byte over.
-    try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "", 0));
+    try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "", 0, .always, null));
     tt.max_bytes = limits.MAX_PAYLOAD_PER_TXN;
     tt.max_ops = 2;
     const b = try tt.begin(2, 0);
-    try tt.appendOp(b, .put, "a", "", 0);
-    try tt.appendOp(b, .put, "b", "", 0);
-    try t.expectError(error.TxnTooLarge, tt.appendOp(b, .put, "c", "", 0));
+    try tt.appendOp(b, .put, "a", "", 0, .always, null);
+    try tt.appendOp(b, .put, "b", "", 0, .always, null);
+    try t.expectError(error.TxnTooLarge, tt.appendOp(b, .put, "c", "", 0, .always, null));
 }
 
 test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
@@ -422,10 +430,10 @@ test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     @memset(big, 'a');
 
     // First op fits exactly (key 2 + value MAX-2)
-    try tt.appendOp(id, .put, "k1", big[0 .. MAX_PAYLOAD_PER_TXN - 2], 0);
+    try tt.appendOp(id, .put, "k1", big[0 .. MAX_PAYLOAD_PER_TXN - 2], 0, .always, null);
 
     // Second op pushes over → too large
-    try t.expectError(error.TxnTooLarge, tt.appendOp(id, .put, "k2", "more", 0));
+    try t.expectError(error.TxnTooLarge, tt.appendOp(id, .put, "k2", "more", 0, .always, null));
 }
 
 test "TxnTable: reapIdle drops idle transactions, but not a used or committing one" {
@@ -439,7 +447,7 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
         id.* = try tt.begin(1, 0);
         tt.get(id.*).?.last_active_ms = 1_000;
     }
-    try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0);
+    try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0, .always, null);
     const committing = try tt.begin(1, 0);
     tt.get(committing).?.last_active_ms = 1_000;
     tt.get(committing).?.committing = true;

@@ -46,4 +46,4 @@ pub const DEFAULT_MAX_BYTES_PER_TXN: usize = 256 * 1024;
 /// Raft ring, the apply buffer and a replication frame must each hold one,
 /// or an entry could be accepted and then never applied or sent to a
 /// follower. It is apart from the request frame, which is a fraction of it.
-pub const MAX_LOG_ENTRY_PAYLOAD: usize = 1_055_234;
+pub const MAX_LOG_ENTRY_PAYLOAD: usize = 1_057_794;

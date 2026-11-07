@@ -30,7 +30,7 @@ test "integration: KV state takes 10000 puts and 5000 deletes, and counts them" 
     try testing.expectEqualStrings("value-005000-payload", st.get("key-005000").?.value);
     for (0..5000) |i| {
         const key = std.fmt.bufPrint(&key_buf, "key-{d:0>6}", .{i}) catch unreachable;
-        _ = try apply(&kv, .kv_delete, .{ .key = key }, 0);
+        _ = try apply(&kv, .kv_delete, .{ .key = key, .cas_version = null }, 0);
     }
     try testing.expectEqual(@as(u64, 5000), st.liveKeys("default"));
     try testing.expect(st.get("key-004999") == null);
@@ -74,11 +74,11 @@ test "integration: KV expire sets and clears a TTL, and finds nothing on a missi
     defer kv.deinit();
     const stamp: u64 = 1_000 * std.time.ns_per_s;
     try kv.put("doc", "data", stamp);
-    _ = try apply(&kv, .kv_expire, .{ .key = "doc", .ttl_ms = 1_000 }, stamp);
+    _ = try apply(&kv, .kv_expire, .{ .key = "doc", .ttl_ms = 1_000, .cas_version = null }, stamp);
     try testing.expectEqual(stamp + std.time.ns_per_s, kv.state().getRaw("doc").?.expiry_ns);
-    _ = try apply(&kv, .kv_expire, .{ .key = "doc", .ttl_ms = 0 }, stamp);
+    _ = try apply(&kv, .kv_expire, .{ .key = "doc", .ttl_ms = 0, .cas_version = null }, stamp);
     try testing.expectEqual(@as(u64, 0), kv.state().getRaw("doc").?.expiry_ns);
-    try testing.expect((try apply(&kv, .kv_expire, .{ .key = "nope", .ttl_ms = 0 }, stamp)).refused() != null);
+    try testing.expect((try apply(&kv, .kv_expire, .{ .key = "nope", .ttl_ms = 0, .cas_version = null }, stamp)).refused() != null);
 }
 
 // json_path over values the state holds. The ops end to end are in

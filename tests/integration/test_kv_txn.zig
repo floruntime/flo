@@ -23,12 +23,12 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     try testing.expect(tid != 0);
 
     // Stage put + delete + incr.
-    try table.appendOp(tid, .put, "alice", "100", 0);
-    try table.appendOp(tid, .delete, "bob", "", 0);
+    try table.appendOp(tid, .put, "alice", "100", 0, .always, null);
+    try table.appendOp(tid, .delete, "bob", "", 0, .always, null);
 
     var delta_buf: [8]u8 = undefined;
     std.mem.writeInt(i64, &delta_buf, 5, .little);
-    try table.appendOp(tid, .incr, "counter", &delta_buf, 0);
+    try table.appendOp(tid, .incr, "counter", &delta_buf, 0, .always, null);
 
     const state = table.get(tid).?;
     try testing.expectEqual(@as(usize, 3), state.ops.items.len);
@@ -50,9 +50,9 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     defer table.deinit();
 
     const tid = try table.begin(0, 99);
-    try table.appendOp(tid, .put, "k1", "v1", 1_000);
-    try table.appendOp(tid, .put, "k2", "v2", 0);
-    try table.appendOp(tid, .delete, "k3", "", 0);
+    try table.appendOp(tid, .put, "k1", "v1", 1_000, .always, null);
+    try table.appendOp(tid, .put, "k2", "v2", 0, .always, null);
+    try table.appendOp(tid, .delete, "k3", "", 0, .always, null);
 
     const state = table.get(tid).?;
     const payload = try txn_mod.encodeBatch(testing.allocator, state.ops.items);
