@@ -3648,6 +3648,11 @@ test "e2e/workflow: with no wait set, a step whose action isn't registered fails
         try awaitRunStatus(ctx, run_id, "failed", 3000);
         var want_buf: [128]u8 = undefined;
         try awaitHistory(ctx, run_id, try std.fmt.bufPrint(&want_buf, "action {s} is not registered in namespace default", .{action}), 1000);
+        // It didn't wait, even a tick.
+        var history = try ctx.cli.run(&.{ "workflow", "history", run_id });
+        defer history.deinit();
+        try testing.expect(!history.stdoutContains("action_not_registered"));
+        try testing.expect(!history.stdoutContains("waited"));
     }
 }
 

@@ -624,6 +624,11 @@ pub const ExecutorHealth = struct {
     }
 
     /// Check if circuit breaker should allow request
+    /// What `shouldAllowRequest` would answer, changing nothing.
+    pub fn wouldAllowRequest(self: *const ExecutorHealth, config: CircuitBreakerConfig, now_ms: i64) bool {
+        return self.breaker_state != .open or now_ms - self.breaker_opened_at_ms >= config.cooldown_ms;
+    }
+
     pub fn shouldAllowRequest(self: *ExecutorHealth, config: CircuitBreakerConfig, now_ms: i64) bool {
         switch (self.breaker_state) {
             .closed => return true,

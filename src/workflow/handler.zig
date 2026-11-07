@@ -1788,7 +1788,13 @@ pub const WorkflowHandler = struct {
     /// lost: this shard proposed it and has applied that entry's index
     /// without creating it.
     fn pendingLost(shard: *Shard, run: *const RunRecord, on_shard: ?u16) bool {
-        if (run.pending_index == 0 or (on_shard orelse shard.id) != shard.id) return false;
+        if ((on_shard orelse shard.id) != shard.id) return false;
+        // No index: this shard held the start, and a step-down may have
+        // dropped it. A start it has let go of is `starting` until it applies.
+        if (run.pending_index == 0) {
+            const rid = run.pending_action_run_id_owned orelse return false;
+            return !shard.actions_handler.startPending(rid);
+        }
         return shard.raft_node.last_applied >= run.pending_index;
     }
 
@@ -1879,8 +1885,8 @@ pub const WorkflowHandler = struct {
                 executor.action_name;
 
             // With another executor to try, a missing action doesn't hold the
-            // step up; the last waits, as a step with no plan does.
-            const can_wait = run.plan_executor_idx + 1 >= exec_count;
+            // step up; the last that can run waits, as a step with no plan does.
+            const can_wait = !self.anotherExecutorCanRun(plan, exec_order[run.plan_executor_idx + 1 ..], namespace, run.workflow_name_owned, plan_name, now_ms);
             const outcome = self.invokeAction(shard, run, resolved_action, step_input, step_label, namespace, can_wait, now_ms);
 
             // Parked for async action — will resume via resumeFromAction
@@ -1918,6 +1924,19 @@ pub const WorkflowHandler = struct {
         // All executors exhausted
         resetPlanPass(run);
         return definition.StepOutcome.failure;
+    }
+
+    /// Whether one of `order`'s executors could run: its breaker, if it has
+    /// one, isn't holding it back.
+    fn anotherExecutorCanRun(self: *WorkflowHandler, plan: definition.InlinePlan, order: []const u8, namespace: []const u8, workflow: []const u8, plan_name: []const u8, now_ms: i64) bool {
+        for (order) |i| {
+            if (plan.selection != .health_weighted) return true;
+            const executor = plan.executors[i];
+            const cfg = executor.breaker orelse return true;
+            const health = self.getOrCreateHealth(namespace, workflow, plan_name, executor.name) orelse return true;
+            if (health.wouldAllowRequest(cfg, now_ms)) return true;
+        }
+        return false;
     }
 
     /// Invoke an action by name via the ActionsHandler.
@@ -4714,6 +4733,149 @@ test "step executor: past MAX_HELD waiting steps, a step fails at once" {
     defer actions.freeFinished(told);
     try testing.expectEqualStrings(ActionsHandler.NOT_REGISTERED, told.outcome);
     try testing.expectEqualStrings("action nope is not registered in namespace default; too many steps are already waiting for an action on this shard", told.output);
+}
+
+test "step executor: a step whose hold a step-down dropped fails, rather than wait for ever" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-d", "run-d", "test-wf");
+    handler.advanceWorkflow(&shard, "default:run-d", "default");
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get("default:run-d").?.status);
+
+    actions.stoppedLeading(&shard);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get("default:run-d").?.status);
+}
+
+test "step executor: a start let go of isn't lost before its invoke applies" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-r", "run-r", "test-wf");
+    handler.advanceWorkflow(&shard, "default:run-r", "default");
+    handler.checkPendingActions(&shard);
+    registerTestAction(&shard, "step-a");
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    // Proposed, not applied.
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, handler.runs.get("default:run-r").?.status);
+}
+
+test "step executor: an action deleted after its invoke was proposed fails the step at once" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:run-x", "run-x", "test-wf");
+    handler.advanceWorkflow(&shard, "default:run-x", "default");
+    // The delete comes first in the log: the invoke applies to no action.
+    applyTestActionEntry(&shard, .action_delete, test_action_entries.Delete.Value{ .ns = "default", .name = "step-a" }, 1);
+    _ = shard.applyCommitted();
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+
+    const run = handler.runs.get("default:run-x").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
+    var found = false;
+    for (run.history.items) |e| {
+        if (std.mem.eql(u8, e.event_type_owned, "action_not_found")) {
+            try testing.expectEqualStrings("action step-a is not registered in namespace default", e.detail_owned);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "step executor: a start too long to log fails its step, and isn't held" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    const input = try allocator.alloc(u8, 70 * 1024);
+    defer allocator.free(input);
+    @memset(input, 'x');
+    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "big", "nope", input, "wf-run", "wf", true).?;
+    defer allocator.free(message);
+    actions.startRunFromInbox(&shard, shard.id, message);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    const told = actions.takeFinished("big").?;
+    defer actions.freeFinished(told);
+    try testing.expectEqualStrings("", told.outcome);
+}
+
+test "step executor: a held start that can't be proposed is tried until the wait ends, then fails" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "stuck", "late", "{}", "wf-run", "wf", true).?;
+    defer allocator.free(message);
+    actions.startRunFromInbox(&shard, shard.id, message);
+    registerTestAction(&shard, "late");
+    shard.raft_node.halt_at = .{ .index = 1, .term = 1, .crc = 0 };
+    defer shard.raft_node.halt_at = null;
+
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 1), actions.held.count());
+
+    actions.held.getPtr("stuck").?.until_ms = 0;
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    const told = actions.takeFinished("stuck").?;
+    defer actions.freeFinished(told);
+    try testing.expectEqualStrings("", told.outcome);
+}
+
+test "step executor: a plan's executor waits when the only other's breaker is open, and not when it could run" {
+    const allocator = testing.allocator;
+    for ([_]bool{ true, false }) |open| {
+        var handler = WorkflowHandler.init(allocator);
+        defer handler.deinit();
+        var actions = ActionsHandler.init(allocator);
+        defer actions.deinit();
+        var shard = try createTestShard(&actions);
+        defer destroyTestShard(&shard);
+
+        createTestDef(&handler, "default:plan-wf", "plan-wf", test_plan_exhaust_workflow_json);
+        createTestRun(&handler, "default:run-b", "run-b", "plan-wf");
+        const paypal = handler.getOrCreateHealth("default", "plan-wf", "charge", "paypal").?;
+        if (open) {
+            paypal.breaker_state = .open;
+            paypal.breaker_opened_at_ms = @import("stdx").time.milliTimestamp();
+        }
+        // stripe is tried first either way: as listed first, and as the
+        // healthier when paypal's breaker is open.
+        handler.advanceWorkflow(&shard, "default:run-b", "default");
+        try testing.expectEqual(@as(u32, if (open) 1 else 0), actions.held.count());
+    }
 }
 
 test "step executor: failing action follows failure transition" {

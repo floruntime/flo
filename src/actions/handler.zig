@@ -1742,8 +1742,8 @@ pub const ActionsHandler = struct {
         };
     }
 
-    /// A run on another shard, as that shard last told this one; taken, so
-    /// the workflow resumes once.
+    /// A run as its shard last told this one, or as this shard told itself
+    /// of a start it didn't make; taken, so the workflow resumes once.
     pub fn takeFinished(self: *ActionsHandler, run_id: []const u8) ?Finished {
         if (self.asked.fetchRemove(run_id)) |kv| self.allocator.free(kv.key);
         const kv = self.finished.fetchRemove(run_id) orelse return null;
@@ -1794,6 +1794,11 @@ pub const ActionsHandler = struct {
     /// run that couldn't be started is lost: asked about, it says so.
     pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8) void {
         const m = StartMessage.parse(bytes) orelse return;
+        // Too long for an entry now means too long when the action registers.
+        if (!m.fits(from)) {
+            log.err("shard {d}: action run {s} asked for by a workflow is too long to log; that workflow's step fails", .{ shard.id, m.run });
+            return self.sendFinished(shard, from, m.run, .cancelled, "", "");
+        }
         if (!actionExists(shard, m.ns, m.action)) {
             // A plan's executor with another to try doesn't wait for this one.
             if (m.can_wait) return self.hold(shard, from, bytes, m.run, m.ns, m.action);
@@ -1823,6 +1828,16 @@ pub const ActionsHandler = struct {
             const can_wait = r.next() orelse return null;
             return .{ .run = run, .ns = ns, .action = action, .caller = caller, .workflow = workflow, .can_wait = can_wait.len > 0, .input = bytes[r.off..] };
         }
+
+        fn invoke(m: StartMessage, from: u16) ae.Invoke.Value {
+            const caller: ?[]const u8 = if (m.caller.len == 0) null else m.caller;
+            return .{ .ns = m.ns, .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow, .caller_shard = if (caller != null) from else null };
+        }
+
+        fn fits(m: StartMessage, from: u16) bool {
+            _ = ae.Invoke.encodedSize(m.invoke(from)) catch return false;
+            return true;
+        }
     };
 
     fn startRun(self: *ActionsHandler, shard: *Shard, from: u16, m: StartMessage) bool {
@@ -1834,7 +1849,7 @@ pub const ActionsHandler = struct {
 
     /// Whether a run asked for here is yet to exist, not lost: its invoke
     /// is on its way, or its action isn't registered yet.
-    fn startPending(self: *const ActionsHandler, run_id: []const u8) bool {
+    pub fn startPending(self: *const ActionsHandler, run_id: []const u8) bool {
         return self.starting.contains(run_id) or self.held.contains(run_id);
     }
 
@@ -1884,8 +1899,11 @@ pub const ActionsHandler = struct {
         while (it.next()) |e| {
             const m = StartMessage.parse(e.value_ptr.bytes).?;
             if (actionExists(shard, m.ns, m.action)) {
-                // Not proposed: tried again next tick.
-                if (!self.startRun(shard, e.value_ptr.from, m)) continue;
+                // Not proposed: tried again next tick, until the wait ends.
+                if (!self.startRun(shard, e.value_ptr.from, m)) {
+                    if (now_ms < e.value_ptr.until_ms) continue;
+                    self.sendFinished(shard, e.value_ptr.from, m.run, .cancelled, "", "");
+                }
             } else if (now_ms >= e.value_ptr.until_ms) {
                 var why_buf: [64]u8 = undefined;
                 const why = std.fmt.bufPrint(&why_buf, "; waited {d} ms", .{self.missing_action_wait_ms}) catch "";

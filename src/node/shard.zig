@@ -15380,12 +15380,15 @@ test "actions: what a shard keeps of runs asked about, and runs it was asked to 
     const here = &t.two.shards[0];
     const actions = here.actions_handler;
     actions.askResult(here, 1, "default", "act-old");
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
+    const there = &t.two.shards[1];
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", t.name, "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
-    actions.startRunFromInbox(here, 1, start);
+    there.actions_handler.startRunFromInbox(there, 0, start);
+    try std.testing.expect(there.actions_handler.starting.get("run-old") != null);
     actions.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
+    there.actions_handler.pruneAt(@import("stdx").time.monotonicMs() + 10 * 60 * 1000 + 1);
     try std.testing.expect(actions.asked.get("act-old") == null);
-    try std.testing.expect(actions.starting.get("run-old") == null);
+    try std.testing.expect(there.actions_handler.starting.get("run-old") == null);
     t.two.settle();
 }
 
