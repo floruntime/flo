@@ -111,7 +111,7 @@ pub const WorkflowHandler = struct {
     /// for the delivery-leases work and the state-machine contract to settle.
     completion_retries: std.ArrayListUnmanaged(PendingCompletion) = .empty,
     /// Logs a completion record. A seam so a test can make the log refuse.
-    propose: *const fn (shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 = proposeCompletion,
+    propose: *const fn (shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult = proposeCompletion,
 
     /// In-memory definition store: "namespace:name" → DefinitionRecord.
     /// Key is namespace-qualified (allocated separately from record fields).
@@ -278,6 +278,11 @@ pub const WorkflowHandler = struct {
 
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
         wait_timeout_at_ms: i64 = 0,
+
+        /// The entry of a cancel proposed and not yet applied, and its term:
+        /// nothing else moves the run meanwhile (`cancelInFlight`).
+        cancel_index: u64 = 0,
+        cancel_term: u64 = 0,
 
         /// This run's key in `runs`, which owns it.
         ns_key: []const u8 = "",
@@ -529,11 +534,17 @@ pub const WorkflowHandler = struct {
         shard.park(conn, req, proposed, switch (op) {
             .workflow_create => answerCreate,
             .workflow_start => answerStart,
+            .workflow_cancel => answerCancel,
             else => answerOk,
         });
     }
 
     fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        shard.sendOkResponse(conn, request_id, "");
+    }
+
+    fn answerCancel(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
+        if (shard.metrics_registry) |m| m.workflow.recordCancelled();
         shard.sendOkResponse(conn, request_id, "");
     }
 
@@ -582,7 +593,7 @@ pub const WorkflowHandler = struct {
             .workflow_create => return self.handleCreate(shard, conn, req),
             .workflow_start => return self.handleStart(shard, conn, req),
             .workflow_signal => self.handleSignal(shard, conn, req),
-            .workflow_cancel => self.handleCancel(shard, conn, req),
+            .workflow_cancel => return self.handleCancel(shard, conn, req),
             .workflow_status => self.handleStatus(shard, conn, req),
             .workflow_history => self.handleHistory(shard, conn, req),
             .workflow_list_runs => self.handleListRuns(shard, conn, req),
@@ -896,7 +907,8 @@ pub const WorkflowHandler = struct {
         // this pass and is kept, its start not yet applied.
         while (i < self.started_to_advance.items.len) : (i += 1) {
             const s = self.started_to_advance.items[i];
-            if (shard.raft_node.last_applied < s.index) {
+            const cancelling = if (self.runs.getPtr(s.ns_key)) |r| cancelInFlight(shard, r) else false;
+            if (shard.raft_node.last_applied < s.index or cancelling) {
                 self.started_to_advance.items[keep] = s;
                 keep += 1;
                 continue;
@@ -956,6 +968,10 @@ pub const WorkflowHandler = struct {
         // A finished run's history is its logged completion record.
         if (run.status.isTerminal()) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
+            return;
+        }
+        if (cancelInFlight(shard, run)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run is being cancelled");
             return;
         }
 
@@ -1041,39 +1057,39 @@ pub const WorkflowHandler = struct {
 
     // ── CANCEL ──────────────────────────────────────────────────────────
 
-    fn handleCancel(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
+    fn handleCancel(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) ?persistence_mod.ProposeResult {
         const run_id = req.key;
 
         if (run_id.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run_id is required");
-            return;
+            return null;
         }
 
         const run_ns_key = self.makeNsKey(req.namespace, run_id) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+            return null;
         };
         defer self.allocator.free(run_ns_key);
 
         const run = self.runs.getPtr(run_ns_key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .not_found, "");
-            return;
+            return null;
         };
 
         if (run.status.isTerminal()) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
-            return;
+            return null;
         }
         if (req.value.len > MAX_CANCEL_REASON) {
             var msg: [96]u8 = undefined;
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&msg, "a cancel reason is at most {d} bytes, not {d}", .{ MAX_CANCEL_REASON, req.value.len }) catch "cancel reason too long");
-            return;
+            return null;
         }
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
         const reason = if (req.value.len > 0) req.value else "cancelled by user";
         const held_action = run.pending_action_run_id_owned;
         const held_on = run.pending_action_shard_id orelse shard.id;
-        self.tryComplete(shard, run_ns_key, run, .cancelled, reason, now_ms) catch |err| {
+        const proposed = self.proposeComplete(shard, run_ns_key, run, .cancelled, reason, now_ms) catch |err| {
             const status: proto.StatusCode, const text: []const u8 = switch (err) {
                 error.OutOfMemory => .{ .internal_error, "out of memory" },
                 error.BadKey => .{ .internal_error, "internal error: a run key without its namespace" },
@@ -1081,11 +1097,25 @@ pub const WorkflowHandler = struct {
             };
             // tryComplete fails only before or at the propose.
             shard.sendRefusal(conn, req.header.request_id, status, proto.notRun(text));
-            return;
+            return null;
         };
+        defer self.allocator.free(proposed.value);
+        // The run ends when the entry applies, and the client is answered
+        // then. If it never does, the client is told the leader changed, and
+        // the run carries on.
+        run.cancel_index = proposed.result.index;
+        run.cancel_term = proposed.result.term;
         if (held_action) |rid| shard.actions_handler.cancelHeld(shard, held_on, rid);
+        return proposed.result;
+    }
 
-        shard.sendOkResponse(conn, req.header.request_id, "");
+    /// Whether a cancel of this run is on its way to applying in this term.
+    /// One whose entry was cut from the log, or applied and refused, leaves
+    /// the index behind: that it's passed, or the term moved, is what ends this.
+    pub fn cancelInFlight(shard: *const Shard, run: *const RunRecord) bool {
+        if (run.cancel_index == 0 or run.status.isTerminal()) return false;
+        const raft = shard.raft_node;
+        return raft.role == .leader and raft.current_term == run.cancel_term and raft.last_applied < run.cancel_index;
     }
 
     // ── STATUS ──────────────────────────────────────────────────────────
@@ -2231,6 +2261,7 @@ pub const WorkflowHandler = struct {
                 self.parked.removeByPtr(key_ptr);
                 continue;
             }
+            if (cancelInFlight(shard, run)) continue;
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
@@ -2273,6 +2304,11 @@ pub const WorkflowHandler = struct {
         // may have moved it on: each is asked again as it fires.
         for (due_keys[0..due_count]) |ns_key| {
             const r = self.runs.getPtr(ns_key) orelse continue;
+            if (cancelInFlight(shard, r)) {
+                // Its timer stands if the cancel doesn't.
+                if (timerDue(r, now_ms) != .none) self.armTimer(r, now_ms +| CANCEL_RECHECK_MS);
+                continue;
+            }
             switch (timerDue(r, now_ms)) {
                 .none => {},
                 // Re-invoke the current step's action.
@@ -2291,6 +2327,8 @@ pub const WorkflowHandler = struct {
         // Its capacity is what the walk above costs.
         if (self.parked.count() == 0 and self.parked.capacity() > 64) self.parked.clearAndFree(self.allocator);
     }
+
+    const CANCEL_RECHECK_MS: i64 = 100;
 
     /// Which of a run's timers has come due, if any.
     fn timerDue(run: *const RunRecord, now_ms: i64) enum { none, poll, wait } {
@@ -2730,6 +2768,28 @@ pub const WorkflowHandler = struct {
     }
 
     fn tryComplete(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) !void {
+        const proposed = try self.proposeComplete(shard, run_ns_key, run, status, detail, now_ms);
+        defer self.allocator.free(proposed.value);
+        // The applier applies the same record again at commit, at the same
+        // stamp; it replaces the terminal state wholesale, so a second
+        // apply is a no-op.
+        self.applyComplete(run, proposed.value, @intCast(proposed.result.timestamp_ns / std.time.ns_per_ms)) catch {};
+
+        // Every terminal transition but a cancel's, which counts when it
+        // applies, passes through here, so this is the one place the
+        // outcome counters need to be recorded.
+        if (shard.metrics_registry) |m| switch (run.status) {
+            .completed => m.workflow.recordCompleted(),
+            .failed => m.workflow.recordFailed(),
+            .cancelled => m.workflow.recordCancelled(),
+            .timed_out => m.workflow.recordTimedOut(),
+            else => {},
+        };
+    }
+
+    /// Logs a run's completion record, without touching the run. The caller
+    /// frees `value`.
+    fn proposeComplete(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) !struct { value: []u8, result: persistence_mod.ProposeResult } {
         const sep = std.mem.indexOfScalar(u8, run_ns_key, ':') orelse return error.BadKey;
         const namespace = run_ns_key[0..sep];
 
@@ -2759,31 +2819,17 @@ pub const WorkflowHandler = struct {
             error.OutOfMemory => return err,
             error.TooLarge => try encodeTrimmed(self.allocator, parts, limit),
         };
-        defer self.allocator.free(value);
+        errdefer self.allocator.free(value);
 
-        const stamp_ns = self.propose(shard, namespace, run_ns_key, value) catch |err| {
+        const result = self.propose(shard, namespace, run_ns_key, value) catch |err| {
             if (!shard.quietHalted(err)) log.err("workflow run {s}: completion not persisted: {s}", .{ run_ns_key, @errorName(err) });
             return err;
         };
-        // The applier applies the same record again at commit, at the same
-        // stamp; it replaces the terminal state wholesale, so a second
-        // apply is a no-op.
-        self.applyComplete(run, value, @intCast(stamp_ns / std.time.ns_per_ms)) catch {};
-
-        // Every terminal transition passes through here, so this is the one
-        // place the outcome counters need to be recorded.
-        if (shard.metrics_registry) |m| switch (run.status) {
-            .completed => m.workflow.recordCompleted(),
-            .failed => m.workflow.recordFailed(),
-            .cancelled => m.workflow.recordCancelled(),
-            .timed_out => m.workflow.recordTimedOut(),
-            else => {},
-        };
+        return .{ .value = value, .result = result };
     }
 
-    /// Propose a completion; returns its entry's stamp.
-    fn proposeCompletion(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 {
-        return (try persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, run_ns_key, value)).timestamp_ns;
+    fn proposeCompletion(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult {
+        return persistence_mod.proposeEntry(shard, .workflow_complete, entry_mod.Flags.NONE, namespace, run_ns_key, value);
     }
 
     /// A completion the log was too busy to take, retried from the run's
@@ -2825,7 +2871,8 @@ pub const WorkflowHandler = struct {
         var i: usize = 0;
         while (i < self.completion_retries.items.len) {
             const p = self.completion_retries.items[i];
-            if (p.due_ms > now_ms) {
+            const cancelling = if (self.runs.getPtr(p.run_ns_key)) |r| cancelInFlight(shard, r) else false;
+            if (p.due_ms > now_ms or cancelling) {
                 i += 1;
                 continue;
             }
@@ -5219,6 +5266,96 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
 }
 
+test "workflow cancel: while one is in flight nothing moves the run, and once it can't apply the run carries on" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
+    createTestRun(&handler, "default:r", "r", "two-waits");
+    handler.advanceWorkflow(&shard, "default:r", "default");
+    const run = handler.runs.getPtr("default:r").?;
+    run.wait_timeout_at_ms = 1;
+    handler.armTimer(run, 1);
+
+    const raft = shard.raft_node;
+    run.cancel_index = raft.last_applied + 10;
+    run.cancel_term = raft.current_term;
+    try testing.expect(WorkflowHandler.cancelInFlight(&shard, run));
+    // A timer due while it's in flight neither fires nor is lost.
+    handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
+    try testing.expect(run.current_step_name_owned == null);
+    // The wait's own far-off timer, and the due one again, a little later.
+    try testing.expectEqual(@as(usize, 2), handler.timers.count());
+
+    // Re-elected in a later term, its entry cut: the run moves again.
+    raft.current_term += 1;
+    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    raft.current_term -= 1;
+    // Its index applied without ending the run.
+    run.cancel_index = raft.last_applied;
+    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    // No longer leading.
+    run.cancel_index = raft.last_applied + 10;
+    raft.role = .follower;
+    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    raft.role = .leader;
+    run.cancel_index = 0;
+
+    // The timer it kept fires now.
+    @import("stdx").time.sleep(@as(u64, WorkflowHandler.CANCEL_RECHECK_MS + 20) * std.time.ns_per_ms);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqualStrings("second", run.current_step_name_owned.?);
+}
+
+test "workflow cancel: in flight, a finished action, a first step and a completion retry all wait for it" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    registerTestAction(&shard, "step-a");
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    const raft = shard.raft_node;
+
+    createTestRun(&handler, "default:parked", "parked", "test-wf");
+    handler.advanceWorkflow(&shard, "default:parked", "default");
+    _ = shard.applyCommitted();
+    const parked = handler.runs.getPtr("default:parked").?;
+    const action_run = parked.pending_action_run_id_owned.?;
+    completeTestAction(&shard, action_run);
+
+    createTestRun(&handler, "default:started", "started", "test-wf");
+    handler.queueFirstStep("default:started", raft.last_applied);
+    createTestRun(&handler, "default:retry", "retry", "test-wf");
+    handler.retryCompletionLater("default:retry", .failed, "stop", 1, 0);
+    handler.completion_retries.items[0].due_ms = 0;
+
+    for ([_][]const u8{ "default:parked", "default:started", "default:retry" }) |key| {
+        const run = handler.runs.getPtr(key).?;
+        run.cancel_index = raft.last_applied + 10;
+        run.cancel_term = raft.current_term;
+    }
+    handler.advanceStartedRuns(&shard);
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, parked.status);
+    try testing.expect(parked.pending_action_run_id_owned != null);
+    try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
+    try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:retry").?.status);
+
+    // Its entry cut, each goes on.
+    raft.current_term += 1;
+    defer raft.current_term -= 1;
+    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, parked));
+}
+
 test "step executor: failing action follows failure transition" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -5935,14 +6072,14 @@ test "a signal that would leave the completion no headroom is refused, holding n
 }
 
 var fake_propose_refusals: u32 = 0;
-fn refuseThenPropose(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!u64 {
+fn refuseThenPropose(shard: *Shard, namespace: []const u8, run_ns_key: []const u8, value: []const u8) anyerror!persistence_mod.ProposeResult {
     if (fake_propose_refusals > 0) {
         fake_propose_refusals -= 1;
         return error.Overloaded;
     }
     return WorkflowHandler.proposeCompletion(shard, namespace, run_ns_key, value);
 }
-fn notLeading(_: *Shard, _: []const u8, _: []const u8, _: []const u8) anyerror!u64 {
+fn notLeading(_: *Shard, _: []const u8, _: []const u8, _: []const u8) anyerror!persistence_mod.ProposeResult {
     return error.NotLeader;
 }
 
@@ -6083,7 +6220,7 @@ test "cancelling a run that already finished is refused and keeps its result" {
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     const events = run.history.items.len;
 
-    handler.handleCancel(&shard, &conn, makeRequest(.workflow_cancel, "r", ""));
+    try testing.expect(handler.handleCancel(&shard, &conn, makeRequest(.workflow_cancel, "r", "")) == null);
     const answer = try queuedAnswer(&conn);
     try testing.expectEqual(@backingInt(proto.StatusCode.bad_request), answer.header.status);
     try testing.expectEqualStrings("run already finished", (try answer.refused()).message);
