@@ -217,6 +217,20 @@ pub fn readsInTxn(req: proto.Request) bool {
     return false;
 }
 
+/// Whether a table op may run on a leader still applying what earlier terms
+/// committed. KV's writes read nothing when proposed: each is decided as its
+/// entry applies, in log order, so refusing one would only cost a retry. The
+/// namespace ops check that leader themselves, and say what the asker needs.
+pub fn runsOnApplyingLeader(req: proto.Request) bool {
+    inline for (table.op_table) |o| {
+        if (o.code == req.header.op_code) {
+            const own_check = comptime std.mem.eql(u8, o.name, "namespace.create") or std.mem.eql(u8, o.name, "namespace.ensure") or std.mem.eql(u8, o.name, "namespace.published");
+            return own_check or (comptime std.mem.startsWith(u8, o.name, "kv."));
+        }
+    }
+    return false;
+}
+
 /// Whether a table op is a read its leader answers.
 pub fn atLeader(req: proto.Request) bool {
     inline for (table.op_table) |o| {
