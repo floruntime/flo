@@ -1364,7 +1364,7 @@ test "e2e/workflow: E2E-2 scheduled workflow creation" {
 // =============================================================================
 // Timeout enforcement (14.16) is implemented — timer processing wired in
 // dispatcher tick loop. This test verifies that a 2s signal timeout fires
-// and transitions the workflow to its on_timeout target (flo.Failed).
+// and the run times out.
 
 test "e2e/workflow: timeout enforcement" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
@@ -1421,13 +1421,10 @@ test "e2e/workflow: timeout enforcement" {
         }
     }
 
-    // Wait for the 2s signal timeout to fire (3s to be safe)
-    @import("stdx").time.sleep(3000 * std.time.ns_per_ms);
-
-    // Workflow should have timed out: wait-forever's on_timeout → flo.Failed
-    var status = try ctx.cli.run(&.{ "workflow", "status", "e2e3-timeout-run" });
-    defer status.deinit();
-    try stdx.testing.assertSucceeded(status);
+    // Waiting until its 2 s timeout fires. It names no on_timeout, so the run
+    // times out.
+    try expectRunStatus(ctx, "e2e3-timeout-run", "waiting");
+    try awaitRunStatus(ctx, "e2e3-timeout-run", "timed_out", 6000);
 }
 
 // =============================================================================
@@ -3510,12 +3507,13 @@ fn expectRunStatus(ctx: *stdx.testing.TestContext, run_id: []const u8, want: []c
 
 /// Polls until `run_id` has status `want`, for up to `ms`.
 fn awaitRunStatus(ctx: *stdx.testing.TestContext, run_id: []const u8, want: []const u8, ms: u64) !void {
+    var line_buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "Status:   {s}\n", .{want});
     for (0..ms / 50) |_| {
-        expectRunStatus(ctx, run_id, want) catch {
-            stdx.time.sleep(50 * std.time.ns_per_ms);
-            continue;
-        };
-        return;
+        var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
+        defer status.deinit();
+        if (status.exit_code == 0 and status.stdoutContains(line)) return;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
     }
     try expectRunStatus(ctx, run_id, want);
 }
@@ -3674,4 +3672,180 @@ test "e2e/workflow: a run cancelled while its step waits for its action starts n
         defer taken.deinit();
         try testing.expect(extractTaskId(taken.stdout) == null);
     }
+}
+
+// =============================================================================
+// Timers and schedules
+// =============================================================================
+
+fn createYamlWorkflow(ctx: *stdx.testing.TestContext, yaml: []const u8) !void {
+    const path = try writeTempYaml(testing.allocator, yaml, "timers-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+}
+
+test "e2e/workflow: a signal ends its wait's deadline, so a later wait with none doesn't time out on it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: old-deadline
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: first
+        \\    timeout_ms: 500
+        \\    on_timeout: flo.Failed
+        \\  transitions:
+        \\    success: second
+        \\steps:
+        \\  second:
+        \\    wait_for_signal:
+        \\      type: second
+        \\    transitions:
+        \\      success: flo.Completed
+    );
+    try ctx.exec(&.{ "workflow", "start", "old-deadline", "{}", "--run-id", "od" });
+    try awaitRunStatus(ctx, "od", "waiting", 3000);
+    try ctx.exec(&.{ "workflow", "signal", "od", "--type", "first" });
+    try awaitHistory(ctx, "od", "signal_matched", 3000);
+    // Well past the first wait's deadline.
+    stdx.time.sleep(1000 * std.time.ns_per_ms);
+    try expectRunStatus(ctx, "od", "waiting");
+    try ctx.exec(&.{ "workflow", "signal", "od", "--type", "second" });
+    try awaitRunStatus(ctx, "od", "completed", 3000);
+}
+
+test "e2e/workflow: a signal ends its wait's deadline, so a child workflow step after it doesn't time out on it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: inner
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    );
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: outer
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: first
+        \\    timeout_ms: 500
+        \\    on_timeout: flo.Failed
+        \\  transitions:
+        \\    success: call
+        \\steps:
+        \\  call:
+        \\    run: "@workflow/inner"
+        \\    transitions:
+        \\      success: flo.Completed
+        \\      failure: flo.Failed
+    );
+    try ctx.exec(&.{ "workflow", "start", "outer", "{}", "--run-id", "oc" });
+    try awaitRunStatus(ctx, "oc", "waiting", 3000);
+    try ctx.exec(&.{ "workflow", "signal", "oc", "--type", "first" });
+    try awaitHistory(ctx, "oc", "awaiting_child", 3000);
+    stdx.time.sleep(1000 * std.time.ns_per_ms);
+    try expectRunStatus(ctx, "oc", "waiting");
+}
+
+test "e2e/workflow: a signal ends its wait's on_timeout, so a later wait doesn't take it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: old-target
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: first
+        \\    timeout_ms: 60000
+        \\    on_timeout: flo.Failed
+        \\  transitions:
+        \\    success: second
+        \\steps:
+        \\  second:
+        \\    wait_for_signal:
+        \\      type: second
+        \\      timeout_ms: 300
+        \\    transitions:
+        \\      success: flo.Completed
+    );
+    try ctx.exec(&.{ "workflow", "start", "old-target", "{}", "--run-id", "ot" });
+    try awaitRunStatus(ctx, "ot", "waiting", 3000);
+    try ctx.exec(&.{ "workflow", "signal", "ot", "--type", "first" });
+    try awaitRunStatus(ctx, "ot", "timed_out", 5000);
+}
+
+test "e2e/workflow: a poll step invokes its action again when its timer comes due" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "poller" });
+    try ctx.exec(&.{ "worker", "register", "poll-w", "poller" });
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: polled
+        \\version: 1.0.0
+        \\start:
+        \\  run: "@actions/poller"
+        \\  poll:
+        \\    max_attempts: 3
+        \\    initial_delay_ms: 300
+        \\    base_delay_ms: 300
+        \\  transitions:
+        \\    success: flo.Completed
+        \\    timeout: flo.Failed
+        \\    failure: flo.Failed
+    );
+    try ctx.exec(&.{ "workflow", "start", "polled", "{}", "--run-id", "pr" });
+    var first = try ctx.cli.run(&.{ "worker", "await", "poller", "--worker-id", "poll-w", "--block", "5000" });
+    defer first.deinit();
+    const first_id = extractTaskId(std.mem.trim(u8, first.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+    try ctx.exec(&.{ "worker", "complete", first_id, "--worker-id", "poll-w", "--outcome", "pending", "--result", "{}" });
+    try awaitHistory(ctx, "pr", "poll_scheduled", 3000);
+
+    var second = try ctx.cli.run(&.{ "worker", "await", "poller", "--worker-id", "poll-w", "--block", "5000" });
+    defer second.deinit();
+    const second_id = extractTaskId(std.mem.trim(u8, second.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+    try ctx.exec(&.{ "worker", "complete", second_id, "--worker-id", "poll-w", "--result", "{}" });
+    try awaitRunStatus(ctx, "pr", "completed", 5000);
+}
+
+test "e2e/workflow: a schedule's max_concurrent holds it while a run is unfinished, and it fires again once none is" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "sched-act" });
+    try ctx.exec(&.{ "worker", "register", "sched-w", "sched-act" });
+    try createYamlWorkflow(ctx,
+        \\kind: Workflow
+        \\name: scheduled
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 200
+        \\  max_concurrent: 1
+        \\start:
+        \\  run: "@actions/sched-act"
+        \\  transitions:
+        \\    success: flo.Completed
+        \\    failure: flo.Failed
+    );
+    var first = try ctx.cli.run(&.{ "worker", "await", "sched-act", "--worker-id", "sched-w", "--block", "5000" });
+    defer first.deinit();
+    const first_id = extractTaskId(std.mem.trim(u8, first.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+
+    // Several intervals: it's held at one.
+    var none = try ctx.cli.run(&.{ "worker", "await", "sched-act", "--worker-id", "sched-w", "--block", "800" });
+    defer none.deinit();
+    try testing.expect(extractTaskId(none.stdout) == null);
+
+    try ctx.exec(&.{ "worker", "complete", first_id, "--worker-id", "sched-w", "--result", "{}" });
+    var again = try ctx.cli.run(&.{ "worker", "await", "sched-act", "--worker-id", "sched-w", "--block", "5000" });
+    defer again.deinit();
+    try testing.expect(extractTaskId(again.stdout) != null);
 }
