@@ -22,6 +22,13 @@ pub const Delta = schema.Int(i64);
 /// What a transaction's op does. A TTL of 0 on `expire` clears it.
 pub const BatchKind = enum(u8) { put, delete, incr, expire };
 
+/// What a write's `condition` and `cas_version` ask of the key. They travel in
+/// the entry and are decided when it applies, in log order and from the
+/// entry's stamp, so every replica decides alike and two racing writers can't
+/// both pass.
+pub const Condition = schema.Enum(kv_ops.Condition);
+pub const CasVersion = Optional(schema.Int(u64));
+
 /// One op of a committed transaction. Which of `value`, `ttl_ms` and
 /// `delta` it carries follows from its kind (`batchOpRule`).
 pub const BatchOp = Record(&.{
@@ -30,6 +37,8 @@ pub const BatchOp = Record(&.{
     .{ .name = "value", .T = Optional(Value) },
     .{ .name = "ttl_ms", .T = Optional(TtlMs) },
     .{ .name = "delta", .T = Optional(Delta) },
+    .{ .name = "condition", .T = Condition },
+    .{ .name = "cas_version", .T = CasVersion },
 });
 
 /// Everything a batch op carries but its key and value bytes: what
@@ -42,8 +51,13 @@ pub const Put = Record(&.{
     .{ .name = "key", .T = Key },
     .{ .name = "value", .T = Value },
     .{ .name = "ttl_ms", .T = Optional(TtlMs) },
+    .{ .name = "condition", .T = Condition },
+    .{ .name = "cas_version", .T = CasVersion },
 });
-pub const Delete = Record(&.{.{ .name = "key", .T = Key }});
+pub const Delete = Record(&.{
+    .{ .name = "key", .T = Key },
+    .{ .name = "cas_version", .T = CasVersion },
+});
 pub const Incr = Record(&.{
     .{ .name = "key", .T = Key },
     .{ .name = "delta", .T = Delta },
@@ -51,6 +65,7 @@ pub const Incr = Record(&.{
 pub const Expire = Record(&.{
     .{ .name = "key", .T = Key },
     .{ .name = "ttl_ms", .T = TtlMs },
+    .{ .name = "cas_version", .T = CasVersion },
 });
 pub const Batch = Record(&.{.{ .name = "ops", .T = BatchOps }});
 
@@ -91,19 +106,19 @@ pub fn Payload(comptime type_code: u8) type {
 pub const MAX_PAYLOAD: usize = Batch.max_size;
 
 /// What's wrong with a batch op, or null: each kind carries exactly the
-/// fields it uses. A put's TTL is optional; a delete carries nothing more.
+/// fields it uses. A put's TTL is optional; a delete carries at most a cas_version.
 pub fn batchOpRule(op: BatchOp.Value) ?[]const u8 {
     const ok = switch (op.kind) {
         .put => op.value != null and op.delta == null,
-        .delete => op.value == null and op.ttl_ms == null and op.delta == null,
-        .incr => op.value == null and op.ttl_ms == null and op.delta != null,
-        .expire => op.value == null and op.ttl_ms != null and op.delta == null,
+        .delete => op.value == null and op.ttl_ms == null and op.delta == null and op.condition == .always,
+        .incr => op.value == null and op.ttl_ms == null and op.delta != null and op.condition == .always and op.cas_version == null,
+        .expire => op.value == null and op.ttl_ms != null and op.delta == null and op.condition == .always,
     };
     return if (ok) null else switch (op.kind) {
         .put => "a put carries a value and no delta",
-        .delete => "a delete carries only its key",
+        .delete => "a delete carries only its key and cas_version",
         .incr => "an incr carries only its key and delta",
-        .expire => "an expire carries only its key and TTL",
+        .expire => "an expire carries only its key, TTL and cas_version",
     };
 }
 
@@ -119,10 +134,10 @@ const testing = std.testing;
 
 test "kv entries: a batch round-trips, and each kind's fields are checked" {
     const ops = [_]BatchOp.Value{
-        .{ .kind = .put, .key = "ns\x00a", .value = "1", .ttl_ms = 500, .delta = null },
-        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null },
-        .{ .kind = .incr, .key = "c", .value = null, .ttl_ms = null, .delta = -3 },
-        .{ .kind = .expire, .key = "d", .value = null, .ttl_ms = 0, .delta = null },
+        .{ .kind = .put, .key = "ns\x00a", .value = "1", .ttl_ms = 500, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .incr, .key = "c", .value = null, .ttl_ms = null, .delta = -3, .condition = .always, .cas_version = null },
+        .{ .kind = .expire, .key = "d", .value = null, .ttl_ms = 0, .delta = null, .condition = .always, .cas_version = null },
     };
     for (ops) |op| try testing.expectEqual(@as(?[]const u8, null), batchOpRule(op));
     var buf: [256]u8 = undefined;
@@ -140,16 +155,16 @@ test "kv entries: a batch round-trips, and each kind's fields are checked" {
     }
     try testing.expectEqual(ops.len, i);
 
-    try testing.expect(batchOpRule(.{ .kind = .put, .key = "a", .value = null, .ttl_ms = null, .delta = null }) != null);
-    try testing.expect(batchOpRule(.{ .kind = .delete, .key = "a", .value = "x", .ttl_ms = null, .delta = null }) != null);
-    try testing.expect(batchOpRule(.{ .kind = .incr, .key = "a", .value = null, .ttl_ms = null, .delta = null }) != null);
-    try testing.expect(batchOpRule(.{ .kind = .expire, .key = "a", .value = null, .ttl_ms = null, .delta = null }) != null);
+    try testing.expect(batchOpRule(.{ .kind = .put, .key = "a", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null }) != null);
+    try testing.expect(batchOpRule(.{ .kind = .delete, .key = "a", .value = "x", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null }) != null);
+    try testing.expect(batchOpRule(.{ .kind = .incr, .key = "a", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null }) != null);
+    try testing.expect(batchOpRule(.{ .kind = .expire, .key = "a", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null }) != null);
 }
 
 test "kv entries: a batch cut anywhere or with an unknown kind is refused whole" {
     const ops = [_]BatchOp.Value{
-        .{ .kind = .put, .key = "a", .value = "v", .ttl_ms = null, .delta = null },
-        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null },
+        .{ .kind = .put, .key = "a", .value = "v", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
     };
     var buf: [64]u8 = undefined;
     var w: schema.Writer = .{ .buf = &buf };
@@ -169,9 +184,9 @@ test "kv entries: a batch's op count is read from its prefix" {
     var buf: [512]u8 = undefined;
     var w = schema.Writer{ .buf = &buf };
     const ops = [_]BatchOp.Value{
-        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null },
-        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null },
-        .{ .kind = .put, .key = "c", .value = "3", .ttl_ms = null, .delta = null },
+        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .put, .key = "c", .value = "3", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
     };
     try BatchOps.encodeSlice(&w, &ops);
     // A batch is its list and nothing else, so the prefix leads the payload.

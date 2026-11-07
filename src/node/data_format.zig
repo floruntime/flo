@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 5;
+pub const CURRENT: u32 = 6;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -24,9 +24,10 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 3, .segment_version = 4, .entries = 0x3ff1b4bff4565f2 },
     // Namespace ids are dense and allocated by shard 0, not name hashes.
     .{ .format = 4, .segment_version = 4, .entries = 0x3ff1b4bff4565f2 },
-    // Action entries are schemas, and deliveries are logged. Unreleased,
-    // so it is re-pinned in place while its layouts still change.
+    // Action entries are schemas, and deliveries are logged.
     .{ .format = 5, .segment_version = 5, .entries = 0x8a485f4c721d6c8d },
+    // KV entries carry their conditions, decided when they apply.
+    .{ .format = 6, .segment_version = 6, .entries = 0xaf37ccaa7271c1e5 },
 };
 
 comptime {

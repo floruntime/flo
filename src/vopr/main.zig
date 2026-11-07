@@ -222,7 +222,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
     std.debug.print(
         "[vopr] seed={d} {s}: ticks={d} ops={d} acked={d} lost={d} committed={d} " ++
-            "elections={d} crashes={d} wipes={d} restarts={d} warm_restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} family_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d}\n",
+            "elections={d} crashes={d} wipes={d} restarts={d} warm_restarts={d} delivered={d} dropped={d} stalls={d} catch_up_reads={d} divergences={d} beyond_tolerance={d} vouches_taken={d} stranger_frames={d} state_checks={d} rebuilt_checks={d} family_checks={d} kv_refusals={d} kv_staged_refusals={d} kv_merges={d} kv_field_deletes={d} kv_condition_refusals={d} kv_conditions_held={d} kv_batch_condition_refusals={d} kv_batch_conditions_held={d}\n",
         .{
             s.seed,
             if (s.ok) "OK" else "FAILED",
@@ -251,6 +251,10 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
             s.kv.staged_refusals,
             s.kv.merges,
             s.kv.field_deletes,
+            s.kv.condition_refusals,
+            s.kv.conditions_held,
+            s.kv.batch_condition_refusals,
+            s.kv.batch_conditions_held,
         },
     );
     if (scenario.action_percent > 0) printActionCounts(s.actions);

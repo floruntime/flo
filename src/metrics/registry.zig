@@ -1376,7 +1376,7 @@ fn writeKVMetrics(
     snapshot: KVMetrics.Snapshot,
     labels: []const u8,
 ) !void {
-    try writer.print("# HELP flo_kv_keys Keys stored in this namespace: those written and not deleted, a key past its TTL included until it is deleted or overwritten\n", .{});
+    try writer.print("# HELP flo_kv_keys Keys stored in this namespace: those written and not deleted, a key past its TTL included until it is overwritten\n", .{});
     try writer.print("# TYPE flo_kv_keys gauge\n", .{});
     try writer.print("flo_kv_keys{{{s}}} {d}\n", .{ labels, snapshot.key_count });
 

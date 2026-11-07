@@ -62,7 +62,7 @@ pub fn main() !void {
     var pbuf: [64]u8 = undefined;
     start = stdx.time.nanoTimestamp();
     for (0..BENCH_ITERS) |i| {
-        const p = try kv_entries.Delete.encodeInto(&pbuf, .{ .key = formatKey(&kbuf, i) });
+        const p = try kv_entries.Delete.encodeInto(&pbuf, .{ .key = formatKey(&kbuf, i), .cas_version = null });
         _ = try kv.apply(&entry_mod.buildEntry(.kv_delete, 0, 1, kv.index + 1, 0, p));
     }
     report("KV Delete:", BENCH_ITERS, start, "");

@@ -1802,6 +1802,25 @@ pub const Simulator = struct {
         try self.pending_ops.append(self.allocator, id);
     }
 
+    /// A batch's conditions are on a key only it writes, so the entry alone says
+    /// how they come out, on every replica alike.
+    fn checkBatchAnswer(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, effect: families.Kv.Effect) void {
+        if (e.header.entry_type != @backingInt(entry_mod.EntryType.kv_batch)) return;
+        const answer = Workload.batchAnswer(e.payload) orelse return;
+        const refused = effect == .batch_condition_refused;
+        // `Kv.apply` judges the reason and op of what the machine refuses, so
+        // `.staged_refused` on a batch that must refuse is a mutant refusing early.
+        const wrong = if (answer == .holds) refused else !refused and effect != .staged_refused;
+        if (wrong) self.checker.fail(.{
+            .invariant = .applied_integrity,
+            .node = node.id,
+            .index = idx,
+            .tick = self.now,
+            .detail = if (refused) "the KV machine refused a batch for a condition that holds" else "the KV machine didn't refuse a batch for a condition that can't hold",
+        });
+        if (first and !refused and answer == .holds) self.kv_counts.batch_conditions_held += 1;
+    }
+
     /// What a batch did at this replica, after the machine answered: one it
     /// refused reached nothing. Its proposer's limit is checked either way.
     fn countTxn(self: *Simulator, node: *SimNode, e: *const entry_mod.Entry, idx: u64, first: bool, live: bool, effect: families.Kv.Effect, txns_before: i64) void {
@@ -1817,7 +1836,7 @@ pub const Simulator = struct {
                 .detail = "a leader proposed a batch above its own transaction limit",
             });
         }
-        if (effect == .staged_refused or effect == .refused) {
+        if (effect == .staged_refused or effect == .refused or effect == .batch_condition_refused) {
             if (first) c.machine_refused += 1;
             // The planted refusal diverges a replica, which is the checksums'
             // to catch, not this check's.
@@ -2058,6 +2077,7 @@ pub const Simulator = struct {
         const txns_before = if (is_txn) node.kv.counter(workload_mod.TXN_APPLIED_KEY) else 0;
         if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
             if (first) self.kv_counts.count(effect);
+            self.checkBatchAnswer(node, e, idx, first, effect);
             if (is_txn) self.countTxn(node, e, idx, first, live, effect, txns_before);
         } else |err| self.checker.fail(switch (err) {
             error.RefusalChangedState => .{
@@ -2066,6 +2086,20 @@ pub const Simulator = struct {
                 .index = idx,
                 .tick = self.now,
                 .detail = "a KV entry the machine refused changed a family",
+            },
+            error.BatchRefusedWrong => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the KV machine refused a batch for another reason or op than its entry says",
+            },
+            error.ConditionDecidedWrong => .{
+                .invariant = .applied_integrity,
+                .node = node.id,
+                .index = idx,
+                .tick = self.now,
+                .detail = "the KV machine decided a put's condition other than its key says",
             },
             else => .{
                 .invariant = .applied_integrity,
@@ -2707,7 +2741,7 @@ test "vopr sim: an effect only live apply runs fails state_checksum between a re
     try testing.expect((try stateChecksumUnder(.live_only_effect)).rebuilt_vs_live);
 }
 
-test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuses batches after staging" {
+test "vopr sim: in every run, KV merges JSON patches, deletes fields, refuses batches after staging, and decides conditions both ways" {
     // Swarm seeds, the reviewed low-merge ones (7, 13, 16) among them; each
     // run is checked on its own, not summed, and each entry counts once
     // however many replicas apply it.
@@ -2720,6 +2754,10 @@ test "vopr sim: in every run, KV merges JSON patches, deletes fields, and refuse
         try testing.expect(s.kv.merges >= 5);
         try testing.expect(s.kv.field_deletes >= 2);
         try testing.expect(s.kv.staged_refusals >= 5);
+        try testing.expect(s.kv.condition_refusals >= 5);
+        try testing.expect(s.kv.conditions_held >= 5);
+        try testing.expect(s.kv.batch_condition_refusals >= 1);
+        try testing.expect(s.kv.batch_conditions_held >= 5);
     }
 }
 
@@ -2859,6 +2897,34 @@ test "vopr sim: a replica that refuses a batch above its own limit at apply fail
     var kv = false;
     for (sim.checker.violations.items) |v| kv = kv or (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, " kv.") != null);
     try testing.expect(kv);
+}
+
+test "vopr sim: a KV condition one replica decides differently fails state_checksum on KV's families" {
+    var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(1), .{ .family_mutant = .kv_condition_local });
+    defer sim.deinit();
+    _ = try sim.run();
+    var caught = false;
+    for (sim.checker.violations.items) |v| {
+        if (v.invariant == .state_checksum and std.mem.indexOf(u8, v.detail, "different kv.value") != null) caught = true;
+    }
+    try testing.expect(caught);
+}
+
+test "vopr sim: a wrong answer every replica agrees on fails applied_integrity" {
+    const Case = struct { mutant: families.Mutant, says: []const u8 };
+    for ([_]Case{
+        .{ .mutant = .kv_if_absent_holds, .says = "decided a put's condition" },
+        .{ .mutant = .kv_batch_conditions_ignored, .says = "a condition that can't hold" },
+    }) |case| {
+        var sim = try Simulator.init(testing.allocator, Scenario.fromSeed(1), .{ .family_mutant = case.mutant });
+        defer sim.deinit();
+        _ = try sim.run();
+        var caught = false;
+        for (sim.checker.violations.items) |v| {
+            if (v.invariant == .applied_integrity and std.mem.indexOf(u8, v.detail, case.says) != null) caught = true;
+        }
+        try testing.expect(caught);
+    }
 }
 
 test "vopr sim: a replay that skips KV's batches fails state_checksum on KV's families" {
