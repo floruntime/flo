@@ -119,6 +119,8 @@ pub const RuntimeConfig = struct {
     max_txn_ops: u16 = @import("../protocol/limits.zig").DEFAULT_MAX_OPS_PER_TXN,
     max_txn_bytes: u32 = @import("../protocol/limits.zig").DEFAULT_MAX_BYTES_PER_TXN,
     worker_remove_after_ms: u64 = 600_000,
+    /// How long a workflow step waits for its action to be registered.
+    missing_action_wait_ms: u64 = 600_000,
 
     // =========================================================================
     // Port Derivation Methods
@@ -814,6 +816,7 @@ pub const Runtime = struct {
             shards[i].kv_handler.txn_table.max_ops = self.config.max_txn_ops;
             shards[i].kv_handler.txn_table.max_bytes = self.config.max_txn_bytes;
             shards[i].worker_handler.remove_after_ms = self.config.worker_remove_after_ms;
+            shards[i].actions_handler.missing_action_wait_ms = self.config.missing_action_wait_ms;
             shards[i].registerBackgroundTasks();
             shards[i].wireHandlerShardPtrs();
             shards[i].applyDeferredTail();
