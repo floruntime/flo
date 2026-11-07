@@ -45,6 +45,8 @@ pub const Tag = enum(u8) {
     action_result_ask, // a workflow's shard asking a run's shard how it ended: payload [ns_len:u16][ns][run]
     action_abandon, // a task whose await went away before it was answered, handed back to the run's shard
     worker_report, // a report counted toward its worker's stats, where the worker is registered
+    action_held, // a run a workflow on the receiver waits on is held for want of its action: payload [run_len:u16][run][action]
+    action_unhold, // a workflow run ended while the receiver held the start of its step: payload the action run's id
 };
 
 /// 32-byte compact envelope — the payload is allocated separately.
