@@ -191,9 +191,19 @@ pub const ActionsHandler = struct {
     /// When this shard last asked about a run on another shard, by run id.
     asked: std.StringHashMapUnmanaged(u64) = .empty,
     /// Runs another shard's workflow asked this one to start, not yet
-    /// applied (or refused for want of their action), by when: asked
-    /// about meanwhile, they aren't lost. Kept `FINISHED_KEEP_MS`.
+    /// applied, by when: asked about meanwhile, they aren't lost. Kept
+    /// `FINISHED_KEEP_MS`.
     starting: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Starts a workflow step asked for whose action isn't registered, by
+    /// run id: each starts when the action registers, or its step fails at
+    /// `until_ms`. Leader memory, like the rest of a step's state.
+    held: std.StringHashMapUnmanaged(HeldStart) = .empty,
+    /// Which action each newly held run waits for, until its workflow on
+    /// this shard writes that into the run's history.
+    held_notes: std.StringHashMapUnmanaged(HeldNote) = .empty,
+    /// How long a step waits for its action to be registered; 0 fails it at
+    /// once. Set from the server's config.
+    missing_action_wait_ms: u64 = 600_000,
     /// Messages for other shards the inbox had no room for; sent again each
     /// duty tick.
     unsent: std.ArrayListUnmanaged(Unsent) = .empty,
@@ -216,6 +226,15 @@ pub const ActionsHandler = struct {
     pub const Finished = struct { status: ActionRunStatus, outcome: []u8, output: []u8, at_ms: u64 };
 
     const Unsent = struct { target: u16, tag: @import("../node/inbox.zig").Tag, bytes: []u8 };
+
+    /// `bytes` is the `encodeStartRunMessage` message; the run id key points
+    /// into it.
+    const HeldStart = struct { from: u16, bytes: []u8, until_ms: u64 };
+    const HeldNote = struct { action: []u8, at_ms: u64 };
+
+    /// Starts one shard holds: past it a step fails at once rather than
+    /// hold its input in memory.
+    pub const MAX_HELD: usize = 1024;
 
     /// How long a run's result from another shard waits for its workflow
     /// (and a run another shard asked for waits to start, and an ask is
@@ -255,6 +274,9 @@ pub const ActionsHandler = struct {
         self.asked.deinit(self.allocator);
         freeKeys(self.allocator, &self.starting);
         self.starting.deinit(self.allocator);
+        self.held.deinit(self.allocator);
+        self.freeHeldNotes();
+        self.held_notes.deinit(self.allocator);
         for (self.unsent.items) |u| self.allocator.free(u.bytes);
         self.unsent.deinit(self.allocator);
         if (self.status_buf) |b| self.allocator.free(b);
@@ -1460,13 +1482,11 @@ pub const ActionsHandler = struct {
             .action_deliver => if (leads) self.deliverApplied(shard, e, result),
             .action_invoke => {
                 const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
-                // Refused for want of the action, a run another shard's
-                // workflow asked for stays starting, so that step waits for
-                // the action as it always has (on the workflow's own shard
-                // it fails at once); only a run whose invoke was lost is.
-                const no_action = if (result.refused()) |r| r.refusal.reason == .not_found else false;
-                if (!no_action) if (self.starting.fetchRemove(p.run)) |kv| self.allocator.free(kv.key);
+                if (self.starting.fetchRemove(p.run)) |kv| self.allocator.free(kv.key);
                 if (leads and result.refused() == null) shard.wake_workers = true;
+                // The action was deleted after the invoke was proposed.
+                const no_action = if (result.refused()) |r| r.refusal.reason == .not_found else false;
+                if (leads and no_action) if (p.caller_shard) |from| self.failHeld(shard, from, p.run, p.ns, p.action, "");
             },
             .action_extend => {
                 const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
@@ -1605,8 +1625,10 @@ pub const ActionsHandler = struct {
     }
 
     /// `[run_len:u16][run][status:u8][outcome_len:u16][outcome][output]`.
-    /// A run its shard has no record of, and isn't starting, goes as
-    /// `cancelled`: its invoke was lost.
+    /// A run its shard has no record of, and isn't starting or holding,
+    /// goes as `cancelled`: its invoke was lost. One whose action never
+    /// came goes as `cancelled` with outcome `target_not_found`, saying why
+    /// in `output`.
     fn sendFinished(self: *ActionsHandler, shard: *Shard, target: u16, run_id: []const u8, status: ActionRunStatus, outcome: []const u8, output: []const u8) void {
         const bytes = self.allocator.alloc(u8, 2 + run_id.len + 1 + 2 + outcome.len + output.len) catch return;
         std.mem.writeInt(u16, bytes[0..2], @intCast(run_id.len), .little);
@@ -1619,6 +1641,17 @@ pub const ActionsHandler = struct {
     }
 
     fn send(self: *ActionsHandler, shard: *Shard, target: u16, tag: @import("../node/inbox.zig").Tag, bytes: []u8) void {
+        // What a workflow's own shard says to it needs no inbox.
+        if (target == shard.id) {
+            defer self.allocator.free(bytes);
+            switch (tag) {
+                .action_finished => self.finishedFromInbox(bytes),
+                .action_held => self.heldFromInbox(bytes),
+                .action_unhold => self.unhold(bytes),
+                else => unreachable,
+            }
+            return;
+        }
         const mailboxes = shard.peer_mailboxes orelse return self.allocator.free(bytes);
         if (target >= mailboxes.len) return self.allocator.free(bytes);
         if (mailboxes[target].inbox.send(.{ .tag = tag, .src_shard = @intCast(shard.id), .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr })) return;
@@ -1685,7 +1718,7 @@ pub const ActionsHandler = struct {
             if (finishedStatus(run.status)) self.sendFinished(shard, from, run_id, statusOf(run), if (run.status == .completed) run.outcome else "", if (run.status == .completed) run.result else "");
             return;
         }
-        if (self.starting.contains(run_id)) return;
+        if (self.startPending(run_id)) return;
         self.sendFinished(shard, from, run_id, .cancelled, "", "");
     }
 
@@ -1709,8 +1742,8 @@ pub const ActionsHandler = struct {
         };
     }
 
-    /// A run on another shard, as that shard last told this one; taken, so
-    /// the workflow resumes once.
+    /// A run as its shard last told this one, or as this shard told itself
+    /// of a start it didn't make; taken, so the workflow resumes once.
     pub fn takeFinished(self: *ActionsHandler, run_id: []const u8) ?Finished {
         if (self.asked.fetchRemove(run_id)) |kv| self.allocator.free(kv.key);
         const kv = self.finished.fetchRemove(run_id) orelse return null;
@@ -1753,23 +1786,182 @@ pub const ActionsHandler = struct {
 
     /// A workflow on another shard asking this one to start a run it will
     /// wait on: `[run_len:u16][run][ns_len:u16][ns][action_len:u16][action]`
-    /// `[caller_len:u16][caller][workflow_len:u16][workflow][input]`, from
-    /// the shard `from`, where the workflow's run is. A run
-    /// that couldn't be started is lost: asked about, it says so.
+    /// `[caller_len:u16][caller][workflow_len:u16][workflow]`
+    /// `[wait_len:u16][wait][input]` (a non-empty `wait` if its step may wait
+    /// for the action), from
+    /// the shard `from`, where the workflow's run is (this shard, for a step
+    /// here whose action isn't registered). Held while the action isn't. A
+    /// run that couldn't be started is lost: asked about, it says so.
     pub fn startRunFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8) void {
-        var r: Fields = .{ .bytes = bytes };
-        const run_id = r.next() orelse return;
-        const ns = r.next() orelse return;
-        const action = r.next() orelse return;
-        const caller = r.next() orelse return;
-        const workflow = r.next() orelse return;
-        const input = bytes[r.off..];
-        if (proposeInvoke(shard, ns, action, run_id, input, if (caller.len == 0) null else caller, if (workflow.len == 0) null else workflow, if (caller.len == 0) null else from) == null) {
-            log.err("shard {d}: action run {s} asked for by a workflow on another shard could not be started; that workflow's step fails", .{ shard.id, run_id });
-            return;
+        const m = StartMessage.parse(bytes) orelse return;
+        // Too long for an entry now means too long when the action registers.
+        if (!m.fits(from)) {
+            log.err("shard {d}: action run {s} asked for by a workflow is too long to log; that workflow's step fails", .{ shard.id, m.run });
+            return self.sendFinished(shard, from, m.run, .cancelled, "", "");
         }
-        const k = self.allocator.dupe(u8, run_id) catch return;
+        if (!actionExists(shard, m.ns, m.action)) {
+            // A plan's executor with another to try doesn't wait for this one.
+            if (m.can_wait) return self.hold(shard, from, bytes, m.run, m.ns, m.action);
+            return self.failHeld(shard, from, m.run, m.ns, m.action, "");
+        }
+        if (!self.startRun(shard, from, m)) {
+            log.err("shard {d}: action run {s} asked for by a workflow could not be started; that workflow's step fails", .{ shard.id, m.run });
+        }
+    }
+
+    const StartMessage = struct {
+        run: []const u8,
+        ns: []const u8,
+        action: []const u8,
+        caller: []const u8,
+        workflow: []const u8,
+        can_wait: bool,
+        input: []const u8,
+
+        fn parse(bytes: []const u8) ?StartMessage {
+            var r: Fields = .{ .bytes = bytes };
+            const run = r.next() orelse return null;
+            const ns = r.next() orelse return null;
+            const action = r.next() orelse return null;
+            const caller = r.next() orelse return null;
+            const workflow = r.next() orelse return null;
+            const can_wait = r.next() orelse return null;
+            return .{ .run = run, .ns = ns, .action = action, .caller = caller, .workflow = workflow, .can_wait = can_wait.len > 0, .input = bytes[r.off..] };
+        }
+
+        fn invoke(m: StartMessage, from: u16) ae.Invoke.Value {
+            const caller: ?[]const u8 = if (m.caller.len == 0) null else m.caller;
+            return .{ .ns = m.ns, .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow, .caller_shard = if (caller != null) from else null };
+        }
+
+        fn fits(m: StartMessage, from: u16) bool {
+            _ = ae.Invoke.encodedSize(m.invoke(from)) catch return false;
+            return true;
+        }
+    };
+
+    fn startRun(self: *ActionsHandler, shard: *Shard, from: u16, m: StartMessage) bool {
+        _ = proposeInvoke(shard, m.ns, m.action, m.run, m.input, if (m.caller.len == 0) null else m.caller, if (m.workflow.len == 0) null else m.workflow, if (m.caller.len == 0) null else from) orelse return false;
+        const k = self.allocator.dupe(u8, m.run) catch return true;
         self.starting.put(self.allocator, k, @import("stdx").time.monotonicMs()) catch self.allocator.free(k);
+        return true;
+    }
+
+    /// Whether a run asked for here is yet to exist, not lost: its invoke
+    /// is on its way, or its action isn't registered yet.
+    pub fn startPending(self: *const ActionsHandler, run_id: []const u8) bool {
+        return self.starting.contains(run_id) or self.held.contains(run_id);
+    }
+
+    /// Hold a start until its action is registered, and tell its workflow
+    /// why it waits. With no wait set, or no room, its step fails now.
+    fn hold(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8, run_id: []const u8, ns: []const u8, action: []const u8) void {
+        if (self.missing_action_wait_ms == 0) return self.failHeld(shard, from, run_id, ns, action, "");
+        if (self.held.count() >= MAX_HELD) return self.failHeld(shard, from, run_id, ns, action, "; too many steps are already waiting for an action on this shard");
+        const owned = self.allocator.dupe(u8, bytes) catch return self.failHeld(shard, from, run_id, ns, action, "; out of memory");
+        const m = StartMessage.parse(owned).?;
+        const until_ms = @import("stdx").time.monotonicMs() +| self.missing_action_wait_ms;
+        var first = true;
+        var it = self.held.valueIterator();
+        while (it.next()) |h| {
+            const other = StartMessage.parse(h.bytes).?;
+            if (std.mem.eql(u8, other.action, m.action) and std.mem.eql(u8, other.ns, m.ns)) first = false;
+        }
+        self.held.put(self.allocator, m.run, .{ .from = from, .bytes = owned, .until_ms = until_ms }) catch {
+            self.allocator.free(owned);
+            return self.failHeld(shard, from, run_id, ns, action, "; out of memory");
+        };
+        if (first) log.warn("shard {d}: a workflow step waits for action {s} in namespace {s}, which isn't registered; it fails in {d} ms if it still isn't ([workflows] missing_action_wait_ms)", .{ shard.id, m.action, m.ns, self.missing_action_wait_ms });
+        const note = self.allocator.alloc(u8, 2 + m.run.len + m.action.len) catch return;
+        std.mem.writeInt(u16, note[0..2], @intCast(m.run.len), .little);
+        @memcpy(note[2..][0..m.run.len], m.run);
+        @memcpy(note[2 + m.run.len ..], m.action);
+        self.send(shard, from, .action_held, note);
+    }
+
+    /// A step's start this shard won't hold, or held too long.
+    fn failHeld(self: *ActionsHandler, shard: *Shard, from: u16, run_id: []const u8, ns: []const u8, action: []const u8, why: []const u8) void {
+        var buf: [1024]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "action {s} is not registered in namespace {s}{s}", .{ action, ns, why }) catch "the action is not registered";
+        self.sendFinished(shard, from, run_id, .cancelled, NOT_REGISTERED, detail);
+    }
+
+    /// The outcome of a step whose action never came.
+    pub const NOT_REGISTERED = "target_not_found";
+
+    /// Start what was held for an action now registered, and fail what has
+    /// waited long enough.
+    fn stepHeld(self: *ActionsHandler, shard: *Shard, now_ms: u64) void {
+        if (self.held.count() == 0) return;
+        var done: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer done.deinit(self.allocator);
+        var it = self.held.iterator();
+        while (it.next()) |e| {
+            const m = StartMessage.parse(e.value_ptr.bytes).?;
+            if (actionExists(shard, m.ns, m.action)) {
+                // Not proposed: tried again next tick, until the wait ends.
+                if (!self.startRun(shard, e.value_ptr.from, m)) {
+                    if (now_ms < e.value_ptr.until_ms) continue;
+                    self.sendFinished(shard, e.value_ptr.from, m.run, .cancelled, "", "");
+                }
+            } else if (now_ms >= e.value_ptr.until_ms) {
+                var why_buf: [64]u8 = undefined;
+                const why = std.fmt.bufPrint(&why_buf, "; waited {d} ms", .{self.missing_action_wait_ms}) catch "";
+                self.failHeld(shard, e.value_ptr.from, m.run, m.ns, m.action, why);
+            } else continue;
+            done.append(self.allocator, e.key_ptr.*) catch break;
+        }
+        for (done.items) |k| self.unhold(k);
+    }
+
+    /// Forget a held start: its workflow run was cancelled, or it's done.
+    fn unhold(self: *ActionsHandler, run_id: []const u8) void {
+        const kv = self.held.fetchRemove(run_id) orelse return;
+        self.allocator.free(kv.value.bytes);
+    }
+
+    /// A workflow run here ended while its step waited for its action on
+    /// shard `target`: nothing should start for it now.
+    pub fn cancelHeld(self: *ActionsHandler, shard: *Shard, target: u16, run_id: []const u8) void {
+        if (target == shard.id) return self.unhold(run_id);
+        const bytes = self.allocator.dupe(u8, run_id) catch return;
+        self.send(shard, target, .action_unhold, bytes);
+    }
+
+    /// `[run_len:u16][run][action]`: a run a workflow here waits on is held
+    /// for want of its action.
+    pub fn heldFromInbox(self: *ActionsHandler, bytes: []const u8) void {
+        if (bytes.len < 2) return;
+        const n: usize = std.mem.readInt(u16, bytes[0..2], .little);
+        if (2 + n > bytes.len or self.held_notes.contains(bytes[2..][0..n])) return;
+        const k = self.allocator.dupe(u8, bytes[2..][0..n]) catch return;
+        const action = self.allocator.dupe(u8, bytes[2 + n ..]) catch return self.allocator.free(k);
+        self.held_notes.put(self.allocator, k, .{ .action = action, .at_ms = @import("stdx").time.monotonicMs() }) catch {
+            self.allocator.free(k);
+            self.allocator.free(action);
+        };
+    }
+
+    /// The action a run is newly held for, once; the caller frees it.
+    pub fn takeHeldNote(self: *ActionsHandler, run_id: []const u8) ?[]u8 {
+        const kv = self.held_notes.fetchRemove(run_id) orelse return null;
+        self.allocator.free(kv.key);
+        return kv.value.action;
+    }
+
+    fn freeHeldNotes(self: *ActionsHandler) void {
+        var it = self.held_notes.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.action);
+        }
+        self.held_notes.clearRetainingCapacity();
+    }
+
+    fn dropHeld(self: *ActionsHandler) void {
+        var it = self.held.valueIterator();
+        while (it.next()) |h| self.allocator.free(h.bytes);
+        self.held.clearRetainingCapacity();
     }
 
     const Fields = struct {
@@ -1787,8 +1979,8 @@ pub const ActionsHandler = struct {
 
     /// The inbox payload `startRunFromInbox` reads, allocated with
     /// `allocator`; the receiving shard frees it.
-    pub fn encodeStartRunMessage(allocator: Allocator, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8) ?[]u8 {
-        const parts = [_][]const u8{ run_id, homeOf(namespace), action_name, caller_run_id orelse "", caller_workflow_name orelse "" };
+    pub fn encodeStartRunMessage(allocator: Allocator, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, can_wait: bool) ?[]u8 {
+        const parts = [_][]const u8{ run_id, homeOf(namespace), action_name, caller_run_id orelse "", caller_workflow_name orelse "", if (can_wait) "w" else "" };
         var size: usize = input.len;
         for (parts) |p| {
             if (p.len > std.math.maxInt(u16)) return null;
@@ -1822,6 +2014,7 @@ pub const ActionsHandler = struct {
         // node's own clock but not by the stamp would apply as a no-op,
         // and a full one chain into another at once.
         const now = shard.raft_node.now();
+        self.stepHeld(shard, @import("stdx").time.monotonicMs());
         if (self.duty_term != shard.raft_node.current_term) {
             self.duty_term = shard.raft_node.current_term;
             self.duty_since_ns = now;
@@ -1909,6 +2102,13 @@ pub const ActionsHandler = struct {
     pub fn pruneAt(self: *ActionsHandler, now: u64) void {
         pruneOld(self.allocator, &self.asked, now);
         pruneOld(self.allocator, &self.starting, now);
+        if (self.held_notes.count() > 0) {
+            var notes: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer notes.deinit(self.allocator);
+            var nit = self.held_notes.iterator();
+            while (nit.next()) |e| if (now -| e.value_ptr.at_ms > FINISHED_KEEP_MS) notes.append(self.allocator, e.key_ptr.*) catch break;
+            for (notes.items) |k| if (self.takeHeldNote(k)) |action| self.allocator.free(action);
+        }
         if (self.finished.count() == 0) return;
         var it = self.finished.iterator();
         var old: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1952,6 +2152,7 @@ pub const ActionsHandler = struct {
         self.rebuilding = false;
         self.expiring = null;
         self.duty_term = 0;
+        self.dropHeld();
     }
 
     pub fn actionCount(shard: *Shard) usize {

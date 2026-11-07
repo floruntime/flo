@@ -3457,3 +3457,221 @@ test "e2e/workflow: on 4 shards, a run started with an id the client chose is fo
     defer theirs.deinit();
     try testing.expectEqual(@as(usize, 1), theirs.stdoutCount("Workflow: rid-wf-0"));
 }
+
+// =============================================================================
+// A step whose action isn't registered
+// =============================================================================
+
+/// Which shard the server routes `key` to on 4 shards: by namespace and key,
+/// over as many partitions as it picks when none are configured.
+fn shardOfKey(key: []const u8) u16 {
+    const r = @import("src").node.router.Router.init(0, 4, 0);
+    return switch (r.route(@import("src").node.router.hashKeyWithNamespace("default", key))) {
+        .local => 0,
+        .shard => |s| s.shard_id,
+    };
+}
+
+/// An action name on the workflow's own shard, or on another.
+fn actionPlaced(buf: []u8, prefix: []const u8, workflow: []const u8, same_shard: bool) ![]const u8 {
+    for (0..256) |i| {
+        const name = try std.fmt.bufPrint(buf, "{s}-{d}", .{ prefix, i });
+        if ((shardOfKey(name) == shardOfKey(workflow)) == same_shard) return name;
+    }
+    return error.NoAction;
+}
+
+/// Creates workflow `name`, one step calling `action`.
+fn createStepWorkflow(ctx: *stdx.testing.TestContext, name: []const u8, action: []const u8) !void {
+    var builder = YamlBuilder.init(testing.allocator);
+    defer builder.deinit();
+    _ = builder.workflow(name, "1.0.0");
+    const target = try std.fmt.allocPrint(testing.allocator, "@actions/{s}", .{action});
+    defer testing.allocator.free(target);
+    _ = builder.start(target).onSuccess("flo.Completed").onFailure("flo.Failed");
+    const yaml = try builder.build();
+    defer testing.allocator.free(yaml);
+    const path = try writeTempYaml(testing.allocator, yaml, "missing-action-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+}
+
+fn expectRunStatus(ctx: *stdx.testing.TestContext, run_id: []const u8, want: []const u8) !void {
+    var status = try ctx.cli.run(&.{ "workflow", "status", run_id });
+    defer status.deinit();
+    try testing.expectEqual(@as(u8, 0), status.exit_code);
+    var line_buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "Status:   {s}\n", .{want});
+    if (!status.stdoutContains(line)) {
+        std.debug.print("[TEST] run {s} wants {s}: {s}\n", .{ run_id, want, status.stdout });
+        return error.AssertionFailed;
+    }
+}
+
+/// Polls until `run_id` has status `want`, for up to `ms`.
+fn awaitRunStatus(ctx: *stdx.testing.TestContext, run_id: []const u8, want: []const u8, ms: u64) !void {
+    for (0..ms / 50) |_| {
+        expectRunStatus(ctx, run_id, want) catch {
+            stdx.time.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
+        return;
+    }
+    try expectRunStatus(ctx, run_id, want);
+}
+
+/// Polls until `run_id`'s history has a row holding `text`, for up to `ms`.
+fn awaitHistory(ctx: *stdx.testing.TestContext, run_id: []const u8, text: []const u8, ms: u64) !void {
+    for (0..ms / 50) |_| {
+        var history = try ctx.cli.run(&.{ "workflow", "history", run_id });
+        defer history.deinit();
+        if (history.exit_code == 0 and history.stdoutContains(text)) return;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    var history = try ctx.cli.run(&.{ "workflow", "history", run_id });
+    defer history.deinit();
+    std.debug.print("[TEST] run {s} history lacks '{s}': {s}\n", .{ run_id, text, history.stdout });
+    return error.AssertionFailed;
+}
+
+test "e2e/workflow: a step waits for its action to be registered, then runs it, on the workflow's shard or another" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "late-wf-same", "late-wf-other" }, [_][]const u8{ "late-run-same", "late-run-other" }) |same_shard, wf, run_id| {
+        var name_buf: [32]u8 = undefined;
+        const action = try actionPlaced(&name_buf, "late-act", wf, same_shard);
+        try createStepWorkflow(ctx, wf, action);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+
+        // It says what it waits for, and goes on waiting.
+        try awaitHistory(ctx, run_id, "action_not_registered", 5000);
+        try expectRunStatus(ctx, run_id, "waiting");
+
+        try ctx.exec(&.{ "action", "register", action });
+        var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "late-w", "--block", "5000" });
+        defer taken.deinit();
+        try testing.expectEqual(@as(u8, 0), taken.exit_code);
+        const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+        try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "late-w", "--result", "{}" });
+        try awaitRunStatus(ctx, run_id, "completed", 7000);
+    }
+}
+
+test "e2e/workflow: a step whose action never registers fails at the timeout, on the workflow's shard or another" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
+        .shards = 4,
+        .extra_config = "[workflows]\nmissing_action_wait_ms = 1500\n",
+    } });
+    defer ctx.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "never-wf-same", "never-wf-other" }, [_][]const u8{ "never-run-same", "never-run-other" }) |same_shard, wf, run_id| {
+        var name_buf: [32]u8 = undefined;
+        const action = try actionPlaced(&name_buf, "never-act", wf, same_shard);
+        try createStepWorkflow(ctx, wf, action);
+        const started = stdx.time.monotonicMs();
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+        try awaitRunStatus(ctx, run_id, "failed", 10_000);
+        try testing.expect(stdx.time.monotonicMs() - started >= 1500);
+
+        var want_buf: [128]u8 = undefined;
+        try awaitHistory(ctx, run_id, try std.fmt.bufPrint(&want_buf, "action {s} is not registered in namespace default; waited 1500 ms", .{action}), 1000);
+    }
+}
+
+fn createPlanWorkflow(ctx: *stdx.testing.TestContext, name: []const u8, first: []const u8, second: []const u8) !void {
+    var builder = YamlBuilder.init(testing.allocator);
+    defer builder.deinit();
+    _ = builder.workflow(name, "1.0.0");
+    const first_target = try std.fmt.allocPrint(testing.allocator, "@actions/{s}", .{first});
+    defer testing.allocator.free(first_target);
+    const second_target = try std.fmt.allocPrint(testing.allocator, "@actions/{s}", .{second});
+    defer testing.allocator.free(second_target);
+    _ = builder.plans()
+        .plan("p", "static-order")
+        .executor("first", first_target, 100)
+        .executor("second", second_target, 100)
+        .done()
+        .done();
+    _ = builder.start("@plan/p").onSuccess("flo.Completed").onFailure("flo.Failed");
+    const yaml = try builder.build();
+    defer testing.allocator.free(yaml);
+    const path = try writeTempYaml(testing.allocator, yaml, "plan-wait.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+}
+
+fn takeAndComplete(ctx: *stdx.testing.TestContext, action: []const u8, block_ms: []const u8) !void {
+    var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "plan-w", "--block", block_ms });
+    defer taken.deinit();
+    const id = extractTaskId(std.mem.trim(u8, taken.stdout, &std.ascii.whitespace)) orelse return error.AssertionFailed;
+    try ctx.exec(&.{ "worker", "complete", id, "--worker-id", "plan-w", "--result", "{}" });
+}
+
+test "e2e/workflow: a plan moves past an executor whose action isn't registered at once, and its last executor waits, on the workflow's shard or another" {
+    // The default wait: a plan that waited for its first executor would
+    // not reach its second within this test.
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "plan-wf-same", "plan-wf-other" }, [_][]const u8{ "plan-run-same", "plan-run-other" }, [_][]const u8{ "plan-next-same", "plan-next-other" }) |same_shard, wf, run_id, second| {
+        var first_buf: [32]u8 = undefined;
+        const first = try actionPlaced(&first_buf, if (same_shard) "plan-first-same" else "plan-first-other", wf, same_shard);
+        try ctx.exec(&.{ "action", "register", second });
+        try createPlanWorkflow(ctx, wf, first, second);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+        try takeAndComplete(ctx, second, "5000");
+        try awaitRunStatus(ctx, run_id, "completed", 7000);
+    }
+    // Neither registered: it reaches the last, which waits for its action.
+    for ([_]bool{ true, false }, [_][]const u8{ "last-wf-same", "last-wf-other" }, [_][]const u8{ "last-run-same", "last-run-other" }) |same_shard, wf, run_id| {
+        var last_buf: [32]u8 = undefined;
+        const last = try actionPlaced(&last_buf, if (same_shard) "plan-last-same" else "plan-last-other", wf, same_shard);
+        try createPlanWorkflow(ctx, wf, "plan-absent", last);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+        try awaitHistory(ctx, run_id, "action_not_registered", 7000);
+        try expectRunStatus(ctx, run_id, "waiting");
+        try ctx.exec(&.{ "action", "register", last });
+        try takeAndComplete(ctx, last, "5000");
+        try awaitRunStatus(ctx, run_id, "completed", 7000);
+    }
+}
+
+test "e2e/workflow: with no wait set, a step whose action isn't registered fails at once, on the workflow's shard or another" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{
+        .shards = 4,
+        .extra_config = "[workflows]\nmissing_action_wait_ms = 0\n",
+    } });
+    defer ctx.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "now-wf-same", "now-wf-other" }, [_][]const u8{ "now-run-same", "now-run-other" }) |same_shard, wf, run_id| {
+        var name_buf: [32]u8 = undefined;
+        const action = try actionPlaced(&name_buf, "now-act", wf, same_shard);
+        try createStepWorkflow(ctx, wf, action);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+        try awaitRunStatus(ctx, run_id, "failed", 3000);
+        var want_buf: [128]u8 = undefined;
+        try awaitHistory(ctx, run_id, try std.fmt.bufPrint(&want_buf, "action {s} is not registered in namespace default", .{action}), 1000);
+        // It didn't wait, even a tick.
+        var history = try ctx.cli.run(&.{ "workflow", "history", run_id });
+        defer history.deinit();
+        try testing.expect(!history.stdoutContains("action_not_registered"));
+        try testing.expect(!history.stdoutContains("waited"));
+    }
+}
+
+test "e2e/workflow: a run cancelled while its step waits for its action starts nothing when the action registers" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+    for ([_]bool{ true, false }, [_][]const u8{ "gone-wf-same", "gone-wf-other" }, [_][]const u8{ "gone-run-same", "gone-run-other" }) |same_shard, wf, run_id| {
+        var name_buf: [32]u8 = undefined;
+        const action = try actionPlaced(&name_buf, "gone-act", wf, same_shard);
+        try createStepWorkflow(ctx, wf, action);
+        try ctx.exec(&.{ "workflow", "start", wf, "{}", "--run-id", run_id });
+        try awaitHistory(ctx, run_id, "action_not_registered", 5000);
+        try ctx.exec(&.{ "workflow", "cancel", run_id });
+        try awaitRunStatus(ctx, run_id, "cancelled", 3000);
+
+        try ctx.exec(&.{ "action", "register", action });
+        // Longer than a duty tick: a held start would be ready by now.
+        var taken = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", "gone-w", "--block", "1500" });
+        defer taken.deinit();
+        try testing.expect(extractTaskId(taken.stdout) == null);
+    }
+}
