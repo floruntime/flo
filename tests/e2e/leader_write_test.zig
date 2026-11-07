@@ -84,6 +84,7 @@ test "e2e/leader-write: after failover, a cancel never overwrites how a run the 
     defer cluster.deinit();
     errdefer cluster.printLogs();
     try cluster.execOnWithRetry(0, &.{ "kv", "set", "up", "v" }, 40, 250);
+    try cluster.execOnWithRetry(0, &.{ "action", "register", "act" }, 40, 250);
     const old = try leaderOf(&cluster);
 
     var writer = Client.init(testing.allocator, cluster.endpoints[old].?);
