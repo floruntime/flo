@@ -220,11 +220,12 @@ pub fn readsInTxn(req: proto.Request) bool {
 /// Whether a table op may run on a leader still applying what earlier terms
 /// committed. KV's writes read nothing when proposed: each is decided as its
 /// entry applies, in log order, so refusing one would only cost a retry. The
-/// namespace ops check that leader themselves, and say what the asker needs.
+/// namespace ops and a worker's await check that leader themselves: they say
+/// what the asker needs, and an await gets no task.
 pub fn runsOnApplyingLeader(req: proto.Request) bool {
     inline for (table.op_table) |o| {
         if (o.code == req.header.op_code) {
-            const own_check = comptime std.mem.eql(u8, o.name, "namespace.create") or std.mem.eql(u8, o.name, "namespace.ensure") or std.mem.eql(u8, o.name, "namespace.published");
+            const own_check = comptime std.mem.eql(u8, o.name, "namespace.create") or std.mem.eql(u8, o.name, "namespace.ensure") or std.mem.eql(u8, o.name, "namespace.published") or std.mem.eql(u8, o.name, "action.await");
             return own_check or (comptime std.mem.startsWith(u8, o.name, "kv."));
         }
     }
