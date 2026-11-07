@@ -225,7 +225,7 @@ pub fn readsInTxn(req: proto.Request) bool {
 pub fn runsOnApplyingLeader(req: proto.Request) bool {
     inline for (table.op_table) |o| {
         if (o.code == req.header.op_code) {
-            const own_check = comptime std.mem.eql(u8, o.name, "namespace.create") or std.mem.eql(u8, o.name, "namespace.ensure") or std.mem.eql(u8, o.name, "namespace.published") or std.mem.eql(u8, o.name, "action.await");
+            const own_check = comptime std.mem.eql(u8, o.name, "namespace.create") or std.mem.eql(u8, o.name, "namespace.ensure") or std.mem.eql(u8, o.name, "action.await");
             return own_check or (comptime std.mem.startsWith(u8, o.name, "kv."));
         }
     }

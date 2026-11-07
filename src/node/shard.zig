@@ -1950,10 +1950,15 @@ pub const Shard = struct {
         // of it. A halted one answers the former, marked stale, as other reads
         // are. So too a write whose handler reads state to decide what to
         // propose: it could finish a run again, or drop a stream that isn't
-        // empty. Changing the membership must stay possible, since a leader
-        // can wait here on a peer that has to be replaced; so must a repair.
+        // empty. Rather than judge each, all are refused but those that read
+        // nothing the backlog could change. A membership change answers for
+        // itself: it waits for the leader's first commit, and past that,
+        // needn't wait for the apply. A repair reads only the log. A worker's
+        // registration lives in the leader's memory alone.
         const in_txn_read = table_run.readsInTxn(req);
-        const refuses_write = writes and !in_txn_read and !membership_op and !repair_op and !table_run.runsOnApplyingLeader(req);
+        const worker_op = req.header.op_code == @backingInt(proto.OpCode.worker_register) or req.header.op_code == @backingInt(proto.OpCode.worker_heartbeat) or
+            req.header.op_code == @backingInt(proto.OpCode.worker_deregister) or req.header.op_code == @backingInt(proto.OpCode.worker_drain);
+        const refuses_write = writes and !in_txn_read and !membership_op and !repair_op and !worker_op and !table_run.runsOnApplyingLeader(req);
         if ((at_leader or in_txn_read or refuses_write) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
@@ -13467,7 +13472,7 @@ test "Shard: a leader still applying earlier terms refuses writes chosen from it
     var out: [4096]u8 = undefined;
 
     const raft = shard.raft_node;
-    const refused_while_applying = [_]proto.OpCode{ .stream_delete, .stream_append, .stream_group_create, .queue_enqueue, .queue_dequeue, .ts_write, .workflow_cancel, .workflow_signal, .worker_heartbeat };
+    const refused_while_applying = [_]proto.OpCode{ .stream_delete, .stream_append, .stream_group_create, .queue_enqueue, .queue_dequeue, .ts_write, .workflow_cancel, .workflow_signal, .action_invoke };
     raft.ready_index = raft.log.lastIndex() + 100;
     const last = raft.log.lastIndex();
     for (refused_while_applying, 0..) |op, i| for ([_]@import("run.zig").Origin{ .client, .shard, .peer }) |origin| {
@@ -13558,12 +13563,40 @@ test "Shard: a leader still applying earlier terms still takes KV's writes, its 
     try c.send(c.other, .kv_commit_txn, 4, "", "kv.txn.commit", .{ .txn = id });
     try std.testing.expectEqual(last + 1, raft.log.lastIndex());
 
-    // Refused for itself, if at all, not for this leader's backlog.
-    c.t.shard.runRequest(c.other, try ParkTest.request(.cluster_remove, 5, "", "", "", ""), .client);
-    const removal = try c.otherAnswer();
-    if (removal.refused()) |why| {
-        try std.testing.expect(!std.mem.eql(u8, why.message, Shard.LEADER_NOT_READY_REFUSAL));
-    } else |_| {}
+    // The leader's first commit is behind it, so a membership change is proposed.
+    last = raft.log.lastIndex();
+    var remove: [5]u8 = undefined;
+    std.mem.writeInt(u32, remove[0..4], 2, .little);
+    remove[4] = 1;
+    c.t.shard.runRequest(c.other, try ParkTest.request(.cluster_remove, 5, "", "", &remove, ""), .client);
+    try std.testing.expectEqual(last + 1, raft.log.lastIndex());
+}
+
+test "Shard: a leader still applying earlier terms answers a repair, a worker and a namespace create for themselves" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const shard = &c.t.shard;
+    const raft = shard.raft_node;
+    raft.ready_index = raft.log.lastIndex() + 100;
+    const last = raft.log.lastIndex();
+
+    // Not understood by the repair itself, which never met the refusal.
+    shard.runRequest(c.other, try ParkTest.request(.cluster_repair_skip, 1, "", "", "", ""), .admin);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), (try c.otherAnswer()).header.status);
+
+    // Only this node's memory: each answered, and nothing proposed.
+    inline for (.{ proto.OpCode.worker_register, proto.OpCode.worker_heartbeat, proto.OpCode.worker_drain, proto.OpCode.worker_deregister }, 2..) |op, id| {
+        shard.runRequest(c.other, try ParkTest.request(op, id, "", "w1", "", ""), .client);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.otherAnswer()).header.status);
+    }
+
+    // Its own refusal, naming what didn't happen.
+    shard.runRequest(c.other, try ParkTest.request(.namespace_create, 6, "", "fresh", "", ""), .client);
+    const refused = try c.otherAnswer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, (try refused.refused()).message);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
 }
 
 /// `resp` is the refusal a leader still applying earlier terms gives.
