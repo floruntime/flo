@@ -116,6 +116,14 @@ test "e2e/leader-write: after failover, a cancel never overwrites how a run the 
         defer r.deinit();
         try testing.expectEqual(proto.StatusCode.ok, r.status);
     }
+    // A cancel is answered as it's proposed. A later write answered once it
+    // commits says the cancels before it committed too.
+    {
+        var body: [64]u8 = undefined;
+        var r = try writer.sendRequest(.kv_put, "", "committed", try src.protocol.kv_ops.plainSetBody(&body, "v"));
+        defer r.deinit();
+        try testing.expectEqual(proto.StatusCode.ok, r.status);
+    }
     cluster.killNode(old);
 
     var survivor = Client.init(testing.allocator, cluster.endpoints[(old + 1) % 3].?);
