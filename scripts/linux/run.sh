@@ -43,6 +43,17 @@ if ! docker volume inspect "$VOLUME" >/dev/null 2>&1; then
   docker run --rm -v "$VOLUME:/zigcache" "$IMAGE" chown -R "$(id -u):$(id -g)" /zigcache
 fi
 
+# The cache is a shared named volume. A container that mounts it without
+# --user (a stray command, not this script) leaves root-owned files, and a
+# later user-run build then fails with manifest_create AccessDenied. Give any
+# such files back before building; `find -uid 0` is quick when there are none.
+if docker run --rm -v "$VOLUME:/zigcache" "$IMAGE" \
+     sh -c 'find /zigcache -mindepth 1 -uid 0 -print -quit | grep -q .'; then
+  echo "==> cache has root-owned files (a container ran without --user); fixing ownership"
+  docker run --rm -v "$VOLUME:/zigcache" "$IMAGE" \
+    find /zigcache -mindepth 1 -uid 0 -exec chown "$(id -u):$(id -g)" {} +
+fi
+
 CPU_ARG=()
 [ "$ARCH" = "aarch64" ] && CPU_ARG=(-Dcpu=baseline+crc)
 
