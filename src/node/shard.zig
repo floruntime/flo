@@ -13492,7 +13492,8 @@ test "Shard: a stream's appends a new leader hasn't applied: a delete is refused
     try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
 
     // As a leader finds its predecessor's entry: in its log, not applied, so
-    // the stream looks empty here. Without the refusal the delete goes through.
+    // the stream looks empty here. Without the refusal the delete is proposed, and
+    // only its apply would stop it.
     raft.ready_index = raft.log.lastIndex();
     const last = raft.log.lastIndex();
     try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");

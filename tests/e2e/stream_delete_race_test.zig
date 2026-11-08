@@ -47,7 +47,8 @@ const Racer = struct {
         try conn.connect();
         for (0..ROUNDS) |i| {
             _ = self.arrived.fetchAdd(1, .acq_rel);
-            while (self.round.load(.acquire) <= i) std.atomic.spinLoopHint();
+            // A yield, not a spin: the round opens within microseconds either way.
+            while (self.round.load(.acquire) <= i) std.Thread.yield() catch {};
             var key_buf: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "race-{d}", .{i});
             var r = try conn.sendRequest(self.op, "", key, if (self.op == .stream_append) ONE_RECORD else "");
@@ -74,7 +75,7 @@ test "e2e/stream-delete: an append racing a delete without --force on another no
     const ta = try std.Thread.spawn(.{}, Racer.run, .{&appender});
     const td = try std.Thread.spawn(.{}, Racer.run, .{&deleter});
     for (0..ROUNDS) |i| {
-        while (arrived.load(.acquire) < (i + 1) * 2 and !appender.failed and !deleter.failed) std.atomic.spinLoopHint();
+        while (arrived.load(.acquire) < (i + 1) * 2 and !appender.failed and !deleter.failed) std.Thread.yield() catch {};
         round.store(@intCast(i + 1), .release);
     }
     ta.join();
