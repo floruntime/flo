@@ -107,7 +107,7 @@ pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     return sum;
 }
 
-pub const ForceError = error{ NoLog, NoHardState, TruncationIncomplete };
+pub const ForceError = error{ NoLog, NoConfig, NoHardState, TruncationIncomplete };
 
 /// Make this node the group's only voter: append a config naming only
 /// it, sealed as committed, then clear a lost-log flag. The config is on
@@ -116,6 +116,9 @@ pub const ForceError = error{ NoLog, NoHardState, TruncationIncomplete };
 /// config.
 pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *const Summary) !void {
     if (sum.last_index == 0) return error.NoLog;
+    // The cluster is restarted from this node's config: with none there is
+    // no cluster id to keep, and a forced one would found a nameless cluster.
+    if (sum.config_index == 0) return error.NoConfig;
     const hs = sum.hard_state orelse return error.NoHardState;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try groupDir(&dir_buf, data_dir);
@@ -585,6 +588,25 @@ test "offline: force-members refuses a data dir with no log" {
     defer testing.allocator.free(root);
     var sum = try summarize(testing.allocator, root);
     try testing.expectError(error.NoLog, forceMembers(testing.allocator, root, &sum));
+}
+
+test "offline: force-members refuses a log with no member list, and writes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(root);
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try groupDir(&dir_buf, root);
+    try stdx.fs.makePath(dir);
+    // A founder that crashed after its term's no-op, before its config.
+    var es: [1]Entry = .{entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, "")};
+    for (&es) |*e| e.header.crc32c = e.computeCrc();
+    try writeLog(dir, &es, 1);
+    try hard_state_mod.save(dir, .{ .node_id = 1, .term = 1, .voted_for = 1, .lost_log = false });
+
+    var sum = try summarize(testing.allocator, root);
+    try testing.expectError(error.NoConfig, forceMembers(testing.allocator, root, &sum));
+    try testing.expectEqual(@as(u64, 1), (try summarize(testing.allocator, root)).last_index);
 }
 
 test "offline: a retired secret is recognised, with when, and others are not" {

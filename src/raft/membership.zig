@@ -43,8 +43,8 @@ pub const Removed = struct {
 };
 
 pub const Config = struct {
-    /// Made once, when the cluster is founded, and the same in every config
-    /// after: a config from another cluster is refused.
+    /// Made once, when the cluster is founded, and kept by every config
+    /// after: a proposed config that changes it is refused.
     cluster_id: [CLUSTER_ID_LEN]u8 = @splat(0),
     /// Raised only by `force-members`, which starts the group again from one
     /// node's log.
