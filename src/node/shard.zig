@@ -4553,7 +4553,9 @@ pub const Shard = struct {
             },
             .stream_delete => {
                 // The stream is gone on every node that applied this entry;
-                // drop its series here, not in the leader-only handler.
+                // drop its series here, not in the leader-only handler. One
+                // refused for what the stream held changed nothing.
+                if (result.refused() != null) return;
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (self.metrics_registry) |mr| {
                     const ns = self.metricsNamespace(cmd.namespace_hash) orelse return;
@@ -13491,7 +13493,8 @@ test "Shard: a stream's appends a new leader hasn't applied: a delete is refused
     try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
 
     // As a leader finds its predecessor's entry: in its log, not applied, so
-    // the stream looks empty here. Without the refusal the delete goes through.
+    // the stream looks empty here. Without the refusal the delete is proposed, and
+    // only its apply would stop it.
     raft.ready_index = raft.log.lastIndex();
     const last = raft.log.lastIndex();
     try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");
@@ -13502,8 +13505,35 @@ test "Shard: a stream's appends a new leader hasn't applied: a delete is refused
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try std.testing.expect(raft.leaderReady());
     try ParkTest.send(&c.t.shard, c.other, .stream_delete, 3, "s", "");
+    try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), (try c.otherAnswer()).header.status);
-    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a stream delete proposed behind an append not yet applied is refused when it applies, and the record stays" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const record = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00";
+    // Both proposed before either applies: at propose time the stream is empty.
+    try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", record);
+    try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");
+    try std.testing.expectEqual(@as(u32, 2), c.t.shard.pending_count);
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+    const refused = try c.otherAnswer();
+    try CondTest.expectConflict(refused, .unclassified);
+    try std.testing.expectEqualStrings(@import("../stream/handler.zig").StreamHandler.NOT_EMPTY_MESSAGE, (try refused.refused()).message);
+    const name_hash = node_router.nameHash(node_router.namespaceHash("default"), "s");
+    try std.testing.expectEqual(@as(usize, 1), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
+
+    // Forced, it goes whatever the stream holds.
+    var ob: [8]u8 = undefined;
+    var options = proto.OptionsBuilder.init(&ob);
+    try options.addFlag(.force);
+    c.t.shard.runRequest(c.other, try ParkTest.request(.stream_delete, 3, proto.DEFAULT_NAMESPACE, "s", "", options.getOptions()), .client);
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.otherAnswer()).header.status);
+    try std.testing.expectEqual(@as(usize, 0), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
 }
 
 test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then told it finished" {
