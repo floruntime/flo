@@ -3990,3 +3990,14 @@ test "e2e/workflow/cluster: a cancel answered ok is cancelled on the next leader
     const next = try clusterLeader(&cluster, first);
     for (&ids) |*id| try testing.expect(cancelledOn(&cluster, next, id));
 }
+
+test "e2e/workflow: disable and enable take no --version, which a definition doesn't have" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_][]const u8{ "disable", "enable" }) |verb| {
+        var r = try ctx.cli.run(&.{ "workflow", verb, "anything", "--version", "1.0.0" });
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains("version"));
+    }
+}

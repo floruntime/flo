@@ -226,32 +226,24 @@ pub fn getDefinition(
     return client.sendRequest(.workflow_get_definition, namespace, workflow_name, version orelse "");
 }
 
-/// Disable a workflow (blocks new runs, pauses schedules)
-/// Wire format:
-///   - namespace: req.namespace
-///   - key: workflow_name
-///   - value: version (optional)
+/// Disable a workflow (blocks new runs, pauses schedules). A definition is one per name, so every version goes.
+/// key = workflow_name; value empty.
 pub fn disable(
     client: *Client,
     namespace: []const u8,
     workflow_name: []const u8,
-    version: ?[]const u8,
 ) !Response {
-    return client.sendRequest(.workflow_disable, namespace, workflow_name, version orelse "");
+    return client.sendRequest(.workflow_disable, namespace, workflow_name, "");
 }
 
-/// Enable a workflow (allows runs, resumes schedules)
-/// Wire format:
-///   - namespace: req.namespace
-///   - key: workflow_name
-///   - value: version (optional)
+/// Enable a workflow (allows runs, resumes schedules). A definition is one per name, so every version goes.
+/// key = workflow_name; value empty.
 pub fn enable(
     client: *Client,
     namespace: []const u8,
     workflow_name: []const u8,
-    version: ?[]const u8,
 ) !Response {
-    return client.sendRequest(.workflow_enable, namespace, workflow_name, version orelse "");
+    return client.sendRequest(.workflow_enable, namespace, workflow_name, "");
 }
 
 /// List workflow definitions; value [limit:u32][cursor] like every list op.

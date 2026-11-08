@@ -50,12 +50,12 @@ pub fn createActionCommand(allocator: Allocator) !*commander.Command {
                 .about("Register a new action")
                 .examples(&.{
                     "flo action register myaction",
-                    "flo action register process --owner myteam --retries 3",
+                    "flo action register process --owner myteam --max-attempts 5",
                 })
                 .arg("name", "Action name")
                 .stringFlag("owner", 0, "cli", "Owner/team name")
-                .uintFlag("timeout", 0, 30000, "Execution timeout (ms)")
-                .uintFlag("retries", 'r', 0, "Max retry attempts")
+                .uintFlag("timeout", 0, 0, "The lease: how long a run may go without its worker reporting, in ms (5000 to 43200000; 0 is the server's 300000)")
+                .uintFlag("max-attempts", 0, 0, "Attempts in all, the first counted (1 to 1000; 0 is the server's 3)")
                 .action(wrapHandler(runRegister)),
         )
         .subcommand(
@@ -159,7 +159,9 @@ pub fn createWorkerCommand(allocator: Allocator) !*commander.Command {
                 .arg("task_id", "Task ID, as await printed it")
                 .stringFlag("worker-id", 'w', "", "Worker ID (required)")
                 .stringFlag("error", 0, "", "Error message")
-                .boolFlag("retry", 'r', "Allow retry")
+                .boolFlag("no-retry", 0, "Fail the run for good, not on this attempt only")
+                .boolFlag("abandoned", 0, "Hand the run back untried: no attempt is counted")
+                .uintFlag("delay", 0, 0, "Wait this long before the run is tried again (ms, at most 86400000)")
                 .action(wrapHandler(runWorkerFail)),
         )
         .subcommand(
@@ -206,8 +208,10 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
     const name = ctx.getPositional("name").?; // validated by commander
 
     const owner = ctx.getString("owner") orelse "cli";
-    const timeout = ctx.getUint("timeout") orelse 30000;
-    const retries = ctx.getUint("retries") orelse 0;
+    const timeout = ctx.getUint("timeout") orelse 0;
+    const max_attempts = ctx.getUint("max-attempts") orelse 0;
+    if (timeout > std.math.maxInt(u32)) return outcome.usage(ctx, "--timeout is at most {d} ms", .{std.math.maxInt(u32)});
+    if (max_attempts > std.math.maxInt(u32)) return outcome.usage(ctx, "--max-attempts is at most 1000", .{});
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -216,8 +220,7 @@ fn runRegister(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    // register(client, namespace, action_name, action_type, owner, timeout_ms, max_retries, retry_delay_ms, wasm_bytes)
-    var result = client_mod.action.register(&client, namespace, name, 0, owner, @intCast(timeout), @intCast(retries), null, null) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.action.register(&client, namespace, name, owner, @intCast(timeout), @intCast(max_attempts)) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
@@ -304,6 +307,8 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
         if (s.error_message) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print(",\"worker_id\":", .{});
         if (s.worker_id) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
+        ctx.print(",\"outcome\":", .{});
+        if (s.outcome) |v| ctx.print("{f}", .{cli_output.jsonString(v)}) else ctx.print("null", .{});
         ctx.print("}}\n", .{});
         return;
     }
@@ -312,6 +317,7 @@ fn runStatus(ctx: *commander.Context) commander.Error!void {
     if (s.completed_at_ms) |v| ctx.print("completed_at: {d}\n", .{v});
     ctx.print("attempt: {d}\n", .{s.attempt});
     if (s.worker_id) |v| ctx.print("worker_id: {s}\n", .{v});
+    if (s.outcome) |v| ctx.print("outcome: {s}\n", .{v});
     if (s.output) |v| ctx.print("output: {s}\n", .{v});
     if (s.error_message) |v| ctx.print("error: {s}\n", .{v});
 }
@@ -548,11 +554,14 @@ fn runWorkerComplete(ctx: *commander.Context) commander.Error!void {
 fn runWorkerFail(ctx: *commander.Context) commander.Error!void {
     const id = try taskIdOf(ctx);
     const worker_id = ctx.getString("worker-id") orelse return outcome.usage(ctx, "Missing --worker-id", .{});
+    const delay = ctx.getUint("delay") orelse 0;
+    if (delay > action_ops.MAX_DELAY_MS) return outcome.usage(ctx, "--delay is at most {d} ms", .{action_ops.MAX_DELAY_MS});
+    if (ctx.getBool("abandoned") and ctx.getBool("no-retry")) return outcome.usage(ctx, "--abandoned hands the run back to be tried again; it can't take --no-retry", .{});
     const namespace = cli_config.getNamespace(ctx);
     var client = Client.init(ctx.allocator, cli_config.getEndpoint(ctx));
     defer client.deinit();
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-    var result = client_mod.action.workerFail(&client, namespace, worker_id, id, ctx.getString("error") orelse "", ctx.getBool("retry")) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.action.workerFail(&client, namespace, worker_id, id, ctx.getString("error") orelse "", !ctx.getBool("no-retry"), ctx.getBool("abandoned"), delay) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
     try outcome.check(ctx, result);
     ctx.print("OK\n", .{});

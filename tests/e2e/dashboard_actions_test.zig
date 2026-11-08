@@ -24,7 +24,7 @@ test "e2e/dashboard: action owner + timeout_ms are persisted and surfaced" {
     });
     defer ctx.deinit();
 
-    try ctx.exec(&.{ "action", "register", "owned-action", "--owner", "myteam", "--timeout", "60000", "--retries", "5" });
+    try ctx.exec(&.{ "action", "register", "owned-action", "--owner", "myteam", "--timeout", "60000", "--max-attempts", "5" });
 
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
@@ -36,7 +36,7 @@ test "e2e/dashboard: action owner + timeout_ms are persisted and surfaced" {
     try testing.expect(std.mem.indexOf(u8, list.body, "\"owner\":\"myteam\"") != null);
     try testing.expect(std.mem.indexOf(u8, list.body, "\"timeout_ms\":60000") != null);
 
-    // Detail endpoint too, plus its attempts (`--retries` sets them) and the latency.
+    // Detail endpoint too, plus its attempts (`--max-attempts` sets them) and the latency.
     var detail = try http.get("/api/v1/actions/owned-action");
     defer detail.deinit();
     if (detail.status != 200 or std.mem.indexOf(u8, detail.body, "\"owner\":\"myteam\"") == null)
