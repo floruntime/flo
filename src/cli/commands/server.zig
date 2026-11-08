@@ -673,6 +673,8 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     const fds = stdx.process.raiseOpenFileLimit();
     if (fds.was == 0) {
         std.log.warn("could not read the open-file limit; using it as set", .{});
+    } else if (fds.refused) {
+        std.log.warn("the OS refused to raise the open-file soft limit above {d}; using it as set", .{fds.was});
     } else if (fds.now > fds.was) {
         std.log.info("raised the open-file soft limit from {d} to {d}", .{ fds.was, fds.now });
     }
