@@ -1439,7 +1439,8 @@ test "e2e/action/worker: fail retries unless told not to, and --abandoned counts
         defer s.deinit();
         try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
     }
-    // Handed back: the next delivery is still the second attempt's.
+    // Handed back: the second delivery's attempt isn't counted, so the run
+    // has used one, as before it was taken.
     var tb2: [256]u8 = undefined;
     var await2 = try ctx.cli.run(&.{ "worker", "await", "flaky", "--worker-id", "fw", "--block", "5000" });
     defer await2.deinit();
@@ -1450,7 +1451,7 @@ test "e2e/action/worker: fail retries unless told not to, and --abandoned counts
         const s = try runStatusJson(ctx, one.run);
         defer s.deinit();
         try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
-        try testing.expectEqual(@as(i64, 2), s.value.object.get("attempt").?.integer);
+        try testing.expectEqual(@as(i64, 1), s.value.object.get("attempt").?.integer);
     }
     // --abandoned and --no-retry contradict each other.
     var both = try ctx.cli.run(&.{ "worker", "fail", tb2[0..second.len], "--worker-id", "fw", "--abandoned", "--no-retry" });
