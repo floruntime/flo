@@ -14281,9 +14281,12 @@ test "Shard: a second create of a name being created waits for the first, and is
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
     for (two) |r| try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), r.header.status);
 
+    // A node leads again only in a new term, ready once it has applied
+    // what it proposed before: the late "team" create among them. So the
+    // next create's id is past it.
+    try ParkTest.ack(&shard);
+    shard.namespace_handler.settle(&shard);
     // This time it applies: the first made it, the second finds it there.
-    // (The allocator restarted with the leadership, so "crew" first asks
-    // for the id the late "team" create takes, and is proposed again.)
     shard.runRequest(conn, try ParkTest.request(.namespace_create, 3, "", "crew", "", ""), .client);
     shard.runRequest(conn, try ParkTest.request(.namespace_create, 4, "", "crew", "", ""), .client);
     for (0..2) |_| {
@@ -14295,79 +14298,6 @@ test "Shard: a second create of a name being created waits for the first, and is
     for (two) |r| by_id[r.header.request_id - 3] = r;
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), by_id[0].header.status);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), by_id[1].header.status);
-}
-
-test "Shard: a create whose id another took first is proposed again with a fresh one, and its client sees only success" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-    defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
-    defer shard.deinit();
-    shard.raft_network = &rn;
-    shard.wireHandlerShardPtrs();
-    try ParkTest.joinPeer(&shard);
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-    const nh = shard.namespace_handler;
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
-    // This leader proposes "mine" with the next id it sees free; it waits
-    // for the peer's ack...
-    shard.runRequest(conn, try ParkTest.request(.namespace_create, 2, "", "mine", "", ""), .client);
-    // ...while an older leader's create, ahead of it in the log, takes that
-    // id first (applied here directly, as replicating it would).
-    try std.testing.expectEqual(NamespaceHandler.CreateOutcome.created, nh.applyCreateAt("taken", first, 0, 1));
-    // "mine" applies with a stale id: refused on every replica alike, then
-    // proposed again by its leader with a fresh one.
-    try ParkTest.ack(&shard);
-    try std.testing.expect(!nh.namespaces.contains("mine"));
-    nh.settle(&shard);
-    try ParkTest.ack(&shard);
-    nh.settle(&shard);
-    var buf: [256]u8 = undefined;
-    var one: [1]proto.Response = undefined;
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(?ns_table.Id, first), nh.table.lookup("taken"));
-    try std.testing.expectEqual(@as(?ns_table.Id, .of(first.int() + 1)), nh.table.lookup("mine"));
-}
-
-test "Shard: a create whose id another took first is not proposed again by a leader that isn't ready; its client is told to retry" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-    defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
-    defer shard.deinit();
-    shard.raft_network = &rn;
-    shard.wireHandlerShardPtrs();
-    try ParkTest.joinPeer(&shard);
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-    const nh = shard.namespace_handler;
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
-    shard.runRequest(conn, try ParkTest.request(.namespace_create, 2, "", "mine", "", ""), .client);
-    try std.testing.expectEqual(NamespaceHandler.CreateOutcome.created, nh.applyCreateAt("taken", first, 0, 1));
-    try ParkTest.ack(&shard);
-    try std.testing.expect(!nh.namespaces.contains("mine"));
-    // Still leader, but with an earlier term's entry unapplied, as a new
-    // leader is: an id chosen now may be one that entry takes.
-    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
-    try std.testing.expect(!shard.raft_node.leaderReady());
-    const last = shard.raft_node.log.lastIndex();
-    nh.settle(&shard);
-    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
-    var buf: [256]u8 = undefined;
-    var one: [1]proto.Response = undefined;
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqual(@as(?ns_table.Id, null), nh.table.lookup("mine"));
 }
 
 test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
