@@ -903,6 +903,11 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    /// Whether the stepping duty has anything to do.
+    pub fn hasDutyWork(self: *const WorkflowHandler) bool {
+        return self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
+    }
+
     /// Take the first step of each queued run whose start has applied, in
     /// queue order; one not applied yet waits for a later tick, one the log
     /// dropped is forgotten. Leader only: a step proposes.
@@ -4396,6 +4401,8 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.shard_metrics = null;
     shard.offline = null;
     shard.halted = null;
+    shard.duties = .{};
+    shard.node_health = &.{};
     shard.marker = .{};
     shard.skips = .{};
     shard.skip_scan_from = 0;
@@ -5377,6 +5384,28 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     // Its entry cut, each goes on.
     parked.cancel_term = cancel.term + 1;
     try testing.expect(!WorkflowHandler.cancelInFlight(&shard, parked));
+}
+
+test "a halted shard's expire duty holds back the starts it holds, and lets them go once it serves" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "held-run", "late", "{}", "wf-run", "wf", true).?;
+    defer allocator.free(message);
+    actions.startRunFromInbox(&shard, shard.id, message);
+    registerTestAction(&shard, "late");
+
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 1), actions.held.count());
+    try testing.expectEqual(@as(u32, 1), shard.duties.held());
+
+    shard.halted = null;
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    try testing.expectEqual(@as(u32, 0), shard.duties.held());
 }
 
 test "step executor: failing action follows failure transition" {

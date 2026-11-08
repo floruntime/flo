@@ -1310,7 +1310,7 @@ const ShardBoot = struct {
                 self.cluster_node_id,
                 if (i == 0) self.shard0_role else .single,
                 self.raft_config,
-                .{ .health = slot, .cancel = &self.cancel, .namespaces = self.namespaces },
+                .{ .health = slot, .node_health = self.health.shards, .cancel = &self.cancel, .namespaces = self.namespaces },
             )) |shard| {
                 self.shards[i] = shard;
                 self.failed[i] = null;
