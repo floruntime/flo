@@ -140,10 +140,8 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Disable a workflow (blocks new runs, pauses schedules)")
                 .examples(&.{
                     "flo workflow disable order-processing",
-                    "flo workflow disable order-processing --version 1.0.0",
                 })
                 .arg("name", "Workflow name")
-                .stringFlag("version", 0, "", "Specific version (default: all versions)")
                 .action(wrapHandler(runDisable)),
         )
         .subcommand(
@@ -152,10 +150,8 @@ pub fn createWorkflowCommand(allocator: Allocator) !*commander.Command {
                 .about("Enable a workflow (allows runs, resumes schedules)")
                 .examples(&.{
                     "flo workflow enable order-processing",
-                    "flo workflow enable order-processing --version 1.0.0",
                 })
                 .arg("name", "Workflow name")
-                .stringFlag("version", 0, "", "Specific version (default: all versions)")
                 .action(wrapHandler(runEnable)),
         )
         .subcommand(
@@ -624,9 +620,6 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "workflow name is required", .{});
     };
 
-    const version = ctx.getString("version");
-    const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
-
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -635,16 +628,12 @@ fn runDisable(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.disable(&client, namespace, name, version_val) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.workflow.disable(&client, namespace, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
 
-    if (version_val) |v| {
-        ctx.print("Workflow '{s}' v{s} disabled\n", .{ name, v });
-    } else {
-        ctx.print("Workflow '{s}' disabled\n", .{name});
-    }
+    ctx.print("Workflow '{s}' disabled\n", .{name});
 }
 
 fn runEnable(ctx: *commander.Context) commander.Error!void {
@@ -652,9 +641,6 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
         return outcome.usage(ctx, "workflow name is required", .{});
     };
 
-    const version = ctx.getString("version");
-    const version_val: ?[]const u8 = if (version) |v| if (v.len > 0) v else null else null;
-
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -663,16 +649,12 @@ fn runEnable(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.workflow.enable(&client, namespace, name, version_val) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.workflow.enable(&client, namespace, name) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
 
-    if (version_val) |v| {
-        ctx.print("Workflow '{s}' v{s} enabled\n", .{ name, v });
-    } else {
-        ctx.print("Workflow '{s}' enabled\n", .{name});
-    }
+    ctx.print("Workflow '{s}' enabled\n", .{name});
 }
 
 fn runListDefinitions(ctx: *commander.Context) commander.Error!void {

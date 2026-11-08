@@ -53,8 +53,8 @@ test "e2e/action: register with all options" {
 
     // flo action register handler --owner myteam --timeout 60000 --retries 5
     try ctx.exec(&.{
-        "action",  "register",  "handler",
-        "--owner", "myteam",    "--timeout",
+        "action",  "register",       "handler",
+        "--owner", "myteam",         "--timeout",
         "60000",   "--max-attempts", "5",
     });
 }
@@ -525,7 +525,7 @@ test "e2e/action/worker: worker fails task with retry" {
 
     // 1. Register action with retries
     try ctx.exec(&.{
-        "action",    "register", action_name,
+        "action",         "register", action_name,
         "--max-attempts", "3",
     });
 
@@ -610,8 +610,8 @@ test "e2e/action/worker: worker fails task permanently" {
 
     // 5. Worker fails the task (NO retry - permanent failure)
     var fail_result = try ctx.cli.run(&.{
-        "worker",                           "fail",    taskIdOf(await_result.stdout) orelse return error.TestFailed,
-        "--worker-id",                      worker_id, "--error",
+        "worker",                           "fail",       taskIdOf(await_result.stdout) orelse return error.TestFailed,
+        "--worker-id",                      worker_id,    "--error",
         "Permanent failure: invalid input", "--no-retry",
     });
     defer fail_result.deinit();
@@ -1401,11 +1401,11 @@ test "e2e/action/register: no --timeout or --max-attempts leaves both to the ser
     defer ctx.deinit();
     try ctx.exec(&.{ "action", "register", "defaulted" });
     try ctx.exec(&.{ "action", "register", "named", "--timeout", "6000", "--max-attempts", "1" });
-    const d = try actionInfoJson(&ctx, "defaulted");
+    const d = try actionInfoJson(ctx, "defaulted");
     defer d.deinit();
     try testing.expectEqual(@as(i64, 300000), d.value.object.get("timeout_ms").?.integer);
     try testing.expectEqual(@as(i64, 3), d.value.object.get("max_attempts").?.integer);
-    const n = try actionInfoJson(&ctx, "named");
+    const n = try actionInfoJson(ctx, "named");
     defer n.deinit();
     try testing.expectEqual(@as(i64, 6000), n.value.object.get("timeout_ms").?.integer);
     try testing.expectEqual(@as(i64, 1), n.value.object.get("max_attempts").?.integer);
@@ -1432,10 +1432,10 @@ test "e2e/action/worker: fail retries unless told not to, and --abandoned counts
     var tb: [256]u8 = undefined;
 
     // Plain fail: the run is tried again.
-    const one = try takeOne(&ctx, "flaky", "fw", &rb, &tb);
+    const one = try takeOne(ctx, "flaky", "fw", &rb, &tb);
     try ctx.exec(&.{ "worker", "fail", one.task, "--worker-id", "fw", "--error", "once" });
     {
-        const s = try runStatusJson(&ctx, one.run);
+        const s = try runStatusJson(ctx, one.run);
         defer s.deinit();
         try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
     }
@@ -1447,7 +1447,7 @@ test "e2e/action/worker: fail retries unless told not to, and --abandoned counts
     @memcpy(tb2[0..second.len], second);
     try ctx.exec(&.{ "worker", "fail", tb2[0..second.len], "--worker-id", "fw", "--abandoned" });
     {
-        const s = try runStatusJson(&ctx, one.run);
+        const s = try runStatusJson(ctx, one.run);
         defer s.deinit();
         try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
         try testing.expectEqual(@as(i64, 2), s.value.object.get("attempt").?.integer);
@@ -1465,9 +1465,9 @@ test "e2e/action/status: a completed run's named outcome is shown" {
     try ctx.exec(&.{ "worker", "register", "dw", "decide" });
     var rb: [64]u8 = undefined;
     var tb: [256]u8 = undefined;
-    const t = try takeOne(&ctx, "decide", "dw", &rb, &tb);
+    const t = try takeOne(ctx, "decide", "dw", &rb, &tb);
     try ctx.exec(&.{ "worker", "complete", t.task, "--worker-id", "dw", "--outcome", "approved" });
-    const s = try runStatusJson(&ctx, t.run);
+    const s = try runStatusJson(ctx, t.run);
     defer s.deinit();
     try testing.expectEqualStrings("approved", s.value.object.get("outcome").?.string);
     const table = try ctx.execCapture(&.{ "action", "status", t.run });
