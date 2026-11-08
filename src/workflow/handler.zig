@@ -534,17 +534,11 @@ pub const WorkflowHandler = struct {
         shard.park(conn, req, proposed, switch (op) {
             .workflow_create => answerCreate,
             .workflow_start => answerStart,
-            .workflow_cancel => answerCancel,
             else => answerOk,
         });
     }
 
     fn answerOk(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
-        shard.sendOkResponse(conn, request_id, "");
-    }
-
-    fn answerCancel(shard: *Shard, conn: *Connection, request_id: u64, _: *const Result) void {
-        if (shard.metrics_registry) |m| m.workflow.recordCancelled();
         shard.sendOkResponse(conn, request_id, "");
     }
 
@@ -569,6 +563,7 @@ pub const WorkflowHandler = struct {
     /// applying an earlier term's start: that start's own leader may have
     /// stepped it already, so it stays at its start (`dropStartedRuns`).
     pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.workflow_complete)) return self.cancelApplied(shard, entry);
         if (entry.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start)) return;
         if (result.refused() != null or shard.raft_node.role != .leader) return;
         if (entry.header.term != shard.raft_node.current_term) return;
@@ -580,6 +575,20 @@ pub const WorkflowHandler = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.queueFirstStep(cmd.key, result.index);
+    }
+
+    /// A completion applied: if it was the cancel this leader proposed last
+    /// for its run, the run was cancelled once, however many cancels and
+    /// answers there were.
+    fn cancelApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry) void {
+        if (shard.raft_node.role != .leader) return;
+        const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        const run = self.runs.getPtr(cmd.key) orelse return;
+        if (run.cancel_index != entry.header.index) return;
+        run.cancel_index = 0;
+        if (shard.metrics_registry) |m| if (run.status == .cancelled) m.workflow.recordCancelled();
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -971,7 +980,9 @@ pub const WorkflowHandler = struct {
             return;
         }
         if (cancelInFlight(shard, run)) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run is being cancelled");
+            // Retried, it's delivered if the cancel never applies, and told
+            // the run finished if it does.
+            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is being cancelled — retry"));
             return;
         }
 
@@ -1109,13 +1120,15 @@ pub const WorkflowHandler = struct {
         return proposed.result;
     }
 
-    /// Whether a cancel of this run is on its way to applying in this term.
-    /// One whose entry was cut from the log, or applied and refused, leaves
-    /// the index behind: that it's passed, or the term moved, is what ends this.
+    /// Whether a cancel of this run may still apply: its entry is in this
+    /// leader's log, as it was proposed, and hasn't applied. A node elected
+    /// again keeps its entries, so a new term alone doesn't end it; an entry
+    /// cut and replaced, or one that applied without ending the run, does.
     pub fn cancelInFlight(shard: *const Shard, run: *const RunRecord) bool {
         if (run.cancel_index == 0 or run.status.isTerminal()) return false;
         const raft = shard.raft_node;
-        return raft.role == .leader and raft.current_term == run.cancel_term and raft.last_applied < run.cancel_index;
+        if (raft.role != .leader or raft.last_applied >= run.cancel_index) return false;
+        return (raft.log.entryTerm(run.cancel_index) orelse return false) == run.cancel_term;
     }
 
     // ── STATUS ──────────────────────────────────────────────────────────
@@ -2775,9 +2788,9 @@ pub const WorkflowHandler = struct {
         // apply is a no-op.
         self.applyComplete(run, proposed.value, @intCast(proposed.result.timestamp_ns / std.time.ns_per_ms)) catch {};
 
-        // Every terminal transition but a cancel's, which counts when it
-        // applies, passes through here, so this is the one place the
-        // outcome counters need to be recorded.
+        // Every terminal transition but a client's cancel passes through
+        // here, so this is where its outcome is counted; that cancel counts
+        // when it applies (`cancelApplied`).
         if (shard.metrics_registry) |m| switch (run.status) {
             .completed => m.workflow.recordCompleted(),
             .failed => m.workflow.recordFailed(),
@@ -4575,6 +4588,7 @@ test "a producer's start joins the first-step queue when it applies, then takes 
     registerTestAction(&shard, "step-b");
     handler.registerReplay(&shard.replay_registry);
     shard.workflow_handler = &handler;
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
     // Proposed, not yet applied: there is no run to step, and nothing waits.
@@ -5266,6 +5280,11 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
 }
 
+/// An entry proposed and not yet applied, as a cancel's is: its index and term.
+fn unappliedEntry(shard: *Shard) !persistence_mod.ProposeResult {
+    return shard.raft_node.propose(.raft_noop, entry_mod.Flags.NONE, "");
+}
+
 test "workflow cancel: while one is in flight nothing moves the run, and once it can't apply the run carries on" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -5282,29 +5301,31 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
     handler.armTimer(run, 1);
 
     const raft = shard.raft_node;
-    run.cancel_index = raft.last_applied + 10;
-    run.cancel_term = raft.current_term;
+    const cancel = try unappliedEntry(&shard);
+    run.cancel_index = cancel.index;
+    run.cancel_term = cancel.term;
     try testing.expect(WorkflowHandler.cancelInFlight(&shard, run));
     // A timer due while it's in flight neither fires nor is lost.
     handler.checkPendingActions(&shard);
-    _ = shard.applyCommitted();
     try testing.expect(run.current_step_name_owned == null);
     // The wait's own far-off timer, and the due one again, a little later.
     try testing.expectEqual(@as(usize, 2), handler.timers.count());
 
-    // Re-elected in a later term, its entry cut: the run moves again.
+    // Elected again, its entry still in the log: it may yet apply.
     raft.current_term += 1;
-    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    try testing.expect(WorkflowHandler.cancelInFlight(&shard, run));
     raft.current_term -= 1;
-    // Its index applied without ending the run.
-    run.cancel_index = raft.last_applied;
+    // Its entry cut and replaced by another term's.
+    run.cancel_term = cancel.term + 1;
     try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    run.cancel_term = cancel.term;
     // No longer leading.
-    run.cancel_index = raft.last_applied + 10;
     raft.role = .follower;
     try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
     raft.role = .leader;
-    run.cancel_index = 0;
+    // Its index applied without ending the run.
+    _ = shard.applyCommitted();
+    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
 
     // The timer it kept fires now.
     @import("stdx").time.sleep(@as(u64, WorkflowHandler.CANCEL_RECHECK_MS + 20) * std.time.ns_per_ms);
@@ -5337,22 +5358,24 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     handler.retryCompletionLater("default:retry", .failed, "stop", 1, 0);
     handler.completion_retries.items[0].due_ms = 0;
 
+    const cancel = try unappliedEntry(&shard);
     for ([_][]const u8{ "default:parked", "default:started", "default:retry" }) |key| {
         const run = handler.runs.getPtr(key).?;
-        run.cancel_index = raft.last_applied + 10;
-        run.cancel_term = raft.current_term;
+        run.cancel_index = cancel.index;
+        run.cancel_term = cancel.term;
     }
     handler.advanceStartedRuns(&shard);
     handler.checkPendingActions(&shard);
     try testing.expectEqual(WorkflowHandler.RunStatus.waiting, parked.status);
-    try testing.expect(parked.pending_action_run_id_owned != null);
+    // Not resumed: still at its first step, on the same action run.
+    try testing.expect(parked.current_step_name_owned == null);
+    try testing.expectEqualStrings(action_run, parked.pending_action_run_id_owned.?);
     try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
     try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:retry").?.status);
 
     // Its entry cut, each goes on.
-    raft.current_term += 1;
-    defer raft.current_term -= 1;
+    parked.cancel_term = cancel.term + 1;
     try testing.expect(!WorkflowHandler.cancelInFlight(&shard, parked));
 }
 
@@ -6381,6 +6404,7 @@ test "a step whose mapped input would nest past 128 levels fails its run" {
     registerTestAction(&shard, "step-a");
     // Its completions apply through the log, as on a shard.
     handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:map-wf", "map-wf",
         \\{"kind":"Workflow","name":"map-wf","version":"1.0.0",
         \\"start":{"run":"@actions/step-a","input_mapping":"\"$.input\"","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
