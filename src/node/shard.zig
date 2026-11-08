@@ -1948,8 +1948,18 @@ pub const Shard = struct {
         // transaction, which falls through to the leader's state: a leader
         // still applying what earlier terms committed would answer from part
         // of it. A halted one answers the former, marked stale, as other reads
-        // are.
-        if ((at_leader or table_run.readsInTxn(req)) and self.leaderApplying()) {
+        // are. So too a write whose handler reads state to decide what to
+        // propose: it could finish a run again, or drop a stream that isn't
+        // empty. Rather than judge each, all are refused but those that read
+        // nothing the backlog could change. A membership change answers for
+        // itself: it waits for the leader's first commit, and past that,
+        // needn't wait for the apply. A repair reads only the log. A worker's
+        // registration lives in the leader's memory alone.
+        const in_txn_read = table_run.readsInTxn(req);
+        const worker_op = req.header.op_code == @backingInt(proto.OpCode.worker_register) or req.header.op_code == @backingInt(proto.OpCode.worker_heartbeat) or
+            req.header.op_code == @backingInt(proto.OpCode.worker_deregister) or req.header.op_code == @backingInt(proto.OpCode.worker_drain);
+        const refuses_write = writes and !in_txn_read and !membership_op and !repair_op and !worker_op and !table_run.runsOnApplyingLeader(req);
+        if ((at_leader or in_txn_read or refuses_write) and self.leaderApplying()) {
             self.sendRefusal(conn, req.header.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = LEADER_NOT_READY_REFUSAL });
             return;
         }
@@ -13448,6 +13458,145 @@ test "Shard: a new leader refuses plain reads until it has applied earlier terms
     try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), answered.header.status);
     var diag: schema.Diagnostic = .{};
     try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, (try table_run.op("action.status").response.decodeAll(answered.data, &diag)).status);
+}
+
+test "Shard: a leader still applying earlier terms refuses writes chosen from its state, and proposes nothing" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    const raft = shard.raft_node;
+    const refused_while_applying = [_]proto.OpCode{ .stream_delete, .stream_append, .stream_group_create, .queue_enqueue, .queue_dequeue, .ts_write, .workflow_cancel, .workflow_signal, .action_invoke };
+    raft.ready_index = raft.log.lastIndex() + 100;
+    const last = raft.log.lastIndex();
+    for (refused_while_applying, 0..) |op, i| for ([_]@import("run.zig").Origin{ .client, .shard, .peer }) |origin| {
+        shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(op, i + 1), .namespace = "", .key = "k", .value = "" }, origin);
+        try expectLeaderNotReady(try nextAnswer(c, &shard, &out));
+    };
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a stream's appends a new leader hasn't applied: a delete is refused, then weighed against them" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const raft = c.t.shard.raft_node;
+    try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
+
+    // As a leader finds its predecessor's entry: in its log, not applied, so
+    // the stream looks empty here. Without the refusal the delete goes through.
+    raft.ready_index = raft.log.lastIndex();
+    const last = raft.log.lastIndex();
+    try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");
+    try expectLeaderNotReady(try c.otherAnswer());
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+    try std.testing.expect(raft.leaderReady());
+    try ParkTest.send(&c.t.shard, c.other, .stream_delete, 3, "s", "");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), (try c.otherAnswer()).header.status);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then told it finished" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const raft = c.t.shard.raft_node;
+    _ = try proposeAction(&c.t.shard, .action_register, testRegister("act"));
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(&c.t.shard, c.t.conn, .workflow_create, 1, "flow", def);
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+    try ParkTest.send(&c.t.shard, c.t.conn, .workflow_start, 2, "flow", "");
+    try ParkTest.ack(&c.t.shard);
+    const started = try c.answer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), started.header.status);
+    var id_buf: [32]u8 = undefined;
+    const run_id = id_buf[0..started.data.len];
+    @memcpy(run_id, started.data);
+
+    // What finishes the run: as a new leader finds it, in its log, not applied.
+    try ParkTest.send(&c.t.shard, c.t.conn, .workflow_cancel, 3, run_id, "first");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+    raft.ready_index = raft.log.lastIndex();
+    const last = raft.log.lastIndex();
+    try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 4, run_id, "second");
+    try expectLeaderNotReady(try c.otherAnswer());
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expect(raft.leaderReady());
+    try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 5, run_id, "third");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), (try c.otherAnswer()).header.status);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a leader still applying earlier terms still takes KV's writes, its transactions and a membership change" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const raft = c.t.shard.raft_node;
+    try c.set(c.t.conn, 1, "k", "v1", .always, null, null);
+    try ParkTest.ack(&c.t.shard);
+    _ = try c.answer();
+    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), node_router.namespaceHash(""));
+    try c.set(c.t.conn, 2, "in-txn", "x", .always, null, id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+
+    raft.ready_index = raft.log.lastIndex() + 100;
+    var last = raft.log.lastIndex();
+    // A plain write and a commit, each proposed: decided as they apply.
+    try c.set(c.t.conn, 3, "k", "v2", .if_present, null, null);
+    try std.testing.expectEqual(last + 1, raft.log.lastIndex());
+    last = raft.log.lastIndex();
+    try c.send(c.other, .kv_commit_txn, 4, "", "kv.txn.commit", .{ .txn = id });
+    try std.testing.expectEqual(last + 1, raft.log.lastIndex());
+
+    // The leader's first commit is behind it, so a membership change is proposed.
+    last = raft.log.lastIndex();
+    var remove: [5]u8 = undefined;
+    std.mem.writeInt(u32, remove[0..4], 2, .little);
+    remove[4] = 1;
+    c.t.shard.runRequest(c.other, try ParkTest.request(.cluster_remove, 5, "", "", &remove, ""), .client);
+    try std.testing.expectEqual(last + 1, raft.log.lastIndex());
+}
+
+test "Shard: a leader still applying earlier terms answers a repair, a worker and a namespace create for themselves" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const shard = &c.t.shard;
+    const raft = shard.raft_node;
+    raft.ready_index = raft.log.lastIndex() + 100;
+    const last = raft.log.lastIndex();
+
+    // Not understood by the repair itself, which never met the refusal.
+    shard.runRequest(c.other, try ParkTest.request(.cluster_repair_skip, 1, "", "", "", ""), .admin);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), (try c.otherAnswer()).header.status);
+
+    // Only this node's memory: each answered, and nothing proposed.
+    inline for (.{ proto.OpCode.worker_register, proto.OpCode.worker_heartbeat, proto.OpCode.worker_drain, proto.OpCode.worker_deregister }, 2..) |op, id| {
+        shard.runRequest(c.other, try ParkTest.request(op, id, "", "w1", "", ""), .client);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.otherAnswer()).header.status);
+    }
+
+    // Its own refusal, naming what didn't happen.
+    shard.runRequest(c.other, try ParkTest.request(.namespace_create, 6, "", "fresh", "", ""), .client);
+    const refused = try c.otherAnswer();
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, (try refused.refused()).message);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
 }
 
 /// `resp` is the refusal a leader still applying earlier terms gives.

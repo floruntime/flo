@@ -1251,6 +1251,7 @@ pub const RaftNode = struct {
             self.votes_received += 1;
             if (self.votes_received >= self.votes_needed) {
                 self.becomeLeader();
+                if (self.role != .leader) return .none;
                 log.debug("Raft: won election, node_id={d}, term={d}, votes={d}", .{ self.id, self.current_term, self.votes_received });
                 return .won;
             }
@@ -1996,7 +1997,14 @@ pub const RaftNode = struct {
         if (self.log.append(&noop)) |idx| {
             if (self.voterPeers() == 0) self.raiseCommit(self.selfCountedThrough(idx));
         } else |err| {
-            log.err("Raft: cannot append the leadership noop at index {d}: {s}; earlier terms' entries commit only after the next client write", .{ next, @errorName(err) });
+            // Without it the earlier terms' entries needn't ever commit, and
+            // this leader would refuse writes for as long as it holds office.
+            // The term and its vote stay: the vote was spent, so another
+            // election takes a newer term.
+            log.err("Raft: cannot append the leadership noop at index {d}: {s}; stepping down", .{ next, @errorName(err) });
+            self.role = .follower;
+            self.leader_id = NO_VOTE;
+            self.rearmElectionTimer();
         }
     }
 
@@ -3481,6 +3489,31 @@ test "raft node: a new leader's noop lets earlier terms' entries commit before a
     sentAll(&node);
     node.handleAppendResponse(.{ .term = 2, .success = true, .match_index = 2, .from = 2 });
     try testing.expectEqual(@as(u64, 2), node.commit_index);
+}
+
+test "raft node: a winner that can't append its leadership noop steps down, keeping its term and vote, and can stand again" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 8192, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    // The noop opens a term run, and that allocation fails.
+    const allocator = node.log.allocator;
+    node.log.allocator = testing.failing_allocator;
+    _ = candidacy(&node).?;
+    const term = node.current_term;
+    try testing.expect(node.handleVoteResponse(.{ .term = term, .vote_granted = true, .from = 2 }) == .none);
+    try testing.expect(node.role == .follower);
+    try testing.expect(!node.leaderReady());
+    try testing.expectEqual(NO_VOTE, node.leader_id);
+    try testing.expectEqual(term, node.current_term);
+    try testing.expectEqual(@as(NodeId, 1), node.voted_for);
+    try testing.expectEqual(@as(u64, 0), node.log.lastIndex());
+
+    node.log.allocator = allocator;
+    _ = candidacy(&node).?;
+    try testing.expect(node.current_term > term);
+    try testing.expect(node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 }) == .won);
+    try testing.expectEqual(@as(u64, 1), node.log.lastIndex());
 }
 
 test "raft node: a new leader is ready once it has applied every earlier term's entry, and not after stepping down" {
