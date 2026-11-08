@@ -984,13 +984,16 @@ pub const Namespaces = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         const next = self.handler.next_id;
-        try self.handler.replayEntry(e, &out);
-        const r = out.refused() orelse {
-            var diag: schema.Diagnostic = .{};
-            const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return error.Halt;
-            return if (c.id == next) .created else .past_next;
+        var diag: schema.Diagnostic = .{};
+        const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return error.Halt;
+        // The server halts on a create its applier refuses (a ready leader
+        // never proposes one); the model says which, so the checker can.
+        if (c.id < next) return .stale_id;
+        self.handler.replayEntry(e, &out) catch |err| return switch (err) {
+            error.Halt => .refused,
+            else => err,
         };
-        return if (std.mem.eql(u8, r.refusal.message, ns_handler.NamespaceHandler.STALE_ID_MESSAGE)) .stale_id else .refused;
+        return if (c.id == next) .created else .past_next;
     }
 
     /// The registry, the creates this log refused, and the next id, in no

@@ -1555,9 +1555,11 @@ pub const Shard = struct {
     }
 
     /// The id of namespace `name` (empty is "default"), as the node's
-    /// table has it; `.invalid` for one it doesn't.
+    /// table or this shard has it; `.invalid` for one neither does.
     pub fn namespaceId(self: *const Shard, name: []const u8) ns_table.Id {
-        return self.namespace_handler.table.lookup(if (name.len == 0) "default" else name) orelse .invalid;
+        const effective = if (name.len == 0) "default" else name;
+        // Shard 0 knows a create it proposed before the table does.
+        return self.namespace_handler.table.lookup(effective) orelse self.namespace_handler.idOf(effective) orelse .invalid;
     }
 
     /// A client's request: walked across shards, sent to the shard that
@@ -1607,8 +1609,18 @@ pub const Shard = struct {
         // per namespace. One shard routes nothing: its write waits the same
         // way where it runs (`prepareWrite`), after a follower has
         // forwarded it to its leader.
-        if (self.shardCount() > 1 and req.ns_id == .invalid and req.key.len > 0 and op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op))))
-            return self.ensureThenRun(conn, req, auth.origin);
+        if (self.shardCount() > 1 and req.ns_id == .invalid and req.key.len > 0 and op < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(op)))) {
+            if (self.id != 0) return self.ensureThenRun(conn, req, auth.origin);
+            // Shard 0 proposes the create and routes by the id it gave.
+            switch (self.namespace_handler.prepareWrite(self, req.namespace)) {
+                .go => {},
+                .refused => |r| return self.sendRefusal(conn, req.header.request_id, r.status, proto.notRun(r.message)),
+                .ensure => unreachable, // shard 0 creates
+            }
+            var routed = req;
+            routed.ns_id = self.namespaceIdOf(req);
+            return self.route(conn, routed, auth);
+        }
 
         // Route to the correct shard/node, or dispatch locally.
         switch (self.resolveTarget(op, req)) {
@@ -2002,7 +2014,12 @@ pub const Shard = struct {
                 .refused => |r| return self.sendErrorResponse(conn, req.header.request_id, r.status, r.message),
                 .ensure => return self.ensureThenRun(conn, req, auth.origin),
             }
+            if (req.ns_id == .invalid) req.ns_id = self.namespaceIdOf(req);
         }
+        // A wait names what it waits for by its namespace's id; one in a
+        // namespace never created has none, and nothing could wake it.
+        if (req.ns_id == .invalid and namespaced(req.header.op_code) and blockingWait(req) != null)
+            return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
         if (internal_from_client) return answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code);
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
     }
@@ -8038,9 +8055,9 @@ const TwoShards = struct {
                 n += @intCast(s.raft_node.last_applied - before);
             }
             const nh = self.shards[0].namespace_handler;
-            const waiting = nh.waiters.items.len + nh.unpublished.items.len + nh.refused_creates.items.len;
+            const waiting = nh.waiters.items.len + nh.unpublished.items.len;
             nh.settle(&self.shards[0]);
-            n += waiting - (nh.waiters.items.len + nh.unpublished.items.len + nh.refused_creates.items.len);
+            n += waiting - (nh.waiters.items.len + nh.unpublished.items.len);
             if (n == 0) return;
         }
     }
@@ -10690,9 +10707,11 @@ test "Shard: shard 0 creates no namespace until its leader has applied earlier t
     // A leader whose earlier terms' tail hasn't applied here.
     a.raft_node.ready_index = a.raft_node.last_applied + 1;
     const last = a.raft_node.log.lastIndex();
-    // A write to a new namespace waits for its create (`namespace.ensure`),
-    // and the create is refused.
-    try std.testing.expect(a.namespace_handler.prepareWrite(a, "fresh") == .ensure);
+    // A write to a new namespace is refused: its create can't be proposed.
+    switch (a.namespace_handler.prepareWrite(a, "fresh")) {
+        .refused => |r| try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, r.message),
+        else => return error.TestUnexpectedResult,
+    }
     switch (a.namespace_handler.proposeCreateOn(a.raft_node, "fresh")) {
         .refused => |r| {
             try std.testing.expectEqual(proto.StatusCode.unavailable, r.status);
@@ -12773,6 +12792,10 @@ test "Shard: a blocking group read wakes on its own namespace's append, not a sa
     var ob_buf: [16]u8 = undefined;
     var ob = proto.OptionsBuilder.init(&ob_buf);
     try ob.addU32(.block_ms, 5000);
+    // Both namespaces exist: a wait in one never created is refused.
+    for ([_][]const u8{ "app", "other" }) |ns| {
+        _ = shard.namespace_handler.applyCreate(ns);
+    }
     shard.runRequest(conn, try ParkTest.request(.stream_group_read, 1, "app", "s", group_consumer, ob.getOptions()), .client);
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
 
@@ -18888,43 +18911,6 @@ test "Shard: a follower's held reads count against their connection's requests i
     try std.testing.expectEqual(@as(u16, 1), f.c.conn.forwards_in_flight);
     shard.sweepEdge(Shard.nowMs() + edge_mod.WAIT_MS);
     try std.testing.expectEqual(@as(u16, 0), f.c.conn.forwards_in_flight);
-}
-
-test "Shard: a read waiting on shard 0 for a create that is then refused is answered that there is no namespace" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-    defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
-    defer shard.deinit();
-    shard.raft_network = &rn;
-    shard.wireHandlerShardPtrs();
-    try ParkTest.joinPeer(&shard);
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-    const asker = try TestClient.open(&shard);
-    defer _ = std.c.close(asker.pair[1]);
-    const nh = shard.namespace_handler;
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
-    shard.runRequest(conn, try ParkTest.request(.namespace_create, 2, "", "mine", "", ""), .client);
-    // Another shard asks about the name while its create is under way: the
-    // answer waits for the create.
-    shard.runRequest(asker.conn, .{ .header = proto.RequestHeader.init(.namespace_published, 7), .namespace = "", .key = "mine", .value = "" }, .peer);
-    try expectNoAnswer(asker, &shard);
-    // The create's id was taken first, and this leader can't propose it
-    // again yet: the create is refused.
-    try std.testing.expectEqual(NamespaceHandler.CreateOutcome.created, nh.applyCreateAt("taken", first, 0, 1));
-    try ParkTest.ack(&shard);
-    shard.raft_node.ready_index = shard.raft_node.last_applied + 1;
-    nh.settle(&shard);
-    var out: [512]u8 = undefined;
-    const got = try nextAnswer(asker, &shard, &out);
-    try std.testing.expectEqual(@as(u64, 7), got.header.request_id);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), got.header.status);
-    try std.testing.expectEqual(proto.Ran.no, (try got.refused()).ran);
 }
 
 test "Shard: a run id the client chose is told apart from a generated one exactly, though it may read as a partition" {

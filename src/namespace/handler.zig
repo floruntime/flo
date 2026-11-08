@@ -229,7 +229,7 @@ pub const NamespaceHandler = struct {
     /// proposed and has not yet applied: a burst of first writes proposes
     /// one. Cleared when this node stops leading: an entry the log then
     /// drops is proposed again.
-    pending_creates: std.StringHashMapUnmanaged(void) = .{},
+    pending_creates: std.StringHashMapUnmanaged(ns_table.Id) = .{},
     /// Shard 0: the next id a create may take, as applied on every replica.
     next_id: u32 = ns_table.FIRST_ALLOCATED.int(),
     /// Shard 0's leader: the next id it proposes, past the creates it has
@@ -240,9 +240,6 @@ pub const NamespaceHandler = struct {
     unpublished: std.ArrayListUnmanaged(Unpublished) = .empty,
     /// Shard 0: requests waiting for a name's create to be published.
     waiters: std.ArrayListUnmanaged(Waiter) = .empty,
-    /// Shard 0: creates the applier refused since the last settle, for
-    /// their waiters.
-    refused_creates: std.ArrayListUnmanaged(RefusedCreate) = .empty,
     flush_warn_ms: i64 = 0,
     implicit_failed: u64 = 0,
     implicit_warn_ms: i64 = 0,
@@ -262,9 +259,6 @@ pub const NamespaceHandler = struct {
     pub const CreateOutcome = enum { created, existed, invalid, full, stale_id, failed };
 
     pub const LIMIT_MESSAGE = std.fmt.comptimePrint("namespace limit reached ({d})", .{MAX_NAMESPACES});
-    /// A create whose id another took first, after a leader change: its
-    /// leader proposes it again with a fresh id.
-    pub const STALE_ID_MESSAGE = "unavailable: the namespace's id was taken by another create; retry";
     /// How long a request waits for its namespace's create to reach disk:
     /// a write held on another shard asks through a gather part, whose
     /// deadline this is, so a create and a held write are told at once,
@@ -299,7 +293,6 @@ pub const NamespaceHandler = struct {
         request_id: u64,
         deadline_ms: u64,
     };
-    const RefusedCreate = struct { name: []const u8, status: proto.StatusCode, message: []const u8 };
 
     /// Why a request may not create or write to a namespace.
     pub const Refusal = struct { status: @import("../protocol/proto.zig").StatusCode, message: []const u8 };
@@ -356,8 +349,6 @@ pub const NamespaceHandler = struct {
         self.unpublished.deinit(self.allocator);
         for (self.waiters.items) |w| self.freeWaiter(w);
         self.waiters.deinit(self.allocator);
-        for (self.refused_creates.items) |r| self.allocator.free(r.name);
-        self.refused_creates.deinit(self.allocator);
         if (self.owns_table) self.table.destroy();
     }
 
@@ -399,13 +390,7 @@ pub const NamespaceHandler = struct {
     /// that can't wait for it (a pipeline's sink), stays unknown, and the
     /// caller's `admission` check drops the write.
     pub fn proposeImplicitCreate(self: *NamespaceHandler, name: []const u8, s: *Shard) void {
-        const effective = if (name.len == 0) "default" else name;
-        const outcome: Prepared = if (self.owner and !self.namespaces.contains(effective) and !self.pending_creates.contains(effective)) switch (self.proposeCreateOn(s.raft_node, effective)) {
-            .proposed => .go,
-            .refused => |r| .{ .refused = r },
-            .failed => |err| .{ .refused = refusalOf(err) },
-        } else self.prepareWrite(s, name);
-        switch (outcome) {
+        switch (self.prepareWrite(s, name)) {
             .go, .ensure => {},
             .refused => |r| {
                 // Every write to the namespace tries again, so said once per
@@ -427,12 +412,14 @@ pub const NamespaceHandler = struct {
     /// filling the registry cannot lock it out.
     pub fn admission(self: *const NamespaceHandler, name: []const u8) ?Refusal {
         const effective = if (name.len == 0) "default" else name;
-        if (self.namespaces.contains(effective)) return null;
+        if (self.namespaces.contains(effective) or self.pending_creates.contains(effective)) return null;
         if (nameRefusal(effective)) |why| return .{ .status = .bad_request, .message = why };
-        // A write carries its namespace's id, so it waits for the create to
-        // be published; another shard binds a name the table has.
-        if (!self.owner and (self.pending_creates.contains(effective) or self.table.lookup(effective) != null)) return null;
-        return .{ .status = .unavailable, .message = UNKNOWN_HERE_MESSAGE };
+        // Only shard 0 knows every namespace, so only it decides the id and
+        // the room; another shard learns of a name it publishes.
+        if (!self.owner) return if (self.table.lookup(effective) != null) null else .{ .status = .unavailable, .message = UNKNOWN_HERE_MESSAGE };
+        if (self.namespaces.count() + self.pending_creates.count() >= MAX_NAMESPACES)
+            return .{ .status = .bad_request, .message = LIMIT_MESSAGE };
+        return null;
     }
 
     pub fn admits(self: *const NamespaceHandler, name: []const u8) bool {
@@ -443,11 +430,12 @@ pub const NamespaceHandler = struct {
         return std.mem.eql(u8, name, "default");
     }
 
-    /// Note a create this leader proposed, until it applies.
-    fn notePending(self: *NamespaceHandler, name: []const u8) void {
+    /// Note a create or bind this leader proposed, with its id, until it
+    /// applies: the writes behind it carry that id.
+    fn notePending(self: *NamespaceHandler, name: []const u8, id: ns_table.Id) void {
         if (self.pending_creates.contains(name)) return;
         const owned = self.allocator.dupe(u8, name) catch return;
-        self.pending_creates.put(self.allocator, owned, {}) catch self.allocator.free(owned);
+        self.pending_creates.put(self.allocator, owned, id) catch self.allocator.free(owned);
     }
 
     /// This node stopped leading: its implicit creates may have been
@@ -482,9 +470,12 @@ pub const NamespaceHandler = struct {
     }
 
     /// The id of a namespace this shard knows, by name.
+    /// The id of a namespace this shard knows, by name: applied, or
+    /// proposed by this leader and not yet applied.
     pub fn idOf(self: *const NamespaceHandler, name: []const u8) ?ns_table.Id {
-        const meta = self.namespaces.get(if (name.len == 0) "default" else name) orelse return null;
-        return meta.id;
+        const effective = if (name.len == 0) "default" else name;
+        if (self.namespaces.get(effective)) |meta| return meta.id;
+        return self.pending_creates.get(effective);
     }
 
     /// Apply a committed namespace creation to the local registry. The
@@ -707,12 +698,16 @@ pub const NamespaceHandler = struct {
         // from inside it, leaderReady would say ready mid-apply.
         std.debug.assert(!shard.applying);
         const name = if (name_or_empty.len == 0) "default" else name_or_empty;
-        if (self.namespaces.contains(name)) return .go;
-        // A write names its namespace by id, which its create may yet lose
-        // to a leader change: none is proposed until the create is
-        // published (`namespace.ensure`).
-        if (self.owner) return .ensure;
-        if (self.pending_creates.contains(name)) return .go;
+        if (self.namespaces.contains(name) or self.pending_creates.contains(name)) return .go;
+        // Shard 0 proposes the create ahead of the write, in one log, and
+        // the write carries the id the create proposed: every create a
+        // ready leader proposes applies (`replayEntry`), or is dropped with
+        // the log's tail, writes behind it included.
+        if (self.owner) return switch (self.proposeCreateOn(shard.raft_node, name)) {
+            .proposed => .go,
+            .refused => |r| .{ .refused = r },
+            .failed => |err| .{ .refused = refusalOf(err) },
+        };
         const id = self.table.lookup(name) orelse return .ensure;
         _ = proposeBind(shard, name, id) catch |err| return .{ .refused = refusalOf(proposeError(err)) };
         return .go;
@@ -724,23 +719,10 @@ pub const NamespaceHandler = struct {
     }
 
     /// Shard 0, once a tick: put applied creates on disk and publish them,
-    /// then answer or run what waited for them; answer what waited for a
-    /// refused create; and answer what has waited too long.
+    /// then answer or run what waited for them; and answer what has waited
+    /// too long.
     pub fn settle(self: *NamespaceHandler, shard: *Shard) void {
         if (!self.owner) return;
-        for (self.refused_creates.items) |r| {
-            defer self.allocator.free(r.name);
-            // A create that lost its id to a leader change is proposed
-            // again, by the leader, with a fresh one.
-            if (r.status == .unavailable and shard.raft_node.leaderReady() and self.hasWaiter(r.name)) {
-                if (self.proposeCreate(shard.raft_node, r.name)) |_| {
-                    self.notePending(r.name);
-                    continue;
-                } else |_| {}
-            }
-            self.answerWaiters(shard, r.name, .{ .refused = .{ .status = r.status, .message = r.message } });
-        }
-        self.refused_creates.clearRetainingCapacity();
 
         if (self.unpublished.items.len > 0) publish: {
             shard.flushSegmentToDisk() catch |err| {
@@ -901,7 +883,6 @@ pub const NamespaceHandler = struct {
         if (self.createRefusal(name)) |r| return .{ .refused = r };
         if (!raft.leaderReady()) return .{ .refused = .{ .status = .unavailable, .message = CATCHING_UP_MESSAGE } };
         const proposed = self.proposeCreate(raft, name) catch |err| return .{ .failed = proposeError(err) };
-        self.notePending(name);
         return .{ .proposed = proposed };
     }
 
@@ -917,6 +898,7 @@ pub const NamespaceHandler = struct {
         const bytes = P.encodeInto(&buf, .{ .name = name, .id = id }) catch return error.PayloadTooLarge;
         const proposed = try raft.propose(.namespace_create, entry_mod.Flags.NONE, bytes);
         self.next_alloc = id + 1;
+        self.notePending(name, .of(id));
         return proposed;
     }
 
@@ -930,7 +912,7 @@ pub const NamespaceHandler = struct {
         var buf: [P.max_size]u8 = undefined;
         const bytes = P.encodeInto(&buf, .{ .id = id.int(), .name = name }) catch return error.PayloadTooLarge;
         const proposed = try shard.raft_node.propose(.namespace_bind, entry_mod.Flags.NONE, bytes);
-        self.notePending(name);
+        self.notePending(name, id);
         return proposed;
     }
 
@@ -945,11 +927,11 @@ pub const NamespaceHandler = struct {
         return self.replayEntry(entry, out);
     }
 
-    /// Apply a namespace entry, at boot or after commit. A create refused
-    /// for its name, its id or the cap is refused the same way on every
-    /// replica. A bind that disagrees with what this shard holds breaks
-    /// the log, on every replica alike, and halts.
+    /// Apply a namespace entry, at boot or after commit. A create its
+    /// applier refuses, or a bind that disagrees with what this shard
+    /// holds, breaks the log, on every replica alike, and halts.
     pub fn replayEntry(self: *NamespaceHandler, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
+        _ = out; // nothing a namespace entry applies answers a client
         var diag: schema.Diagnostic = .{};
         switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(entry.header.entry_type)))) {
             .namespace_create => {
@@ -958,19 +940,18 @@ pub const NamespaceHandler = struct {
                 if (!self.owner) return error.Halt;
                 if (self.pending_creates.fetchRemove(c.name)) |kv| self.allocator.free(kv.key);
                 const outcome = self.applyCreateAt(c.name, .of(c.id), entry.header.timestamp_ns, entry.header.index);
-                const refused_create: ?RefusedCreate = switch (outcome) {
-                    .created => null,
-                    .existed => .{ .name = c.name, .status = .conflict, .message = "namespace already exists" },
-                    .invalid => .{ .name = c.name, .status = .bad_request, .message = nameRefusal(c.name) orelse "invalid namespace name" },
-                    .full => .{ .name = c.name, .status = .bad_request, .message = LIMIT_MESSAGE },
-                    .stale_id => .{ .name = c.name, .status = .unavailable, .message = STALE_ID_MESSAGE },
+                switch (outcome) {
+                    .created => {},
                     .failed => return error.OutOfMemory,
-                };
-                if (refused_create) |r| {
-                    out.refuse(r.status, .unclassified, r.message);
-                    // For the waiters, if any wait here.
-                    const owned = self.allocator.dupe(u8, r.name) catch return;
-                    self.refused_creates.append(self.allocator, .{ .name = owned, .status = r.status, .message = r.message }) catch self.allocator.free(owned);
+                    // A leader proposes a create only once it is ready, so
+                    // it has applied every earlier entry, and checks the
+                    // name and the room against them and its own creates in
+                    // flight; its ids run past every id in its log
+                    // (`proposeCreate`). So a create it proposed is never
+                    // refused here. One that is would leave the writes it
+                    // carries behind it naming an id that isn't theirs: the
+                    // log is broken, on every replica alike.
+                    .existed, .invalid, .full, .stale_id => return error.Halt,
                 }
             },
             .namespace_bind => {
@@ -1047,7 +1028,7 @@ test "namespace handler: list pages in name order, holding default from the star
     try testing.expect(past.cursor == null);
 }
 
-test "namespace handler: a create takes the next dense id, and one below it is refused as stale" {
+test "namespace handler: a create takes the next dense id, and one its leader could never have proposed halts" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
     var buf: [namespace_entries.Create.max_size]u8 = undefined;
@@ -1063,22 +1044,20 @@ test "namespace handler: a create takes the next dense id, and one below it is r
     try testing.expectEqual(first + 1, handler.next_id);
     // Applied, not yet published: that waits for the flush.
     try testing.expect(handler.table.lookup("stamped") == null);
-    // A second create of the name is refused where it applies.
+    // A second create of the name: its leader checks the name first, so
+    // the log is broken, and every replica halts on it alike.
     var again = Result.start(&e);
-    try handler.replayEntry(&e, &again);
-    try testing.expectEqual(proto.StatusCode.conflict, again.refused().?.status);
-    // An id another create took first: refused on every replica alike, and
-    // its leader proposes it again with a fresh one.
+    try testing.expectError(error.Halt, handler.replayEntry(&e, &again));
+    // An id another create took first: no ready leader proposes one, so
+    // the log is broken, and every replica halts on it alike.
     const stale = try testEntry(.namespace_create, 8, 0, .{ .name = "late", .id = first }, &buf);
     var st = Result.start(&stale);
-    try handler.replayEntry(&stale, &st);
-    try testing.expectEqual(proto.StatusCode.unavailable, st.refused().?.status);
+    try testing.expectError(error.Halt, handler.replayEntry(&stale, &st));
     try testing.expect(!handler.namespaces.contains("late"));
     // A reserved id is never allocated.
     const reserved = try testEntry(.namespace_create, 9, 0, .{ .name = "sneaky", .id = ns_table.SYSTEM.int() }, &buf);
     var rs = Result.start(&reserved);
-    try handler.replayEntry(&reserved, &rs);
-    try testing.expect(rs.refused() != null);
+    try testing.expectError(error.Halt, handler.replayEntry(&reserved, &rs));
     // Only shard 0 logs creates.
     var other = try NamespaceHandler.initFor(testing.allocator, 1, null);
     defer other.deinit();

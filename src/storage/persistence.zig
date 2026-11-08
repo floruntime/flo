@@ -245,9 +245,9 @@ pub fn proposeEntry(
     value: []const u8,
 ) !ProposeResult {
     if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
-    // A write runs only once its namespace is published (the edge, or
-    // `prepareWrite`), so the node's table has its id.
-    const ns_id = shard.namespace_handler.table.lookup(if (namespace.len == 0) "default" else namespace) orelse return error.NamespaceUnknown;
+    // A write runs once its namespace is known here (`prepareWrite`):
+    // published, or, on shard 0, proposed ahead of it.
+    const ns_id = shard.namespaceId(namespace);
     return proposeEntryIn(shard, entry_type, flags, ns_id, key, value);
 }
 
@@ -346,9 +346,14 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
         }
     };
     var entry_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
-    const table = try @import("../namespace/table.zig").Table.create(std.testing.allocator);
-    defer table.destroy();
-    const shard = struct { raft_node: FakeRaft, entry_buf: []u8, namespace_handler: struct { table: *@import("../namespace/table.zig").Table } }{ .raft_node = .{}, .entry_buf = &entry_buf, .namespace_handler = .{ .table = table } };
+    const FakeShard = struct {
+        raft_node: FakeRaft,
+        entry_buf: []u8,
+        pub fn namespaceId(_: *const @This(), _: []const u8) NamespaceId {
+            return .default;
+        }
+    };
+    const shard: FakeShard = .{ .raft_node = .{}, .entry_buf = &entry_buf };
     const long = @as([(MAX_ENTRY_KEY + 1)]u8, @splat('k'));
     try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
     try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
