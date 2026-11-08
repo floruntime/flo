@@ -51,10 +51,26 @@ pub const DurableLog = struct {
     /// The segment whose header would not read, when listing failed on it.
     bad_header: [128]u8 = undefined,
     bad_header_len: usize = 0,
+    /// Rate-limits the line said when a segment header can't be read now: a
+    /// blocked catch-up re-lists on every retry, so without this it floods.
+    /// Null until it is first said, so a block within the first interval of
+    /// uptime is not held silent.
+    block_warn_ms: ?u64 = null,
+    /// Tests only: an error `openCovering` returns when a segment must actually
+    /// be opened, standing in for a resource or IO failure from the OS without
+    /// provoking a real one. Null in production.
+    test_open_error: ?anyerror = null,
     /// The segment last read below the ring, kept open: a deferred tail
     /// reads one entry per call, and re-opening and CRC-checking the whole
     /// file each time is quadratic.
     open: ?Open = null,
+    /// What a read below the ring came to. `blocked` means it could not be
+    /// read right now, kept apart from "it isn't there": a hole is damage, a
+    /// blocked read is retried. `disk_failing` marks a blocked read whose
+    /// cause (an IO error, or an unmapped errno that may be one) should become
+    /// damage if it persists, as against a resource shortage that is expected
+    /// to pass on its own.
+    pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false };
 
     const Open = struct {
         first_index: u64,
@@ -106,31 +122,71 @@ pub const DurableLog = struct {
     /// packed into `arena`, from wherever they are: the writer's buffer if
     /// it holds `start`, else the sealed segment whose range covers it. Stops
     /// at the end of that source, so a caller wanting more calls again from
-    /// the next index. Returns the number of entries copied; zero when
-    /// nothing durable holds `start`. An unopenable segment, or one whose
-    /// header covers `start` but whose entries do not, is logged. While a
-    /// cut is pending the files still hold the discarded suffix, so reads
-    /// stop at the cut.
-    pub fn readRange(self: *DurableLog, start: u64, buf: []Entry, arena: []u8) usize {
-        if (buf.len == 0) return 0;
+    /// the next index. The result's `count` is how many were copied; zero
+    /// with `blocked` unset means nothing durable holds `start`. A segment
+    /// that is listed but cannot be opened or read sets `blocked` (and
+    /// `disk_failing` when the cause may be the disk) so the caller retries
+    /// rather than reading it as a hole; one whose header covers `start` but
+    /// whose entries do not is logged and returns zero. While a cut is
+    /// pending the files still hold the discarded suffix, so reads stop at
+    /// the cut.
+    pub fn readRange(self: *DurableLog, start: u64, buf: []Entry, arena: []u8) ReadResult {
+        if (buf.len == 0) return .{};
         const w = self.writer;
         if (w.entry_count > 0 and start >= w.first_index and start <= w.last_index) {
-            return copyFrom(w.data.items, start, buf, arena);
+            return .{ .count = copyFrom(w.data.items, start, buf, arena) };
         }
         if (self.pending_cut) |cut| {
-            if (start > cut) return 0;
+            if (start > cut) return .{};
         }
         const opened = self.openCovering(start) catch |err| {
-            log.err("durable log: cannot read below the ring at index {d}: {s}", .{ start, @errorName(err) });
-            return 0;
-        } orelse return 0;
+            // A resource or IO failure means "not now", not "not there": the
+            // segment is listed, so the data exists; the caller retries. A
+            // corrupt or missing segment is a genuine fault.
+            switch (readBlockClass(err)) {
+                .resource => return .{ .blocked = true },
+                .disk => return .{ .blocked = true, .disk_failing = true },
+                .fault => {
+                    log.err("durable log: cannot read below the ring at index {d}: {s}", .{ start, @errorName(err) });
+                    return .{};
+                },
+            }
+        } orelse return .{};
         const offset = opened.reader.findOffset(start) orelse {
             log.err("durable log: the segment covering index {d} does not hold it", .{start});
-            return 0;
+            return .{};
         };
         const data = opened.buf[opened.reader.data_start + offset .. opened.reader.data_end];
         const limit = if (self.pending_cut) |cut| @min(buf.len, @as(usize, @intCast(cut - start + 1))) else buf.len;
-        return copyFrom(data, start, buf[0..limit], arena);
+        return .{ .count = copyFrom(data, start, buf[0..limit], arena) };
+    }
+
+    const ReadBlockClass = enum {
+        /// A resource shortage expected to pass: hold and retry indefinitely.
+        resource,
+        /// An IO error, or an unmapped errno that may be one: retry, but let
+        /// the caller give up and damage if it persists. A read's `EIO`
+        /// surfaces as `error.InputOutput`; an open's `EIO` is unmapped and
+        /// surfaces as `error.Unexpected`, as the corruption errnos
+        /// (`EUCLEAN`, `EBADMSG`) do too.
+        disk,
+        /// A corrupt or missing segment: a genuine fault, damage now.
+        fault,
+    };
+
+    /// Classify a failure to open or read a listed segment.
+    fn readBlockClass(err: anyerror) ReadBlockClass {
+        return switch (err) {
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.SystemResources,
+            error.OutOfMemory,
+            => .resource,
+            error.InputOutput,
+            error.Unexpected,
+            => .disk,
+            else => .fault,
+        };
     }
 
     /// Drop every durable entry above `after_index`: the writer's buffer
@@ -314,6 +370,19 @@ pub const DurableLog = struct {
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.segs_path, de.name });
             errdefer self.allocator.free(path);
             const hdr = readHeader(path) catch |err| {
+                // A resource or IO failure is "not now", not a bad header: let
+                // the caller retry rather than log it as corruption and mark a
+                // good segment unreadable for good. Said at most once every 30
+                // s, because a blocked catch-up re-lists on every retry.
+                // `path`'s errdefer frees it on return.
+                if (readBlockClass(err) != .fault) {
+                    const now = stdx.time.monotonicMs();
+                    if (self.block_warn_ms == null or now -| self.block_warn_ms.? >= 30_000) {
+                        self.block_warn_ms = now;
+                        log.warn("durable log: could not read the header of {s} now: {s}; will retry", .{ path, @errorName(err) });
+                    }
+                    return err;
+                }
                 if (err == error.InvalidVersion) {
                     log.err("durable log: {s} was written by a flo whose stored format this build can't read; start from an empty data directory", .{path});
                 } else log.err("durable log: cannot read the header of {s}: {s}", .{ path, @errorName(err) });
@@ -413,6 +482,9 @@ pub const DurableLog = struct {
         if (self.open) |*o| {
             if (index >= o.first_index and index <= o.last_index) return o;
         }
+        // A cached segment above needs no open and is served even under the
+        // injected error; one that must be opened hits it.
+        if (self.test_open_error) |e| return e;
         const files = try self.segments();
         for (files) |f| {
             if (index < f.first_index or index > f.last_index) continue;
@@ -619,21 +691,21 @@ test "durable log: readRange serves the writer buffer, then each sealed segment"
     var buf: [8]Entry = undefined;
     var arena: [256]u8 = undefined;
     // From inside the sealed segment: the rest of that segment, not beyond.
-    var n = dl.readRange(2, &buf, &arena);
+    var n = dl.readRange(2, &buf, &arena).count;
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u64, 2), buf[0].header.index);
     try testing.expectEqualStrings("two", buf[0].payload);
     try testing.expectEqual(@as(u64, 3), buf[1].header.index);
     try testing.expectEqualStrings("three", buf[1].payload);
     // From the writer buffer, with the terms the entries carry.
-    n = dl.readRange(4, &buf, &arena);
+    n = dl.readRange(4, &buf, &arena).count;
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u64, 2), buf[0].header.term);
     try testing.expectEqualStrings("five", buf[1].payload);
     // Nothing holds index 6.
-    try testing.expectEqual(@as(usize, 0), dl.readRange(6, &buf, &arena));
+    try testing.expectEqual(@as(usize, 0), dl.readRange(6, &buf, &arena).count);
     // A one-slot buffer gets exactly one.
-    try testing.expectEqual(@as(usize, 1), dl.readRange(1, buf[0..1], &arena));
+    try testing.expectEqual(@as(usize, 1), dl.readRange(1, buf[0..1], &arena).count);
     try testing.expectEqualStrings("one", buf[0].payload);
 }
 
@@ -686,13 +758,13 @@ test "durable log: truncateAfter rewrites the sealed tail under its own name and
 
     var buf: [8]Entry = undefined;
     var arena: [256]u8 = undefined;
-    try testing.expectEqual(@as(usize, 2), dl.readRange(4, &buf, &arena));
-    try testing.expectEqual(@as(usize, 0), dl.readRange(6, &buf, &arena));
+    try testing.expectEqual(@as(usize, 2), dl.readRange(4, &buf, &arena).count);
+    try testing.expectEqual(@as(usize, 0), dl.readRange(6, &buf, &arena).count);
 
     // A new index 6 flushed later lands in its own file and reads back.
     try writer.addEntry(&testEntry(6, 2, "F"));
     try dl.flush(6);
-    try testing.expectEqual(@as(usize, 1), dl.readRange(6, &buf, &arena));
+    try testing.expectEqual(@as(usize, 1), dl.readRange(6, &buf, &arena).count);
     try testing.expectEqual(@as(u64, 2), buf[0].header.term);
     try testing.expectEqual(@as(u64, 6), try dl.watermark());
 }
@@ -751,8 +823,8 @@ test "durable log: dropThrough deletes whole segments oldest first, keeps one st
         try testing.expectEqual(before + 1, stdx.fs.dir_syncs.load(.monotonic));
         var buf: [8]Entry = undefined;
         var arena: [256]u8 = undefined;
-        try testing.expectEqual(@as(usize, 0), dl.readRange(2, &buf, &arena));
-        try testing.expectEqual(@as(usize, 3), dl.readRange(4, &buf, &arena));
+        try testing.expectEqual(@as(usize, 0), dl.readRange(2, &buf, &arena).count);
+        try testing.expectEqual(@as(usize, 3), dl.readRange(4, &buf, &arena).count);
     }
     // Reopened: the listing starts at 4, and dropping through 6 takes 4-6.
     var writer = SegmentWriter.init(testing.allocator, 0);
@@ -866,19 +938,19 @@ test "durable log: the cached listing and open segment are dropped by a flush an
     try dl.flush(2);
     var buf: [4]Entry = undefined;
     var arena: [64]u8 = undefined;
-    try testing.expectEqual(@as(usize, 2), dl.readRange(1, &buf, &arena));
+    try testing.expectEqual(@as(usize, 2), dl.readRange(1, &buf, &arena).count);
     try testing.expect(dl.open != null);
 
     // A new file must be visible to the next read.
     try writer.addEntry(&testEntry(3, 1, "c"));
     try dl.flush(3);
-    try testing.expectEqual(@as(usize, 1), dl.readRange(3, &buf, &arena));
+    try testing.expectEqual(@as(usize, 1), dl.readRange(3, &buf, &arena).count);
     try testing.expectEqualStrings("c", buf[0].payload);
 
     // A cut inside the open segment must not be served from the old copy.
     try dl.truncateAfter(1);
-    try testing.expectEqual(@as(usize, 0), dl.readRange(2, &buf, &arena));
-    try testing.expectEqual(@as(usize, 1), dl.readRange(1, &buf, &arena));
+    try testing.expectEqual(@as(usize, 0), dl.readRange(2, &buf, &arena).count);
+    try testing.expectEqual(@as(usize, 1), dl.readRange(1, &buf, &arena).count);
 }
 
 test "durable log: a truncation that cannot reach the files wedges flushing until it does" {
@@ -910,9 +982,9 @@ test "durable log: a truncation that cannot reach the files wedges flushing unti
     // hand it out while the cut is pending.
     var stale: [4]Entry = undefined;
     var stale_arena: [64]u8 = undefined;
-    try testing.expectEqual(@as(usize, 2), dl.readRange(1, &stale, &stale_arena));
+    try testing.expectEqual(@as(usize, 2), dl.readRange(1, &stale, &stale_arena).count);
     // Index 3 itself comes from the buffer, the replacement, not the file.
-    try testing.expectEqual(@as(usize, 1), dl.readRange(3, &stale, &stale_arena));
+    try testing.expectEqual(@as(usize, 1), dl.readRange(3, &stale, &stale_arena).count);
     try testing.expectEqual(@as(u64, 2), stale[0].header.term);
 
     // Once the cut can complete, the next flush finishes it first. The
@@ -1121,4 +1193,116 @@ test "durable log: a recovery listing refuses a damaged file whose name is not a
     const file = try stdx.fs.createFile(path, .{});
     stdx.fs.closeFile(file);
     try testing.expectError(error.TooSmall, dl.listSegments(false));
+}
+
+test "durable log: a resource or IO read failure is held as blocked, corruption is not" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    try writer.addEntry(&testEntry(1, 1, "one"));
+    try writer.addEntry(&testEntry(2, 1, "two"));
+    try writer.addEntry(&testEntry(3, 1, "three"));
+    try dl.flush(3);
+    try writer.addEntry(&testEntry(4, 1, "four"));
+    try writer.addEntry(&testEntry(5, 1, "five"));
+    try dl.flush(5);
+    try writer.addEntry(&testEntry(6, 1, "six"));
+    try dl.flush(6);
+    var buf: [8]Entry = undefined;
+    var arena: [256]u8 = undefined;
+    // A resource error opening a segment is "not now", not "not there": the
+    // read is held as blocked, and a resource shortage is not the disk failing.
+    dl.test_open_error = error.SystemResources;
+    {
+        const r = dl.readRange(1, &buf, &arena);
+        try testing.expect(r.blocked and !r.disk_failing and r.count == 0);
+    }
+    // An IO error is blocked too, and marked as the disk maybe failing.
+    dl.test_open_error = error.InputOutput;
+    {
+        const r = dl.readRange(1, &buf, &arena);
+        try testing.expect(r.blocked and r.disk_failing);
+    }
+    dl.test_open_error = null;
+    // Recovered: the first segment reads whole.
+    const r2 = dl.readRange(1, &buf, &arena);
+    try testing.expectEqual(@as(usize, 3), r2.count);
+    {
+        // The open segment is cached, so a later read of it is served even
+        // while a fresh open would fail; a read that must open the next one is
+        // blocked.
+        dl.test_open_error = error.SystemResources;
+        defer dl.test_open_error = null;
+        const cached = dl.readRange(2, &buf, &arena);
+        try testing.expect(cached.count == 2 and !cached.blocked);
+        const next = dl.readRange(4, &buf, &arena);
+        try testing.expect(next.blocked and next.count == 0);
+    }
+    const files = try dl.segments();
+    const path1: []const u8 = try testing.allocator.dupe(u8, files[0].path);
+    defer testing.allocator.free(path1);
+    const path2: []const u8 = try testing.allocator.dupe(u8, files[1].path);
+    defer testing.allocator.free(path2);
+    const path3: []const u8 = try testing.allocator.dupe(u8, files[2].path);
+    defer testing.allocator.free(path3);
+    // A permission error is a fault, not a block: the read gives up.
+    {
+        var dpath: [600:0]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path3}, 0);
+        _ = std.c.chmod(z, 0);
+        dl.open = blk: {
+            if (dl.open) |o| testing.allocator.free(o.buf);
+            break :blk null;
+        };
+        const r = dl.readRange(6, &buf, &arena);
+        try testing.expect(!r.blocked);
+        _ = std.c.chmod(z, 0o644);
+    }
+    // A truncated segment is a fault, not a block.
+    {
+        var dpath: [600:0]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path2}, 0);
+        const tfd = std.c.open(z, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        _ = std.c.ftruncate(tfd, 80);
+        _ = std.c.close(tfd);
+        const r = dl.readRange(4, &buf, &arena);
+        try testing.expect(!r.blocked and r.count == 0);
+    }
+    // A removed segment is a fault, not a block.
+    {
+        try stdx.fs.deleteFile(path3);
+        const r = dl.readRange(6, &buf, &arena);
+        try testing.expect(!r.blocked and r.count == 0);
+    }
+    // A bad header is a fault, not a block.
+    {
+        dl.invalidate();
+        var dpath: [600:0]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path1}, 0);
+        const fd = std.c.open(z, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        _ = std.c.write(fd, "XXXX", 4);
+        _ = std.c.close(fd);
+        const r = dl.readRange(1, &buf, &arena);
+        try testing.expect(!r.blocked and r.count == 0);
+    }
+}
+
+test "durable log: readBlockClass sorts a read error into resource, disk, or fault" {
+    const R = DurableLog.ReadBlockClass;
+    // A resource shortage holds: these clear on their own.
+    try testing.expectEqual(R.resource, DurableLog.readBlockClass(error.ProcessFdQuotaExceeded));
+    try testing.expectEqual(R.resource, DurableLog.readBlockClass(error.SystemFdQuotaExceeded));
+    try testing.expectEqual(R.resource, DurableLog.readBlockClass(error.SystemResources));
+    try testing.expectEqual(R.resource, DurableLog.readBlockClass(error.OutOfMemory));
+    // An IO error (or an unmapped one that may be one) holds, then becomes
+    // damage if it lasts.
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.InputOutput));
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.Unexpected));
+    // Corruption and a missing or unreadable file are faults, read now as a hole.
+    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.InvalidVersion));
+    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.AccessDenied));
+    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.EndOfStream));
 }
