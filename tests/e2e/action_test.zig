@@ -1387,3 +1387,89 @@ test "e2e/action: a task held past its action's timeout goes back to pending, th
         }
     }
 }
+
+/// `action info -o json` for `name`, which must exit 0 and parse.
+fn actionInfoJson(ctx: *stdx.testing.TestContext, name: []const u8) !std.json.Parsed(std.json.Value) {
+    var result = try ctx.cli.run(&.{ "action", "info", name, "-o", "json" });
+    defer result.deinit();
+    if (result.exit_code != 0) return error.TestFailed;
+    return std.json.parseFromSlice(std.json.Value, testing.allocator, result.stdout, .{});
+}
+
+test "e2e/action/register: no --timeout or --max-attempts leaves both to the server" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "defaulted" });
+    try ctx.exec(&.{ "action", "register", "named", "--timeout", "6000", "--max-attempts", "1" });
+    const d = try actionInfoJson(&ctx, "defaulted");
+    defer d.deinit();
+    try testing.expectEqual(@as(i64, 300000), d.value.object.get("timeout_ms").?.integer);
+    try testing.expectEqual(@as(i64, 3), d.value.object.get("max_attempts").?.integer);
+    const n = try actionInfoJson(&ctx, "named");
+    defer n.deinit();
+    try testing.expectEqual(@as(i64, 6000), n.value.object.get("timeout_ms").?.integer);
+    try testing.expectEqual(@as(i64, 1), n.value.object.get("max_attempts").?.integer);
+}
+
+/// Invoke `action` and take its task as `worker`: the run id and task id.
+fn takeOne(ctx: *stdx.testing.TestContext, action: []const u8, worker: []const u8, run_buf: []u8, task_buf: []u8) !struct { run: []const u8, task: []const u8 } {
+    const invoked = try ctx.execCapture(&.{ "action", "invoke", action, "{}" });
+    const run = extractRunId(invoked) orelse return error.TestFailed;
+    @memcpy(run_buf[0..run.len], run);
+    var await_result = try ctx.cli.run(&.{ "worker", "await", action, "--worker-id", worker, "--block", "5000" });
+    defer await_result.deinit();
+    const task = taskIdOf(await_result.stdout) orelse return error.TestFailed;
+    @memcpy(task_buf[0..task.len], task);
+    return .{ .run = run_buf[0..run.len], .task = task_buf[0..task.len] };
+}
+
+test "e2e/action/worker: fail retries unless told not to, and --abandoned counts no attempt" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "flaky", "--max-attempts", "3" });
+    try ctx.exec(&.{ "worker", "register", "fw", "flaky" });
+    var rb: [64]u8 = undefined;
+    var tb: [256]u8 = undefined;
+
+    // Plain fail: the run is tried again.
+    const one = try takeOne(&ctx, "flaky", "fw", &rb, &tb);
+    try ctx.exec(&.{ "worker", "fail", one.task, "--worker-id", "fw", "--error", "once" });
+    {
+        const s = try runStatusJson(&ctx, one.run);
+        defer s.deinit();
+        try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
+    }
+    // Handed back: the next delivery is still the second attempt's.
+    var tb2: [256]u8 = undefined;
+    var await2 = try ctx.cli.run(&.{ "worker", "await", "flaky", "--worker-id", "fw", "--block", "5000" });
+    defer await2.deinit();
+    const second = taskIdOf(await2.stdout) orelse return error.TestFailed;
+    @memcpy(tb2[0..second.len], second);
+    try ctx.exec(&.{ "worker", "fail", tb2[0..second.len], "--worker-id", "fw", "--abandoned" });
+    {
+        const s = try runStatusJson(&ctx, one.run);
+        defer s.deinit();
+        try testing.expectEqualStrings("pending", s.value.object.get("status").?.string);
+        try testing.expectEqual(@as(i64, 2), s.value.object.get("attempt").?.integer);
+    }
+    // --abandoned and --no-retry contradict each other.
+    var both = try ctx.cli.run(&.{ "worker", "fail", tb2[0..second.len], "--worker-id", "fw", "--abandoned", "--no-retry" });
+    defer both.deinit();
+    try testing.expect(both.exit_code != 0);
+}
+
+test "e2e/action/status: a completed run's named outcome is shown" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "action", "register", "decide" });
+    try ctx.exec(&.{ "worker", "register", "dw", "decide" });
+    var rb: [64]u8 = undefined;
+    var tb: [256]u8 = undefined;
+    const t = try takeOne(&ctx, "decide", "dw", &rb, &tb);
+    try ctx.exec(&.{ "worker", "complete", t.task, "--worker-id", "dw", "--outcome", "approved" });
+    const s = try runStatusJson(&ctx, t.run);
+    defer s.deinit();
+    try testing.expectEqualStrings("approved", s.value.object.get("outcome").?.string);
+    const table = try ctx.execCapture(&.{ "action", "status", t.run });
+    try testing.expect(std.mem.indexOf(u8, table, "outcome: approved") != null);
+}
