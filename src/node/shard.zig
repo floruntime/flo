@@ -13527,8 +13527,8 @@ test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then to
     @memcpy(run_id, started.data);
 
     // What finishes the run: as a new leader finds it, in its log, not applied.
+    // A cancel is answered when it applies, so this one waits for the ack.
     try ParkTest.send(&c.t.shard, c.t.conn, .workflow_cancel, 3, run_id, "first");
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     raft.ready_index = raft.log.lastIndex();
     const last = raft.log.lastIndex();
     try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 4, run_id, "second");
@@ -13536,6 +13536,7 @@ test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then to
     try std.testing.expectEqual(last, raft.log.lastIndex());
 
     try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try std.testing.expect(raft.leaderReady());
     try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 5, run_id, "third");
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), (try c.otherAnswer()).header.status);
@@ -16898,6 +16899,135 @@ test "a write parked past the halt whose entry a later leader replaces is told t
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
     try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
     try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+}
+
+fn raceTestRun(t: *RaceTest, id: []const u8) *WorkflowHandler.RunRecord {
+    var it = t.shard.workflow_handler.runs.valueIterator();
+    while (it.next()) |r| if (std.mem.eql(u8, r.run_id_owned, id)) return r;
+    @panic("no run with that id");
+}
+
+fn raceTestWaitingRun(t: *RaceTest, buf: []u8, one: []proto.Response) ![]const u8 {
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    t.send(.workflow_create, 40, "flow", def);
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
+    t.send(.workflow_start, 41, "flow", "");
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
+    return one[0].data;
+}
+
+test "a workflow cancel is answered when its entry applies, and the run ends then, not before" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    t.send(.workflow_cancel, 42, id, "");
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(WorkflowHandler.cancelInFlight(&t.shard, run));
+
+    // A signal meanwhile is refused as retryable, and doesn't move it.
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 43, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(u64, 42), one[0].header.request_id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+}
+
+test "a workflow cancel on a leader elected again still holds the run, applies, and counts once" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    t.shard.setMetricsRegistry(&registry);
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    const r = t.shard.raft_node;
+
+    // Two cancels in the window: one run cancelled.
+    t.send(.workflow_cancel, 42, id, "");
+    t.send(.workflow_cancel, 43, id, "");
+    // Elected again, as `becomeLeader` leaves it: its entries kept.
+    r.current_term += 1;
+    r.ready_index = r.log.lastIndex();
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 44, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    // An entry of its own term, so the earlier ones commit with it.
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    try ParkTest.ack(&t.shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    for (two) |a| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    try std.testing.expectEqual(@as(u64, 1), registry.workflow.cancelled_total.load(.monotonic));
+}
+
+test "a workflow cancel whose entry a later leader replaces is told the leader changed, and the run isn't cancelled" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    const r = t.shard.raft_node;
+    const before = r.log.lastIndex();
+    const term = r.current_term;
+    const prev_term = term;
+
+    t.send(.workflow_cancel, 42, id, "");
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+
+    // Node 2 leads term + 1, replaces the cancel's entry with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, before + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = prev_term, .entries = (&noop)[0..1], .leader_commit = before + 1 });
+    _ = t.shard.applyCommitted();
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(!WorkflowHandler.cancelInFlight(&t.shard, run));
 }
 
 test "an entry stamped no later than the one before it halts its shard" {
