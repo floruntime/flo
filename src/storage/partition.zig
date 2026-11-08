@@ -403,7 +403,7 @@ test "partition: queue projection wired through router" {
 
     // Enqueue via UAL entry
     var buf1: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q1", "msg", &buf1) orelse unreachable;
+    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, .default, "q1", "msg", &buf1) orelse unreachable;
     _ = try part.apply(&e1);
 
     try testing.expectEqual(@as(u64, 1), part.queue.stats.enqueued);

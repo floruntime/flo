@@ -346,10 +346,10 @@ test "TxnTable: two tables start their ids at different counters" {
     defer a.deinit();
     var b = TxnTable.init(std.testing.allocator);
     defer b.deinit();
-    const first = try a.begin(0, 0);
+    const first = try a.begin(0, .default);
     // A restart's table: the id a client held from before isn't open in it.
     try std.testing.expect(b.get(first) == null);
-    try std.testing.expect(try b.begin(0, 0) != first);
+    try std.testing.expect(try b.begin(0, .default) != first);
     try std.testing.expect(first & ID_COUNTER_MASK != 0);
 }
 
@@ -358,7 +358,7 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(0xDEADBEEF, 0xABCD);
+    const id = try tt.begin(0xDEADBEEF, .of(0xABCD));
     try t.expectEqual(@as(usize, 1), tt.count());
 
     try tt.appendOp(id, .put, "default\x00k1", "v1", 0, .always, null);
@@ -376,7 +376,7 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(1, 0);
+    const id = try tt.begin(1, .default);
     try tt.appendOp(id, .put, "ns\x00k", "v1", 0, .always, null);
     try tt.appendOp(id, .put, "ns\x00other", "x", 0, .always, null);
     try tt.appendOp(id, .put, "ns\x00k", "v2", 0, .always, null);
@@ -392,7 +392,7 @@ test "TxnTable: by default a transaction holds the largest value a plain set tak
     comptime std.debug.assert(limits.MAX_QUALIFIED_KEY + @import("../protocol/kv_ops.zig").MAX_VALUE <= limits.DEFAULT_MAX_BYTES_PER_TXN);
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
-    const id = try tt.begin(1, 0);
+    const id = try tt.begin(1, .default);
     const key = try t.allocator.alloc(u8, limits.MAX_QUALIFIED_KEY);
     defer t.allocator.free(key);
     @memset(key, 'k');
@@ -407,13 +407,13 @@ test "TxnTable: max_bytes and max_ops move their refusal points" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
     tt.max_bytes = 10;
-    const a = try tt.begin(1, 0);
+    const a = try tt.begin(1, .default);
     try tt.appendOp(a, .put, "k", "123456789", 0, .always, null);
     // One byte over.
     try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "", 0, .always, null));
     tt.max_bytes = limits.MAX_PAYLOAD_PER_TXN;
     tt.max_ops = 2;
-    const b = try tt.begin(2, 0);
+    const b = try tt.begin(2, .default);
     try tt.appendOp(b, .put, "a", "", 0, .always, null);
     try tt.appendOp(b, .put, "b", "", 0, .always, null);
     try t.expectError(error.TxnTooLarge, tt.appendOp(b, .put, "c", "", 0, .always, null));
@@ -425,7 +425,7 @@ test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     defer tt.deinit();
     tt.max_bytes = MAX_PAYLOAD_PER_TXN;
 
-    const id = try tt.begin(1, 0);
+    const id = try tt.begin(1, .default);
     const big = try t.allocator.alloc(u8, MAX_PAYLOAD_PER_TXN);
     defer t.allocator.free(big);
     @memset(big, 'a');
@@ -445,14 +445,14 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
     // More idle ones than one gathering pass holds.
     var idle: [150]u64 = undefined;
     for (&idle) |*id| {
-        id.* = try tt.begin(1, 0);
+        id.* = try tt.begin(1, .default);
         tt.get(id.*).?.last_active_ms = 1_000;
     }
     try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0, .always, null);
-    const committing = try tt.begin(1, 0);
+    const committing = try tt.begin(1, .default);
     tt.get(committing).?.last_active_ms = 1_000;
     tt.get(committing).?.committing = true;
-    const used = try tt.begin(1, 0);
+    const used = try tt.begin(1, .default);
     tt.get(used).?.last_active_ms = 1_000 + IDLE_TIMEOUT_MS;
 
     const now = 1_000 + IDLE_TIMEOUT_MS;
@@ -507,5 +507,5 @@ test "txn: an id names its shard" {
     var t = TxnTable.init(std.testing.allocator);
     defer t.deinit();
     t.shard_id = 7;
-    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, 0)));
+    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, .default)));
 }

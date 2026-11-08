@@ -2129,7 +2129,7 @@ pub const ProcessingHandler = struct {
 
 fn applySubmit(h: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyError!Result {
     var out: Result = .{};
-    try h.replaySubmit(key, value, created_at_ms, &out);
+    try h.replaySubmit(key, value, .default, created_at_ms, &out);
     return out;
 }
 
@@ -2325,7 +2325,7 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
         @memcpy(value[8..15], "default");
         @memcpy(value[15 .. 15 + yaml.len], yaml);
         var pbuf: [1024]u8 = undefined;
-        _ = try applyLogged(&handler, &entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 15 + yaml.len], &pbuf).?);
+        _ = try applyLogged(&handler, &entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, .default, "job-1", value[0 .. 15 + yaml.len], &pbuf).?);
         try std.testing.expectEqual(stamp_ms, (handler.jobs.get("job-1") orelse return error.JobNotCreated).created_at_ms);
     }
 }
@@ -2524,7 +2524,7 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
     var pbuf: [1024]u8 = undefined;
     const value = testSubmitValue(&buf, .stopped, yaml);
     for ([_]struct { []const u8, bool }{ .{ "job-1", false }, .{ "job-2", true }, .{ "job-1", false } }) |c| {
-        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, 0, c[0], value, &pbuf).?;
+        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, .default, c[0], value, &pbuf).?;
         var out = Result.start(&entry);
         try handler.replayEntry(&entry, &out);
         try std.testing.expectEqual(c[1], out.refused() != null);
@@ -2538,9 +2538,9 @@ fn applyKeyed(h: *ProcessingHandler, etype: EntryType, key: []const u8, value: [
     return applyKeyedIn(h, etype, .default, key, value);
 }
 
-fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_hash: u32, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
+fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_id: NamespaceId, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
     var pbuf: [1024]u8 = undefined;
-    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_hash, key, value, &pbuf).?;
+    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_id, key, value, &pbuf).?;
     return applyLogged(h, &entry);
 }
 
@@ -2563,7 +2563,7 @@ test "ProcessingHandler: a remove is refused while its job runs, and frees the s
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 2)).refused() != null);
 
     // Another namespace's remove finds no such job, on every replica.
-    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("other"), "job-1", "")).refused().?;
+    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, .of(16), "job-1", "")).refused().?;
     try std.testing.expectEqual(proto.StatusCode.not_found, elsewhere.status);
     try std.testing.expect(handler.jobs.contains("job-1"));
 
@@ -2988,7 +2988,7 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     const ids = [_][]const u8{ "job-a", "job-b", "job-c" };
     for (ids, 1..) |id, i| _ = try applySubmit(&handler, id, testSubmitValue(&buf, .stopped, lookup_yaml), @intCast(i));
 
-    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), "", "", null, 0);
+    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), .{ .name = "" }, "", null, 0);
     try std.testing.expectEqual(ids.len, page.items.len);
     var seen: [ids.len]bool = @splat(false);
     for (page.items) |item| {

@@ -1047,7 +1047,7 @@ test "queue: projection handle with router" {
 
     // Build a queue_enqueue entry
     var payload_buf: [64]u8 = undefined;
-    const entry = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q", "test-payload", &payload_buf).?;
+    const entry = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, .default, "q", "test-payload", &payload_buf).?;
     var out = Result.start(&entry);
     const result = try router.apply(&entry, &out);
 
@@ -1059,8 +1059,8 @@ test "queue: an enqueue in a namespace the shard never bound halts, and changes 
     var q = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer q.deinit();
     const Bound = struct {
-        fn resolve(_: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 {
-            return if (ns_hash == 77) "orders" else null;
+        fn resolve(_: *anyopaque, ns: NamespaceId) ?[]const u8 {
+            return if (ns == NamespaceId.of(77)) "orders" else null;
         }
     };
     var ctx: u8 = 0;
@@ -1068,13 +1068,13 @@ test "queue: an enqueue in a namespace the shard never bound halts, and changes 
     q.ns_resolver_ctx = @ptrCast(&ctx);
 
     var payload_buf: [64]u8 = undefined;
-    const bound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 77, "q", "\x00\x00\x00\x00one", &payload_buf).?;
+    const bound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, .of(77), "q", "\x00\x00\x00\x00one", &payload_buf).?;
     var out = Result.start(&bound);
     try q.applyEntry(&bound, &out);
     try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
 
     // Never refiled under "default": the log lacks the namespace's bind.
-    const unbound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 2, 2000, 78, "q", "\x00\x00\x00\x00two", &payload_buf).?;
+    const unbound = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 2, 2000, .of(78), "q", "\x00\x00\x00\x00two", &payload_buf).?;
     var out2 = Result.start(&unbound);
     try testing.expectError(error.Halt, q.applyEntry(&unbound, &out2));
     try testing.expectEqual(@as(u64, 1), q.stats.enqueued);
@@ -1091,17 +1091,17 @@ test "queue: an ack or nack entry touches a message only in the queue it names" 
     var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
     for ([_]EntryType{ .queue_ack, .queue_nack }) |kind| {
         // Another queue's id: nothing happens.
-        const other = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, &std.mem.toBytes(@as(u64, 7)), &payload_buf).?;
+        const other = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, .default, &key, &std.mem.toBytes(@as(u64, 7)), &payload_buf).?;
         try applyTest(&q, &other);
         try testing.expect(q.inQueue(theirs, 42));
         try testing.expectEqual(@as(u64, 0), q.stats.acked + q.stats.nacked);
         // No queue at all: no proposer writes that, and it halts.
-        const none = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, 0, &key, "", &payload_buf).?;
+        const none = entry_mod.buildCommandEntry(kind, 0, 1, 2, 2000, .default, &key, "", &payload_buf).?;
         try testing.expectError(error.Halt, applyTest(&q, &none));
         try testing.expect(q.inQueue(theirs, 42));
     }
     // Its own queue's id: acked.
-    const entry = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 3, 3000, 0, &key, &std.mem.toBytes(@as(u64, 42)), &payload_buf).?;
+    const entry = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 3, 3000, .default, &key, &std.mem.toBytes(@as(u64, 42)), &payload_buf).?;
     try applyTest(&q, &entry);
     try testing.expect(!q.inQueue(theirs, 42));
     try testing.expectEqual(@as(u64, 1), q.stats.acked);
@@ -1152,7 +1152,7 @@ test "queue: each queue's ready and leased counts match its messages through eve
 
 test "queue: a replica that only replays the log counts a queue's enqueues and dequeues as the leader did" {
     var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 64]u8 = undefined;
-    const hash = node_router.nameHash(0, "q");
+    const hash = node_router.nameHash(.default, "q");
     // The leader: three enqueues applied, one dequeued here, its ack applied.
     var leader = QueueProjection.init(testing.allocator, .{ .default_lease_ns = 1000 });
     defer leader.deinit();
@@ -1160,7 +1160,7 @@ test "queue: a replica that only replays the log counts a queue's enqueues and d
     defer replica.deinit();
     var seqs: [3]u64 = undefined;
     for (&seqs, 1..) |*seq, i| {
-        const e = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, i, 1000 * i, 0, "q", "\x00\x00\x00\x00m", &payload_buf).?;
+        const e = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, i, 1000 * i, .default, "q", "\x00\x00\x00\x00m", &payload_buf).?;
         try applyTest(&leader, &e);
         try applyTest(&replica, &e);
         seq.* = leader.next_seq - 1;
@@ -1169,7 +1169,7 @@ test "queue: a replica that only replays the log counts a queue's enqueues and d
     try testing.expectEqual(seqs[0], d.seq);
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, d.seq, .little);
-    const ack = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 4, 6000, 0, &key, &std.mem.toBytes(hash), &payload_buf).?;
+    const ack = entry_mod.buildCommandEntry(.queue_ack, 0, 1, 4, 6000, .default, &key, &std.mem.toBytes(hash), &payload_buf).?;
     try applyTest(&leader, &ack);
     try applyTest(&replica, &ack);
 

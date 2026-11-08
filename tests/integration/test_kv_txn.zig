@@ -19,7 +19,7 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     var table = txn_mod.TxnTable.init(testing.allocator);
     defer table.deinit();
 
-    const tid = try table.begin(0xDEAD_BEEF, 42);
+    const tid = try table.begin(0xDEAD_BEEF, .of(42));
     try testing.expect(tid != 0);
 
     // Stage put + delete + incr.
@@ -33,7 +33,7 @@ test "integration: kv_txn — table appends ops and drops cleanly" {
     const state = table.get(tid).?;
     try testing.expectEqual(@as(usize, 3), state.ops.items.len);
     try testing.expectEqual(@as(u64, 0xDEAD_BEEF), state.pinned_hash);
-    try testing.expectEqual(@as(u32, 42), state.namespace_hash);
+    try testing.expectEqual(@as(u32, 42), state.ns_id.int());
 
     // Last-op-for-key lookup powers RYW reads.
     try testing.expect(table.lastOpForKey(tid, "alice") != null);
@@ -49,7 +49,7 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     var table = txn_mod.TxnTable.init(testing.allocator);
     defer table.deinit();
 
-    const tid = try table.begin(0, 99);
+    const tid = try table.begin(0, .of(99));
     try table.appendOp(tid, .put, "k1", "v1", 1_000, .always, null);
     try table.appendOp(tid, .put, "k2", "v2", 0, .always, null);
     try table.appendOp(tid, .delete, "k3", "", 0, .always, null);

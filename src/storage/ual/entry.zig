@@ -572,7 +572,7 @@ test "entry: a command payload with a key near the u16 limit decodes" {
 
 test "entry: an unknown entry type has no command payload" {
     var buf: [64]u8 = undefined;
-    var e = buildCommandEntry(.queue_enqueue, Flags.NONE, 1, 1, 0, 0, "k", "v", &buf).?;
+    var e = buildCommandEntry(.queue_enqueue, Flags.NONE, 1, 1, 0, .default, "k", "v", &buf).?;
     try std.testing.expect(e.commandPayload() != null);
     e.header.entry_type = 0xfe;
     try std.testing.expect(e.commandPayload() == null);

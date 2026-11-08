@@ -1236,15 +1236,15 @@ test "ts: basic insert and query" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 82.5, 1000, 1, "");
-    try ts.insert(0, "cpu", "usage", 75.0, 2000, 2, "");
-    try ts.insert(0, "cpu", "usage", 90.1, 3000, 3, "");
+    try ts.insert(.of(16), "cpu", "usage", 82.5, 1000, 1, "");
+    try ts.insert(.of(16), "cpu", "usage", 75.0, 2000, 2, "");
+    try ts.insert(.of(16), "cpu", "usage", 90.1, 3000, 3, "");
 
     try testing.expectEqual(@as(u64, 3), ts.stats.points_inserted);
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange(0, "cpu", "usage", null, 1000, 3000, &buf);
+    const result = try ts.queryRange(.of(16), "cpu", "usage", null, 1000, 3000, &buf);
     try testing.expectEqual(@as(usize, 3), result.points_in_buffer);
     try testing.expectEqual(@as(f64, 82.5), buf[0].field_value);
 }
@@ -1253,13 +1253,13 @@ test "ts: range query filters by timestamp" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "mem", "used", 100.0, 1000, 1, "");
-    try ts.insert(0, "mem", "used", 200.0, 2000, 2, "");
-    try ts.insert(0, "mem", "used", 300.0, 3000, 3, "");
-    try ts.insert(0, "mem", "used", 400.0, 4000, 4, "");
+    try ts.insert(.of(16), "mem", "used", 100.0, 1000, 1, "");
+    try ts.insert(.of(16), "mem", "used", 200.0, 2000, 2, "");
+    try ts.insert(.of(16), "mem", "used", 300.0, 3000, 3, "");
+    try ts.insert(.of(16), "mem", "used", 400.0, 4000, 4, "");
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange(0, "mem", "used", null, 2000, 3000, &buf);
+    const result = try ts.queryRange(.of(16), "mem", "used", null, 2000, 3000, &buf);
     try testing.expectEqual(@as(usize, 2), result.points_in_buffer);
     try testing.expectEqual(@as(f64, 200.0), buf[0].field_value);
     try testing.expectEqual(@as(f64, 300.0), buf[1].field_value);
@@ -1269,11 +1269,11 @@ test "ts: aggregation — avg" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
-    try ts.insert(0, "cpu", "usage", 90.0, 2000, 2, "");
-    try ts.insert(0, "cpu", "usage", 100.0, 3000, 3, "");
+    try ts.insert(.of(16), "cpu", "usage", 80.0, 1000, 1, "");
+    try ts.insert(.of(16), "cpu", "usage", 90.0, 2000, 2, "");
+    try ts.insert(.of(16), "cpu", "usage", 100.0, 3000, 3, "");
 
-    const average = (try ts.avg(0, "cpu", "usage", &.{}, 1000, 3000)).?;
+    const average = (try ts.avg(.of(16), "cpu", "usage", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), average, 0.001);
 }
 
@@ -1281,17 +1281,17 @@ test "ts: aggregation — min/max/sum" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "disk", "iops", 10.0, 1000, 1, "");
-    try ts.insert(0, "disk", "iops", 50.0, 2000, 2, "");
-    try ts.insert(0, "disk", "iops", 30.0, 3000, 3, "");
+    try ts.insert(.of(16), "disk", "iops", 10.0, 1000, 1, "");
+    try ts.insert(.of(16), "disk", "iops", 50.0, 2000, 2, "");
+    try ts.insert(.of(16), "disk", "iops", 30.0, 3000, 3, "");
 
-    const min_val = (try ts.min(0, "disk", "iops", &.{}, 1000, 3000)).?;
+    const min_val = (try ts.min(.of(16), "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 10.0), min_val, 0.001);
 
-    const max_val = (try ts.max(0, "disk", "iops", &.{}, 1000, 3000)).?;
+    const max_val = (try ts.max(.of(16), "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 50.0), max_val, 0.001);
 
-    const sum_val = (try ts.sum(0, "disk", "iops", &.{}, 1000, 3000)).?;
+    const sum_val = (try ts.sum(.of(16), "disk", "iops", &.{}, 1000, 3000)).?;
     try testing.expectApproxEqAbs(@as(f64, 90.0), sum_val, 0.001);
 }
 
@@ -1299,11 +1299,11 @@ test "ts: aggregation — count" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "net", "rx", 1.0, 1000, 1, "");
-    try ts.insert(0, "net", "rx", 2.0, 2000, 2, "");
-    try ts.insert(0, "net", "rx", 3.0, 3000, 3, "");
+    try ts.insert(.of(16), "net", "rx", 1.0, 1000, 1, "");
+    try ts.insert(.of(16), "net", "rx", 2.0, 2000, 2, "");
+    try ts.insert(.of(16), "net", "rx", 3.0, 3000, 3, "");
 
-    const c = try ts.count(0, "net", "rx", &.{}, 1500, 2500);
+    const c = try ts.count(.of(16), "net", "rx", &.{}, 1500, 2500);
     try testing.expectEqual(@as(usize, 1), c); // only ts=2000 in range
 }
 
@@ -1311,18 +1311,18 @@ test "ts: buffer flush creates block" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 3 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 1.0, 1000, 1, "");
-    try ts.insert(0, "cpu", "usage", 2.0, 2000, 2, "");
+    try ts.insert(.of(16), "cpu", "usage", 1.0, 1000, 1, "");
+    try ts.insert(.of(16), "cpu", "usage", 2.0, 2000, 2, "");
     try testing.expectEqual(@as(u64, 0), ts.stats.blocks_flushed);
 
     // Third insert triggers flush
-    try ts.insert(0, "cpu", "usage", 3.0, 3000, 3, "");
+    try ts.insert(.of(16), "cpu", "usage", 3.0, 3000, 3, "");
     try testing.expectEqual(@as(u64, 1), ts.stats.blocks_flushed);
     try testing.expectEqual(@as(usize, 1), ts.totalBlocks());
 
     // Buffer should be cleared after flush
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange(0, "cpu", "usage", null, 1000, 3000, &buf);
+    const result = try ts.queryRange(.of(16), "cpu", "usage", null, 1000, 3000, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
     try testing.expectEqual(@as(usize, 1), result.blocks_matched);
 }
@@ -1331,9 +1331,9 @@ test "ts: multiple series" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(0, "cpu", "usage", 80.0, 1000, 1, "");
-    try ts.insert(0, "cpu", "idle", 20.0, 1000, 2, "");
-    try ts.insert(0, "mem", "used", 4096.0, 1000, 3, "");
+    try ts.insert(.of(16), "cpu", "usage", 80.0, 1000, 1, "");
+    try ts.insert(.of(16), "cpu", "idle", 20.0, 1000, 2, "");
+    try ts.insert(.of(16), "mem", "used", 4096.0, 1000, 3, "");
 
     try testing.expectEqual(@as(usize, 3), ts.seriesCount());
 }
@@ -1343,7 +1343,7 @@ test "ts: query nonexistent series" {
     defer ts.deinit();
 
     var buf: [10]StoredPoint = undefined;
-    const result = try ts.queryRange(0, "nonexistent", "field", null, 0, 9999, &buf);
+    const result = try ts.queryRange(.of(16), "nonexistent", "field", null, 0, 9999, &buf);
     try testing.expectEqual(@as(usize, 0), result.points_in_buffer);
     try testing.expectEqual(@as(usize, 0), result.blocks_matched);
 }
@@ -1354,7 +1354,7 @@ test "ts: a write's answer carries the longest measurement name an entry can hol
     const name = @as([@import("../storage/persistence.zig").MAX_ENTRY_KEY]u8, @splat('m'));
     const val_bytes: [8]u8 = @bitCast(@as(u64, @bitCast(@as(f64, 1.5))));
     var payload_buf: [name.len + 128]u8 = undefined;
-    const e = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, 0, &name, &val_bytes, &payload_buf).?;
+    const e = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, .of(16), &name, &val_bytes, &payload_buf).?;
     var out = Result.start(&e);
     try ts.applyEntry(&e, &out);
     try testing.expect(!out.overflowed);
@@ -1371,7 +1371,7 @@ test "ts: apply entry for ts_write" {
     const val: f64 = 82.5;
     const val_bytes: [8]u8 = @bitCast(@as(u64, @bitCast(val)));
     var payload_buf: [128]u8 = undefined;
-    const ual_entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, 0, "cpu", &val_bytes, &payload_buf) orelse unreachable;
+    const ual_entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 1000, .of(16), "cpu", &val_bytes, &payload_buf) orelse unreachable;
     try applyTest(&ts, &ual_entry);
 
     try testing.expectEqual(@as(u64, 1), ts.stats.points_inserted);
@@ -1387,26 +1387,26 @@ test "ts: tags are a series dimension, not collapsed into one buffer" {
     const web2 = canonicalTagHash("host=web-02");
     try testing.expect(web1 != web2);
 
-    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01");
-    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, "host=web-02");
-    try ts.insert(1, "cpu", "value", 30.0, 3000, 3, "host=web-01");
+    try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01");
+    try ts.insert(.of(17), "cpu", "value", 20.0, 2000, 2, "host=web-02");
+    try ts.insert(.of(17), "cpu", "value", 30.0, 3000, 3, "host=web-01");
 
     // Same measurement+field, two tag sets → two distinct series.
     try testing.expectEqual(@as(usize, 2), ts.seriesCount());
 
     // An exact tag query sees only that tag's points.
     var buf: [16]StoredPoint = undefined;
-    const r1 = try ts.queryRange(1, "cpu", "value", web1, 0, std.math.maxInt(u64), &buf);
+    const r1 = try ts.queryRange(.of(17), "cpu", "value", web1, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 2), r1.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 10.0), buf[0].field_value, 0.001);
     try testing.expectApproxEqAbs(@as(f64, 30.0), buf[1].field_value, 0.001);
 
-    const r2 = try ts.queryRange(1, "cpu", "value", web2, 0, std.math.maxInt(u64), &buf);
+    const r2 = try ts.queryRange(.of(17), "cpu", "value", web2, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 1), r2.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 20.0), buf[0].field_value, 0.001);
 
     // A tag set that was never written matches nothing.
-    const r3 = try ts.queryRange(1, "cpu", "value", canonicalTagHash("host=nope"), 0, std.math.maxInt(u64), &buf);
+    const r3 = try ts.queryRange(.of(17), "cpu", "value", canonicalTagHash("host=nope"), 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 0), r3.points_in_buffer);
 }
 
@@ -1414,13 +1414,13 @@ test "ts: untagged query still sees tagged writes (no silent regression)" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
 
-    try ts.insert(1, "cpu", "value", 10.0, 3000, 1, "host=a");
-    try ts.insert(1, "cpu", "value", 20.0, 1000, 2, "host=b");
-    try ts.insert(1, "cpu", "value", 30.0, 2000, 3, "");
+    try ts.insert(.of(17), "cpu", "value", 10.0, 3000, 1, "host=a");
+    try ts.insert(.of(17), "cpu", "value", 20.0, 1000, 2, "host=b");
+    try ts.insert(.of(17), "cpu", "value", 30.0, 2000, 3, "");
 
     // `null` = any tags: every tag-series is merged...
     var buf: [16]StoredPoint = undefined;
-    const r = try ts.queryRange(1, "cpu", "value", null, 0, std.math.maxInt(u64), &buf);
+    const r = try ts.queryRange(.of(17), "cpu", "value", null, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 3), r.points_in_buffer);
 
     // ...and the merged result is time-ordered, which window/rate rely on.
@@ -1429,9 +1429,9 @@ test "ts: untagged query still sees tagged writes (no silent regression)" {
     try testing.expectEqual(@as(u64, 3000), buf[2].timestamp_ns);
 
     // Aggregations follow the same rule: (10+20+30)/3 across all tag-series.
-    const a = try ts.avg(1, "cpu", "value", &.{}, 0, std.math.maxInt(u64));
+    const a = try ts.avg(.of(17), "cpu", "value", &.{}, 0, std.math.maxInt(u64));
     try testing.expectApproxEqAbs(@as(f64, 20.0), a.?, 0.001);
-    const a_b = try ts.avg(1, "cpu", "value", &[_]TagPredicate{.{ .key = "host", .op = .eq, .value = "b" }}, 0, std.math.maxInt(u64));
+    const a_b = try ts.avg(.of(17), "cpu", "value", &[_]TagPredicate{.{ .key = "host", .op = .eq, .value = "b" }}, 0, std.math.maxInt(u64));
     try testing.expectApproxEqAbs(@as(f64, 20.0), a_b.?, 0.001);
 }
 
@@ -1450,8 +1450,8 @@ test "ts: tag hash is canonical — order does not fragment a series" {
 
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
-    try ts.insert(1, "cpu", "value", 1.0, 1000, 1, "host=a,env=b");
-    try ts.insert(1, "cpu", "value", 2.0, 2000, 2, "env=b,host=a");
+    try ts.insert(.of(17), "cpu", "value", 1.0, 1000, 1, "host=a,env=b");
+    try ts.insert(.of(17), "cpu", "value", 2.0, 2000, 2, "env=b,host=a");
     try testing.expectEqual(@as(usize, 1), ts.seriesCount());
 }
 
@@ -1471,7 +1471,7 @@ test "ts: series key parsing isolates field from the trailing tag hash" {
     try testing.expectEqual(@as(u64, 0x1122334455667788), keyTagHash(key));
 
     // A longer field must not prefix-match a shorter one.
-    const prefix = try seriesKeyPrefix(testing.allocator, 0xAABBCCDD, "cpu", "user");
+    const prefix = try seriesKeyPrefix(testing.allocator, .of(0xAABBCCDD), "cpu", "user");
     defer testing.allocator.free(prefix);
     const other = try seriesKeyToString(testing.allocator, .{
         .ns_id = .of(0xAABBCCDD),
@@ -1515,16 +1515,16 @@ test "ts: partial tag filter matches a superset tag set" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
 
-    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
-    try ts.insert(1, "cpu", "value", 20.0, 2000, 2, "host=web-02,env=prod");
-    try ts.insert(1, "cpu", "value", 30.0, 3000, 3, "host=web-01,env=staging");
+    try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
+    try ts.insert(.of(17), "cpu", "value", 20.0, 2000, 2, "host=web-02,env=prod");
+    try ts.insert(.of(17), "cpu", "value", 30.0, 3000, 3, "host=web-01,env=staging");
 
     var buf: [16]StoredPoint = undefined;
 
     // The whole point of 2b: a filter naming ONE tag selects every series whose
     // tag set contains it. Under the 2a tag-hash lookup this matched nothing.
     const host1 = [_]TagPredicate{.{ .key = "host", .op = .eq, .value = "web-01" }};
-    const r1 = try ts.queryRangeFiltered(1, "cpu", "value", &host1, 0, std.math.maxInt(u64), &buf);
+    const r1 = try ts.queryRangeFiltered(.of(17), "cpu", "value", &host1, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 2), r1.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 10.0), buf[0].field_value, 0.001);
     try testing.expectApproxEqAbs(@as(f64, 30.0), buf[1].field_value, 0.001);
@@ -1534,12 +1534,12 @@ test "ts: partial tag filter matches a superset tag set" {
         .{ .key = "host", .op = .eq, .value = "web-01" },
         .{ .key = "env", .op = .eq, .value = "prod" },
     };
-    const r2 = try ts.queryRangeFiltered(1, "cpu", "value", &both, 0, std.math.maxInt(u64), &buf);
+    const r2 = try ts.queryRangeFiltered(.of(17), "cpu", "value", &both, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 1), r2.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 10.0), buf[0].field_value, 0.001);
 
     // No predicates = every tag-series.
-    const r3 = try ts.queryRangeFiltered(1, "cpu", "value", &.{}, 0, std.math.maxInt(u64), &buf);
+    const r3 = try ts.queryRangeFiltered(.of(17), "cpu", "value", &.{}, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 3), r3.points_in_buffer);
 }
 
@@ -1547,26 +1547,26 @@ test "ts: negated and glob tag predicates" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1024 });
     defer ts.deinit();
 
-    try ts.insert(1, "m", "value", 1.0, 1000, 1, "region=us-east");
-    try ts.insert(1, "m", "value", 2.0, 2000, 2, "region=us-west");
-    try ts.insert(1, "m", "value", 3.0, 3000, 3, "region=eu-west");
-    try ts.insert(1, "m", "value", 4.0, 4000, 4, "");
+    try ts.insert(.of(17), "m", "value", 1.0, 1000, 1, "region=us-east");
+    try ts.insert(.of(17), "m", "value", 2.0, 2000, 2, "region=us-west");
+    try ts.insert(.of(17), "m", "value", 3.0, 3000, 3, "region=eu-west");
+    try ts.insert(.of(17), "m", "value", 4.0, 4000, 4, "");
 
     var buf: [16]StoredPoint = undefined;
 
     // `!=` — and an absent tag satisfies a negation, so the untagged point matches.
     const neq = [_]TagPredicate{.{ .key = "region", .op = .neq, .value = "us-east" }};
-    const r1 = try ts.queryRangeFiltered(1, "m", "value", &neq, 0, std.math.maxInt(u64), &buf);
+    const r1 = try ts.queryRangeFiltered(.of(17), "m", "value", &neq, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 3), r1.points_in_buffer);
 
     // Glob `us-*`.
     const glob = [_]TagPredicate{.{ .key = "region", .op = .glob, .value = "us-*" }};
-    const r2 = try ts.queryRangeFiltered(1, "m", "value", &glob, 0, std.math.maxInt(u64), &buf);
+    const r2 = try ts.queryRangeFiltered(.of(17), "m", "value", &glob, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 2), r2.points_in_buffer);
 
     // Negated glob `*-west` excludes us-west and eu-west, keeps us-east + untagged.
     const nglob = [_]TagPredicate{.{ .key = "region", .op = .nglob, .value = "*-west" }};
-    const r3 = try ts.queryRangeFiltered(1, "m", "value", &nglob, 0, std.math.maxInt(u64), &buf);
+    const r3 = try ts.queryRangeFiltered(.of(17), "m", "value", &nglob, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 2), r3.points_in_buffer);
 }
 
@@ -1588,19 +1588,19 @@ test "ts: tag dictionary resolves a series' tags, and a tag filter matches by th
     defer ts.deinit();
 
     // Written unsorted — the dictionary stores the canonical (sorted) spelling.
-    try ts.insert(1, "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
+    try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
     const h = canonicalTagHash("env=prod,host=web-01");
     try testing.expectEqualStrings("env=prod,host=web-01", ts.tagsForHash(h));
     try testing.expectEqualStrings("", ts.tagsForHash(0));
 
     var names: [8][]const u8 = undefined;
-    const n = try ts.seriesTagsFor(1, "cpu", "value", &names);
+    const n = try ts.seriesTagsFor(.of(17), "cpu", "value", &names);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("env=prod,host=web-01", names[0]);
 
     var buf: [8]StoredPoint = undefined;
     const preds = [_]TagPredicate{.{ .key = "host", .op = .eq, .value = "web-01" }};
-    const r = try ts.queryRangeFiltered(1, "cpu", "value", &preds, 0, std.math.maxInt(u64), &buf);
+    const r = try ts.queryRangeFiltered(.of(17), "cpu", "value", &preds, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
 }
 
@@ -1620,14 +1620,14 @@ test "ts: replay reconstructs the tagged series exactly" {
     }).?;
 
     var payload_buf: [512]u8 = undefined;
-    const entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 123, 1, "cpu", encoded, &payload_buf).?;
+    const entry = entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 123, .of(17), "cpu", encoded, &payload_buf).?;
     try applyTest(&ts, &entry);
 
     // Field, timestamp and tags all survive — and the point is addressable by a
     // partial tag filter, which requires the dictionary to be repopulated.
     var buf: [8]StoredPoint = undefined;
     const preds = [_]TagPredicate{.{ .key = "env", .op = .eq, .value = "prod" }};
-    const r = try ts.queryRangeFiltered(1, "cpu", "user", &preds, 0, std.math.maxInt(u64), &buf);
+    const r = try ts.queryRangeFiltered(.of(17), "cpu", "user", &preds, 0, std.math.maxInt(u64), &buf);
     try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
     try testing.expectApproxEqAbs(@as(f64, 55.0), buf[0].field_value, 0.001);
     try testing.expectEqual(@as(u64, 7_000_000_000), buf[0].timestamp_ns);
@@ -1637,18 +1637,18 @@ test "ts: retention evicts only its own measurement in its own namespace" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
     defer ts.deinit();
 
-    try ts.insert(1, "a", "value", 1.0, 1000, 1, "");
-    try ts.insert(1, "a", "value", 2.0, 5000, 2, "");
-    try ts.insert(1, "b", "value", 3.0, 1000, 3, "");
-    try ts.insert(2, "a", "value", 4.0, 1000, 4, "");
+    try ts.insert(.of(17), "a", "value", 1.0, 1000, 1, "");
+    try ts.insert(.of(17), "a", "value", 2.0, 5000, 2, "");
+    try ts.insert(.of(17), "b", "value", 3.0, 1000, 3, "");
+    try ts.insert(.of(18), "a", "value", 4.0, 1000, 4, "");
 
-    try testing.expectEqual(@as(usize, 1), ts.applyRetention(1, "a", 2000));
+    try testing.expectEqual(@as(usize, 1), ts.applyRetention(.of(17), "a", 2000));
 
     var buf: [10]StoredPoint = undefined;
-    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "a", "value", null, 0, 10000, &buf)).points_in_buffer);
+    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(.of(17), "a", "value", null, 0, 10000, &buf)).points_in_buffer);
     try testing.expectEqual(@as(f64, 2.0), buf[0].field_value);
-    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).points_in_buffer);
-    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(2, "a", "value", null, 0, 10000, &buf)).points_in_buffer);
+    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).points_in_buffer);
+    try testing.expectEqual(@as(usize, 1), (try ts.queryRange(.of(18), "a", "value", null, 0, 10000, &buf)).points_in_buffer);
 }
 
 test "ts: a retention entry cuts at its stamp less its duration, not at the host's clock" {
@@ -1659,20 +1659,20 @@ test "ts: a retention entry cuts at its stamp less its duration, not at the host
     for ([_]u64{ 1_000 * s_ns, host_ns + std.time.ns_per_day }) |stamp| {
         var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
         defer ts.deinit();
-        for ([_]u64{ 10, 5, 1 }, 1..) |age_s, i| try ts.insert(1, "m", "value", 1.0, stamp - age_s * s_ns, i, "");
+        for ([_]u64{ 10, 5, 1 }, 1..) |age_s, i| try ts.insert(.of(17), "m", "value", 1.0, stamp - age_s * s_ns, i, "");
 
         var age: [8]u8 = undefined;
         var pbuf: [64]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old points.
         std.mem.writeInt(u64, &age, 3_000, .little);
-        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 10, stamp, 1, "m", &age, &pbuf).?);
+        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 10, stamp, .of(17), "m", &age, &pbuf).?);
         var buf: [10]StoredPoint = undefined;
-        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
+        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(.of(17), "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
 
         // A duration past the stamp trims nothing, never everything.
         std.mem.writeInt(u64, &age, stamp / std.time.ns_per_ms + 1, .little);
-        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 11, stamp, 1, "m", &age, &pbuf).?);
-        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(1, "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
+        try applyTest(&ts, &entry_mod.buildCommandEntry(.ts_retention, 0, 1, 11, stamp, .of(17), "m", &age, &pbuf).?);
+        try testing.expectEqual(@as(usize, 1), (try ts.queryRange(.of(17), "m", "value", null, 0, std.math.maxInt(u64), &buf)).points_in_buffer);
     }
 }
 
@@ -1681,18 +1681,18 @@ test "ts: retention spares other measurements' flushed blocks" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 1 });
     defer ts.deinit();
 
-    try ts.insert(1, "a", "value", 1.0, 1000, 1, "");
-    try ts.insert(1, "a", "value", 2.0, 1500, 2, "");
-    try ts.insert(1, "b", "value", 3.0, 1000, 3, "");
-    try ts.insert(1, "b", "value", 4.0, 1500, 4, "");
+    try ts.insert(.of(17), "a", "value", 1.0, 1000, 1, "");
+    try ts.insert(.of(17), "a", "value", 2.0, 1500, 2, "");
+    try ts.insert(.of(17), "b", "value", 3.0, 1000, 3, "");
+    try ts.insert(.of(17), "b", "value", 4.0, 1500, 4, "");
     try testing.expect(ts.blocks.count() > 0);
 
     var buf: [10]StoredPoint = undefined;
     // Flushed points are counted as matching blocks, not buffered points.
-    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).blocks_matched);
-    _ = ts.applyRetention(1, "a", 2000);
-    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(1, "b", "value", null, 0, 10000, &buf)).blocks_matched);
-    try testing.expectEqual(@as(usize, 0), (try ts.queryRange(1, "a", "value", null, 0, 10000, &buf)).blocks_matched);
+    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).blocks_matched);
+    _ = ts.applyRetention(.of(17), "a", 2000);
+    try testing.expectEqual(@as(usize, 2), (try ts.queryRange(.of(17), "b", "value", null, 0, 10000, &buf)).blocks_matched);
+    try testing.expectEqual(@as(usize, 0), (try ts.queryRange(.of(17), "a", "value", null, 0, 10000, &buf)).blocks_matched);
 }
 
 test "ts: a tag filter is parsed strictly and canonically" {
@@ -1723,25 +1723,25 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
     for ([_]usize{ 100, 1 }) |capacity| {
         var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = capacity });
         defer ts.deinit();
-        try ts.insert(1, "temp", "value", 1.0, 1000, 1, "sensor=A1,site=x");
-        try ts.insert(1, "temp", "value", 2.0, 1000, 2, "sensor=B2,site=x");
-        try ts.insert(1, "temp", "value", 3.0, 1000, 3, "");
-        try ts.insert(2, "temp", "value", 4.0, 1000, 4, "sensor=A1,site=x");
+        try ts.insert(.of(17), "temp", "value", 1.0, 1000, 1, "sensor=A1,site=x");
+        try ts.insert(.of(17), "temp", "value", 2.0, 1000, 2, "sensor=B2,site=x");
+        try ts.insert(.of(17), "temp", "value", 3.0, 1000, 3, "");
+        try ts.insert(.of(18), "temp", "value", 4.0, 1000, 4, "sensor=A1,site=x");
 
         var canon: [MAX_TAG_STRING]u8 = undefined;
         var preds: [MAX_TAGS]TagPredicate = undefined;
         const a1 = parseTagFilter("sensor=A1", &canon, &preds).ok.preds;
-        try testing.expect(ts.hasSeries(1, "temp", a1));
-        _ = ts.deleteSeries(1, "temp", a1);
-        try testing.expect(!ts.hasSeries(1, "temp", a1));
+        try testing.expect(ts.hasSeries(.of(17), "temp", a1));
+        _ = ts.deleteSeries(.of(17), "temp", a1);
+        try testing.expect(!ts.hasSeries(.of(17), "temp", a1));
         // The other series, the untagged one, and the same series in
         // another namespace remain.
         var canon2: [MAX_TAG_STRING]u8 = undefined;
         var preds2: [MAX_TAGS]TagPredicate = undefined;
-        try testing.expect(ts.hasSeries(1, "temp", parseTagFilter("sensor=B2", &canon2, &preds2).ok.preds));
-        try testing.expect(ts.hasSeries(2, "temp", a1));
+        try testing.expect(ts.hasSeries(.of(17), "temp", parseTagFilter("sensor=B2", &canon2, &preds2).ok.preds));
+        try testing.expect(ts.hasSeries(.of(18), "temp", a1));
         var buf: [10]StoredPoint = undefined;
-        const untagged = try ts.queryRange(1, "temp", "value", 0, 0, 10000, &buf);
+        const untagged = try ts.queryRange(.of(17), "temp", "value", 0, 0, 10000, &buf);
         try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
     }
 }
@@ -1749,19 +1749,19 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
 test "ts: a list page's counts come from one pass, each name's its own" {
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
     defer ts.deinit();
-    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(0, "cpu", "usage", 1, t, t, "host=a");
-    try ts.insert(0, "cpu", "usage", 1, 500, 4, "host=b");
-    try ts.insert(0, "cpu", "idle", 1, 4000, 5, "host=a");
-    try ts.insert(0, "mem", "used", 1, 9000, 6, "");
-    try ts.insert(7, "cpu", "usage", 1, 9000, 7, "");
+    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(.of(16), "cpu", "usage", 1, t, t, "host=a");
+    try ts.insert(.of(16), "cpu", "usage", 1, 500, 4, "host=b");
+    try ts.insert(.of(16), "cpu", "idle", 1, 4000, 5, "host=a");
+    try ts.insert(.of(16), "mem", "used", 1, 9000, 6, "");
+    try ts.insert(.of(23), "cpu", "usage", 1, 9000, 7, "");
 
     const names = [_][]const u8{ "mem", "cpu", "disk" };
     var out: [names.len]TSProjection.ListCounts = undefined;
-    try ts.listCounts(0, &names, testing.allocator, &out);
+    try ts.listCounts(.of(16), &names, testing.allocator, &out);
     try testing.expectEqual(TSProjection.ListCounts{ .series = 1, .fields = 1, .points = 1 }, out[0]);
     // Its series agree with the summary's, flushed block and all.
     var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
-    const sum = ts.summarize(0, "cpu", &fields);
+    const sum = ts.summarize(.of(16), "cpu", &fields);
     try testing.expectEqual(TSProjection.ListCounts{ .series = sum.series, .fields = sum.fields, .points = sum.points }, out[1]);
     try testing.expectEqual(TSProjection.ListCounts{}, out[2]);
 }
@@ -1770,22 +1770,22 @@ test "ts: a measurement's summary counts its series, fields and points, flushed 
     var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 2 });
     defer ts.deinit();
     // Three points of one series: a block of two, one buffered.
-    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(0, "cpu", "usage", 1, t, t, "host=a");
-    try ts.insert(0, "cpu", "usage", 1, 500, 4, "host=b");
-    try ts.insert(0, "cpu", "idle", 1, 4000, 5, "host=a");
+    for ([_]u64{ 1000, 2000, 3000 }) |t| try ts.insert(.of(16), "cpu", "usage", 1, t, t, "host=a");
+    try ts.insert(.of(16), "cpu", "usage", 1, 500, 4, "host=b");
+    try ts.insert(.of(16), "cpu", "idle", 1, 4000, 5, "host=a");
     // Another measurement, and the same one in another namespace.
-    try ts.insert(0, "mem", "used", 1, 9000, 6, "");
-    try ts.insert(7, "cpu", "usage", 1, 9000, 7, "");
+    try ts.insert(.of(16), "mem", "used", 1, 9000, 6, "");
+    try ts.insert(.of(23), "cpu", "usage", 1, 9000, 7, "");
 
     var fields: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
-    const s = ts.summarize(0, "cpu", &fields);
+    const s = ts.summarize(.of(16), "cpu", &fields);
     try testing.expectEqual(@as(u32, 3), s.series);
     try testing.expectEqual(@as(u32, 2), s.fields);
     try testing.expect(!s.fields_capped);
     try testing.expectEqual(@as(u64, 5), s.points);
     try testing.expectEqual(@as(u64, 500), s.oldest_ns);
     try testing.expectEqual(@as(u64, 4000), s.newest_ns);
-    const none = ts.summarize(0, "disk", &fields);
+    const none = ts.summarize(.of(16), "disk", &fields);
     try testing.expectEqual(@as(u64, 0), none.points);
     try testing.expectEqual(@as(u32, 0), none.series);
 }

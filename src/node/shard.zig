@@ -1852,7 +1852,11 @@ pub const Shard = struct {
     /// null when it can go now, or is refused by `runRequest`. A
     /// waiting request is left unread: nothing about it has run or been
     /// counted.
-    fn holdForward(self: *Shard, conn: *Connection, req: proto.Request) ?Connection.Waiting {
+    fn holdForward(self: *Shard, conn: *Connection, req_in: proto.Request) ?Connection.Waiting {
+        // Read straight off the socket: its route needs the id `runRequest`
+        // would give it.
+        var req = req_in;
+        req.ns_id = self.namespaceIdOf(req);
         // A body that doesn't decode is refused when it runs; it waits for
         // nothing first.
         if (table.isOp(req.header.op_code) and !table_run.decodes(req)) return null;
@@ -8075,7 +8079,7 @@ test "Shard: a kv.mget another shard sent refuses a key it doesn't own, and answ
     while (owned[0] == null or owned[1] == null) : (i += 1) {
         var scratch: [8]u8 = undefined;
         const k = try std.fmt.bufPrint(&scratch, "k{d}", .{i});
-        const owner = b.router.partitionToShard(b.router.hashToPartition(node_router.hashKeyWithNamespace("", k)));
+        const owner = b.router.partitionToShard(b.router.hashToPartition(node_router.routeNsKey(.default, k)));
         if (owned[owner] == null) {
             @memcpy(names[owner][0..k.len], k);
             owned[owner] = names[owner][0..k.len];
@@ -8135,7 +8139,7 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
     const shardOf = struct {
         fn of(sh: *Shard, key: []const u8) u16 {
             // Parsed requests name the default namespace "default".
-            return sh.router.partitionToShard(sh.router.hashToPartition(node_router.hashKeyWithNamespace("default", key)));
+            return sh.router.partitionToShard(sh.router.hashToPartition(node_router.routeNsKey(.default, key)));
         }
     }.of;
     const a = &two.shards[0];
@@ -8163,7 +8167,7 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
             var keys = Keys.Builder.init(&self.kbuf);
             try std.testing.expect(try keys.add(key));
             const body = try op.request.encodeInto(&self.body_buf, .{ .keys = keys.value(), .routing_key = routing_key });
-            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "default", .key = "", .value = body };
+            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "default", .ns_id = .default, .key = "", .value = body };
         }
     };
     var m: Mget = .{};
@@ -8226,7 +8230,7 @@ const MgetGatherFixture = struct {
         while (found[0] + found[1] < N) : (i += 1) {
             var scratch: [12]u8 = undefined;
             const k = try std.fmt.bufPrint(&scratch, "key{d}", .{i});
-            const owner = a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("default", k)));
+            const owner = a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(.default, k)));
             const slot = 2 * found[owner] + owner;
             if (found[owner] == N / 2) continue;
             @memcpy(self.names[slot][0..k.len], k);
@@ -8431,7 +8435,7 @@ test "Shard: a shard asked for a page of a list with a limit of 0 sends one name
     try f.init(&.{ "m", "n" }, &.{"a"}, true);
     defer f.deinit();
     var buf: [1024]u8 = undefined;
-    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), "", "", null, 0, 0, 1024, &buf);
+    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), .{ .name = "", .id = .default }, "", null, 0, 0, 1024, &buf);
     try std.testing.expectEqual(@as(u32, 1), v.entries.count);
     try std.testing.expect(v.more);
 }
@@ -8537,7 +8541,7 @@ test "Shard: a shard's page of a list stops before its entries pass the room it 
     const buf = try std.testing.allocator.alloc(u8, @import("../protocol/system_ops.zig").Entries.max_size);
     defer std.testing.allocator.free(buf);
     // Each entry is [len:u16][name]: 4 bytes, so 10 bytes of room hold two.
-    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), "default", "", null, 0, 10, 10, buf);
+    const v = try walk_mod.ownPage(&f.two.shards[0], @backingInt(proto.OpCode.ts_list), .{ .name = "default", .id = .default }, "", null, 0, 10, 10, buf);
     try std.testing.expectEqual(@as(u32, 2), v.entries.count);
     try std.testing.expect(v.more);
 }
@@ -8750,12 +8754,19 @@ test "Shard: a gather refused for room frees its state and this shard's part, an
 }
 
 /// A key that namespace `ns` puts on shard `want` of `shard`'s node.
-fn keyOn(shard: *Shard, ns: []const u8, want: u16, buf: []u8) ![]const u8 {
+fn keyOn(shard: *Shard, ns: ns_table.Id, want: u16, buf: []u8) ![]const u8 {
     var i: usize = 0;
     while (true) : (i += 1) {
         const k = try std.fmt.bufPrint(buf, "k{d}", .{i});
-        if (shard.router.partitionToShard(shard.router.hashToPartition(node_router.hashKeyWithNamespace(ns, k))) == want) return k;
+        if (shard.router.partitionToShard(shard.router.hashToPartition(node_router.routeNsKey(ns, k))) == want) return k;
     }
+}
+
+/// The id shard 0 gives the next namespace it creates: a write to a new
+/// namespace is routed by it once the create is published.
+fn nextNamespaceId(shard0: *const Shard) ns_table.Id {
+    const nh = shard0.namespace_handler;
+    return .of(@max(nh.next_id, nh.next_alloc));
 }
 
 /// The log index of the first `t` entry in `shard`'s log at or after `from`, or null.
@@ -8786,7 +8797,7 @@ test "Shard: a write on shard 1 to a namespace nobody created is answered once, 
     const c = try TestClient.open(b);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "fresh", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     const from = b.raft_node.log.lastIndex() + 1;
     b.runRequest(c.conn, try ParkTest.request(.kv_put, 7, "fresh", k, "v", ""), .client);
     two.settle();
@@ -8823,14 +8834,14 @@ test "Shard: a write another shard forwards here, to a namespace nobody created,
     var out: [512]u8 = undefined;
     var kbuf: [16]u8 = undefined;
     // One answered as it runs, one once it commits.
-    const w = try keyOn(b, "wfresh", 1, &kbuf);
+    const w = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     a.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.worker_register, 11), .namespace = "wfresh", .key = w, .value = "" }, .client);
     two.settle();
     var resp = try nextAnswer(c, a, &out);
     try std.testing.expectEqual(@as(u64, 11), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     var k2buf: [16]u8 = undefined;
-    const k = try keyOn(b, "kfresh", 1, &k2buf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &k2buf);
     const from = b.raft_node.log.lastIndex() + 1;
     a.runRequest(c.conn, try ParkTest.request(.kv_put, 12, "kfresh", k, "v", ""), .client);
     two.settle();
@@ -8858,7 +8869,7 @@ test "Shard: shard 0 refusing to create the namespace refuses the write, and not
     const c = try TestClient.open(b);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "one-more", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     const from = b.raft_node.log.lastIndex() + 1;
     b.runRequest(c.conn, try ParkTest.request(.kv_put, 8, "one-more", k, "v", ""), .client);
     two.settle();
@@ -8884,7 +8895,7 @@ test "Shard: a forwarded write whose namespace shard 0 refuses is refused once t
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "one-more", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     const from = b.raft_node.log.lastIndex() + 1;
     a.runRequest(c.conn, try ParkTest.request(.kv_put, 8, "one-more", k, "v", ""), .client);
     two.settle();
@@ -8913,7 +8924,7 @@ test "Shard: a forwarded write to a new namespace that waits for its commit is a
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "later", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     a.runRequest(c.conn, try ParkTest.request(.kv_put, 21, "later", k, "v", ""), .client);
     two.settle();
     var out: [512]u8 = undefined;
@@ -8944,8 +8955,8 @@ test "Shard: forwarded requests run while another waits for its namespace are ea
     defer _ = std.c.close(c2.pair[1]);
     var k1buf: [16]u8 = undefined;
     var k2buf: [16]u8 = undefined;
-    const k1 = try keyOn(b, "inter", 1, &k1buf);
-    const k2 = try keyOn(b, "default", 1, &k2buf);
+    const k1 = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &k1buf);
+    const k2 = try keyOn(b, .default, 1, &k2buf);
     // The first waits on shard 0; the second runs on shard 1 meanwhile.
     a.runRequest(c1.conn, try ParkTest.request(.kv_put, 31, "inter", k1, "v", ""), .client);
     a.runRequest(c2.conn, try ParkTest.request(.kv_put, 32, "default", k2, "v", ""), .client);
@@ -8971,7 +8982,7 @@ test "Shard: a forwarded write whose ensure shard 0 doesn't answer in time is re
     const c = try TestClient.open(a);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "slow", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     a.runRequest(c.conn, try ParkTest.request(.kv_put, 41, "slow", k, "v", ""), .client);
     // Shard 1 runs it and asks shard 0, which hasn't read the ask yet.
     _ = b.drainInbox();
@@ -8997,7 +9008,7 @@ test "Shard: a client gone while shard 0 creates its namespace runs nothing, and
     const b = &two.shards[1];
     const c = try TestClient.open(b);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "fresh", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     const from = b.raft_node.log.lastIndex() + 1;
     b.runRequest(c.conn, try ParkTest.request(.kv_put, 9, "fresh", k, "v", ""), .client);
     b.closeConnection(c.conn.fd);
@@ -9018,10 +9029,10 @@ test "Shard: a namespace still unknown when the held write runs again is refused
     const c = try TestClient.open(b);
     defer _ = std.c.close(c.pair[1]);
     var kbuf: [16]u8 = undefined;
-    const k = try keyOn(b, "ghost", 1, &kbuf);
+    const k = try keyOn(b, nextNamespaceId(&two.shards[0]), 1, &kbuf);
     const req = try ParkTest.request(.kv_put, 10, "ghost", k, "v", "");
     const st = try std.testing.allocator.create(Shard.EnsureThenRun);
-    st.* = .{ .bytes = try Shard.serializeRequest(std.testing.allocator, req) };
+    st.* = .{ .bytes = try Shard.serializeRequest(std.testing.allocator, req), .origin = .client };
     defer Shard.EnsureThenRun.free(st, std.testing.allocator);
     // Shard 0's answer names an id this node's table doesn't have.
     const Ensure = table_run.op("namespace.ensure").response;
@@ -9181,7 +9192,7 @@ test "Shard: a transaction id naming a shard that exists but doesn't hold it is 
     const txn = txn_mod;
 
     // Begun on shard 0; the same counter under shard 1's bits.
-    const id = try a.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), .default);
+    const id = try a.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
     const forged = txn.makeId(1, id & txn.ID_COUNTER_MASK);
     var buf: [64]u8 = undefined;
     switch (a.resolveTarget(@backingInt(proto.OpCode.kv_get), txnGet(&buf, forged))) {
@@ -9451,12 +9462,20 @@ test "Shard: an answer for another shard's client that holds no reply slot is dr
 }
 
 /// A key `a` sends to shard `target`, for requests that must go there.
+/// A request from wire bytes as `shard` takes it in: with its namespace's id
+/// resolved, which its route needs.
+fn parsedOn(shard: *const Shard, bytes: []const u8) !proto.Request {
+    var req = try proto.Request.parse(bytes);
+    req.ns_id = shard.namespaceId(req.namespace);
+    return req;
+}
+
 fn keyOwnedBy(a: *Shard, target: u16, buf: []u8) ![]const u8 {
     for (0..1000) |i| {
         const key = try std.fmt.bufPrint(buf, "k{d}", .{i});
         const bytes = try testRequest(.kv_get, 0, key, "");
         defer std.testing.allocator.free(bytes);
-        const to = a.forwardTarget(try proto.Request.parse(bytes)) orelse continue;
+        const to = a.forwardTarget(try parsedOn(a, bytes)) orelse continue;
         if (to.target == target) return key;
     }
     return error.NoKeyForShard;
@@ -9915,7 +9934,7 @@ test "Shard: a closing client's blocking read already answered is not cancelled,
         const k = try std.fmt.bufPrint(&keys[found], "k{d}", .{i});
         const probe = try testRequest(.kv_get, 0, k, "");
         defer std.testing.allocator.free(probe);
-        const to = a.forwardTarget(try proto.Request.parse(probe)) orelse continue;
+        const to = a.forwardTarget(try parsedOn(a, probe)) orelse continue;
         if (to.target != 1) continue;
         names[found] = k;
         found += 1;
@@ -10621,7 +10640,7 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
         // An id this node never published: a forged or future one.
         .{ .id = 4000, .published = 0, .status = .no_namespace, .says = "namespace not found" },
         // Another namespace's id under this request's name.
-        .{ .id = ledger, .published = 0, .status = .no_namespace, .says = "namespace not found" },
+        .{ .id = ledger.int(), .published = 0, .status = .no_namespace, .says = "namespace not found" },
         // An id this node doesn't know yet, from a forwarder whose table is ahead.
         .{ .id = 4000, .published = 1 << 40, .status = .unavailable, .says = "unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry" },
     }, 0..) |c, i| {
@@ -10640,40 +10659,12 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
     // the forwarder's table is ahead.
     for ([_]u64{ 0, 1 << 40 }, 0..) |published, i| {
         std.mem.writeInt(u32, frame[0..4], @intCast(200 + i), .little);
-        std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], orders, .little);
+        std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], orders.int(), .little);
         std.mem.writeInt(u64, frame[FORWARD_PREFIX + 4 ..][0..8], published, .little);
         const last = shard.raft_node.log.lastIndex();
         shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
         try std.testing.expectEqual(last + 1, shard.raft_node.log.lastIndex());
     }
-}
-
-test "Shard: a write proposed behind a create the log refuses is refused too, and shard 0 doesn't halt" {
-    var two: TwoShards = undefined;
-    try two.init();
-    defer two.deinit();
-    const a = &two.shards[0];
-    // A create an earlier leader committed that this one hasn't applied
-    // takes the next id first.
-    const C = @import("../protocol/namespace_entries.zig").Create;
-    var cbuf: [C.max_size]u8 = undefined;
-    _ = try a.raft_node.propose(.namespace_create, entry_mod.Flags.NONE, try C.encodeInto(&cbuf, .{ .name = "xold", .id = @import("../namespace/table.zig").FIRST_ALLOCATED }));
-    // A client's enqueue: the create, then the write.
-    try std.testing.expect(a.namespace_handler.prepareWrite(a, "ynew") == .go);
-    _ = try persistence_mod.proposeEntry(a, .queue_enqueue, entry_mod.Flags.NONE, "ynew", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
-    two.settle();
-    try std.testing.expect(a.halted == null);
-    try std.testing.expect(!a.namespace_handler.namespaces.contains("ynew"));
-    try std.testing.expectEqual(@as(usize, 0), a.queue_handler.queue.readyCount());
-    // Once created, its writes land.
-    try std.testing.expect(a.namespace_handler.prepareWrite(a, "ynew") == .go);
-    _ = try persistence_mod.proposeEntry(a, .queue_enqueue, entry_mod.Flags.NONE, "ynew", "q", &[_]u8{ 0, 0, 0, 0, 'B' });
-    two.settle();
-    try std.testing.expect(a.halted == null);
-    try std.testing.expectEqual(@as(usize, 1), a.queue_handler.queue.readyCount());
-    // The refusal is forgotten once the name is created, so the record
-    // holds only names that were never created.
-    try std.testing.expect(!a.namespace_handler.createRefused(node_router.namespaceHash("ynew")));
 }
 
 test "Shard: a shard's processing knows its shard and the partitions before the log replays" {
@@ -10699,7 +10690,10 @@ test "Shard: shard 0 creates no namespace until its leader has applied earlier t
     // A leader whose earlier terms' tail hasn't applied here.
     a.raft_node.ready_index = a.raft_node.last_applied + 1;
     const last = a.raft_node.log.lastIndex();
-    switch (a.namespace_handler.prepareWrite(a, "fresh")) {
+    // A write to a new namespace waits for its create (`namespace.ensure`),
+    // and the create is refused.
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "fresh") == .ensure);
+    switch (a.namespace_handler.proposeCreateOn(a.raft_node, "fresh")) {
         .refused => |r| {
             try std.testing.expectEqual(proto.StatusCode.unavailable, r.status);
             try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, r.message);
@@ -10710,7 +10704,7 @@ test "Shard: shard 0 creates no namespace until its leader has applied earlier t
     // A namespace it knows needs nothing proposed, and goes.
     try std.testing.expect(a.namespace_handler.prepareWrite(a, "default") == .go);
     a.raft_node.ready_index = a.raft_node.last_applied;
-    try std.testing.expect(a.namespace_handler.prepareWrite(a, "fresh") == .go);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
 }
 
 test "Shard: with every namespace id spent, a create is refused as such, not as an internal error" {
@@ -10720,10 +10714,11 @@ test "Shard: with every namespace id spent, a create is refused as such, not as 
     const a = &two.shards[0];
     // Ids spent by creates refused or lost to leader changes.
     a.namespace_handler.next_alloc = @import("../namespace/table.zig").CAPACITY;
-    switch (a.namespace_handler.prepareWrite(a, "fresh")) {
-        .refused => |r| {
+    switch (a.namespace_handler.proposeCreateOn(a.raft_node, "fresh")) {
+        .failed => |err| {
+            const r = handler_mod.NamespaceHandler.refusal(err);
             try std.testing.expectEqual(proto.StatusCode.bad_request, r.status);
-            try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.IDS_USED_UP_MESSAGE, r.message);
+            try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.IDS_USED_UP_MESSAGE, r.refusal.message);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -10737,9 +10732,10 @@ test "Shard: a publish that fails partway publishes the rest next tick, and none
     defer shard.deinit();
     try std.testing.expect(shard.applyCommitted());
     const nh = shard.namespace_handler;
-    const first = nh.next_id;
+    const first: ns_table.Id = .of(nh.next_id);
+    const second: ns_table.Id = .of(nh.next_id + 1);
     try std.testing.expectEqual(.created, nh.applyCreateAt("orders", first, 0, 1));
-    try std.testing.expectEqual(.created, nh.applyCreateAt("ledger", first + 1, 0, 2));
+    try std.testing.expectEqual(.created, nh.applyCreateAt("ledger", second, 0, 2));
 
     // The table can copy one name, not the second.
     const table_allocator = nh.table.allocator;
@@ -10748,10 +10744,10 @@ test "Shard: a publish that fails partway publishes the rest next tick, and none
     nh.settle(&shard);
     nh.table.allocator = table_allocator;
     try std.testing.expectEqualStrings("orders", nh.table.nameOf(first).?);
-    try std.testing.expect(nh.table.nameOf(first + 1) == null);
+    try std.testing.expect(nh.table.nameOf(second) == null);
 
     nh.settle(&shard);
-    try std.testing.expectEqualStrings("ledger", nh.table.nameOf(first + 1).?);
+    try std.testing.expectEqualStrings("ledger", nh.table.nameOf(second).?);
     try std.testing.expectEqual(@as(usize, 0), nh.unpublished.items.len);
 }
 
@@ -10850,7 +10846,7 @@ const FollowerTest = struct {
 test "Shard: a start that applies on a follower, or on a later leader, queues no first step; on the leader that proposed it the run it created does" {
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var pbuf: [128]u8 = undefined;
-    const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, 0, "default:r1", &start, &pbuf).?;
+    const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, "default:r1", &start, &pbuf).?;
 
     // A follower: a step proposes, and only the leader does.
     var t: FollowerTest = undefined;
@@ -10873,7 +10869,7 @@ test "Shard: a start that applies on a follower, or on a later leader, queues no
     try std.testing.expectEqual(raft_node_mod.Role.leader, shard.raft_node.role);
     // Past the entries the group's start applied.
     const next = shard.raft_node.last_applied + 1;
-    const led = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next, 0, 0, "default:r1", &start, &pbuf).?;
+    const led = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next, 0, .default, "default:r1", &start, &pbuf).?;
     out = persistence_mod.Result.start(&led);
     try std.testing.expect(shard.applyEntry(&led, &out));
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
@@ -10881,14 +10877,14 @@ test "Shard: a start that applies on a follower, or on a later leader, queues no
     // its start: its own leader may have stepped it already.
     try std.testing.expect(shard.raft_node.current_term > 0);
     var earlier_buf: [128]u8 = undefined;
-    const earlier = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term - 1, next + 1, 0, 0, "default:r0", &start, &earlier_buf).?;
+    const earlier = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term - 1, next + 1, 0, .default, "default:r0", &start, &earlier_buf).?;
     out = persistence_mod.Result.start(&earlier);
     try std.testing.expect(shard.applyEntry(&earlier, &out));
     try std.testing.expect(shard.workflow_handler.runs.contains("default:r0"));
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
     // A second start of the run is refused, and queues nothing more.
     var again_buf: [128]u8 = undefined;
-    const again = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next + 2, 0, 0, "default:r1", &start, &again_buf).?;
+    const again = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next + 2, 0, .default, "default:r1", &start, &again_buf).?;
     out = persistence_mod.Result.start(&again);
     try std.testing.expect(shard.applyEntry(&again, &out));
     try std.testing.expect(out.refused() != null);
@@ -11724,7 +11720,7 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
         }
     }.run;
 
-    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), .default);
+    const id = try shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
     const set = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
     const in_txn = try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
@@ -11941,7 +11937,7 @@ test "Shard: a transaction's condition is answered at commit, not at the op, and
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
 
-    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), .default);
+    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
     try c.set(c.t.conn, 2, "other", "x", .always, null, id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     // Would fail now, and buffers all the same.
@@ -11965,7 +11961,7 @@ test "Shard: a delete or expire in a transaction keeps its cas_version: a wrong 
         try ParkTest.ack(&c.t.shard);
         _ = try c.answer();
 
-        const id = try c.t.shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), .default);
+        const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
         const body: table_run.op(name).request.Value = if (op == .kv_delete)
             .{ .cas_version = 9, .routing_key = "rk", .txn = id }
         else
@@ -12024,7 +12020,7 @@ test "Shard: a KV commit answered with a failure instead of its batch drops its 
         const table_ = &shard.kv_handler.txn_table;
         const commit = table_run.op("kv.txn.commit");
         var txn_buf: [16]u8 = undefined;
-        const id2 = try table_.begin(node_router.hashKeyWithNamespace("", "rk"), .default);
+        const id2 = try table_.begin(node_router.routeNsKey(.default, "rk"), .default);
         try table_.appendOp(id2, .put, "k", "v", 0, .always, null);
         shard.runRequest(conn, .{ .header = proto.RequestHeader.init(.kv_commit_txn, 2), .namespace = "", .key = "", .value = try commit.request.encodeInto(&txn_buf, .{ .txn = id2 }) }, .client);
         try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
@@ -12982,7 +12978,7 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
     shard.registerBackgroundTasks();
 
     const table_ = &shard.kv_handler.txn_table;
-    const id = try table_.begin(node_router.hashKeyWithNamespace("", "k"), .default);
+    const id = try table_.begin(node_router.routeNsKey(.default, "k"), .default);
     var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
     try table_.appendOp(id, .put, try handler_mod.qualifyKey(&qbuf, "", "k"), "v", 0, .always, null);
     const c = try TestClient.open(&shard);
@@ -13181,7 +13177,7 @@ fn testCommandEntry(entry_type: entry_mod.EntryType, index: u64, key: []const u8
         var payload_buf: [256]u8 = undefined;
     };
     const cmd = entry_mod.CommandPayload{
-        .namespace_hash = .default,
+        .namespace_id = .default,
         .key_length = @intCast(key.len),
         .value_length = @intCast(value.len),
         .key = key,
@@ -13571,7 +13567,7 @@ test "Shard: a leader still applying earlier terms still takes KV's writes, its 
     try c.set(c.t.conn, 1, "k", "v1", .always, null, null);
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
-    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "rk"), .default);
+    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
     try c.set(c.t.conn, 2, "in-txn", "x", .always, null, id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
 
@@ -13643,7 +13639,7 @@ test "Shard: a read inside a transaction on a leader still applying earlier term
     var body_buf: [64]u8 = undefined;
     shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "the-value") }, .client);
     try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), (try nextAnswer(c, &shard, &out)).header.status);
-    const id = try shard.kv_handler.txn_table.begin(node_router.hashKeyWithNamespace("", "k"), .default);
+    const id = try shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
     const get = txnGet(&body_buf, id);
     var exists_buf: [64]u8 = undefined;
     const exists_body = try table_run.op("kv.exists").request.encodeInto(&exists_buf, .{ .routing_key = null, .txn = id });
@@ -14232,8 +14228,8 @@ test "Shard: a namespace create is published, and answered, only once its segmen
     again.wireHandlerShardPtrs();
     _ = again.applyCommitted();
     again.namespace_handler.settle(&again);
-    try std.testing.expectEqual(@as(?u32, @import("../namespace/table.zig").FIRST_ALLOCATED), again.namespace_handler.table.lookup("orders"));
-    try std.testing.expectEqual(@import("../namespace/table.zig").FIRST_ALLOCATED + 1, again.namespace_handler.next_id);
+    try std.testing.expectEqual(@as(?ns_table.Id, ns_table.FIRST_ALLOCATED), again.namespace_handler.table.lookup("orders"));
+    try std.testing.expectEqual(ns_table.FIRST_ALLOCATED.int() + 1, again.namespace_handler.next_id);
 }
 
 test "Shard: a second create of a name being created waits for the first, and is never told it exists when it doesn't" {
@@ -14312,8 +14308,8 @@ test "Shard: a create whose id another took first is proposed again with a fresh
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(@as(?u32, first), nh.table.lookup("taken"));
-    try std.testing.expectEqual(@as(?u32, first + 1), nh.table.lookup("mine"));
+    try std.testing.expectEqual(@as(?ns_table.Id, first), nh.table.lookup("taken"));
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(first.int() + 1)), nh.table.lookup("mine"));
 }
 
 test "Shard: a create whose id another took first is not proposed again by a leader that isn't ready; its client is told to retry" {
@@ -14348,7 +14344,7 @@ test "Shard: a create whose id another took first is not proposed again by a lea
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
-    try std.testing.expectEqual(@as(?u32, null), nh.table.lookup("mine"));
+    try std.testing.expectEqual(@as(?ns_table.Id, null), nh.table.lookup("mine"));
 }
 
 test "Shard: with async durability, an entry the writer could not buffer is a hole, and buffering goes on" {
@@ -14947,11 +14943,11 @@ const TwoShardActions = struct {
         const there = &t.two.shards[1];
         t.name = for (0..256) |i| {
             const n = try std.fmt.bufPrint(&t.name_buf, "act-{d}", .{i});
-            if (there.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+            if (there.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
         } else return error.NoName;
         t.worker = for (0..256) |i| {
             const w = try std.fmt.bufPrint(&t.worker_buf, "w-{d}", .{i});
-            if (here.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+            if (here.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
         } else return error.NoWorker;
         t.ca = try TestClient.open(here);
         t.cb = try TestClient.open(there);
@@ -15030,7 +15026,7 @@ test "actions: a retry with its request key gets the task another shard gave it 
     var local_buf: [16]u8 = undefined;
     const local = for (0..256) |i| {
         const n = try std.fmt.bufPrint(&local_buf, "loc-{d}", .{i});
-        if (here.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+        if (here.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
     } else return error.NoName;
     _ = try applyActionEntry(here, .action_register, testRegister(local), 1, 1);
     _ = try proposeAction(here, .action_invoke, testInvoke(local, "loc-run"));
@@ -15168,7 +15164,7 @@ test "actions: a task taken by an await whose client, on another shard, closed b
     var wbuf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&wbuf, "fw-{d}", .{i});
-        if (there.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+        if (there.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
     } else return error.NoWorker;
     try t.invoke(1, "\x00job");
     var b: [256]u8 = undefined;
@@ -15212,7 +15208,7 @@ test "actions: a task taken for an await another shard forwarded, whose client w
     var wbuf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&wbuf, "fw-{d}", .{i});
-        if (there.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+        if (there.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
     } else return error.NoWorker;
     var b: [256]u8 = undefined;
     const frame = try testRequest(.action_await, 2, worker, try ActionsHandler.for_tests.awaitBody(&b, &.{t.name}, 30_000, "k1"));
@@ -15770,12 +15766,12 @@ test "Shard: a worker's await runs where the worker is registered, so a labelled
     var name_buf: [16]u8 = undefined;
     const name = for (0..256) |i| {
         const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
-        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+        if (owner.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
     } else return error.NoLocalName;
     var worker_buf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
-        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+        if (other.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
     } else return error.NoLocalWorker;
 
     const ca = try TestClient.open(owner);
@@ -15861,12 +15857,12 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
     var name_buf: [16]u8 = undefined;
     const name = for (0..256) |i| {
         const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
-        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+        if (owner.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
     } else return error.NoLocalName;
     var worker_buf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
-        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+        if (other.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
     } else return error.NoLocalWorker;
 
     const ca = try TestClient.open(owner);
@@ -15961,7 +15957,7 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     var name_buf: [16]u8 = undefined;
     const name = for (0..256) |i| {
         const n = try std.fmt.bufPrint(&name_buf, "act-{d}", .{i});
-        if (owner.router.route(node_router.hashKeyWithNamespace("default", n)) == .local) break n;
+        if (owner.router.route(node_router.routeNsKey(.default, n)) == .local) break n;
     } else return error.NoLocalName;
 
     const ca = try TestClient.open(owner);
@@ -15998,7 +15994,7 @@ test "Shard: a failed attempt sent back to pending wakes an await parked on anot
     var worker_buf: [16]u8 = undefined;
     const worker = for (0..256) |i| {
         const w = try std.fmt.bufPrint(&worker_buf, "w-{d}", .{i});
-        if (other.router.route(node_router.hashKeyWithNamespace("default", w)) == .local) break w;
+        if (other.router.route(node_router.routeNsKey(.default, w)) == .local) break w;
     } else return error.NoLocalWorker;
     const aw = try testRequest(.action_await, 3, worker, wait_value);
     defer std.testing.allocator.free(aw);
@@ -17437,7 +17433,7 @@ test "Shard: a skip stamped out of order replays as it applied live, and the sta
         skip.header.crc32c = skip.computeCrc();
         _ = try r.log.append(&skip);
         // After the skip's stamp, but not after the last applied entry's.
-        const cmd = entry_mod.CommandPayload{ .namespace_hash = .default, .key_length = 1, .value_length = 5, .key = "q", .value = &[_]u8{ 0, 0, 0, 0, 'Z' } };
+        const cmd = entry_mod.CommandPayload{ .namespace_id = .default, .key_length = 1, .value_length = 5, .key = "q", .value = &[_]u8{ 0, 0, 0, 0, 'Z' } };
         var cmd_buf: [64]u8 = undefined;
         var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, r.current_term, skip.header.index + 1, last - 500, cmd_buf[0..cmd.serialize(&cmd_buf).?]);
         e.header.crc32c = e.computeCrc();
@@ -18304,7 +18300,7 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     var id_buf: [run_id_mod.MAX_ID_LEN]u8 = undefined;
     const run_id = for (0..256) |_| {
         const id = gen.next(.action, partition, &id_buf);
-        if (a.router.partitionToShard(a.router.hashToPartition(node_router.hashKeyWithNamespace("", id))) == 0) break id;
+        if (a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(.default, id))) == 0) break id;
     } else return error.TestUnexpectedResult;
     _ = try applyActionEntry(&two.shards[1], .action_register, testRegister("echo"), 1, 1);
     _ = try applyActionEntry(&two.shards[1], .action_invoke, testInvoke("echo", run_id), 2, 1000 * std.time.ns_per_ms);

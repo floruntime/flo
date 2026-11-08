@@ -914,6 +914,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     return .{
         .header = proto.RequestHeader.init(op, 1),
         .namespace = "default",
+        .ns_id = .default,
         .key = key,
         .value = value,
         .options = options,
@@ -1213,6 +1214,7 @@ test "ts handler: pre-route by measurement" {
     // Same measurement, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.ts_write, "cpu", "", "");
     req_ns.namespace = "other";
+    req_ns.ns_id = .of(16);
     try testing.expect(TSHandler.preRouteByMeasurement(req1) != TSHandler.preRouteByMeasurement(req_ns));
 }
 

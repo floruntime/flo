@@ -2275,6 +2275,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     return .{
         .header = proto.RequestHeader.init(op, 1),
         .namespace = "default",
+        .ns_id = .default,
         .key = key,
         .value = value,
         .options = options,
@@ -3557,6 +3558,7 @@ test "stream handler: pre-route by stream" {
     // Same stream, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.stream_append, "stream-a", "", "");
     req_ns.namespace = "other";
+    req_ns.ns_id = .of(16);
     try testing.expect(StreamHandler.preRouteByStream(req1) != StreamHandler.preRouteByStream(req_ns));
 }
 
@@ -3575,6 +3577,7 @@ test "stream handler: a group name must come in the wire format, and is always i
     try std.testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("g"), "")) != .err);
     var other = makeRequest(.stream_group_create, "s1", groupWire("g"), "");
     other.namespace = "other";
+    other.ns_id = .of(16);
     try std.testing.expect(handler.handleCommand(other) != .err);
 }
 
@@ -3590,11 +3593,13 @@ test "stream handler: a stream or group name too long to qualify, or holding a N
     for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
         var req = makeRequest(op, long, groupWire("g"), "");
         req.namespace = "b";
+        req.ns_id = .of(16);
         try testing.expect(handler.handleCommand(req) == .err);
     }
     // The stream fits qualified ("b\x00" + 4090), but not with its group.
     var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
     near.namespace = "b";
+    near.ns_id = .of(16);
     try testing.expect(handler.handleCommand(near) == .err);
     // A NUL in either name could spell another namespace's key.
     try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b\x00orders", groupWire("g"), "")) == .err);

@@ -1051,13 +1051,13 @@ test "namespace handler: a create takes the next dense id, and one below it is r
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
     var buf: [namespace_entries.Create.max_size]u8 = undefined;
-    const first = ns_table.FIRST_ALLOCATED;
+    const first = ns_table.FIRST_ALLOCATED.int();
     const e = try testEntry(.namespace_create, 7, 1234 * std.time.ns_per_s, .{ .name = "stamped", .id = first }, &buf);
     var out = Result.start(&e);
     try handler.replayEntry(&e, &out);
     try testing.expect(out.refused() == null);
     const meta = handler.namespaces.get("stamped").?;
-    try testing.expectEqual(first, meta.id);
+    try testing.expectEqual(ns_table.Id.of(first), meta.id);
     try testing.expectEqual(@as(u64, 1234 * std.time.ns_per_s), meta.created_at_ns);
     try testing.expectEqual(@as(u64, 7), meta.created_index);
     try testing.expectEqual(first + 1, handler.next_id);
@@ -1075,7 +1075,7 @@ test "namespace handler: a create takes the next dense id, and one below it is r
     try testing.expectEqual(proto.StatusCode.unavailable, st.refused().?.status);
     try testing.expect(!handler.namespaces.contains("late"));
     // A reserved id is never allocated.
-    const reserved = try testEntry(.namespace_create, 9, 0, .{ .name = "sneaky", .id = ns_table.SYSTEM }, &buf);
+    const reserved = try testEntry(.namespace_create, 9, 0, .{ .name = "sneaky", .id = ns_table.SYSTEM.int() }, &buf);
     var rs = Result.start(&reserved);
     try handler.replayEntry(&reserved, &rs);
     try testing.expect(rs.refused() != null);
@@ -1091,12 +1091,12 @@ test "namespace handler: a bind registers a name once on a shard other than 0, a
     var handler = try NamespaceHandler.initFor(testing.allocator, 3, null);
     defer handler.deinit();
     var buf: [namespace_entries.Bind.max_size]u8 = undefined;
-    const id = ns_table.FIRST_ALLOCATED + 4;
+    const id = ns_table.FIRST_ALLOCATED.int() + 4;
     const bind = try testEntry(.namespace_bind, 3, 0, .{ .id = id, .name = "orders" }, &buf);
     var out = Result.start(&bind);
     try handler.replayEntry(&bind, &out);
-    try testing.expectEqualStrings("orders", handler.nameForHash(router.namespaceHash("orders")).?);
-    try testing.expectEqual(id, handler.namespaces.get("orders").?.id);
+    try testing.expectEqualStrings("orders", handler.nameOf(.of(id)).?);
+    try testing.expectEqual(ns_table.Id.of(id), handler.namespaces.get("orders").?.id);
     // The same bind again changes nothing.
     var again = Result.start(&bind);
     try handler.replayEntry(&bind, &again);
@@ -1107,9 +1107,9 @@ test "namespace handler: a bind registers a name once on a shard other than 0, a
     const other_id = try testEntry(.namespace_bind, 4, 0, .{ .id = id + 1, .name = "orders" }, &buf2);
     var w = Result.start(&other_id);
     try testing.expectError(error.Halt, handler.replayEntry(&other_id, &w));
-    try testing.expectEqual(id, handler.namespaces.get("orders").?.id);
+    try testing.expectEqual(ns_table.Id.of(id), handler.namespaces.get("orders").?.id);
     // A reserved id is never bound.
-    const reserved = try testEntry(.namespace_bind, 5, 0, .{ .id = ns_table.SYSTEM, .name = "x" }, &buf2);
+    const reserved = try testEntry(.namespace_bind, 5, 0, .{ .id = ns_table.SYSTEM.int(), .name = "x" }, &buf2);
     var r = Result.start(&reserved);
     try testing.expectError(error.Halt, handler.replayEntry(&reserved, &r));
     // Shard 0 knows its namespaces from their creates; a bind there halts.
@@ -1119,30 +1119,21 @@ test "namespace handler: a bind registers a name once on a shard other than 0, a
     try testing.expectError(error.Halt, owner.replayEntry(&bind, &o));
 }
 
-test "namespace handler: a bind whose name's hash another name holds halts" {
+test "namespace handler: a bind of a second name to an id the shard holds halts" {
     var handler = try NamespaceHandler.initFor(testing.allocator, 1, null);
     defer handler.deinit();
-    // Two valid names with one 32-bit hash: entries carry the hash, so the
-    // second would share the first's data.
-    var seen = std.AutoHashMap(u32, u32).init(testing.allocator);
-    defer seen.deinit();
-    var a: [16]u8 = undefined;
-    var b: [16]u8 = undefined;
-    const pair = for (0..1_000_000) |i| {
-        const name = try std.fmt.bufPrint(&a, "c{d}", .{i});
-        const got = try seen.getOrPut(router.namespaceHash(name));
-        if (got.found_existing) break .{ name, try std.fmt.bufPrint(&b, "c{d}", .{got.value_ptr.*}) };
-        got.value_ptr.* = @intCast(i);
-    } else return error.NoCollisionFound;
+    // Entries carry the id, so the second name would share the first's data.
+    const id = ns_table.FIRST_ALLOCATED.int();
     var buf: [namespace_entries.Bind.max_size]u8 = undefined;
-    const first = try testEntry(.namespace_bind, 1, 0, .{ .id = ns_table.FIRST_ALLOCATED, .name = pair[1] }, &buf);
+    const first = try testEntry(.namespace_bind, 1, 0, .{ .id = id, .name = "orders" }, &buf);
     var out = Result.start(&first);
     try handler.replayEntry(&first, &out);
     var buf2: [namespace_entries.Bind.max_size]u8 = undefined;
-    const second = try testEntry(.namespace_bind, 2, 0, .{ .id = ns_table.FIRST_ALLOCATED + 1, .name = pair[0] }, &buf2);
+    const second = try testEntry(.namespace_bind, 2, 0, .{ .id = id, .name = "ledger" }, &buf2);
     var out2 = Result.start(&second);
     try testing.expectError(error.Halt, handler.replayEntry(&second, &out2));
-    try testing.expectEqualStrings(pair[1], handler.nameForHash(router.namespaceHash(pair[0])).?);
+    try testing.expectEqualStrings("orders", handler.nameOf(.of(id)).?);
+    try testing.expect(!handler.namespaces.contains("ledger"));
 }
 
 test "namespace handler: a write to an unknown namespace registers it" {
@@ -1210,42 +1201,14 @@ test "namespace handler: the applier refuses a bad name and a full registry, wha
     try testing.expectEqual(NamespaceHandler.CreateOutcome.existed, handler.applyCreate("default"));
 }
 
-test "namespace handler: default's id, and id 0, are never another name's" {
+test "namespace handler: default has its own id from the start, and id 0 names nothing" {
     var handler = try NamespaceHandler.init(testing.allocator);
     defer handler.deinit();
     // Held before anything is created or replayed.
-    try testing.expectEqualStrings("default", handler.nameForHash(.default).?);
-    try testing.expect(handler.idTaken("squatter", .default));
-    try testing.expect(!handler.idTaken("default", .default));
-    try testing.expect(handler.idTaken("squatter", 0));
-}
-
-test "namespace handler: a create in flight holds its id against another name" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-    handler.notePending("pending-one");
-    try testing.expect(handler.idTaken("other", router.namespaceHash("pending-one")));
-    try testing.expect(!handler.idTaken("pending-one", router.namespaceHash("pending-one")));
-}
-
-test "namespace handler: a name whose id another namespace holds is refused, by the applier and at admission" {
-    var handler = try NamespaceHandler.init(testing.allocator);
-    defer handler.deinit();
-    // Find two valid names with one 32-bit id.
-    var seen = std.AutoHashMap(u32, u32).init(testing.allocator);
-    defer seen.deinit();
-    var a: [16]u8 = undefined;
-    var b: [16]u8 = undefined;
-    const pair = for (0..1_000_000) |i| {
-        const name = try std.fmt.bufPrint(&a, "c{d}", .{i});
-        const got = try seen.getOrPut(router.namespaceHash(name));
-        if (got.found_existing) break .{ name, try std.fmt.bufPrint(&b, "c{d}", .{got.value_ptr.*}) };
-        got.value_ptr.* = @intCast(i);
-    } else return error.NoCollisionFound;
-    try testing.expectEqual(NamespaceHandler.CreateOutcome.created, handler.applyCreate(pair[1]));
-    try testing.expect(!handler.admits(pair[0]));
-    try testing.expectEqual(NamespaceHandler.CreateOutcome.collision, handler.applyCreate(pair[0]));
-    try testing.expectEqualStrings(pair[1], handler.nameForHash(router.namespaceHash(pair[0])).?);
+    try testing.expectEqualStrings("default", handler.nameOf(.default).?);
+    try testing.expectEqual(@as(?ns_table.Id, .default), handler.idOf("default"));
+    try testing.expectEqual(@as(?ns_table.Id, .default), handler.idOf(""));
+    try testing.expect(handler.nameOf(.invalid) == null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1347,19 +1310,21 @@ test "namespace handler: applyCreate is idempotent" {
     try testing.expectEqual(@as(usize, 2), handler.namespaces.count());
 }
 
-test "namespace: a committed entry's hash resolves to the name" {
+test "namespace: a committed entry's id resolves to the name" {
     var handler = try NamespaceHandler.init(std.testing.allocator);
     defer handler.deinit();
 
-    const hash = router.namespaceHash("prod");
-    try std.testing.expect(handler.nameForHash(hash) == null);
+    const id = ns_table.FIRST_ALLOCATED;
+    try std.testing.expect(handler.nameOf(id) == null);
 
     _ = handler.applyCreate("prod");
-    try std.testing.expectEqualStrings("prod", handler.nameForHash(hash).?);
+    try std.testing.expectEqual(@as(?ns_table.Id, id), handler.idOf("prod"));
+    try std.testing.expectEqualStrings("prod", handler.nameOf(id).?);
     // Re-applying (a replay) neither duplicates nor loses the mapping.
     _ = handler.applyCreate("prod");
-    try std.testing.expectEqualStrings("prod", handler.nameForHash(hash).?);
-    try std.testing.expect(handler.nameForHash(router.namespaceHash("never")) == null);
+    try std.testing.expectEqualStrings("prod", handler.nameOf(id).?);
+    try std.testing.expect(handler.nameOf(.of(id.int() + 1)) == null);
+    try std.testing.expect(handler.idOf("never") == null);
 }
 
 test "namespace handler: a key holding a NUL is never qualified" {

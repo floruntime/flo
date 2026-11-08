@@ -4373,6 +4373,11 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.wake_workers = false;
     shard.replies_held = 0;
     shard.forward_count = 0;
+    // A write's entry carries its namespace's id, from the node's table.
+    const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
+    const namespaces = try std.testing.allocator.create(NamespaceHandler);
+    namespaces.* = try NamespaceHandler.init(std.testing.allocator);
+    shard.namespace_handler = namespaces;
     return shard;
 }
 
@@ -4387,6 +4392,8 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.free(shard.entry_buf);
     shard.scratch.deinit(std.testing.allocator);
     std.testing.allocator.free(shard.pending);
+    shard.namespace_handler.deinit();
+    std.testing.allocator.destroy(shard.namespace_handler);
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
@@ -5196,6 +5203,8 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try handler.replayStart("a:r1", value[0..off], 1, &out);
     try testing.expectEqual(@as(?u32, 2), handler.active_runs.get("a:wf"));
 
+    // A start's entry carries its namespace's id: "a" is created first.
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
     handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 });
     const runsOf = struct {
         fn count(h: *WorkflowHandler, shard_: *Shard) usize {
@@ -5733,10 +5742,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
         var out: Result = .{};
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?, &out);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, "default:r1", &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, handler.runs.get("default:r1").?.created_at_ms);
         // completed, no output, no steps, no history, no tags
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);

@@ -26,18 +26,18 @@ pub const Id = enum(u32) {
     _,
 
     pub fn of(n: u32) Id {
-        return @enumFromInt(n);
+        return @fromBackingInt(@intCast(n));
     }
 
     pub fn int(id: Id) u32 {
-        return @intFromEnum(id);
+        return @backingInt(id);
     }
 
     /// The id as it leads a key: fixed width, big-endian, so one
     /// namespace's keys sort together.
     pub fn bytes(id: Id) [4]u8 {
         var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, @intFromEnum(id), .big);
+        std.mem.writeInt(u32, &b, @backingInt(id), .big);
         return b;
     }
 };

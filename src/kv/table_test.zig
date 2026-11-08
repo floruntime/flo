@@ -340,10 +340,10 @@ test "kv table: routing_key routes the request in place of its key" {
             const header = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 1);
             var given = plainBody(op);
             given.routing_key = "user:1";
-            const req: proto.Request = .{ .header = header, .namespace = "ns", .key = "balance", .value = try op.request.encodeInto(&buf, given) };
-            try testing.expectEqual(router.hashKeyWithNamespace("ns", "user:1"), route(req).?);
-            const plain: proto.Request = .{ .header = header, .namespace = "ns", .key = "balance", .value = try op.request.encodeInto(&buf, plainBody(op)) };
-            try testing.expectEqual(router.hashKeyWithNamespace("ns", "balance"), route(plain).?);
+            const req: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "balance", .value = try op.request.encodeInto(&buf, given) };
+            try testing.expectEqual(router.routeNsKey(.of(16), "user:1"), route(req).?);
+            const plain: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "balance", .value = try op.request.encodeInto(&buf, plainBody(op)) };
+            try testing.expectEqual(router.routeNsKey(.of(16), "balance"), route(plain).?);
         }
     }
     try testing.expectEqual(@as(usize, 10), routed);
@@ -357,10 +357,10 @@ test "kv table: kv.mget routes on its routing key, and stays where it lands with
     try testing.expect(try keys.add("balance"));
     var buf: [64]u8 = undefined;
     const header = proto.RequestHeader.init(.kv_mget, 1);
-    const routed: proto.Request = .{ .header = header, .namespace = "ns", .key = "", .value = try op.request.encodeInto(&buf, .{ .keys = keys.value(), .routing_key = "user:1" }) };
-    try testing.expectEqual(router.hashKeyWithNamespace("ns", "user:1"), route(routed).?);
+    const routed: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "", .value = try op.request.encodeInto(&buf, .{ .keys = keys.value(), .routing_key = "user:1" }) };
+    try testing.expectEqual(router.routeNsKey(.of(16), "user:1"), route(routed).?);
     var buf2: [64]u8 = undefined;
-    const plain: proto.Request = .{ .header = header, .namespace = "ns", .key = "", .value = try op.request.encodeInto(&buf2, .{ .keys = keys.value(), .routing_key = null }) };
+    const plain: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "", .value = try op.request.encodeInto(&buf2, .{ .keys = keys.value(), .routing_key = null }) };
     try testing.expectEqual(@as(?u64, null), route(plain));
 }
 
@@ -384,7 +384,7 @@ test "kv table: a set in a transaction is buffered, read back inside it, and uns
     try h.init();
     defer h.deinit();
     const txn_table = &h.shard.kv_handler.txn_table;
-    const id = try txn_table.begin(router.hashKeyWithNamespace("", "user:1"), .default);
+    const id = try txn_table.begin(router.routeNsKey(.default, "user:1"), .default);
 
     try expectSet(try h.set("bal", setBody("5", .{ .routing_key = "user:1", .txn = id })), null);
     try expectValue((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id }))).?, 0, "5");
@@ -400,7 +400,7 @@ test "kv table: a forged or stale transaction id is refused as no such transacti
     try h.init();
     defer h.deinit();
     const txn_table = &h.shard.kv_handler.txn_table;
-    const open = try txn_table.begin(router.hashKeyWithNamespace("", "k"), .default);
+    const open = try txn_table.begin(router.routeNsKey(.default, "k"), .default);
     // Another shard's bits on a live counter, a counter never handed out,
     // and one dropped.
     const forged = [_]u64{ txn_mod.makeId(5, open & txn_mod.ID_COUNTER_MASK), txn_mod.makeId(0, 999), open };
@@ -495,7 +495,7 @@ test "kv ops: delete, incr, expire and exists in a transaction are buffered, and
     defer h.deinit();
     for ([_][]const u8{ "gone", "ttl" }) |k| try expectSet(try h.set(k, setBody("v", .{ .routing_key = "rk" })), 1);
     const begun = try h.ok("kv.txn.begin", "rk", .{});
-    try testing.expectEqual(router.hashKeyWithNamespace("", "rk"), begun.pinned);
+    try testing.expectEqual(router.routeNsKey(.default, "rk"), begun.pinned);
     const txn = begun.txn;
 
     try testing.expectEqual(@as(?bool, null), (try h.ok("kv.delete", "gone", .{ .cas_version = null, .routing_key = "rk", .txn = txn })).existed);

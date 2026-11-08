@@ -1216,8 +1216,8 @@ fn nsCreate(n: *Namespaces, index: u64, name: []const u8, id: u32) !Namespaces.E
     return n.apply(&e);
 }
 
-test "families: a namespace create refused for its id folds into the checksum, and resets" {
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+test "families: a namespace create refused for its id leaves the checksum as it was, and resets" {
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED.int();
     var a = Namespaces.init(testing.allocator);
     defer a.deinit();
     var b = Namespaces.init(testing.allocator);
@@ -1227,11 +1227,10 @@ test "families: a namespace create refused for its id folds into the checksum, a
     try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&b, 1, "orders", first));
     try testing.expectEqual(a.checksum(), b.checksum());
     const created = a.checksum();
-    // "ledger" asks for the id "orders" took: refused on both alike, and
-    // the refusal is part of the state.
+    // "ledger" asks for the id "orders" took: refused on both alike. No
+    // write waits behind a create, so the refusal leaves nothing to keep.
     try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&a, 2, "ledger", first));
-    try testing.expect(a.checksum() != created);
-    try testing.expect(a.checksum() != b.checksum());
+    try testing.expectEqual(created, a.checksum());
     try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&b, 2, "ledger", first));
     try testing.expectEqual(a.checksum(), b.checksum());
     a.reset();
@@ -1239,7 +1238,7 @@ test "families: a namespace create refused for its id folds into the checksum, a
 }
 
 test "families: a namespace create past the next free id is told apart from one at it" {
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED.int();
     var n = Namespaces.init(testing.allocator);
     defer n.deinit();
     try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&n, 1, "orders", first));

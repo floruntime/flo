@@ -1038,11 +1038,11 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
         try @import("../contract/machine.zig").applyEntry(&@import("machine.zig").machine, &store, &scratch, &e, &out);
     }
 
-    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, "default", "b\x00", null, 10).items.len);
-    const all = KVHandler.localScanKeys(&kv, "default", "", null, 10).items;
+    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, .{ .name = "default" }, "b\x00", null, 10).items.len);
+    const all = KVHandler.localScanKeys(&kv, .{ .name = "default" }, "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), all.len);
     try testing.expectEqualStrings("mine", all[0]);
-    const b_keys = KVHandler.localScanKeys(&kv, "b", "", null, 10).items;
+    const b_keys = KVHandler.localScanKeys(&kv, .{ .name = "b" }, "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), b_keys.len);
     try testing.expectEqualStrings("k", b_keys[0]);
 }

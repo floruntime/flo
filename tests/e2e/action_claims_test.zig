@@ -285,7 +285,7 @@ test "e2e/action/claims: on 4 shards, a worker whose shard isn't its action's is
     const router = src.node.router.Router.init(0, 4, 0);
     const shardOf = struct {
         fn f(r: src.node.router.Router, key: []const u8) u16 {
-            return switch (r.route(src.node.router.hashKeyWithNamespace("default", key))) {
+            return switch (r.route(src.node.router.routeNsKey(.default, key))) {
                 .local => 0,
                 .shard => |s| s.shard_id,
             };

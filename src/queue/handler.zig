@@ -1012,6 +1012,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     return .{
         .header = proto.RequestHeader.init(op, 1),
         .namespace = "default",
+        .ns_id = .default,
         .key = key,
         .value = value,
         .options = options,
@@ -1310,6 +1311,7 @@ test "queue handler: pre-route by queue" {
     // Same queue, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.queue_enqueue, "queue-a", "", "");
     req_ns.namespace = "other";
+    req_ns.ns_id = .of(16);
     try testing.expect(QueueHandler.preRouteByQueue(req1) != QueueHandler.preRouteByQueue(req_ns));
 }
 
