@@ -55,7 +55,7 @@ test "e2e/action: register with all options" {
     try ctx.exec(&.{
         "action",  "register",  "handler",
         "--owner", "myteam",    "--timeout",
-        "60000",   "--retries", "5",
+        "60000",   "--max-attempts", "5",
     });
 }
 
@@ -526,7 +526,7 @@ test "e2e/action/worker: worker fails task with retry" {
     // 1. Register action with retries
     try ctx.exec(&.{
         "action",    "register", action_name,
-        "--retries", "3",
+        "--max-attempts", "3",
     });
 
     // 2. Register worker
@@ -558,7 +558,7 @@ test "e2e/action/worker: worker fails task with retry" {
     var fail_result = try ctx.cli.run(&.{
         "worker",            "fail",    taskIdOf(await_result.stdout) orelse return error.TestFailed,
         "--worker-id",       worker_id, "--error",
-        "Temporary failure", "--retry",
+        "Temporary failure",
     });
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
@@ -612,8 +612,7 @@ test "e2e/action/worker: worker fails task permanently" {
     var fail_result = try ctx.cli.run(&.{
         "worker",                           "fail",    taskIdOf(await_result.stdout) orelse return error.TestFailed,
         "--worker-id",                      worker_id, "--error",
-        "Permanent failure: invalid input",
-        // Note: no --retry flag
+        "Permanent failure: invalid input", "--no-retry",
     });
     defer fail_result.deinit();
     try stdx.testing.assertSucceeded(fail_result);
@@ -1364,7 +1363,7 @@ test "e2e/action: a task held past its action's timeout goes back to pending, th
     defer ctx.deinit();
 
     // The shortest lease an action may have.
-    try ctx.exec(&.{ "action", "register", "slow-task", "--timeout", "5000", "--retries", "2" });
+    try ctx.exec(&.{ "action", "register", "slow-task", "--timeout", "5000", "--max-attempts", "2" });
     try ctx.exec(&.{ "worker", "register", "slow-worker", "slow-task" });
     const run_id = extractRunId(try ctx.execCapture(&.{ "action", "invoke", "slow-task", "{}" })) orelse return error.TestFailed;
 

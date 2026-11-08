@@ -49,6 +49,8 @@ const Run = machine.Run.Value;
 
 /// An action's lease when its register names none.
 pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
+/// Attempts in all, the first counted, for a register that names none (0).
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// The most actions one shard holds.
 const MAX_ACTIONS: usize = 10_000;
@@ -378,9 +380,11 @@ pub const ActionsHandler = struct {
         shard.sendOkResponse(conn, request_id, "");
     }
 
-    /// `[action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]`,
+    /// `[action_type:u8][timeout_ms:u32][max_attempts:u32][owner_len:u16][owner]`,
     /// every field defaulted. The timeout is the action's lease: 0 is the
     /// default, and one below the floor or past the ceiling is refused.
+    /// Attempts count the first; 0 is the default too, so a client that
+    /// names an owner needn't name them.
     fn handleRegister(shard: *Shard, req: Request) CommandResult {
         const name = req.key;
         if (name.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
@@ -390,10 +394,10 @@ pub const ActionsHandler = struct {
             return .{ .err = .{ .code = .internal_error, .message = "action limit reached" } };
         const v = req.value;
         var timeout_ms: u64 = 0;
-        var max_retries: u32 = 3;
+        var max_attempts: u32 = 0;
         var owner: []const u8 = "";
         if (v.len >= 5) timeout_ms = std.mem.readInt(u32, v[1..5], .little);
-        if (v.len >= 9) max_retries = std.mem.readInt(u32, v[5..9], .little);
+        if (v.len >= 9) max_attempts = std.mem.readInt(u32, v[5..9], .little);
         if (v.len >= 11) {
             const owner_len: usize = std.mem.readInt(u16, v[9..11], .little);
             if (v.len >= 11 + owner_len) owner = v[11 .. 11 + owner_len];
@@ -402,7 +406,7 @@ pub const ActionsHandler = struct {
         const lease_ms = if (timeout_ms == 0) DEFAULT_LEASE_MS else timeout_ms;
         if (lease_ms < ae.MIN_LEASE_MS or lease_ms > ae.MAX_LEASE_MS)
             return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's timeout is its lease: at least {d} ms and at most {d} ms, or 0 for {d} ms", .{ ae.MIN_LEASE_MS, ae.MAX_LEASE_MS, DEFAULT_LEASE_MS }) } };
-        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns, .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = std.math.clamp(max_retries, 1, 1000) }) catch |err|
+        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns, .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else std.math.clamp(max_attempts, 1, 1000) }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
