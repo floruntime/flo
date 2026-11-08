@@ -857,6 +857,8 @@ pub const StreamHandler = struct {
         } };
     }
 
+    pub const NOT_EMPTY_MESSAGE = "stream is not empty; pass --force to delete";
+
     // ── DELETE ──────────────────────────────────────────────────────────
 
     /// Delete a stream entirely (records + metadata + name registry + metrics)
@@ -871,17 +873,17 @@ pub const StreamHandler = struct {
         const ns_hash = router.namespaceHash(req.namespace);
         const name_hash = router.nameHash(ns_hash, req.key);
 
-        // Safety guard: don't drop a non-empty stream without --force.
+        // Whether the stream is empty is decided as the entry applies: here, an
+        // append committed and not yet applied would read as nothing.
         const force = req.findOption(.force) != null;
-        if (!force and self.stream.streamRecordCount(name_hash) > 0) {
-            return .{ .err = .{ .code = .conflict, .message = "stream is not empty; pass --force to delete" } };
-        }
-
         if (self.shard_ptr) |sptr| {
-            const proposed = self.proposeDelete(shardFromPtr(sptr), req.namespace, req.key) catch |err| {
+            const proposed = self.proposeDelete(shardFromPtr(sptr), req.namespace, req.key, force) catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "delete not persisted") };
             };
             return .{ .parked = proposed };
+        }
+        if (!force and self.stream.streamRecordCount(name_hash) > 0) {
+            return .{ .err = .{ .code = .conflict, .message = NOT_EMPTY_MESSAGE } };
         }
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qualified = ns_keys.qualifyKey(&q_buf, req.namespace, req.key) catch return NAME_TOO_LONG;
@@ -1946,7 +1948,14 @@ pub const StreamHandler = struct {
             // Applied from the committed log everywhere, like stream_trim.
             .stream_delete => {
                 if (cmd.key.len == 0) return error.Halt;
-                _ = self.stream.deleteStream(router.nameHash(cmd.namespace_hash, cmd.key), cmd.key, cmd.value);
+                const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                // In log order, so an append committed before the delete counts
+                // on every replica, whatever its proposer had applied.
+                if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(name_hash) > 0) {
+                    out.refuse(.conflict, .unclassified, NOT_EMPTY_MESSAGE);
+                    return;
+                }
+                _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
             },
             // Consumer-group durability: cg_commit carries a group's
             // ack-floor cursor + sweeper config; cg_delete removes the group. The
@@ -1984,11 +1993,11 @@ pub const StreamHandler = struct {
     /// A delete entry: key = raw stream name, value = namespace-qualified
     /// name, so followers and replay clear the name registry without the
     /// namespace string (they only carry `namespace_hash`).
-    fn proposeDelete(self: *StreamHandler, shard: *Shard, namespace: []const u8, raw_name: []const u8) !persistence_mod.ProposeResult {
+    fn proposeDelete(self: *StreamHandler, shard: *Shard, namespace: []const u8, raw_name: []const u8, force: bool) !persistence_mod.ProposeResult {
         _ = self;
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const qualified = try ns_keys.qualifyKey(&q_buf, namespace, raw_name);
-        return persistence_mod.proposeEntry(shard, .stream_delete, entry_mod.Flags.NONE, namespace, raw_name, qualified);
+        return persistence_mod.proposeEntry(shard, .stream_delete, if (force) entry_mod.Flags.FORCE else entry_mod.Flags.NONE, namespace, raw_name, qualified);
     }
 
     /// Retention's trims: proposed; the trim applies when it commits.
@@ -2905,6 +2914,31 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     try testing.expect(std.meta.activeTag(again) == .ok);
 }
 
+test "stream handler: a stream_delete entry without force is refused for a stream that holds records, on replay too" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    var vb: [64]u8 = undefined;
+    _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
+    const orders_hash = router.nameHash(router.namespaceHash("default"), "orders");
+    var pbuf: [128]u8 = undefined;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
+    const out = try applyLogged(&handler, &del);
+    const refused = out.refused().?;
+    try testing.expectEqual(proto.StatusCode.conflict, refused.status);
+    try testing.expectEqual(proto.Ran.no, refused.refusal.ran);
+    try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
+
+    // An empty stream, or none, is deleted all the same.
+    var ebuf: [128]u8 = undefined;
+    const none = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 2, 1, router.namespaceHash("default"), "never", "never", &ebuf).?;
+    try testing.expect((try applyLogged(&handler, &none)).refused() == null);
+}
+
 test "stream handler: stream_delete replay/follower path wipes the stream" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
@@ -2923,7 +2957,7 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
     // A replicated/replayed stream_delete entry (key = raw name, value = qualified)
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
-    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
     _ = try applyLogged(&handler, &del);
     try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
