@@ -142,6 +142,11 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
         forced.removed[forced.removed_count] = rm;
         forced.removed_count += 1;
     }
+    // The same cluster, started again: a config from before can't be taken
+    // for one after, and no id it used is given out again.
+    forced.cluster_id = sum.config.cluster_id;
+    forced.generation = sum.config.generation + 1;
+    forced.next_id = @max(forced.next_id, sum.config.next_id);
     // Stamped after the entry before it, as a leader stamps: apply halts on
     // a stamp that isn't.
     const now_ns: u64 = @intCast(@as(i64, @import("stdx").time.milliTimestamp()) * std.time.ns_per_ms);
@@ -529,7 +534,7 @@ fn writeLog(dir: []const u8, entries: []const Entry, commit: u64) !void {
     try w.writeToFile(segs);
 }
 
-test "offline: inspect reads the log's range, term and latest config; force-members makes this node the only voter" {
+test "offline: inspect reads the log's range, term and latest config; force-members makes this node the only voter, in the same cluster at the next generation" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
@@ -539,9 +544,11 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
     try stdx.fs.makePath(dir);
 
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
+    // Ids up to 7 were used; 7 has left.
+    const before = membership.Config.founding(1, @splat(0x5c)).withJoiner(2, true).withJoiner(3, true).withJoiner(7, false).without(7, 5);
     var es: [3]Entry = .{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, ""),
-        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&membership.Config.ofVoters(&.{ 1, 2, 3 }), &cfg_buf)),
+        entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&before, &cfg_buf)),
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 4, 3, 30, ""),
     };
     for (&es) |*e| e.header.crc32c = e.computeCrc();
@@ -563,6 +570,9 @@ test "offline: inspect reads the log's range, term and latest config; force-memb
     try testing.expectEqual(@as(u64, 4), after.config_index);
     try testing.expectEqual(@as(u64, 5), after.config_term);
     try testing.expectEqualSlices(u32, &.{2}, after.configMembers());
+    try testing.expectEqualSlices(u8, &before.cluster_id, &after.config.cluster_id);
+    try testing.expectEqual(before.generation + 1, after.config.generation);
+    try testing.expectEqual(@as(u32, 8), after.config.next_id);
     try testing.expect(!after.hard_state.?.lost_log);
     // Stamped after the entry before it, so applying it doesn't halt.
     try testing.expect(after.last_stamp > 30);

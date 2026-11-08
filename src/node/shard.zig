@@ -6728,7 +6728,9 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 return error.LostLogFounding;
             }
             try raft.bootstrap();
-            const founding = membership.Config.ofVoters(&.{node_id});
+            var cluster_id: [membership.CLUSTER_ID_LEN]u8 = undefined;
+            try stdx.io.instance().randomSecure(&cluster_id);
+            const founding = membership.Config.founding(node_id, cluster_id);
             switch (try raft.proposeConfig(&founding)) {
                 .proposed => {},
                 else => return error.FoundingRefused,
@@ -7334,6 +7336,22 @@ test "Shard: inbox shutdown message" {
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
     try std.testing.expect(shard.stop_requested.load(.acquire));
+}
+
+test "Shard: a founded cluster gets a random id, at generation 1, its next id past the founder" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var a = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{}, .{});
+    defer a.deinit();
+    var b = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{}, .{});
+    defer b.deinit();
+    const ca = a.raft_node.latest_config;
+    const unset: [membership.CLUSTER_ID_LEN]u8 = @splat(0);
+    try std.testing.expect(!std.mem.eql(u8, &unset, &ca.cluster_id));
+    try std.testing.expect(!std.mem.eql(u8, &ca.cluster_id, &b.raft_node.latest_config.cluster_id));
+    try std.testing.expectEqual(@as(u64, 1), ca.generation);
+    try std.testing.expectEqual(@as(u32, 8), ca.next_id);
 }
 
 test "Shard: a first member leads a group of itself from the log; a joiner waits to be named" {

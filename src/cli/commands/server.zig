@@ -788,6 +788,7 @@ fn printGroup(ctx: *commander.Context, data_dir: []const u8, shard: u16, sum: *c
     if (shard != 0) {} else if (sum.member_count > 0) {
         var voters: [membership.MAX_MEMBERS]u32 = undefined;
         ctx.print("members:     {any}, voters {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config.voterIds(&voters), sum.config_index, sum.config_term });
+        ctx.print("cluster:     {x}, generation {d}, next id {d}\n", .{ &sum.config.cluster_id, sum.config.generation, sum.config.next_id });
     } else {
         ctx.print("members:     no member list in the log\n", .{});
     }
