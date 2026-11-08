@@ -667,6 +667,16 @@ fn runStart(ctx: *commander.Context) commander.Error!void {
     // This ensures SIGPIPE is ignored before any threads start writing to sockets
     setupSignalHandlers();
 
+    // Use every descriptor the OS allows before any socket opens: a low default
+    // soft limit (256 under launchd, 1024 on a plain Linux shell) otherwise caps
+    // how many connections, files and peers the node can hold at once.
+    const fds = stdx.process.raiseOpenFileLimit();
+    if (fds.was == 0) {
+        std.log.warn("could not read the open-file limit; using it as set", .{});
+    } else if (fds.now > fds.was) {
+        std.log.info("raised the open-file soft limit from {d} to {d}", .{ fds.was, fds.now });
+    }
+
     var runtime = Runtime.init(allocator, runtime_config) catch |err| {
         return outcome.localRefusal(ctx, "cannot initialize runtime: {}", .{err});
     };

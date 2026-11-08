@@ -26,6 +26,37 @@ pub const Term = union(enum) {
     Unknown: u32,
 };
 
+/// The open-file (NOFILE) soft limit before and after `raiseOpenFileLimit`.
+/// `now == was` means it was left as it was; `was == 0` means the limit could
+/// not be read.
+pub const OpenFileLimit = struct { was: u64, now: u64 };
+
+/// Raise this process's soft open-file limit to the hard limit, so the server
+/// can open as many descriptors as the OS allows rather than a low default (256
+/// under launchd, 1024 on a plain Linux shell). Best effort: it never lowers
+/// the limit and never fails the caller — the OS refusing just leaves it as it
+/// was. macOS rejects a soft NOFILE above OPEN_MAX even when the hard limit is
+/// higher, so it is capped there. The caller logs the result.
+pub fn raiseOpenFileLimit() OpenFileLimit {
+    var lim = std.posix.getrlimit(.NOFILE) catch return .{ .was = 0, .now = 0 };
+    const was: u64 = @intCast(lim.cur);
+    var want = lim.max;
+    // OPEN_MAX on macOS: a soft NOFILE above it is rejected (EINVAL).
+    if (builtin.os.tag == .macos and @as(u64, @intCast(want)) > 10_240) want = 10_240;
+    if (want <= lim.cur) return .{ .was = was, .now = was };
+    lim.cur = want;
+    std.posix.setrlimit(.NOFILE, lim) catch return .{ .was = was, .now = was };
+    return .{ .was = was, .now = @intCast(want) };
+}
+
+test "process: raising the open-file limit never lowers it and stays within the hard limit" {
+    const before = std.posix.getrlimit(.NOFILE) catch return; // unavailable here
+    const r = raiseOpenFileLimit();
+    try std.testing.expect(r.was != 0);
+    try std.testing.expect(r.now >= r.was);
+    try std.testing.expect(r.now <= @as(u64, @intCast(before.max)));
+}
+
 /// This process's environment as it is now, `setenv` included. Caller
 /// deinits.
 pub fn currentEnv(allocator: Allocator) !std.process.Environ.Map {
