@@ -1974,7 +1974,8 @@ pub const Shard = struct {
         if (req.key.len > 0 and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(req.header.op_code)))) {
             switch (self.namespace_handler.prepareWrite(self, req.namespace)) {
                 .go => {},
-                .refused => |r| return self.sendErrorResponse(conn, req.header.request_id, r.status, r.message),
+                // Refused before anything was proposed, so a retry is safe.
+                .refused => |r| return self.sendRefusal(conn, req.header.request_id, r.status, proto.notRun(r.message)),
                 .ensure => return self.ensureThenRun(conn, req),
             }
         }
@@ -2025,7 +2026,7 @@ pub const Shard = struct {
             }
             switch (nh.prepareWrite(shard, name)) {
                 .go => {},
-                .refused => |r| return shard.sendErrorResponse(conn, request_id, r.status, r.message),
+                .refused => |r| return shard.sendRefusal(conn, request_id, r.status, proto.notRun(r.message)),
                 .ensure => unreachable, // the table has it
             }
             shard.runRequest(conn, req, .held);
@@ -13627,6 +13628,31 @@ test "Shard: a leader still applying earlier terms answers a repair, a worker an
     const refused = try c.otherAnswer();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
     try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, (try refused.refused()).message);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a write to a namespace a new leader can't create yet is refused as not run, so clients retry it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    const raft = shard.raft_node;
+    raft.ready_index = raft.log.lastIndex() + 100;
+    const last = raft.log.lastIndex();
+    var body_buf: [64]u8 = undefined;
+    // KV's writes run on such a leader, but creating their namespace can't.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "fresh", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "v") }, .client);
+    const refused = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), refused.header.status);
+    const why = try refused.refused();
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, why.message);
     try std.testing.expectEqual(last, raft.log.lastIndex());
 }
 
