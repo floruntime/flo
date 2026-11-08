@@ -800,6 +800,7 @@ fn printGroup(ctx: *commander.Context, data_dir: []const u8, shard: u16, sum: *c
     if (shard != 0) {} else if (sum.member_count > 0) {
         var voters: [membership.MAX_MEMBERS]u32 = undefined;
         ctx.print("members:     {any}, voters {any} (config at index {d}, term {d})\n", .{ sum.configMembers(), sum.config.voterIds(&voters), sum.config_index, sum.config_term });
+        ctx.print("cluster:     {x}, generation {d}, next id {d}\n", .{ &sum.config.cluster_id, sum.config.generation, sum.config.next_id });
     } else {
         ctx.print("members:     no member list in the log\n", .{});
     }
@@ -833,6 +834,11 @@ fn runForceMembers(ctx: *commander.Context) commander.Error!void {
 
     if (sum.last_index == 0) {
         return outcome.localRefusal(ctx, "this node has no log; there is nothing to recover from. Run force-members on a node that has one (see inspect)", .{});
+    }
+    // Before the secret is retired: a node with no member list has no
+    // cluster to restart.
+    if (sum.config_index == 0) {
+        return outcome.localRefusal(ctx, "this node's log names no member list, so it holds no cluster to restart; run force-members on a node whose inspect shows one", .{});
     }
     const hs = sum.hard_state orelse {
         return outcome.localRefusal(ctx, "this node has a log but no hard state, so its node id is not on disk and force-members cannot name it. Start it once with --join and --node-id set to its id from the member list above (it writes its hard state and waits guarded), stop it, then run force-members again", .{});
