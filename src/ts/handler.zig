@@ -107,7 +107,7 @@ pub const TSHandler = struct {
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
         const self = shard.ts_handler;
         var names: [TSProjection.MAX_SUMMARY_FIELDS][]const u8 = undefined;
-        const sum = self.ts.summarize(router.namespaceHash(req.namespace), req.key, &names);
+        const sum = self.ts.summarize(req.ns_id, req.key, &names);
         if (sum.series == 0) return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = "not found: no such measurement" } } };
         // Listed while they fit; the rest are counted, not named.
         var w: schema.Writer = .{ .buf = &self.info_buf };
@@ -133,7 +133,7 @@ pub const TSHandler = struct {
 
     fn preRouteByMeasurement(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     /// A FloQL query carries its measurement in the query, not the key: it
@@ -141,7 +141,7 @@ pub const TSHandler = struct {
     /// wherever it lands.
     fn preRouteByQueryMeasurement(req: Request) ?u64 {
         const measurement = floql_parser.Parser.sourceMeasurement(req.value) orelse return 0;
-        return router.hashKeyWithNamespace(req.namespace, measurement);
+        return router.routeNsKey(req.ns_id, measurement);
     }
 
     // ── Shard Walker: Local Scan ──────────────────────────────────────
@@ -154,25 +154,25 @@ pub const TSHandler = struct {
     /// (guaranteed — single-threaded shard).
     pub fn localScanMeasurements(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
         const ts: *TSProjection = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(ts.buffers.count());
-        const count = ts.scanMeasurementNames(router.namespaceHash(namespace), name_buf);
+        const count = ts.scanMeasurementNames(ns.id, name_buf);
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
     /// A page of measurements as the list answers them, each
     /// `[name_len:u16][name][series:u32][fields:u32][fields_capped:u8][points:u64]`.
     /// The counts are exact, so fields_capped is 0; ts.info's isn't.
-    fn writeListEntries(ctx: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void {
+    fn writeListEntries(ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, names: []const []const u8, allocator: Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void {
         const ts: *const TSProjection = @ptrCast(@alignCast(ctx));
         const counts = try allocator.alloc(TSProjection.ListCounts, names.len);
         defer allocator.free(counts);
-        try ts.listCounts(router.namespaceHash(namespace), names, allocator, counts);
+        try ts.listCounts(ns.id, names, allocator, counts);
         try ends.ensureTotalCapacity(allocator, names.len);
         for (names, counts) |name, c| {
             var head: [2]u8 = undefined;
@@ -308,7 +308,7 @@ pub const TSHandler = struct {
             // registration).
             const timestamp_ns = client_ts orelse serverTimestampNs();
             const ual_index = self.nextUalIndex();
-            self.ts.insert(router.namespaceHash(req.namespace), measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
+            self.ts.insert(req.ns_id, measurement, field_name, value, timestamp_ns, ual_index, tags_str) catch {
                 return .{ .err = .{ .code = .internal_error, .message = "ts write failed" } };
             };
             return writeOk(measurement, timestamp_ns, ual_index);
@@ -401,7 +401,7 @@ pub const TSHandler = struct {
         var point_buf: [4096]StoredPoint = undefined;
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const preds = requestTagPredicates(req, &pred_buf);
-        const result = self.ts.queryRangeFiltered(router.namespaceHash(req.namespace), measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
+        const result = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts read failed" } };
         };
 
@@ -453,12 +453,12 @@ pub const TSHandler = struct {
             break :blk if (w > 0) w else DEFAULT_WINDOW_MS;
         } else DEFAULT_WINDOW_MS;
 
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_id = req.ns_id;
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const preds = requestTagPredicates(req, &pred_buf);
 
         var point_buf: [4096]StoredPoint = undefined;
-        const qr = self.ts.queryRangeFiltered(ns_hash, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
+        const qr = self.ts.queryRangeFiltered(ns_id, measurement, field_name, preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts query failed" } };
         };
         const pts = point_buf[0..qr.points_in_buffer];
@@ -549,7 +549,7 @@ pub const TSHandler = struct {
         var point_buf: [4096]StoredPoint = undefined;
         var pred_buf: [32]ts_mod.TagPredicate = undefined;
         const src_preds = floqlTagPredicates(query.source.filters, &pred_buf);
-        const qr = self.ts.queryRangeFiltered(router.namespaceHash(req.namespace), measurement, field_name, src_preds, from_ns, to_ns, &point_buf) catch {
+        const qr = self.ts.queryRangeFiltered(req.ns_id, measurement, field_name, src_preds, from_ns, to_ns, &point_buf) catch {
             return .{ .err = .{ .code = .internal_error, .message = "floql: ts query failed" } };
         };
 
@@ -603,7 +603,7 @@ pub const TSHandler = struct {
     // ── LIST ────────────────────────────────────────────────────────────
 
     fn handleList(self: *TSHandler, req: Request) CommandResult {
-        const names = self.ts.listMeasurements(router.namespaceHash(req.namespace), self.allocator) catch {
+        const names = self.ts.listMeasurements(req.ns_id, self.allocator) catch {
             return .{ .err = .{ .code = .internal_error, .message = "ts list failed" } };
         };
         defer {
@@ -635,8 +635,8 @@ pub const TSHandler = struct {
             .too_many => return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("a tag filter takes at most {d} tags", .{ts_mod.MAX_TAGS}) } },
             .too_long => return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("a tag filter is at most {d} bytes", .{ts_mod.MAX_TAG_STRING}) } },
         };
-        const ns_hash = router.namespaceHash(req.namespace);
-        if (filter.preds.len > 0 and !self.ts.hasSeries(ns_hash, req.key, filter.preds)) {
+        const ns_id = req.ns_id;
+        if (filter.preds.len > 0 and !self.ts.hasSeries(ns_id, req.key, filter.preds)) {
             return self.refuse(.not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ req.key, filter.canonical }, "no series has those tags; nothing deleted");
         }
 
@@ -648,7 +648,7 @@ pub const TSHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        _ = self.ts.deleteSeries(ns_hash, req.key, filter.preds);
+        _ = self.ts.deleteSeries(ns_id, req.key, filter.preds);
         return .ok;
     }
 
@@ -689,7 +689,7 @@ pub const TSHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        _ = self.ts.applyRetention(router.namespaceHash(req.namespace), req.key, ts_mod.retentionCutoffNs(serverTimestampNs(), age_ms));
+        _ = self.ts.applyRetention(req.ns_id, req.key, ts_mod.retentionCutoffNs(serverTimestampNs(), age_ms));
         return .ok;
     }
 

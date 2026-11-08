@@ -332,8 +332,8 @@ pub const KVHandler = struct {
     /// Transaction `id`, open in the request's namespace, which the
     /// request's key routes to.
     fn openTxn(shard: *Shard, req: Request, id: u64, routing_key: ?[]const u8) Error!*txn_mod.TxnState {
-        const t = txnIn(&shard.kv_handler.*.txn_table, id, req.namespace) orelse return error.NoSuchTransaction;
-        if (t.pinned_hash != router.hashKeyWithNamespace(req.namespace, routing_key orelse req.key)) return error.WrongRoutingKey;
+        const t = txnIn(&shard.kv_handler.*.txn_table, id, req.ns_id) orelse return error.NoSuchTransaction;
+        if (t.pinned_hash != router.routeNsKey(req.ns_id, routing_key orelse req.key)) return error.WrongRoutingKey;
         return t;
     }
 
@@ -426,7 +426,7 @@ pub const KVHandler = struct {
         var want: u32 = @min(limit, NameWalker.MAX_BATCH);
         while (true) {
             _ = dispatcher_mod.takeScanShort();
-            const page = walker.walk(&contexts, req.namespace, req.key, from, want, &found, &self.cursor_buf);
+            const page = walker.walk(&contexts, .{ .name = req.namespace, .id = req.ns_id }, req.key, from, want, &found, &self.cursor_buf);
             if (dispatcher_mod.takeScanShort()) return error.ScanShort;
 
             var names = Names.Builder.init(&self.answer_buf);
@@ -481,7 +481,7 @@ pub const KVHandler = struct {
         // Keys other shards own are read on those shards: each owner gets
         // its part, and the answers are merged here once all have come.
         if (routing_key == null and !forwarded and shard.shardCount() > 1) {
-            var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .namespace = req.namespace }, MgetOwner.of) catch return error.Internal;
+            var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .namespace = req.namespace, .ns_id = req.ns_id }, MgetOwner.of) catch return error.Internal;
             defer plan.deinit(shard.allocator);
             if (plan.owners.len > 1 or (plan.owners.len == 1 and plan.owners[0] != shard.id)) {
                 try startMgetGather(shard, conn, req, &plan);
@@ -494,7 +494,7 @@ pub const KVHandler = struct {
         var it = keys.iterator();
         var index: u16 = 0;
         while (it.next() catch return error.Internal) |raw_key| : (index += 1) {
-            const found = try mgetLookup(shard, req.namespace, raw_key, routing_key != null);
+            const found = try mgetLookup(shard, req.namespace, req.ns_id, raw_key, routing_key != null);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 return .{ .answer = .{ .entries = entries.value(), .next = index } };
             }
@@ -506,7 +506,7 @@ pub const KVHandler = struct {
     /// one, or one the server keeps, is not found. Without a routing key the
     /// key must be this shard's: one another shard owns is never read here
     /// or answered missing.
-    fn mgetLookup(shard: *Shard, namespace: []const u8, raw_key: []const u8, routed: bool) Error!MgetLookup {
+    fn mgetLookup(shard: *Shard, namespace: []const u8, ns_id: router.NamespaceId, raw_key: []const u8, routed: bool) Error!MgetLookup {
         const none: MgetLookup = .{ .found = false, .value = "", .version = 0 };
         if (raw_key.len == 0 or isReservedKey(raw_key)) return none;
         var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
@@ -514,7 +514,7 @@ pub const KVHandler = struct {
         // With a routing key the request was routed to its shard, where
         // every key lives.
         if (!routed) {
-            const owner = MgetOwner.of(.{ .shard = shard, .namespace = namespace }, raw_key);
+            const owner = MgetOwner.of(.{ .shard = shard, .namespace = namespace, .ns_id = ns_id }, raw_key);
             if (owner != shard.id) {
                 log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
                 return error.NotOwner;
@@ -542,7 +542,7 @@ pub const KVHandler = struct {
         errdefer if (local) |b| shard.allocator.free(b);
         for (plan.owners, plan.keys, 0..) |owner, part_keys, i| {
             if (owner == shard.id) {
-                local = try localPart(shard, req.namespace, part_keys);
+                local = try localPart(shard, req.namespace, req.ns_id, part_keys);
                 parts[i] = .{ .owner = owner, .body = local.? };
             } else {
                 const body = mget_mod.pieceBody(scratch[used..], part_keys) catch unreachable; // sized above
@@ -560,12 +560,12 @@ pub const KVHandler = struct {
 
     /// The part of a gathered mget this shard owns, answered here as the
     /// body another owner would send.
-    fn localPart(shard: *Shard, namespace: []const u8, keys: []const []const u8) Error![]u8 {
+    fn localPart(shard: *Shard, namespace: []const u8, ns_id: router.NamespaceId, keys: []const []const u8) Error![]u8 {
         const Entries = MgetResponse.field_list[0].T;
         var entries = Entries.Builder.init(&shard.kv_handler.answer_buf);
         var next: ?u16 = null;
         for (keys, 0..) |raw_key, i| {
-            const found = try mgetLookup(shard, namespace, raw_key, false);
+            const found = try mgetLookup(shard, namespace, ns_id, raw_key, false);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 next = @intCast(i);
                 break;
@@ -579,13 +579,14 @@ pub const KVHandler = struct {
     const MgetOwner = struct {
         shard: *const Shard,
         namespace: []const u8,
+        ns_id: router.NamespaceId,
 
         fn of(self: MgetOwner, raw_key: []const u8) u16 {
             if (raw_key.len == 0 or isReservedKey(raw_key)) return self.shard.id;
             var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
             _ = qualifyKey(&qbuf, self.namespace, raw_key) catch return self.shard.id;
             const r = &self.shard.router;
-            return r.partitionToShard(r.hashToPartition(router.hashKeyWithNamespace(self.namespace, raw_key)));
+            return r.partitionToShard(r.hashToPartition(router.routeNsKey(self.ns_id, raw_key)));
         }
     };
 
@@ -757,8 +758,8 @@ pub const KVHandler = struct {
     /// the key is the routing key every op in it gives.
     fn txnBegin(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(TxnBeginResponse) {
         if (req.key.len == 0) return error.KeyEmpty;
-        const pinned = router.hashKeyWithNamespace(req.namespace, req.key);
-        const id = shard.kv_handler.*.txn_table.begin(pinned, router.namespaceHash(req.namespace)) catch |err| return switch (err) {
+        const pinned = router.routeNsKey(req.ns_id, req.key);
+        const id = shard.kv_handler.*.txn_table.begin(pinned, req.ns_id) catch |err| return switch (err) {
             error.TooManyOpenTxns => error.TooManyTransactions,
             error.OutOfMemory => error.Internal,
         };
@@ -768,7 +769,7 @@ pub const KVHandler = struct {
     /// Commit a transaction's writes as one log entry.
     fn txnCommit(shard: *Shard, _: *Connection, req: Request, txn: u64) Error!table_run.Outcome(TxnCommitResponse) {
         const self = shard.kv_handler;
-        const t = txnIn(&self.txn_table, txn, req.namespace) orelse return error.NoSuchTransaction;
+        const t = txnIn(&self.txn_table, txn, req.ns_id) orelse return error.NoSuchTransaction;
         if (t.ops.items.len == 0) {
             self.txn_table.drop(txn);
             return .{ .answer = .{ .commit_index = shard.raft_node.commit_index, .ops = 0 } };
@@ -796,7 +797,7 @@ pub const KVHandler = struct {
     /// Drop a transaction and its buffered writes.
     fn txnRollback(shard: *Shard, _: *Connection, req: Request, txn: u64) Error!table_run.Outcome(TxnRollbackResponse) {
         const table = &shard.kv_handler.*.txn_table;
-        _ = txnIn(table, txn, req.namespace) orelse return error.NoSuchTransaction;
+        _ = txnIn(table, txn, req.ns_id) orelse return error.NoSuchTransaction;
         table.drop(txn);
         return .{ .answer = .{} };
     }
@@ -829,11 +830,12 @@ pub const KVHandler = struct {
     /// moves no other key in or out of the walk.
     fn localScanKeys(
         ctx: *anyopaque,
-        namespace: []const u8,
+        walk_ns: dispatcher_mod.WalkNamespace,
         filter: []const u8,
         local_cursor: ?[]const u8,
         limit: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = walk_ns.name;
         const kv: *KvState = @ptrCast(@alignCast(ctx));
         // A key can't hold the separator, so a filter that does names nothing.
         if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
@@ -905,10 +907,10 @@ pub const KVHandler = struct {
     /// Ids are small per-shard counters, so one begun in another namespace
     /// is not found from this one. One whose commit is in the log is closed.
     /// Marks it used, so the idle reaper leaves it.
-    fn txnIn(txn_table: anytype, txn_id: u64, namespace: []const u8) ?*txn_mod.TxnState {
+    fn txnIn(txn_table: anytype, txn_id: u64, ns_id: router.NamespaceId) ?*txn_mod.TxnState {
         const t = txn_table.get(txn_id) orelse return null;
         if (t.committing) return null;
-        if (t.namespace_hash != router.namespaceHash(namespace)) return null;
+        if (t.ns_id != ns_id) return null;
         t.last_active_ms = @import("stdx").time.monotonicMs();
         return t;
     }

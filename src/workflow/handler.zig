@@ -483,18 +483,19 @@ pub const WorkflowHandler = struct {
     /// operations for a given workflow land on the same shard.
     fn preRouteByWorkflow(req: proto.Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     /// ShardWalker LocalScanFn for workflow_list_definitions — returns
     /// workflow definition names from one shard's WorkflowHandler registry.
     fn localScanWorkflowDefs(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8, // filter
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
         handler.mu.lock();
         defer handler.mu.unlock();
@@ -810,7 +811,7 @@ pub const WorkflowHandler = struct {
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
-            const partition_id = shard.router.keyToPartitionNs(req.namespace, workflow_name);
+            const partition_id = shard.router.keyToPartitionNs(req.ns_id, workflow_name);
             break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
         };
 
@@ -1788,7 +1789,7 @@ pub const WorkflowHandler = struct {
     /// Compute the shard ID that owns the given workflow (definition + runs).
     fn resolveWorkflowShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, workflow_name: []const u8) u16 {
         _ = self;
-        const hash = router.hashKeyWithNamespace(namespace, workflow_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), workflow_name);
         const target = shard.router.route(hash);
         return switch (target) {
             .local => shard.id,
@@ -1810,7 +1811,7 @@ pub const WorkflowHandler = struct {
         id_buf: *[32]u8,
         index: *u64,
     ) ?[]const u8 {
-        const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(namespace), wf_name);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf);
         index.* = self.proposeRun(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
         return run_id_str;
@@ -2001,7 +2002,7 @@ pub const WorkflowHandler = struct {
         // message while the action isn't registered, so a step waits for
         // its action wherever the two are placed.
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name);
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
         const message = ActionsHandler.encodeStartRunMessage(shard.allocator, namespace, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned, can_wait) orelse {
             return definition.StepOutcome.execution_failure;
@@ -2066,7 +2067,7 @@ pub const WorkflowHandler = struct {
     /// rather than the local shard (which is merely wherever the triggering
     /// workflow definition happened to be created). Falls back to local.
     fn resolveStreamHandler(shard: *Shard, namespace: []const u8, stream_name: []const u8) @TypeOf(shard.stream_handler) {
-        const hash = router.hashKeyWithNamespace(namespace, stream_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), stream_name);
         const target = shard.router.route(hash);
         switch (target) {
             .local => return shard.stream_handler,
@@ -2082,7 +2083,7 @@ pub const WorkflowHandler = struct {
     /// Compute the shard ID that owns the given action.
     fn resolveActionShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) u16 {
         _ = self;
-        const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), action_name);
         const target = shard.router.route(hash);
         return switch (target) {
             .local => shard.id,
@@ -3165,7 +3166,7 @@ pub const WorkflowHandler = struct {
 
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(schedule.namespace_owned), schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
@@ -3301,7 +3302,7 @@ pub const WorkflowHandler = struct {
     ) void {
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(trigger.namespace_owned), trigger.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         // Room for the longest stream name a trigger may have, and both

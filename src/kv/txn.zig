@@ -37,6 +37,7 @@
 //! shard's reactor thread. No locks needed.
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
@@ -86,11 +87,11 @@ pub const TxnOp = struct {
 
 pub const TxnState = struct {
     txn_id: u64,
-    /// Wyhash of `namespace \0 routing_key` — the pinned partition routing hash.
+    /// The pinned partition's routing hash: the namespace's id and the
+    /// routing key (`router.routeNsKey`).
     pinned_hash: u64,
-    /// Wyhash of the namespace the txn was begun in; it is found only from
-    /// there.
-    namespace_hash: u32,
+    /// The namespace the txn was begun in; it is found only from there.
+    ns_id: NamespaceId,
     /// When a request last used it, on the monotonic clock (ms).
     last_active_ms: u64,
     /// Buffered ops in submission order.
@@ -185,7 +186,7 @@ pub const TxnTable = struct {
 
     /// Begin a new transaction pinned to `pinned_hash`. Returns the new id.
     /// Returns `error.TooManyOpenTxns` when the cap is reached.
-    pub fn begin(self: *TxnTable, pinned_hash: u64, namespace_hash: u32) !u64 {
+    pub fn begin(self: *TxnTable, pinned_hash: u64, ns_id: NamespaceId) !u64 {
         if (self.map.count() >= MAX_OPEN_TXNS) return error.TooManyOpenTxns;
 
         const id = makeId(self.shard_id, self.next_id);
@@ -194,7 +195,7 @@ pub const TxnTable = struct {
         try self.map.put(id, .{
             .txn_id = id,
             .pinned_hash = pinned_hash,
-            .namespace_hash = namespace_hash,
+            .ns_id = ns_id,
             .last_active_ms = stdx_time.monotonicMs(),
             .ops = .empty,
             .payload_bytes = 0,

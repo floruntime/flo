@@ -17,12 +17,12 @@
 //!   queue_lease   → acquire lease with duration
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
 const node_router = @import("../node/router.zig");
-const NOT_CREATED_MESSAGE = @import("stream.zig").NOT_CREATED_MESSAGE;
 
 const Entry = entry_mod.Entry;
 const Result = router_mod.Result;
@@ -175,7 +175,7 @@ pub const QueueProjection = struct {
     /// queue_enqueue entry carries only the namespace hash, so on replay the
     /// apply path can't recover the namespace string on its own; this lets it
     /// register the queue under its real namespace instead of "default".
-    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 = null,
+    ns_resolver: ?*const fn (ctx: *anyopaque, ns: NamespaceId) ?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
 
     pub const Lane = struct {
@@ -480,9 +480,9 @@ pub const QueueProjection = struct {
     /// The namespace an entry's hash names, or null when the shard has
     /// never bound it (see `StreamProjection.resolveNamespace`). Without a
     /// resolver, every hash is "default".
-    fn resolveNamespace(self: *const QueueProjection, ns_hash: u32) error{Refused}!?[]const u8 {
+    fn resolveNamespace(self: *const QueueProjection, ns: NamespaceId) ?[]const u8 {
         const resolver = self.ns_resolver orelse return "default";
-        return resolver(self.ns_resolver_ctx.?, ns_hash);
+        return resolver(self.ns_resolver_ctx.?, ns);
     }
 
     pub fn registerQueue(self: *QueueProjection, queue_name_hash: u64, name: []const u8, namespace: []const u8) !void {
@@ -722,14 +722,10 @@ pub const QueueProjection = struct {
                     priority = std.mem.readInt(u32, cmd.value[0..4], .little);
                     payload = cmd.value[4..];
                 }
-                const q_name_hash = node_router.nameHash(cmd.namespace_hash, cmd.key);
+                const q_name_hash = node_router.nameHash(cmd.namespace_id, cmd.key);
                 // Before anything changes: a namespace this shard never bound
                 // halts here on every replica, never lands in "default".
-                // One whose create the log refused is refused here too.
-                const namespace = (self.resolveNamespace(cmd.namespace_hash) catch {
-                    out.refuse(.unavailable, .unclassified, NOT_CREATED_MESSAGE);
-                    return;
-                }) orelse return error.Halt;
+                const namespace = self.resolveNamespace(cmd.namespace_id) orelse return error.Halt;
                 // Register queue during recovery so list works after restart. The entry
                 // only has the namespace hash; resolve the real namespace string when a
                 // resolver is wired (live enqueues already register the correct namespace
@@ -760,7 +756,7 @@ pub const QueueProjection = struct {
             .queue_purge => {
                 // Drop all ready+leased messages for one queue. Key = queue name.
                 const cmd = CommandPayload.deserialize(entry.payload) orelse return error.Halt;
-                out.putInt(u64, try self.purgeQueue(node_router.nameHash(cmd.namespace_hash, cmd.key)));
+                out.putInt(u64, try self.purgeQueue(node_router.nameHash(cmd.namespace_id, cmd.key)));
             },
             else => return error.Halt,
         }

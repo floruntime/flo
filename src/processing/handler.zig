@@ -22,6 +22,7 @@
 //! | processing_list      | (unused)   | [limit:u32][cursor...]?        |
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
@@ -98,6 +99,9 @@ pub const ProcessingHandler = struct {
     peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
+    /// The node's namespace table, wired by the shard: a sink routes by its
+    /// namespace's id, as the dispatcher does.
+    ns_table: ?*const @import("../namespace/table.zig").Table = null,
 
     /// KV handlers — one per shard, wired by Runtime.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
@@ -217,6 +221,8 @@ pub const ProcessingHandler = struct {
         job_id_owned: []const u8,
         name_owned: []const u8,
         namespace_owned: []const u8,
+        /// The id its submit carried: the namespace a remove must name.
+        ns_id: NamespaceId,
         status: JobStatus,
         batch_size: u32,
         yaml_owned: []const u8,
@@ -290,10 +296,8 @@ pub const ProcessingHandler = struct {
     }
 
     /// Resolve the correct StreamHandler for a given stream name + namespace.
-    /// Uses hashKeyWithNamespace (namespace + key) to match the Dispatcher's
-    /// stream_append routing — the Dispatcher uses preRouteByStream which
-    /// hashes with hashKeyWithNamespace(namespace, key), so stream data lives
-    /// on the shard selected by that composite hash.
+    /// Routes as the dispatcher routes stream_append (`peerShardId`), so the
+    /// stream's data is on the shard chosen.
     fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, namespace: []const u8) *stream_handler_mod.StreamHandler {
         const peers = self.peer_stream_handlers orelse return local;
         if (peers.len <= 1) return local;
@@ -304,7 +308,9 @@ pub const ProcessingHandler = struct {
     /// dispatchers use to route stream/kv/queue/ts commands. Sinks resolve through
     /// this so a write lands on the shard a subsequent read will query.
     fn peerShardId(self: *const ProcessingHandler, namespace: []const u8, key: []const u8) u16 {
-        const hash = router.hashKeyWithNamespace(namespace, key);
+        const name = if (namespace.len == 0) "default" else namespace;
+        const id = if (std.mem.eql(u8, name, "default")) .default else if (self.ns_table) |t| t.lookup(name) orelse .invalid else .invalid;
+        const hash = router.routeNsKey(id, key);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
         return @intCast(partition_id % self.peer_shard_count);
     }
@@ -465,11 +471,12 @@ pub const ProcessingHandler = struct {
     /// no cursor either, so the walker pages it by offset.
     fn localScanJobs(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(handler.jobs.count());
 
@@ -664,9 +671,8 @@ pub const ProcessingHandler = struct {
 
     /// Whether `job` lives in the namespace an entry's hash names; a bare
     /// namespace is "default", as it is for ownedJob.
-    fn inNamespace(job: *const JobRecord, ns_hash: u32) bool {
-        if (ns_hash == router.namespaceHash(job.namespace_owned)) return true;
-        return ns_hash == router.namespaceHash("") and std.mem.eql(u8, job.namespace_owned, "default");
+    fn inNamespace(job: *const JobRecord, ns_id: NamespaceId) bool {
+        return ns_id == job.ns_id;
     }
 
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -1016,10 +1022,10 @@ pub const ProcessingHandler = struct {
         const stamp_ms: i64 = @intCast(entry.header.timestamp_ns / std.time.ns_per_ms);
 
         return switch (etype) {
-            .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms, out),
+            .processing_submit => self.replaySubmit(cmd.key, cmd.value, cmd.namespace_id, stamp_ms, out),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped, out),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled, out),
-            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_hash, out),
+            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_id, out),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => error.Halt,
         };
@@ -1027,7 +1033,7 @@ pub const ProcessingHandler = struct {
 
     /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
     /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, ns_id: NamespaceId, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         const job_id = key;
         if (value.len == 0 or value[0] != SUBMIT_LAYOUT) {
             log.err("processing job {s} not started: its submit entry is from an older server, with a parallelism the server no longer takes; submit the job again", .{job_id});
@@ -1111,6 +1117,7 @@ pub const ProcessingHandler = struct {
             .job_id_owned = owned_id,
             .name_owned = name,
             .namespace_owned = namespace,
+            .ns_id = ns_id,
             .status = status,
             .batch_size = batch_size,
             .yaml_owned = owned_yaml,
@@ -1167,11 +1174,11 @@ pub const ProcessingHandler = struct {
     /// Replay a processing_remove entry: drop the job and any pipelines it
     /// left. A running job stays, refused in log order on every replica; a
     /// job already gone was removed by an earlier entry.
-    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_hash: u32, out: *Result) persistence_mod.ApplyError!void {
+    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_id: NamespaceId, out: *Result) persistence_mod.ApplyError!void {
         const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
         // The leader checked this too (ownedJob); every replica holds the
         // entry to it, so a remove never reaches another namespace's job.
-        if (!inNamespace(job, ns_hash)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        if (!inNamespace(job, ns_id)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
         if (job.status == .running) return out.refuse(.conflict, .job_running, "job is running: stop or cancel it, then remove it");
         self.dropPipelines(key);
         var removed = self.jobs.fetchRemove(key).?;
@@ -1567,7 +1574,7 @@ pub const ProcessingHandler = struct {
         // the series directly instead of being scanned for after the fact (which
         // also wasted the point budget on non-matching points).
         const result = shard.ts_handler.ts.queryRange(
-            router.namespaceHash(pipe.src_namespace),
+            shard.namespaceId(pipe.src_namespace),
             pipe.src_measurement,
             pipe.src_field,
             if (pipe.src_tag_hash != 0) pipe.src_tag_hash else null,
@@ -1819,7 +1826,7 @@ pub const ProcessingHandler = struct {
                     const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
                     const ual_idx = ts_h.nextUalIndex();
                     ts_h.ts.insert(
-                        router.namespaceHash(snk.namespace),
+                        shard.namespaceId(snk.namespace),
                         snk.measurement,
                         snk.value_field,
                         field_value,
@@ -1893,7 +1900,7 @@ pub const ProcessingHandler = struct {
                     continue;
                 }
                 const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
+                ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
                     continue;
                 };
@@ -1906,7 +1913,7 @@ pub const ProcessingHandler = struct {
             (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
         if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
+        ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
     }
 
     const MAX_SINK_KEY = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
@@ -2528,7 +2535,7 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
 
 /// Applies a keyed entry of `etype` for job `key`, as the log does.
 fn applyKeyed(h: *ProcessingHandler, etype: EntryType, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
-    return applyKeyedIn(h, etype, router.namespaceHash(""), key, value);
+    return applyKeyedIn(h, etype, .default, key, value);
 }
 
 fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_hash: u32, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
@@ -2562,7 +2569,7 @@ test "ProcessingHandler: a remove is refused while its job runs, and frees the s
 
     // Removed: the job, its pipeline and its slot are gone; "default" by
     // name is the bare namespace.
-    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("default"), "job-1", "")).refused() == null);
+    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, .default, "job-1", "")).refused() == null);
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
     try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 3)).refused() == null);

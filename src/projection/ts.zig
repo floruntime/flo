@@ -25,6 +25,7 @@
 //!   ts_write_batch → insert batch of points
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.ts_projection);
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -206,7 +207,7 @@ pub const TsWriteValue = struct {
 
 /// Series keys are namespace-scoped AND tag-scoped:
 ///
-///   [namespace_hash: u32 LE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
+///   [ns_id: u32 LE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
 ///
 /// `tag_hash` is a real series dimension (issue #24): points sharing a
 /// measurement+field but carrying different tags live in different series
@@ -395,7 +396,7 @@ pub fn canonicalTagHashPairs(pairs: []const TagPair, scratch: []u8) u64 {
 }
 
 const SeriesKey = struct {
-    namespace_hash: u32,
+    ns_id: NamespaceId,
     measurement: []const u8,
     field_name: []const u8,
     tag_hash: u64,
@@ -404,16 +405,16 @@ const SeriesKey = struct {
 fn seriesKeyToString(allocator: Allocator, key: SeriesKey) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try appendSeriesPrefix(allocator, &buf, key.namespace_hash, key.measurement, key.field_name);
+    try appendSeriesPrefix(allocator, &buf, key.ns_id, key.measurement, key.field_name);
     var tag_bytes: [TAG_SUFFIX]u8 = undefined;
     std.mem.writeInt(u64, &tag_bytes, key.tag_hash, .little);
     try buf.appendSlice(allocator, &tag_bytes);
     return try buf.toOwnedSlice(allocator);
 }
 
-fn appendSeriesPrefix(allocator: Allocator, buf: *std.ArrayList(u8), namespace_hash: u32, measurement: []const u8, field_name: []const u8) !void {
+fn appendSeriesPrefix(allocator: Allocator, buf: *std.ArrayList(u8), ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) !void {
     var ns_bytes: [NS_PREFIX]u8 = undefined;
-    std.mem.writeInt(u32, &ns_bytes, namespace_hash, .little);
+    std.mem.writeInt(u32, &ns_bytes, ns_id.int(), .little);
     try buf.appendSlice(allocator, &ns_bytes);
     try buf.appendSlice(allocator, measurement);
     try buf.append(allocator, 0);
@@ -425,15 +426,15 @@ fn appendSeriesPrefix(allocator: Allocator, buf: *std.ArrayList(u8), namespace_h
 /// tag hash. Two keys share this prefix exactly when they are the same series in
 /// every dimension except tags. Because the prefix ends with the field's \x00
 /// terminator, a longer field name can never false-positive against a shorter one.
-fn seriesKeyPrefix(allocator: Allocator, namespace_hash: u32, measurement: []const u8, field_name: []const u8) ![]const u8 {
+fn seriesKeyPrefix(allocator: Allocator, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try appendSeriesPrefix(allocator, &buf, namespace_hash, measurement, field_name);
+    try appendSeriesPrefix(allocator, &buf, ns_id, measurement, field_name);
     return try buf.toOwnedSlice(allocator);
 }
 
-fn inMeasurement(key: []const u8, namespace_hash: u32, measurement: []const u8) bool {
-    return keyNsHash(key) == namespace_hash and std.mem.eql(u8, keyMeasurement(key), measurement);
+fn inMeasurement(key: []const u8, ns_id: NamespaceId, measurement: []const u8) bool {
+    return keyNsHash(key) == ns_id.int() and std.mem.eql(u8, keyMeasurement(key), measurement);
 }
 
 /// Namespace hash from a series key's 4-byte prefix.
@@ -554,7 +555,7 @@ pub const TSProjection = struct {
     /// non-canonically, producing series no query could ever find.
     pub fn insert(
         self: *TSProjection,
-        namespace_hash: u32,
+        ns_id: NamespaceId,
         measurement: []const u8,
         field_name: []const u8,
         value: f64,
@@ -568,7 +569,7 @@ pub const TSProjection = struct {
         try self.registerTagSet(tag_hash, canonical);
 
         const series_str = try seriesKeyToString(self.allocator, .{
-            .namespace_hash = namespace_hash,
+            .ns_id = ns_id,
             .measurement = measurement,
             .field_name = field_name,
             .tag_hash = tag_hash,
@@ -648,7 +649,7 @@ pub const TSProjection = struct {
     /// read able to see tagged writes now that tags are part of the series key.
     pub fn queryRange(
         self: *TSProjection,
-        namespace_hash: u32,
+        ns_id: NamespaceId,
         measurement: []const u8,
         field_name: []const u8,
         tag_hash: ?u64,
@@ -664,7 +665,7 @@ pub const TSProjection = struct {
         if (tag_hash) |th| {
             // Exact tag set — a single hash lookup.
             const series_str = try seriesKeyToString(self.allocator, .{
-                .namespace_hash = namespace_hash,
+                .ns_id = ns_id,
                 .measurement = measurement,
                 .field_name = field_name,
                 .tag_hash = th,
@@ -683,7 +684,7 @@ pub const TSProjection = struct {
             }
         } else {
             // Any tags — merge every tag-series under this measurement+field.
-            const prefix = try seriesKeyPrefix(self.allocator, namespace_hash, measurement, field_name);
+            const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
             defer self.allocator.free(prefix);
 
             var it = self.buffers.iterator();
@@ -725,7 +726,7 @@ pub const TSProjection = struct {
     /// means "every tag-series".
     pub fn queryRangeFiltered(
         self: *TSProjection,
-        namespace_hash: u32,
+        ns_id: NamespaceId,
         measurement: []const u8,
         field_name: []const u8,
         preds: []const TagPredicate,
@@ -735,7 +736,7 @@ pub const TSProjection = struct {
     ) !QueryResult {
         var result = QueryResult{ .points_in_buffer = 0, .blocks_matched = 0 };
 
-        const prefix = try seriesKeyPrefix(self.allocator, namespace_hash, measurement, field_name);
+        const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
         defer self.allocator.free(prefix);
 
         var it = self.buffers.iterator();
@@ -773,12 +774,12 @@ pub const TSProjection = struct {
     /// strings. Backs per-series rollups and `group_by`.
     pub fn seriesTagsFor(
         self: *TSProjection,
-        namespace_hash: u32,
+        ns_id: NamespaceId,
         measurement: []const u8,
         field_name: []const u8,
         out: [][]const u8,
     ) !usize {
-        const prefix = try seriesKeyPrefix(self.allocator, namespace_hash, measurement, field_name);
+        const prefix = try seriesKeyPrefix(self.allocator, ns_id, measurement, field_name);
         defer self.allocator.free(prefix);
         var n: usize = 0;
         var it = self.buffers.iterator();
@@ -800,9 +801,9 @@ pub const TSProjection = struct {
     // ─── Aggregations ──────────────────────────────────────────────────────
 
     /// Compute the average of points in a range from the write buffer.
-    pub fn avg(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn avg(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var acc: f64 = 0;
@@ -813,9 +814,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the min of points in a range from the write buffer.
-    pub fn min(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn min(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var min_val: f64 = std.math.floatMax(f64);
@@ -826,9 +827,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the max of points in a range from the write buffer.
-    pub fn max(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn max(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
         if (result.points_in_buffer == 0) return null;
 
         var max_val: f64 = -std.math.floatMax(f64);
@@ -839,9 +840,9 @@ pub const TSProjection = struct {
     }
 
     /// Compute the sum of points in a range from the write buffer.
-    pub fn sum(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
+    pub fn sum(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !?f64 {
         var point_buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &point_buf);
+        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &point_buf);
         if (result.points_in_buffer == 0) return null;
 
         var total: f64 = 0;
@@ -852,9 +853,9 @@ pub const TSProjection = struct {
     }
 
     /// Count points in a range from the write buffer.
-    pub fn count(self: *TSProjection, namespace_hash: u32, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !usize {
+    pub fn count(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, field_name: []const u8, preds: []const TagPredicate, min_ts: u64, max_ts: u64) !usize {
         var buf: [4096]StoredPoint = undefined;
-        const result = try self.queryRangeFiltered(namespace_hash, measurement, field_name, preds, min_ts, max_ts, &buf);
+        const result = try self.queryRangeFiltered(ns_id, measurement, field_name, preds, min_ts, max_ts, &buf);
         return result.points_in_buffer;
     }
 
@@ -870,13 +871,13 @@ pub const TSProjection = struct {
     /// Returns the count of unique names written. Names are borrowed
     /// references into the internal HashMap key storage — valid only
     /// while the projection is not mutated.
-    pub fn scanMeasurementNames(self: *const TSProjection, namespace_hash: u32, buf: [][]const u8) usize {
+    pub fn scanMeasurementNames(self: *const TSProjection, ns_id: NamespaceId, buf: [][]const u8) usize {
         var result_count: usize = 0;
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             if (result_count >= buf.len) break;
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != namespace_hash) continue;
+            if (keyNsHash(key) != ns_id.int()) continue;
             const meas = keyMeasurement(key);
             // Dedup via linear scan (measurement count is typically small)
             var dup = false;
@@ -915,7 +916,7 @@ pub const TSProjection = struct {
     /// `names`' counts into `out`, one per name, in one pass over the
     /// shard's series keys and block headers, so a list page costs one pass
     /// however many names it holds.
-    pub fn listCounts(self: *const TSProjection, namespace_hash: u32, names: []const []const u8, allocator: Allocator, out: []ListCounts) error{OutOfMemory}!void {
+    pub fn listCounts(self: *const TSProjection, ns_id: NamespaceId, names: []const []const u8, allocator: Allocator, out: []ListCounts) error{OutOfMemory}!void {
         std.debug.assert(out.len == names.len);
         @memset(out, .{});
         var index = std.StringHashMap(u32).init(allocator);
@@ -928,7 +929,7 @@ pub const TSProjection = struct {
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != namespace_hash) continue;
+            if (keyNsHash(key) != ns_id.int()) continue;
             const meas = keyMeasurement(key);
             const i = index.get(meas) orelse continue;
             const c = &out[i];
@@ -947,12 +948,12 @@ pub const TSProjection = struct {
     /// names go into `field_buf`, at most `MAX_SUMMARY_FIELDS` of them, and
     /// are borrowed from the keys, valid until the projection changes.
     /// A pass over the shard's series keys, as listing them is.
-    pub fn summarize(self: *const TSProjection, namespace_hash: u32, measurement: []const u8, field_buf: *[MAX_SUMMARY_FIELDS][]const u8) Summary {
+    pub fn summarize(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, field_buf: *[MAX_SUMMARY_FIELDS][]const u8) Summary {
         var total: Summary = .{};
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != namespace_hash or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
+            if (keyNsHash(key) != ns_id.int() or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
             total.series += 1;
             const field = keyFieldName(key);
             for (field_buf[0..total.fields]) |seen| {
@@ -977,7 +978,7 @@ pub const TSProjection = struct {
 
     /// Return unique measurement names from the write buffers.
     /// Caller owns the returned slices and must free them.
-    pub fn listMeasurements(self: *const TSProjection, namespace_hash: u32, allocator: Allocator) ![][]const u8 {
+    pub fn listMeasurements(self: *const TSProjection, ns_id: NamespaceId, allocator: Allocator) ![][]const u8 {
         // Collect unique measurement names from this namespace's buffer keys.
         var seen = std.StringHashMap(void).init(allocator);
         defer seen.deinit();
@@ -985,7 +986,7 @@ pub const TSProjection = struct {
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != namespace_hash) continue;
+            if (keyNsHash(key) != ns_id.int()) continue;
             _ = try seen.getOrPut(keyMeasurement(key));
         }
 
@@ -1013,36 +1014,36 @@ pub const TSProjection = struct {
 
     /// Delete all data for a measurement (all fields).
     /// Returns the number of series removed.
-    pub fn deleteMeasurement(self: *TSProjection, namespace_hash: u32, measurement: []const u8) usize {
-        return self.deleteSeries(namespace_hash, measurement, &.{});
+    pub fn deleteMeasurement(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8) usize {
+        return self.deleteSeries(ns_id, measurement, &.{});
     }
 
     /// Whether `key` is a series of `measurement` in the namespace whose
     /// tags satisfy every predicate.
-    fn seriesMatches(self: *const TSProjection, key: []const u8, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) bool {
-        return inMeasurement(key, namespace_hash, measurement) and tagsMatch(self.tagsForHash(keyTagHash(key)), preds);
+    fn seriesMatches(self: *const TSProjection, key: []const u8, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) bool {
+        return inMeasurement(key, ns_id, measurement) and tagsMatch(self.tagsForHash(keyTagHash(key)), preds);
     }
 
     /// Whether any series of `measurement` in the namespace matches.
-    pub fn hasSeries(self: *const TSProjection, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) bool {
+    pub fn hasSeries(self: *const TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) bool {
         var bit = self.buffers.keyIterator();
-        while (bit.next()) |k| if (self.seriesMatches(k.*, namespace_hash, measurement, preds)) return true;
+        while (bit.next()) |k| if (self.seriesMatches(k.*, ns_id, measurement, preds)) return true;
         var blit = self.blocks.keyIterator();
-        while (blit.next()) |k| if (self.seriesMatches(k.*, namespace_hash, measurement, preds)) return true;
+        while (blit.next()) |k| if (self.seriesMatches(k.*, ns_id, measurement, preds)) return true;
         return false;
     }
 
     /// Delete the series of `measurement`, in one namespace, whose tags
     /// satisfy every predicate (all of them, when there are none).
     /// Returns the number of series removed.
-    pub fn deleteSeries(self: *TSProjection, namespace_hash: u32, measurement: []const u8, preds: []const TagPredicate) usize {
+    pub fn deleteSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) usize {
         var removed: usize = 0;
 
         // Delete matching write buffers (this namespace + measurement only)
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (self.seriesMatches(key, namespace_hash, measurement, preds)) {
+            if (self.seriesMatches(key, ns_id, measurement, preds)) {
                 kv.value_ptr.deinit();
                 self.allocator.free(@constCast(key));
                 self.buffers.removeByPtr(kv.key_ptr);
@@ -1054,7 +1055,7 @@ pub const TSProjection = struct {
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (self.seriesMatches(key, namespace_hash, measurement, preds)) {
+            if (self.seriesMatches(key, ns_id, measurement, preds)) {
                 kv.value_ptr.deinit(self.allocator);
                 self.allocator.free(@constCast(key));
                 self.blocks.removeByPtr(kv.key_ptr);
@@ -1066,13 +1067,13 @@ pub const TSProjection = struct {
 
     /// Remove one measurement's points older than `cutoff_ns`, in one
     /// namespace. Returns the number of points evicted.
-    pub fn applyRetention(self: *TSProjection, namespace_hash: u32, measurement: []const u8, cutoff_ns: u64) usize {
+    pub fn applyRetention(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, cutoff_ns: u64) usize {
         var evicted: usize = 0;
 
         // Evict from write buffers
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
-            if (!inMeasurement(kv.key_ptr.*, namespace_hash, measurement)) continue;
+            if (!inMeasurement(kv.key_ptr.*, ns_id, measurement)) continue;
             const buf = kv.value_ptr;
             var write_idx: usize = 0;
             for (buf.points.items) |pt| {
@@ -1089,7 +1090,7 @@ pub const TSProjection = struct {
         // Evict old blocks (entire blocks where max_timestamp < cutoff)
         var blit = self.blocks.iterator();
         while (blit.next()) |kv| {
-            if (!inMeasurement(kv.key_ptr.*, namespace_hash, measurement)) continue;
+            if (!inMeasurement(kv.key_ptr.*, ns_id, measurement)) continue;
             const block_list = kv.value_ptr;
             var write_idx: usize = 0;
             for (block_list.items) |block| {
@@ -1124,7 +1125,7 @@ pub const TSProjection = struct {
                 const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
                 const rec = TsWriteValue.decode(cmd.value, ual_entry.header.timestamp_ns) orelse return error.Halt;
                 try self.insert(
-                    cmd.namespace_hash,
+                    cmd.namespace_id,
                     cmd.key,
                     rec.field_name,
                     rec.value,
@@ -1142,7 +1143,7 @@ pub const TSProjection = struct {
                 var canon_buf: [MAX_TAG_STRING]u8 = undefined;
                 var preds_buf: [MAX_TAGS]TagPredicate = undefined;
                 switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
-                    .ok => |f| _ = self.deleteSeries(cmd.namespace_hash, cmd.key, f.preds),
+                    .ok => |f| _ = self.deleteSeries(cmd.namespace_id, cmd.key, f.preds),
                     else => return error.Halt,
                 }
             },
@@ -1152,7 +1153,7 @@ pub const TSProjection = struct {
                 const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
                 if (cmd.value.len != 8) return error.Halt;
                 const age_ms = std.mem.readInt(u64, cmd.value[0..8], .little);
-                _ = self.applyRetention(cmd.namespace_hash, cmd.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
+                _ = self.applyRetention(cmd.namespace_id, cmd.key, retentionCutoffNs(ual_entry.header.timestamp_ns, age_ms));
             },
             else => return error.Halt,
         }
@@ -1456,7 +1457,7 @@ test "ts: tag hash is canonical — order does not fragment a series" {
 
 test "ts: series key parsing isolates field from the trailing tag hash" {
     const key = try seriesKeyToString(testing.allocator, .{
-        .namespace_hash = 0xAABBCCDD,
+        .ns_id = .of(0xAABBCCDD),
         .measurement = "cpu",
         .field_name = "user",
         .tag_hash = 0x1122334455667788,
@@ -1473,7 +1474,7 @@ test "ts: series key parsing isolates field from the trailing tag hash" {
     const prefix = try seriesKeyPrefix(testing.allocator, 0xAABBCCDD, "cpu", "user");
     defer testing.allocator.free(prefix);
     const other = try seriesKeyToString(testing.allocator, .{
-        .namespace_hash = 0xAABBCCDD,
+        .ns_id = .of(0xAABBCCDD),
         .measurement = "cpu",
         .field_name = "username",
         .tag_hash = 0,

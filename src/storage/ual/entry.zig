@@ -32,7 +32,7 @@
 //! layout:
 //!
 //! ```
-//! namespace_hash: u32
+//! namespace_id: u32
 //! key_length:     u16
 //! value_length:   u32
 //! key:            [key_length]u8
@@ -42,6 +42,7 @@
 //! Raft control entries (noop, config) may have different payload formats.
 
 const std = @import("std");
+const NamespaceId = @import("../../namespace/table.zig").Id;
 const checksum_mod = @import("../../util/checksum.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -193,11 +194,12 @@ pub const Header = extern struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Common payload prefix for key-value command entries.
-/// Fixed 10-byte prefix: namespace_hash(4) + key_length(2) + value_length(4)
+/// Fixed 10-byte prefix: namespace_id(4) + key_length(2) + value_length(4)
 pub const COMMAND_PREFIX_SIZE: usize = @import("../../protocol/limits.zig").COMMAND_PREFIX_SIZE;
 
 pub const CommandPayload = struct {
-    namespace_hash: u32,
+    /// The namespace the command is in; never 0 for a tenant's.
+    namespace_id: NamespaceId,
     key_length: u16,
     value_length: u32,
     key: []const u8,
@@ -213,7 +215,7 @@ pub const CommandPayload = struct {
         const total = self.serializedSize();
         if (buf.len < total) return null;
 
-        std.mem.writeInt(u32, buf[0..4], self.namespace_hash, .little);
+        std.mem.writeInt(u32, buf[0..4], self.namespace_id.int(), .little);
         std.mem.writeInt(u16, buf[4..6], self.key_length, .little);
         std.mem.writeInt(u32, buf[6..10], self.value_length, .little);
 
@@ -232,7 +234,7 @@ pub const CommandPayload = struct {
     pub fn deserialize(data: []const u8) ?CommandPayload {
         if (data.len < COMMAND_PREFIX_SIZE) return null;
 
-        const ns_hash = std.mem.readInt(u32, data[0..4], .little);
+        const ns_id: NamespaceId = .of(std.mem.readInt(u32, data[0..4], .little));
         // usize: `COMMAND_PREFIX_SIZE + key_len` overflows u16 for keys near the limit.
         const key_len: usize = std.mem.readInt(u16, data[4..6], .little);
         const val_len: usize = std.mem.readInt(u32, data[6..10], .little);
@@ -241,7 +243,7 @@ pub const CommandPayload = struct {
         if (data.len < total) return null;
 
         return .{
-            .namespace_hash = ns_hash,
+            .namespace_id = ns_id,
             .key_length = @intCast(key_len),
             .value_length = @intCast(val_len),
             .key = data[COMMAND_PREFIX_SIZE .. COMMAND_PREFIX_SIZE + key_len],
@@ -365,13 +367,13 @@ pub fn buildCommandEntry(
     term: u64,
     index: u64,
     timestamp_ns: u64,
-    namespace_hash: u32,
+    namespace_id: NamespaceId,
     key: []const u8,
     value: []const u8,
     payload_buf: []u8,
 ) ?Entry {
     const cmd = CommandPayload{
-        .namespace_hash = namespace_hash,
+        .namespace_id = namespace_id,
         .key_length = @intCast(key.len),
         .value_length = @intCast(value.len),
         .key = key,
@@ -453,7 +455,7 @@ test "entry: serialize and deserialize roundtrip" {
 
 test "entry: CommandPayload serialize/deserialize" {
     const cmd = CommandPayload{
-        .namespace_hash = 0xABCD_1234,
+        .namespace_id = .of(0xABCD_1234),
         .key_length = 5,
         .value_length = 3,
         .key = "hello",
@@ -469,7 +471,7 @@ test "entry: CommandPayload serialize/deserialize" {
     try std.testing.expect(parsed != null);
 
     const p = parsed.?;
-    try std.testing.expectEqual(@as(u32, 0xABCD_1234), p.namespace_hash);
+    try std.testing.expectEqual(NamespaceId.of(0xABCD_1234), p.namespace_id);
     try std.testing.expectEqual(@as(u16, 5), p.key_length);
     try std.testing.expectEqual(@as(u32, 3), p.value_length);
     try std.testing.expectEqualStrings("hello", p.key);
@@ -485,7 +487,7 @@ test "entry: buildCommandEntry end-to-end" {
         2,
         50,
         9999,
-        0x12345678,
+        .of(0x12345678),
         "mykey",
         "myvalue",
         &payload_buf,
@@ -498,7 +500,7 @@ test "entry: buildCommandEntry end-to-end" {
     // Extract command payload
     const cmd = e.commandPayload();
     try std.testing.expect(cmd != null);
-    try std.testing.expectEqual(@as(u32, 0x12345678), cmd.?.namespace_hash);
+    try std.testing.expectEqual(NamespaceId.of(0x12345678), cmd.?.namespace_id);
     try std.testing.expectEqualStrings("mykey", cmd.?.key);
     try std.testing.expectEqualStrings("myvalue", cmd.?.value);
 }

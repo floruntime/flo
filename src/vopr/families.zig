@@ -1004,11 +1004,9 @@ pub const Namespaces = struct {
             var hasher = std.hash.Wyhash.init(HASH_SEED);
             hasher.update(kv.key_ptr.*);
             const m = kv.value_ptr.*;
-            hasher.update(std.mem.asBytes(&[3]u64{ m.id, m.created_at_ns, m.created_index }));
+            hasher.update(std.mem.asBytes(&[3]u64{ m.id.int(), m.created_at_ns, m.created_index }));
             sum +%= hasher.final();
         }
-        var refused = h.refused_hashes.keyIterator();
-        while (refused.next()) |hash| sum +%= std.hash.Wyhash.hash(HASH_SEED +% 1, std.mem.asBytes(hash));
         return sum;
     }
 };

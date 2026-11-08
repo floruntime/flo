@@ -107,11 +107,12 @@ pub const QueueHandler = struct {
     /// from one shard's QueueProjection registry.
     fn localScanQueues(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8, // filter
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(handler.queue.known_queues.count());
 
@@ -132,7 +133,7 @@ pub const QueueHandler = struct {
 
     fn preRouteByQueue(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     fn dispatchQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -233,7 +234,7 @@ pub const QueueHandler = struct {
             }
 
             // Register waiter — store queue_name_hash in min_version for the resolver
-            const ns_hash_w = router.namespaceHash(req.namespace);
+            const ns_hash_w = req.ns_id;
             const q_hash = router.nameHash(ns_hash_w, req.key);
             const registered = shard.waiter_pool.register(.{
                 .kind = .queue_dequeue,
@@ -287,7 +288,7 @@ pub const QueueHandler = struct {
 
         const priority: u32 = if (req.getPriority()) |p| @as(u32, p) else 0;
         const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
 
         // Register the queue with its REAL namespace before applying the entry.
         // The apply path (queue.applyEntry) re-registers using only the namespace
@@ -371,7 +372,7 @@ pub const QueueHandler = struct {
         const count = req.getCount() orelse DEFAULT_DEQUEUE_COUNT;
         const capped = @min(count, MAX_DEQUEUE_BATCH);
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const queue_name_hash = router.nameHash(ns_hash, req.key);
 
         // Expire stale leases first
@@ -401,7 +402,7 @@ pub const QueueHandler = struct {
         var dequeued_bytes: usize = 0;
         for (results[0..actual]) |r| {
             dequeued_bytes += r.payload.len;
-            self.persistAck(req.namespace, queue_name_hash, r.seq);
+            self.persistAck(req.ns_id, queue_name_hash, r.seq);
         }
 
         if (self.metrics_registry) |mr| {
@@ -442,7 +443,7 @@ pub const QueueHandler = struct {
         const seqs = parseSeqs(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "message sequences are required: [count:u32][seq:u64]*" } };
         };
-        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const queue_hash = router.nameHash(req.ns_id, req.key);
         var held: [MAX_ACK_BATCH]u64 = undefined;
         var held_count: usize = 0;
         for (0..seqs.count) |i| {
@@ -481,7 +482,7 @@ pub const QueueHandler = struct {
                 self.partition.current_term,
                 self.partition.ual.max_index + 1,
                 @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000,
-                router.namespaceHash(req.namespace),
+                req.ns_id,
                 &seq_key,
                 &queue_key,
                 &payload_buf,
@@ -517,7 +518,7 @@ pub const QueueHandler = struct {
     fn runPeek(shard: *Shard, _: *Connection, req: Request, limit: u32) Error!table_run.Outcome(PeekResponse) {
         const self = shard.queue_handler;
         var found: [QueueProjection.MAX_PEEK]*const queue_mod.Message = undefined;
-        const peeked = self.queue.peek(router.nameHash(router.namespaceHash(req.namespace), req.key), found[0..@min(limit, found.len)]);
+        const peeked = self.queue.peek(router.nameHash(req.ns_id, req.key), found[0..@min(limit, found.len)]);
         var out = queue_ops.PeekedList.Builder.init(try self.answerBuf());
         var more = peeked.more;
         for (found[0..peeked.count]) |m| {
@@ -545,7 +546,7 @@ pub const QueueHandler = struct {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         }
-        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const queue_hash = router.nameHash(req.ns_id, req.key);
         const counts = self.queue.queueCounts(queue_hash);
         var stats: QueueProjection.Stats = .{};
         if (self.queue.known_queues.get(queue_hash)) |meta| {
@@ -573,7 +574,7 @@ pub const QueueHandler = struct {
         if (req.key.len == 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         }
-        const queue_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const queue_hash = router.nameHash(req.ns_id, req.key);
         // [limit:u32][after:u64]?, both optional: a page of up to 100, after
         // the dead letter whose seq ends the page before.
         var limit: u32 = MAX_DLQ_PAGE;
@@ -612,7 +613,7 @@ pub const QueueHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         }
 
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const q_name_hash = router.nameHash(ns_hash, req.key);
 
         // The applier purges the projection and records what it removed;
@@ -749,7 +750,7 @@ pub const QueueHandler = struct {
 
     /// Persist a queue_ack UAL entry for a dequeued message, naming its queue
     /// as any ack does, so consumed messages don't reappear after restart.
-    fn persistAck(self: *QueueHandler, namespace: []const u8, queue_hash: u64, seq: u64) void {
+    fn persistAck(self: *QueueHandler, ns_id: router.NamespaceId, queue_hash: u64, seq: u64) void {
         var seq_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &seq_key, seq, .little);
         var queue_key: [8]u8 = undefined;
@@ -760,7 +761,7 @@ pub const QueueHandler = struct {
         // the operator must hear about.
         if (self.shard_ptr) |sptr| {
             const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
+            _ = persistence_mod.proposeEntryIn(shard, .queue_ack, entry_mod.Flags.NONE, ns_id, &seq_key, &queue_key) catch |err| {
                 if (!shard.quietHalted(err)) log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
             };
             return;
@@ -779,7 +780,7 @@ pub const QueueHandler = struct {
             self.partition.current_term,
             next_index,
             timestamp_ns,
-            router.namespaceHash(namespace),
+            ns_id,
             &seq_key,
             &queue_key,
             payload_buf[0..payload_size],
@@ -1395,7 +1396,7 @@ test "queue handler: a listing gives each queue its own dead-letter count" {
     var handler = QueueHandler.init(allocator, partition);
 
     const q = &partition.queue;
-    const ns = router.namespaceHash("default");
+    const ns: router.NamespaceId = .default;
     for ([_]struct { name: []const u8, dead: usize }{ .{ .name = "mine", .dead = 1 }, .{ .name = "theirs", .dead = 2 } }) |c| {
         const hash = router.nameHash(ns, c.name);
         try q.registerQueue(hash, c.name, "default");

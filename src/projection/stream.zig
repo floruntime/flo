@@ -15,6 +15,7 @@
 //!   create → join member → read (adds to PEL) → ack/nack → claim → leave → delete
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
@@ -197,10 +198,6 @@ pub fn decodeAppendValue(value: []const u8) AppendValue {
 pub const MAX_BATCH_RECORDS: u32 = proto_limits.MAX_STREAM_BATCH_RECORDS;
 const proto_limits = @import("../protocol/proto.zig");
 
-/// What an entry is answered with when its namespace's create was refused
-/// earlier in the same log: shard 0 proposes a write right behind its
-/// namespace's create, and the create can lose its id or the room.
-pub const NOT_CREATED_MESSAGE = "unavailable: the namespace's create was refused; the write was not run — retry";
 /// Most records one read returns (whole appends, at least one).
 pub const MAX_READ_RECORDS: u32 = proto_limits.MAX_STREAM_READ_RECORDS;
 
@@ -1090,7 +1087,7 @@ pub const StreamProjection = struct {
     /// apply path cannot recover the namespace string on its own. Without it,
     /// recovered streams register under their bare name and are invisible to
     /// `stream list`, which filters on the namespace prefix.
-    ns_resolver: ?*const fn (ctx: *anyopaque, ns_hash: u32) error{Refused}!?[]const u8 = null,
+    ns_resolver: ?*const fn (ctx: *anyopaque, ns: NamespaceId) ?[]const u8 = null,
     ns_resolver_ctx: ?*anyopaque = null,
 
     pub const Stats = struct {
@@ -1563,9 +1560,9 @@ pub const StreamProjection = struct {
     /// the applier halts rather than file the entry under another namespace.
     /// Without a resolver (a projection on its own, in a test), every hash
     /// is "default".
-    pub fn resolveNamespace(self: *const StreamProjection, ns_hash: u32) error{Refused}!?[]const u8 {
+    pub fn resolveNamespace(self: *const StreamProjection, ns: NamespaceId) ?[]const u8 {
         const resolver = self.ns_resolver orelse return "default";
-        return resolver(self.ns_resolver_ctx.?, ns_hash);
+        return resolver(self.ns_resolver_ctx.?, ns);
     }
 
     pub fn registerStream(self: *StreamProjection, name: []const u8) !void {

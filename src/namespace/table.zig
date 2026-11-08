@@ -15,14 +15,38 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
-pub const Id = u32;
+/// A namespace, below the edge: the edge resolves a request's name to its
+/// id once, and what runs past it names the namespace by id. A distinct
+/// type, so a hash or a count can't be passed for one.
+pub const Id = enum(u32) {
+    /// Never a namespace's: an entry that carries 0 names none.
+    invalid = 0,
+    default = 1,
+    system = 2,
+    _,
 
-/// Never a namespace's: an entry that carries 0 names none.
-pub const INVALID: Id = 0;
-pub const DEFAULT: Id = 1;
-pub const SYSTEM: Id = 2;
+    pub fn of(n: u32) Id {
+        return @enumFromInt(n);
+    }
+
+    pub fn int(id: Id) u32 {
+        return @intFromEnum(id);
+    }
+
+    /// The id as it leads a key: fixed width, big-endian, so one
+    /// namespace's keys sort together.
+    pub fn bytes(id: Id) [4]u8 {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, @intFromEnum(id), .big);
+        return b;
+    }
+};
+
+pub const INVALID: Id = .invalid;
+pub const DEFAULT: Id = .default;
+pub const SYSTEM: Id = .system;
 /// Ids below this are compile-time constants, never allocated.
-pub const FIRST_ALLOCATED: Id = 16;
+pub const FIRST_ALLOCATED: Id = .of(16);
 
 /// The most live namespaces: tenants and admins alike, until principals
 /// split the count.
@@ -31,7 +55,7 @@ pub const MAX_LIVE: u32 = 4096;
 /// Every id the table can hold: the reserved ones, then one per live
 /// namespace. Ids are never reused, and nothing is deleted yet, so this
 /// bounds the ids too.
-pub const CAPACITY: u32 = FIRST_ALLOCATED + MAX_LIVE;
+pub const CAPACITY: u32 = FIRST_ALLOCATED.int() + MAX_LIVE;
 
 /// Open-addressed name → id slots, at most half full.
 const INDEX_SLOTS: u32 = 2 * std.math.ceilPowerOfTwoAssert(u32, CAPACITY);
@@ -74,11 +98,11 @@ pub const Table = struct {
     /// Publish `name` as `id`, known at shard 0's log index `index`. Shard
     /// 0's thread only; the id is new and the name not yet published.
     pub fn publish(self: *Table, id: Id, name: []const u8, index: u64) !void {
-        std.debug.assert(id != INVALID and id < CAPACITY and name.len > 0);
-        std.debug.assert(self.lens[id].load(.monotonic) == 0);
+        std.debug.assert(id != INVALID and id.int() < CAPACITY and name.len > 0);
+        std.debug.assert(self.lens[id.int()].load(.monotonic) == 0);
         const owned = try self.allocator.dupe(u8, name);
-        self.names[id] = owned.ptr;
-        self.lens[id].store(@intCast(owned.len), .release);
+        self.names[id.int()] = owned.ptr;
+        self.lens[id.int()].store(@intCast(owned.len), .release);
         var slot = slotOf(name);
         while (true) : (slot = (slot + 1) & (INDEX_SLOTS - 1)) {
             // One writer: an empty slot stays empty until it writes it.
@@ -103,10 +127,10 @@ pub const Table = struct {
 
     /// The name published as `id`, or null.
     pub fn nameOf(self: *const Table, id: Id) ?[]const u8 {
-        if (id == INVALID or id >= CAPACITY) return null;
-        const n = self.lens[id].load(.acquire);
+        if (id == INVALID or id.int() >= CAPACITY) return null;
+        const n = self.lens[id.int()].load(.acquire);
         if (n == 0) return null;
-        return self.names[id][0..n];
+        return self.names[id.int()][0..n];
     }
 
     pub fn publishedIndex(self: *const Table) u64 {
@@ -140,7 +164,7 @@ test "namespace table: a published name is found by name and by id, and the inde
     try testing.expectEqualStrings("orders", t.nameOf(FIRST_ALLOCATED).?);
     try testing.expectEqual(@as(u64, 9), t.publishedIndex());
     // A publish at a lower index leaves it where it was.
-    try t.publish(FIRST_ALLOCATED + 1, "ledger", 7);
+    try t.publish(.of(FIRST_ALLOCATED.int() + 1), "ledger", 7);
     try testing.expectEqual(@as(u64, 9), t.publishedIndex());
 }
 
@@ -148,10 +172,10 @@ test "namespace table: it holds every id it can, and every name is found" {
     const t = try Table.create(testing.allocator);
     defer t.destroy();
     var buf: [16]u8 = undefined;
-    var id: Id = FIRST_ALLOCATED;
-    while (id < CAPACITY) : (id += 1) try t.publish(id, try std.fmt.bufPrint(&buf, "ns{d}", .{id}), id);
-    id = FIRST_ALLOCATED;
-    while (id < CAPACITY) : (id += 1) try testing.expectEqual(@as(?Id, id), t.lookup(try std.fmt.bufPrint(&buf, "ns{d}", .{id})));
+    var n: u32 = FIRST_ALLOCATED.int();
+    while (n < CAPACITY) : (n += 1) try t.publish(.of(n), try std.fmt.bufPrint(&buf, "ns{d}", .{n}), n);
+    n = FIRST_ALLOCATED.int();
+    while (n < CAPACITY) : (n += 1) try testing.expectEqual(@as(?Id, .of(n)), t.lookup(try std.fmt.bufPrint(&buf, "ns{d}", .{n})));
     try testing.expect(t.lookup("ns1") == null);
 }
 
@@ -162,8 +186,8 @@ test "namespace table: readers racing the publisher see whole names, and everyth
         bad: Atomic(u32) = .init(0),
         checks: Atomic(u64) = .init(0),
 
-        fn name(buf: []u8, id: Id) []const u8 {
-            return std.fmt.bufPrint(buf, "name-{d}-{d}", .{ id, id *% 2654435761 }) catch unreachable;
+        fn name(buf: []u8, n: u32) []const u8 {
+            return std.fmt.bufPrint(buf, "name-{d}-{d}", .{ n, n *% 2654435761 }) catch unreachable;
         }
 
         fn read(s: *@This()) void {
@@ -173,23 +197,23 @@ test "namespace table: readers racing the publisher see whole names, and everyth
                 // now: its length or its index slot, once seen, must
                 // bring the whole name with it.
                 const frontier = s.t.publishedIndex() + 1;
-                var probe: Id = @intCast(@max(frontier, FIRST_ALLOCATED));
+                var probe: u32 = @intCast(@max(frontier, FIRST_ALLOCATED.int()));
                 while (probe < @min(frontier + 4, CAPACITY)) : (probe += 1) {
                     const want = name(&buf, probe);
-                    if (s.t.nameOf(probe)) |got| {
+                    if (s.t.nameOf(.of(probe))) |got| {
                         if (!std.mem.eql(u8, got, want)) _ = s.bad.fetchAdd(1, .monotonic);
                     }
                     if (s.t.lookup(want)) |found| {
-                        if (found != probe) _ = s.bad.fetchAdd(1, .monotonic);
+                        if (found != Id.of(probe)) _ = s.bad.fetchAdd(1, .monotonic);
                     }
                 }
                 // Everything at or below the published index is there, whole.
                 const upto = s.t.publishedIndex();
-                var id: Id = FIRST_ALLOCATED;
-                while (id <= upto) : (id += 1) {
-                    const want = name(&buf, id);
-                    if (s.t.lookup(want) != id) _ = s.bad.fetchAdd(1, .monotonic);
-                    const got = s.t.nameOf(id) orelse {
+                var n: u32 = FIRST_ALLOCATED.int();
+                while (n <= upto) : (n += 1) {
+                    const want = name(&buf, n);
+                    if (s.t.lookup(want) != Id.of(n)) _ = s.bad.fetchAdd(1, .monotonic);
+                    const got = s.t.nameOf(.of(n)) orelse {
                         _ = s.bad.fetchAdd(1, .monotonic);
                         continue;
                     };
@@ -208,9 +232,9 @@ test "namespace table: readers racing the publisher see whole names, and everyth
         var readers: [4]std.Thread = undefined;
         for (&readers) |*r| r.* = try std.Thread.spawn(.{}, Shared.read, .{&shared});
         var buf: [48]u8 = undefined;
-        var id: Id = FIRST_ALLOCATED;
+        var n: u32 = FIRST_ALLOCATED.int();
         // The id doubles as the index it was published at.
-        while (id < CAPACITY) : (id += 1) try t.publish(id, Shared.name(&buf, id), id);
+        while (n < CAPACITY) : (n += 1) try t.publish(.of(n), Shared.name(&buf, n), n);
         shared.done.store(true, .release);
         for (readers) |r| r.join();
         try testing.expectEqual(@as(u32, 0), shared.bad.load(.monotonic));
