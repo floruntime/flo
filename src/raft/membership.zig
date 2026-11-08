@@ -443,6 +443,10 @@ test "membership: a config keeps its cluster and generation, and its next id nev
     var back = joined;
     back.next_id = 3;
     try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&joined, &back, 1));
+    // Still above every id it names, but below what the group had reached.
+    var reached = joined;
+    reached.next_id = 20;
+    try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&reached, &joined, 1));
     a.next_id = 1;
     try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&.{}, &a, 1));
     // The largest id can't be passed, and doesn't block.
