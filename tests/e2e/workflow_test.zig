@@ -3849,3 +3849,155 @@ test "e2e/workflow: a schedule's max_concurrent holds it while a run is unfinish
     defer again.deinit();
     try testing.expect(extractTaskId(again.stdout) != null);
 }
+
+// =============================================================================
+// A cancel across a failover
+// =============================================================================
+
+fn clusterLeader(c: *stdx.testing.ClusterContext, skip: ?usize) !usize {
+    for (0..100) |_| {
+        for (0..c.node_count) |i| {
+            if (skip == i or c.getServer(i) == null) continue;
+            const out = c.execCaptureOn(i, &.{ "cluster", "status", "-o", "json" }) catch continue;
+            defer c.allocator.free(out);
+            if (std.mem.indexOf(u8, out, "\"role\":\"leader\"") != null) return i;
+        }
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    }
+    return error.NoLeader;
+}
+
+/// A definition whose runs wait, and `ids.len` of them started on `leader`.
+fn startWaitingRuns(c: *stdx.testing.ClusterContext, leader: usize, ids: [][8]u8) !void {
+    const path = try writeTempYaml(testing.allocator,
+        \\kind: Workflow
+        \\name: to-cancel
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , "to-cancel.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try c.execOn(leader, &.{ "workflow", "create", "-f", path });
+    for (ids, 0..) |*id, i| {
+        _ = try std.fmt.bufPrint(id, "cf-{d:0>5}", .{i});
+        try c.execOn(leader, &.{ "workflow", "start", "to-cancel", "{}", "--run-id", id });
+    }
+}
+
+/// A connection with a cancel of run `id` on its way.
+fn sendCancel(port: u16, id: []const u8) !std.c.fd_t {
+    const proto = @import("src").protocol.proto;
+    const fd = try stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 1000);
+    errdefer _ = std.c.close(fd);
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.workflow_cancel, 7), .namespace = "default", .key = id, .value = "", .options = "" };
+    var buf: [256]u8 = undefined;
+    const bytes = try req.serialize(&buf);
+    if (std.c.write(fd, bytes.ptr, bytes.len) != @as(isize, @intCast(bytes.len))) return error.ShortWrite;
+    return fd;
+}
+
+/// The status of the answer on `fd`, if one comes within `ms`.
+fn cancelAnswer(fd: std.c.fd_t, ms: u64) ?u8 {
+    const proto = @import("src").protocol.proto;
+    var out: [512]u8 = undefined;
+    var got: usize = 0;
+    const until = stdx.time.monotonicMs() + ms;
+    while (stdx.time.monotonicMs() < until) {
+        const rc = std.c.recv(fd, out[got..].ptr, out.len - got, std.c.MSG.DONTWAIT);
+        if (rc > 0) got += @intCast(rc);
+        if (proto.Response.parse(out[0..got])) |resp| return resp.header.status else |_| {}
+        stdx.time.sleep(5 * std.time.ns_per_ms);
+    }
+    return null;
+}
+
+/// Whether run `id` reads cancelled on `node`, once what the node inherited
+/// has applied.
+fn cancelledOn(c: *stdx.testing.ClusterContext, node: usize, id: []const u8) bool {
+    for (0..40) |_| {
+        const out = c.execCaptureOn(node, &.{ "workflow", "status", id }) catch {
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        defer c.allocator.free(out);
+        if (std.mem.indexOf(u8, out, "Status:   cancelled\n") != null) return true;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "e2e/workflow/cluster: a cancel no majority holds isn't answered ok, and the next leader has the run as it was" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    var ids: [8][8]u8 = undefined;
+    try startWaitingRuns(&cluster, first, &ids);
+
+    // Nothing the leader proposes from here reaches a follower.
+    for (0..cluster.node_count) |i| if (i != first) {
+        _ = std.c.kill(cluster.getServer(i).?.process.?.id, .STOP);
+    };
+    defer for (0..cluster.node_count) |i| if (i != first) {
+        if (cluster.getServer(i)) |server| if (server.process) |p| {
+            _ = std.c.kill(p.id, .CONT);
+        };
+    };
+    var fds: [ids.len]std.c.fd_t = undefined;
+    const port = cluster.getServer(first).?.getPort();
+    for (&ids, &fds) |*id, *fd| fd.* = try sendCancel(port, id);
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var told_ok: [ids.len]bool = undefined;
+    for (fds, &told_ok) |fd, *ok| ok.* = (cancelAnswer(fd, 100) orelse 1) == 0;
+
+    cluster.killNode(first);
+    for (0..cluster.node_count) |i| if (i != first) {
+        _ = std.c.kill(cluster.getServer(i).?.process.?.id, .CONT);
+    };
+    const next = try clusterLeader(&cluster, first);
+    // Whatever a client was told ok is true on the next leader.
+    var lost: u32 = 0;
+    for (&ids, told_ok) |*id, ok| if (ok and !cancelledOn(&cluster, next, id)) {
+        lost += 1;
+    };
+    try testing.expectEqual(@as(u32, 0), lost);
+    for (told_ok) |ok| try testing.expect(!ok);
+}
+
+test "e2e/workflow/cluster: a cancel answered ok is cancelled on the next leader" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    var ids: [16][8]u8 = undefined;
+    try startWaitingRuns(&cluster, first, &ids);
+
+    var fds: [ids.len]std.c.fd_t = undefined;
+    const port = cluster.getServer(first).?.getPort();
+    for (&ids, &fds) |*id, *fd| fd.* = try sendCancel(port, id);
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    for (fds) |fd| try testing.expectEqual(@as(?u8, 0), cancelAnswer(fd, 5000));
+
+    // A crash, at once: nothing flushed on the way out.
+    cluster.killNode(first);
+    const next = try clusterLeader(&cluster, first);
+    for (&ids) |*id| try testing.expect(cancelledOn(&cluster, next, id));
+}
+
+test "e2e/workflow: disable and enable take no --version, which a definition doesn't have" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_][]const u8{ "disable", "enable" }) |verb| {
+        var r = try ctx.cli.run(&.{ "workflow", verb, "anything", "--version", "1.0.0" });
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains("version"));
+    }
+}

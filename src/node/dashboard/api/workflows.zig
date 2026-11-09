@@ -317,14 +317,14 @@ fn getDefinition(allocator: Allocator, name: []const u8, query_string: ?[]const 
     return try json_aw.toOwnedSlice();
 }
 
-/// PUT /workflow/definitions/:name/enable?namespace=&version= (loopback write)
+/// PUT /workflow/definitions/:name/enable?namespace= (loopback write). A
+/// definition is one per name, so every version goes.
 fn enableWorkflow(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const version = h.parseQueryParam([]const u8, query_string, "version");
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.workflow.enable(&client, ns_q, name, version) catch
+    var resp = client_mod.workflow.enable(&client, ns_q, name) catch
         return try h.jsonError(allocator, "Enable failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());
@@ -341,14 +341,14 @@ fn enableWorkflow(allocator: Allocator, name: []const u8, query_string: ?[]const
     return try json_aw.toOwnedSlice();
 }
 
-/// PUT /workflow/definitions/:name/disable?namespace=&version= (loopback write)
+/// PUT /workflow/definitions/:name/disable?namespace= (loopback write). A
+/// definition is one per name, so every version goes.
 fn disableWorkflow(allocator: Allocator, name: []const u8, query_string: ?[]const u8, ctx: *DashboardContext) ![]const u8 {
     const ns_q = h.parseQueryParam([]const u8, query_string, "namespace") orelse "default";
-    const version = h.parseQueryParam([]const u8, query_string, "version");
 
     var client = loopbackConnect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.workflow.disable(&client, ns_q, name, version) catch
+    var resp = client_mod.workflow.disable(&client, ns_q, name) catch
         return try h.jsonError(allocator, "Disable failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

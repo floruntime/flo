@@ -1,7 +1,7 @@
-//! The payload of a `raft_config` entry: every member and its role, and
-//! the ids removed from the group. The leader that writes it and every node
-//! that applies it read the same bytes, so membership is exactly what the
-//! log says.
+//! The payload of a `raft_config` entry: the cluster it belongs to, every
+//! member and its role, and the ids removed from the group. The leader that
+//! writes it and every node that applies it read the same bytes, so
+//! membership is exactly what the log says.
 //!
 //! A member is a voter or a replica. A replica takes the log and counts
 //! toward nothing: no quorum, no vote. `may_vote` says the leader may make
@@ -18,9 +18,12 @@ pub const MAX_REMOVED = 64;
 /// A member that has never caught up is removed after this long.
 pub const JOIN_AGE_LIMIT_MS: u64 = 10 * 60 * 1000;
 
+pub const CLUSTER_ID_LEN = 16;
+
+const HEADER_SIZE = 2 + CLUSTER_ID_LEN + 8 + 4;
 const MEMBER_SIZE = 5;
 const REMOVED_SIZE = 12;
-pub const MAX_SIZE = 2 + MAX_MEMBERS * MEMBER_SIZE + MAX_REMOVED * REMOVED_SIZE;
+pub const MAX_SIZE = HEADER_SIZE + MAX_MEMBERS * MEMBER_SIZE + MAX_REMOVED * REMOVED_SIZE;
 
 const VOTER: u8 = 1;
 const MAY_VOTE: u8 = 2;
@@ -40,6 +43,15 @@ pub const Removed = struct {
 };
 
 pub const Config = struct {
+    /// Made once, when the cluster is founded, and kept by every config
+    /// after: a proposed config that changes it is refused.
+    cluster_id: [CLUSTER_ID_LEN]u8 = @splat(0),
+    /// Raised only by `force-members`, which starts the group again from one
+    /// node's log.
+    generation: u64 = 1,
+    /// The id the next member gets: above every id the group has used, and
+    /// never lowered.
+    next_id: u32 = 1,
     members: [MAX_MEMBERS]Member = undefined,
     member_count: u8 = 0,
     removed: [MAX_REMOVED]Removed = undefined,
@@ -52,7 +64,15 @@ pub const Config = struct {
         for (voter_ids[0..@min(voter_ids.len, MAX_MEMBERS)]) |id| {
             c.members[c.member_count] = .{ .id = id, .voter = true, .may_vote = true, .caught_up = true };
             c.member_count += 1;
+            c.next_id = @max(c.next_id, id +| 1);
         }
+        return c;
+    }
+
+    /// A new cluster's first config: `id` its one voter.
+    pub fn founding(id: u32, cluster_id: [CLUSTER_ID_LEN]u8) Config {
+        var c = ofVoters(&.{id});
+        c.cluster_id = cluster_id;
         return c;
     }
 
@@ -62,6 +82,14 @@ pub const Config = struct {
 
     pub fn removedSlice(self: *const Config) []const Removed {
         return self.removed[0..self.removed_count];
+    }
+
+    /// Whether `next_id` is above every id the config names. An id of
+    /// the most a u32 holds can't be passed, and is taken as passed.
+    fn nextIdAhead(self: *const Config) bool {
+        for (self.memberSlice()) |m| if (m.id +| 1 > self.next_id) return false;
+        for (self.removedSlice()) |r| if (r.id +| 1 > self.next_id) return false;
+        return true;
     }
 
     pub fn find(self: *const Config, id: u32) ?Member {
@@ -111,6 +139,7 @@ pub const Config = struct {
         var c = self;
         c.members[c.member_count] = .{ .id = id, .voter = false, .may_vote = may_vote };
         c.member_count += 1;
+        c.next_id = @max(c.next_id, id +| 1);
         return c;
     }
 
@@ -141,11 +170,13 @@ pub const Config = struct {
             }
             c.removed[c.removed_count] = .{ .id = id, .when_ms = when };
             c.removed_count += 1;
+            c.next_id = @max(c.next_id, id +| 1);
         }
         return c;
     }
 
     pub fn eql(a: *const Config, b: *const Config) bool {
+        if (!std.mem.eql(u8, &a.cluster_id, &b.cluster_id) or a.generation != b.generation or a.next_id != b.next_id) return false;
         if (a.member_count != b.member_count or a.removed_count != b.removed_count) return false;
         for (a.memberSlice(), b.memberSlice()) |x, y| if (!std.meta.eql(x, y)) return false;
         for (a.removedSlice(), b.removedSlice()) |x, y| if (!std.meta.eql(x, y)) return false;
@@ -153,12 +184,16 @@ pub const Config = struct {
     }
 };
 
-/// `[members:u8][removed:u8]`, then per member `[id:u32][flags:u8]`, then
-/// per removed id `[id:u32][when_ms:u64]`; little-endian.
+/// `[members:u8][removed:u8][cluster_id:16][generation:u64][next_id:u32]`,
+/// then per member `[id:u32][flags:u8]`, then per removed id
+/// `[id:u32][when_ms:u64]`; little-endian.
 pub fn encode(cfg: *const Config, buf: *[MAX_SIZE]u8) []const u8 {
     buf[0] = cfg.member_count;
     buf[1] = cfg.removed_count;
-    var off: usize = 2;
+    @memcpy(buf[2..][0..CLUSTER_ID_LEN], &cfg.cluster_id);
+    std.mem.writeInt(u64, buf[2 + CLUSTER_ID_LEN ..][0..8], cfg.generation, .little);
+    std.mem.writeInt(u32, buf[2 + CLUSTER_ID_LEN + 8 ..][0..4], cfg.next_id, .little);
+    var off: usize = HEADER_SIZE;
     for (cfg.memberSlice()) |m| {
         std.mem.writeInt(u32, buf[off..][0..4], m.id, .little);
         buf[off + 4] = (if (m.voter) VOTER else 0) | (if (m.may_vote) MAY_VOTE else 0) | (if (m.caught_up) CAUGHT_UP else 0);
@@ -174,15 +209,22 @@ pub fn encode(cfg: *const Config, buf: *[MAX_SIZE]u8) []const u8 {
 
 /// Null for bytes that are not a config: counts the bytes do not cover, no
 /// voter, more members than a group holds, an id of 0, an id named twice or
-/// both a member and removed, or a flag this version does not know. A group
-/// with no voter can never commit; a member named twice holds two peer
-/// slots and a quorum it can never fill.
+/// both a member and removed, a flag this version does not know, a
+/// generation of 0, or a `next_id` not above every id named. A group with
+/// no voter can never commit; a member named twice holds two peer slots and
+/// a quorum it can never fill.
 pub fn decode(payload: []const u8) ?Config {
-    if (payload.len < 2) return null;
-    var c: Config = .{ .member_count = payload[0], .removed_count = payload[1] };
-    if (c.member_count > MAX_MEMBERS or c.removed_count > MAX_REMOVED) return null;
-    if (payload.len != 2 + @as(usize, c.member_count) * MEMBER_SIZE + @as(usize, c.removed_count) * REMOVED_SIZE) return null;
-    var off: usize = 2;
+    if (payload.len < HEADER_SIZE) return null;
+    var c: Config = .{
+        .member_count = payload[0],
+        .removed_count = payload[1],
+        .cluster_id = payload[2..][0..CLUSTER_ID_LEN].*,
+        .generation = std.mem.readInt(u64, payload[2 + CLUSTER_ID_LEN ..][0..8], .little),
+        .next_id = std.mem.readInt(u32, payload[2 + CLUSTER_ID_LEN + 8 ..][0..4], .little),
+    };
+    if (c.member_count > MAX_MEMBERS or c.removed_count > MAX_REMOVED or c.generation == 0) return null;
+    if (payload.len != HEADER_SIZE + @as(usize, c.member_count) * MEMBER_SIZE + @as(usize, c.removed_count) * REMOVED_SIZE) return null;
+    var off: usize = HEADER_SIZE;
     for (0..c.member_count) |i| {
         const id = std.mem.readInt(u32, payload[off..][0..4], .little);
         const flags = payload[off + 4];
@@ -197,7 +239,7 @@ pub fn decode(payload: []const u8) ?Config {
         c.removed[i] = .{ .id = id, .when_ms = std.mem.readInt(u64, payload[off + 4 ..][0..8], .little) };
         off += REMOVED_SIZE;
     }
-    if (c.voterCount() == 0) return null;
+    if (c.voterCount() == 0 or !c.nextIdAhead()) return null;
     return c;
 }
 
@@ -214,9 +256,15 @@ pub const Refusal = enum {
     voters_jump,
     rejoined_removed,
     not_a_voter,
+    other_cluster,
+    generation_changed,
+    next_id_behind,
 
     pub fn message(self: Refusal) []const u8 {
         return switch (self) {
+            .other_cluster => "that config belongs to another cluster",
+            .generation_changed => "only force-members changes a group's generation",
+            .next_id_behind => "the next id must stay above every id the group has used",
             .no_voter => "a group needs at least one voter",
             .too_many_members => "the group is full",
             .voters_jump => "voters change one at a time",
@@ -234,9 +282,17 @@ pub const Refusal = enum {
 /// proposer, which takes the new config on disk before it acts and never
 /// counts by the old one again, and no other node can win by the old one.
 /// Proposed by anyone else, the lone voter could go on committing alone
-/// beside the two. A removed id stays out.
+/// beside the two. A removed id stays out. The cluster id and generation stay
+/// as they were, and the next id never goes back, except from no config at
+/// all: a group's founding.
 pub fn checkChange(prev: *const Config, next: *const Config, proposer: u32) ?Refusal {
     if (next.voterCount() == 0) return .no_voter;
+    if (prev.member_count > 0) {
+        if (!std.mem.eql(u8, &prev.cluster_id, &next.cluster_id)) return .other_cluster;
+        if (prev.generation != next.generation) return .generation_changed;
+        if (next.next_id < prev.next_id) return .next_id_behind;
+    }
+    if (!next.nextIdAhead()) return .next_id_behind;
     if (next.member_count > MAX_MEMBERS) return .too_many_members;
     for (next.memberSlice()) |m| {
         if (prev.removedAt(m.id) != null) return .rejoined_removed;
@@ -322,10 +378,16 @@ const testing = std.testing;
 test "membership: a config round-trips, and bytes that are not one are refused" {
     var buf: [MAX_SIZE]u8 = undefined;
     var c = Config.ofVoters(&.{ 3, 1 }).withJoiner(2, true).without(9, 1234);
+    c.cluster_id = @splat(0xab);
+    c.generation = 3;
     const bytes = encode(&c, &buf);
-    try testing.expectEqual(@as(usize, 2 + 3 * 5 + 12), bytes.len);
+    try testing.expectEqual(@as(usize, HEADER_SIZE + 3 * 5 + 12), bytes.len);
     const back = decode(bytes).?;
     try testing.expect(back.eql(&c));
+    try testing.expectEqual(@as(u8, 0xab), back.cluster_id[15]);
+    try testing.expectEqual(@as(u64, 3), back.generation);
+    // Past the removed id too: it was used.
+    try testing.expectEqual(@as(u32, 10), back.next_id);
     try testing.expect(back.isVoter(3) and !back.isVoter(2) and back.names(2));
     try testing.expectEqual(@as(?u64, 1234), back.removedAt(9));
 
@@ -344,12 +406,52 @@ test "membership: a config round-trips, and bytes that are not one are refused" 
     try testing.expect(decode(copy[0 .. good.len - 1]) == null);
     copy[good.len] = 0;
     try testing.expect(decode(copy[0 .. good.len + 1]) == null);
-    copy[6] |= 0x80;
+    copy[HEADER_SIZE + 4] |= 0x80;
     try testing.expect(decode(copy[0..good.len]) == null);
-    copy[6] &= 0x7f;
-    std.mem.writeInt(u32, copy[2..6], 0, .little);
+    copy[HEADER_SIZE + 4] &= 0x7f;
+    std.mem.writeInt(u32, copy[HEADER_SIZE..][0..4], 0, .little);
     try testing.expect(decode(copy[0..good.len]) == null);
     try testing.expect(decode("") == null);
+    // A generation of 0, and a next id not above every id named.
+    var gen0 = Config.ofVoters(&.{ 1, 2 });
+    gen0.generation = 0;
+    try testing.expect(decode(encode(&gen0, &buf)) == null);
+    var behind = Config.ofVoters(&.{ 1, 2 }).without(7, 1);
+    behind.next_id = 7;
+    try testing.expect(decode(encode(&behind, &buf)) == null);
+}
+
+test "membership: a config keeps its cluster and generation, and its next id never goes back" {
+    var a = Config.founding(1, @splat(1));
+    try testing.expectEqual(@as(u32, 2), a.next_id);
+    // Founding: from no config at all.
+    try testing.expectEqual(@as(?Refusal, null), checkChange(&.{}, &a, 1));
+    const joined = a.withJoiner(5, true);
+    try testing.expectEqual(@as(u32, 6), joined.next_id);
+    try testing.expectEqual(@as(?Refusal, null), checkChange(&a, &joined, 1));
+    // Removing the newest id keeps its number used.
+    const left = joined.without(5, 9);
+    try testing.expectEqual(@as(u32, 6), left.next_id);
+    try testing.expectEqual(@as(?Refusal, null), checkChange(&joined, &left, 1));
+
+    var other = joined;
+    other.cluster_id = @splat(2);
+    try testing.expectEqual(@as(?Refusal, .other_cluster), checkChange(&a, &other, 1));
+    var forced = joined;
+    forced.generation = 2;
+    try testing.expectEqual(@as(?Refusal, .generation_changed), checkChange(&a, &forced, 1));
+    var back = joined;
+    back.next_id = 3;
+    try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&joined, &back, 1));
+    // Still above every id it names, but below what the group had reached.
+    var reached = joined;
+    reached.next_id = 20;
+    try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&reached, &joined, 1));
+    a.next_id = 1;
+    try testing.expectEqual(@as(?Refusal, .next_id_behind), checkChange(&.{}, &a, 1));
+    // The largest id can't be passed, and doesn't block.
+    const top = Config.ofVoters(&.{std.math.maxInt(u32)});
+    try testing.expectEqual(@as(?Refusal, null), checkChange(&.{}, &top, 1));
 }
 
 test "membership: voters change one at a time, except a lone voter making two; removed ids stay out" {

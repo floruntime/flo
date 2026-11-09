@@ -2011,7 +2011,8 @@ pub const Shard = struct {
         if (req.key.len > 0 and req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opCreates(@fromBackingInt(@intCast(req.header.op_code)))) {
             switch (self.namespace_handler.prepareWrite(self, req.namespace)) {
                 .go => {},
-                .refused => |r| return self.sendErrorResponse(conn, req.header.request_id, r.status, r.message),
+                // Refused before anything was proposed, so a retry is safe.
+                .refused => |r| return self.sendRefusal(conn, req.header.request_id, r.status, proto.notRun(r.message)),
                 .ensure => return self.ensureThenRun(conn, req, auth.origin),
             }
             if (req.ns_id == .invalid) req.ns_id = self.namespaceIdOf(req);
@@ -2070,7 +2071,7 @@ pub const Shard = struct {
             if (self.origin == .client or self.origin == .admin) return shard.runRequest(conn, req, self.origin);
             switch (nh.prepareWrite(shard, name)) {
                 .go => {},
-                .refused => |r| return shard.sendErrorResponse(conn, request_id, r.status, r.message),
+                .refused => |r| return shard.sendRefusal(conn, request_id, r.status, proto.notRun(r.message)),
                 .ensure => unreachable, // the table has it
             }
             shard.runRequest(conn, req, .held);
@@ -4598,7 +4599,9 @@ pub const Shard = struct {
             },
             .stream_delete => {
                 // The stream is gone on every node that applied this entry;
-                // drop its series here, not in the leader-only handler.
+                // drop its series here, not in the leader-only handler. One
+                // refused for what the stream held changed nothing.
+                if (result.refused() != null) return;
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (self.metrics_registry) |mr| {
                     const ns = self.metricsNamespace(cmd.namespace_id) orelse return;
@@ -6775,7 +6778,9 @@ fn bringUpGroup(raft: *RaftNode, role: ClusterRole, buf: []u8, shard_id: u16, no
                 return error.LostLogFounding;
             }
             try raft.bootstrap();
-            const founding = membership.Config.ofVoters(&.{node_id});
+            var cluster_id: [membership.CLUSTER_ID_LEN]u8 = undefined;
+            try stdx.io.instance().randomSecure(&cluster_id);
+            const founding = membership.Config.founding(node_id, cluster_id);
             switch (try raft.proposeConfig(&founding)) {
                 .proposed => {},
                 else => return error.FoundingRefused,
@@ -7381,6 +7386,22 @@ test "Shard: inbox shutdown message" {
     const processed = shard.drainInbox();
     try std.testing.expectEqual(@as(usize, 1), processed);
     try std.testing.expect(shard.stop_requested.load(.acquire));
+}
+
+test "Shard: a founded cluster gets a random id, at generation 1, its next id past the founder" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var a = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{}, .{});
+    defer a.deinit();
+    var b = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 7, .bootstrap, .{}, .{});
+    defer b.deinit();
+    const ca = a.raft_node.latest_config;
+    const unset: [membership.CLUSTER_ID_LEN]u8 = @splat(0);
+    try std.testing.expect(!std.mem.eql(u8, &unset, &ca.cluster_id));
+    try std.testing.expect(!std.mem.eql(u8, &ca.cluster_id, &b.raft_node.latest_config.cluster_id));
+    try std.testing.expectEqual(@as(u64, 1), ca.generation);
+    try std.testing.expectEqual(@as(u32, 8), ca.next_id);
 }
 
 test "Shard: a first member leads a group of itself from the log; a joiner waits to be named" {
@@ -13538,7 +13559,8 @@ test "Shard: a stream's appends a new leader hasn't applied: a delete is refused
     try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00");
 
     // As a leader finds its predecessor's entry: in its log, not applied, so
-    // the stream looks empty here. Without the refusal the delete goes through.
+    // the stream looks empty here. Without the refusal the delete is proposed, and
+    // only its apply would stop it.
     raft.ready_index = raft.log.lastIndex();
     const last = raft.log.lastIndex();
     try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");
@@ -13549,8 +13571,35 @@ test "Shard: a stream's appends a new leader hasn't applied: a delete is refused
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try std.testing.expect(raft.leaderReady());
     try ParkTest.send(&c.t.shard, c.other, .stream_delete, 3, "s", "");
+    try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), (try c.otherAnswer()).header.status);
-    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a stream delete proposed behind an append not yet applied is refused when it applies, and the record stays" {
+    var c: CondTest = undefined;
+    try c.init();
+    defer c.deinit();
+    const record = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00";
+    // Both proposed before either applies: at propose time the stream is empty.
+    try ParkTest.send(&c.t.shard, c.t.conn, .stream_append, 1, "s", record);
+    try ParkTest.send(&c.t.shard, c.other, .stream_delete, 2, "s", "");
+    try std.testing.expectEqual(@as(u32, 2), c.t.shard.pending_count);
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
+    const refused = try c.otherAnswer();
+    try CondTest.expectConflict(refused, .unclassified);
+    try std.testing.expectEqualStrings(@import("../stream/handler.zig").StreamHandler.NOT_EMPTY_MESSAGE, (try refused.refused()).message);
+    const name_hash = node_router.nameHash(.default, "s");
+    try std.testing.expectEqual(@as(usize, 1), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
+
+    // Forced, it goes whatever the stream holds.
+    var ob: [8]u8 = undefined;
+    var options = proto.OptionsBuilder.init(&ob);
+    try options.addFlag(.force);
+    c.t.shard.runRequest(c.other, try ParkTest.request(.stream_delete, 3, proto.DEFAULT_NAMESPACE, "s", "", options.getOptions()), .client);
+    try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.otherAnswer()).header.status);
+    try std.testing.expectEqual(@as(usize, 0), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
 }
 
 test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then told it finished" {
@@ -13575,8 +13624,8 @@ test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then to
     @memcpy(run_id, started.data);
 
     // What finishes the run: as a new leader finds it, in its log, not applied.
+    // A cancel is answered when it applies, so this one waits for the ack.
     try ParkTest.send(&c.t.shard, c.t.conn, .workflow_cancel, 3, run_id, "first");
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     raft.ready_index = raft.log.lastIndex();
     const last = raft.log.lastIndex();
     try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 4, run_id, "second");
@@ -13584,6 +13633,7 @@ test "Shard: a run a new leader hasn't seen finish: a cancel is refused, then to
     try std.testing.expectEqual(last, raft.log.lastIndex());
 
     try ParkTest.ack(&c.t.shard);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try std.testing.expect(raft.leaderReady());
     try ParkTest.send(&c.t.shard, c.other, .workflow_cancel, 5, run_id, "third");
     try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), (try c.otherAnswer()).header.status);
@@ -13644,6 +13694,31 @@ test "Shard: a leader still applying earlier terms answers a repair, a worker an
     const refused = try c.otherAnswer();
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
     try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, (try refused.refused()).message);
+    try std.testing.expectEqual(last, raft.log.lastIndex());
+}
+
+test "Shard: a write to a namespace a new leader can't create yet is refused as not run, so clients retry it" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [4096]u8 = undefined;
+
+    const raft = shard.raft_node;
+    raft.ready_index = raft.log.lastIndex() + 100;
+    const last = raft.log.lastIndex();
+    var body_buf: [64]u8 = undefined;
+    // KV's writes run on such a leader, but creating their namespace can't.
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "fresh", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "v") }, .client);
+    const refused = try nextAnswer(c, &shard, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.unavailable)), refused.header.status);
+    const why = try refused.refused();
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expectEqualStrings(handler_mod.NamespaceHandler.CATCHING_UP_MESSAGE, why.message);
     try std.testing.expectEqual(last, raft.log.lastIndex());
 }
 
@@ -16876,6 +16951,135 @@ test "a write parked past the halt whose entry a later leader replaces is told t
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
     try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
     try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+}
+
+fn raceTestRun(t: *RaceTest, id: []const u8) *WorkflowHandler.RunRecord {
+    var it = t.shard.workflow_handler.runs.valueIterator();
+    while (it.next()) |r| if (std.mem.eql(u8, r.run_id_owned, id)) return r;
+    @panic("no run with that id");
+}
+
+fn raceTestWaitingRun(t: *RaceTest, buf: []u8, one: []proto.Response) ![]const u8 {
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    t.send(.workflow_create, 40, "flow", def);
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
+    t.send(.workflow_start, 41, "flow", "");
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
+    return one[0].data;
+}
+
+test "a workflow cancel is answered when its entry applies, and the run ends then, not before" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    t.send(.workflow_cancel, 42, id, "");
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(WorkflowHandler.cancelInFlight(&t.shard, run));
+
+    // A signal meanwhile is refused as retryable, and doesn't move it.
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 43, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(u64, 42), one[0].header.request_id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+}
+
+test "a workflow cancel on a leader elected again still holds the run, applies, and counts once" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    t.shard.setMetricsRegistry(&registry);
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    const r = t.shard.raft_node;
+
+    // Two cancels in the window: one run cancelled.
+    t.send(.workflow_cancel, 42, id, "");
+    t.send(.workflow_cancel, 43, id, "");
+    // Elected again, as `becomeLeader` leaves it: its entries kept.
+    r.current_term += 1;
+    r.ready_index = r.log.lastIndex();
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 44, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+
+    // An entry of its own term, so the earlier ones commit with it.
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    try ParkTest.ack(&t.shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    for (two) |a| try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
+    try std.testing.expectEqual(@as(u64, 1), registry.workflow.cancelled_total.load(.monotonic));
+}
+
+test "a workflow cancel whose entry a later leader replaces is told the leader changed, and the run isn't cancelled" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const data = try raceTestWaitingRun(&t, &buf, &one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    const run = raceTestRun(&t, id);
+    const r = t.shard.raft_node;
+    const before = r.log.lastIndex();
+    const term = r.current_term;
+    const prev_term = term;
+
+    t.send(.workflow_cancel, 42, id, "");
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+
+    // Node 2 leads term + 1, replaces the cancel's entry with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, before + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = prev_term, .entries = (&noop)[0..1], .leader_commit = before + 1 });
+    _ = t.shard.applyCommitted();
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(!WorkflowHandler.cancelInFlight(&t.shard, run));
 }
 
 test "an entry stamped no later than the one before it halts its shard" {

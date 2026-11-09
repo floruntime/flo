@@ -29,7 +29,7 @@ pub fn main() !void {
     var conn = client.Client.init(allocator, endpoint);
     defer conn.deinit();
     try conn.connect();
-    var reg = try client.action.register(&conn, "", "bench-act", 0, "", 60_000, 3, null, null);
+    var reg = try client.action.register(&conn, "", "bench-act", "", 60_000, 3);
     if (reg.status != .ok) return error.NotOk;
     reg.deinit();
 

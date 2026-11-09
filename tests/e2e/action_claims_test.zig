@@ -183,7 +183,7 @@ test "e2e/action/claims: a complete from the holder after its lease expired is r
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     // The shortest lease, and attempts left after one expiry.
-    try ctx.exec(&.{ "action", "register", "lapse", "--timeout", "5000", "--retries", "3" });
+    try ctx.exec(&.{ "action", "register", "lapse", "--timeout", "5000", "--max-attempts", "3" });
     var run_buf: [64]u8 = undefined;
     const run = try invoke(try ctx.execCapture(&.{ "action", "invoke", "lapse", "{}" }), &run_buf);
 
@@ -212,7 +212,7 @@ test "e2e/action/claims: a complete from the holder after its lease expired is r
 test "e2e/action/claims: once a run is given to another worker, the first's complete names a delivery since replaced, and is refused" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    try ctx.exec(&.{ "action", "register", "again", "--timeout", "5000", "--retries", "3" });
+    try ctx.exec(&.{ "action", "register", "again", "--timeout", "5000", "--max-attempts", "3" });
     var run_buf: [64]u8 = undefined;
     const run = try invoke(try ctx.execCapture(&.{ "action", "invoke", "again", "{}" }), &run_buf);
 
@@ -367,7 +367,7 @@ test "e2e/action/cluster: a run claimed before its leader is killed stays its wo
     errdefer cluster.printLogs();
     const first = try leaderOf(&cluster, null);
     // A lease long enough to outlast the failover and the new leader's grace.
-    try cluster.execOn(first, &.{ "action", "register", "survive", "--timeout", "60000", "--retries", "3" });
+    try cluster.execOn(first, &.{ "action", "register", "survive", "--timeout", "60000", "--max-attempts", "3" });
     var run_buf: [64]u8 = undefined;
     const invoked = try cluster.execCaptureOn(first, &.{ "action", "invoke", "survive", "{}" });
     defer cluster.allocator.free(invoked);
@@ -415,7 +415,7 @@ test "e2e/action/cluster: after a leader is killed, a lease longer than the new 
     // Longer than the 30 s the new leader's grace is capped at, so the
     // grace ends before the deadline: only the deadline may end the lease.
     const lease_ms = 40_000;
-    try cluster.execOn(first, &.{ "action", "register", "outlast", "--timeout", "40000", "--retries", "3" });
+    try cluster.execOn(first, &.{ "action", "register", "outlast", "--timeout", "40000", "--max-attempts", "3" });
     var run_buf: [64]u8 = undefined;
     const invoked = try cluster.execCaptureOn(first, &.{ "action", "invoke", "outlast", "{}" });
     defer cluster.allocator.free(invoked);

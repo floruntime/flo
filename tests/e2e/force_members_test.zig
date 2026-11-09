@@ -8,6 +8,17 @@ const stdx = @import("stdx");
 const data_format = @import("src").node.data_format;
 const ServerProcess = stdx.testing.ServerProcess;
 const CliRunner = stdx.testing.CliRunner;
+const ClusterContext = stdx.testing.ClusterContext;
+
+/// The line `flo server inspect` prints about a node's cluster: its id,
+/// generation and next id.
+fn clusterLine(allocator: std.mem.Allocator, offline: *CliRunner, server: *ServerProcess) ![]u8 {
+    var inspect = try offline.runRaw(&.{ "server", "inspect", "--config", server.config_file, "--data-dir", server.data_dir });
+    defer inspect.deinit();
+    const at = std.mem.indexOf(u8, inspect.stdout, "cluster:") orelse return error.NoClusterLine;
+    const end = std.mem.indexOfScalarPos(u8, inspect.stdout, at, '\n') orelse inspect.stdout.len;
+    return allocator.dupe(u8, inspect.stdout[at..end]);
+}
 
 test "e2e/cluster: force-members makes a stopped node the only voter and retires its secret, which the server then refuses" {
     const allocator = testing.allocator;
@@ -34,6 +45,9 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     defer inspect.deinit();
     try testing.expect(inspect.stdoutContains("log:         indices 1.."));
     try testing.expect(inspect.stdoutContains("config at index"));
+    const founded = try clusterLine(allocator, offline, node);
+    defer allocator.free(founded);
+    try testing.expect(std.mem.indexOf(u8, founded, ", generation 1,") != null);
 
     // A mistyped path is refused, and not created.
     const missing = try std.fmt.allocPrint(allocator, "{s}/no-such-dir", .{node.data_dir});
@@ -54,6 +68,12 @@ test "e2e/cluster: force-members makes a stopped node the only voter and retires
     var forced = try offline.runRaw(&.{ "server", "force-members", "--config", node.config_file, "--data-dir", node.data_dir, "--yes" });
     defer forced.deinit();
     try testing.expect(forced.stdoutContains("is now the only voter"));
+    // The same cluster, at the next generation.
+    const after_force = try clusterLine(allocator, offline, node);
+    defer allocator.free(after_force);
+    const id_end = std.mem.indexOf(u8, founded, ", generation").?;
+    try testing.expectEqualStrings(founded[0..id_end], after_force[0..id_end]);
+    try testing.expect(std.mem.indexOf(u8, after_force, ", generation 2,") != null);
 
     // The old secret is refused, by name, at the next start (and every
     // later one: the record is on disk).
@@ -124,4 +144,34 @@ test "e2e/cluster: inspect and force-members refuse a data dir of another format
         try testing.expectEqual(@as(u8, 78), refused.exit_code);
         try testing.expectEqualStrings(want, std.mem.trim(u8, refused.stderr, &std.ascii.whitespace));
     }
+}
+
+test "e2e/cluster: every member of a cluster holds its one id, through a restart" {
+    const allocator = testing.allocator;
+    var cluster = try ClusterContext.initDefault(allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "up", "v" }, 40, 250);
+    for (0..3) |n| cluster.allocator.free(try cluster.pollUntilContains(n, &.{ "kv", "get", "up" }, "v", 40, 250));
+    for (0..3) |n| cluster.stopNode(n);
+
+    const offline = try CliRunner.init(allocator, cluster.getServer(0).?.flo_binary, "127.0.0.1:1");
+    defer offline.deinit();
+    const first = try clusterLine(allocator, offline, cluster.getServer(0).?);
+    defer allocator.free(first);
+    const unset = "cluster:     " ++ stdx.repeat("00", 16);
+    try testing.expect(!std.mem.startsWith(u8, first, unset));
+    const id_end = std.mem.indexOf(u8, first, ", generation").?;
+    for (1..3) |n| {
+        const line = try clusterLine(allocator, offline, cluster.getServer(n).?);
+        defer allocator.free(line);
+        try testing.expectEqualStrings(first[0..id_end], line[0..id_end]);
+    }
+
+    for (0..3) |n| try cluster.restartNode(n);
+    try cluster.execOnWithRetry(0, &.{ "kv", "set", "again", "v" }, 40, 250);
+    cluster.stopNode(0);
+    const later = try clusterLine(allocator, offline, cluster.getServer(0).?);
+    defer allocator.free(later);
+    try testing.expectEqualStrings(first[0..id_end], later[0..id_end]);
 }

@@ -155,6 +155,8 @@ pub const Flags = struct {
     pub const COMPRESSED_ZSTD: u16 = 1 << 1;
     pub const HAS_TTL: u16 = 1 << 2;
     pub const TOMBSTONE: u16 = 1 << 3;
+    /// A stream delete given `--force`: it drops the stream whatever it holds.
+    pub const FORCE: u16 = 1 << 4;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

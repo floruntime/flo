@@ -24,26 +24,25 @@ const FixedWireWriter = wire.FixedWireWriter;
 
 /// Register an action.
 /// Wire format in value:
-///   [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
+///   [action_type:u8][timeout_ms:u32][max_attempts:u32][owner_len:u16][owner]
 /// key = action_name.
 pub fn register(
     client: *Client,
     namespace: []const u8,
     action_name: []const u8,
-    action_type: u8,
     owner: []const u8,
-    timeout_ms: ?u32,
-    max_retries: ?u8,
-    _: ?u32, // retry_delay_ms - not persisted yet
-    _: ?[]const u8, // wasm_module_bytes - removed
+    /// The lease; 0 is the server's default.
+    timeout_ms: u32,
+    /// Attempts in all, the first counted; 0 is the server's default.
+    max_attempts: u32,
 ) !Response {
     var value_buf: [1024]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&value_buf);
     const writer = &fbs;
 
-    try writer.writeByte(action_type);
-    try writer.writeInt(u32, timeout_ms orelse 30_000, .little);
-    try writer.writeInt(u32, @as(u32, max_retries orelse 3), .little);
+    try writer.writeByte(0); // action type: the only one
+    try writer.writeInt(u32, timeout_ms, .little);
+    try writer.writeInt(u32, max_attempts, .little);
     const owner_len: u16 = @intCast(@min(owner.len, std.math.maxInt(u16)));
     try writer.writeInt(u16, owner_len, .little);
     try writer.writeAll(owner[0..owner_len]);
@@ -180,8 +179,8 @@ pub fn workerComplete(client: *Client, namespace: []const u8, worker_id: []const
 }
 
 /// Fail task `id`; with `retry` its run is ready again while attempts are left.
-pub fn workerFail(client: *Client, namespace: []const u8, worker_id: []const u8, id: action_ops.TaskId, error_message: []const u8, retry: bool) !Response {
-    return client.call(action_ops.op("action.fail"), namespace, id.run, .{ .action = id.action, .worker = worker_id, .deliveries = id.deliveries, .term = id.term, .index = id.index, .retry = retry, .abandoned = false, .delay_ms = 0, .@"error" = error_message });
+pub fn workerFail(client: *Client, namespace: []const u8, worker_id: []const u8, id: action_ops.TaskId, error_message: []const u8, retry: bool, abandoned: bool, delay_ms: u64) !Response {
+    return client.call(action_ops.op("action.fail"), namespace, id.run, .{ .action = id.action, .worker = worker_id, .deliveries = id.deliveries, .term = id.term, .index = id.index, .retry = retry, .abandoned = abandoned, .delay_ms = delay_ms, .@"error" = error_message });
 }
 
 /// A page of the namespace's workers after `cursor` (empty: from the start).
