@@ -398,3 +398,83 @@ pub fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
     const buf = try view.arena.alloc(u8, 1 + ns.len + k.len);
     return view_mod.key(buf, ns, k) catch unreachable;
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// A model of each kind, in test families.
+const ByName = Model(.{ .ready_id = 2, .ready_name = "t.ready", .deadline_id = 3, .deadline_name = "t.deadline", .request_id = 4, .request_name = "t.request", .scope = "scope", .max_scope = 16, .max_id = 16, .max_namespace = 16, .noun = "run" });
+const ById = Model(.{ .ready_id = 5, .ready_name = "u.ready", .deadline_id = 6, .deadline_name = "u.deadline", .request_id = 7, .request_name = "u.request", .scope = "scope", .max_scope = 8, .max_id = 16, .max_namespace = 16, .ns = .id, .order = "priority", .noun = "message" });
+
+test "delivery model: ready keys sort by order, then due time, then id, and read back" {
+    var a: ById.KeyBuf = undefined;
+    var b: ById.KeyBuf = undefined;
+    // A lower order goes first, however late it is due.
+    const late_first = ById.readyKey(&a, "q0000000", 0, 900, "x");
+    const early_second = ById.readyKey(&b, "q0000000", 1, 100, "a");
+    try testing.expect(std.mem.order(u8, late_first, early_second) == .lt);
+    var c: ById.KeyBuf = undefined;
+    try testing.expect(std.mem.order(u8, ById.readyKey(&c, "q0000000", 1, 99, "z"), early_second) == .lt);
+    try testing.expect(std.mem.startsWith(u8, early_second, ById.orderPrefix(&c, "q0000000", 1)));
+    const back = ById.parseReadyKey(early_second, 8).?;
+    try testing.expectEqual(@as(u64, 100), back.due_ns);
+    try testing.expectEqualStrings("a", back.id);
+    // With no order, a key is the scope, a NUL, the due time and the id.
+    var d: ByName.KeyBuf = undefined;
+    try testing.expectEqualSlices(u8, "send\x00\x00\x00\x00\x00\x00\x00\x00\x07r1", ByName.readyKey(&d, "send", {}, 7, "r1"));
+}
+
+test "delivery model: a deadline key names its namespace by name or by id, and reads back" {
+    var a: ByName.KeyBuf = undefined;
+    const k = ByName.deadlineKey(&a, 42, "ns", "r1");
+    const back = ByName.parseDeadlineKey(k).?;
+    try testing.expectEqual(@as(u64, 42), back.expiry_ns);
+    try testing.expectEqualStrings("ns", back.ns);
+    try testing.expectEqualStrings("r1", back.id);
+    var b: ById.KeyBuf = undefined;
+    const kid = ById.deadlineKey(&b, 42, .of(7), "m1");
+    try testing.expectEqual(@as(usize, 8 + 4 + 2), kid.len);
+    const bid = ById.parseDeadlineKey(kid).?;
+    try testing.expectEqual(NamespaceId.of(7), bid.ns);
+    try testing.expectEqualStrings("m1", bid.id);
+    // The id that names no namespace is no deadline's.
+    try testing.expect(ById.parseDeadlineKey(ById.deadlineKey(&b, 42, .invalid, "m1")) == null);
+    try testing.expect(ByName.parseDeadlineKey("short") == null);
+}
+
+test "delivery model: a stale report says what became of the item, in the family's own word" {
+    const Item = struct { deliveries: u32, token: ae.Token.Value, holder: []const u8, ended: Ended };
+    const tok: ae.Token.Value = .{ .term = 2, .index = 9 };
+    const item: Item = .{ .deliveries = 3, .token = tok, .holder = "w1", .ended = .expired };
+    try testing.expectEqualStrings("stale report: the message was delivered again since", ById.staleWhy(item, "w1", 2, tok));
+    try testing.expectEqualStrings("stale report: the run was delivered again since", ByName.staleWhy(item, "w1", 2, tok));
+    try testing.expectEqualStrings("stale report: another worker holds this delivery", ById.staleWhy(item, "w2", 3, tok));
+    try testing.expectEqualStrings("stale report: the lease expired and the message moved on", ById.staleWhy(item, "w1", 3, tok));
+}
+
+test "delivery model: the duty's walk reads deadlines earliest first and stops at the first not yet due" {
+    var store = store_mod.Store.init(testing.allocator);
+    defer store.deinit();
+    for ([_]u64{ 30, 10, 20, 50 }, 0..) |expiry, i| {
+        var b: ById.KeyBuf = undefined;
+        var kb: [1 + ById.MAX_KEY]u8 = undefined;
+        const id = [_]u8{ 'm', @intCast('0' + i) };
+        const k = try view_mod.key(&kb, "", ById.deadlineKey(&b, expiry, .of(3), &id));
+        var w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer w.deinit();
+        try (Stored(Deadline){ .v = .{ .scope = "q" } }).encode(&w.writer);
+        const rec = try store.allocRecord(k);
+        store.link(ById.Deadlines.ID, rec, try testing.allocator.dupe(u8, w.written()));
+    }
+    var it = ById.pastDue(.{ .store = &store }, 30);
+    var seen: [4]u64 = undefined;
+    var n: usize = 0;
+    while (it.next()) |d| : (n += 1) {
+        seen[n] = d.key.expiry_ns;
+        try testing.expectEqualStrings("q", d.scope);
+    }
+    try testing.expectEqualSlices(u64, &.{ 10, 20, 30 }, seen[0..n]);
+}
+
+const store_mod = @import("store.zig");
