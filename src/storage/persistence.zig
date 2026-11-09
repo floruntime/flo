@@ -249,10 +249,13 @@ pub fn proposeEntry(
     // published, or, on shard 0, proposed ahead of it.
     // This resolves the name a second time, after the edge resolved it
     // into the request's id. Both reads agree because the table and the
-    // shard's maps only grow: nothing deletes a namespace or gives its
-    // name another id. (A leader's pending creates are dropped only when
-    // it stops leading, and then it proposes nothing.) A namespace delete
-    // would have to stamp from the request's id instead.
+    // shard's maps only grow, and nothing deletes a namespace. (A leader's
+    // pending creates are dropped only when it stops leading, and then it
+    // proposes nothing.) The one way a name gets a second id is a shard 0
+    // that lost a create's tail and created the name again; a shard that
+    // still binds the old id refuses the namespace before any write
+    // (`Shard.boundElsewhere`). A namespace delete would have to stamp from
+    // the request's id instead.
     const ns_id = shard.namespaceId(namespace);
     return proposeEntryIn(shard, entry_type, flags, ns_id, key, value);
 }

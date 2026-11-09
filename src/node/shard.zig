@@ -1641,6 +1641,17 @@ pub const Shard = struct {
         }
     }
 
+    /// The id this shard (not 0) bound `req`'s namespace to, when the
+    /// node's table now has the name under another. Only a shard 0 that
+    /// lost a create's tail, and created the name again, gets here: a write
+    /// stamped with the table's id would find no binding at apply and halt
+    /// there, and its data under the old id is out of reach either way.
+    fn boundElsewhere(self: *const Shard, req: proto.Request) ?ns_table.Id {
+        if (self.id == 0 or req.ns_id == .invalid) return null;
+        const bound = self.namespace_handler.idOf(req.namespace) orelse return null;
+        return if (bound == req.ns_id) null else bound;
+    }
+
     /// The id of the namespace `req` names, as the node's table has it.
     fn namespaceIdOf(self: *const Shard, req: proto.Request) ns_table.Id {
         return self.namespaceId(req.namespace);
@@ -2028,6 +2039,12 @@ pub const Shard = struct {
     fn dispatchLocal(self: *Shard, conn: *Connection, req_in: proto.Request, auth: run_mod.Authorized) void {
         var req = req_in;
         if (req.ns_id == .invalid) req.ns_id = self.namespaceIdOf(req);
+        if (self.boundElsewhere(req)) |bound| {
+            var msg: [256]u8 = undefined;
+            const name = if (req.namespace.len == 0) "default" else req.namespace;
+            const text = std.fmt.bufPrint(&msg, "internal error: namespace '{s}' is bound on this shard as id {d}, but the node's namespace table has it as {d}: shard 0 lost the create this shard bound (its log was damaged or salvaged). This shard refuses the namespace; wipe the node and rebuild it", .{ name, bound.int(), req.ns_id.int() }) catch "internal error: this shard binds the namespace under another id than the node's table";
+            return self.sendRefusal(conn, req.header.request_id, .internal_error, proto.notRun(text));
+        }
         // Taken through every check below as an unknown op is, then answered
         // as one, so nothing tells the two apart.
         const internal_from_client = run_mod.internalFromClient(req.header.op_code, auth.origin);
@@ -11616,6 +11633,41 @@ test "Shard: at boot, shard 0 proposes no id another shard has bound, though its
     two.settle();
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), two.namespaces.lookup("fresh"));
     try std.testing.expect(a.halted == null);
+}
+
+test "Shard: a shard that binds a name under an id shard 0 has since given another refuses it, naming why, and doesn't halt" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // Shard 1 bound "gone"; shard 0 lost that create's tail.
+    const lost: u32 = a.namespace_handler.next_id;
+    const P = @import("../protocol/namespace_entries.zig").Bind;
+    var pbuf: [P.max_size]u8 = undefined;
+    var e = entry_mod.buildEntry(.namespace_bind, entry_mod.Flags.NONE, 1, 1, 1, try P.encodeInto(&pbuf, .{ .id = lost, .name = "gone" }));
+    e.header.crc32c = e.computeCrc();
+    var out = persistence_mod.Result{ .index = 1 };
+    try b.namespace_handler.replayEntry(&e, &out);
+    raiseNamespaceIdFloor(&two.shards);
+    // Shard 0 creates the name again, under a new id, and publishes it.
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "gone") == .proposed);
+    two.settle();
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), two.namespaces.lookup("gone"));
+    // A write on shard 1 is refused, not run, and says why.
+    const c = try TestClient.open(b);
+    defer _ = std.c.close(c.pair[1]);
+    var body_buf: [64]u8 = undefined;
+    const last = b.raft_node.log.lastIndex();
+    b.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "gone", .key = "k", .value = try kv_ops.plainSetBody(&body_buf, "v") }, .shard);
+    var buf: [4096]u8 = undefined;
+    const refused = try nextAnswer(c, b, &buf);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.internal_error)), refused.header.status);
+    const why = try refused.refused();
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expect(std.mem.indexOf(u8, why.message, "bound on this shard") != null);
+    try std.testing.expectEqual(last, b.raft_node.log.lastIndex());
+    try std.testing.expect(b.halted == null);
 }
 
 test "Shard: with every namespace id spent, a create is refused as such, not as an internal error" {
