@@ -1773,11 +1773,12 @@ test "runtime: the lock probe sees a lock another process holds, and a free one"
     try std.testing.expect(otherProcessCanLock(path));
 }
 
-/// Keeps freed blocks of one size, poisoned, instead of freeing them, so a
-/// write after free shows as a changed byte; everything else passes through.
+/// Keeps the watched blocks, poisoned, when they are freed, so a write after
+/// free shows as a changed byte; everything else passes through. Watched by
+/// address: other allocations may share a block's size.
 const PoisonFreed = struct {
     backing: std.mem.Allocator,
-    watch_len: usize,
+    watch: [2]usize = .{ 0, 0 },
     kept: [8][]u8 = undefined,
     kept_n: usize = 0,
 
@@ -1804,7 +1805,8 @@ const PoisonFreed = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
         const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
-        if (memory.len == self.watch_len and self.kept_n < self.kept.len and alignment == std.mem.Alignment.of(MetricsRegistry)) {
+        const at = @intFromPtr(memory.ptr);
+        if ((at == self.watch[0] or at == self.watch[1]) and self.kept_n < self.kept.len) {
             @memset(memory, POISON);
             self.kept[self.kept_n] = memory;
             self.kept_n += 1;
@@ -1854,7 +1856,7 @@ test "Runtime: a cluster start that fails after the bulk thread began stops it b
 }
 
 test "Runtime: a cluster member's shutdown writes nothing to its metrics after freeing them, with a peer linked" {
-    var poison: PoisonFreed = .{ .backing = std.testing.allocator, .watch_len = @sizeOf(MetricsRegistry) };
+    var poison: PoisonFreed = .{ .backing = std.testing.allocator };
     const gpa = poison.allocator();
     const secret = "flo-secret-" ++ stdx.repeat("7", 64);
 
@@ -1882,6 +1884,7 @@ test "Runtime: a cluster member's shutdown writes nothing to its metrics after f
     try b.start();
     b_up = true;
 
+    poison.watch = .{ @intFromPtr(a.metrics_registry.?), @intFromPtr(b.metrics_registry.?) };
     var tries: usize = 0;
     while (!a.raft_network.?.isLinked(2) or !b.raft_network.?.isLinked(1)) : (tries += 1) {
         if (tries == 200) return error.NeverLinked;
