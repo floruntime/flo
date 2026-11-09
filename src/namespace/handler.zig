@@ -235,6 +235,13 @@ pub const NamespaceHandler = struct {
     /// Shard 0's leader: the next id it proposes, past the creates it has
     /// in flight, so two creates never take one id.
     next_alloc: u32 = 0,
+    /// Shard 0: past every id another shard of this node has bound, set at
+    /// boot before any shard runs. Data there is keyed by id, so if shard
+    /// 0's log lost the tail that created one, a create reusing it would
+    /// read that shard's old data as its own. Only what this leader
+    /// proposes rises past it: replicas check ids against `next_id` alone,
+    /// which every replica computes alike.
+    id_floor: u32 = 0,
     /// Shard 0: creates applied and not yet on disk, published at the next
     /// flush.
     unpublished: std.ArrayListUnmanaged(Unpublished) = .empty,
@@ -480,7 +487,24 @@ pub const NamespaceHandler = struct {
         return self.names_by_id.get(id);
     }
 
-    /// The id of a namespace this shard knows, by name.
+    /// The highest id this shard has bound or created, or null for none
+    /// past the reserved ones.
+    pub fn highestId(self: *const NamespaceHandler) ?u32 {
+        var top: ?u32 = null;
+        var it = self.names_by_id.keyIterator();
+        while (it.next()) |id| {
+            if (id.int() < ns_table.FIRST_ALLOCATED.int()) continue;
+            top = @max(top orelse 0, id.int());
+        }
+        return top;
+    }
+
+    /// Shard 0: propose no id at or below `id` (`id_floor`).
+    pub fn raiseIdFloor(self: *NamespaceHandler, id: u32) void {
+        std.debug.assert(self.owner);
+        self.id_floor = @max(self.id_floor, id + 1);
+    }
+
     /// The id of a namespace this shard knows, by name: applied, or
     /// proposed by this leader and not yet applied.
     pub fn idOf(self: *const NamespaceHandler, name: []const u8) ?ns_table.Id {
@@ -902,7 +926,7 @@ pub const NamespaceHandler = struct {
     /// choose an id; they check the one given (`applyCreateAt`).
     fn proposeCreate(self: *NamespaceHandler, raft: *RaftNode, name: []const u8) !persistence_mod.ProposeResult {
         std.debug.assert(self.owner);
-        const id: u32 = @max(self.next_id, self.next_alloc);
+        const id: u32 = @max(self.next_id, self.next_alloc, self.id_floor);
         if (id >= ns_table.CAPACITY) return error.NamespacesFull;
         const P = namespace_entries.Create;
         var buf: [P.max_size]u8 = undefined;

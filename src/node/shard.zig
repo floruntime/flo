@@ -7224,6 +7224,17 @@ fn applyRaftConfig(ctx: *anyopaque, entry: *const entry_mod.Entry, _: *persisten
     log.info("Raft: membership committed: {any}, voters {any} (config index {d})", .{ cfg.ids(&ids), cfg.voterIds(&voters), entry.header.index });
 }
 
+/// After every shard of the node has replayed and before any runs: shard
+/// 0 proposes no id another shard has bound. Its own log decides `next_id`,
+/// and a log that lost its tail (damage, salvage) may have forgotten a
+/// create whose id another shard's data is keyed by.
+pub fn raiseNamespaceIdFloor(shards: []Shard) void {
+    if (shards.len == 0) return;
+    for (shards[1..]) |*s| {
+        if (s.namespace_handler.highestId()) |id| shards[0].namespace_handler.raiseIdFloor(id);
+    }
+}
+
 pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
     return @max(RAFT_RING_MIN, @min(hot_buffer_capacity / 4, RAFT_RING_MAX));
 }
@@ -9219,7 +9230,7 @@ fn keyOn(shard: *Shard, ns: ns_table.Id, want: u16, buf: []u8) ![]const u8 {
 /// namespace is routed by it once the create is published.
 fn nextNamespaceId(shard0: *const Shard) ns_table.Id {
     const nh = shard0.namespace_handler;
-    return .of(@max(nh.next_id, nh.next_alloc));
+    return .of(@max(nh.next_id, nh.next_alloc, nh.id_floor));
 }
 
 /// The log index of the first `t` entry in `shard`'s log at or after `from`, or null.
@@ -11418,6 +11429,29 @@ test "Shard: a leader short of memory to note its create or bind proposes neithe
     two.settle();
     try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .namespace_bind, b_last + 1));
     try std.testing.expect(b.halted == null);
+}
+
+test "Shard: at boot, shard 0 proposes no id another shard has bound, though its own log lacks the create" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    // Shard 1 replayed a bind for an id shard 0's log never created (its
+    // tail was lost).
+    const lost: u32 = a.namespace_handler.next_id + 5;
+    const P = @import("../protocol/namespace_entries.zig").Bind;
+    var pbuf: [P.max_size]u8 = undefined;
+    var e = entry_mod.buildEntry(.namespace_bind, entry_mod.Flags.NONE, 1, 1, 1, try P.encodeInto(&pbuf, .{ .id = lost, .name = "gone" }));
+    e.header.crc32c = e.computeCrc();
+    var out = persistence_mod.Result{ .index = 1 };
+    try b.namespace_handler.replayEntry(&e, &out);
+    raiseNamespaceIdFloor(&two.shards);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
+    two.settle();
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), two.namespaces.lookup("fresh"));
+    try std.testing.expect(a.halted == null);
 }
 
 test "Shard: with every namespace id spent, a create is refused as such, not as an internal error" {
