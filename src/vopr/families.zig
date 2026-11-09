@@ -120,7 +120,7 @@ pub const Mutant = enum {
     queue_deliver_wrong_order,
     /// A deliver takes at most one message, whatever its count.
     queue_deliver_short,
-    /// An expire ends only its first item's lease.
+    /// An expire ends only the first live lease it names past due.
     queue_expire_first_only,
     /// A settle also changes a message it doesn't name.
     queue_report_changes_unnamed,
