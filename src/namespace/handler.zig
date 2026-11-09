@@ -430,12 +430,23 @@ pub const NamespaceHandler = struct {
         return std.mem.eql(u8, name, "default");
     }
 
+    /// Room for a create or bind this leader is about to propose, taken
+    /// before it proposes: once proposed, the entry is in the log on every
+    /// replica, and a pending entry lost to memory here would let the next
+    /// write propose the same create again, which halts shard 0 everywhere
+    /// when it applies. Out of memory refuses the propose instead.
+    /// Null when `name` is already pending: the first id stands.
+    fn reservePending(self: *NamespaceHandler, name: []const u8) error{OutOfMemory}!?[]const u8 {
+        if (self.pending_creates.contains(name)) return null;
+        try self.pending_creates.ensureUnusedCapacity(self.allocator, 1);
+        return try self.allocator.dupe(u8, name);
+    }
+
     /// Note a create or bind this leader proposed, with its id, until it
-    /// applies: the writes behind it carry that id.
-    fn notePending(self: *NamespaceHandler, name: []const u8, id: ns_table.Id) void {
-        if (self.pending_creates.contains(name)) return;
-        const owned = self.allocator.dupe(u8, name) catch return;
-        self.pending_creates.put(self.allocator, owned, id) catch self.allocator.free(owned);
+    /// applies: the writes behind it carry that id. `owned` is from
+    /// `reservePending`.
+    fn notePending(self: *NamespaceHandler, owned: ?[]const u8, id: ns_table.Id) void {
+        if (owned) |k| self.pending_creates.putAssumeCapacityNoClobber(k, id);
     }
 
     /// This node stopped leading: its implicit creates may have been
@@ -896,9 +907,11 @@ pub const NamespaceHandler = struct {
         const P = namespace_entries.Create;
         var buf: [P.max_size]u8 = undefined;
         const bytes = P.encodeInto(&buf, .{ .name = name, .id = id }) catch return error.PayloadTooLarge;
+        const owned = try self.reservePending(name);
+        errdefer if (owned) |k| self.allocator.free(k);
         const proposed = try raft.propose(.namespace_create, entry_mod.Flags.NONE, bytes);
         self.next_alloc = id + 1;
-        self.notePending(name, .of(id));
+        self.notePending(owned, .of(id));
         return proposed;
     }
 
@@ -911,8 +924,10 @@ pub const NamespaceHandler = struct {
         const P = namespace_entries.Bind;
         var buf: [P.max_size]u8 = undefined;
         const bytes = P.encodeInto(&buf, .{ .id = id.int(), .name = name }) catch return error.PayloadTooLarge;
+        const owned = try self.reservePending(name);
+        errdefer if (owned) |k| self.allocator.free(k);
         const proposed = try shard.raft_node.propose(.namespace_bind, entry_mod.Flags.NONE, bytes);
-        self.notePending(name, id);
+        self.notePending(owned, id);
         return proposed;
     }
 

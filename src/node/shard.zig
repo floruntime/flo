@@ -11374,6 +11374,48 @@ test "Shard: shard 0 creates no namespace until its leader has applied earlier t
     try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
 }
 
+test "Shard: a leader short of memory to note its create or bind proposes neither, and a retry proposes it once" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const nh = a.namespace_handler;
+    const real = nh.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    nh.allocator = failing.allocator();
+    const last = a.raft_node.log.lastIndex();
+    switch (nh.proposeCreateOn(a.raft_node, "fresh")) {
+        .failed => |err| try std.testing.expectEqual(error.OutOfMemory, err),
+        else => return error.TestUnexpectedResult,
+    }
+    // Nothing logged: a create proposed but not noted would be proposed
+    // again by the next write, and the second halts shard 0 at apply.
+    try std.testing.expectEqual(last, a.raft_node.log.lastIndex());
+    nh.allocator = real;
+    try std.testing.expect(nh.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expect(a.namespace_handler.prepareWrite(a, "fresh") == .go);
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(a, .namespace_create, last + 1));
+    try std.testing.expect(a.halted == null);
+    try std.testing.expect(two.namespaces.lookup("fresh") != null);
+
+    // The same for shard 1's bind.
+    const bh = b.namespace_handler;
+    const b_real = bh.allocator;
+    var b_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    bh.allocator = b_failing.allocator();
+    const b_last = b.raft_node.log.lastIndex();
+    try std.testing.expect(bh.prepareWrite(b, "fresh") == .refused);
+    try std.testing.expectEqual(b_last, b.raft_node.log.lastIndex());
+    bh.allocator = b_real;
+    try std.testing.expect(bh.prepareWrite(b, "fresh") == .go);
+    try std.testing.expect(bh.prepareWrite(b, "fresh") == .go);
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(b, .namespace_bind, b_last + 1));
+    try std.testing.expect(b.halted == null);
+}
+
 test "Shard: with every namespace id spent, a create is refused as such, not as an internal error" {
     var two: TwoShards = undefined;
     try two.init();
