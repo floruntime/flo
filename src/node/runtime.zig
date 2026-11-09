@@ -1613,8 +1613,6 @@ test "Runtime: a shard that cannot boot fails the start with its own error, and 
 /// A shard log of `entries` queue enqueues in `data_dir`, as shard `id` of
 /// `shard_count`, flushed to segments.
 fn writeShardLog(data_dir: []const u8, id: u16, shard_count: u16, entries: usize) !void {
-    const persistence = @import("../storage/persistence.zig");
-    const entry_mod = @import("../storage/ual/entry.zig");
     const pipe_fds = try stdx.io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -1622,7 +1620,7 @@ fn writeShardLog(data_dir: []const u8, id: u16, shard_count: u16, entries: usize
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     for (0..entries) |i| {
-        _ = try persistence.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'x' });
+        _ = try @import("../queue/handler.zig").proposeEnqueue(&shard, "q", "x");
         _ = shard.applyCommitted();
         if (i % 2000 == 1999) try shard.flushSegmentToDisk();
     }

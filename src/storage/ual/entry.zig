@@ -28,7 +28,7 @@
 //!
 //! KV entries declare their payloads in the entry table
 //! (`protocol/kv_entries.zig`). The other key-value commands
-//! (stream_append, queue_enqueue, etc.) use a common "command payload"
+//! (stream_append, ts_write, etc.) use a common "command payload"
 //! layout:
 //!
 //! ```
@@ -77,10 +77,12 @@ pub const EntryType = enum(u8) {
 
     // ── Queue ──
     queue_enqueue = 0x20,
-    queue_ack = 0x21,
-    queue_nack = 0x22,
-    queue_lease = 0x23,
-    queue_purge = 0x24,
+    queue_deliver = 0x21,
+    queue_settle = 0x22,
+    queue_release = 0x23,
+    queue_extend = 0x24,
+    queue_expire = 0x25,
+    queue_purge = 0x26,
 
     // ── TimeSeries ──
     ts_write = 0x30,
@@ -139,7 +141,7 @@ pub const EntryType = enum(u8) {
             .namespace_create, .namespace_bind => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
-            .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
+            .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_commit, .cg_create, .cg_delete => true,
             .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled => true,
@@ -488,7 +490,7 @@ test "entry: buildCommandEntry end-to-end" {
     var payload_buf: [256]u8 = undefined;
 
     const entry = buildCommandEntry(
-        .queue_enqueue,
+        .stream_append,
         Flags.NONE,
         2,
         50,
@@ -524,7 +526,7 @@ test "entry: EntryType hasKeyValue" {
     try std.testing.expect(!EntryType.kv_put.hasKeyValue());
     try std.testing.expect(!EntryType.kv_batch.hasKeyValue());
     try std.testing.expect(EntryType.stream_append.hasKeyValue());
-    try std.testing.expect(EntryType.queue_enqueue.hasKeyValue());
+    try std.testing.expect(!EntryType.queue_enqueue.hasKeyValue());
     try std.testing.expect(EntryType.ts_write.hasKeyValue());
     try std.testing.expect(!EntryType.raft_noop.hasKeyValue());
     try std.testing.expect(!EntryType.raft_config.hasKeyValue());
@@ -578,7 +580,7 @@ test "entry: a command payload with a key near the u16 limit decodes" {
 
 test "entry: an unknown entry type has no command payload" {
     var buf: [64]u8 = undefined;
-    var e = buildCommandEntry(.queue_enqueue, Flags.NONE, 1, 1, 0, .default, "k", "v", &buf).?;
+    var e = buildCommandEntry(.stream_append, Flags.NONE, 1, 1, 0, .default, "k", "v", &buf).?;
     try std.testing.expect(e.commandPayload() != null);
     e.header.entry_type = 0xfe;
     try std.testing.expect(e.commandPayload() == null);

@@ -89,7 +89,6 @@ const stream_proj_mod = @import("../projection/stream.zig");
 const StreamProjection = stream_proj_mod.StreamProjection;
 const StreamID = stream_proj_mod.StreamID;
 const StreamHandler = @import("../stream/handler.zig").StreamHandler;
-const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const TSProjection = @import("../projection/ts.zig").TSProjection;
 const TSHandler = @import("../ts/handler.zig").TSHandler;
@@ -774,7 +773,7 @@ pub const Shard = struct {
 
         const queue_handler = try allocator.create(QueueHandler);
         errdefer allocator.destroy(queue_handler);
-        queue_handler.* = QueueHandler.init(allocator, partition);
+        queue_handler.* = QueueHandler.init(allocator);
 
         const ts_handler = try allocator.create(TSHandler);
         errdefer allocator.destroy(ts_handler);
@@ -786,13 +785,10 @@ pub const Shard = struct {
         namespace_handler.* = try NamespaceHandler.initFor(allocator, shard_id, boot.namespaces);
         errdefer namespace_handler.deinit();
 
-        // Wire the queue projection's namespace resolver to the (stable, heap-allocated)
-        // namespace handler. Done HERE — before replaySegments runs below — so that
-        // queues re-registered during replay resolve their real namespace instead of
-        // falling back to "default". (A namespace's create or bind replays before the
-        // queue_enqueue entries that reference it, so the registry is populated in time.)
-        queue_handler.queue.ns_resolver = resolveQueueNamespace;
-        queue_handler.queue.ns_resolver_ctx = @ptrCast(namespace_handler);
+        // Wire the stream projection's namespace resolver to the (stable,
+        // heap-allocated) namespace handler. Done HERE — before replaySegments
+        // runs below — so that streams re-registered during replay resolve
+        // their real namespace instead of falling back to "default".
         stream_handler.stream.ns_resolver = resolveQueueNamespace;
         stream_handler.stream.ns_resolver_ctx = @ptrCast(namespace_handler);
 
@@ -4553,6 +4549,7 @@ pub const Shard = struct {
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates(self);
         self.actions_handler.stoppedLeading(self);
+        self.queue_handler.stoppedLeading(self);
         self.resolvePending(message);
         // Blocking reads that hand out work belong to the leader: a parked
         // dequeue woken here would take a message from this node's copy
@@ -4827,6 +4824,7 @@ pub const Shard = struct {
                             // Its client is told it didn't run; the shard is
                             // as the repair wants it.
                             self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                            self.queue_handler.skipped(self, &e);
                             continue;
                         }
                         // The leader stamps each entry after the one before it,
@@ -4935,6 +4933,8 @@ pub const Shard = struct {
         // workers woken for a run ready again (once a pass: each wake is a
         // message to every other shard), a workflow told its run ended.
         self.actions_handler.afterApply(self, entry, result);
+        // A dequeue its deliver answers, dequeues woken for messages ready.
+        self.queue_handler.afterApply(self, entry, result);
         if (comptime build_options.test_faults) {
             const leads = self.raft_node.role == .leader and entry.header.term == self.raft_node.current_term;
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
@@ -4993,15 +4993,13 @@ pub const Shard = struct {
                     mr.unregisterStream(ns, cmd.key, 0);
                 }
             },
-            .queue_enqueue => {
-                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-                if (cmd.key.len == 0) return;
+            .queue_enqueue => if (result.refused() == null) {
+                var diag: schema.Diagnostic = .{};
+                const p = @import("../protocol/queue_entries.zig").Enqueue.decodeAll(entry.payload, &diag) catch return;
                 if (self.metrics_registry) |mr| {
-                    const ns = self.metricsNamespace(cmd.namespace_id) orelse return;
-                    // The value carries a 4-byte priority before the message.
-                    const body_len = cmd.value.len -| 4;
-                    if (mr.registerQueue(ns, cmd.key)) |qm| {
-                        qm.recordEnqueue(1, body_len);
+                    const ns = self.metricsNamespace(.of(p.ns)) orelse return;
+                    if (mr.registerQueue(ns, p.queue)) |qm| {
+                        qm.recordEnqueue(1, p.payload.len);
                     } else |_| {}
                 }
             },
@@ -5038,11 +5036,6 @@ pub const Shard = struct {
                 if (cmd.key.len == 0) return;
                 self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
                 self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
-            },
-            .queue_enqueue => {
-                const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-                if (cmd.key.len == 0) return;
-                self.waiter_pool.notify(.queue_dequeue, cmd.key, resolveQueueWaiter, @ptrCast(self));
             },
             else => {},
         }
@@ -5486,6 +5479,14 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
+        // Queue leases past their deadline, on the leader, as for actions.
+        self.task_scheduler.register(
+            "queue_expire",
+            @import("../queue/handler.zig").DUTY_INTERVAL_MS,
+            queueExpireTask,
+            @ptrCast(self),
+        ) catch {};
+
         // Consumer-group PEL sweeper — runs every 1 second. Makes ready
         // pending entries idle past their group's ack_timeout_ms and drops
         // poison entries past max_deliver. Local in-memory PEL mutation only
@@ -5626,6 +5627,13 @@ pub const Shard = struct {
     fn actionTimeoutSweepTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         return self.actions_handler.expireDue(self);
+    }
+
+    /// TaskScheduler callback: on the leader, end queue leases past their
+    /// deadline. Returns how many deadline keys it named.
+    fn queueExpireTask(ctx: *anyopaque) u64 {
+        const self: *Shard = @ptrCast(@alignCast(ctx));
+        return self.queue_handler.expireDue(self);
     }
 
     /// TaskScheduler callback: sweep every consumer group's PEL.
@@ -6799,12 +6807,7 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
                 shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, r.status, r.refusal);
             }
         },
-        .queue_dequeue => {
-            // Queue blocking dequeue timeout → empty messages response (count = 0)
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buf, 0, .little);
-            shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &buf);
-        },
+        .queue_dequeue => QueueHandler.answerEmpty(shard, waiter.reply_to, waiter.request_id),
         // stream_read / action_await / stream_group_read → empty OK response
         .stream_read, .stream_group_read => {
             shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
@@ -6900,55 +6903,6 @@ pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 pub fn wakeGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
     shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
-    return true;
-}
-
-/// Queue waiter resolver: try to dequeue a message.
-/// Returns true if a message was available and sent.
-pub fn resolveQueueWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
-    const shard: *Shard = @ptrCast(@alignCast(ctx));
-    // A leader whose own removal commits stops leading inside the commit,
-    // and applies that batch before the step-down answers its waiters: an
-    // enqueue in it must not be handed out from what is now a follower's
-    // copy while the new leader hands it out too.
-    if (shard.raft_network != null and shard.raft_node.role != .leader) {
-        answerNotLeading(waiter, ctx);
-        return true;
-    }
-    const partition = shard.defaultPartition();
-
-    const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-    partition.queue.expireLeases(now_ns);
-
-    // min_version holds the pre-computed queue_name_hash
-    const queue_name_hash = waiter.min_version;
-    const maybe_result = partition.queue.dequeue(now_ns, queue_name_hash) catch return false;
-    const deq_result = maybe_result orelse return false;
-
-    // Serialize BEFORE auto-ack (ack frees the message payload).
-    const results = [1]@import("../projection/queue.zig").DequeueResult{deq_result};
-    const data = queue_handler_mod.serializeDequeueResultsPub(shard.queue_handler.allocator, &results) catch return false;
-    defer shard.queue_handler.allocator.free(data);
-
-    // Auto-ack: persist a queue_ack entry so the message doesn't reappear
-    // after restart; it names the queue, as any ack does.
-    {
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, deq_result.seq, .little);
-        var queue_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &queue_key, queue_name_hash, .little);
-        // The waiter holds only the queue's hash; its namespace comes from
-        // the queue's registration.
-        const namespace = if (partition.queue.known_queues.get(queue_name_hash)) |meta| meta.namespace else "default";
-
-        // Same contract as the queue handler's dequeue-ack: log, never fail
-        // the dequeue. The ack applies when it commits.
-        _ = persistence_mod.proposeEntry(shard, .queue_ack, entry_mod.Flags.NONE, namespace, &seq_key, &queue_key) catch |err| {
-            if (!shard.quietHalted(err)) log.err("shard {d}: queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ shard.id, deq_result.seq, @errorName(err) });
-        };
-    }
-
-    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, data);
     return true;
 }
 
@@ -7391,14 +7345,15 @@ fn listed(list: []const entry_mod.EntryType, etype: entry_mod.EntryType) bool {
 
 fn routedToProjection(etype: entry_mod.EntryType) bool {
     return switch (projection_router.routeTarget(etype)) {
-        .queue, .ts => true,
+        .ts => true,
         .none, .snapshot => false,
     };
 }
 
-/// The one apply path: the partition (hot ring plus the projections the
-/// router owns: queue and TS), then a contract machine for the types one
-/// owns (KV's), then the registry appliers for every other entry type.
+/// The one apply path: the partition (hot ring plus the projection the
+/// router owns: TS), then a contract machine for the types one owns (KV's,
+/// actions', queues'), then the registry appliers for every other entry
+/// type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").of(entry)) |f| {
@@ -8341,6 +8296,19 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
             return table_run.op("action.await").request.encodeInto(buf, body) catch unreachable;
         },
         .action_complete, .action_fail, .action_touch, .action_deliver => return value,
+        // A dequeue's count and wait from its options, encoded as the op's
+        // body would be but with the wait unbounded, so one past its bound
+        // reaches the server.
+        .queue_dequeue => {
+            if (value.len > 0) return value;
+            const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
+            const ms: u64 = if (opts.findOption(.block_ms)) |o| o.asU32() orelse 0 else 0;
+            const count: u32 = if (opts.findOption(.count)) |o| o.asU32() orelse 1 else 1;
+            const Fields = table_run.op("queue.dequeue").request.field_list;
+            const Wide = schema.Record(&.{ Fields[0], Fields[1], Fields[2], .{ .name = "block_ms", .T = schema.Defaulted(schema.Int(u64), 0) }, Fields[4] });
+            return Wide.encodeInto(buf, .{ .consumer = "", .count = count, .lease_ms = null, .block_ms = ms, .ack = false }) catch unreachable;
+        },
+        .queue_complete, .queue_fail, .queue_touch => return value,
         else => unreachable,
     }
 }
@@ -9806,9 +9774,8 @@ test "Shard: queue.peek shows as many of the next ready messages as its limit as
     var f: MgetGatherFixture = undefined;
     try f.init(8);
     defer f.deinit();
-    const q_hash = node_router.nameHash(.default, "q");
     for (&f.two.shards) |*s| {
-        for ([_][]const u8{ "m1", "m2", "m3" }, 0..) |m, i| _ = try s.defaultPartition().queue.enqueue(i + 1, 0, i + 1, q_hash, m);
+        for ([_][]const u8{ "m1", "m2", "m3" }) |m| try queue_handler_mod.enqueueHere(s, "q", m);
     }
     const a = &f.two.shards[0];
     const Peek = table_run.op("queue.peek");
@@ -9825,7 +9792,7 @@ test "Shard: queue.peek shows as many of the next ready messages as its limit as
     try std.testing.expectEqualStrings("m2", (try it.next()).?.payload);
     try std.testing.expect((try it.next()) == null);
     try std.testing.expect(v.more);
-    for (&f.two.shards) |*s| try std.testing.expectEqual(@as(u64, 3), s.defaultPartition().queue.liveCounts(q_hash).ready);
+    for (&f.two.shards) |*s| try std.testing.expectEqual(@as(u64, 3), (queue_handler_mod.metaOf(s, .default, "q") orelse return error.NoQueue).ready);
     try f.expectSettled(0);
 }
 
@@ -12508,36 +12475,6 @@ test "Shard: ran is no for a parked write whose index another term took, and unk
     }
 }
 
-test "Shard: a nack batch the log fills up partway says it may have run" {
-    var t: RanTest = undefined;
-    try t.init();
-    defer t.deinit();
-    var buf: [512]u8 = undefined;
-    // Two messages in q, committed.
-    var seqs: [2]u64 = undefined;
-    for (&seqs, 0..) |*seq, i| {
-        try ParkTest.send(&t.shard, t.conn, .queue_enqueue, 20 + i, "q", "m");
-        try ParkTest.ack(&t.shard);
-        var one: [1]proto.Response = undefined;
-        try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
-        seq.* = std.mem.readInt(u64, one[0].data[0..8], .little);
-    }
-    // Room for one more entry before the log refuses: the batch's first
-    // nack goes in, its second is refused.
-    const raft = t.shard.raft_node;
-    while (raft.log.lastIndex() - raft.commit_index < raft_node_mod.MAX_OUTSTANDING - 1) {
-        _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, "filler");
-    }
-    var value: [4 + 16]u8 = undefined;
-    std.mem.writeInt(u32, value[0..4], 2, .little);
-    std.mem.writeInt(u64, value[4..12], seqs[0], .little);
-    std.mem.writeInt(u64, value[12..20], seqs[1], .little);
-    try ParkTest.send(&t.shard, t.conn, .queue_fail, 30, "q", &value);
-    const got = try t.refusal(&buf);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), got.status);
-    try std.testing.expectEqual(proto.Ran.unknown, got.r.ran);
-}
-
 test "Shard: a node forwards only writes to its leader; a forwarded read is refused, not run" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -13291,42 +13228,6 @@ test "Shard: a step-down answers parked dequeues unavailable and leaves parked w
     var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(@as(u64, 30), resp.header.request_id);
-    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
-}
-
-test "Shard: an enqueue applied after this node stopped leading wakes a parked dequeue with unavailable, not the message" {
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
-    defer rn.deinit();
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
-    defer shard.deinit();
-    shard.raft_network = &rn;
-    shard.wireHandlerShardPtrs();
-    try ParkTest.joinPeer(&shard);
-
-    var pair: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
-    defer _ = std.c.close(pair[1]);
-    const conn = try shard.addConnection(pair[0]);
-
-    const q_hash = node_router.nameHash(.default, "jobs");
-    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .queue_dequeue, .reply_to = conn.replyTo(), .request_id = 40, .key = "jobs", .min_version = q_hash, .timeout_ms = 60_000 }));
-
-    // The commit that removed this leader also carried an enqueue; it
-    // applies before the step-down runs.
-    shard.raft_node.role = .follower;
-    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, q_hash, "m");
-    shard.waiter_pool.notify(.queue_dequeue, "jobs", resolveQueueWaiter, @ptrCast(&shard));
-
-    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.queue_dequeue));
-    try std.testing.expectEqual(@as(usize, 1), shard.defaultPartition().queue.queueCounts(q_hash).ready);
-    var out: [512]u8 = undefined;
-    const n = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
-    var resp = try proto.Response.parse(out[0..n]);
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
-    try std.testing.expectEqual(@as(u64, 40), resp.header.request_id);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
@@ -14138,6 +14039,16 @@ fn testDataDir(tmp: *std.testing.TmpDir) ![]const u8 {
     return @import("stdx").fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
 }
 
+/// An enqueue to the default namespace's `queue`, as a leader logs it.
+fn testEnqueueEntry(index: u64, queue: []const u8, payload: []const u8) entry_mod.Entry {
+    const S = struct {
+        var payload_buf: [256]u8 = undefined;
+    };
+    var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, 1, index, index * 1000, queue_handler_mod.enqueuePayload(&S.payload_buf, .default, queue, payload));
+    e.header.crc32c = e.computeCrc();
+    return e;
+}
+
 fn testCommandEntry(entry_type: entry_mod.EntryType, index: u64, key: []const u8, value: []const u8) entry_mod.Entry {
     const S = struct {
         var payload_buf: [256]u8 = undefined;
@@ -14184,8 +14095,8 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
-    try w.addEntry(&testCommandEntry(.queue_enqueue, 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
-    try w.addEntry(&testCommandEntry(.queue_enqueue, 3, "q", &[_]u8{ 0, 0, 0, 0, 'B' }));
+    try w.addEntry(&testEnqueueEntry(2, "q", "A"));
+    try w.addEntry(&testEnqueueEntry(3, "q", "B"));
     w.commit_index_at_seal = 2;
     try w.writeToFile(segs);
 
@@ -14196,15 +14107,14 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
-    const q = node_router.nameHash(.default, "q");
     // Index 3 is in the log and nowhere else.
-    try std.testing.expectEqual(@as(u64, 1), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 1), queue_handler_mod.countQueue(&shard, .default, "q"));
     try std.testing.expectEqual(@as(u64, 2), shard.raft_node.last_applied);
     try std.testing.expectEqual(@as(u64, 4), shard.raft_node.log.lastIndex());
     try std.testing.expectEqual(@as(u64, 4), shard.raft_node.commit_index);
 
     shard.applyDeferredTail();
-    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 2), queue_handler_mod.countQueue(&shard, .default, "q"));
     try std.testing.expectEqual(@as(u64, 4), shard.raft_node.last_applied);
 
     // Below the ring the log reads the segments: the wiring, not a stub.
@@ -14213,7 +14123,8 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     var arena: [512]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena).count);
     try std.testing.expectEqual(@as(u64, 3), buf[1].header.index);
-    try std.testing.expectEqualStrings("q", entry_mod.CommandPayload.deserialize(buf[1].payload).?.key);
+    var diag: schema.Diagnostic = .{};
+    try std.testing.expectEqualStrings("q", (try @import("../protocol/queue_entries.zig").Enqueue.decodeAll(buf[1].payload, &diag)).queue);
 }
 
 /// A member's segment, a config naming nodes 1 and 2 then `n` enqueues to
@@ -14229,7 +14140,7 @@ fn writeMemberSegment(data_dir: []const u8, n: u64, mark: u64) !void {
     cfg.header.crc32c = cfg.computeCrc();
     try w.addEntry(&cfg);
     var i: u64 = 0;
-    while (i < n) : (i += 1) try w.addEntry(&testCommandEntry(.queue_enqueue, i + 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+    while (i < n) : (i += 1) try w.addEntry(&testEnqueueEntry(i + 2, "q", "A"));
     w.commit_index_at_seal = mark;
     try w.writeToFile(segs);
     // A member's hard state, so its boot has no vote to confirm first.
@@ -14253,12 +14164,11 @@ test "Shard: with async durability a member's boot applies nothing until a leade
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
-    const q = node_router.nameHash(.default, "q");
     const raft = shard.raft_node;
     try std.testing.expectEqual(@as(u64, 5), raft.log.lastIndex());
     try std.testing.expectEqual(@as(u64, 0), raft.last_applied);
     try std.testing.expectEqual(@as(u64, 0), raft.commit_index);
-    try std.testing.expectEqual(@as(u64, 0), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 0), queue_handler_mod.countQueue(&shard, .default, "q"));
     // The config its segment was sealed under is committed.
     try std.testing.expectEqual(@as(u64, 1), raft.committed_config_index);
     try std.testing.expect(raft.committed_config.isVoter(2));
@@ -14289,7 +14199,7 @@ test "Shard: with async durability a member's boot applies nothing until a leade
     // Committed but not yet applied: still not caught up.
     try std.testing.expect(!shard.coldCaughtUp());
     try std.testing.expect(shard.applyCommitted());
-    try std.testing.expectEqual(@as(u64, 4), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 4), queue_handler_mod.countQueue(&shard, .default, "q"));
     try std.testing.expect(shard.coldCaughtUp());
     try std.testing.expectEqual(health_mod.ShardState.ok, shard.healthState());
     // Once per boot: falling behind again doesn't close it.
@@ -14311,9 +14221,8 @@ test "Shard: with sync durability a member's boot applies what its segments were
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
 
-    const q = node_router.nameHash(.default, "q");
     try std.testing.expectEqual(@as(u64, 5), shard.raft_node.last_applied);
-    try std.testing.expectEqual(@as(u64, 4), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 4), queue_handler_mod.countQueue(&shard, .default, "q"));
     try std.testing.expect(shard.coldCaughtUp());
 }
 
@@ -14352,8 +14261,7 @@ test "Shard: a backlog applies in passes, each ending at its budget" {
         }
     }
     try std.testing.expect(passes >= 3 and passes <= 5);
-    const q = node_router.nameHash(.default, "q");
-    try std.testing.expectEqual(n, shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(n, queue_handler_mod.countQueue(&shard, .default, "q"));
 }
 
 test "Shard: a leader still applying earlier terms' entries refuses the reads it answers from memory" {
@@ -14363,7 +14271,7 @@ test "Shard: a leader still applying earlier terms' entries refuses the reads it
     var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
-    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(.default, "q"), "here");
+    try queue_handler_mod.enqueueHere(&shard, "q", "here");
     const conn_pipe = try @import("stdx").io.pipe();
     defer _ = std.c.close(conn_pipe[1]);
     const conn = try shard.addConnection(conn_pipe[0]);
@@ -14840,8 +14748,8 @@ test "a committed entry the durable log cannot serve fails the drain instead of 
     var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 0, "");
     noop.header.crc32c = noop.computeCrc();
     try w.addEntry(&noop);
-    try w.addEntry(&testCommandEntry(.queue_enqueue, 2, "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
-    try w.addEntry(&testCommandEntry(.queue_enqueue, 3, "q", &[_]u8{ 0, 0, 0, 0, 'B' }));
+    try w.addEntry(&testEnqueueEntry(2, "q", "A"));
+    try w.addEntry(&testEnqueueEntry(3, "q", "B"));
     w.commit_index_at_seal = 2;
     try w.writeToFile(segs);
 
@@ -14857,8 +14765,7 @@ test "a committed entry the durable log cannot serve fails the drain instead of 
     shard.raft_node.log.ual.truncateAfter(2);
     shard.segment_writer.reset();
     try std.testing.expect(!shard.applyCommitted());
-    const q = node_router.nameHash(.default, "q");
-    try std.testing.expectEqual(@as(u64, 2), shard.queue_handler.queue.countQueue(q));
+    try std.testing.expectEqual(@as(u64, 2), queue_handler_mod.countQueue(&shard, .default, "q"));
 }
 
 test "a truncation the previous run recorded is finished before replay" {
@@ -14929,8 +14836,8 @@ test "a restarted node stamps after the last entry its log replays, though its c
         defer shard.deinit();
         shard.wireHandlerShardPtrs();
         shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
-        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
-        last = (try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'B' })).timestamp_ns;
+        _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A'});
+        last = (try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'B'})).timestamp_ns;
         try std.testing.expect(shard.applyCommitted());
     }
 
@@ -14939,7 +14846,7 @@ test "a restarted node stamps after the last entry its log replays, though its c
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
-    const next = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'C' });
+    const next = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'C'});
     try std.testing.expect(next.timestamp_ns > last);
     try std.testing.expect(shard.raft_node.stamp_clock_behind);
 }
@@ -15405,8 +15312,12 @@ const ActionsTest = struct {
     next_id: u64 = 100,
 
     fn init(t: *ActionsTest) !void {
+        return t.initAs(.single);
+    }
+
+    fn initAs(t: *ActionsTest, mode: anytype) !void {
         t.pipe_fds = try @import("stdx").io.pipe();
-        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, mode, .{}, .{});
         t.shard.wireHandlerShardPtrs();
         try std.testing.expect(t.shard.applyCommitted());
         t.c = try TestClient.open(&t.shard);
@@ -15549,6 +15460,503 @@ test "actions: an await retried with its request key gets the task the first got
     try std.testing.expectEqual(first_input, again.input[0..1].*);
     const other = (try t.take("w1", "act", 0, "k2")).?;
     try std.testing.expect(other.index != first_index);
+}
+
+/// The queue ops on a leading shard: `ActionsTest`'s client, with the
+/// requests and answers coded by the op table, and a wall clock a test can
+/// move on.
+const QueuesTest = struct {
+    a: ActionsTest,
+    clock: Clock = .{},
+    rn: ?RaftNetwork = null,
+
+    const Dequeue = table_run.op("queue.dequeue");
+    const Complete = table_run.op("queue.complete");
+    const Fail = table_run.op("queue.fail");
+    const Touch = table_run.op("queue.touch");
+    const Item = @import("../protocol/queue_ops.zig").Item;
+    const Items = schema.List(Item, 100);
+
+    const Clock = struct {
+        ahead_ns: u64 = 0,
+        fn read(ctx: ?*anyopaque) u64 {
+            const c: *Clock = @ptrCast(@alignCast(ctx.?));
+            return @as(u64, @intCast(@max(0, @import("stdx").time.nanoTimestamp()))) + c.ahead_ns;
+        }
+    };
+
+    fn init(t: *QueuesTest) !void {
+        return t.initAs(.single);
+    }
+
+    /// `.bootstrap`, for a test that adds a peer (`withPeer`).
+    fn initAs(t: *QueuesTest, mode: anytype) !void {
+        t.clock = .{};
+        t.rn = null;
+        try t.a.initAs(mode);
+        t.a.shard.raft_node.wall_clock = .{ .ctx = &t.clock, .now_ns = Clock.read };
+    }
+
+    fn deinit(t: *QueuesTest) void {
+        t.a.deinit();
+        if (t.rn) |*rn| rn.deinit();
+    }
+
+    /// From here a peer must ack before anything commits (`ParkTest.ack`),
+    /// so a test can stop between an entry's proposal and its apply.
+    fn withPeer(t: *QueuesTest) !void {
+        t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.a.shard.raft_network = &t.rn.?;
+        try ParkTest.joinPeer(&t.a.shard);
+    }
+
+    /// `op` run on the shard, nothing applied after.
+    fn send(t: *QueuesTest, op: proto.OpCode, body: []const u8) !u64 {
+        t.a.next_id += 1;
+        t.a.shard.runRequest(t.a.c.conn, try ParkTest.request(op, t.a.next_id, proto.DEFAULT_NAMESPACE, "q", body, ""), .client);
+        return t.a.next_id;
+    }
+
+    fn enqueue(t: *QueuesTest, payload: []const u8) !void {
+        _ = try t.a.ok(.queue_enqueue, "q", payload);
+    }
+
+    /// What a dequeue took, copied out of the answer buffer the next call
+    /// reuses.
+    const Got = struct {
+        term: u64,
+        index: u64,
+        count: u32 = 0,
+        seq: [8]u64 = undefined,
+        deliveries: [8]u32 = undefined,
+        payload: [8][16]u8 = undefined,
+        payload_len: [8]usize = undefined,
+
+        fn payloadOf(g: *const Got, i: usize) []const u8 {
+            return g.payload[i][0..g.payload_len[i]];
+        }
+    };
+
+    fn gotOf(data: []const u8) !Got {
+        var diag: schema.Diagnostic = .{};
+        const v = try Dequeue.response.decodeAll(data, &diag);
+        var g: Got = .{ .term = v.term, .index = v.index };
+        var it = v.messages.iterator();
+        while (try it.next()) |m| {
+            g.seq[g.count] = m.seq;
+            g.deliveries[g.count] = m.deliveries;
+            // Its first 16 bytes: enough to tell messages apart.
+            const n = @min(m.payload.len, 16);
+            g.payload_len[g.count] = n;
+            @memcpy(g.payload[g.count][0..n], m.payload[0..n]);
+            g.count += 1;
+        }
+        return g;
+    }
+
+    fn dequeue(t: *QueuesTest, consumer: []const u8, count: u32, lease_ms: ?u64, ack: bool) !Got {
+        var b: [Dequeue.request.max_size]u8 = undefined;
+        const resp = try t.a.ok(.queue_dequeue, "q", try Dequeue.request.encodeInto(&b, .{ .consumer = consumer, .count = count, .lease_ms = lease_ms, .block_ms = 0, .ack = ack }));
+        return gotOf(resp.data);
+    }
+
+    /// The (seq, deliveries) of each message `got` took.
+    fn itemsOf(buf: []u8, got: Got) !Items.Value {
+        var b = Items.Builder.init(buf);
+        for (0..got.count) |i| _ = try b.add(.{ .seq = got.seq[i], .deliveries = got.deliveries[i] });
+        return b.value();
+    }
+
+    fn complete(t: *QueuesTest, consumer: []const u8, got: Got) !Complete.response.Value {
+        var ib: [Items.max_size]u8 = undefined;
+        var b: [Complete.request.max_size]u8 = undefined;
+        const resp = try t.a.ok(.queue_complete, "q", try Complete.request.encodeInto(&b, .{ .consumer = consumer, .term = got.term, .index = got.index, .messages = try itemsOf(&ib, got) }));
+        var diag: schema.Diagnostic = .{};
+        return Complete.response.decodeAll(resp.data, &diag);
+    }
+
+    fn fail(t: *QueuesTest, got: Got, delay_ms: u64, dead: bool) !Fail.response.Value {
+        var ib: [Items.max_size]u8 = undefined;
+        var b: [Fail.request.max_size]u8 = undefined;
+        const resp = try t.a.ok(.queue_fail, "q", try Fail.request.encodeInto(&b, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try itemsOf(&ib, got), .delay_ms = delay_ms, .dead = dead, .@"error" = "boom" }));
+        var diag: schema.Diagnostic = .{};
+        return Fail.response.decodeAll(resp.data, &diag);
+    }
+
+    fn touch(t: *QueuesTest, got: Got) !Touch.response.Value {
+        var ib: [Items.max_size]u8 = undefined;
+        var b: [Touch.request.max_size]u8 = undefined;
+        const resp = try t.a.ok(.queue_touch, "q", try Touch.request.encodeInto(&b, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try itemsOf(&ib, got) }));
+        var diag: schema.Diagnostic = .{};
+        return Touch.response.decodeAll(resp.data, &diag);
+    }
+
+    fn msg(t: *QueuesTest, seq: u64) ?queue_machine.Msg.Value {
+        return queue_handler_mod.msgOf(&t.a.shard, .default, queue_machine.hashOf("q"), seq);
+    }
+
+    fn first(got: Got) !u64 {
+        if (got.count == 0) return error.TestUnexpectedResult;
+        return got.seq[0];
+    }
+};
+
+const queue_machine = @import("../queue/machine.zig");
+
+test "queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.enqueue("b");
+    try t.enqueue("c");
+    const got = try t.dequeue("c1", 2, null, false);
+    try std.testing.expectEqual(@as(u32, 2), got.count);
+    try std.testing.expectEqualStrings("a", got.payloadOf(0));
+    try std.testing.expectEqualStrings("b", got.payloadOf(1));
+    const seq = try QueuesTest.first(got);
+    try std.testing.expectEqual(queue_machine.Status.leased, t.msg(seq).?.status);
+    try std.testing.expectEqualStrings("c1", t.msg(seq).?.holder);
+    // The next dequeue takes what's left, under its own delivery.
+    const rest = try t.dequeue("c2", 2, null, false);
+    try std.testing.expectEqual(@as(u32, 1), rest.count);
+    try std.testing.expect(rest.index != got.index);
+
+    // Another consumer, or another delivery's token, applies to nothing.
+    var r = try t.complete("c2", got);
+    try std.testing.expectEqual(@as(u32, 0), r.applied);
+    try std.testing.expectEqual(@as(u32, 2), r.refused.count);
+    var stale = got;
+    stale.index = rest.index;
+    r = try t.complete("c1", stale);
+    try std.testing.expectEqual(@as(u32, 0), r.applied);
+    var rit = r.refused.iterator();
+    const stale_one = (try rit.next()).?;
+    try std.testing.expectEqual(queue_machine.Why.delivered_again, stale_one.why);
+    try std.testing.expect(std.mem.indexOf(u8, stale_one.reason, "delivered again") != null);
+
+    r = try t.complete("c1", got);
+    try std.testing.expectEqual(@as(u32, 2), r.applied);
+    try std.testing.expect(t.msg(seq) == null);
+    // A resend: the messages are gone, which for a complete means done.
+    r = try t.complete("c1", got);
+    try std.testing.expectEqual(@as(u32, 0), r.applied);
+    rit = r.refused.iterator();
+    try std.testing.expectEqual(queue_machine.Why.gone, (try rit.next()).?.why);
+}
+
+test "queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.enqueue("b");
+    const named = try t.dequeue("c1", 1, 10_000, false);
+    const m = try QueuesTest.first(named);
+    try std.testing.expectEqual(@as(u64, 10_000), t.msg(m).?.lease_ms);
+    const default = try t.dequeue("c1", 1, null, false);
+    try std.testing.expectEqual(@as(u64, 30_000), t.msg(try QueuesTest.first(default)).?.lease_ms);
+
+    // Early: the lease stands, and nothing is logged.
+    const before = t.a.shard.raft_node.log.lastIndex();
+    var tr = try t.touch(named);
+    try std.testing.expectEqual(t.a.shard.raft_node.log.lastIndex(), before);
+    const expiry = t.msg(m).?.expiry_ns;
+    try std.testing.expectEqual(@as(i64, @intCast(expiry / std.time.ns_per_ms)), tr.expires_at_ms);
+    // Past half: a full lease from now.
+    t.clock.ahead_ns = 6 * std.time.ns_per_s;
+    tr = try t.touch(named);
+    try std.testing.expectEqual(@as(u32, 1), tr.applied);
+    try std.testing.expect(t.msg(m).?.expiry_ns > expiry);
+    // Past the new lease and its grace, the duty ends it: the message is
+    // ready again, and a touch of the old delivery is refused. The grace
+    // runs from the duty's first tick in the term.
+    try std.testing.expectEqual(@as(u64, 0), t.a.shard.queue_handler.expireDue(&t.a.shard));
+    t.clock.ahead_ns += 60 * std.time.ns_per_s;
+    _ = t.a.shard.queue_handler.expireDue(&t.a.shard);
+    _ = t.a.shard.applyCommitted();
+    _ = t.a.shard.applyCommitted();
+    try std.testing.expectEqual(queue_machine.Status.ready, t.msg(m).?.status);
+    tr = try t.touch(named);
+    try std.testing.expectEqual(@as(u32, 0), tr.applied);
+    try std.testing.expectEqual(@as(u32, 1), tr.refused.count);
+}
+
+test "queues: a dequeue with block_ms 0 answers at once with none; one that waits is answered when a message is enqueued" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    try t.a.feed(.queue_dequeue, "q", try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+    const waiting = t.a.next_id;
+    t.a.shard.flushToClient(t.a.c.conn.fd);
+    try std.testing.expectEqual(@as(c_int, 0), unreadBytes(t.a.c.pair[1]));
+    try t.a.feed(.queue_enqueue, "q", "woken");
+    _ = t.a.shard.applyCommitted();
+    var rs: [2]proto.Response = undefined;
+    var buf: [4096]u8 = undefined;
+    try ParkTest.responses(&t.a.shard, t.a.c.conn, t.a.c.pair[1], &buf, &rs);
+    const got = for (rs) |r| {
+        if (r.header.request_id == waiting) break r;
+    } else return error.TestUnexpectedResult;
+    const v = try QueuesTest.gotOf(got.data);
+    try std.testing.expectEqualStrings("woken", v.payloadOf(0));
+}
+
+test "queues: a report or purge on a queue the leader doesn't hold logs nothing, answering each message gone, or unavailable for a namespace not known here" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    const got = try t.dequeue("c1", 1, null, false);
+    const before = t.a.shard.raft_node.log.lastIndex();
+    var ib: [QueuesTest.Items.max_size]u8 = undefined;
+    const items = try QueuesTest.itemsOf(&ib, got);
+    var cb: [QueuesTest.Complete.request.max_size]u8 = undefined;
+    var fb: [QueuesTest.Fail.request.max_size]u8 = undefined;
+    var tb: [QueuesTest.Touch.request.max_size]u8 = undefined;
+    const ops_ = [_]struct { op: proto.OpCode, body: []const u8 }{
+        .{ .op = .queue_complete, .body = try QueuesTest.Complete.request.encodeInto(&cb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items }) },
+        .{ .op = .queue_fail, .body = try QueuesTest.Fail.request.encodeInto(&fb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items, .delay_ms = 0, .dead = true, .@"error" = "" }) },
+        .{ .op = .queue_touch, .body = try QueuesTest.Touch.request.encodeInto(&tb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items }) },
+        .{ .op = .queue_purge, .body = "" },
+    };
+    for (ops_) |o| for ([_][]const u8{ "default", "never-made" }) |ns| {
+        t.a.next_id += 1;
+        const frame = try Shard.serializeRequest(std.testing.allocator, testReq(o.op, t.a.next_id, ns, "other", o.body, ""));
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+        _ = t.a.shard.applyCommitted();
+        const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+        const named = std.mem.eql(u8, ns, "default");
+        if (o.op == .queue_purge) {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, resp.data[0..4], .little));
+            continue;
+        }
+        if (!named) {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+            try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+            continue;
+        }
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+        var diag: schema.Diagnostic = .{};
+        const refused = if (o.op == .queue_touch) (try QueuesTest.Touch.response.decodeAll(resp.data, &diag)).refused else (try QueuesTest.Complete.response.decodeAll(resp.data, &diag)).refused;
+        var it = refused.iterator();
+        try std.testing.expectEqual(queue_machine.Why.gone, (try it.next()).?.why);
+    };
+    try std.testing.expectEqual(before, t.a.shard.raft_node.log.lastIndex());
+    try std.testing.expect(t.a.shard.halted == null);
+    // The real queue's message is untouched.
+    try std.testing.expectEqual(queue_machine.Status.leased, t.msg(got.seq[0]).?.status);
+}
+
+test "queues: an enqueue wakes one waiting dequeue per message: the rest keep waiting, and nothing more is logged" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    var waiting: [3]u64 = undefined;
+    for (&waiting, 0..) |*w, i| {
+        const consumer = [_]u8{ 'c', @intCast('0' + i) };
+        try t.a.feed(.queue_dequeue, "q", try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = &consumer, .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+        w.* = t.a.next_id;
+    }
+    const before = t.a.shard.raft_node.log.lastIndex();
+    try t.a.feed(.queue_enqueue, "q", "one");
+    _ = t.a.shard.applyCommitted();
+    // The enqueue and one deliver.
+    try std.testing.expectEqual(before + 2, t.a.shard.raft_node.log.lastIndex());
+    var rs: [2]proto.Response = undefined;
+    var buf: [4096]u8 = undefined;
+    try ParkTest.responses(&t.a.shard, t.a.c.conn, t.a.c.pair[1], &buf, &rs);
+    var answered: usize = 0;
+    for (rs) |r| for (waiting) |w| {
+        if (r.header.request_id == w) {
+            answered += 1;
+            try std.testing.expectEqualStrings("one", (try QueuesTest.gotOf(r.data)).payloadOf(0));
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1), answered);
+    try std.testing.expectEqual(@as(u16, 2), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+    // The duty's wake proposes nothing while nothing is due.
+    _ = t.a.shard.queue_handler.expireDue(&t.a.shard);
+    try std.testing.expectEqual(before + 2, t.a.shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u16, 2), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+}
+
+test "queues: a dequeue with ack whose complete can't be confirmed before a step-down is answered as leased, so its messages are never lost" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.withPeer();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    _ = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 0, .ack = true }));
+    const qh = t.a.shard.queue_handler;
+    try std.testing.expectEqual(@as(usize, 1), qh.pending.items.len);
+    // Its deliver applies, and its complete is proposed, not applied.
+    try ParkTest.ack(&t.a.shard);
+    try std.testing.expectEqual(@as(usize, 1), qh.acking.items.len);
+    qh.stoppedLeading(&t.a.shard);
+    const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const v = try QueuesTest.Dequeue.response.decodeAll(resp.data, &diag);
+    try std.testing.expect(v.expires_at_ms > 0);
+    const got = try QueuesTest.gotOf(resp.data);
+    try std.testing.expectEqualStrings("a", got.payloadOf(0));
+    // The complete commits after all: a later ack of the delivery finds the
+    // message gone, which for a complete means done.
+    try ParkTest.ack(&t.a.shard);
+    try std.testing.expect(t.msg(got.seq[0]) == null);
+    var ib: [QueuesTest.Items.max_size]u8 = undefined;
+    var cb: [QueuesTest.Complete.request.max_size]u8 = undefined;
+    const id = try t.send(.queue_complete, try QueuesTest.Complete.request.encodeInto(&cb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try QueuesTest.itemsOf(&ib, got) }));
+    try ParkTest.ack(&t.a.shard);
+    const done = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(id, done.header.request_id);
+    const r = try QueuesTest.Complete.response.decodeAll(done.data, &diag);
+    var it = r.refused.iterator();
+    try std.testing.expectEqual(queue_machine.Why.gone, (try it.next()).?.why);
+}
+
+test "queues: a dequeue whose deliver a repair skips is told it took nothing, and its claim is released" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.withPeer();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    const id = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 0, .ack = false }));
+    const qh = t.a.shard.queue_handler;
+    const pd = qh.pending.items[0];
+    try std.testing.expectEqual(@as(usize, 1), qh.claimed.count());
+    // As the apply loop passes over a skipped entry.
+    var e = entry_mod.buildEntry(.queue_deliver, entry_mod.Flags.NONE, pd.term, pd.index, 0, "");
+    qh.skipped(&t.a.shard, &e);
+    try std.testing.expectEqual(@as(usize, 0), qh.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), qh.claimed.count());
+    const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(id, resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "queues: a deliver that takes fewer than it claimed wakes the dequeues still waiting" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    // Five messages too large for one answer to carry all of.
+    const big = try std.testing.allocator.alloc(u8, 60_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'm');
+    for (0..5) |_| try t.enqueue(big);
+    try t.withPeer();
+    // One dequeue claims all five; another waits behind its claim.
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    const first_id = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 5, .lease_ms = null, .block_ms = 0, .ack = false }));
+    const waiting = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c2", .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+    try std.testing.expectEqual(@as(u16, 1), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+    // The first takes four, as many as its answer holds; the waiting one is
+    // woken for the fifth.
+    try ParkTest.ack(&t.a.shard);
+    try ParkTest.ack(&t.a.shard);
+    const buf = try std.testing.allocator.alloc(u8, 600_000);
+    defer std.testing.allocator.free(buf);
+    // The first answer is larger than a socket holds at once: flushed and
+    // read until both are in.
+    var total: usize = 0;
+    var rs: [2]proto.Response = undefined;
+    var got_n: usize = 0;
+    var tries: usize = 0;
+    while (got_n < 2 and tries < 10_000) : (tries += 1) {
+        t.a.shard.flushToClient(t.a.c.conn.fd);
+        const n = std.c.recv(t.a.c.pair[1], buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+        if (n > 0) total += @intCast(n);
+        var off: usize = 0;
+        got_n = 0;
+        while (got_n < 2) {
+            const r = proto.Response.parse(buf[off..total]) catch break;
+            rs[got_n] = r;
+            off += @sizeOf(proto.ResponseHeader) + r.data.len;
+            got_n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), got_n);
+    var counts: [2]u32 = .{ 0, 0 };
+    for (rs) |r| {
+        const g = try QueuesTest.gotOf(r.data);
+        if (r.header.request_id == first_id) counts[0] = g.count;
+        if (r.header.request_id == waiting) counts[1] = g.count;
+    }
+    try std.testing.expectEqual([2]u32{ 4, 1 }, counts);
+    try std.testing.expectEqual(@as(u16, 0), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+}
+
+test "queues: an enqueue's delay holds its message back until due, and a dedup key is refused" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var ob_buf: [32]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU64(.delay_ms, 60_000);
+    t.a.next_id += 1;
+    var frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_enqueue, t.a.next_id, "default", "q", "later", ob.getOptions()));
+    _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+    std.testing.allocator.free(frame);
+    _ = t.a.shard.applyCommitted();
+    var resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
+    t.clock.ahead_ns = 61 * std.time.ns_per_s;
+    try std.testing.expectEqualStrings("later", (try t.dequeue("c1", 1, null, false)).payloadOf(0));
+
+    var dd_buf: [32]u8 = undefined;
+    var dd = proto.OptionsBuilder.init(&dd_buf);
+    try dd.addBytes(.dedup_key, "k1");
+    t.a.next_id += 1;
+    frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_enqueue, t.a.next_id, "default", "q", "dup", dd.getOptions()));
+    _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+    std.testing.allocator.free(frame);
+    resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try resp.refused()).message, "dedup_key isn't supported") != null);
+}
+
+test "queues: a dequeue with ack is answered once its complete applies, so nothing comes back" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    const got = try t.dequeue("c1", 1, null, true);
+    try std.testing.expectEqualStrings("a", got.payloadOf(0));
+    // Answered once its complete applied: the message is gone already.
+    try std.testing.expect(t.msg(try QueuesTest.first(got)) == null);
+    try std.testing.expectEqual(@as(u64, 0), queue_handler_mod.countQueue(&t.a.shard, .default, "q"));
+}
+
+test "queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    var got = try t.dequeue("c1", 1, null, false);
+    const seq = try QueuesTest.first(got);
+    var r = try t.fail(got, 60_000, false);
+    try std.testing.expectEqual(@as(u32, 1), r.applied);
+    try std.testing.expectEqual(queue_machine.Status.ready, t.msg(seq).?.status);
+    try std.testing.expectEqualStrings("boom", t.msg(seq).?.@"error");
+    // Not due for a minute: none to take.
+    try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
+    t.clock.ahead_ns = 61 * std.time.ns_per_s;
+    got = try t.dequeue("c1", 1, null, false);
+    try std.testing.expectEqual(@as(u32, 2), got.deliveries[0]);
+    r = try t.fail(got, 0, true);
+    try std.testing.expectEqual(@as(u32, 1), r.applied);
+    try std.testing.expectEqual(queue_machine.Status.dead, t.msg(seq).?.status);
+    try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
 }
 
 test "actions: a fail with retry readies the run after delay_ms, one without retry fails it with its error, and an abandoned one counts no failure" {
@@ -17280,7 +17688,7 @@ const DamageTest = struct {
         var shard = try self.open();
         defer shard.deinit();
         for (0..ENQUEUES) |i| {
-            _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' + @as(u8, @intCast(i)) });
+            _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A' + @as(u8, @intCast(i))});
             try std.testing.expect(shard.applyCommitted());
             try shard.flushSegmentToDisk();
         }
@@ -17345,7 +17753,7 @@ const DamageTest = struct {
     }
 
     fn queued(shard: *Shard) u64 {
-        return shard.queue_handler.queue.countQueue(node_router.nameHash(.default, "q"));
+        return queue_handler_mod.countQueue(shard, .default, "q");
     }
 
     /// Reopen, and expect the shard offline for `path`, having applied the
@@ -17564,7 +17972,7 @@ test "an entry no projection or applier can take halts its shard at it, applying
         try std.testing.expect(shard.offline == null);
         try std.testing.expectEqual(health_mod.ShardState.halted, shard.healthState());
         // Its writes are refused; a membership change still goes in.
-        try std.testing.expectError(error.Halted, persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' }));
+        try std.testing.expectError(error.Halted, queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A'}));
         _ = try shard.raft_node.proposeConfig(&shard.raft_node.latest_config);
         try std.testing.expect(!shard.applyCommitted());
         try std.testing.expectEqual(bad.index - 1, shard.raft_node.last_applied);
@@ -18185,7 +18593,7 @@ test "an entry stamped no later than the one before it halts its shard" {
     var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
-    _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'A' });
+    _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'A'});
     try std.testing.expect(shard.applyCommitted());
     const r = shard.raft_node;
     // An entry no leader would stamp: the same stamp as the one before.
@@ -18331,7 +18739,7 @@ test "a shard halted before a restart comes up halted at the same entry, with no
         defer shard.deinit();
         // Nothing applies a cg_create; an enqueue commits after it.
         halted_at = (try shard.raft_node.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
-        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+        _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'Z'});
         try std.testing.expect(!shard.applyCommitted());
         try std.testing.expectEqual(halted_at, shard.halted.?.index);
         try shard.flushSegmentToDisk();
@@ -18444,7 +18852,7 @@ test "Shard: a committed skip takes a halted shard past its halt, and a restart 
             var shard = try t.open();
             defer shard.deinit();
             h = try c.propose(&shard);
-            _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+            _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'Z'});
             try std.testing.expect(!shard.applyCommitted());
             try std.testing.expectEqual(h, shard.halted.?.index);
             // Proposed while halted: a skip is exempt from the halt.
@@ -18475,7 +18883,7 @@ test "Shard: a shard halted before a restart goes on once a skip commits, as one
         var shard = try t.open();
         defer shard.deinit();
         h = try HaltCase.no_applier.propose(&shard);
-        _ = try persistence_mod.proposeEntry(&shard, .queue_enqueue, entry_mod.Flags.NONE, "", "q", &[_]u8{ 0, 0, 0, 0, 'Z' });
+        _ = try queue_handler_mod.proposeEnqueue(&shard, "q", &[_]u8{'Z'});
         try std.testing.expect(!shard.applyCommitted());
         try shard.flushSegmentToDisk();
     }
@@ -18694,9 +19102,8 @@ test "Shard: a skip stamped out of order replays as it applied live, and the sta
         skip.header.crc32c = skip.computeCrc();
         _ = try r.log.append(&skip);
         // After the skip's stamp, but not after the last applied entry's.
-        const cmd = entry_mod.CommandPayload{ .namespace_id = .default, .key_length = 1, .value_length = 5, .key = "q", .value = &[_]u8{ 0, 0, 0, 0, 'Z' } };
-        var cmd_buf: [64]u8 = undefined;
-        var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, r.current_term, skip.header.index + 1, last - 500, cmd_buf[0..cmd.serialize(&cmd_buf).?]);
+        var q_buf: [64]u8 = undefined;
+        var e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, r.current_term, skip.header.index + 1, last - 500, queue_handler_mod.enqueuePayload(&q_buf, .default, "q", "Z"));
         e.header.crc32c = e.computeCrc();
         _ = try r.log.append(&e);
         r.commit_index = e.header.index;
@@ -19846,7 +20253,7 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     // A type nothing else applies: the machine is its applier.
     try checkAppliersWith(&(listed_now ++ .{Toy.owning(.raft_snapshot)}), 0, &shard.replay_registry);
     // Routed to a projection, or registered by a handler, too: refused.
-    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.queue_enqueue)}), 0, &shard.replay_registry));
+    try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.ts_write)}), 0, &shard.replay_registry));
     try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.stream_append)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
@@ -20263,7 +20670,7 @@ test "Shard: a read the leader answers, on a node that does not lead, waits for 
     defer shard.deinit();
     shard.raft_network = &rn;
     // This node's own copy holds a message: a peek answered here would show it.
-    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(.default, "q"), "here");
+    try queue_handler_mod.enqueueHere(&shard, "q", "here");
 
     var pair: [2]std.posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
@@ -20307,7 +20714,7 @@ test "a halted leader answers a read only it can, marked stale: a halt clears no
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
-    _ = try shard.defaultPartition().queue.enqueue(1, 0, 1, node_router.nameHash(.default, "q"), "kept");
+    try queue_handler_mod.enqueueHere(&shard, "q", "kept");
     haltForTest(&shard, shard.raft_node.log.lastIndex() + 1);
 
     const c = try TestClient.open(&shard);
