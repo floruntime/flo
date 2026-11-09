@@ -1217,6 +1217,15 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
     try testing.expect(tsReadHasPoints(read_result.stdout));
     try testing.expect(read_result.stdoutContains("["));
 
+    // The sink series keeps the source's tags: the source looks them up in
+    // its own namespace, so each sensor's points are its own series here.
+    for ([_][]const u8{ "sensor=A1", "sensor=A2" }) |tag| {
+        var tagged = try ctx.cli.run(&.{ "ts", "read", "derived_temp", "--tags", tag, "-n", "proc_ts2ts", "--from", "0", "--limit", "100", "--output", "json" });
+        defer tagged.deinit();
+        try stdx.testing.assertSucceeded(tagged);
+        try testing.expect(tsReadHasPoints(tagged.stdout));
+    }
+
     // Step 5: Verify derived_temp appears in ts list
     var list_result = try ctx.cli.run(&.{ "ts", "list", "-n", "proc_ts2ts" });
     defer list_result.deinit();

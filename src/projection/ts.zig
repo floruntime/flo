@@ -207,7 +207,10 @@ pub const TsWriteValue = struct {
 
 /// Series keys are namespace-scoped AND tag-scoped:
 ///
-///   [ns_id: u32 LE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
+///   [ns_id: u32 BE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
+///
+/// The prefix is `Id.bytes()`, as on every key below the edge, so the
+/// first four bytes of a key name its namespace the same way everywhere.
 ///
 /// `tag_hash` is a real series dimension (issue #24): points sharing a
 /// measurement+field but carrying different tags live in different series
@@ -413,9 +416,7 @@ fn seriesKeyToString(allocator: Allocator, key: SeriesKey) ![]const u8 {
 }
 
 fn appendSeriesPrefix(allocator: Allocator, buf: *std.ArrayList(u8), ns_id: NamespaceId, measurement: []const u8, field_name: []const u8) !void {
-    var ns_bytes: [NS_PREFIX]u8 = undefined;
-    std.mem.writeInt(u32, &ns_bytes, ns_id.int(), .little);
-    try buf.appendSlice(allocator, &ns_bytes);
+    try buf.appendSlice(allocator, &ns_id.bytes());
     try buf.appendSlice(allocator, measurement);
     try buf.append(allocator, 0);
     try buf.appendSlice(allocator, field_name);
@@ -434,13 +435,13 @@ fn seriesKeyPrefix(allocator: Allocator, ns_id: NamespaceId, measurement: []cons
 }
 
 fn inMeasurement(key: []const u8, ns_id: NamespaceId, measurement: []const u8) bool {
-    return keyNsHash(key) == ns_id.int() and std.mem.eql(u8, keyMeasurement(key), measurement);
+    return keyNsId(key) == ns_id and std.mem.eql(u8, keyMeasurement(key), measurement);
 }
 
-/// Namespace hash from a series key's 4-byte prefix.
-fn keyNsHash(key: []const u8) u32 {
-    if (key.len < NS_PREFIX) return 0;
-    return std.mem.readInt(u32, key[0..NS_PREFIX], .little);
+/// Namespace id from a series key's 4-byte prefix.
+fn keyNsId(key: []const u8) NamespaceId {
+    if (key.len < NS_PREFIX) return .invalid;
+    return .of(std.mem.readInt(u32, key[0..NS_PREFIX], .big));
 }
 
 /// Measurement name from a series key (the bytes after the prefix, up to \x00).
@@ -475,20 +476,22 @@ pub fn keyTagHash(key: []const u8) u64 {
 pub const TSProjection = struct {
     allocator: Allocator,
 
-    /// Write buffers keyed by series key: namespace hash, measurement, field
+    /// Write buffers keyed by series key: namespace id, measurement, field
     /// and tag hash (`seriesKeyToString`).
     buffers: std.StringHashMap(WriteBuffer),
 
     /// Flushed blocks (per series key).
     blocks: std.StringHashMap(std.ArrayList(Block)),
 
-    /// Tag dictionary: `tag_hash` → its canonical tag string (owned).
+    /// Tag dictionary: a namespace's `tag_hash` → its canonical tag string
+    /// (owned). Keyed by namespace too, so one namespace's entry is never
+    /// another's.
     ///
     /// The series key stores only a hash, which can answer exact-set equality
     /// and nothing else. Keeping the string alongside it is what makes partial
     /// matching (`{host=web-01}` against `host=web-01,env=prod`), `!=`, glob
     /// filters, listing a series' tags and `group_by(tag)` possible.
-    tag_dict: std.AutoHashMap(u64, []const u8),
+    tag_dict: std.AutoHashMap(TagKey, []const u8),
 
     /// Buffer capacity (points in write buffer before flush).
     buffer_capacity: usize,
@@ -498,6 +501,8 @@ pub const TSProjection = struct {
 
     /// Stats.
     stats: Stats,
+
+    const TagKey = struct { ns_id: NamespaceId, tag_hash: u64 };
 
     pub const Stats = struct {
         points_inserted: u64 = 0,
@@ -514,7 +519,7 @@ pub const TSProjection = struct {
             .allocator = allocator,
             .buffers = std.StringHashMap(WriteBuffer).init(allocator),
             .blocks = std.StringHashMap(std.ArrayList(Block)).init(allocator),
-            .tag_dict = std.AutoHashMap(u64, []const u8).init(allocator),
+            .tag_dict = std.AutoHashMap(TagKey, []const u8).init(allocator),
             .buffer_capacity = config.buffer_capacity,
             .applied_index = 0,
             .stats = .{},
@@ -566,7 +571,7 @@ pub const TSProjection = struct {
         var canon_buf: [MAX_TAG_STRING]u8 = undefined;
         const canonical = canonicalTagString(tags, &canon_buf);
         const tag_hash: u64 = if (canonical.len == 0) 0 else std.hash.Wyhash.hash(0, canonical);
-        try self.registerTagSet(tag_hash, canonical);
+        try self.registerTagSet(ns_id, tag_hash, canonical);
 
         const series_str = try seriesKeyToString(self.allocator, .{
             .ns_id = ns_id,
@@ -743,7 +748,7 @@ pub const TSProjection = struct {
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
             if (!std.mem.startsWith(u8, key, prefix)) continue;
-            if (!tagsMatch(self.tagsForHash(keyTagHash(key)), preds)) continue;
+            if (!tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds)) continue;
             if (result.points_in_buffer >= point_buf.len) break;
             result.points_in_buffer += kv.value_ptr.queryRange(min_ts, max_ts, point_buf[result.points_in_buffer..]);
         }
@@ -752,7 +757,7 @@ pub const TSProjection = struct {
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
             if (!std.mem.startsWith(u8, key, prefix)) continue;
-            if (!tagsMatch(self.tagsForHash(keyTagHash(key)), preds)) continue;
+            if (!tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds)) continue;
             for (kv.value_ptr.items) |block| {
                 if (block.max_timestamp_ns >= min_ts and block.min_timestamp_ns <= max_ts) {
                     result.blocks_matched += 1;
@@ -787,7 +792,7 @@ pub const TSProjection = struct {
             if (n >= out.len) break;
             const key = kv.key_ptr.*;
             if (!std.mem.startsWith(u8, key, prefix)) continue;
-            out[n] = self.tagsForHash(keyTagHash(key));
+            out[n] = self.tagsForHash(ns_id, keyTagHash(key));
             n += 1;
         }
         return n;
@@ -877,7 +882,7 @@ pub const TSProjection = struct {
         while (it.next()) |kv| {
             if (result_count >= buf.len) break;
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != ns_id.int()) continue;
+            if (keyNsId(key) != ns_id) continue;
             const meas = keyMeasurement(key);
             // Dedup via linear scan (measurement count is typically small)
             var dup = false;
@@ -929,7 +934,7 @@ pub const TSProjection = struct {
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != ns_id.int()) continue;
+            if (keyNsId(key) != ns_id) continue;
             const meas = keyMeasurement(key);
             const i = index.get(meas) orelse continue;
             const c = &out[i];
@@ -953,7 +958,7 @@ pub const TSProjection = struct {
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != ns_id.int() or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
+            if (keyNsId(key) != ns_id or !std.mem.eql(u8, keyMeasurement(key), measurement)) continue;
             total.series += 1;
             const field = keyFieldName(key);
             for (field_buf[0..total.fields]) |seen| {
@@ -986,7 +991,7 @@ pub const TSProjection = struct {
         var it = self.buffers.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            if (keyNsHash(key) != ns_id.int()) continue;
+            if (keyNsId(key) != ns_id) continue;
             _ = try seen.getOrPut(keyMeasurement(key));
         }
 
@@ -1021,7 +1026,7 @@ pub const TSProjection = struct {
     /// Whether `key` is a series of `measurement` in the namespace whose
     /// tags satisfy every predicate.
     fn seriesMatches(self: *const TSProjection, key: []const u8, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) bool {
-        return inMeasurement(key, ns_id, measurement) and tagsMatch(self.tagsForHash(keyTagHash(key)), preds);
+        return inMeasurement(key, ns_id, measurement) and tagsMatch(self.tagsForHash(ns_id, keyTagHash(key)), preds);
     }
 
     /// Whether any series of `measurement` in the namespace matches.
@@ -1202,22 +1207,24 @@ pub const TSProjection = struct {
 
     /// Record a tag set in the dictionary. Idempotent — the first canonical
     /// string wins, so a hash always resolves to one spelling.
-    pub fn registerTagSet(self: *TSProjection, tag_hash: u64, canonical: []const u8) !void {
+    pub fn registerTagSet(self: *TSProjection, ns_id: NamespaceId, tag_hash: u64, canonical: []const u8) !void {
         if (tag_hash == 0 or canonical.len == 0) return;
-        const gop = try self.tag_dict.getOrPut(tag_hash);
+        const key: TagKey = .{ .ns_id = ns_id, .tag_hash = tag_hash };
+        const gop = try self.tag_dict.getOrPut(key);
         if (!gop.found_existing) {
             gop.value_ptr.* = self.allocator.dupe(u8, canonical) catch |e| {
-                _ = self.tag_dict.remove(tag_hash);
+                _ = self.tag_dict.remove(key);
                 return e;
             };
         }
     }
 
-    /// Canonical tag string for a hash. The untagged series (hash 0) resolves
-    /// to "" so predicate matching treats it as "no tags present".
-    pub fn tagsForHash(self: *const TSProjection, tag_hash: u64) []const u8 {
+    /// Canonical tag string for a namespace's tag hash. The untagged series
+    /// (hash 0) resolves to "" so predicate matching treats it as "no tags
+    /// present".
+    pub fn tagsForHash(self: *const TSProjection, ns_id: NamespaceId, tag_hash: u64) []const u8 {
         if (tag_hash == 0) return "";
-        return self.tag_dict.get(tag_hash) orelse "";
+        return self.tag_dict.get(.{ .ns_id = ns_id, .tag_hash = tag_hash }) orelse "";
     }
 };
 
@@ -1464,7 +1471,9 @@ test "ts: series key parsing isolates field from the trailing tag hash" {
     });
     defer testing.allocator.free(key);
 
-    try testing.expectEqual(@as(u32, 0xAABBCCDD), keyNsHash(key));
+    try testing.expectEqual(NamespaceId.of(0xAABBCCDD), keyNsId(key));
+    // The prefix is the id big-endian, as every key below the edge leads.
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD }, key[0..NS_PREFIX]);
     try testing.expectEqualStrings("cpu", keyMeasurement(key));
     // Slicing to the end of the key would drag in \x00 + 8 hash bytes.
     try testing.expectEqualStrings("user", keyFieldName(key));
@@ -1590,8 +1599,10 @@ test "ts: tag dictionary resolves a series' tags, and a tag filter matches by th
     // Written unsorted — the dictionary stores the canonical (sorted) spelling.
     try ts.insert(.of(17), "cpu", "value", 10.0, 1000, 1, "host=web-01,env=prod");
     const h = canonicalTagHash("env=prod,host=web-01");
-    try testing.expectEqualStrings("env=prod,host=web-01", ts.tagsForHash(h));
-    try testing.expectEqualStrings("", ts.tagsForHash(0));
+    try testing.expectEqualStrings("env=prod,host=web-01", ts.tagsForHash(.of(17), h));
+    try testing.expectEqualStrings("", ts.tagsForHash(.of(17), 0));
+    // Another namespace's dictionary has no entry for it.
+    try testing.expectEqualStrings("", ts.tagsForHash(.of(18), h));
 
     var names: [8][]const u8 = undefined;
     const n = try ts.seriesTagsFor(.of(17), "cpu", "value", &names);
@@ -1744,6 +1755,56 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
         const untagged = try ts.queryRange(.of(17), "temp", "value", 0, 0, 10000, &buf);
         try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
     }
+}
+
+test "ts: the same tags and measurement in two namespaces stay apart, live and replayed" {
+    const tags = "sensor=A1,site=x";
+    var vals: [2][256]u8 = undefined;
+    var payloads: [3][512]u8 = undefined;
+    const entries = [_]Entry{
+        entry_mod.buildCommandEntry(.ts_write, 0, 1, 1, 100, .of(17), "temp", TsWriteValue.encode(&vals[0], .{ .value = 1.0, .timestamp_ns = 1000, .field_name = "value", .tags = tags }).?, &payloads[0]).?,
+        entry_mod.buildCommandEntry(.ts_write, 0, 1, 2, 200, .of(18), "temp", TsWriteValue.encode(&vals[1], .{ .value = 2.0, .timestamp_ns = 1000, .field_name = "value", .tags = tags }).?, &payloads[1]).?,
+        entry_mod.buildCommandEntry(.ts_delete, 0, 1, 3, 300, .of(17), "temp", "sensor=A1", &payloads[2]).?,
+    };
+    const a1 = [_]TagPredicate{.{ .key = "sensor", .op = .eq, .value = "A1" }};
+    const h = canonicalTagHash(tags);
+
+    const check = struct {
+        /// The namespace's one point, or none, as a tag-filtered query sees it.
+        fn point(ts: *TSProjection, ns: NamespaceId, want: ?f64) !void {
+            var buf: [4]StoredPoint = undefined;
+            const r = try ts.queryRangeFiltered(ns, "temp", "value", &a1, 0, std.math.maxInt(u64), &buf);
+            if (want) |v| {
+                try testing.expectEqual(@as(usize, 1), r.points_in_buffer);
+                try testing.expectEqual(v, buf[0].field_value);
+            } else try testing.expectEqual(@as(usize, 0), r.points_in_buffer);
+        }
+    };
+
+    // Live: each entry applied in turn.
+    var live = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer live.deinit();
+    try applyTest(&live, &entries[0]);
+    try applyTest(&live, &entries[1]);
+    try testing.expectEqual(@as(usize, 2), live.seriesCount());
+    try testing.expectEqual(@as(u32, 2), live.tag_dict.count());
+    try testing.expectEqualStrings(tags, live.tagsForHash(.of(17), h));
+    try testing.expectEqualStrings(tags, live.tagsForHash(.of(18), h));
+    try check.point(&live, .of(17), 1.0);
+    try check.point(&live, .of(18), 2.0);
+    try applyTest(&live, &entries[2]);
+    try check.point(&live, .of(17), null);
+    try check.point(&live, .of(18), 2.0);
+    try testing.expect(!live.hasSeries(.of(17), "temp", &.{}));
+
+    // Replayed: the whole log into a fresh projection ends the same.
+    var replayed = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer replayed.deinit();
+    for (&entries) |*e| try applyTest(&replayed, e);
+    try check.point(&replayed, .of(17), null);
+    try check.point(&replayed, .of(18), 2.0);
+    try testing.expectEqualStrings(tags, replayed.tagsForHash(.of(18), h));
+    try testing.expectEqual(@as(usize, 1), replayed.seriesCount());
 }
 
 test "ts: a list page's counts come from one pass, each name's its own" {
