@@ -461,11 +461,6 @@ pub const Runtime = struct {
             self.allocator.destroy(ms);
             self.metrics_server = null;
         }
-        if (self.metrics_registry) |metrics| {
-            metrics.deinit();
-            self.allocator.destroy(metrics);
-            self.metrics_registry = null;
-        }
         if (self.health) |h| {
             h.deinit(self.allocator);
             self.allocator.destroy(h);
@@ -545,6 +540,14 @@ pub const Runtime = struct {
 
         if (self.pipe_write_ends) |ends| {
             self.allocator.free(ends);
+        }
+
+        // After everything that records into it: the shards hold it, and the
+        // Raft network's peers set the linked-peers gauge as they close.
+        if (self.metrics_registry) |metrics| {
+            metrics.deinit();
+            self.allocator.destroy(metrics);
+            self.metrics_registry = null;
         }
 
         // Last: everything that writes to the data dir has stopped.
@@ -1701,4 +1704,101 @@ test "runtime: the lock probe sees a lock another process holds, and a free one"
     stdx.fs.closeFile(held);
     // Unheld, the child takes it: what a filesystem that ignores flock looks like.
     try std.testing.expect(otherProcessCanLock(path));
+}
+
+/// Keeps freed blocks of one size, poisoned, instead of freeing them, so a
+/// write after free shows as a changed byte; everything else passes through.
+const PoisonFreed = struct {
+    backing: std.mem.Allocator,
+    watch_len: usize,
+    kept: [8][]u8 = undefined,
+    kept_n: usize = 0,
+
+    const POISON: u8 = 0xdb;
+
+    fn allocator(self: *PoisonFreed) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
+        if (memory.len == self.watch_len and self.kept_n < self.kept.len and alignment == std.mem.Alignment.of(MetricsRegistry)) {
+            @memset(memory, POISON);
+            self.kept[self.kept_n] = memory;
+            self.kept_n += 1;
+            return;
+        }
+        self.backing.rawFree(memory, alignment, ret);
+    }
+
+    /// Whether every kept block is still all poison, then frees them.
+    fn untouched(self: *PoisonFreed) bool {
+        var clean = true;
+        for (self.kept[0..self.kept_n]) |m| {
+            for (m) |b| if (b != POISON) {
+                clean = false;
+                break;
+            };
+            self.backing.rawFree(m, std.mem.Alignment.of(MetricsRegistry), @returnAddress());
+        }
+        self.kept_n = 0;
+        return clean;
+    }
+};
+
+test "Runtime: a cluster member's shutdown writes nothing to its metrics after freeing them, with a peer linked" {
+    var poison: PoisonFreed = .{ .backing = std.testing.allocator, .watch_len = @sizeOf(MetricsRegistry) };
+    const gpa = poison.allocator();
+    const secret = "flo-secret-" ++ stdx.repeat("7", 64);
+
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    const dir_a = try stdx.fs.dirRealpathAlloc(tmp_a.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_a);
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const dir_b = try stdx.fs.dirRealpathAlloc(tmp_b.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_b);
+
+    var a = try Runtime.init(gpa, .{ .num_shards = 1, .listen_port = 0, .data_dir = dir_a, .dashboard_enabled = false, .cluster_enabled = true, .cluster_node_id = 1, .cluster_secret = secret });
+    var a_up = false;
+    defer if (a_up) a.deinit();
+    try a.start();
+    a_up = true;
+    try std.testing.expect(a.metrics_registry != null);
+
+    var seed_buf: [32]u8 = undefined;
+    const seed = try std.fmt.bufPrint(&seed_buf, "127.0.0.1:{d}", .{a.raft_network.?.listen_port});
+    var b = try Runtime.init(gpa, .{ .num_shards = 1, .listen_port = 0, .data_dir = dir_b, .dashboard_enabled = false, .cluster_node_id = 2, .cluster_seeds = &.{seed}, .cluster_secret = secret });
+    var b_up = false;
+    defer if (b_up) b.deinit();
+    try b.start();
+    b_up = true;
+
+    var tries: usize = 0;
+    while (!a.raft_network.?.isLinked(2) or !b.raft_network.?.isLinked(1)) : (tries += 1) {
+        if (tries == 200) return error.NeverLinked;
+        stdx.time.sleep(50 * std.time.ns_per_ms);
+    }
+    b.deinit();
+    b_up = false;
+    a.deinit();
+    a_up = false;
+    try std.testing.expectEqual(@as(usize, 2), poison.kept_n);
+    try std.testing.expect(poison.untouched());
 }
