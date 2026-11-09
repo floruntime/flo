@@ -31,8 +31,8 @@ pub const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 pub const Want = enum {
     /// Being read: hold the read that asked, and make it again once woken.
     pending,
-    /// Not on disk either (below the first segment, or not sealed): the
-    /// reader skips it as before.
+    /// Not in the durable log either (below its first segment): the reader
+    /// skips it as before.
     absent,
     /// Can't be read right now (a resource or IO failure): the held read
     /// answers retryable once its deadline passes.
@@ -94,7 +94,10 @@ pub const DiskReads = struct {
             if (index >= r.start and index < end) return if (state == .queued) .pending else self.landOne(r, index);
         }
         var path_buf: [bulk_io.MAX_PATH]u8 = undefined;
-        const src = (self.dl.sealedSource(index, &path_buf) catch return .blocked) orelse return .absent;
+        // In no sealed segment: still in the writer's buffer, waiting for a
+        // flush (under async durability a burst outruns it), which is read
+        // in place with no I/O; or not in the durable log at all.
+        const src = (self.dl.sealedSource(index, &path_buf) catch return .blocked) orelse return self.readInPlace(index);
         const bulk = self.bulk orelse return self.readInPlace(index);
         const i = self.freeSlot() orelse return .pending;
         if (!self.ensureBuffers(i)) return .blocked;

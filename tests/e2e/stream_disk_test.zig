@@ -9,9 +9,10 @@ const proto = src.protocol.proto;
 const Client = src.cli_client.Client;
 const stream = src.cli_client.stream;
 
-/// About 70 MiB, in appends under the 64 KiB each may carry: past the
-/// partition's 64 MiB hot ring and its 32 MiB warm store.
-const APPENDS = 1200;
+/// About 42 MiB, in appends under the 64 KiB each may carry: past a 2 MiB
+/// hot ring and the 32 MiB warm store. Written faster than async durability
+/// flushes, so the oldest may still be in the segment writer's buffer.
+const APPENDS = 700;
 const RECORD_BYTES = 60 * 1024;
 
 /// A read, retried while it is refused retryable: a payload read back from
@@ -33,7 +34,7 @@ fn recordCount(data: []const u8) !u32 {
 }
 
 test "e2e/stream-disk: records past the warm store are read back from their segments, by plain and group reads" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .tiered_log = .{ .hot_buffer_capacity = 2 * 1024 * 1024 } } });
     defer ctx.deinit();
     var conn = Client.init(testing.allocator, ctx.endpoint);
     defer conn.deinit();
@@ -52,9 +53,15 @@ test "e2e/stream-disk: records past the warm store are read back from their segm
     }
     const record = try testing.allocator.alloc(u8, RECORD_BYTES);
     defer testing.allocator.free(record);
+    var first_seq: ?u64 = null;
+    var first_ts: u64 = 0;
     for (0..APPENDS) |i| {
         @memset(record, @as(u8, @intCast('a' + i % 26)));
-        _ = try stream.append(&conn, "", "s", &.{record}, null);
+        const r = try stream.append(&conn, "", "s", &.{record}, null);
+        if (first_seq == null) {
+            first_seq = r.last_id.sequence;
+            first_ts = r.last_id.timestamp_ms;
+        }
     }
 
     // From the start: the first append's record, read from disk.
@@ -63,7 +70,10 @@ test "e2e/stream-disk: records past the warm store are read back from their segm
     try testing.expectEqual(proto.StatusCode.ok, plain.status);
     // As many whole records as an answer holds: at 60 KiB, one or two.
     try testing.expect(try recordCount(plain.data) >= 1);
-    // [count] then [sequence:u64][timestamp_ms:i64][tier:u8]...
+    // [count] then [sequence:u64][timestamp_ms:i64][tier:u8]...: the very
+    // first record, none skipped, from the durable log.
+    try testing.expectEqual(first_seq.?, std.mem.readInt(u64, plain.data[4..12], .little));
+    try testing.expectEqual(first_ts, std.mem.readInt(u64, plain.data[12..20], .little));
     try testing.expectEqual(@backingInt(proto.StorageTier.disk), plain.data[4 + 8 + 8]);
     try testing.expect(std.mem.indexOf(u8, plain.data, "aaaa") != null);
 

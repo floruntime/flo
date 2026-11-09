@@ -13097,6 +13097,53 @@ test "Shard: a stream record past the hot ring and the warm store is read back f
     try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
 }
 
+test "Shard: a stream record past the warm store but not yet flushed is read from the writer's buffer, not skipped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // A small hot ring, and a warm store that keeps almost nothing.
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, 64 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    shard.defaultPartition().setWarmBudget(4096);
+
+    // One record per append: [count][len][payload][header_count].
+    var batch: [4 + 4 + 2048 + 2]u8 = undefined;
+    std.mem.writeInt(u32, batch[0..4], 1, .little);
+    std.mem.writeInt(u32, batch[4..8], 2048, .little);
+    @memset(batch[8 .. 8 + 2048], 'r');
+    std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
+    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
+    defer std.testing.allocator.free(v);
+    const APPENDS = 100;
+    for (0..APPENDS) |_| {
+        _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+        try std.testing.expect(shard.applyCommitted());
+    }
+
+    // Under async durability a burst outruns the flush: nothing is sealed.
+    try std.testing.expect(shard.durable_log.?.writer.entry_count > 0);
+
+    // From the start: every record, the first ones from the writer's buffer.
+    const handler = shard.stream_handler;
+    var window: waiter_pool_mod.StreamWindow = .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = 10 };
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    const records, const result = handler.readReadable(&window, &buf);
+    defer handler.freeResult(result);
+    try std.testing.expectEqual(@as(usize, 10), records.len);
+    try std.testing.expect(result == .stream_messages);
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, result.stream_messages.data[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
+    // The first record's tier byte says disk: after the count, sequence
+    // and timestamp.
+    try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
+}
+
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
