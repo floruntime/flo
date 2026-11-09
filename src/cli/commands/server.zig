@@ -761,6 +761,7 @@ fn openOffline(ctx: *commander.Context, data_dir: []const u8, lock: *stdx.fs.Fil
     const sum = offline.summarize(ctx.allocator, data_dir) catch |err| {
         stdx.fs.closeFile(lock.*);
         if (err == error.LogReadBlocked) return outcome.localRetryable(ctx, "{s} can't be read right now (a resource failure); run this again", .{data_dir});
+        if (err == error.LogDiskFailing) return outcome.localRetryable(ctx, "{s} can't be read: the disk may be failing; run again once it reads, or replace the disk", .{data_dir});
         return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
     };
     printGroup(ctx, data_dir, 0, &sum);
@@ -892,6 +893,7 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     }
     const sum = offline.summarizeDir(ctx.allocator, dir) catch |err| {
         if (err == error.LogReadBlocked) return outcome.localRetryable(ctx, "{s} can't be read right now (a resource failure); run this again", .{data_dir});
+        if (err == error.LogDiskFailing) return outcome.localRetryable(ctx, "{s} can't be read: the disk may be failing; run again once it reads, or replace the disk", .{data_dir});
         return outcome.localRefusal(ctx, "cannot read shard {d}'s log in {s}: {}", .{ shard, data_dir, err });
     };
     printGroup(ctx, data_dir, shard, &sum);
@@ -899,6 +901,7 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     // would hold what the others don't.
     const group = offline.summarize(ctx.allocator, data_dir) catch |err| {
         if (err == error.LogReadBlocked) return outcome.localRetryable(ctx, "{s} can't be read right now (a resource failure); run this again", .{data_dir});
+        if (err == error.LogDiskFailing) return outcome.localRetryable(ctx, "{s} can't be read: the disk may be failing; run again once it reads, or replace the disk", .{data_dir});
         return outcome.localRefusal(ctx, "cannot read the cluster group in {s}: {}", .{ data_dir, err });
     };
     if (group.member_count > 1) {
@@ -910,7 +913,8 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     const arena = ctx.allocator.alloc(u8, 4 * 1024 * 1024) catch return outcome.localRefusal(ctx, "out of memory", .{});
     defer ctx.allocator.free(arena);
     const halted = offline.entryAt(ctx.allocator, dir, index, arena) catch |err| switch (err) {
-        error.LogReadBlocked => return outcome.localRetryable(ctx, "shard {d}'s entry {d} can't be read right now (a resource or IO failure); run this again", .{ shard, index }),
+        error.LogReadBlocked => return outcome.localRetryable(ctx, "shard {d}'s entry {d} can't be read right now (a resource failure); run this again", .{ shard, index }),
+        error.LogDiskFailing => return outcome.localRetryable(ctx, "shard {d}'s entry {d} can't be read: the disk may be failing; run again once it reads, or replace the disk", .{ shard, index }),
         else => return outcome.localRefusal(ctx, "shard {d}'s log doesn't hold entry {d} (it holds {d}..{d})", .{ shard, index, sum.first_index, sum.last_index }),
     };
     const type_name = std.enums.tagName(@import("../../storage/ual/entry.zig").EntryType, @fromBackingInt(halted.header.entry_type)) orelse "unknown";
@@ -979,6 +983,7 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
         error.LogStartsAfterOne => outcome.localRefusal(ctx, "shard {d}'s log doesn't start at entry 1, and salvage only cuts a log that holds its whole history", .{shard}),
         error.OverlappingSegments => outcome.localRefusal(ctx, "two of shard {d}'s segments hold the same entry with no cut pending, so nothing says which is the log", .{shard}),
         error.LogReadBlocked => outcome.localRetryable(ctx, "a segment of shard {d} can't be read right now (a resource failure), which says nothing about damage; nothing was cut. Run salvage again", .{shard}),
+        error.LogDiskFailing => outcome.localRetryable(ctx, "a segment of shard {d} can't be read, which says nothing about damage; nothing was cut: the disk may be failing; run again once it reads, or replace the disk", .{shard}),
         else => outcome.localRefusal(ctx, "cannot read shard {d}'s log: {}", .{ shard, err }),
     };
     defer r.deinit(ctx.allocator);
@@ -1019,6 +1024,7 @@ fn runSalvage(ctx: *commander.Context) commander.Error!void {
     const cleared = offline.salvage(ctx.allocator, dir, shard, &r, after) catch |err| return switch (err) {
         error.SegmentUnreadable => outcome.localRefusal(ctx, "a segment of shard {d} that holds entries at or below {d} won't read, so nothing was cut; run salvage again with a lower --truncate-after", .{ shard, after }),
         error.ReadBlocked => outcome.localRetryable(ctx, "a segment of shard {d} can't be read right now (a resource failure); nothing was cut. Run salvage again", .{shard}),
+        error.DiskFailing => outcome.localRetryable(ctx, "a segment of shard {d} can't be read; nothing was cut: the disk may be failing; run again once it reads, or replace the disk", .{shard}),
         error.SalvageIncomplete => outcome.localRefusal(ctx, "shard {d}'s log still holds entries after {d} once cut; leave the data directory as it is and report this", .{ shard, after }),
         else => outcome.localRefusal(ctx, "cannot cut shard {d}'s log: {}. The cut is recorded; run salvage again to finish it", .{ shard, err }),
     };

@@ -258,7 +258,11 @@ pub const DurableLog = struct {
                 if (f.unreadable) return error.SegmentUnreadable;
                 // The one file the cut rewrites must read whole.
                 const opened = SegmentReader.initFromFile(self.allocator, f.path) catch |err| {
-                    return if (readBlockClass(err) == .resource) error.ReadBlocked else error.SegmentUnreadable;
+                    return switch (readBlockClass(err)) {
+                        .resource => error.ReadBlocked,
+                        .disk => error.DiskFailing,
+                        .fault => error.SegmentUnreadable,
+                    };
                 };
                 self.allocator.free(opened.buf);
             }

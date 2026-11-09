@@ -92,7 +92,7 @@ pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     var idx = sum.first_index;
     while (idx <= sum.last_index) {
         const r = dl.readRange(idx, &batch, arena);
-        if (r.blocked) return error.LogReadBlocked;
+        if (r.blocked) return if (r.disk_failing) error.LogDiskFailing else error.LogReadBlocked;
         const n = r.count;
         if (n == 0) return error.LogUnreadable;
         for (batch[0..n]) |*e| {
@@ -166,7 +166,7 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     if (hs.lost_log) try hard_state_mod.save(dir, cleared);
 }
 
-pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, LogReadBlocked, IsSkip, NotSkippable, NotHalted };
+pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, LogReadBlocked, LogDiskFailing, IsSkip, NotSkippable, NotHalted };
 
 /// Shard `dir`'s entry at `index`, its payload in `arena`.
 pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena: []u8) !Entry {
@@ -178,7 +178,7 @@ pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena:
     defer dl.deinit();
     var one: [1]Entry = undefined;
     const r = dl.readRange(index, &one, arena);
-    if (r.blocked) return error.LogReadBlocked;
+    if (r.blocked) return if (r.disk_failing) error.LogDiskFailing else error.LogReadBlocked;
     if (r.count != 1 or one[0].header.index != index) return error.NotInLog;
     return one[0];
 }
@@ -304,6 +304,19 @@ pub const Readable = struct {
     }
 };
 
+/// A segment read that failed for a reason that may pass: a resource
+/// failure, or an IO failure the disk may recover from. An operator offered
+/// a cut there could delete committed segments from a whole log, so these
+/// refuse instead; only real damage (a bad header, checksum, short or
+/// missing file) is offered a cut.
+pub fn notNow(err: anyerror) ?anyerror {
+    return switch (durable_log_mod.DurableLog.readBlockClass(err)) {
+        .resource => error.LogReadBlocked,
+        .disk => error.LogDiskFailing,
+        .fault => null,
+    };
+}
+
 /// Read the stopped shard in `dir` for a salvage. Writes nothing.
 pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
     var segs_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -361,7 +374,7 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
         }
         const opened = SegmentReader.initFromFile(allocator, f.path) catch |err| {
             // Not damage: a cut offered on it would drop a whole log.
-            if (durable_log_mod.DurableLog.readBlockClass(err) == .resource) return error.LogReadBlocked;
+            if (notNow(err)) |e| return e;
             r.stop("segment {s} is unreadable ({s})", .{ name, @errorName(err) });
             break;
         };
@@ -397,7 +410,7 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
             continue;
         }
         const opened = SegmentReader.initFromFile(allocator, f.path) catch |err| {
-            if (durable_log_mod.DurableLog.readBlockClass(err) == .resource) return error.LogReadBlocked;
+            if (notNow(err)) |e| return e;
             r.config_unknown = true;
             if (f.holds_skip) r.skips_unread = true;
             continue;
@@ -707,6 +720,18 @@ test "offline: salvage takes a segment it can't read for a resource failure as n
         if (!failing.has_induced_failure) break;
     }
     try testing.expect(blocked);
+}
+
+test "offline: a segment read that fails for a resource or IO failure is refused, never offered a cut; only damage is" {
+    try testing.expectEqual(@as(?anyerror, error.LogReadBlocked), notNow(error.OutOfMemory));
+    try testing.expectEqual(@as(?anyerror, error.LogReadBlocked), notNow(error.ProcessFdQuotaExceeded));
+    // An IO failure may pass on a retry: a cut offered on it would delete
+    // committed segments from a whole log.
+    try testing.expectEqual(@as(?anyerror, error.LogDiskFailing), notNow(error.InputOutput));
+    try testing.expectEqual(@as(?anyerror, error.LogDiskFailing), notNow(error.Unexpected));
+    // Gone or unreadable as written: damage, and a cut may be offered.
+    try testing.expectEqual(@as(?anyerror, null), notNow(error.FileNotFound));
+    try testing.expectEqual(@as(?anyerror, null), notNow(error.AccessDenied));
 }
 
 fn kvEntries(comptime first: u64, comptime n: usize) [n]Entry {
