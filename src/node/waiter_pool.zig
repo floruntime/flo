@@ -167,8 +167,9 @@ pub const Waiter = struct {
 /// A key this long or shorter is held inline; most are.
 const INLINE_KEY = 256;
 
-/// The longest key a waiter holds: a namespace-qualified key.
-pub const MAX_WAITER_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
+/// The longest key a waiter keeps: a KV key as state stores it, its
+/// namespace's id in front, is the longest any kind waits on.
+pub const MAX_WAITER_KEY = @import("../protocol/limits.zig").MAX_KV_KEY;
 
 pub const WaiterPool = struct {
     allocator: std.mem.Allocator,

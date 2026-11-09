@@ -2590,8 +2590,8 @@ pub const Shard = struct {
         defer if (bytes.len > 0) self.allocator.free(bytes);
         const put = KVHandler.SinkPut.decode(bytes) orelse
             return self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
-        if (KVHandler.sinkPropose(self, put.namespace, put.qkey, put.value, put.ttl_ms)) |why| {
-            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.qkey, why);
+        if (KVHandler.sinkPropose(self, put.namespace, put.key, put.value, put.ttl_ms)) |why| {
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.key, why);
         }
     }
 
@@ -4080,12 +4080,15 @@ pub const Shard = struct {
         while (it.next()) |n| {
             // Looked up once: a namespace's metrics never move.
             const km: *KVMetrics = if (kv.publish_to.get(n.ns)) |p| @ptrCast(@alignCast(p)) else blk: {
-                const km = registry.registerKVNamespace(n.ns) catch {
+                const name = self.metricsNamespace(n.ns) orelse {
                     all = false;
                     continue;
                 };
-                const name = self.allocator.dupe(u8, n.ns) catch break :blk km;
-                kv.publish_to.put(self.allocator, name, km) catch self.allocator.free(name);
+                const km = registry.registerKVNamespace(name) catch {
+                    all = false;
+                    continue;
+                };
+                kv.publish_to.put(self.allocator, n.ns, km) catch {};
                 break :blk km;
             };
             km.publishCounts(self.id, n.counts.live, n.counts.bytes, n.counts.history_bytes, n.counts.history_evicted);
@@ -4562,9 +4565,10 @@ pub const Shard = struct {
                 // Every single-key KV entry starts with its key.
                 var diag: schema.Diagnostic = .{};
                 var r: schema.Reader = .{ .bytes = entry.payload, .diag = &diag };
-                const key = kv_entries.Key.decode(&r, "key") catch return;
+                const key = kv_state.Key.ofStored(kv_entries.Key.decode(&r, "key") catch return) orelse return;
                 if (self.metrics_registry) |mr| {
-                    if (mr.registerKVNamespace(kv_state.Qualified.of(key).ns)) |km| switch (etype) {
+                    const ns = self.metricsNamespace(key.ns) orelse return;
+                    if (mr.registerKVNamespace(ns)) |km| switch (etype) {
                         .kv_put => if (result.refused() == null) km.recordSet(),
                         // A delete of nothing is answered and changes nothing.
                         .kv_delete => if (result.refused() == null) {
@@ -4633,8 +4637,12 @@ pub const Shard = struct {
                 var diag: schema.Diagnostic = .{};
                 const batch = kv_entries.Batch.decodeAll(entry.payload, &diag) catch return;
                 var it = batch.ops.iterator();
+                var kb: [limits.MAX_KV_KEY]u8 = undefined;
                 while (it.next() catch return) |op| {
-                    self.waiter_pool.notify(.kv_get, op.key, resolveKVWaiter, @ptrCast(self));
+                    // A waiter keeps the key as state does: the batch's
+                    // namespace in front.
+                    const key = kv_state.Key.init(&kb, .of(batch.ns), op.key);
+                    self.waiter_pool.notify(.kv_get, key.stored, resolveKVWaiter, @ptrCast(self));
                 }
             },
             .stream_append => {

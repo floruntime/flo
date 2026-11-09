@@ -9,8 +9,9 @@
 //!   its history's charge and the versions evicted. Kept by the same
 //!   entries that change the keys, so every replica counts the same.
 //!
-//! An entry names its keys namespace-qualified (`ns\0key`; a bare key is
-//! the default namespace's).
+//! Every key leads with its namespace's id (`id ‖ key`), in every family
+//! and every namespace, so a namespace's keys are one prefix and a key in
+//! one namespace can never be read as another's.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -179,38 +180,47 @@ pub const NsCounts = view_mod.Family(12, "kv.ns_counts", Counts);
 
 // ─── Keys ────────────────────────────────────────────────────────────────
 
-/// A namespace-qualified key split: what precedes its separator, or the
-/// default namespace for a bare key.
-pub const Qualified = struct {
-    ns: []const u8,
-    key: []const u8,
-    /// The qualified key's length: what it counts against its namespace
-    /// beside its value.
-    len: usize,
+pub const NamespaceId = @import("../namespace/table.zig").Id;
 
-    pub fn of(qkey: []const u8) Qualified {
-        const sep = std.mem.indexOfScalar(u8, qkey, 0) orelse return .{ .ns = "default", .key = qkey, .len = qkey.len };
-        return .{ .ns = qkey[0..sep], .key = qkey[sep + 1 ..], .len = qkey.len };
+/// A key in its namespace: the namespace's id, the key the client named,
+/// and the two as state and single-key entries keep them (`id ‖ raw`).
+pub const Key = struct {
+    ns: NamespaceId,
+    raw: []const u8,
+    stored: []const u8,
+
+    /// `raw` in `ns`, its stored form written to `buf`.
+    pub fn init(buf: *[limits.MAX_KV_KEY]u8, ns: NamespaceId, raw: []const u8) Key {
+        return .{ .ns = ns, .raw = raw, .stored = view_mod.idKey(buf, ns, raw) catch unreachable };
     }
 
-    fn keyBytes(q: Qualified) u64 {
-        return q.len;
+    /// A stored key read back, as a single-key entry or a waiter carries
+    /// it; null for one too short to hold an id, or whose id names no
+    /// namespace: no handler writes either.
+    pub fn ofStored(stored: []const u8) ?Key {
+        if (stored.len < ID_BYTES) return null;
+        const ns: NamespaceId = .of(std.mem.readInt(u32, stored[0..ID_BYTES], .big));
+        if (ns == .invalid) return null;
+        return .{ .ns = ns, .raw = stored[ID_BYTES..], .stored = stored };
     }
 };
 
-/// The longest key a family here stores: a qualified key's parts, framed,
-/// and a version.
-pub const MAX_KEY = 1 + limits.MAX_NAMESPACE_NAME + 2 + limits.MAX_QUALIFIED_KEY + 8;
+const ID_BYTES = limits.NAMESPACE_ID_BYTES;
 
-pub fn valueKey(buf: []u8, q: Qualified) []const u8 {
-    return view_mod.key(buf, q.ns, q.key) catch unreachable;
+/// The longest key a family here stores: a stored key's id, the raw key
+/// framed, and a version.
+pub const MAX_KEY = ID_BYTES + 2 + limits.MAX_QUALIFIED_KEY + 8;
+
+/// `k` in `kv.value`: its stored form.
+pub fn valueKey(k: Key) []const u8 {
+    return k.stored;
 }
 
-/// The prefix of `q`'s versions in `kv.history`: its key, length-framed so
-/// no other key's versions share it.
-pub fn historyPrefix(buf: []u8, q: Qualified) []const u8 {
+/// The prefix of `k`'s versions in `kv.history`: its namespace's id, then
+/// its key length-framed, so no other key's versions share it.
+pub fn historyPrefix(buf: []u8, k: Key) []const u8 {
     var framed: [2 + limits.MAX_QUALIFIED_KEY]u8 = undefined;
-    return view_mod.key(buf, q.ns, frame(&framed, q.key)) catch unreachable;
+    return view_mod.idKey(buf, k.ns, frame(&framed, k.raw)) catch unreachable;
 }
 
 fn frame(buf: []u8, k: []const u8) []const u8 {
@@ -219,42 +229,56 @@ fn frame(buf: []u8, k: []const u8) []const u8 {
     return buf[0 .. 2 + k.len];
 }
 
-/// `q`'s version `version` in `kv.history`. Big-endian, so versions sort
+/// `k`'s version `version` in `kv.history`. Big-endian, so versions sort
 /// oldest first.
-pub fn historyKey(buf: []u8, q: Qualified, version: u64) []const u8 {
-    const prefix = historyPrefix(buf, q);
+pub fn historyKey(buf: []u8, k: Key, version: u64) []const u8 {
+    const prefix = historyPrefix(buf, k);
     std.mem.writeInt(u64, buf[prefix.len..][0..8], version, .big);
     return buf[0 .. prefix.len + 8];
 }
 
-pub fn countsKey(buf: []u8, ns: []const u8) []const u8 {
-    return view_mod.key(buf, ns, "") catch unreachable;
+/// A namespace's counts in `kv.ns_counts`: its id alone.
+pub fn countsKey(buf: []u8, ns: NamespaceId) []const u8 {
+    return view_mod.idKey(buf, ns, "") catch unreachable;
 }
 
-fn declare(out: *KeySet, qkey: []const u8) error{OutOfMemory}!void {
-    const q = Qualified.of(qkey);
+/// The namespace a `kv.ns_counts` key names.
+pub fn countsNamespace(key: []const u8) NamespaceId {
+    return .of(std.mem.readInt(u32, key[0..ID_BYTES], .big));
+}
+
+fn declare(out: *KeySet, k: Key) error{OutOfMemory}!void {
     var framed: [2 + limits.MAX_QUALIFIED_KEY]u8 = undefined;
-    try out.add(Values.ID, q.ns, q.key);
-    out.addRange(History.ID, q.ns, frame(&framed, q.key)) catch |err| switch (err) {
+    try out.addIn(Values.ID, k.ns, k.raw);
+    out.addRangeIn(History.ID, k.ns, frame(&framed, k.raw)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // A key with no namespace: apply halts on it before touching anything.
-        error.NoNamespace => {},
+        // `Key.ofStored` and a batch's decode refuse the id 0 first.
+        error.NoNamespace => unreachable,
     };
-    try out.add(NsCounts.ID, q.ns, "");
+    try out.addIn(NsCounts.ID, k.ns, "");
+}
+
+/// A single-key entry's key, or nothing to declare: apply halts on a key
+/// with no namespace before touching anything.
+fn declareStored(out: *KeySet, stored: []const u8) error{OutOfMemory}!void {
+    try declare(out, Key.ofStored(stored) orelse return);
 }
 
 fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     var diag: schema.Diagnostic = .{};
     switch (@as(entry_mod.EntryType, @fromBackingInt(@intCast(e.header.entry_type)))) {
-        .kv_put => try declare(out, (kv_entries.Put.decodeAll(e.payload, &diag) catch return).key),
-        .kv_delete => try declare(out, (kv_entries.Delete.decodeAll(e.payload, &diag) catch return).key),
-        .kv_incr => try declare(out, (kv_entries.Incr.decodeAll(e.payload, &diag) catch return).key),
-        .kv_expire => try declare(out, (kv_entries.Expire.decodeAll(e.payload, &diag) catch return).key),
-        .kv_json_patch => try declare(out, (kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return).key),
+        .kv_put => try declareStored(out, (kv_entries.Put.decodeAll(e.payload, &diag) catch return).key),
+        .kv_delete => try declareStored(out, (kv_entries.Delete.decodeAll(e.payload, &diag) catch return).key),
+        .kv_incr => try declareStored(out, (kv_entries.Incr.decodeAll(e.payload, &diag) catch return).key),
+        .kv_expire => try declareStored(out, (kv_entries.Expire.decodeAll(e.payload, &diag) catch return).key),
+        .kv_json_patch => try declareStored(out, (kv_entries.JsonPatch.decodeAll(e.payload, &diag) catch return).key),
         .kv_batch => {
             const batch = kv_entries.Batch.decodeAll(e.payload, &diag) catch return;
+            const ns: NamespaceId = .of(batch.ns);
+            if (ns == .invalid) return;
             var it = batch.ops.iterator();
-            while (it.next() catch return) |op| try declare(out, op.key);
+            var kb: [limits.MAX_KV_KEY]u8 = undefined;
+            while (it.next() catch return) |op| try declare(out, .init(&kb, ns, op.key));
         },
         else => {},
     }
@@ -283,12 +307,10 @@ const Stamp = struct {
     }
 };
 
-/// `qkey` split, or a halt for a key with no namespace (`\x00key`): no
+/// A single-key entry's key, or a halt for one with no namespace: no
 /// handler writes one, and its keys couldn't be declared.
-fn split(qkey: []const u8) ApplyError!Qualified {
-    const q = Qualified.of(qkey);
-    if (q.ns.len == 0) return error.Halt;
-    return q;
+fn split(stored: []const u8) ApplyError!Key {
+    return Key.ofStored(stored) orelse error.Halt;
 }
 
 /// Answers: put, the key's version; delete, whether the key was there
@@ -332,17 +354,19 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         .kv_batch => {
             // Decoded and checked whole before any op applies.
             const batch = kv_entries.Batch.decodeAll(e.payload, &diag) catch return error.Halt;
+            const ns: NamespaceId = .of(batch.ns);
+            if (ns == .invalid) return error.Halt;
             var all = batch.ops.iterator();
             var ops: u16 = 0;
             while (all.next() catch return error.Halt) |op| {
                 if (kv_entries.batchOpRule(op) != null) return error.Halt;
-                _ = try split(op.key);
                 ops += 1;
             }
             var it = batch.ops.iterator();
             var n: u16 = 0;
+            var kb: [limits.MAX_KV_KEY]u8 = undefined;
             while (it.next() catch return error.Halt) |op| : (n += 1) {
-                const q = try split(op.key);
+                const q: Key = .init(&kb, ns, op.key);
                 // An expire weighs its own cas_version: an absent key is not_found first.
                 check(view, q, op.condition, if (op.kind == .expire) null else op.cas_version, at) catch |err| return refusedOp(out, err, n);
                 switch (op.kind) {
@@ -361,10 +385,9 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 /// Whether a write's condition and `cas_version` hold on `q`. A key deleted, or
 /// whose TTL ran out by this entry's stamp, is absent, at version 0. A plain
 /// write reads nothing here.
-fn check(view: *View, q: Qualified, condition: kv_ops.Condition, cas_version: ?u64, at: Stamp) (ApplyError || error{ CasMismatch, ConditionFailed })!void {
+fn check(view: *View, q: Key, condition: kv_ops.Condition, cas_version: ?u64, at: Stamp) (ApplyError || error{ CasMismatch, ConditionFailed })!void {
     if (condition == .always and cas_version == null) return;
-    var kb: [MAX_KEY]u8 = undefined;
-    const cur = try view.get(Values, valueKey(&kb, q));
+    const cur = try view.get(Values, valueKey(q));
     const version: ?u64 = if (cur) |c| (if (c.tombstone or c.expiredAt(at.ns)) null else c.version) else null;
     if (cas_version) |want| if ((version orelse 0) != want) return error.CasMismatch;
     switch (condition) {
@@ -411,12 +434,12 @@ fn refuseOp(out: *Result, err: anyerror, prefix: []const u8) ?ApplyError {
     return null;
 }
 
-fn counts(view: *View, ns: []const u8) ApplyError!Counts {
+fn counts(view: *View, ns: NamespaceId) ApplyError!Counts {
     var kb: [MAX_KEY]u8 = undefined;
     return (try view.get(NsCounts, countsKey(&kb, ns))) orelse .{};
 }
 
-fn putCounts(view: *View, ns: []const u8, c: Counts) ApplyError!void {
+fn putCounts(view: *View, ns: NamespaceId, c: Counts) ApplyError!void {
     var kb: [MAX_KEY]u8 = undefined;
     try view.put(NsCounts, countsKey(&kb, ns), c);
 }
@@ -424,7 +447,7 @@ fn putCounts(view: *View, ns: []const u8, c: Counts) ApplyError!void {
 /// Move `cur` onto `q`'s history, then evict the oldest while either bound
 /// is exceeded, keeping the newest. Returns `cur`'s history fields as they
 /// now are.
-fn pushVersion(view: *View, q: Qualified, cur: Current, c: *Counts) ApplyError!struct { count: u32, bytes: u64 } {
+fn pushVersion(view: *View, q: Key, cur: Current, c: *Counts) ApplyError!struct { count: u32, bytes: u64 } {
     var kb: [MAX_KEY]u8 = undefined;
     const old = Version.of(cur);
     try view.put(History, historyKey(&kb, q, old.version), old);
@@ -445,9 +468,8 @@ fn pushVersion(view: *View, q: Qualified, cur: Current, c: *Counts) ApplyError!s
 }
 
 /// Write `value` as `q`'s new version; returns that version.
-fn put(view: *View, q: Qualified, value: []const u8, value_type: ValueType, at: Stamp, expiry_ns: u64) ApplyError!u64 {
-    var kb: [MAX_KEY]u8 = undefined;
-    const vk = valueKey(&kb, q);
+fn put(view: *View, q: Key, value: []const u8, value_type: ValueType, at: Stamp, expiry_ns: u64) ApplyError!u64 {
+    const vk = valueKey(q);
     var c = try counts(view, q.ns);
     var next: Current = .{ .version = 1, .lsn = at.index, .term = at.term, .timestamp_ns = at.ns, .expiry_ns = expiry_ns, .tombstone = false, .value_type = value_type, .history_count = 0, .history_bytes = 0, .value = value };
     if (try view.get(Values, vk)) |cur| {
@@ -459,7 +481,7 @@ fn put(view: *View, q: Qualified, value: []const u8, value_type: ValueType, at: 
         next.history_bytes = h.bytes;
     } else {
         c.live += 1;
-        c.bytes += q.keyBytes();
+        c.bytes += q.raw.len;
     }
     c.bytes += value.len;
     try view.put(Values, vk, next);
@@ -468,9 +490,8 @@ fn put(view: *View, q: Qualified, value: []const u8, value_type: ValueType, at: 
 }
 
 /// Tombstone `q`; returns whether it held a live, unexpired value.
-fn delete(view: *View, q: Qualified, at: Stamp) ApplyError!bool {
-    var kb: [MAX_KEY]u8 = undefined;
-    const vk = valueKey(&kb, q);
+fn delete(view: *View, q: Key, at: Stamp) ApplyError!bool {
+    const vk = valueKey(q);
     // Nothing to delete, nothing changes: no tombstone, version or history.
     const cur = (try view.get(Values, vk)) orelse return false;
     if (cur.tombstone or cur.expiredAt(at.ns)) return false;
@@ -491,10 +512,9 @@ fn delete(view: *View, q: Qualified, at: Stamp) ApplyError!bool {
 
 /// Add `delta` to `q`'s counter, made at 0 if it has none (or one whose
 /// TTL ran out by this entry's stamp, on every replica alike).
-fn incr(view: *View, q: Qualified, delta: i64, at: Stamp) (ApplyError || error{ Overflow, NotACounter })!struct { version: u64, value: i64 } {
-    var kb: [MAX_KEY]u8 = undefined;
+fn incr(view: *View, q: Key, delta: i64, at: Stamp) (ApplyError || error{ Overflow, NotACounter })!struct { version: u64, value: i64 } {
     var current: i64 = 0;
-    if (try view.get(Values, valueKey(&kb, q))) |cur| {
+    if (try view.get(Values, valueKey(q))) |cur| {
         if (!cur.tombstone and !cur.expiredAt(at.ns)) {
             if (cur.value.len != 8) return error.NotACounter;
             current = std.mem.readInt(i64, cur.value[0..8], .little);
@@ -512,10 +532,9 @@ fn incr(view: *View, q: Qualified, delta: i64, at: Stamp) (ApplyError || error{ 
 /// write, it clears the key's TTL. Returns the new version, 0 when the key
 /// was deleted; a path or document the merge can't take is refused, and
 /// answers nothing.
-fn jsonPatch(view: *View, q: Qualified, path: []const u8, document: ?[]const u8, at: Stamp, out: *Result) ApplyError!u64 {
+fn jsonPatch(view: *View, q: Key, path: []const u8, document: ?[]const u8, at: Stamp, out: *Result) ApplyError!u64 {
     const json_path = @import("../util/json_path.zig");
-    var kb: [MAX_KEY]u8 = undefined;
-    const cur = try view.get(Values, valueKey(&kb, q));
+    const cur = try view.get(Values, valueKey(q));
     const live = if (cur) |c| !c.tombstone and !c.expiredAt(at.ns) else false;
     const whole = std.mem.eql(u8, path, "$");
     if (document) |doc| {
@@ -549,9 +568,8 @@ fn refusedPatch(out: *Result, err: anyerror) ApplyError!u64 {
 }
 
 /// Set `q`'s TTL without a new version: a TTL isn't a value. 0 clears it.
-fn expire(view: *View, q: Qualified, expiry_ns: u64, cas_version: ?u64, at: Stamp) (ApplyError || error{ NotFound, CasMismatch })!void {
-    var kb: [MAX_KEY]u8 = undefined;
-    const vk = valueKey(&kb, q);
+fn expire(view: *View, q: Key, expiry_ns: u64, cas_version: ?u64, at: Stamp) (ApplyError || error{ NotFound, CasMismatch })!void {
+    const vk = valueKey(q);
     var cur = (try view.get(Values, vk)) orelse return error.NotFound;
     if (cur.tombstone or cur.expiredAt(at.ns)) return error.NotFound;
     if (cas_version) |want| if (cur.version != want) return error.CasMismatch;
@@ -608,9 +626,10 @@ pub const TestKv = struct {
         return out;
     }
 
-    /// A put of `value` at `qkey`, as the next entry, stamped `stamp`.
-    pub fn put(self: *TestKv, qkey: []const u8, value: []const u8, stamp: u64) !void {
-        const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
+    /// A put of `value` at stored key `key` (`id ‖ raw`), as the next
+    /// entry, stamped `stamp`.
+    pub fn put(self: *TestKv, key: []const u8, value: []const u8, stamp: u64) !void {
+        const body: kv_entries.Put.Value = .{ .key = key, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
         const buf = try self.store.allocator.alloc(u8, try kv_entries.Put.encodedSize(body));
         defer self.store.allocator.free(buf);
         const p = try kv_entries.Put.encodeInto(buf, body);

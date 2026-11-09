@@ -1,8 +1,10 @@
-//! The KV family's log entries. Each key is namespace-qualified
-//! (`namespace\0key`; a bare key is the default namespace), so the entry
-//! names its namespace without a separate field. A TTL is relative
-//! milliseconds from the entry's stamp, so every replica computes the same
-//! expiry from the entry alone.
+//! The KV family's log entries. A single-key entry's key is stored as state
+//! keeps it: its namespace's id (4 bytes, big-endian), then the key the
+//! client named, so the entry names its namespace without a separate field.
+//! A batch is one transaction's, which is in one namespace: it names the id
+//! once, and its ops carry the keys as the client named them. A TTL is
+//! relative milliseconds from the entry's stamp, so every replica computes
+//! the same expiry from the entry alone.
 
 const std = @import("std");
 const schema = @import("schema.zig");
@@ -14,7 +16,12 @@ const Bytes = schema.Bytes;
 const Optional = schema.Optional;
 const Record = schema.Record;
 
-pub const Key = Bytes(limits.MAX_QUALIFIED_KEY);
+/// A key with its namespace's id in front (`limits.MAX_KV_KEY`).
+pub const Key = Bytes(limits.MAX_KV_KEY);
+/// A key as the client named it, in the namespace its entry names.
+pub const RawKey = Bytes(limits.MAX_QUALIFIED_KEY);
+/// A namespace's id (`namespace/table.zig`); 0 names none.
+pub const NamespaceId = schema.Int(u32);
 pub const Value = Bytes(kv_ops.MAX_VALUE);
 pub const TtlMs = schema.DurationMs(kv_ops.MAX_TTL_MS);
 pub const Delta = schema.Int(i64);
@@ -33,7 +40,7 @@ pub const CasVersion = Optional(schema.Int(u64));
 /// `delta` it carries follows from its kind (`batchOpRule`).
 pub const BatchOp = Record(&.{
     .{ .name = "kind", .T = schema.Enum(BatchKind) },
-    .{ .name = "key", .T = Key },
+    .{ .name = "key", .T = RawKey },
     .{ .name = "value", .T = Optional(Value) },
     .{ .name = "ttl_ms", .T = Optional(TtlMs) },
     .{ .name = "delta", .T = Optional(Delta) },
@@ -67,14 +74,26 @@ pub const Expire = Record(&.{
     .{ .name = "ttl_ms", .T = TtlMs },
     .{ .name = "cas_version", .T = CasVersion },
 });
-pub const Batch = Record(&.{.{ .name = "ops", .T = BatchOps }});
+pub const Batch = Record(&.{
+    .{ .name = "ns", .T = NamespaceId },
+    .{ .name = "ops", .T = BatchOps },
+});
+
+/// A batch's payload: `ops` in namespace `ns`. The list is encoded from a
+/// slice, which a decoded batch's list is not, so it is written here rather
+/// than through `Batch.encode`.
+pub fn encodeBatch(w: *schema.Writer, ns: u32, ops: []const BatchOp.Value) schema.EncodeError!void {
+    try NamespaceId.encode(w, ns);
+    try BatchOps.encodeSlice(w, ops);
+}
 
 /// A batch's op count, from its list prefix, without decoding the ops: what
 /// the apply budget charges it. A payload too short to hold one counts 1.
 pub fn batchOpCount(payload: []const u8) u32 {
+    const at = NamespaceId.min_size;
     const n = BatchOps.min_size;
-    if (payload.len < n) return 1;
-    return std.mem.readInt(@Int(.unsigned, n * 8), payload[0..n], .little);
+    if (payload.len < at + n) return 1;
+    return std.mem.readInt(@Int(.unsigned, n * 8), payload[at..][0..n], .little);
 }
 /// A JSON document's change at `path`: set to `document`, or deleted when
 /// there is none. Merged with the key's value at apply, so a write that
@@ -134,7 +153,7 @@ const testing = std.testing;
 
 test "kv entries: a batch round-trips, and each kind's fields are checked" {
     const ops = [_]BatchOp.Value{
-        .{ .kind = .put, .key = "ns\x00a", .value = "1", .ttl_ms = 500, .delta = null, .condition = .always, .cas_version = null },
+        .{ .kind = .put, .key = "a", .value = "1", .ttl_ms = 500, .delta = null, .condition = .always, .cas_version = null },
         .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
         .{ .kind = .incr, .key = "c", .value = null, .ttl_ms = null, .delta = -3, .condition = .always, .cas_version = null },
         .{ .kind = .expire, .key = "d", .value = null, .ttl_ms = 0, .delta = null, .condition = .always, .cas_version = null },
@@ -142,9 +161,10 @@ test "kv entries: a batch round-trips, and each kind's fields are checked" {
     for (ops) |op| try testing.expectEqual(@as(?[]const u8, null), batchOpRule(op));
     var buf: [256]u8 = undefined;
     var w: schema.Writer = .{ .buf = &buf };
-    try BatchOps.encodeSlice(&w, &ops);
+    try encodeBatch(&w, 17, &ops);
     var diag: schema.Diagnostic = .{};
     const batch = try Batch.decodeAll(w.written(), &diag);
+    try testing.expectEqual(@as(u32, 17), batch.ns);
     var it = batch.ops.iterator();
     var i: usize = 0;
     while (try it.next()) |op| : (i += 1) {
@@ -168,15 +188,15 @@ test "kv entries: a batch cut anywhere or with an unknown kind is refused whole"
     };
     var buf: [64]u8 = undefined;
     var w: schema.Writer = .{ .buf = &buf };
-    try BatchOps.encodeSlice(&w, &ops);
+    try encodeBatch(&w, 1, &ops);
     const whole = w.written();
     var diag: schema.Diagnostic = .{};
     for (0..whole.len) |n| try testing.expectError(error.Refused, Batch.decodeAll(whole[0..n], &diag));
-    // The second op's kind byte: after the count, and the first op's kind,
-    // key, value and two absent fields.
+    // The second op's kind byte: after the namespace and the count, and the
+    // first op's kind, key, value and two absent fields.
     var bad: [64]u8 = undefined;
     @memcpy(bad[0..whole.len], whole);
-    bad[2 + 1 + 2 + 1 + 1 + 4 + 1 + 1 + 1] = 9;
+    bad[4 + 2 + 1 + 2 + 1 + 1 + 4 + 1 + 1 + 1] = 9;
     try testing.expectError(error.Refused, Batch.decodeAll(bad[0..whole.len], &diag));
 }
 
@@ -188,8 +208,9 @@ test "kv entries: a batch's op count is read from its prefix" {
         .{ .kind = .delete, .key = "b", .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
         .{ .kind = .put, .key = "c", .value = "3", .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
     };
-    try BatchOps.encodeSlice(&w, &ops);
-    // A batch is its list and nothing else, so the prefix leads the payload.
+    try encodeBatch(&w, 1, &ops);
+    // A batch is its namespace and its list, so the list's prefix follows
+    // the namespace.
     var diag: schema.Diagnostic = .{};
     try std.testing.expectEqual(@as(u32, 3), (try Batch.decodeAll(w.written(), &diag)).ops.count);
     try std.testing.expectEqual(@as(u32, 3), batchOpCount(w.written()));

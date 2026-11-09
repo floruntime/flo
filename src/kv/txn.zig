@@ -9,7 +9,7 @@
 //! ## Lifecycle
 //!
 //! ```
-//! BEGIN(routing_key)        → server pins txn to hash(namespace, routing_key)
+//! BEGIN(routing_key)        → server pins txn to hash(namespace id, routing_key)
 //!                             returns txn_id (per-shard, monotonically increasing)
 //! PUT/DEL/INCR/...(--txn T) → buffered in TxnState.write_set
 //! GET/EXISTS(--txn T)       → checks write_set first (read-your-writes),
@@ -67,7 +67,8 @@ pub const TxnOpKind = kv_entries.BatchKind;
 /// One buffered op inside a transaction. Owns the key and value bytes.
 pub const TxnOp = struct {
     kind: TxnOpKind,
-    /// Namespace-qualified key (already prefixed with `namespace\0`).
+    /// The key as the client named it: every op is in its transaction's
+    /// namespace (`TxnState.ns_id`), which the batch names once.
     key: []u8,
     /// Op-specific value bytes:
     ///   put    → arbitrary value
@@ -307,7 +308,7 @@ comptime {
 
 /// A commit's `kv.batch` payload for `ops`, allocated. An op that breaks
 /// its kind's rule is a bug in buffering, refused here rather than logged.
-pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {
+pub fn encodeBatch(allocator: Allocator, ns: NamespaceId, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {
     const values = try allocator.alloc(kv_entries.BatchOp.Value, ops.len);
     defer allocator.free(values);
     for (ops, values) |op, *v| {
@@ -315,11 +316,11 @@ pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory
         if (kv_entries.batchOpRule(v.*) != null) return error.InvalidBatch;
     }
     var counter: schema.Writer = .{ .buf = &.{}, .counting = true };
-    try kv_entries.BatchOps.encodeSlice(&counter, values);
+    try kv_entries.encodeBatch(&counter, ns.int(), values);
     const buf = try allocator.alloc(u8, counter.pos);
     errdefer allocator.free(buf);
     var w: schema.Writer = .{ .buf = buf };
-    try kv_entries.BatchOps.encodeSlice(&w, values);
+    try kv_entries.encodeBatch(&w, ns.int(), values);
     return buf;
 }
 
@@ -361,8 +362,8 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     const id = try tt.begin(0xDEADBEEF, .of(0xABCD));
     try t.expectEqual(@as(usize, 1), tt.count());
 
-    try tt.appendOp(id, .put, "default\x00k1", "v1", 0, .always, null);
-    try tt.appendOp(id, .delete, "default\x00k2", "", 0, .always, null);
+    try tt.appendOp(id, .put, "k1", "v1", 0, .always, null);
+    try tt.appendOp(id, .delete, "k2", "", 0, .always, null);
     const txn = tt.get(id).?;
     try t.expectEqual(@as(usize, 2), txn.ops.items.len);
     try t.expectEqual(@as(u64, 0xDEADBEEF), txn.pinned_hash);
@@ -377,14 +378,14 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     defer tt.deinit();
 
     const id = try tt.begin(1, .default);
-    try tt.appendOp(id, .put, "ns\x00k", "v1", 0, .always, null);
-    try tt.appendOp(id, .put, "ns\x00other", "x", 0, .always, null);
-    try tt.appendOp(id, .put, "ns\x00k", "v2", 0, .always, null);
+    try tt.appendOp(id, .put, "k", "v1", 0, .always, null);
+    try tt.appendOp(id, .put, "other", "x", 0, .always, null);
+    try tt.appendOp(id, .put, "k", "v2", 0, .always, null);
 
-    const op = tt.lastOpForKey(id, "ns\x00k").?;
+    const op = tt.lastOpForKey(id, "k").?;
     try t.expectEqualStrings("v2", op.value);
 
-    try t.expectEqual(@as(?*const TxnOp, null), tt.lastOpForKey(id, "ns\x00missing"));
+    try t.expectEqual(@as(?*const TxnOp, null), tt.lastOpForKey(id, "missing"));
 }
 
 test "TxnTable: by default a transaction holds the largest value a plain set takes, under the longest key" {
@@ -448,7 +449,7 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
         id.* = try tt.begin(1, .default);
         tt.get(id.*).?.last_active_ms = 1_000;
     }
-    try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0, .always, null);
+    try tt.appendOp(idle[0], .put, "k", "v", 0, .always, null);
     const committing = try tt.begin(1, .default);
     tt.get(committing).?.last_active_ms = 1_000;
     tt.get(committing).?.committing = true;
@@ -467,19 +468,20 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
 test "kv_batch: a commit's ops decode from its payload as they were buffered" {
     const t = std.testing;
     var ops: [4]TxnOp = .{
-        .{ .kind = .put, .key = @constCast("ns\x00alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
+        .{ .kind = .put, .key = @constCast("alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
         .{ .kind = .delete, .key = @constCast("beta"), .value = @constCast(""), .ttl_ms = 0 },
         .{ .kind = .incr, .key = @constCast("counter"), .value = @constCast("\xf9\xff\xff\xff\xff\xff\xff\xff"), .ttl_ms = 0 },
         .{ .kind = .expire, .key = @constCast("gamma"), .value = @constCast(""), .ttl_ms = 0 },
     };
-    const payload = try encodeBatch(t.allocator, &ops);
+    const payload = try encodeBatch(t.allocator, .of(17), &ops);
     defer t.allocator.free(payload);
     var diag: schema.Diagnostic = .{};
     const batch = try kv_entries.Batch.decodeAll(payload, &diag);
+    try t.expectEqual(@as(u32, 17), batch.ns);
     var it = batch.ops.iterator();
     const a = (try it.next()).?;
     try t.expectEqual(TxnOpKind.put, a.kind);
-    try t.expectEqualStrings("ns\x00alpha", a.key);
+    try t.expectEqualStrings("alpha", a.key);
     try t.expectEqualStrings("hello", a.value.?);
     try t.expectEqual(@as(?u64, 1_000), a.ttl_ms);
     const b = (try it.next()).?;
@@ -495,7 +497,7 @@ test "kv_batch: a commit's ops decode from its payload as they were buffered" {
 
 test "kv_batch: an op that breaks its kind's rule is refused, not logged" {
     var ops = [_]TxnOp{.{ .kind = .incr, .key = @constCast("k"), .value = @constCast(""), .ttl_ms = 0 }};
-    try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, &ops));
+    try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, .default, &ops));
 }
 
 test "txn: an id names its shard" {

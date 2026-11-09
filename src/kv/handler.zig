@@ -69,11 +69,11 @@ const RaftNetwork = network_mode.RaftNetwork;
 /// A transaction's batch is larger and allocated.
 pub const MAX_KEY_ENTRY_PAYLOAD: usize = @max(kv_entries.Put.max_size, kv_entries.JsonPatch.max_size);
 
-/// Re-export from centralized namespace module for local convenience.
+/// The longest key a request names, in any namespace.
 const MAX_QUALIFIED_KEY = ns_keys.MAX_QUALIFIED_KEY;
-const qualifyKey = ns_keys.qualifyKey;
-const stripNsPrefix = ns_keys.stripPrefix;
-const nsPrefix = ns_keys.namespacePrefix;
+/// A key as state keeps it: its namespace's id, then the key.
+const MAX_KV_KEY = @import("../protocol/limits.zig").MAX_KV_KEY;
+const Key = kv_state.Key;
 
 /// Reserved key prefixes — operations on these are blocked for user requests.
 const RESERVED_PREFIXES = [_][]const u8{
@@ -180,6 +180,7 @@ pub const KVHandler = struct {
         ScanShort,
         NotOwner,
         GatherBusy,
+        NamespaceUnknown,
         Internal,
     };
 
@@ -187,7 +188,7 @@ pub const KVHandler = struct {
         return switch (err) {
             error.KeyEmpty => refused(.bad_request, .malformed, "bad request: key is required"),
             error.KeyHasNul => refused(.bad_request, .malformed, "bad request: key must not contain NUL"),
-            error.KeyTooLong => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key is too long: at most {d} bytes, namespace included", .{MAX_QUALIFIED_KEY})),
+            error.KeyTooLong => refused(.bad_request, .field_too_long, std.fmt.comptimePrint("bad request: key is too long: at most {d} bytes", .{MAX_QUALIFIED_KEY})),
             error.ReservedKey => refused(.unauthorized, .reserved_key, "unauthorized: the key is in a prefix the server keeps for itself"),
             error.NotFound => refused(.not_found, .not_found, "not found"),
             error.NoSuchTransaction => refused(.not_found, .no_such_transaction, "not found: no such transaction — it committed, rolled back, or was begun in another namespace"),
@@ -209,6 +210,7 @@ pub const KVHandler = struct {
             error.ScanShort => refused(.overloaded, .shard_busy, "overloaded: no memory to list this page — retry"),
             error.GatherBusy => refused(.overloaded, .shard_busy, "overloaded: too many reads across shards are under way; this request was not run — retry"),
             error.NotOwner => refused(.internal_error, .internal, "internal error: a shard was asked for a key another shard owns"),
+            error.NamespaceUnknown => refused(.unavailable, .unclassified, persistence_mod.failureMessage(error.NamespaceUnknown, "")),
             error.Internal => refused(.internal_error, .internal, "internal error: the request couldn't be run"),
         };
     }
@@ -238,12 +240,12 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(GetResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         const kv = shard.kv_handler.*.kv;
         if (in_txn) |t| {
             if (wait_ms > 0) return error.WaitInTxn;
-            if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
+            if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, key.raw)) |last| switch (last.kind) {
                 .delete => return error.NotFound,
                 // Not committed, so no version or expiry yet.
                 .put => return .{ .answer = .{ .version = 0, .value = last.value, .expires_at_ms = null } },
@@ -251,14 +253,14 @@ pub const KVHandler = struct {
                 .expire, .incr => {},
             };
         }
-        const current = kv.get(qkey);
+        const current = kv.get(key.stored);
         if (wait_ms > 0) {
             if (wait_for == .exists) if (current) |e| return .{ .answer = getAnswer(e) };
             const registered = shard.waiter_pool.register(.{
                 .kind = .kv_get,
                 .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
-                .key = qkey,
+                .key = key.stored,
                 // Answered by the first version past this one.
                 .min_version = switch (wait_for) {
                     .exists => 0,
@@ -300,14 +302,14 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(SetResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         const ttl = ttl_ms orelse 0;
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .put, value, ttl, condition, cas_version);
+            try bufferInTxn(shard, t, key, .put, value, ttl, condition, cas_version);
             return .{ .answer = .{ .version = null } };
         }
-        const proposed = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = if (ttl == 0) null else ttl, .condition = condition, .cas_version = cas_version }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_put, .{ .key = key.stored, .value = value, .ttl_ms = if (ttl == 0) null else ttl, .condition = condition, .cas_version = cas_version }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerSet } };
     }
@@ -318,15 +320,22 @@ pub const KVHandler = struct {
         table_run.answer(SetResponse, shard, conn, request_id, .{ .version = r.int(u64) orelse 0 });
     }
 
-    /// The request's key, namespace-qualified, once it passes the checks
-    /// every key does.
-    fn tableKey(buf: *[MAX_QUALIFIED_KEY]u8, req: Request) Error![]const u8 {
-        if (req.key.len == 0) return error.KeyEmpty;
-        if (isReservedKey(req.key)) return error.ReservedKey;
-        return qualifyKey(buf, req.namespace, req.key) catch |err| switch (err) {
-            error.KeyHasNul => error.KeyHasNul,
-            error.KeyTooLarge => error.KeyTooLong,
-        };
+    /// The request's key in its namespace, once it passes the checks every
+    /// key does; its stored form is written to `buf`.
+    fn tableKey(buf: *[MAX_KV_KEY]u8, req: Request) Error!Key {
+        try checkKey(req.key);
+        return .init(buf, req.ns_id, req.key);
+    }
+
+    /// Why `raw` can't be a key a client reads or writes, if it can't. A
+    /// key with a NUL byte is refused though the stored key, which leads
+    /// with a fixed-width namespace id, could hold one: the CLI and SDKs
+    /// have always refused it, so no client has one to read back.
+    fn checkKey(raw: []const u8) Error!void {
+        if (raw.len == 0) return error.KeyEmpty;
+        if (isReservedKey(raw)) return error.ReservedKey;
+        if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.KeyHasNul;
+        if (raw.len > MAX_QUALIFIED_KEY) return error.KeyTooLong;
     }
 
     /// Transaction `id`, open in the request's namespace, which the
@@ -350,6 +359,7 @@ pub const KVHandler = struct {
             error.WritesStopped => error.WritesStopped,
             error.Overloaded => error.TooManyProposals,
             error.PayloadTooLarge => error.TooLarge,
+            error.NamespaceUnknown => error.NamespaceUnknown,
             else => error.Internal,
         };
     }
@@ -384,13 +394,13 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(DeleteResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .delete, "", 0, .always, cas_version);
+            try bufferInTxn(shard, t, key, .delete, "", 0, .always, cas_version);
             return .{ .answer = .{ .existed = null } };
         }
-        const proposed = proposeKV(shard, .kv_delete, .{ .key = qkey, .cas_version = cas_version }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_delete, .{ .key = key.stored, .cas_version = cas_version }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerDeleted } };
     }
 
@@ -452,10 +462,10 @@ pub const KVHandler = struct {
     /// as many as `limit` and one answer hold; `more` says whether older
     /// kept versions follow. A key with no history at all is not found.
     fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, before_version: ?u64, _: ?[]const u8) Error!table_run.Outcome(HistoryResponse) {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         const self = shard.kv_handler;
-        var it = self.kv.history(qkey, before_version);
+        var it = self.kv.history(key, before_version);
         if (!it.exists()) return error.NotFound;
         const Versions = HistoryResponse.field_list[0].T;
         var versions = Versions.Builder.init(&self.answer_buf);
@@ -481,7 +491,7 @@ pub const KVHandler = struct {
         // Keys other shards own are read on those shards: each owner gets
         // its part, and the answers are merged here once all have come.
         if (routing_key == null and !forwarded and shard.shardCount() > 1) {
-            var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .namespace = req.namespace, .ns_id = req.ns_id }, MgetOwner.of) catch return error.Internal;
+            var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .ns_id = req.ns_id }, MgetOwner.of) catch return error.Internal;
             defer plan.deinit(shard.allocator);
             if (plan.owners.len > 1 or (plan.owners.len == 1 and plan.owners[0] != shard.id)) {
                 try startMgetGather(shard, conn, req, &plan);
@@ -494,7 +504,7 @@ pub const KVHandler = struct {
         var it = keys.iterator();
         var index: u16 = 0;
         while (it.next() catch return error.Internal) |raw_key| : (index += 1) {
-            const found = try mgetLookup(shard, req.namespace, req.ns_id, raw_key, routing_key != null);
+            const found = try mgetLookup(shard, req.ns_id, raw_key, routing_key != null);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 return .{ .answer = .{ .entries = entries.value(), .next = index } };
             }
@@ -506,21 +516,19 @@ pub const KVHandler = struct {
     /// one, or one the server keeps, is not found. Without a routing key the
     /// key must be this shard's: one another shard owns is never read here
     /// or answered missing.
-    fn mgetLookup(shard: *Shard, namespace: []const u8, ns_id: router.NamespaceId, raw_key: []const u8, routed: bool) Error!MgetLookup {
+    fn mgetLookup(shard: *Shard, ns_id: router.NamespaceId, raw_key: []const u8, routed: bool) Error!MgetLookup {
         const none: MgetLookup = .{ .found = false, .value = "", .version = 0 };
-        if (raw_key.len == 0 or isReservedKey(raw_key)) return none;
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = qualifyKey(&qbuf, namespace, raw_key) catch return none;
+        checkKey(raw_key) catch return none;
         // With a routing key the request was routed to its shard, where
         // every key lives.
         if (!routed) {
-            const owner = MgetOwner.of(.{ .shard = shard, .namespace = namespace, .ns_id = ns_id }, raw_key);
+            const owner = MgetOwner.of(.{ .shard = shard, .ns_id = ns_id }, raw_key);
             if (owner != shard.id) {
                 log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
                 return error.NotOwner;
             }
         }
-        const entry = shard.kv_handler.*.kv.get(qkey) orelse return none;
+        const entry = shard.kv_handler.*.kv.getIn(ns_id, raw_key) orelse return none;
         return .{ .found = true, .value = entry.value, .version = entry.version };
     }
 
@@ -542,7 +550,7 @@ pub const KVHandler = struct {
         errdefer if (local) |b| shard.allocator.free(b);
         for (plan.owners, plan.keys, 0..) |owner, part_keys, i| {
             if (owner == shard.id) {
-                local = try localPart(shard, req.namespace, req.ns_id, part_keys);
+                local = try localPart(shard, req.ns_id, part_keys);
                 parts[i] = .{ .owner = owner, .body = local.? };
             } else {
                 const body = mget_mod.pieceBody(scratch[used..], part_keys) catch unreachable; // sized above
@@ -560,12 +568,12 @@ pub const KVHandler = struct {
 
     /// The part of a gathered mget this shard owns, answered here as the
     /// body another owner would send.
-    fn localPart(shard: *Shard, namespace: []const u8, ns_id: router.NamespaceId, keys: []const []const u8) Error![]u8 {
+    fn localPart(shard: *Shard, ns_id: router.NamespaceId, keys: []const []const u8) Error![]u8 {
         const Entries = MgetResponse.field_list[0].T;
         var entries = Entries.Builder.init(&shard.kv_handler.answer_buf);
         var next: ?u16 = null;
         for (keys, 0..) |raw_key, i| {
-            const found = try mgetLookup(shard, namespace, ns_id, raw_key, false);
+            const found = try mgetLookup(shard, ns_id, raw_key, false);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 next = @intCast(i);
                 break;
@@ -578,13 +586,10 @@ pub const KVHandler = struct {
     /// the server keeps, is answered where the request is.
     const MgetOwner = struct {
         shard: *const Shard,
-        namespace: []const u8,
         ns_id: router.NamespaceId,
 
         fn of(self: MgetOwner, raw_key: []const u8) u16 {
-            if (raw_key.len == 0 or isReservedKey(raw_key)) return self.shard.id;
-            var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-            _ = qualifyKey(&qbuf, self.namespace, raw_key) catch return self.shard.id;
+            checkKey(raw_key) catch return self.shard.id;
             const r = &self.shard.router;
             return r.partitionToShard(r.hashToPartition(router.routeNsKey(self.ns_id, raw_key)));
         }
@@ -603,15 +608,15 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(IncrResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         var delta_bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &delta_bytes, delta, .little);
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .incr, &delta_bytes, 0, .always, null);
+            try bufferInTxn(shard, t, key, .incr, &delta_bytes, 0, .always, null);
             return .{ .answer = .{ .version = null, .value = null } };
         }
-        const proposed = proposeKV(shard, .kv_incr, .{ .key = qkey, .delta = delta }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_incr, .{ .key = key.stored, .delta = delta }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerIncr } };
     }
@@ -637,13 +642,13 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(ExpireResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
-            try bufferInTxn(shard, t, qkey, .expire, "", ttl_ms, .always, cas_version);
+            try bufferInTxn(shard, t, key, .expire, "", ttl_ms, .always, cas_version);
             return .{ .answer = .{} };
         }
-        const proposed = proposeKV(shard, .kv_expire, .{ .key = qkey, .ttl_ms = ttl_ms, .cas_version = cas_version }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_expire, .{ .key = key.stored, .ttl_ms = ttl_ms, .cas_version = cas_version }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerExpired } };
     }
 
@@ -662,16 +667,16 @@ pub const KVHandler = struct {
         txn: ?u64,
     ) Error!table_run.Outcome(ExistsResponse) {
         const in_txn = try txnOf(shard, req, txn, routing_key);
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
-            if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, qkey)) |last| switch (last.kind) {
+            if (shard.kv_handler.*.txn_table.lastOpForKey(t.txn_id, key.raw)) |last| switch (last.kind) {
                 .delete => return .{ .answer = .{ .exists = false, .version = 0 } },
                 .put => return .{ .answer = .{ .exists = true, .version = 0 } },
                 .expire, .incr => {},
             };
         }
-        const e = shard.kv_handler.*.kv.get(qkey) orelse return .{ .answer = .{ .exists = false, .version = 0 } };
+        const e = shard.kv_handler.*.kv.get(key.stored) orelse return .{ .answer = .{ .exists = false, .version = 0 } };
         return .{ .answer = .{ .exists = true, .version = e.version } };
     }
 
@@ -683,10 +688,10 @@ pub const KVHandler = struct {
         path: []const u8,
         _: ?[]const u8,
     ) Error!table_run.Outcome(JsonGetResponse) {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         const self = shard.kv_handler;
-        const e = self.kv.get(qkey) orelse return error.NotFound;
+        const e = self.kv.get(key.stored) orelse return error.NotFound;
         const at = json_path.jsonPathGet(self.allocator, e.value, path) catch |err| return jsonError(err);
         defer self.allocator.free(at);
         // The answer outlives this call; the handler's answer buffer holds it.
@@ -705,14 +710,14 @@ pub const KVHandler = struct {
         document: []const u8,
         _: ?[]const u8,
     ) Error!table_run.Outcome(JsonSetResponse) {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
         const self = shard.kv_handler;
         if (!json_depth.within(document)) return error.TooDeep;
         if (!(std.json.validate(self.allocator, document) catch return error.Internal)) return error.NotJson;
         // Merged with the key's value at apply, not here: a write between
         // this read and the apply would otherwise be lost.
-        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = document }) catch |err| return proposeError(err);
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = key.stored, .path = path, .document = document }) catch |err| return proposeError(err);
         shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         return .{ .park = .{ .proposed = proposed, .answer = answerJsonSet } };
     }
@@ -730,9 +735,9 @@ pub const KVHandler = struct {
         path: []const u8,
         _: ?[]const u8,
     ) Error!table_run.Outcome(JsonDelResponse) {
-        var qbuf: [MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = try tableKey(&qbuf, req);
-        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = qkey, .path = path, .document = null }) catch |err| return proposeError(err);
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        const key = try tableKey(&kbuf, req);
+        const proposed = proposeKV(shard, .kv_json_patch, .{ .key = key.stored, .path = path, .document = null }) catch |err| return proposeError(err);
         return .{ .park = .{ .proposed = proposed, .answer = answerJsonDel } };
     }
 
@@ -774,7 +779,9 @@ pub const KVHandler = struct {
             self.txn_table.drop(txn);
             return .{ .answer = .{ .commit_index = shard.raft_node.commit_index, .ops = 0 } };
         }
-        const payload = txn_mod.encodeBatch(self.allocator, t.ops.items) catch return error.Internal;
+        // Begun in a namespace this shard knew; a write here never names id 0.
+        if (t.ns_id == .invalid) return error.NamespaceUnknown;
+        const payload = txn_mod.encodeBatch(self.allocator, t.ns_id, t.ops.items) catch return error.Internal;
         defer self.allocator.free(payload);
         const proposed = shard.raft_node.propose(.kv_batch, entry_mod.Flags.NONE, payload) catch |err| return proposeError(err);
         // The transaction stays until its batch is answered for, applied
@@ -806,14 +813,17 @@ pub const KVHandler = struct {
     fn bufferInTxn(
         shard: *Shard,
         t: *txn_mod.TxnState,
-        qkey: []const u8,
+        key: Key,
         kind: txn_mod.TxnOpKind,
         value: []const u8,
         ttl_ms: u64,
         condition: kv_ops.Condition,
         cas_version: ?u64,
     ) Error!void {
-        shard.kv_handler.*.txn_table.appendOp(t.txn_id, kind, qkey, value, ttl_ms, condition, cas_version) catch |err| return switch (err) {
+        // The transaction is in the key's namespace (`txnIn`): its ops keep
+        // the key as named, and its batch names the namespace once.
+        std.debug.assert(key.ns == t.ns_id);
+        shard.kv_handler.*.txn_table.appendOp(t.txn_id, kind, key.raw, value, ttl_ms, condition, cas_version) catch |err| return switch (err) {
             error.TxnTooLarge => error.TxnTooLarge,
             error.OutOfMemory => error.Internal,
         };
@@ -823,7 +833,8 @@ pub const KVHandler = struct {
 
     /// ShardWalker LocalScanFn for kv_scan — scans key names from one shard's
     /// KV state. Returns borrowed references (zero allocation).
-    /// Filters reserved keys and strips namespace prefix.
+    /// Walks the namespace's id prefix only, filters reserved keys, and
+    /// returns keys as the client named them.
     /// When filter is non-empty, only returns keys matching the prefix filter.
     /// Pages by key: a page starts after `local_cursor`, the last key the
     /// one before it returned, so a key written or deleted between pages
@@ -835,12 +846,11 @@ pub const KVHandler = struct {
         local_cursor: ?[]const u8,
         limit: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const namespace = walk_ns.name;
         const kv: *KvState = @ptrCast(@alignCast(ctx));
-        // A key can't hold the separator, so a filter that does names nothing.
-        if (std.mem.indexOfScalar(u8, filter, ns_keys.NAMESPACE_SEPARATOR) != null) return .{ .items = &.{}, .next_cursor = null };
+        // No key holds a NUL (`checkKey`), so a filter that does names nothing.
+        if (std.mem.indexOfScalar(u8, filter, 0) != null) return .{ .items = &.{}, .next_cursor = null };
         // Keys come back in key order and without their namespace.
-        const ns = if (namespace.len == 0) "default" else namespace;
+        const ns = walk_ns.id;
         // One past the page shows whether more follow.
         const cap: usize = @min(limit, dispatcher_mod.NameWalker.MAX_BATCH);
         if (cap == 0) return .{ .items = &.{}, .next_cursor = local_cursor };
@@ -883,6 +893,9 @@ pub const KVHandler = struct {
     ) !@import("../raft/node.zig").ProposeResult {
         const P = kv_entries.Payload(@backingInt(entry_type));
         comptime std.debug.assert(P.max_size <= MAX_KEY_ENTRY_PAYLOAD);
+        // A write runs once its namespace is known here (`prepareWrite`); a
+        // key naming id 0 would halt every replica that applied it.
+        if (Key.ofStored(payload.key) == null) return error.NamespaceUnknown;
         const size = P.encodedSize(payload) catch |err| return encodeError(err);
         const buf = shard.scratch.borrow(size);
         defer shard.scratch.release(buf);
@@ -893,7 +906,8 @@ pub const KVHandler = struct {
     /// For tests: propose a put of `value` at `key` in the default
     /// namespace, as kv.set would.
     pub fn testProposePut(shard: *Shard, key: []const u8, value: []const u8) !@import("../raft/node.zig").ProposeResult {
-        return proposeKV(shard, .kv_put, .{ .key = key, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null });
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        return proposeKV(shard, .kv_put, .{ .key = Key.init(&kbuf, .default, key).stored, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null });
     }
 
     fn encodeError(err: schema.EncodeError) error{ PayloadTooLarge, TtlTooLarge } {
@@ -919,16 +933,17 @@ pub const KVHandler = struct {
 
     /// A sink's write for the shard that owns its key, as an inbox message
     /// carries it: `[ns len u8][ns][ttl? u8][ttl u64][key len u16][key][value]`.
+    /// The key is as the sink named it; the owner finds the namespace's id.
     pub const SinkPut = struct {
         namespace: []const u8,
-        qkey: []const u8,
+        key: []const u8,
         value: []const u8,
         ttl_ms: ?u64,
 
         /// The message's bytes, owned by the caller (the receiver frees
         /// them), or null out of memory.
         pub fn encode(self: SinkPut, allocator: Allocator) ?[]u8 {
-            const buf = allocator.alloc(u8, 1 + self.namespace.len + 9 + 2 + self.qkey.len + self.value.len) catch return null;
+            const buf = allocator.alloc(u8, 1 + self.namespace.len + 9 + 2 + self.key.len + self.value.len) catch return null;
             var off: usize = 0;
             buf[0] = @intCast(self.namespace.len);
             @memcpy(buf[1..][0..self.namespace.len], self.namespace);
@@ -936,10 +951,10 @@ pub const KVHandler = struct {
             buf[off] = @intFromBool(self.ttl_ms != null);
             std.mem.writeInt(u64, buf[off + 1 ..][0..8], self.ttl_ms orelse 0, .little);
             off += 9;
-            std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.qkey.len), .little);
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.key.len), .little);
             off += 2;
-            @memcpy(buf[off..][0..self.qkey.len], self.qkey);
-            off += self.qkey.len;
+            @memcpy(buf[off..][0..self.key.len], self.key);
+            off += self.key.len;
             @memcpy(buf[off..][0..self.value.len], self.value);
             return buf;
         }
@@ -952,17 +967,20 @@ pub const KVHandler = struct {
             const key_len = std.mem.readInt(u16, bytes[ns_end + 9 ..][0..2], .little);
             const key_at = ns_end + 11;
             if (bytes.len < key_at + key_len) return null;
-            return .{ .namespace = bytes[1..ns_end], .qkey = bytes[key_at..][0..key_len], .value = bytes[key_at + key_len ..], .ttl_ms = ttl };
+            return .{ .namespace = bytes[1..ns_end], .key = bytes[key_at..][0..key_len], .value = bytes[key_at + key_len ..], .ttl_ms = ttl };
         }
     };
 
-    /// The processing KV sink's write of `qkey`, which this shard owns:
-    /// proposed as any put is, unanswered. The reason it couldn't be, or
-    /// null. The caller counts a refusal as a dropped record.
-    pub fn sinkPropose(shard: *Shard, namespace: []const u8, qkey: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
-        if (isReservedKey(kv_state.Qualified.of(qkey).key)) return "access to reserved key denied";
+    /// The processing KV sink's write of `raw_key` in `namespace`, which
+    /// this shard owns: proposed as any put is, unanswered. The reason it
+    /// couldn't be, or null. The caller counts a refusal as a dropped record.
+    pub fn sinkPropose(shard: *Shard, namespace: []const u8, raw_key: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
+        checkKey(raw_key) catch |err| return refusal(err).refusal.message;
         shard.namespace_handler.proposeImplicitCreate(namespace, shard);
-        _ = proposeKV(shard, .kv_put, .{ .key = qkey, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
+        const ns_id = shard.namespaceId(namespace);
+        if (ns_id == .invalid) return "the namespace isn't created on this shard yet";
+        var kbuf: [MAX_KV_KEY]u8 = undefined;
+        _ = proposeKV(shard, .kv_put, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
             error.NotLeader => "this node doesn't lead its group",
             error.WritesStopped => "the shard stopped taking writes",
             error.Halted => "the shard is halted",
@@ -1023,7 +1041,7 @@ test "kv handler: reserved key prefixes" {
     try testing.expect(!isReservedKey("")); // empty key
 }
 
-test "kv handler: the key walk refuses a NUL filter and lists only default's keys in default" {
+test "kv handler: the key walk refuses a NUL filter and lists only the namespace's own keys" {
     const allocator = testing.allocator;
     var store = @import("../contract/store.zig").Store.init(allocator);
     defer store.deinit();
@@ -1031,18 +1049,22 @@ test "kv handler: the key walk refuses a NUL filter and lists only default's key
     defer scratch.deinit();
     var kv: KvState = .{ .store = &store };
     var pbuf: [64]u8 = undefined;
-    for ([_][2][]const u8{ .{ "b\x00k", "b-value" }, .{ "mine", "default-value" } }, 1..) |kvp, i| {
-        const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, i, i, try kv_entries.Put.encodeInto(&pbuf, .{ .key = kvp[0], .value = kvp[1], .ttl_ms = null, .condition = .always, .cas_version = null }));
+    var kbuf: [MAX_KV_KEY]u8 = undefined;
+    const other: router.NamespaceId = .of(16);
+    for ([_]struct { router.NamespaceId, []const u8, []const u8 }{ .{ other, "k", "b-value" }, .{ .default, "mine", "default-value" } }, 1..) |kvp, i| {
+        const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, i, i, try kv_entries.Put.encodeInto(&pbuf, .{ .key = Key.init(&kbuf, kvp[0], kvp[1]).stored, .value = kvp[2], .ttl_ms = null, .condition = .always, .cas_version = null }));
         var out: Result = .{};
         out.reset(&e);
         try @import("../contract/machine.zig").applyEntry(&@import("machine.zig").machine, &store, &scratch, &e, &out);
     }
 
-    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, .{ .name = "default" }, "b\x00", null, 10).items.len);
-    const all = KVHandler.localScanKeys(&kv, .{ .name = "default" }, "", null, 10).items;
+    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, .{ .name = "default", .id = .default }, "b\x00", null, 10).items.len);
+    const all = KVHandler.localScanKeys(&kv, .{ .name = "default", .id = .default }, "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), all.len);
     try testing.expectEqualStrings("mine", all[0]);
-    const b_keys = KVHandler.localScanKeys(&kv, .{ .name = "b" }, "", null, 10).items;
+    const b_keys = KVHandler.localScanKeys(&kv, .{ .name = "b", .id = other }, "", null, 10).items;
     try testing.expectEqual(@as(usize, 1), b_keys.len);
     try testing.expectEqualStrings("k", b_keys[0]);
+    // A namespace no one created holds no keys.
+    try testing.expectEqual(@as(usize, 0), KVHandler.localScanKeys(&kv, .{ .name = "nope" }, "", null, 10).items.len);
 }

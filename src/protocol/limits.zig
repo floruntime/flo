@@ -5,12 +5,20 @@
 /// The most a log entry's command payload holds: its header, key and value.
 pub const MAX_PERSIST_PAYLOAD: usize = 65536;
 
-/// A log entry's command header: namespace hash u32, key length u16, value
+/// A log entry's command header: namespace id u32, key length u16, value
 /// length u32.
 pub const COMMAND_PREFIX_SIZE: usize = 4 + 2 + 4;
 
 /// The longest key, namespace-qualified, that a request or entry carries.
 pub const MAX_QUALIFIED_KEY: usize = 4096;
+
+/// A namespace's id as it leads a stored KV key: fixed width, so one
+/// namespace's keys are one prefix.
+pub const NAMESPACE_ID_BYTES: usize = 4;
+
+/// The longest KV key as state and the log keep it: its namespace's id, then
+/// the longest key a request carries, in any namespace.
+pub const MAX_KV_KEY: usize = NAMESPACE_ID_BYTES + MAX_QUALIFIED_KEY;
 
 /// The longest namespace name.
 pub const MAX_NAMESPACE_NAME: usize = 63;
@@ -46,4 +54,4 @@ pub const DEFAULT_MAX_BYTES_PER_TXN: usize = 256 * 1024;
 /// Raft ring, the apply buffer and a replication frame must each hold one,
 /// or an entry could be accepted and then never applied or sent to a
 /// follower. It is apart from the request frame, which is a fraction of it.
-pub const MAX_LOG_ENTRY_PAYLOAD: usize = 1_057_794;
+pub const MAX_LOG_ENTRY_PAYLOAD: usize = 1_057_798;
