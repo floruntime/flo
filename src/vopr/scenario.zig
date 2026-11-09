@@ -769,7 +769,7 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 38), obj.count());
+    try testing.expectEqual(@as(usize, 40), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
