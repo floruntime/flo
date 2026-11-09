@@ -677,6 +677,12 @@ pub const Shard = struct {
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
     metrics_registry: ?*MetricsRegistry,
 
+    /// The node's live count of held client connections, for the acceptor's
+    /// connection cap. A shard releases a slot here when it closes a client
+    /// connection (not an admin one, which the cap never reserved). The runtime
+    /// wires it; null in tests and when there is no cap.
+    active_connections: ?*std.atomic.Value(u32) = null,
+
     /// What booting a shard needs from the runtime. Both are optional: a
     /// shard built in a test has neither.
     pub const Boot = struct {
@@ -1508,6 +1514,11 @@ pub const Shard = struct {
         if (self.connections.fetchRemove(fd)) |kv| {
             if (kv.value.reads_paused) self.paused_count -= 1;
             self.endWait(kv.value);
+            // Release the cap slot the acceptor reserved for a client connection
+            // (an admin one was never counted). Read before deinit.
+            if (!kv.value.admin) if (self.active_connections) |active| {
+                _ = active.fetchSub(1, .monotonic);
+            };
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             if (self.metrics_registry) |m| m.server.connectionClosed();
@@ -5529,6 +5540,11 @@ pub const Shard = struct {
 
             const conn = self.addConnection(client_fd) catch {
                 _ = std.c.close(client_fd);
+                // A client slot the acceptor reserved is released; an admin fd
+                // was never counted.
+                if (tagged & acceptor_mod.ADMIN_TAG == 0) if (self.active_connections) |active| {
+                    _ = active.fetchSub(1, .monotonic);
+                };
                 continue;
             };
             conn.admin = tagged & acceptor_mod.ADMIN_TAG != 0;
