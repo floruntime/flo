@@ -106,6 +106,8 @@ const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
 const DurableLog = durable_log_mod.DurableLog;
+const CatchUp = @import("catch_up.zig").CatchUp;
+const BulkIo = @import("../storage/bulk_io.zig").BulkIo;
 const raft_log_mod = @import("../raft/log.zig");
 const RaftLog = raft_log_mod.RaftLog;
 const hard_state_mod = @import("../raft/hard_state.zig");
@@ -393,6 +395,9 @@ pub const Shard = struct {
     /// The writer's buffer plus the sealed segments, as one log the Raft
     /// node can read below its ring and truncate through (null if ephemeral).
     durable_log: ?*DurableLog,
+    /// Reads below the ring, a leader's for its peers made off this thread
+    /// once the node's bulk I/O thread is attached (null if ephemeral).
+    catch_up: ?*CatchUp = null,
 
     /// Count of segment flush failures. Surfaced instead of being silently
     /// swallowed so disk-full / IO faults are observable.
@@ -1037,8 +1042,16 @@ pub const Shard = struct {
         raft_node.log.ual.on_append_ctx = @ptrCast(seg_writer);
         raft_node.log.ual.on_append = segmentBufferCallback;
         seg_writer.stop_at_gap = durability == .sync;
+        var catch_up: ?*CatchUp = null;
+        errdefer if (catch_up) |cu| {
+            cu.deinit();
+            allocator.destroy(cu);
+        };
         if (durable_log) |dl| {
-            raft_node.log.catch_up = .{ .ctx = @ptrCast(dl), .read_range = catchUpReadRange };
+            const cu = try allocator.create(CatchUp);
+            cu.* = CatchUp.init(allocator, dl, RPC_MAX_ENTRIES, RPC_BATCH_BYTES);
+            catch_up = cu;
+            raft_node.log.catch_up = cu.source();
             raft_node.log.on_truncate_ctx = @ptrCast(dl);
             raft_node.log.on_truncate = durableTruncate;
         }
@@ -1148,6 +1161,7 @@ pub const Shard = struct {
             .hard_state_store = hard_state_store,
             .segment_writer = seg_writer,
             .durable_log = durable_log,
+            .catch_up = catch_up,
             .persist_failures = 0,
             .durability = durability,
             .shard_data_dir = shard_data_dir,
@@ -1374,6 +1388,12 @@ pub const Shard = struct {
             log.err("shard {d}: final flush on shutdown failed: {s} (buffered entries may be lost)", .{ self.id, @errorName(err) });
         };
 
+        // The runtime stops the bulk thread before it frees any shard, so no
+        // read still writes here.
+        if (self.catch_up) |cu| {
+            cu.deinit();
+            self.allocator.destroy(cu);
+        }
         if (self.durable_log) |dl| {
             dl.deinit();
             self.allocator.destroy(dl);
@@ -4393,9 +4413,18 @@ pub const Shard = struct {
     /// writes are answered with `message`, runs it had not stepped stay at
     /// their start, and implicit creates may have been dropped with the
     /// log's tail.
+    /// From now on a leader reads sealed segments for its peers on `bulk`,
+    /// which must outlive this shard's thread.
+    pub fn attachBulkIo(self: *Shard, bulk: *BulkIo) void {
+        const cu = self.catch_up orelse return;
+        cu.bulk = bulk;
+        cu.notify = .{ .ctx = self.mailbox, .done = catchUpReadDone };
+    }
+
     fn stoppedLeading(self: *Shard, message: []const u8) void {
         // A follower takes no step passes; its polls wait again.
         self.more_work = false;
+        if (self.catch_up) |cu| cu.forget();
         self.workflow_handler.dropStartedRuns(self);
         self.namespace_handler.forgetImplicitCreates(self);
         self.actions_handler.stoppedLeading(self);
@@ -6812,10 +6841,10 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     };
 }
 
-fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
-    const dl: *DurableLog = @ptrCast(@alignCast(ctx));
-    const r = dl.readRange(start, buf, arena);
-    return .{ .count = r.count, .blocked = r.blocked, .disk_failing = r.disk_failing };
+/// A read the bulk I/O thread made for this shard is back.
+fn catchUpReadDone(ctx: *anyopaque) void {
+    const mailbox: *Mailbox = @ptrCast(@alignCast(ctx));
+    mailbox.wake.set(.catch_up_read);
 }
 
 /// Raft log truncation, carried into the durable log.

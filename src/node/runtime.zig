@@ -50,6 +50,7 @@ const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const HttpMetricsServer = @import("../metrics/http_server.zig").HttpMetricsServer;
+const BulkIo = @import("../storage/bulk_io.zig").BulkIo;
 const NodeHealth = @import("health.zig").NodeHealth;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
@@ -340,6 +341,9 @@ pub const Runtime = struct {
 
     /// Raft networking layer for cluster entry replication.
     raft_network: ?*RaftNetwork,
+    /// Reads of sealed segments off the shard threads, for a leader's peers:
+    /// only when there can be peers.
+    bulk_io: ?*BulkIo = null,
     /// Frames from peers to shard 0; owned here, outlives both ends.
     raft_queue: ?*RaftQueue,
 
@@ -536,6 +540,14 @@ pub const Runtime = struct {
         if (self.peer_shards_slice) |s| {
             self.allocator.free(s);
             self.peer_shards_slice = null;
+        }
+
+        // Before the shards: it may still be writing into their buffers, on a
+        // start that failed after it began as well as after a stop.
+        if (self.bulk_io) |bulk| {
+            bulk.deinit();
+            self.allocator.destroy(bulk);
+            self.bulk_io = null;
         }
 
         // Clean up shards
@@ -863,6 +875,13 @@ pub const Runtime = struct {
             for (0..threads_spawned) |i| threads[i].join();
             self.allocator.free(threads);
             self.shard_threads = null;
+            // Then the bulk thread, once no shard can ask it for a read and
+            // before the shard errdefer frees the buffers it writes into.
+            if (self.bulk_io) |bulk| {
+                bulk.deinit();
+                self.allocator.destroy(bulk);
+                self.bulk_io = null;
+            }
         }
 
         // 3.5. Start the peer-facing Raft listener only when this node can
@@ -952,6 +971,17 @@ pub const Runtime = struct {
                 log.err("cluster: no seed resolved to another node's address; this node cannot join anyone. Check the seed addresses (a seed that is this node does not count), or start the first member with --cluster", .{});
                 return error.NoSeedReachable;
             }
+        }
+
+        // 3.6. The bulk I/O thread, before any shard can ask it for a read.
+        if (self.raft_network != null) {
+            const bulk = try self.allocator.create(BulkIo);
+            errdefer self.allocator.destroy(bulk);
+            bulk.* = try BulkIo.init(self.allocator);
+            errdefer bulk.deinit();
+            try bulk.start();
+            self.bulk_io = bulk;
+            for (shards) |*shard| shard.attachBulkIo(bulk);
         }
 
         // 3.7. Spawn shard threads
@@ -1275,6 +1305,10 @@ pub const Runtime = struct {
                 t.join();
             }
         }
+
+        // 5. Then the bulk thread: no shard asks it for anything now, and it
+        //    stops before the shards' buffers it writes into are freed.
+        if (self.bulk_io) |bulk| bulk.stop();
 
         self.started = false;
         log.debug("Runtime.stop: shutdown complete", .{});
@@ -1739,11 +1773,12 @@ test "runtime: the lock probe sees a lock another process holds, and a free one"
     try std.testing.expect(otherProcessCanLock(path));
 }
 
-/// Keeps freed blocks of one size, poisoned, instead of freeing them, so a
-/// write after free shows as a changed byte; everything else passes through.
+/// Keeps the watched blocks, poisoned, when they are freed, so a write after
+/// free shows as a changed byte; everything else passes through. Watched by
+/// address: other allocations may share a block's size.
 const PoisonFreed = struct {
     backing: std.mem.Allocator,
-    watch_len: usize,
+    watch: [2]usize = .{ 0, 0 },
     kept: [8][]u8 = undefined,
     kept_n: usize = 0,
 
@@ -1770,7 +1805,8 @@ const PoisonFreed = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
         const self: *PoisonFreed = @ptrCast(@alignCast(ctx));
-        if (memory.len == self.watch_len and self.kept_n < self.kept.len and alignment == std.mem.Alignment.of(MetricsRegistry)) {
+        const at = @intFromPtr(memory.ptr);
+        if ((at == self.watch[0] or at == self.watch[1]) and self.kept_n < self.kept.len) {
             @memset(memory, POISON);
             self.kept[self.kept_n] = memory;
             self.kept_n += 1;
@@ -1794,8 +1830,33 @@ const PoisonFreed = struct {
     }
 };
 
+test "Runtime: a cluster start that fails after the bulk thread began stops it before freeing the shards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    // Another server answers on the admin socket, so the start fails past
+    // the bulk thread and the shard threads. A short path: the tmp dir's
+    // may be past what a Unix socket path holds.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/flo-bulk-admin-{d}.sock", .{std.c.getpid()});
+    const held = try stdx.net.unixListen(path);
+    defer {
+        _ = std.c.close(held.fd);
+        stdx.fs.deleteFileAbsolute(path) catch {};
+    }
+
+    var runtime = try Runtime.init(std.testing.allocator, .{ .num_shards = 1, .listen_port = 0, .data_dir = dir, .dashboard_enabled = false, .metrics_enabled = false, .cluster_enabled = true, .cluster_node_id = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("8", 64), .admin_socket = path });
+    defer runtime.deinit();
+    try std.testing.expectError(error.AdminSocketInUse, runtime.start());
+    // The start's own cleanup took the bulk thread down, before the shards
+    // whose buffers it writes into: not left to deinit, which comes after.
+    try std.testing.expect(runtime.bulk_io == null);
+    try std.testing.expect(runtime.shards == null);
+}
+
 test "Runtime: a cluster member's shutdown writes nothing to its metrics after freeing them, with a peer linked" {
-    var poison: PoisonFreed = .{ .backing = std.testing.allocator, .watch_len = @sizeOf(MetricsRegistry) };
+    var poison: PoisonFreed = .{ .backing = std.testing.allocator };
     const gpa = poison.allocator();
     const secret = "flo-secret-" ++ stdx.repeat("7", 64);
 
@@ -1823,6 +1884,7 @@ test "Runtime: a cluster member's shutdown writes nothing to its metrics after f
     try b.start();
     b_up = true;
 
+    poison.watch = .{ @intFromPtr(a.metrics_registry.?), @intFromPtr(b.metrics_registry.?) };
     var tries: usize = 0;
     while (!a.raft_network.?.isLinked(2) or !b.raft_network.?.isLinked(1)) : (tries += 1) {
         if (tries == 200) return error.NeverLinked;

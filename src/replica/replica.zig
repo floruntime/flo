@@ -731,6 +731,11 @@ pub fn Replica(comptime Io: type) type {
                         p.sent_up_to = @max(p.sent_up_to, next + rr.count - 1);
                         p.batch_end = next + rr.count - 1;
                         p.sent_at_ms = now;
+                    } else if (rr.pending) {
+                        // Being read off this shard's thread: the read's end
+                        // wakes the shard, and the next pump sends it. Only a
+                        // heartbeat goes now, at the peer's same next index.
+                        if (!want_heartbeat) continue;
                     } else if (rr.blocked) {
                         // The entries are below the ring and can't be read right
                         // now (a resource or IO failure on this leader's disk).
@@ -739,7 +744,11 @@ pub fn Replica(comptime Io: type) type {
                         self.peer_catch_up_retry_ms[i] = now + CATCH_UP_RETRY_MS;
                         if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                             self.peer_batch_warn_ms[i] = now;
-                            log.warn("shard {d}: the entries at index {d} can't be read to replicate to node {d} right now; holding and retrying", .{ self.id, next, raft.peer_ids[i] });
+                            if (rr.stale) {
+                                log.warn("shard {d}: the entries read at index {d} to replicate to node {d} don't match this log's terms; holding and reading them again", .{ self.id, next, raft.peer_ids[i] });
+                            } else {
+                                log.warn("shard {d}: the entries at index {d} can't be read to replicate to node {d} right now; holding and retrying", .{ self.id, next, raft.peer_ids[i] });
+                            }
                         }
                     } else if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                         // An empty batch here would be sent as a heartbeat and
@@ -791,7 +800,7 @@ const TestIo = struct {
         const h = of(r);
         if (msg_type == .append_entries) {
             const hdr = transport.deserializeAppendRequestHeader(payload).?;
-            h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count, .verdict = hdr.halt_verdict }) catch @panic("OOM");
+            h.appends.append(testing.allocator, .{ .to = peer, .entries = hdr.entry_count, .verdict = hdr.halt_verdict, .prev_index = hdr.prev_log_index, .prev_term = hdr.prev_log_term }) catch @panic("OOM");
         }
         return true;
     }
@@ -846,7 +855,7 @@ const Harness = struct {
     arena: [4096]u8 = undefined,
     out: [8192]u8 = undefined,
 
-    const Append = struct { to: u32, entries: u32, verdict: raft_node_mod.HaltVerdict = .{} };
+    const Append = struct { to: u32, entries: u32, verdict: raft_node_mod.HaltVerdict = .{}, prev_index: u64 = 0, prev_term: u64 = 0 };
 
     fn init(self: *Harness) !void {
         self.* = .{ .replica = undefined, .raft = try RaftNode.init(testing.allocator, 1, 1, 1 << 16, .{ .durable_commits = false }) };
@@ -862,6 +871,16 @@ const Harness = struct {
     fn deinit(self: *Harness) void {
         self.appends.deinit(testing.allocator);
         self.raft.deinit();
+    }
+
+    /// The last append sent to `to`.
+    fn lastTo(self: *const Harness, to: u32) ?Append {
+        var i = self.appends.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.appends.items[i].to == to) return self.appends.items[i];
+        }
+        return null;
     }
 
     /// Appends with entries sent to `to` so far.
@@ -1381,4 +1400,66 @@ test "replica: a blocked catch-up read for a lagging follower backs off, not re-
     // Past the back-off, it reads again — once.
     h.replica.pump(h.now + CATCH_UP_RETRY_MS);
     try testing.expectEqual(@as(usize, 2), BlockingCatchUp.calls);
+}
+
+/// A below-the-ring source read off the shard's thread: it answers pending
+/// until `done` is set, then entries of `term`, each with a small payload
+/// (only index and term are checked before they are sent).
+const PendingCatchUp = struct {
+    var done: bool = false;
+    var asks: usize = 0;
+    var term: u64 = 0;
+    fn read(_: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
+        asks += 1;
+        if (!done) return .{ .pending = true };
+        const n = @min(buf.len, 2);
+        for (buf[0..n], 0..) |*e, i| {
+            arena[i] = 'x';
+            e.* = entry_mod.buildEntry(.kv_put, 0, term, start + i, 0, arena[i..][0..1]);
+        }
+        return .{ .count = n };
+    }
+    fn never(_: *anyopaque, _: u64, _: []entry_mod.Entry, _: []u8) raft_log_mod.CatchUpResult {
+        unreachable;
+    }
+};
+
+test "replica: while a peer's read below the ring is pending it gets heartbeats at its own index, then the batch" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const raft = &h.raft;
+    const big = try testing.allocator.alloc(u8, 32 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    for (0..6) |_| _ = try raft.propose(.kv_put, 0, big);
+    try testing.expect(raft.log.ual.readRangeCopy(1, 2, h.replica.rpc_entries[0..1], &h.arena) == 0);
+    PendingCatchUp.done = false;
+    PendingCatchUp.asks = 0;
+    PendingCatchUp.term = raft.current_term;
+    raft.log.catch_up = .{ .ctx = @ptrFromInt(@alignOf(usize)), .read_range = PendingCatchUp.never, .read_range_async = PendingCatchUp.read };
+    raft.peers[0].next_index = 1;
+    raft.peers[0].inflight = false;
+    raft.peers[0].heartbeat_at_ms = 0;
+    raft.peers[1].next_index = raft.log.lastIndex() + 1;
+
+    // Pending: a heartbeat at the peer's own index, no entries, nothing in flight.
+    h.replica.pump(h.now);
+    try testing.expectEqual(@as(usize, 1), PendingCatchUp.asks);
+    try testing.expectEqual(@as(usize, 0), h.batchesTo(2));
+    const beat = h.lastTo(2).?;
+    try testing.expectEqual(@as(u64, 0), beat.prev_index);
+    try testing.expectEqual(@as(u64, 0), beat.prev_term);
+    try testing.expect(!raft.peers[0].inflight);
+    // Still pending, between heartbeats: asked again, nothing sent.
+    const sent = h.appends.items.len;
+    h.replica.pump(h.now + 1);
+    try testing.expectEqual(@as(usize, 2), PendingCatchUp.asks);
+    try testing.expectEqual(sent, h.appends.items.len);
+    // Back: the next pump sends the batch from index 1.
+    PendingCatchUp.done = true;
+    h.replica.pump(h.now + 2);
+    try testing.expectEqual(@as(usize, 1), h.batchesTo(2));
+    try testing.expectEqual(@as(u64, 0), h.lastTo(2).?.prev_index);
+    try testing.expect(raft.peers[0].inflight);
 }

@@ -36,6 +36,9 @@ pub const Flag = enum(u5) {
     /// inbox. It only wakes the shard: waiting connections are looked at
     /// every tick.
     share_returned,
+    /// A read the bulk I/O thread made for this shard is back: the next
+    /// pump sends it.
+    catch_up_read,
 
     pub fn bit(self: Flag) u32 {
         return @as(u32, 1) << @backingInt(self);

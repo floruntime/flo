@@ -411,6 +411,11 @@ jobs:
       - name: Swarm with a ring too small to hold what followers need
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --small-ring --seed-timeout=120 --out-dir=/tmp/vopr-small-ring
         timeout-minutes: 10
+      - name: Swarm with reads below the ring answered later
+        # The small ring, with a leader's reads below it for a peer answered
+        # pending and done some ticks later, as the bulk I/O thread does.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --pending-reads --seed-timeout=120 --out-dir=/tmp/vopr-pending-reads
+        timeout-minutes: 10
       - name: Mutant scenarios still fail
         # Each row of src/vopr/mutants/README.md plants a bug the checker
         # must catch, with the invariant and the words named; the scenario
