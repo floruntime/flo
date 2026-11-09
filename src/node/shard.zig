@@ -6386,6 +6386,10 @@ pub const Shard = struct {
             return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is itself a repair; a skip is never skipped", .{ask.index}) catch "a skip is never skipped");
         if (etype == @backingInt(entry_mod.EntryType.raft_config) or etype == @backingInt(entry_mod.EntryType.raft_noop))
             return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{ask.index}) catch "never skipped");
+        // The writes behind a create or bind carry its id: skipped, they
+        // would apply under an id another namespace may take.
+        if (etype == @backingInt(entry_mod.EntryType.namespace_create) or etype == @backingInt(entry_mod.EntryType.namespace_bind))
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} creates or binds a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take. It is never skipped", .{ask.index}) catch "a namespace create or bind is never skipped");
         const target: raft_node_mod.HaltAt = .{ .index = ask.index, .term = e.header.term, .crc = e.header.crc32c };
         const entry_size: u32 = @intCast(e.payload.len);
         var ids: [raft_node_mod.MAX_PEERS + 1]raft_node_mod.NodeId = undefined;
@@ -19374,6 +19378,26 @@ test "Shard: a diverged member applies nothing more, and its reads say they are 
     try std.testing.expect(raft.commit_index > raft.last_applied);
     // Its reads are served, from that state, marked stale.
     try std.testing.expectEqual(proto.RESPONSE_STALE, (try t.ask(.cluster_status, "", &buf)).header.flags & proto.RESPONSE_STALE);
+}
+
+test "Shard: a cluster repair never skips a namespace create, even one the group halted at" {
+    var t: AdminTest = undefined;
+    try t.init(1, .bootstrap);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    try std.testing.expect(t.shard.applyCommitted());
+    try ParkTest.joinPeer(&t.shard);
+    var buf: [1024]u8 = undefined;
+    // A create of an id already taken: the leader halts at it once it commits.
+    const P = @import("../protocol/namespace_entries.zig").Create;
+    var pbuf: [P.max_size]u8 = undefined;
+    const h = (try raft.propose(.namespace_create, entry_mod.Flags.NONE, try P.encodeInto(&pbuf, .{ .name = "late", .id = ns_table.DEFAULT.int() }))).index;
+    raft.peers[0].sent_up_to = h;
+    raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = h, .from = 2 });
+    try std.testing.expect(!t.shard.applyCommitted());
+    try std.testing.expectEqual(h, raft.halt_at.?.index);
+    try expectAnswer((try t.repairSkip(.admin, h, true, &buf)).?, .bad_request, "never skipped");
+    try std.testing.expectEqual(h, raft.log.lastIndex());
 }
 
 test "Shard: a repair skip runs only from the admin socket, on a leader halted at the entry with a majority halted there; its dry run changes nothing" {
