@@ -871,6 +871,10 @@ pub const ConsumerGroup = struct {
     /// Relies on the array-backed PEL iterating in insertion order (== StreamID
     /// order, since deliveries are monotonic and acks use `fetchOrderedRemove`).
     pub fn autoclaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) ClaimResult {
+        return self.scanClaim(new_consumer, min_idle_ms, now_ms, start_id, max_count, out, true);
+    }
+
+    fn scanClaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID, do_claim: bool) ClaimResult {
         var result_count: u32 = 0;
         const start_order = start_id.order();
         var next_cursor = StreamID.MAX;
@@ -886,24 +890,39 @@ pub const ConsumerGroup = struct {
             const pe = kv.value_ptr;
             const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
             if (idle >= min_idle_ms) {
-                const same_owner = std.mem.eql(u8, pe.consumer, new_consumer);
-                if (!same_owner) {
-                    if (self.members.getPtr(pe.consumer)) |m| {
-                        if (m.pending_count > 0) m.pending_count -= 1;
-                    }
-                    pe.consumer = self.internConsumer(new_consumer);
-                    if (self.members.getPtr(new_consumer)) |m| {
-                        m.pending_count += 1;
-                    }
-                }
-                pe.last_delivery_ms = now_ms;
-                pe.delivery_count += 1;
-                pe.ready = .no;
+                if (do_claim) self.claimOne(pe, new_consumer, now_ms);
                 out[result_count] = pe.id;
                 result_count += 1;
             }
         }
         return .{ .count = result_count, .next_cursor = next_cursor };
+    }
+
+    /// `autoclaim`'s page, claiming nothing: the caller claims what it can
+    /// answer with (`claimIds`).
+    pub fn peekClaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) ClaimResult {
+        return self.scanClaim(new_consumer, min_idle_ms, now_ms, start_id, max_count, out, false);
+    }
+
+    /// Claim these pending entries for `new_consumer`.
+    pub fn claimIds(self: *ConsumerGroup, ids: []const StreamID, new_consumer: []const u8, now_ms: u64) void {
+        for (ids) |id| if (self.pel.getPtr(id.order())) |pe| self.claimOne(pe, new_consumer, now_ms);
+    }
+
+    fn claimOne(self: *ConsumerGroup, pe: *PendingEntry, new_consumer: []const u8, now_ms: u64) void {
+        const same_owner = std.mem.eql(u8, pe.consumer, new_consumer);
+        if (!same_owner) {
+            if (self.members.getPtr(pe.consumer)) |m| {
+                if (m.pending_count > 0) m.pending_count -= 1;
+            }
+            pe.consumer = self.internConsumer(new_consumer);
+            if (self.members.getPtr(new_consumer)) |m| {
+                m.pending_count += 1;
+            }
+        }
+        pe.last_delivery_ms = now_ms;
+        pe.delivery_count += 1;
+        pe.ready = .no;
     }
 
     /// Touch pending entries — reset their idle timer.
@@ -1492,6 +1511,18 @@ pub const StreamProjection = struct {
     pub fn groupAutoclaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !ConsumerGroup.ClaimResult {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
         return group.autoclaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
+    }
+
+    /// `groupAutoclaim`'s page, claiming nothing.
+    pub fn groupPeekClaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !ConsumerGroup.ClaimResult {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        return group.peekClaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
+    }
+
+    /// Claim these pending entries of `group_name` for `consumer`.
+    pub fn groupClaimIds(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, now_ms: u64) !void {
+        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
+        group.claimIds(ids, consumer, now_ms);
     }
 
     /// Touch (reset idle timer) for PEL entries.

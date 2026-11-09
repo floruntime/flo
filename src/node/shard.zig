@@ -6775,6 +6775,16 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
             return true;
         },
     };
+    // A read held only for its disk payloads is answered as a fresh read
+    // would be now, records or none: its stream may be trimmed or deleted.
+    if (records.len == 0 and waiter.kind == .stream_disk_read) {
+        switch (result) {
+            .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
+            .err => |e| shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, e.code.toStatus(), e.refusal()),
+            else => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{ 0, 0, 0, 0 }),
+        }
+        return true;
+    }
     if (records.len == 0) {
         // Everything up to the stream's last id (or `end`) was scanned and none
         // of it is in the window; ids only grow, so the next wake starts there
@@ -13050,98 +13060,142 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
     }
 }
 
-test "Shard: a stream record past the hot ring and the warm store is read back from its segment" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const data_dir = try testDataDir(&tmp);
-    defer std.testing.allocator.free(data_dir);
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    // A small hot ring, and a warm store that keeps almost nothing.
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, 64 * 1024, 0, 0, .sync, 1, .single, .{}, .{});
-    defer shard.deinit();
-    shard.wireHandlerShardPtrs();
-    try std.testing.expect(shard.applyCommitted());
-    shard.defaultPartition().setWarmBudget(4096);
+/// A lone shard with a small hot ring and a warm store that keeps almost
+/// nothing, holding one-record appends to stream "s", each followed by
+/// `filler` appends to stream "f".
+const ColdStream = struct {
+    tmp: std.testing.TmpDir,
+    data_dir: []const u8,
+    pipe_fds: [2]i32,
+    shard: Shard,
+    value: []u8,
 
-    // One record per append: [count][len][payload][header_count].
-    var batch: [4 + 4 + 2048 + 2]u8 = undefined;
-    std.mem.writeInt(u32, batch[0..4], 1, .little);
-    std.mem.writeInt(u32, batch[4..8], 2048, .little);
-    @memset(batch[8 .. 8 + 2048], 'r');
-    std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
-    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
-    defer std.testing.allocator.free(v);
-    const APPENDS = 100;
-    for (0..APPENDS) |i| {
-        _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
-        try std.testing.expect(shard.applyCommitted());
-        if (i % 10 == 9) try shard.flushSegmentToDisk();
+    fn init(self: *ColdStream, durability: Durability, appends: usize, filler: usize, flush_every: usize) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        self.data_dir = try testDataDir(&self.tmp);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, 64 * 1024, 0, 0, durability, 1, .single, .{}, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        self.shard.defaultPartition().setWarmBudget(4096);
+        // One record per append: [count][len][payload][header_count].
+        var batch: [4 + 4 + 2048 + 2]u8 = undefined;
+        std.mem.writeInt(u32, batch[0..4], 1, .little);
+        std.mem.writeInt(u32, batch[4..8], 2048, .little);
+        @memset(batch[8 .. 8 + 2048], 'r');
+        std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
+        self.value = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
+        for (0..appends) |i| {
+            _ = try persistence_mod.proposeEntry(&self.shard, .stream_append, entry_mod.Flags.NONE, "", "s", self.value);
+            for (0..filler) |_| _ = try persistence_mod.proposeEntry(&self.shard, .stream_append, entry_mod.Flags.NONE, "", "f", self.value);
+            try std.testing.expect(self.shard.applyCommitted());
+            if (flush_every > 0 and i % flush_every == flush_every - 1) try self.shard.flushSegmentToDisk();
+        }
+        if (flush_every > 0) try self.shard.flushSegmentToDisk();
     }
-    try shard.flushSegmentToDisk();
 
-    // From the start: every record, the first ones read back from disk (no
-    // bulk thread here, so in place), none skipped.
-    const handler = shard.stream_handler;
-    var window: waiter_pool_mod.StreamWindow = .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = 10 };
+    fn deinit(self: *ColdStream) void {
+        self.shard.deinit();
+        std.testing.allocator.free(self.value);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.data_dir);
+        self.tmp.cleanup();
+    }
+
+    fn window(limit: u32) waiter_pool_mod.StreamWindow {
+        return .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = limit };
+    }
+
+    /// Read `w`, landing disk reads and reading again while it is held, as
+    /// the shard's tick and a held read's wake do.
+    fn read(self: *ColdStream, w: *waiter_pool_mod.StreamWindow, buf: *[StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord) !struct { []stream_mod.StreamRecord, @import("../protocol/result.zig").CommandResult } {
+        const handler = self.shard.stream_handler;
+        for (0..5_000) |_| {
+            const records, const result = handler.readReadable(w, buf);
+            if (result != .pending) return .{ records, result };
+            if (handler.held == .blocked) return error.Blocked;
+            while (!self.shard.stream_disk.?.drain()) @import("stdx").time.sleep(std.time.ns_per_ms);
+        }
+        return error.NeverServed;
+    }
+};
+
+test "Shard: a stream record past the hot ring and the warm store is read back from its segment" {
+    var c: ColdStream = undefined;
+    // Async durability, flushed every 10 appends: segments of 10. (Under sync
+    // each commit seals a segment of its own.)
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // From the start: held once, then every record, the first ones from the
+    // durable log, none skipped.
+    var w = ColdStream.window(10);
     var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
-    const records, const result = handler.readReadable(&window, &buf);
-    defer handler.freeResult(result);
+    const records, const result = try c.read(&w, &buf);
+    defer c.shard.stream_handler.freeResult(result);
     try std.testing.expectEqual(@as(usize, 10), records.len);
-    try std.testing.expect(result == .stream_messages);
     try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, result.stream_messages.data[0..4], .little));
-    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
+    try std.testing.expectEqual(@as(u64, 0), c.shard.stream_handler.skipped_appends);
     // The first record's tier byte says disk: after the count, sequence
     // and timestamp.
     try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
 }
 
 test "Shard: a stream record past the warm store but not yet flushed is read from the writer's buffer, not skipped" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const data_dir = try testDataDir(&tmp);
-    defer std.testing.allocator.free(data_dir);
-    const pipe_fds = try @import("stdx").io.pipe();
-    defer _ = std.c.close(pipe_fds[0]);
-    defer _ = std.c.close(pipe_fds[1]);
-    // A small hot ring, and a warm store that keeps almost nothing.
-    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, 64 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
-    defer shard.deinit();
-    shard.wireHandlerShardPtrs();
-    try std.testing.expect(shard.applyCommitted());
-    shard.defaultPartition().setWarmBudget(4096);
-
-    // One record per append: [count][len][payload][header_count].
-    var batch: [4 + 4 + 2048 + 2]u8 = undefined;
-    std.mem.writeInt(u32, batch[0..4], 1, .little);
-    std.mem.writeInt(u32, batch[4..8], 2048, .little);
-    @memset(batch[8 .. 8 + 2048], 'r');
-    std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
-    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
-    defer std.testing.allocator.free(v);
-    const APPENDS = 100;
-    for (0..APPENDS) |_| {
-        _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
-        try std.testing.expect(shard.applyCommitted());
-    }
-
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 0);
+    defer c.deinit();
     // Under async durability a burst outruns the flush: nothing is sealed.
-    try std.testing.expect(shard.durable_log.?.writer.entry_count > 0);
-
-    // From the start: every record, the first ones from the writer's buffer.
-    const handler = shard.stream_handler;
-    var window: waiter_pool_mod.StreamWindow = .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = 10 };
+    try std.testing.expect(c.shard.durable_log.?.writer.entry_count > 0);
+    var w = ColdStream.window(10);
     var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
-    const records, const result = handler.readReadable(&window, &buf);
-    defer handler.freeResult(result);
+    const records, const result = try c.read(&w, &buf);
+    defer c.shard.stream_handler.freeResult(result);
     try std.testing.expectEqual(@as(usize, 10), records.len);
-    try std.testing.expect(result == .stream_messages);
-    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, result.stream_messages.data[0..4], .little));
-    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
-    // The first record's tier byte says disk: after the count, sequence
-    // and timestamp.
+    try std.testing.expectEqual(@as(u64, 0), c.shard.stream_handler.skipped_appends);
     try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
+}
+
+test "Shard: a cold walk of a stream interleaved with another reads every record, a run per read, none skipped" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 300, 2, 20);
+    defer c.deinit();
+    var bulk = try BulkIo.init(std.testing.allocator);
+    defer bulk.deinit();
+    try bulk.start();
+    c.shard.attachBulkIo(&bulk);
+    defer bulk.stop();
+    const handler = c.shard.stream_handler;
+    var w = ColdStream.window(100);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    var served: usize = 0;
+    while (served < 300) {
+        const records, const result = try c.read(&w, &buf);
+        defer handler.freeResult(result);
+        if (records.len == 0) break;
+        served += std.mem.readInt(u32, result.stream_messages.data[0..4], .little);
+        w.after = stream_mod.lastRecordOf(records[records.len - 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 300), served);
+    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
+    // A read lands a run of the asking stream's window: far fewer reads
+    // than records, the filler stream's entries never cached.
+    const reads = c.shard.stream_disk.?.reads_made;
+    std.debug.print("cold walk: {d} records in {d} reads\n", .{ served, reads });
+    try std.testing.expect(reads > 0 and reads * 10 <= served);
+}
+
+test "Shard: a stream read whose disk read is blocked is refused at once, not held" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    c.shard.durable_log.?.test_open_error = error.SystemResources;
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    try std.testing.expectError(error.Blocked, c.read(&w, &buf));
+    // Backing off: asked again at once, it is still blocked, with no read.
+    _, const again = c.shard.stream_handler.readReadable(&w, &buf);
+    try std.testing.expect(again == .pending and c.shard.stream_handler.held == .blocked);
 }
 
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {

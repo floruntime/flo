@@ -28,6 +28,25 @@ fn readUntilServed(conn: *Client, comptime f: anytype, args: anytype) !src.cli_c
     }
 }
 
+/// The id of the last record in a read's answer:
+/// [count]([sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
+/// [key_present:u8][payload_len:u32][payload][header_count:u32])*, with no
+/// headers in this test.
+fn lastId(data: []const u8) !src.cli_client.StreamID {
+    const n = try recordCount(data);
+    var pos: usize = 4;
+    var id: src.cli_client.StreamID = .{ .timestamp_ms = 0, .sequence = 0 };
+    for (0..n) |_| {
+        id = .{ .sequence = std.mem.readInt(u64, data[pos..][0..8], .little), .timestamp_ms = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little) };
+        pos += 8 + 8 + 1 + 4 + 1;
+        const len = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4 + len;
+        if (std.mem.readInt(u32, data[pos..][0..4], .little) != 0) return error.UnexpectedHeaders;
+        pos += 4;
+    }
+    return id;
+}
+
 fn recordCount(data: []const u8) !u32 {
     if (data.len < 4) return error.ShortAnswer;
     return std.mem.readInt(u32, data[0..4], .little);
@@ -64,23 +83,47 @@ test "e2e/stream-disk: records past the warm store are read back from their segm
         }
     }
 
-    // From the start: the first append's record, read from disk.
+    // Cold, a group read first: refused retryable while its payloads are
+    // read back, with nothing delivered, then the very first record. Had a
+    // refused read delivered, the cursor would be past it.
+    var group = try readUntilServed(&conn, stream.groupRead, .{ "", "s", "g", "c1", @as(?u32, 5), @as(?u32, null) });
+    defer group.deinit();
+    try testing.expectEqual(proto.StatusCode.ok, group.status);
+    try testing.expect(try recordCount(group.data) >= 1);
+    try testing.expectEqual(first_seq.?, std.mem.readInt(u64, group.data[4..12], .little));
+    try testing.expectEqual(first_ts, std.mem.readInt(u64, group.data[12..20], .little));
+
+    // A plain read from the start: the very first record, none skipped,
+    // from the durable log. [count] then [sequence:u64][timestamp_ms:i64][tier:u8]...
     var plain = try readUntilServed(&conn, stream.read, .{ "", "s", stream.StartMode.stream_id, null, null, @as(?u32, 5), @as(?u32, null), @as(?u32, null), @as(?[]const u8, null) });
     defer plain.deinit();
     try testing.expectEqual(proto.StatusCode.ok, plain.status);
     // As many whole records as an answer holds: at 60 KiB, one or two.
     try testing.expect(try recordCount(plain.data) >= 1);
-    // [count] then [sequence:u64][timestamp_ms:i64][tier:u8]...: the very
-    // first record, none skipped, from the durable log.
     try testing.expectEqual(first_seq.?, std.mem.readInt(u64, plain.data[4..12], .little));
     try testing.expectEqual(first_ts, std.mem.readInt(u64, plain.data[12..20], .little));
     try testing.expectEqual(@backingInt(proto.StorageTier.disk), plain.data[4 + 8 + 8]);
     try testing.expect(std.mem.indexOf(u8, plain.data, "aaaa") != null);
 
-    // A group read gets them too, without skipping a delivery.
-    var group = try readUntilServed(&conn, stream.groupRead, .{ "", "s", "g", "c1", @as(?u32, 5), @as(?u32, null) });
-    defer group.deinit();
-    try testing.expectEqual(proto.StatusCode.ok, group.status);
-    try testing.expect(try recordCount(group.data) >= 1);
-    try testing.expect(std.mem.indexOf(u8, group.data, "aaaa") != null);
+    // Read on past the cache's budget (8 MiB, about 136 records here), so
+    // the first ones are evicted: a claim of them is cold too.
+    var at = src.cli_client.StreamID{ .timestamp_ms = first_ts, .sequence = first_seq.? };
+    var walked: usize = 0;
+    while (walked < 200) {
+        var r = try readUntilServed(&conn, stream.read, .{ "", "s", stream.StartMode.stream_id, at, null, @as(?u32, 5), @as(?u32, null), @as(?u32, null), @as(?[]const u8, null) });
+        defer r.deinit();
+        try testing.expectEqual(proto.StatusCode.ok, r.status);
+        const n = try recordCount(r.data);
+        try testing.expect(n >= 1);
+        walked += n;
+        at = try lastId(r.data);
+    }
+
+    // c1 holds what it read; c2 claims it, cold: the first record, claimed
+    // only once its payload is back.
+    var claim = try readUntilServed(&conn, stream.groupClaim, .{ "", "s", "g", "c2", @as(u32, 0), src.cli_client.StreamID{ .timestamp_ms = 0, .sequence = 0 }, @as(u32, 5) });
+    defer claim.deinit();
+    try testing.expectEqual(proto.StatusCode.ok, claim.status);
+    try testing.expect(try recordCount(claim.data) >= 1);
+    try testing.expectEqual(first_seq.?, std.mem.readInt(u64, claim.data[4..12], .little));
 }
