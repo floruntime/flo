@@ -3497,3 +3497,101 @@ test "e2e/cluster: a follower asked about a group answers the leader's members a
     if (std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") == null) std.debug.print("{s}\n", .{info});
     try testing.expect(std.mem.indexOf(u8, info, "\"pending\":1,\"members\":1,") != null);
 }
+
+// =============================================================================
+// A stream's settings, across a restart and a failover
+// =============================================================================
+
+/// Polls `stream info` on `node` until its output holds every one of `want`.
+fn infoHolds(cluster: *stdx.testing.ClusterContext, node: usize, name: []const u8, want: []const []const u8) bool {
+    for (0..50) |_| {
+        const out = cluster.execCaptureOn(node, &.{ "stream", "info", name }) catch {
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        defer cluster.allocator.free(out);
+        for (want) |w| {
+            if (std.mem.indexOf(u8, out, w) == null) break;
+        } else return true;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "e2e/stream: a stream's partition count and retention survive a restart, and its retention still trims" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "create", "kept", "--partitions", "4", "--retention-count", "2" });
+    try ctx.restartServer();
+    const info = try ctx.execCapture(&.{ "stream", "info", "kept" });
+    try testing.expect(std.mem.indexOf(u8, info, "Partitions: 4") != null);
+    try testing.expect(std.mem.indexOf(u8, info, "Count: 2") != null);
+
+    for (0..5) |_| try ctx.exec(&.{ "stream", "append", "kept", "r" });
+    // Retention runs every 10 s.
+    for (0..150) |_| {
+        const now = try ctx.execCapture(&.{ "stream", "info", "kept" });
+        if (std.mem.indexOf(u8, now, "Records: 2\n") != null) return;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return error.NotTrimmed;
+}
+
+test "e2e/stream: a create of a stream that exists is ok with the same settings, and refused with others, pointing at alter" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "create", "twice", "--retention-count", "3" });
+    try ctx.exec(&.{ "stream", "create", "twice", "--retention-count", "3" });
+    var other = try ctx.cli.run(&.{ "stream", "create", "twice", "--retention-count", "4" });
+    defer other.deinit();
+    try testing.expectEqual(@as(u8, 3), other.exit_code);
+    try testing.expect(other.stderrContains("exists with other settings; change them with stream alter"));
+    try ctx.exec(&.{ "stream", "alter", "twice", "--retention-count", "4" });
+    try ctx.restartServer();
+    try testing.expect(std.mem.indexOf(u8, try ctx.execCapture(&.{ "stream", "info", "twice" }), "Count: 4") != null);
+}
+
+test "e2e/stream/cluster: a stream created on a leader keeps its partition count and retention on the next" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try streamLeader(&cluster, null);
+    try cluster.execOn(first, &.{ "stream", "create", "moved", "--partitions", "4", "--retention-count", "2" });
+    cluster.killNode(first);
+    const next = try streamLeader(&cluster, first);
+    try testing.expect(infoHolds(&cluster, next, "moved", &.{ "Partitions: 4", "Count: 2" }));
+}
+
+fn streamLeader(c: *stdx.testing.ClusterContext, skip: ?usize) !usize {
+    for (0..100) |_| {
+        for (0..c.node_count) |i| {
+            if (skip == i or c.getServer(i) == null) continue;
+            const out = c.execCaptureOn(i, &.{ "cluster", "status", "-o", "json" }) catch continue;
+            defer c.allocator.free(out);
+            if (std.mem.indexOf(u8, out, "\"role\":\"leader\"") != null) return i;
+        }
+        stdx.time.sleep(200 * std.time.ns_per_ms);
+    }
+    return error.NoLeader;
+}
+
+test "e2e/stream: an alter in a namespace that has no such stream is not found, and halts nothing" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 8 } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "realns" });
+    for ([_][]const u8{ "nope", "realns" }) |ns| {
+        for (0..7) |i| {
+            var name_buf: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+            var r = try ctx.cli.run(&.{ "stream", "alter", name, "--retention-count", "5", "-n", ns });
+            defer r.deinit();
+            try testing.expect(r.exit_code != 0);
+            try testing.expect(r.stderrContains("not found"));
+        }
+    }
+    // Every shard still takes writes.
+    for (0..16) |i| {
+        var name_buf: [16]u8 = undefined;
+        try ctx.exec(&.{ "stream", "append", try std.fmt.bufPrint(&name_buf, "after{d}", .{i}), "x" });
+    }
+}

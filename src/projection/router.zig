@@ -231,7 +231,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .ts,
 
         // Stream — no projection (UAL direct reads)
-        .stream_append, .stream_trim, .stream_delete => .none,
+        .stream_append, .stream_trim, .stream_delete, .stream_config => .none,
 
         // Raft control — consensus layer
         .raft_config, .raft_noop, .repair_skip => .none,
@@ -241,7 +241,7 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
 
         // Registry-owned: applied by the owning handler's callback, never by
         // this router (Shard.assertOneApplier enforces it).
-        .workflow_create, .workflow_start, .workflow_complete => .none,
+        .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled => .none,
         .namespace_create, .namespace_bind => .none,
         // Actions: their contract machine (actions/machine.zig).
         .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => .none,

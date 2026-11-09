@@ -4001,3 +4001,89 @@ test "e2e/workflow: disable and enable take no --version, which a definition doe
         try testing.expect(r.stderrContains("version"));
     }
 }
+
+// =============================================================================
+// Disable and enable, across a restart and a failover
+// =============================================================================
+
+const SCHEDULED =
+    \\kind: Workflow
+    \\name: paused
+    \\version: 1.0.0
+    \\schedule:
+    \\  interval: 100
+    \\  max_concurrent: 1000
+    \\start:
+    \\  wait_for_signal:
+    \\    type: never
+    \\  transitions:
+    \\    success: flo.Completed
+;
+
+fn runCount(out: []const u8) usize {
+    return std.mem.count(u8, out, "\n");
+}
+
+test "e2e/workflow: a disabled workflow stays disabled across a restart: listed so, its schedule silent, a start refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try createYamlWorkflow(ctx, SCHEDULED);
+    try ctx.exec(&.{ "workflow", "disable", "paused" });
+    try ctx.restartServer();
+
+    const list = try ctx.execCapture(&.{ "workflow", "list" });
+    // Its row: name, version, enabled.
+    var rows = std.mem.splitScalar(u8, list, '\n');
+    const row = while (rows.next()) |r| {
+        if (std.mem.startsWith(u8, r, "paused ")) break r;
+    } else return error.NotListed;
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, row, " "), "no"));
+    var start = try ctx.cli.run(&.{ "workflow", "start", "paused", "{}" });
+    defer start.deinit();
+    try testing.expect(start.stderrContains("workflow is disabled"));
+    const before = runCount(try ctx.execCapture(&.{ "workflow", "list-runs", "-w", "paused", "--limit", "1000" }));
+    stdx.time.sleep(500 * std.time.ns_per_ms);
+    try testing.expectEqual(before, runCount(try ctx.execCapture(&.{ "workflow", "list-runs", "-w", "paused", "--limit", "1000" })));
+
+    // Enabled, it stays so across a restart too.
+    try ctx.exec(&.{ "workflow", "enable", "paused" });
+    try ctx.restartServer();
+    try ctx.exec(&.{ "workflow", "start", "paused", "{}", "--run-id", "after" });
+}
+
+test "e2e/workflow: enabling or disabling a workflow that doesn't exist is not found" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_][]const u8{ "enable", "disable" }) |verb| {
+        var r = try ctx.cli.run(&.{ "workflow", verb, "never-made" });
+        defer r.deinit();
+        try testing.expect(r.stderrContains("workflow not found"));
+    }
+}
+
+test "e2e/workflow/cluster: a workflow disabled on a leader stays disabled on the next" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    const path = try writeTempYaml(testing.allocator, SCHEDULED, "paused.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try cluster.execOn(first, &.{ "workflow", "create", "-f", path });
+    try cluster.execOn(first, &.{ "workflow", "disable", "paused" });
+
+    cluster.killNode(first);
+    const next = try clusterLeader(&cluster, first);
+    var refused = false;
+    for (0..40) |_| {
+        var r = try cluster.clis[next].?.run(&.{ "workflow", "start", "paused", "{}" });
+        defer r.deinit();
+        if (r.stderrContains("workflow is disabled")) {
+            refused = true;
+            break;
+        }
+        // Not yet the leader's to answer, or it started: either way, look again.
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+        if (r.exit_code == 0) break;
+    }
+    try testing.expect(refused);
+}

@@ -71,6 +71,8 @@ pub const EntryType = enum(u8) {
     stream_append = 0x10,
     stream_trim = 0x11,
     stream_delete = 0x12,
+    /// A stream created or altered: its partition count and retention.
+    stream_config = 0x13,
 
     // ── Queue ──
     queue_enqueue = 0x20,
@@ -102,6 +104,8 @@ pub const EntryType = enum(u8) {
     workflow_create = 0x50,
     workflow_start = 0x51,
     workflow_complete = 0x52,
+    /// A workflow disabled or enabled: `[enabled:u8]` for "namespace:name".
+    workflow_enabled = 0x53,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -133,11 +137,11 @@ pub const EntryType = enum(u8) {
             .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => false,
             .namespace_create, .namespace_bind => false,
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
-            .stream_append, .stream_trim, .stream_delete => true,
+            .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => true,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_commit, .cg_create, .cg_delete => true,
-            .workflow_create, .workflow_start, .workflow_complete => true,
+            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };
