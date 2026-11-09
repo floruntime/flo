@@ -731,7 +731,16 @@ pub const RaftNode = struct {
         defer self.allocator.free(buf);
         var at = upper;
         while (at >= lower) : (at -= 1) {
-            const e = self.log.getEntryCopy(at, buf) orelse continue;
+            const e = switch (self.log.readForApply(at, buf)) {
+                .found => |e| e,
+                .absent => continue,
+                // Not read is not "no config here": scan the range again on
+                // the next commit, or a config below would stand in for it.
+                .blocked => {
+                    self.config_scanned_to = lower - 1;
+                    return;
+                },
+            };
             if (e.header.entry_type != @backingInt(EntryType.raft_config)) continue;
             const cfg = membership.decode(e.payload) orelse continue;
             self.commitMembership(&cfg, at);
@@ -4389,6 +4398,64 @@ test "raft node: with more configs above the applied index than the records hold
     try testing.expect(node.committed_config.names(12));
     node.raiseCommit(6);
     try testing.expectEqual(@as(u64, 6), node.committed_config_index);
+}
+
+/// Serves a fixed run of entries from index 1, or answers blocked.
+const ConfigScanSource = struct {
+    entries: []const Entry,
+    blocked: bool = false,
+
+    fn readRange(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) raft_log.CatchUpResult {
+        const self: *ConfigScanSource = @ptrCast(@alignCast(ctx));
+        if (self.blocked) return .{ .blocked = true };
+        if (start == 0 or start > self.entries.len or buf.len == 0) return .{};
+        const e = self.entries[start - 1];
+        if (e.payload.len > arena.len) return .{};
+        @memcpy(arena[0..e.payload.len], e.payload);
+        buf[0] = .{ .header = e.header, .payload = arena[0..e.payload.len] };
+        return .{ .count = 1 };
+    }
+};
+
+test "raft node: a config scan blocked reading an evicted entry is made again, not skipped" {
+    var node = try RaftNode.init(testing.allocator, 2, 0, 4096, .{ .rng_seed = 9 });
+    defer node.deinit();
+    // c0 at 1, applied; c1..c6 at 3..8, then padding that evicts them all
+    // from the ring.
+    var bufs: [7][membership.MAX_SIZE]u8 = undefined;
+    var cfgs: [7]membership.Config = undefined;
+    for (&cfgs, 0..) |*c, k| c.* = membership.Config.ofVoters(&.{ 1, 2, @as(NodeId, @intCast(10 + k)) });
+    const pad: [512]u8 = @splat('p');
+    var entries: [24]Entry = undefined;
+    for (&entries, 1..) |*e, i| {
+        const idx: u64 = @intCast(i);
+        e.* = if (idx == 2 or idx > 8)
+            entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, idx, 0, if (idx > 8) &pad else "")
+        else blk: {
+            const k: usize = if (idx == 1) 0 else idx - 2;
+            break :blk entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, idx, 0, membership.encode(&cfgs[k], &bufs[k]));
+        };
+        e.header.crc32c = e.computeCrc();
+        _ = try node.log.append(e);
+    }
+    var source: ConfigScanSource = .{ .entries = &entries };
+    node.log.catch_up = .{ .ctx = @ptrCast(&source), .read_range = ConfigScanSource.readRange };
+    node.recordConfig(1, 1, &cfgs[0]);
+    node.commitMembership(&cfgs[0], 1);
+    var buf: [membership.MAX_SIZE + 64]u8 = undefined;
+    try node.recordConfigsAbove(2, &buf);
+    try testing.expect(node.log.ual.readCopy(4, &buf) == null); // evicted
+
+    // The config at 4 is only below the ring, and the read blocks: the
+    // committed config holds where it was.
+    source.blocked = true;
+    node.raiseCommit(4);
+    try testing.expectEqual(@as(u64, 1), node.committed_config_index);
+    // Unblocked, the next commit reads it.
+    source.blocked = false;
+    node.raiseCommit(4);
+    try testing.expectEqual(@as(u64, 4), node.committed_config_index);
+    try testing.expect(node.committed_config.names(12));
 }
 
 test "raft node: at boot a config above the applied index that won't decode is refused, not skipped" {

@@ -921,6 +921,9 @@ pub const Shard = struct {
             };
 
             marker = apply_marker.Marker.open(shard_dir, shard_id) catch |err| m: {
+                // Opened empty, a crash it records would be lost: a resource
+                // failure refuses the boot instead, as a segment's does.
+                if (bootRefuses(err)) return refuseBlockedRead(shard_id, apply_marker.FILENAME, err);
                 log.warn("shard {d}: cannot open {s}/{s} ({s}); a crash in apply will not be recorded", .{ shard_id, shard_dir, apply_marker.FILENAME, @errorName(err) });
                 break :m .{};
             };
@@ -975,8 +978,9 @@ pub const Shard = struct {
             // A cold boot replays the log and applies none of it.
             //
             // A `.flseg.tmp` is a flush a crash cut short: the normal torn
-            // tail, never part of the log. Any `.flseg` that will not read
-            // is damage, and replay stops there.
+            // tail, never part of the log. A `.flseg` that will not read is
+            // damage, and replay stops there, unless the read failed for
+            // want of resources: then boot refuses, and a restart may read it.
             _ = durable_log.?.removeTornTail() catch |err| log.warn("shard {d}: could not remove a torn segment flush: {s}", .{ shard_id, @errorName(err) });
             var watermark: u64 = 0;
             var replayed_stamp: u64 = 0;
@@ -987,11 +991,12 @@ pub const Shard = struct {
                     // Before anything applies: a skipped entry must not run,
                     // whatever this build would make of it. The skip set
                     // wins over a crash marker too.
-                    boot_damage = try collectSkips(allocator, files, watermark, &skips);
+                    boot_damage = try collectSkips(allocator, files, watermark, &skips, shard_id);
                     if (boot_damage != null) break :replay;
                     if (marker.crashed) |*c| if (skips.holds(&.{ .index = c.index, .term = c.term, .crc = c.entry_crc })) marker.skipped();
                     const replayed = replaySegments(allocator, files, partition, &replay_registry, if (cold_boot) 0 else watermark, &raft_node.log, shard_id, &losses, &marker, &skips, boot);
                     if (replayed.cancelled) return error.BootCancelled;
+                    if (replayed.blocked) |b| return refuseBlockedRead(shard_id, b.name, b.err);
                     boot_damage = replayed.damage;
                     boot_halt = replayed.halt;
                     raft_node.last_applied = replayed.applied_through;
@@ -2958,12 +2963,14 @@ pub const Shard = struct {
             defer if (release) |r| r(self, ctx);
             if (self.halted) |*h| if (proposed.index >= h.index) {
                 // A membership change takes effect at commit, halted or not.
-                if (self.appliesAroundHalt(proposed.index)) {
+                const around = self.appliesAroundHalt(proposed.index);
+                if (around orelse false) {
                     var done = persistence_mod.Result{ .index = proposed.index };
                     return answer(self, conn, req.header.request_id, &done);
                 }
                 var buf: [320]u8 = undefined;
-                return self.sendRefusal(conn, req.header.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = self.pendingMessage(&buf, proposed.index) });
+                const message = if (around == null) "shard is halted, and your write's entry can't be read back right now to say whether it took effect; do not resend" else self.pendingMessage(&buf, proposed.index);
+                return self.sendRefusal(conn, req.header.request_id, .outcome_pending, .{ .reason = .shard_halted, .ran = .unknown, .message = message });
             };
             if (self.raft_node.last_applied != proposed.index or !self.last_entry_applied) {
                 self.sendRefusal(conn, req.header.request_id, .internal_error, persistence_mod.COMMITTED_REFUSAL);
@@ -4029,9 +4036,14 @@ pub const Shard = struct {
     }
 
     /// The entry at `index` is one a halt doesn't stop: a config, which
-    /// takes effect at commit, or a term's no-op.
-    fn appliesAroundHalt(self: *Shard, index: u64) bool {
-        const e = self.raft_node.log.getEntryCopy(index, self.apply_buf) orelse return false;
+    /// takes effect at commit, or a term's no-op. Null when it can't be
+    /// read right now.
+    fn appliesAroundHalt(self: *Shard, index: u64) ?bool {
+        const e = switch (self.raft_node.log.readForApply(index, self.apply_buf)) {
+            .found => |e| e,
+            .absent => return false,
+            .blocked => return null,
+        };
         return e.header.entry_type == @backingInt(entry_mod.EntryType.raft_config) or e.header.entry_type == @backingInt(entry_mod.EntryType.raft_noop);
     }
 
@@ -4057,6 +4069,8 @@ pub const Shard = struct {
     fn answerHaltedPending(self: *Shard) void {
         const h = &(self.halted orelse return);
         if (self.pending_count == 0) return;
+        // A read below blocked: not again until the back-off has passed.
+        if (nowMs() < self.read_retry_at_ms) return;
         const raft = self.raft_node;
         for (self.pending) |*slot| {
             if (!slot.active or slot.index < h.index or slot.index > raft.commit_index) continue;
@@ -4067,7 +4081,13 @@ pub const Shard = struct {
             };
             // A membership change or a term's no-op takes effect at commit,
             // halted or not: answered as done.
-            if (self.appliesAroundHalt(slot.index)) {
+            // One that can't be read right now waits for the next pass,
+            // rather than being told it applies when the shard resumes.
+            const around = self.appliesAroundHalt(slot.index) orelse {
+                self.read_retry_at_ms = nowMs() + READ_RETRY_MS;
+                return;
+            };
+            if (around) {
                 var done = persistence_mod.Result{ .index = slot.index };
                 const proxy = self.respond_proxy;
                 loadProxy(proxy, slot.reply_to);
@@ -6279,8 +6299,11 @@ pub const Shard = struct {
         const raft = shard.raft_node;
         if (raft.role != .leader) return shard.sendRefusal(conn, rid, .unavailable, proto.notRun("unavailable: the leader changed — retry"));
         var msg: [400]u8 = undefined;
-        const e = shard.replica.ownEntry(ask.index) orelse
-            return shard.sendErrorResponse(conn, rid, .not_found, std.fmt.bufPrint(&msg, "the leader's log doesn't hold entry {d}", .{ask.index}) catch "no such entry");
+        const e = switch (shard.replica.readOwnEntry(ask.index)) {
+            .found => |e| e,
+            .blocked => return shard.sendRefusal(conn, rid, .unavailable, proto.notRun("unavailable: the leader can't read that entry right now — retry")),
+            .absent => return shard.sendErrorResponse(conn, rid, .not_found, std.fmt.bufPrint(&msg, "the leader's log doesn't hold entry {d}", .{ask.index}) catch "no such entry"),
+        };
         const etype = e.header.entry_type;
         if (etype == @backingInt(entry_mod.EntryType.repair_skip))
             return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} is itself a repair; a skip is never skipped", .{ask.index}) catch "a skip is never skipped");
@@ -7338,11 +7361,37 @@ const ReplayOutcome = struct {
     last_stamp: u64 = 0,
     /// Another shard's boot failed, and this one stopped early.
     cancelled: bool = false,
+    /// A segment that would not open for want of resources.
+    blocked: ?BlockedRead = null,
     /// Entries read back, for the progress lines.
     entries: u64 = 0,
     started_ms: u64 = 0,
     next_line_ms: u64 = 0,
 };
+
+const BlockedRead = struct { name: []const u8, err: anyerror };
+
+/// A file boot could not read for a resource failure: that says nothing
+/// about the log, so boot refuses rather than taking it as damage and
+/// telling the operator to repair a log that is whole. An IO failure is
+/// damage (`segmentOpenDamage`): with no bound on how long to wait, a
+/// failing disk would otherwise stop the node at every start.
+fn refuseBlockedRead(shard_id: u16, name: []const u8, err: anyerror) error{BootReadBlocked} {
+    log.err("shard {d}: {s} could not be read at boot ({s}), a resource failure. A restart may succeed; the node will not start until it can read it", .{ shard_id, name, @errorName(err) });
+    return error.BootReadBlocked;
+}
+
+/// Whether a read that failed at boot refuses the boot rather than being
+/// taken as damage: only for want of resources.
+fn bootRefuses(err: anyerror) bool {
+    return DurableLog.readBlockClass(err) == .resource;
+}
+
+/// What a segment that won't open is, as damage.
+fn segmentOpenDamage(name: []const u8, err: anyerror) silent_loss.Damage {
+    if (DurableLog.readBlockClass(err) == .disk) return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s}); the disk may be failing", .{ name, @errorName(err) });
+    return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+}
 
 /// How often a long replay says how far it has got.
 const REPLAY_PROGRESS_MS: u64 = 5_000;
@@ -7360,12 +7409,13 @@ const REPLAY_PROGRESS_MS: u64 = 5_000;
 /// A log that starts after a snapshot needs nothing more: a skip comes
 /// after its entry, so a snapshot past the skip covers both, and one
 /// between them leaves a skip for an entry the log no longer holds.
-fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.SegmentFile, watermark: u64, skips: *repair.Skips) !?silent_loss.Damage {
+fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.SegmentFile, watermark: u64, skips: *repair.Skips, shard_id: u16) !?silent_loss.Damage {
     for (files) |sf| {
         if (!sf.holds_skip or sf.first_index > watermark) continue;
         const name = std.fs.path.basename(sf.path);
         const opened = SegmentReader.initFromFile(allocator, sf.path) catch |err| {
-            return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+            if (bootRefuses(err)) return refuseBlockedRead(shard_id, name, err);
+            return segmentOpenDamage(name, err);
         };
         defer allocator.free(opened.buf);
         var offset: usize = 0;
@@ -7427,7 +7477,7 @@ fn replaySegments(
             break;
         }
         replaySegmentFile(allocator, sf.path, partition, replay_registry, watermark, raft_log, shard_id, losses, marker, skips, boot, last, &out);
-        if (out.damage != null or out.cancelled) break;
+        if (out.damage != null or out.cancelled or out.blocked != null) break;
     }
     if (out.entries > 0 and !out.cancelled) {
         log.info("shard {d}: replayed {d} entries in {d} ms", .{ shard_id, out.entries, Shard.nowMs() -| out.started_ms });
@@ -7454,9 +7504,14 @@ fn replaySegmentFile(
     // One result for the segment's entries, reset for each.
     var replay_result: persistence_mod.Result = .{};
     // Sealed segments are written whole and renamed into place, so one
-    // that will not open, or fails its checksum, is damage, never a crash.
+    // that will not open, or fails its checksum, is damage, never a crash;
+    // one that won't open for want of resources refuses the boot.
     const opened = SegmentReader.initFromFile(allocator, full_path) catch |err| {
-        out.damage = silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+        if (bootRefuses(err)) {
+            out.blocked = .{ .name = name, .err = err };
+            return;
+        }
+        out.damage = segmentOpenDamage(name, err);
         return;
     };
     defer allocator.free(opened.buf);
@@ -16852,6 +16907,61 @@ test "a flipped byte in a sealed segment takes its shard offline, and replay sto
     // The first segment holds the bootstrap no-op and one enqueue; the
     // second, the next.
     try t.expectOffline(.segment_unreadable, 2);
+}
+
+/// The testing allocator, refusing any one allocation of `refuse_len` bytes:
+/// replay's read of a segment that size, a resource failure.
+const RefuseSizeAllocator = struct {
+    refuse_len: usize,
+    refused: usize = 0,
+
+    fn allocator(self: *RefuseSizeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefuseSizeAllocator = @ptrCast(@alignCast(ctx));
+        if (len == self.refuse_len) {
+            self.refused += 1;
+            return null;
+        }
+        return std.testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        return std.testing.allocator.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(m, a, n, ra);
+    }
+    fn free(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        std.testing.allocator.rawFree(m, a, ra);
+    }
+};
+
+test "a segment boot cannot read for a resource failure refuses the boot, and is not taken as damage" {
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(2, &buf);
+    const bytes = try DamageTest.readFile(path);
+    defer std.testing.allocator.free(bytes);
+    var refusing: RefuseSizeAllocator = .{ .refuse_len = bytes.len };
+    try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
+    try std.testing.expect(refusing.refused > 0);
+    // Once it reads, the log is whole: every enqueue is there.
+    var shard = try t.open();
+    defer shard.deinit();
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "at boot only a resource failure refuses; an IO failure is damage, and says the disk may be failing" {
+    for ([_]anyerror{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources, error.OutOfMemory }) |err| try std.testing.expect(bootRefuses(err));
+    for ([_]anyerror{ error.InputOutput, error.Unexpected, error.FileNotFound, error.AccessDenied }) |err| try std.testing.expect(!bootRefuses(err));
+    const io = segmentOpenDamage("00000000000000000004.flseg", error.InputOutput);
+    try std.testing.expect(std.mem.indexOf(u8, io.reason(), "the disk may be failing") != null);
+    const gone = segmentOpenDamage("00000000000000000004.flseg", error.FileNotFound);
+    try std.testing.expect(std.mem.indexOf(u8, gone.reason(), "disk") == null);
 }
 
 test "a member whose segment is damaged at boot is diverged, and /status says why" {
