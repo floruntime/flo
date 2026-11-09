@@ -25,9 +25,6 @@ pub const Plant = enum {
     async_boot_applies,
     /// The simulator's repair waits on every core node, members or not.
     repair_waits_on_removed,
-    /// A leader sends entries a read below its ring made earlier, without
-    /// checking that its log still holds them, term for term.
-    stale_catch_up_read,
 };
 
 pub const active: Plant = std.meta.stringToEnum(Plant, @import("build_options").vopr_plant) orelse

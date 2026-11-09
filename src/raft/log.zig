@@ -11,7 +11,6 @@
 //! term lookup, and index management on top.
 
 const std = @import("std");
-const plant = @import("../plant.zig");
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -224,7 +223,6 @@ pub const RaftLog = struct {
         // still holds, term for term, are sent. A stale one is read again.
         var n: usize = 0;
         while (n < r.count) : (n += 1) {
-            if (comptime plant.active == .stale_catch_up_read) continue;
             const e = buf[n];
             if (e.header.index != start_index + n or self.entryTerm(e.header.index) != e.header.term) break;
         }
