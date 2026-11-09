@@ -170,6 +170,13 @@ pub fn localRefusal(ctx: *Context, comptime fmt: []const u8, args: anytype) Erro
     return error.Refused;
 }
 
+/// Refused here for a failure that may pass, such as a resource failure
+/// reading the data directory: running it again may succeed.
+pub fn localRetryable(ctx: *Context, comptime fmt: []const u8, args: anytype) Error {
+    ctx.printErr("Error: " ++ fmt ++ "\n", args);
+    return error.Retryable;
+}
+
 /// The data directory can't be used by this binary: written in another
 /// format, or not Flo's. Restarting never helps.
 pub fn unusable(ctx: *Context, comptime fmt: []const u8, args: anytype) Error {

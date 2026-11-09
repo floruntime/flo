@@ -360,6 +360,8 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
             break;
         }
         const opened = SegmentReader.initFromFile(allocator, f.path) catch |err| {
+            // Not damage: a cut offered on it would drop a whole log.
+            if (durable_log_mod.DurableLog.readBlockClass(err) == .resource) return error.LogReadBlocked;
             r.stop("segment {s} is unreadable ({s})", .{ name, @errorName(err) });
             break;
         };
@@ -394,7 +396,8 @@ pub fn readable(allocator: std.mem.Allocator, dir: []const u8) !Readable {
             r.config_unknown = true;
             continue;
         }
-        const opened = SegmentReader.initFromFile(allocator, f.path) catch {
+        const opened = SegmentReader.initFromFile(allocator, f.path) catch |err| {
+            if (durable_log_mod.DurableLog.readBlockClass(err) == .resource) return error.LogReadBlocked;
             r.config_unknown = true;
             if (f.holds_skip) r.skips_unread = true;
             continue;
@@ -676,6 +679,32 @@ test "offline: an entry the repair can't read for a resource failure is not take
             continue;
         };
         break;
+    }
+    try testing.expect(blocked);
+}
+
+test "offline: salvage takes a segment it can't read for a resource failure as not now, never as damage to cut at" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    try writeLog(dir, &kvEntries(1, 3), 3);
+    try writeLog(dir, &kvEntries(4, 3), 6);
+    // Each allocation in turn fails: whatever the read comes to, it is the
+    // log read whole, or a refusal, never stopped short at a segment it
+    // couldn't allocate for, which would offer to cut the rest.
+    var blocked = false;
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = n });
+        var r = readable(failing.allocator(), dir) catch |err| {
+            if (err == error.LogReadBlocked) blocked = true;
+            continue;
+        };
+        defer r.deinit(failing.allocator());
+        try testing.expect(r.damage() == null);
+        try testing.expectEqual(@as(u64, 6), r.through);
+        if (!failing.has_induced_failure) break;
     }
     try testing.expect(blocked);
 }

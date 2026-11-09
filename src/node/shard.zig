@@ -916,6 +916,9 @@ pub const Shard = struct {
             };
 
             marker = apply_marker.Marker.open(shard_dir, shard_id) catch |err| m: {
+                // Opened empty, a crash it records would be lost: a resource
+                // failure refuses the boot instead, as a segment's does.
+                if (bootRefuses(err)) return refuseBlockedRead(shard_id, apply_marker.FILENAME, err);
                 log.warn("shard {d}: cannot open {s}/{s} ({s}); a crash in apply will not be recorded", .{ shard_id, shard_dir, apply_marker.FILENAME, @errorName(err) });
                 break :m .{};
             };
@@ -970,8 +973,9 @@ pub const Shard = struct {
             // A cold boot replays the log and applies none of it.
             //
             // A `.flseg.tmp` is a flush a crash cut short: the normal torn
-            // tail, never part of the log. Any `.flseg` that will not read
-            // is damage, and replay stops there.
+            // tail, never part of the log. A `.flseg` that will not read is
+            // damage, and replay stops there, unless the read failed for
+            // want of resources: then boot refuses, and a restart may read it.
             _ = durable_log.?.removeTornTail() catch |err| log.warn("shard {d}: could not remove a torn segment flush: {s}", .{ shard_id, @errorName(err) });
             var watermark: u64 = 0;
             var replayed_stamp: u64 = 0;
@@ -994,7 +998,6 @@ pub const Shard = struct {
                     replayed_stamp = replayed.last_stamp;
                 } else |err| {
                     if (log_files.badHeaderSegment().len == 0) return err;
-                    if (DurableLog.readBlockClass(err) != .fault) return refuseBlockedRead(shard_id, log_files.badHeaderSegment(), err);
                     boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
                 }
             }
@@ -4046,6 +4049,8 @@ pub const Shard = struct {
     fn answerHaltedPending(self: *Shard) void {
         const h = &(self.halted orelse return);
         if (self.pending_count == 0) return;
+        // A read below blocked: not again until the back-off has passed.
+        if (nowMs() < self.read_retry_at_ms) return;
         const raft = self.raft_node;
         for (self.pending) |*slot| {
             if (!slot.active or slot.index < h.index or slot.index > raft.commit_index) continue;
@@ -4058,7 +4063,10 @@ pub const Shard = struct {
             // halted or not: answered as done.
             // One that can't be read right now waits for the next pass,
             // rather than being told it applies when the shard resumes.
-            const around = self.appliesAroundHalt(slot.index) orelse continue;
+            const around = self.appliesAroundHalt(slot.index) orelse {
+                self.read_retry_at_ms = nowMs() + READ_RETRY_MS;
+                return;
+            };
             if (around) {
                 var done = persistence_mod.Result{ .index = slot.index };
                 const proxy = self.respond_proxy;
@@ -7324,7 +7332,7 @@ const ReplayOutcome = struct {
     last_stamp: u64 = 0,
     /// Another shard's boot failed, and this one stopped early.
     cancelled: bool = false,
-    /// A segment that would not open for a reason that may pass.
+    /// A segment that would not open for want of resources.
     blocked: ?BlockedRead = null,
     /// Entries read back, for the progress lines.
     entries: u64 = 0,
@@ -7334,16 +7342,26 @@ const ReplayOutcome = struct {
 
 const BlockedRead = struct { name: []const u8, err: anyerror };
 
-/// A segment boot could not open for a resource or IO failure: that says
-/// nothing about the log, so boot refuses rather than taking the segment as
-/// damage and telling the operator to wipe or repair it.
-fn refuseBlockedRead(shard_id: u16, name: []const u8, err: anyerror) error{SegmentReadBlocked} {
-    const why = switch (DurableLog.readBlockClass(err)) {
-        .disk => "an IO failure; the disk may be failing",
-        else => "a resource failure",
-    };
-    log.err("shard {d}: segment {s} could not be read at boot ({s}): {s}. A restart may succeed; nothing says the log is damaged, so the node will not start without it", .{ shard_id, name, @errorName(err), why });
-    return error.SegmentReadBlocked;
+/// A file boot could not read for a resource failure: that says nothing
+/// about the log, so boot refuses rather than taking it as damage and
+/// telling the operator to repair a log that is whole. An IO failure is
+/// damage (`segmentOpenDamage`): with no bound on how long to wait, a
+/// failing disk would otherwise stop the node at every start.
+fn refuseBlockedRead(shard_id: u16, name: []const u8, err: anyerror) error{BootReadBlocked} {
+    log.err("shard {d}: {s} could not be read at boot ({s}), a resource failure. A restart may succeed; the node will not start until it can read it", .{ shard_id, name, @errorName(err) });
+    return error.BootReadBlocked;
+}
+
+/// Whether a read that failed at boot refuses the boot rather than being
+/// taken as damage: only for want of resources.
+fn bootRefuses(err: anyerror) bool {
+    return DurableLog.readBlockClass(err) == .resource;
+}
+
+/// What a segment that won't open is, as damage.
+fn segmentOpenDamage(name: []const u8, err: anyerror) silent_loss.Damage {
+    if (DurableLog.readBlockClass(err) == .disk) return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s}); the disk may be failing", .{ name, @errorName(err) });
+    return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
 }
 
 /// How often a long replay says how far it has got.
@@ -7367,8 +7385,8 @@ fn collectSkips(allocator: std.mem.Allocator, files: []const durable_log_mod.Seg
         if (!sf.holds_skip or sf.first_index > watermark) continue;
         const name = std.fs.path.basename(sf.path);
         const opened = SegmentReader.initFromFile(allocator, sf.path) catch |err| {
-            if (DurableLog.readBlockClass(err) != .fault) return refuseBlockedRead(shard_id, name, err);
-            return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+            if (bootRefuses(err)) return refuseBlockedRead(shard_id, name, err);
+            return segmentOpenDamage(name, err);
         };
         defer allocator.free(opened.buf);
         var offset: usize = 0;
@@ -7457,13 +7475,14 @@ fn replaySegmentFile(
     // One result for the segment's entries, reset for each.
     var replay_result: persistence_mod.Result = .{};
     // Sealed segments are written whole and renamed into place, so one
-    // that will not open, or fails its checksum, is damage, never a crash.
+    // that will not open, or fails its checksum, is damage, never a crash;
+    // one that won't open for want of resources refuses the boot.
     const opened = SegmentReader.initFromFile(allocator, full_path) catch |err| {
-        if (DurableLog.readBlockClass(err) != .fault) {
+        if (bootRefuses(err)) {
             out.blocked = .{ .name = name, .err = err };
             return;
         }
-        out.damage = silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
+        out.damage = segmentOpenDamage(name, err);
         return;
     };
     defer allocator.free(opened.buf);
@@ -16898,13 +16917,22 @@ test "a segment boot cannot read for a resource failure refuses the boot, and is
     const bytes = try DamageTest.readFile(path);
     defer std.testing.allocator.free(bytes);
     var refusing: RefuseSizeAllocator = .{ .refuse_len = bytes.len };
-    try std.testing.expectError(error.SegmentReadBlocked, Shard.init(refusing.allocator(), 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
+    try std.testing.expectError(error.BootReadBlocked, Shard.init(refusing.allocator(), 0, 4, 4096, t.pipe_fds[0], t.data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .sync, 1, .single, .{}, .{}));
     try std.testing.expect(refusing.refused > 0);
     // Once it reads, the log is whole: every enqueue is there.
     var shard = try t.open();
     defer shard.deinit();
     try std.testing.expect(shard.offline == null);
     try std.testing.expectEqual(@as(u64, DamageTest.ENQUEUES), DamageTest.queued(&shard));
+}
+
+test "at boot only a resource failure refuses; an IO failure is damage, and says the disk may be failing" {
+    for ([_]anyerror{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources, error.OutOfMemory }) |err| try std.testing.expect(bootRefuses(err));
+    for ([_]anyerror{ error.InputOutput, error.Unexpected, error.FileNotFound, error.AccessDenied }) |err| try std.testing.expect(!bootRefuses(err));
+    const io = segmentOpenDamage("00000000000000000004.flseg", error.InputOutput);
+    try std.testing.expect(std.mem.indexOf(u8, io.reason(), "the disk may be failing") != null);
+    const gone = segmentOpenDamage("00000000000000000004.flseg", error.FileNotFound);
+    try std.testing.expect(std.mem.indexOf(u8, gone.reason(), "disk") == null);
 }
 
 test "a member whose segment is damaged at boot is diverged, and /status says why" {
