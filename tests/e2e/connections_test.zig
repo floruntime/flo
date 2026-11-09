@@ -89,3 +89,66 @@ test "e2e/connections: short-lived connections leave the node serving" {
     try shortLivedConnections(server.getRaftPort(), &.{"\x00\x01"});
     try expectKvServes(allocator, server);
 }
+
+/// Connect to `port` and keep the socket open (the caller closes it).
+fn connectKept(port: u16) !c_int {
+    const addr: c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    if (fd < 0) return error.Socket;
+    errdefer _ = c.close(fd);
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+    stdx.net.sysFcntlSetNonblocking(fd) catch {};
+    return fd;
+}
+
+/// A non-blocking read: 0 (EOF) or ECONNRESET means the server closed its side;
+/// EAGAIN means the connection is still held open.
+fn closedByServer(fd: c_int) bool {
+    var buf: [1]u8 = undefined;
+    const n = c.read(fd, &buf, 1);
+    if (n == 0) return true;
+    if (n < 0) return std.posix.errno(@as(c_int, -1)) == .CONNRESET;
+    return false;
+}
+
+fn waitClosedByServer(fd: c_int) bool {
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        if (closedByServer(fd)) return true;
+        stdx.time.sleep(5 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "e2e/connections: at the cap a new connection is refused while the held ones work, and a freed slot is reused" {
+    const allocator = testing.allocator;
+    const server = try ServerProcess.initWithConfig(allocator, .{ .shards = 1, .extra_config = "[server]\nmax_connections = 3\n" });
+    defer server.deinit();
+    try server.start();
+    const port = server.getPort();
+
+    // Three connections reserve the three slots; give the acceptor time to
+    // accept and reserve all of them.
+    var held: [3]c_int = .{ -1, -1, -1 };
+    defer for (held) |fd| {
+        if (fd >= 0) _ = c.close(fd);
+    };
+    for (&held) |*fd| fd.* = try connectKept(port);
+    stdx.time.sleep(150 * std.time.ns_per_ms);
+
+    // A fourth is accepted and closed at once; the three held ones stay open.
+    const fourth = try connectKept(port);
+    defer _ = c.close(fourth);
+    try testing.expect(waitClosedByServer(fourth));
+    for (held) |fd| try testing.expect(!closedByServer(fd));
+
+    // Free one slot: the shard releases it on close, so a new connection is
+    // accepted and held, not refused.
+    _ = c.close(held[0]);
+    held[0] = -1;
+    stdx.time.sleep(150 * std.time.ns_per_ms);
+    const fifth = try connectKept(port);
+    defer _ = c.close(fifth);
+    stdx.time.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(!closedByServer(fifth));
+}
