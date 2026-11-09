@@ -612,6 +612,9 @@ pub const ShardMetrics = struct {
     processing_failed_jobs: Atomic(u64) = Atomic(u64).init(0),
     /// Running processing jobs this node holds without pipelines.
     processing_held_jobs: Atomic(u64) = Atomic(u64).init(0),
+    /// Leader duties held back, and how long the oldest has been.
+    duties_held: Atomic(u64) = Atomic(u64).init(0),
+    duty_oldest_held_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
 
@@ -770,6 +773,8 @@ pub const ShardMetrics = struct {
         duplicate_index: u64,
         processing_failed_jobs: u64,
         processing_held_jobs: u64,
+        duties_held: u64,
+        duty_oldest_held_ms: u64,
         offline: u8,
     };
 
@@ -808,6 +813,8 @@ pub const ShardMetrics = struct {
             .duplicate_index = self.duplicate_index.load(.monotonic),
             .processing_failed_jobs = self.processing_failed_jobs.load(.monotonic),
             .processing_held_jobs = self.processing_held_jobs.load(.monotonic),
+            .duties_held = self.duties_held.load(.monotonic),
+            .duty_oldest_held_ms = self.duty_oldest_held_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
@@ -1580,6 +1587,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     try writer.print("flo_processing_failed_jobs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.processing_failed_jobs });
     try writer.print("flo_processing_held_jobs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.processing_held_jobs });
+    try writer.print("flo_shard_duties_held{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duties_held });
+    try writer.print("flo_shard_duty_oldest_held_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.duty_oldest_held_ms / 1000, snap.duty_oldest_held_ms % 1000 });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });
