@@ -327,11 +327,42 @@ pub const ProcessingHandler = struct {
     /// Outside "default" that shard may never have bound the namespace, and
     /// its log would then hold a write it cannot apply. Such a sink is
     /// refused until sinks write through the shard that owns their target.
+    /// A namespace not yet published has no id to route by, so whether
+    /// its target is here isn't known yet: `sinksReady` asks again once it
+    /// is, before the pipeline writes anything.
     fn crossShardSink(self: *const ProcessingHandler, kind: definition.SinkKind, namespace: []const u8, target: []const u8) bool {
         if (kind != .stream and kind != .queue) return false;
         if (std.mem.eql(u8, namespace, "default")) return false;
         if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) return false;
+        if (self.namespaceIdOf(namespace) == .invalid) return false;
         return self.peerShardId(namespace, target) != self.own_shard;
+    }
+
+    const SinksReady = union(enum) { ready, wait, refused: []const u8 };
+
+    /// Whether `pipe` may write now. Every sink routes by its namespace's
+    /// published id: before shard 0 publishes it, a sink can't tell which
+    /// shard owns its target, so the pipeline reads nothing and waits,
+    /// its cursor where it was. Once every id is known, a stream or queue
+    /// sink whose target is on another shard is refused, as at submit.
+    fn sinksReady(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState, buf: []u8) SinksReady {
+        var wait = false;
+        for (pipe.sinks) |snk| {
+            if (self.namespaceIdOf(snk.namespace) != .invalid) continue;
+            // A namespace this shard refuses for good takes no write; its
+            // records are dropped and counted as they come. One only shard
+            // 0 can publish is waited for.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| if (r.status != .unavailable) continue;
+            shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
+            wait = true;
+        }
+        if (wait) return .wait;
+        for (pipe.sinks) |snk| {
+            if (!self.crossShardSink(snk.kind, snk.namespace, snk.target)) continue;
+            return .{ .refused = std.fmt.bufPrint(buf, "a {s} sink outside the default namespace must be on the job's shard, and '{s}' is on another; use the default namespace, or one shard (--shards 1)", .{ @tagName(snk.kind), snk.target }) catch
+                "a stream or queue sink outside the default namespace must be on the job's shard; use the default namespace, or one shard (--shards 1)" };
+        }
+        return .ready;
     }
 
     /// Why a job's sinks can't run here: one that `crossShardSink` refuses.
@@ -1565,11 +1596,20 @@ pub const ProcessingHandler = struct {
 
             // Only run for RUNNING jobs
             const job = self.jobs.getPtr(base_job_id) orelse continue;
-            if (job.status != .running) continue;
+            if (job.status != .running or job.held) continue;
 
             // Enforce poll interval
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
+            var why_buf: [256]u8 = undefined;
+            switch (self.sinksReady(shard, pipe, &why_buf)) {
+                .ready => {},
+                .wait => continue,
+                .refused => |why| {
+                    self.holdJob(job, why);
+                    continue;
+                },
+            }
             if (self.sinksHeld(shard, pipe)) {
                 held = true;
                 continue;
@@ -1849,7 +1889,11 @@ pub const ProcessingHandler = struct {
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`).
+                    // only to "default" (`crossShardSink`, `sinksReady`).
+                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
+                        continue;
+                    }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -1897,7 +1941,11 @@ pub const ProcessingHandler = struct {
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`).
+                    // only to "default" (`crossShardSink`, `sinksReady`).
+                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
+                        continue;
+                    }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -2025,7 +2073,10 @@ pub const ProcessingHandler = struct {
         const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
         // The applier labels the queue by resolving its namespace; only
         // this shard's handler may be touched from this thread, and a sink
-        // on another shard writes only to "default" (`crossShardSink`).
+        // on another shard writes only to "default" (`crossShardSink`,
+        // `sinksReady`).
+        if (q != shard.queue_handler and !std.mem.eql(u8, snk.namespace, "default"))
+            return self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, "the queue is on another shard");
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
@@ -2851,6 +2902,11 @@ test "ProcessingHandler: a stream or queue sink outside default on another shard
     handler.peer_shard_count = 4;
     handler.peer_partition_count = 256;
     handler.own_shard = 0;
+    // Routed by the id the node's table publishes for it.
+    const table = try @import("../namespace/table.zig").Table.create(allocator);
+    defer table.destroy();
+    try table.publish(@import("../namespace/table.zig").FIRST_ALLOCATED, "acme", 1);
+    handler.ns_table = table;
     // A target on this shard and one on another, in "acme".
     var here_buf: [16]u8 = undefined;
     var there_buf: [16]u8 = undefined;

@@ -9496,6 +9496,71 @@ test "Shard: a namespace still unknown when the held write runs again is refused
     try std.testing.expectEqual(@as(usize, 0), b.gathers.inUse());
 }
 
+test "Shard: a processing sink in a namespace not yet published writes nothing until it is, then is held when the id puts its stream on another shard" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        s.processing_handler.setPeerStreamHandlers(&streams);
+    }
+    // A sink stream that id 0 would put here and the namespace's real id
+    // puts on shard 1: routed before the publish, it lands on the wrong shard.
+    const id = nextNamespaceId(a);
+    var tbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const target = while (true) : (i += 1) {
+        const t = try std.fmt.bufPrint(&tbuf, "out{d}", .{i});
+        const before = a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(.invalid, t)));
+        const after = a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(id, t)));
+        if (before == 0 and after == 1) break t;
+    };
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    try a.stream_handler.appendPayloadToStream(source, "default", "rec-1");
+    two.settle();
+
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [256]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: early
+        \\namespace: pns
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s}, namespace: default }}
+        \\sinks:
+        \\  - name: out
+        \\    stream: {{ name: {s} }}
+    , .{ source, target });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "pns", "", yaml, ""), .client);
+    // The create and the submit apply; shard 0 hasn't published yet.
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("pns") == null);
+    try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobs.count());
+
+    const from_a = a.raft_node.log.lastIndex() + 1;
+    const from_b = b.raft_node.log.lastIndex() + 1;
+    _ = a.processing_handler.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(id, two.namespaces.lookup("pns").?);
+    // Published: the stream is on shard 1, so the job is held, unrun.
+    var it = a.processing_handler.pipelines.valueIterator();
+    while (it.next()) |pipe| pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    two.settle();
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(a, .stream_append, from_a));
+    try std.testing.expectEqual(@as(usize, 0), entriesOf(b, .stream_append, from_b));
+    var jobs = a.processing_handler.jobs.valueIterator();
+    const job = jobs.next().?;
+    try std.testing.expect(job.held);
+    try std.testing.expect(std.mem.indexOf(u8, job.held_owned, "is on another") != null);
+}
+
 test "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" {
     var f: MgetGatherFixture = undefined;
     try f.init(8);
