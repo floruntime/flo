@@ -787,10 +787,11 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 40), obj.count());
+    try testing.expectEqual(@as(usize, 41), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);
+    try testing.expectEqual(@as(i64, s.queue_percent), obj.get("queue_percent").?.integer);
     try testing.expectEqual(s.namespace_creates, obj.get("namespace_creates").?.bool);
     try testing.expectEqual(@as(i64, s.apply_lag_permille), obj.get("apply_lag_permille").?.integer);
     try testing.expectEqual(@as(i64, s.apply_lag_max_ms), obj.get("apply_lag_max_ms").?.integer);
@@ -807,6 +808,16 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     try testing.expectEqual(@as(i64, @intCast(s.partition_min_ms)), obj.get("partition_min_ms").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.partition_max_ms)), obj.get("partition_max_ms").?.integer);
     try testing.expectEqual(@as(i64, @intCast(s.rpc_timeout_ms)), obj.get("rpc_timeout_ms").?.integer);
+}
+
+test "vopr scenario: the queues slice has queue entries and round-trips its share" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const s = Scenario.queues(9);
+    try testing.expect(s.queue_percent >= 25 and s.action_percent == 0);
+    try s.writeJson(&w);
+    const back = try Scenario.fromJsonSlice(testing.allocator, w.buffered());
+    try testing.expectEqual(s.queue_percent, back.queue_percent);
 }
 
 test "vopr scenario: the catching-up slice creates namespaces and lags, and round-trips; other slices do neither" {
