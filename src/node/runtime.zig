@@ -875,6 +875,13 @@ pub const Runtime = struct {
             for (0..threads_spawned) |i| threads[i].join();
             self.allocator.free(threads);
             self.shard_threads = null;
+            // Then the bulk thread, once no shard can ask it for a read and
+            // before the shard errdefer frees the buffers it writes into.
+            if (self.bulk_io) |bulk| {
+                bulk.deinit();
+                self.allocator.destroy(bulk);
+                self.bulk_io = null;
+            }
         }
 
         // 3.5. Start the peer-facing Raft listener only when this node can
@@ -1820,6 +1827,31 @@ const PoisonFreed = struct {
         return clean;
     }
 };
+
+test "Runtime: a cluster start that fails after the bulk thread began stops it before freeing the shards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    // Another server answers on the admin socket, so the start fails past
+    // the bulk thread and the shard threads. A short path: the tmp dir's
+    // may be past what a Unix socket path holds.
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/flo-bulk-admin-{d}.sock", .{std.c.getpid()});
+    const held = try stdx.net.unixListen(path);
+    defer {
+        _ = std.c.close(held.fd);
+        stdx.fs.deleteFileAbsolute(path) catch {};
+    }
+
+    var runtime = try Runtime.init(std.testing.allocator, .{ .num_shards = 1, .listen_port = 0, .data_dir = dir, .dashboard_enabled = false, .metrics_enabled = false, .cluster_enabled = true, .cluster_node_id = 1, .cluster_secret = "flo-secret-" ++ stdx.repeat("8", 64), .admin_socket = path });
+    defer runtime.deinit();
+    try std.testing.expectError(error.AdminSocketInUse, runtime.start());
+    // The start's own cleanup took the bulk thread down, before the shards
+    // whose buffers it writes into: not left to deinit, which comes after.
+    try std.testing.expect(runtime.bulk_io == null);
+    try std.testing.expect(runtime.shards == null);
+}
 
 test "Runtime: a cluster member's shutdown writes nothing to its metrics after freeing them, with a peer linked" {
     var poison: PoisonFreed = .{ .backing = std.testing.allocator, .watch_len = @sizeOf(MetricsRegistry) };
