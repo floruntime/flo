@@ -664,8 +664,18 @@ pub fn Replica(comptime Io: type) type {
         /// This node's entry at `index`, its payload in the RPC scratch: good
         /// until the next pump.
         pub fn ownEntry(self: *Self, index: u64) ?*const entry_mod.Entry {
-            if (self.raftNode().log.getRange(index, self.rpc_entries[0..1], self.rpc_arena) != 1) return null;
-            return &self.rpc_entries[0];
+            return switch (self.readOwnEntry(index)) {
+                .found => |e| e,
+                .absent, .blocked => null,
+            };
+        }
+
+        /// `ownEntry`, telling an entry the log doesn't hold from one it
+        /// can't read right now.
+        pub fn readOwnEntry(self: *Self, index: u64) union(enum) { found: *const entry_mod.Entry, absent, blocked } {
+            const r = self.raftNode().log.getRangeBlocking(index, self.rpc_entries[0..1], self.rpc_arena);
+            if (r.count == 1) return .{ .found = &self.rpc_entries[0] };
+            return if (r.blocked) .blocked else .absent;
         }
 
         /// The leader loop, once per tick and after anything that changes what
