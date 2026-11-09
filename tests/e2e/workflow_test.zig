@@ -4121,6 +4121,30 @@ test "e2e/workflow/cluster: a schedule's slot that fired doesn't fire again on t
     try testing.expectEqual(@as(usize, 1), try slottedRunsOn(&cluster, next));
 }
 
+test "e2e/workflow: a cron schedule fires on the minute, from the first minute after it's created" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    // Created early in a minute, so the checks below land inside it.
+    if (@mod(stdx.time.milliTimestamp(), 60_000) > 40_000) {
+        stdx.time.sleep(@intCast((60_000 - @mod(stdx.time.milliTimestamp(), 60_000) + 1000) * std.time.ns_per_ms));
+    }
+    const def = EVERY_MINUTE;
+    const at = std.mem.indexOf(u8, def, "  interval: 60000").?;
+    const cron_def = try std.mem.concat(testing.allocator, u8, &.{ def[0..at], "  cron: \"* * * * *\"", def[at + "  interval: 60000".len ..] });
+    defer testing.allocator.free(cron_def);
+    try createYamlWorkflow(ctx, cron_def);
+    const list: []const []const u8 = &.{ "workflow", "list-runs", "-w", "slotted", "--limit", "1000" };
+
+    // The minute struck before it existed: nothing yet.
+    stdx.time.sleep(1000 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), slottedRuns(try ctx.execCapture(list)));
+
+    // Just past the next minute: one run.
+    const to_minute = 60_000 - @mod(stdx.time.milliTimestamp(), 60_000);
+    stdx.time.sleep(@intCast((to_minute + 2000) * std.time.ns_per_ms));
+    try testing.expectEqual(@as(usize, 1), slottedRuns(try ctx.execCapture(list)));
+}
+
 test "e2e/workflow: enabling or disabling a workflow that doesn't exist is not found" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

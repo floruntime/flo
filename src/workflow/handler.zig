@@ -37,6 +37,7 @@ const list_runs = @import("list_runs.zig");
 const parser = @import("parser.zig");
 
 const definition = @import("definition.zig");
+const cron_mod = @import("cron.zig");
 const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
 const jsonpath = @import("jsonpath.zig");
@@ -332,9 +333,16 @@ pub const WorkflowHandler = struct {
     pub const ScheduleState = struct {
         workflow_name_owned: []const u8,
         namespace_owned: []const u8,
+        /// Slots every `interval_ms` from the anchor, or at `cron`'s fire
+        /// times (UTC) from the anchor on.
         interval_ms: i64,
+        cron: ?cron_mod.Cron = null,
         max_concurrent: u32,
         input_owned: ?[]const u8,
+        /// A cron's latest fire time changes on the minute: the last one
+        /// found, until `cron_until_ms`.
+        cron_latest_ms: ?i64 = null,
+        cron_until_ms: i64 = std.math.minInt(i64),
         /// Slots count from here: the stamp of the entry that created or
         /// last enabled the workflow, the same on every replica.
         anchor_ms: i64,
@@ -3181,10 +3189,15 @@ pub const WorkflowHandler = struct {
         schedule: definition.ScheduleDef,
         anchor_ms: i64,
     ) void {
-        // Only interval-based schedules are supported for now
-        const interval_ms = schedule.interval_ms orelse return;
-        if (interval_ms <= 0) return;
         if (schedule.paused) return;
+        // The validator lets through exactly one of a valid cron or an
+        // interval; a stored definition holds the same.
+        var parsed: ?cron_mod.Cron = null;
+        const interval_ms: i64 = if (schedule.cron_expr) |expr| blk: {
+            parsed = cron_mod.Cron.parse(expr) orelse return;
+            break :blk 0;
+        } else schedule.interval_ms orelse return;
+        if (parsed == null and interval_ms <= 0) return;
 
         const sched_key = self.makeNsKey(namespace, workflow_name) orelse return;
 
@@ -3216,6 +3229,7 @@ pub const WorkflowHandler = struct {
             .workflow_name_owned = owned_wf,
             .namespace_owned = owned_ns,
             .interval_ms = interval_ms,
+            .cron = parsed,
             .max_concurrent = schedule.max_concurrent,
             .input_owned = owned_input,
             .anchor_ms = anchor_ms,
@@ -3240,9 +3254,18 @@ pub const WorkflowHandler = struct {
     }
 
     /// The latest slot due at `now_ms`, or null before the first. Slot k
-    /// is at anchor + k·interval; slot 0 is the anchor itself.
-    fn dueSlot(schedule: *const ScheduleState, now_ms: i64) ?i64 {
+    /// is at anchor + k·interval; slot 0 is the anchor itself. A cron's
+    /// slots are its fire times at or after the anchor.
+    fn dueSlot(schedule: *ScheduleState, now_ms: i64) ?i64 {
         if (now_ms < schedule.anchor_ms) return null;
+        if (schedule.cron) |c| {
+            if (now_ms >= schedule.cron_until_ms) {
+                schedule.cron_latest_ms = c.latest(now_ms);
+                schedule.cron_until_ms = now_ms - @mod(now_ms, 60_000) + 60_000;
+            }
+            const latest = schedule.cron_latest_ms orelse return null;
+            return if (latest >= schedule.anchor_ms) latest else null;
+        }
         const k = @divFloor(now_ms - schedule.anchor_ms, schedule.interval_ms);
         return schedule.anchor_ms + k * schedule.interval_ms;
     }
@@ -5422,6 +5445,17 @@ test "workflow schedule: slots count from the anchor, and the latest one due is 
     try testing.expectEqual(@as(?i64, 10_500 + 3600 * 1000), WorkflowHandler.dueSlot(&s, 10_500 + 3600 * 1000 + 999));
     s.anchor_ms = 0;
     try testing.expectEqual(@as(?i64, 7000), WorkflowHandler.dueSlot(&s, 7999));
+}
+
+test "workflow schedule: a cron's slots are its fire times from the anchor on" {
+    const minute = cron_mod.calendarToEpochMs(2024, 1, 15, 10, 0);
+    var s: WorkflowHandler.ScheduleState = .{ .workflow_name_owned = "", .namespace_owned = "", .interval_ms = 0, .cron = cron_mod.Cron.parse("*/5 * * * *").?, .max_concurrent = 1, .input_owned = null, .anchor_ms = minute + 30_000 };
+    // Created after 10:00 struck: nothing until 10:05.
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, minute + 50_000));
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, minute + 4 * 60_000 + 59_999));
+    try testing.expectEqual(@as(?i64, minute + 5 * 60_000), WorkflowHandler.dueSlot(&s, minute + 5 * 60_000));
+    // A day missed: the latest fire, once.
+    try testing.expectEqual(@as(?i64, minute + 86_400_000), WorkflowHandler.dueSlot(&s, minute + 86_400_000 + 4 * 60_000));
 }
 
 test "workflow schedule: a slot starts one run however many leaders propose it, and a missed one fires once" {
