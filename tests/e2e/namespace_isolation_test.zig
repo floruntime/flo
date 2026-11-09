@@ -139,9 +139,9 @@ fn writeSeries(ctx: *stdx.testing.TestContext) !void {
             try ctx.exec(&.{ "ts", "write", "same", "--tags", host, "--value", "1", "--timestamp", try std.fmt.bufPrint(&ts, "{d}", .{1000 + k}), "-n", ns });
         }
         try ctx.exec(&.{ "ts", "write", try std.fmt.bufPrint(&only, "only_{s}", .{ns}), "--value", "1", "--timestamp", "1000", "-n", ns });
-        // The same measurement and tag set in both: each namespace's tag
-        // dictionary resolves it apart, so a delete by tag in the first
-        // leaves the second's.
+        // The same measurement and tag set in both: a delete by tag in the
+        // first matches only its own namespace's series (`inMeasurement`
+        // checks the key's id), so the second's stay.
         for (1..count(i) + 1) |k| {
             try ctx.exec(&.{ "ts", "write", "shared", "--tags", "site=x", "--value", "1", "--timestamp", try std.fmt.bufPrint(&ts, "{d}", .{1000 + k}), "-n", ns });
         }

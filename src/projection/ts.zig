@@ -209,8 +209,8 @@ pub const TsWriteValue = struct {
 ///
 ///   [ns_id: u32 BE (4B)][measurement]\x00[field_name]\x00[tag_hash: u64 LE (8B)]
 ///
-/// The prefix is `Id.bytes()`, as on every key below the edge, so one
-/// namespace's series sort together.
+/// The prefix is `Id.bytes()`, as on every key below the edge, so the
+/// first four bytes of a key name its namespace the same way everywhere.
 ///
 /// `tag_hash` is a real series dimension (issue #24): points sharing a
 /// measurement+field but carrying different tags live in different series
