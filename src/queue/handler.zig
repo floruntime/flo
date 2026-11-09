@@ -354,7 +354,11 @@ pub const QueueHandler = struct {
         if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
         const priority: u32 = if (req.getPriority()) |p| p else 0;
-        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = req.ns_id.int(), .queue = req.key, .priority = priority, .payload = req.value }) catch |err| {
+        // As every write resolves its namespace here (`persistence.proposeEntry`):
+        // published, or on shard 0 proposed ahead of this write.
+        const ns = shard.namespaceId(req.namespace);
+        if (ns == .invalid) return .{ .err = persistence_mod.failureError(error.NamespaceUnknown, "enqueue not persisted") };
+        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = ns.int(), .queue = req.key, .priority = priority, .payload = req.value }) catch |err| {
             return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
         };
         return .{ .parked = proposed };
@@ -443,6 +447,7 @@ pub const QueueHandler = struct {
 
     fn handlePurge(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
+        if (metaOf(shard, req.ns_id, req.key) == null) return .{ .queue_purged = .{ .count = 0 } };
         const proposed = propose(shard, .queue_purge, qe.Purge.Value{ .ns = req.ns_id.int(), .queue = req.key }) catch |err|
             return .{ .err = persistence_mod.failureError(err, "purge not persisted") };
         return .{ .parked = proposed };
@@ -736,9 +741,22 @@ pub const QueueHandler = struct {
         return .{ .bytes = buf[0..items.bytes.len], .count = items.count };
     }
 
+    /// A report on a queue this leader doesn't hold, in a namespace that
+    /// may not exist: each message is gone, and nothing is logged.
+    fn allGone(buf: []u8, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Value {
+        var b = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Builder.init(buf);
+        var it = messages.iterator();
+        while (it.next() catch null) |item| _ = b.add(.{ .seq = item.seq, .reason = machine.Why.gone.text() }) catch break;
+        return b.value();
+    }
+
     fn runComplete(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (metaOf(shard, req.ns_id, req.key) == null) {
+            const self = shard.queue_handler;
+            return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
+        }
         const token: ae.Token.Value = .{ .term = term, .index = index };
         const lease = leaseOf(shard, req.ns_id, machine.hashOf(req.key), consumer, token, messages);
         var ib: [qe.Items.max_size]u8 = undefined;
@@ -751,6 +769,10 @@ pub const QueueHandler = struct {
     fn runFail(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value, delay_ms: u64, dead: bool, err_text: []const u8) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (metaOf(shard, req.ns_id, req.key) == null) {
+            const self = shard.queue_handler;
+            return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
+        }
         const token: ae.Token.Value = .{ .term = term, .index = index };
         const lease = leaseOf(shard, req.ns_id, machine.hashOf(req.key), consumer, token, messages);
         var ib: [qe.Items.max_size]u8 = undefined;
@@ -766,6 +788,10 @@ pub const QueueHandler = struct {
     fn runTouch(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(TouchResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (metaOf(shard, req.ns_id, req.key) == null) {
+            const self = shard.queue_handler;
+            return .{ .answer = .{ .expires_at_ms = 0, .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
+        }
         const token: ae.Token.Value = .{ .term = term, .index = index };
         const hash = machine.hashOf(req.key);
         const lease = leaseOf(shard, req.ns_id, hash, consumer, token, messages);

@@ -15672,6 +15672,34 @@ test "queues: a dequeue with block_ms 0 answers at once with none; one that wait
     try std.testing.expectEqualStrings("woken", v.payloadOf(0));
 }
 
+test "queues: a report on a queue the leader doesn't hold, or in a namespace never made, answers each message gone and logs nothing" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.enqueue("a");
+    const got = try t.dequeue("c1", 1, null, false);
+    const before = t.a.shard.raft_node.log.lastIndex();
+    var ib: [QueuesTest.Items.max_size]u8 = undefined;
+    var b: [QueuesTest.Complete.request.max_size]u8 = undefined;
+    const body = try QueuesTest.Complete.request.encodeInto(&b, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try QueuesTest.itemsOf(&ib, got) });
+    for ([_][]const u8{ "default", "never-made" }) |ns| {
+        t.a.next_id += 1;
+        const frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_complete, t.a.next_id, ns, "other", body, ""));
+        defer std.testing.allocator.free(frame);
+        _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+        _ = t.a.shard.applyCommitted();
+        const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+        var diag: schema.Diagnostic = .{};
+        const v = try QueuesTest.Complete.response.decodeAll(resp.data, &diag);
+        try std.testing.expectEqual(@as(u32, 0), v.applied);
+        var it = v.refused.iterator();
+        try std.testing.expect(std.mem.indexOf(u8, (try it.next()).?.reason, "no such message in this queue") != null);
+    }
+    try std.testing.expectEqual(before, t.a.shard.raft_node.log.lastIndex());
+    try std.testing.expect(t.a.shard.halted == null);
+}
+
 test "queues: a dequeue with ack completes what it takes, so nothing comes back" {
     var t: QueuesTest = undefined;
     try t.init();
