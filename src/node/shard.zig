@@ -106,7 +106,8 @@ const UAL = ual_mod.UAL;
 const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
 const DurableLog = durable_log_mod.DurableLog;
-const RaftLog = @import("../raft/log.zig").RaftLog;
+const raft_log_mod = @import("../raft/log.zig");
+const RaftLog = raft_log_mod.RaftLog;
 const hard_state_mod = @import("../raft/hard_state.zig");
 const Durability = @import("../config/server.zig").Durability;
 const SegmentReader = @import("../storage/ual/reader.zig").SegmentReader;
@@ -214,6 +215,13 @@ const ShardIo = struct {
 
         pub fn applyCommitted(r: *Replica) bool {
             return of(r).applyCommitted();
+        }
+
+        /// A committed entry could not be read to apply it. The apply loop
+        /// logs and surfaces this itself, so callers of `applyCommitted` do
+        /// not report the same block again.
+        pub fn readBlocked(r: *Replica) bool {
+            return of(r).read_blocked;
         }
 
         pub fn clearRemovalNotices(r: *Replica) void {
@@ -423,9 +431,12 @@ pub const Shard = struct {
     /// When a node with no membership last asked the peers it can reach
     /// to be added.
     join_asked_ms: u64,
-    /// Proposals whose client waits for commit, by index. A slot is never
-    /// contended: the Raft node refuses proposals past MAX_OUTSTANDING and
-    /// the table is twice that.
+    /// Proposals whose client waits for commit, by index. In steady state a
+    /// slot is never contended: the Raft node refuses proposals past
+    /// MAX_OUTSTANDING and the table is twice that. One case can still fill it
+    /// — a lone node (which has no such cap) whose reads are blocked, so
+    /// committed entries park unapplied; `parkHolding` backstops that by
+    /// refusing a contended slot rather than overwriting it.
     pending: []Pending,
     pending_count: u32,
     /// The connection a parked write is answered on when the client's is not on
@@ -565,6 +576,36 @@ pub const Shard = struct {
     /// The last apply pass stopped at its budget with committed entries
     /// left; the next poll does not wait, and the tick applies on.
     apply_behind: bool,
+    /// A committed entry could not be read to apply it — a resource or IO
+    /// failure reading below the ring, not a hole. The shard holds it unapplied
+    /// and retries, but not on every call: `read_retry_at_ms` paces the retry,
+    /// `apply_behind` is deliberately not set (so the reactor keeps its normal
+    /// poll wait and does not spin), and the state is visible (`/ready` goes
+    /// 503, `/status` names it). A leader blocked this way steps down.
+    read_blocked: bool = false,
+    read_blocked_since_ms: u64 = 0,
+    /// Whether the current block's cause may be the disk failing (an IO error),
+    /// rather than a resource shortage. Shapes the reason `/status` shows.
+    read_block_disk_failing: bool = false,
+    /// The clock reading at which a disk-class block becomes damage, or null
+    /// while the block is not disk-class. Set when the cause first looks like
+    /// the disk and left alone after, so a long resource shortage that later
+    /// turns into a disk error does not shorten the disk's grace: the countdown
+    /// starts at the change. An absolute deadline, not an elapsed time, so it
+    /// never underflows a monotonic uptime clock.
+    read_block_disk_deadline_ms: ?u64 = null,
+    /// The next tick that may re-attempt a blocked read. Between these, apply
+    /// returns at once without touching the disk, so a blocked read is not
+    /// retried per request.
+    read_retry_at_ms: u64 = 0,
+    /// Rate-limits the one line said while blocked; null until it is first said,
+    /// so a block within the first interval of uptime is not held silent.
+    read_block_log_ms: ?u64 = null,
+    /// A repair skip whose named entry could not be read to check it (by the
+    /// skip's own index), 0 when none. The skip entry itself applied; only its
+    /// check is held, and the apply loop does not go past it until the check
+    /// runs. Paced by `read_retry_at_ms` like any blocked read.
+    skip_check_pending: u64 = 0,
     /// What this tick's apply passes have spent, in `applyCost` units: the
     /// budget is the tick's, since every request and frame applies after it.
     /// A call outside a tick (boot, a test) has a budget of its own.
@@ -1224,8 +1265,14 @@ pub const Shard = struct {
             log.info("shard {d}: applying {d} durable entries above the commit watermark (indices {d}..{d})", .{ self.id, pending, raft.last_applied + 1, raft.commit_index });
         }
         // A shard halted at boot has said so: nothing past its halt applies.
-        if (!self.applyCommitted() and self.halted == null) {
-            log.err("shard {d}: not every durable entry above the commit watermark could be applied at boot; projections are missing writes", .{self.id});
+        // A blocked read at boot is not missing writes either — it is held and
+        // retried — so it says that instead of crying data loss.
+        if (!self.applyCommitted() and self.halted == null and self.offline == null) {
+            if (self.read_blocked) {
+                log.warn("shard {d}: a committed entry could not be read to apply at boot ({s}); holding and retrying", .{ self.id, if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage" });
+            } else {
+                log.err("shard {d}: not every durable entry above the commit watermark could be applied at boot; projections are missing writes", .{self.id});
+            }
         }
     }
 
@@ -1931,7 +1978,10 @@ pub const Shard = struct {
         const exempt = status_op or req.header.op_code == @backingInt(proto.OpCode.ping);
         if (!writes and !at_leader and !exempt and !internal_from_client and auth.origin != .peer and self.refusedRead(conn, req)) return;
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged) and !writes);
+        // A read is stale when this node can't apply what the group committed:
+        // halted, diverged, or blocked reading a committed entry — the
+        // projections sit behind the commit either way.
+        proto.answering_stale = was_stale or ((self.halted != null or self.replica.diverged or self.read_blocked) and !writes);
         defer proto.answering_stale = was_stale;
         if (self.raft_network != null and (writes or at_leader) and (self.replica.diverged or self.raft_node.role != .leader)) {
             if (self.replica.diverged) {
@@ -2868,7 +2918,10 @@ pub const Shard = struct {
         const answered_here = self.raft_node.commit_index >= proposed.index and here: {
             std.debug.assert(self.raft_node.last_applied < proposed.index);
             _ = self.applyThrough(proposed.index);
-            break :here !self.apply_behind or self.raft_node.last_applied >= proposed.index;
+            // Reached its entry, or the pass drained fully (not stopped by the
+            // budget, and not held by a blocked read): otherwise it parks and
+            // is answered when the rest applies.
+            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked);
         };
         if (answered_here) {
             defer if (release) |r| r(self, ctx);
@@ -2892,8 +2945,10 @@ pub const Shard = struct {
         }
         const slot = &self.pending[proposed.index % PENDING_SLOTS];
         if (slot.active) {
-            // Cannot happen while the Raft node caps outstanding entries
-            // below the table size; said out loud rather than trusted.
+            // In steady state the Raft node's outstanding cap keeps this below
+            // the table size. It can still happen on a lone node (no such cap)
+            // whose reads are blocked, holding committed entries unapplied: the
+            // write is refused rather than a parked one overwritten.
             log.err("shard {d}: pending slot for index {d} still holds index {d}", .{ self.id, proposed.index, slot.index });
             if (release) |r| r(self, ctx);
             // Proposed already: it may still apply.
@@ -3798,7 +3853,20 @@ pub const Shard = struct {
         const raft = self.raft_node;
         var idx = @max(self.skip_scan_from, h.index + 1);
         while (idx <= raft.commit_index) : (idx += 1) {
-            const e = raft.log.getEntryCopy(idx, self.apply_buf) orelse continue;
+            const e = switch (raft.log.readForApply(idx, self.apply_buf)) {
+                .found => |x| x,
+                // A blocked read: can't tell if this is the skip, so pause the
+                // scan here and try again rather than walk past it (which would
+                // leave the node halted for good). Paced and surfaced like any
+                // blocked read, not probed once per request.
+                .blocked => |b| {
+                    self.skip_scan_from = idx;
+                    _ = self.noteReadBlock(b.disk_failing, idx);
+                    return false;
+                },
+                .absent => continue,
+            };
+            if (self.read_blocked) self.clearReadBlocked();
             const skip = repair.Skip.decode(&e) orelse continue;
             if (skip.index != h.index or skip.term != h.term or skip.crc != h.crc) continue;
             self.skips.add(self.allocator, &skip) catch {
@@ -3850,9 +3918,22 @@ pub const Shard = struct {
         const raft = self.raft_node;
         if (skip.index < raft.log.start()) return true;
         // Overwrites `e`, and the reason with it.
-        const named = raft.log.getEntryCopy(skip.index, self.apply_buf) orelse {
-            log.warn("shard {d}: the repair at entry {d} names entry {d}, which this node can't read back; it skips nothing here", .{ self.id, at, skip.index });
-            return true;
+        const named = switch (raft.log.readForApply(skip.index, self.apply_buf)) {
+            .found => |x| x,
+            // The named entry can't be read to decide the skip. Don't seal it
+            // as naming nothing (which would silently keep what no other
+            // replica holds). Hold the check by the skip's own index — the
+            // apply loop runs it again, paced, before anything past the skip
+            // applies — rather than drop it.
+            .blocked => |b| {
+                self.skip_check_pending = at;
+                _ = self.noteReadBlock(b.disk_failing, skip.index);
+                return false;
+            },
+            .absent => {
+                log.warn("shard {d}: the repair at entry {d} names entry {d}, which this node can't read back; it skips nothing here", .{ self.id, at, skip.index });
+                return true;
+            },
         };
         if (!skip.names(&named)) {
             log.warn("shard {d}: the repair at entry {d} names entry {d} in term {d}, which this log doesn't hold; it skips nothing", .{ self.id, at, skip.index, skip.term });
@@ -3864,6 +3945,41 @@ pub const Shard = struct {
         }
         self.damaged(silent_loss.Damage.init(.applied_skipped, "entry {d} applied on this node, but the repair at entry {d} skips it on every replica", .{ skip.index, at }));
         return false;
+    }
+
+    /// Re-run a repair-skip check that an earlier blocked read held. The skip
+    /// entry itself applied; only its check — whether it names an entry this
+    /// node applied divergently — waited. True once the check has run (sealed,
+    /// or the node damaged) or nothing is held; false while the read is still
+    /// blocked, so the apply loop does not go past the skip meanwhile.
+    fn runPendingSkipCheck(self: *Shard) bool {
+        const at = self.skip_check_pending;
+        if (at == 0) return true;
+        switch (self.raft_node.log.readForApply(at, self.apply_buf)) {
+            .found => |e| {
+                if (self.checkSkip(&e)) {
+                    self.skip_check_pending = 0;
+                    self.seal_skip = true;
+                    self.clearReadBlocked();
+                    return true;
+                }
+                // checkSkip returned false: either its named read is still
+                // blocked (it re-armed the back-off) or the node is now
+                // damaged. Either way, hold here.
+                if (self.offline != null or self.replica.diverged) self.skip_check_pending = 0;
+                return false;
+            },
+            .blocked => |b| {
+                _ = self.noteReadBlock(b.disk_failing, at);
+                return false;
+            },
+            // The skip entry was truncated away: nothing left to check.
+            .absent => {
+                self.skip_check_pending = 0;
+                self.clearReadBlocked();
+                return true;
+            },
+        }
     }
 
     /// Whether `err` is a halted shard refusing one of its own writes.
@@ -3945,6 +4061,9 @@ pub const Shard = struct {
     /// its group, as a diverged one does.
     fn damaged(self: *Shard, damage: silent_loss.Damage) void {
         if (self.offline != null or self.replica.diverged) return;
+        // No longer waiting on the read: drop the block so its gauge does not
+        // stick and `/status` shows the damage, not the stale block.
+        self.clearReadBlocked();
         self.losses.note(damage.path, nowMs(), self.id, "{s}", .{damage.reason()});
         if (self.raft_network == null) {
             self.offline = damage;
@@ -4011,6 +4130,65 @@ pub const Shard = struct {
         return true;
     }
 
+    const ReadBlockOutcome = enum { hold, damaged };
+
+    /// Record that a committed read (entry `index`) is blocked right now, pace
+    /// the retry, and surface it. Shared by the apply loop and the two
+    /// skip-scan reads so all three back off and show a block the same way.
+    /// `.damaged` means a disk-class block lasted past its grace and the node
+    /// is now offline or diverged; `.hold` means keep the entry unapplied and
+    /// try again after the back-off.
+    fn noteReadBlock(self: *Shard, disk_failing: bool, index: u64) ReadBlockOutcome {
+        const raft = self.raft_node;
+        const now = nowMs();
+        if (!self.read_blocked) {
+            self.read_blocked = true;
+            self.read_blocked_since_ms = now;
+            if (self.shard_metrics) |sm| sm.recordReadBlockStart();
+        }
+        self.read_block_disk_failing = disk_failing;
+        // The disk's grace is counted from when the cause first looks like the
+        // disk: set the deadline on that change and leave it, and clear it when
+        // the cause is a resource shortage, so a resource wait never shortens
+        // the disk's grace (the countdown restarts at the change).
+        if (disk_failing) {
+            if (self.read_block_disk_deadline_ms == null) self.read_block_disk_deadline_ms = now + DISK_FAILING_MS;
+        } else {
+            self.read_block_disk_deadline_ms = null;
+        }
+        const blocked_for = now -| self.read_blocked_since_ms;
+        // A disk-class block held past its grace is treated as damage: the node
+        // diverges and is replaced, rather than wait on a disk that is not
+        // coming back. A resource shortage holds indefinitely.
+        if (self.read_block_disk_deadline_ms) |deadline| if (now >= deadline) {
+            self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read for {d} ms; the disk may be failing", .{ index, blocked_for }));
+            return .damaged;
+        };
+        // A leader that cannot apply freezes the group: tell Raft, which steps
+        // it down past an election timeout.
+        raft.setReadBlocked(self.read_blocked_since_ms, disk_failing);
+        if (self.read_block_log_ms == null or now -| self.read_block_log_ms.? >= READ_BLOCK_LOG_MS) {
+            self.read_block_log_ms = now;
+            log.err("shard {d}: a committed entry has not been readable to apply for {d} ms ({s}); applied {d} of {d}, holding and retrying", .{ self.id, blocked_for, if (disk_failing) "the disk may be failing" else "a resource shortage", raft.last_applied, raft.commit_index });
+        }
+        self.read_retry_at_ms = now + READ_RETRY_MS;
+        return .hold;
+    }
+
+    /// The block is over — a committed entry read again, or the node damaged
+    /// and no longer waiting. Account the time, drop the gauge, and let the
+    /// node lead and campaign once more. Safe to call when not blocked.
+    fn clearReadBlocked(self: *Shard) void {
+        if (!self.read_blocked) return;
+        if (self.shard_metrics) |sm| sm.recordReadBlockEnd(nowMs() -| self.read_blocked_since_ms);
+        self.read_blocked = false;
+        self.read_block_disk_failing = false;
+        self.read_block_disk_deadline_ms = null;
+        self.read_retry_at_ms = 0;
+        self.read_block_log_ms = null;
+        self.raft_node.clearReadBlocked();
+    }
+
     fn healthState(self: *const Shard) health_mod.ShardState {
         if (self.removed_at_ms != null) return .removed;
         if (self.replica.diverged) return .diverged;
@@ -4029,6 +4207,12 @@ pub const Shard = struct {
                 if (!m.voter and !m.caught_up) return .catching_up;
             }
         }
+        // After the catching-up states: a node still catching up shows that and
+        // stays 503, rather than flipping to this and answering 200 while it
+        // refuses reads. On a lone node a blocked read still serves (stale), and
+        // `readiness` keeps it ready; in a cluster another node can serve, so it
+        // is not ready.
+        if (self.read_blocked) return .read_blocked;
         return .ok;
     }
 
@@ -4070,6 +4254,7 @@ pub const Shard = struct {
             sm.duties_held.store(self.duties.held(), .monotonic);
             sm.duty_oldest_held_ms.store(self.duties.oldestMs(nowMs()), .monotonic);
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
+            sm.setReadBlocked(self.read_blocked);
         }
         const slot = self.health orelse return;
         slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
@@ -4082,6 +4267,10 @@ pub const Shard = struct {
             slot.halt_term.store(h.term, .monotonic);
             slot.halt_crc.store(h.crc, .monotonic);
         }
+        const raft = self.raft_node;
+        // In `healthState`'s own order, strongest first, so a block that then
+        // damages the node shows the damage, not the stale block — and
+        // `damaged` clears the block anyway.
         if (self.diverged_damage) |*damage| {
             slot.setReason(damage.reason());
         } else if (self.replica.divergedReason()) |why| {
@@ -4099,8 +4288,17 @@ pub const Shard = struct {
                     "the leader applied this entry; a build with no version can't be told apart: on the same build this node halted alone (wipe and rejoin), on another upgrade it";
                 break :blk std.fmt.bufPrint(&buf, "{s}; {s}", .{ note, h.reason() }) catch note;
             } else h.reason());
+        } else if (self.read_blocked) {
+            slot.read_blocked_since_ms.store(self.read_blocked_since_ms, .monotonic);
+            var buf: [health_mod.REASON_MAX]u8 = undefined;
+            slot.setReason(std.fmt.bufPrint(&buf, "a committed entry has not been readable to apply ({s}); applied {d} of {d}", .{
+                if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage",
+                raft.last_applied,
+                raft.commit_index,
+            }) catch "a committed entry could not be read to apply");
         }
-        const raft = self.raft_node;
+        // A lone blocked shard keeps the node ready; a cluster one is a 503.
+        slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
 
@@ -4338,6 +4536,17 @@ pub const Shard = struct {
         return self.applyThrough(std.math.maxInt(u64));
     }
 
+    /// How long to wait between re-attempting a blocked read, so a block
+    /// costs one disk probe a fraction of a second, not one per request.
+    const READ_RETRY_MS: u64 = 250;
+    /// How often to say a read is still blocked.
+    const READ_BLOCK_LOG_MS: u64 = 30_000;
+    /// A read blocked for a reason that may be the disk failing — an IO error,
+    /// or an unmapped errno that may be one — becomes damage once it has lasted
+    /// this long, rather than holding forever: the node then diverges and is
+    /// replaced. A resource shortage never does.
+    const DISK_FAILING_MS: u64 = 5 * 60 * 1000;
+
     /// The apply budget of one tick, in `applyCost` units.
     const APPLY_PASS_NS: u64 = std.time.ns_per_ms;
     const ENTRY_COST_NS: u64 = 1_400;
@@ -4362,6 +4571,13 @@ pub const Shard = struct {
         // over it (after an async-flush rewind, say) would make it neither
         // its own history nor the group's, so it stays as it was.
         if (self.applying or self.offline != null or self.replica.diverged) return true;
+        // Blocked on a read and still inside the back-off: don't probe the disk
+        // again this call. apply runs after every request, so re-attempting
+        // here would mean one disk read per request and one log line per retry.
+        if (self.read_blocked and nowMs() < self.read_retry_at_ms) return false;
+        // A repair skip whose check an earlier blocked read held: re-run it
+        // before anything past the skip applies, so the check is never dropped.
+        if (self.skip_check_pending != 0 and !self.runPendingSkipCheck()) return false;
         // Halted: nothing past the entry applies until a committed repair
         // skips it, but writes committed after it are told so as their
         // entries commit.
@@ -4395,74 +4611,94 @@ pub const Shard = struct {
                 // Advanced before the apply: whatever a notification does, this
                 // entry is never taken twice, and the loop cannot stall.
                 raft.last_applied = next_idx;
-                if (raft.log.getEntryCopy(next_idx, self.apply_buf)) |e| {
-                    spent += applyCost(&e);
-                    if (skippedHere(&self.skips, &e)) {
-                        self.last_entry_applied = false;
-                        self.last_result.reset(&e);
-                        self.defaultPartition().passOverSkipped(&e) catch |err| {
-                            self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                            self.damaged(localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ next_idx, @errorName(err) })));
-                            all_applied = false;
-                            break :drain;
-                        };
-                        // Its client is told it didn't run; the shard is
-                        // as the repair wants it.
-                        self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                        continue;
-                    }
-                    // The leader stamps each entry after the one before it,
-                    // so an entry that isn't is a bug every replica sees. A
-                    // skip never halts.
-                    if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp and !isSkip(&e)) {
-                        self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
+                switch (raft.log.readForApply(next_idx, self.apply_buf)) {
+                    .blocked => |b| {
+                        // The entry's segment could not be read right now (a
+                        // resource or IO failure), which is not a hole. Hold it
+                        // unapplied and retry — paced by `read_retry_at_ms`, not
+                        // per call, and without `apply_behind`, so the reactor
+                        // keeps its poll wait and does not spin. `noteReadBlock`
+                        // may instead damage the node (a disk failing too long).
+                        raft.last_applied = next_idx - 1;
                         all_applied = false;
+                        _ = self.noteReadBlock(b.disk_failing, next_idx);
                         break :drain;
-                    }
-                    self.last_result.reset(&e);
-                    const verdict = self.applyOne(&e, &self.last_result);
-                    switch (verdict) {
-                        .applied, .duplicate => {},
-                        .halt => |why| {
-                            self.halt(&e, "{s} (a Flo bug)", .{why});
-                            all_applied = false;
-                            break :drain;
-                        },
-                        .local => |damage| {
+                    },
+                    .found => |e| {
+                        if (self.read_blocked) {
+                            self.clearReadBlocked();
+                            log.info("shard {d}: committed entries are readable again; applying from {d}", .{ self.id, next_idx });
+                        }
+                        spent += applyCost(&e);
+                        if (skippedHere(&self.skips, &e)) {
                             self.last_entry_applied = false;
+                            self.last_result.reset(&e);
+                            self.defaultPartition().passOverSkipped(&e) catch |err| {
+                                self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                                self.damaged(localDamage(err, silent_loss.Damage.init(.partition_reject, "entry {d}, which a repair skips, could not be passed over on this node: {s}", .{ next_idx, @errorName(err) })));
+                                all_applied = false;
+                                break :drain;
+                            };
+                            // Its client is told it didn't run; the shard is
+                            // as the repair wants it.
                             self.answerPending(next_idx, e.header.term, false, &self.last_result);
-                            self.damaged(damage);
-                            all_applied = false;
-                            break :drain;
-                        },
-                    }
-                    raft.noteApplied(e.header.timestamp_ns);
-                    const applied = verdict == .applied;
-                    // A bug in an applier, never a valid request's doing:
-                    // every answer is sized for the longest key.
-                    if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
-                    if (!applied) all_applied = false;
-                    self.last_entry_applied = applied;
-                    self.answerPending(next_idx, e.header.term, applied, &self.last_result);
-                    // Last: it reads the entry it names into the same buffer.
-                    if (isSkip(&e)) {
-                        if (!self.checkSkip(&e)) {
+                            continue;
+                        }
+                        // The leader stamps each entry after the one before it,
+                        // so an entry that isn't is a bug every replica sees. A
+                        // skip never halts.
+                        if (raft.applied_stamp != 0 and e.header.timestamp_ns <= raft.applied_stamp and !isSkip(&e)) {
+                            self.halt(&e, "its stamp {d} is not after the last applied entry's, {d} (a Flo bug)", .{ e.header.timestamp_ns, raft.applied_stamp });
                             all_applied = false;
                             break :drain;
                         }
-                        self.seal_skip = true;
-                    }
-                } else {
-                    self.last_entry_applied = false;
-                    self.last_result.index = next_idx;
-                    self.answerPending(next_idx, 0, false, &self.last_result);
-                    // A committed index is always within the log, in the ring
-                    // or below it in the durable log, and the buffer fits every
-                    // entry; an unreadable one is a bug or a damaged segment,
-                    // and nothing after it may apply over the hole.
-                    self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read back to apply", .{next_idx}));
-                    all_applied = false;
-                    break :drain;
+                        self.last_result.reset(&e);
+                        const verdict = self.applyOne(&e, &self.last_result);
+                        switch (verdict) {
+                            .applied, .duplicate => {},
+                            .halt => |why| {
+                                self.halt(&e, "{s} (a Flo bug)", .{why});
+                                all_applied = false;
+                                break :drain;
+                            },
+                            .local => |damage| {
+                                self.last_entry_applied = false;
+                                self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                                self.damaged(damage);
+                                all_applied = false;
+                                break :drain;
+                            },
+                        }
+                        raft.noteApplied(e.header.timestamp_ns);
+                        const applied = verdict == .applied;
+                        // A bug in an applier, never a valid request's doing:
+                        // every answer is sized for the longest key.
+                        if (self.last_result.overflowed) log.err("shard {d}: entry {d}'s answer didn't fit its result; its client is told the answer was lost", .{ self.id, next_idx });
+                        if (!applied) all_applied = false;
+                        self.last_entry_applied = applied;
+                        self.answerPending(next_idx, e.header.term, applied, &self.last_result);
+                        // Last: it reads the entry it names into the same buffer.
+                        if (isSkip(&e)) {
+                            if (!self.checkSkip(&e)) {
+                                all_applied = false;
+                                break :drain;
+                            }
+                            self.seal_skip = true;
+                        }
+                    },
+                    .absent => {
+                        self.last_entry_applied = false;
+                        self.last_result.index = next_idx;
+                        self.answerPending(next_idx, 0, false, &self.last_result);
+                        // A committed index is always within the log, in the
+                        // ring or below it in the durable log, and the buffer
+                        // fits every entry; one that isn't there is a bug or a
+                        // damaged segment (a blocked read is handled above),
+                        // and nothing after it may apply over the hole.
+                        self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read back to apply", .{next_idx}));
+                        all_applied = false;
+                        break :drain;
+                    },
                 }
             }
             // Applying can propose (a workflow's next step); flushing that
@@ -4627,11 +4863,11 @@ pub const Shard = struct {
 
     // ─── Event loop ──────────────────────────────────────────────────────
 
-    /// Answer the reads whose wait ran out. On a halted or diverged shard
-    /// they read stale state, and say so.
+    /// Answer the reads whose wait ran out. On a halted or diverged shard, or
+    /// one blocked reading a committed entry, they read stale state, and say so.
     fn expireWaiters(self: *Shard) void {
         const was_stale = proto.answering_stale;
-        proto.answering_stale = was_stale or self.halted != null or self.replica.diverged;
+        proto.answering_stale = was_stale or self.halted != null or self.replica.diverged or self.read_blocked;
         defer proto.answering_stale = was_stale;
         self.waiter_pool.expireTimeouts(handleWaiterTimeout, @ptrCast(self));
     }
@@ -6537,9 +6773,10 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     };
 }
 
-fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) usize {
+fn catchUpReadRange(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
     const dl: *DurableLog = @ptrCast(@alignCast(ctx));
-    return dl.readRange(start, buf, arena);
+    const r = dl.readRange(start, buf, arena);
+    return .{ .count = r.count, .blocked = r.blocked, .disk_failing = r.disk_failing };
 }
 
 /// Raft log truncation, carried into the durable log.
@@ -13318,7 +13555,7 @@ test "replay applies up to the commit watermark; the tail waits for commit to be
     const src = shard.raft_node.log.catch_up.?;
     var buf: [4]entry_mod.Entry = undefined;
     var arena: [512]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena));
+    try std.testing.expectEqual(@as(usize, 2), src.read_range(src.ctx, 2, &buf, &arena).count);
     try std.testing.expectEqual(@as(u64, 3), buf[1].header.index);
     try std.testing.expectEqualStrings("q", entry_mod.CommandPayload.deserialize(buf[1].payload).?.key);
 }
@@ -14247,7 +14484,7 @@ test "Shard: an entry the writer could not buffer is buffered again from the log
     try std.testing.expect(writer.first_unbuffered == null);
     var got: [4]entry_mod.Entry = undefined;
     var arena: [256]u8 = undefined;
-    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena) == 1);
+    try std.testing.expect(s.shard.durable_log.?.readRange(s.shard.raft_node.log.lastIndex(), &got, &arena).count == 1);
 }
 
 test "Shard: with sync durability, entries after one the writer could not buffer reach disk once each, in order" {
@@ -14278,7 +14515,7 @@ test "Shard: with sync durability, entries after one the writer could not buffer
     try std.testing.expectEqual(first.index + 1, s.shard.raft_node.durable_index);
     var got: [4]entry_mod.Entry = undefined;
     var arena: [256]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena));
+    try std.testing.expectEqual(@as(usize, 2), s.shard.durable_log.?.readRange(first.index, &got, &arena).count);
     try std.testing.expectEqual(first.index, got[0].header.index);
     try std.testing.expectEqual(first.index + 1, got[1].header.index);
 }
@@ -19532,4 +19769,292 @@ test "Shard: a forward lost after it went to the leader tells a read it didn't r
             try std.testing.expect(std.mem.indexOf(u8, why.message, "write may still apply") != null);
         }
     }
+}
+
+/// A below-the-ring source that can never be read right now, to stand in for
+/// a host whose disk reads are blocked.
+const BlockedCatchUp = struct {
+    fn blocked(_: *anyopaque, _: u64, _: []entry_mod.Entry, _: []u8) raft_log_mod.CatchUpResult {
+        return .{ .blocked = true };
+    }
+};
+
+/// A blocked source that counts how often it is read and whose cause the test
+/// can switch between a resource shortage and a failing disk.
+const CountingBlock = struct {
+    var calls: usize = 0;
+    var disk_failing: bool = false;
+    fn read(_: *anyopaque, _: u64, _: []entry_mod.Entry, _: []u8) raft_log_mod.CatchUpResult {
+        calls += 1;
+        return .{ .blocked = true, .disk_failing = disk_failing };
+    }
+};
+
+/// A shard with 100 large entries, the first of them below the ring, so a
+/// swapped-in catch-up source decides whether applying can proceed. Caller
+/// owns `tmp` (cleanup) and the returned scratch slice (free).
+fn blockedReadFixture(tmp: *std.testing.TmpDir, pipe_read: std.posix.fd_t) !struct { shard: Shard, real: raft_log_mod.CatchUpSource } {
+    const data_dir = try testDataDir(tmp);
+    defer std.testing.allocator.free(data_dir);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_read, data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    errdefer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const big = try std.testing.allocator.alloc(u8, 32 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0);
+    const raft = shard.raft_node;
+    const first = raft.log.lastIndex() + 1;
+    for (0..100) |_| _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, big);
+    try shard.flushSegmentToDisk();
+    var scratch: [1024 * 1024]u8 = undefined;
+    try std.testing.expect(raft.log.ual.readCopy(first, &scratch) == null);
+    return .{ .shard = shard, .real = raft.log.catch_up.? };
+}
+
+test "shard: a blocked read is retried on a back-off, not probed on every apply" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const fix = try blockedReadFixture(&tmp, pipe_fds[0]);
+    var shard = fix.shard;
+    defer shard.deinit();
+    const raft = shard.raft_node;
+
+    CountingBlock.calls = 0;
+    CountingBlock.disk_failing = false;
+    raft.log.catch_up = .{ .ctx = fix.real.ctx, .read_range = CountingBlock.read };
+
+    // The first apply probes the disk once and blocks.
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 1), CountingBlock.calls);
+    // Further applies inside the back-off do not touch the disk.
+    for (0..5) |_| try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 1), CountingBlock.calls);
+    // Past the back-off, it probes again — once.
+    shard.read_retry_at_ms = 0;
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expectEqual(@as(usize, 2), CountingBlock.calls);
+}
+
+test "shard: a disk-failing read damages only after the disk's own grace, restarting the clock at the class change, and clears the block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const fix = try blockedReadFixture(&tmp, pipe_fds[0]);
+    var shard = fix.shard;
+    defer shard.deinit();
+    const raft = shard.raft_node;
+
+    CountingBlock.calls = 0;
+    CountingBlock.disk_failing = false; // begins as a resource shortage
+    raft.log.catch_up = .{ .ctx = fix.real.ctx, .read_range = CountingBlock.read };
+    try std.testing.expect(!shard.applyCommitted());
+    // A resource shortage sets no disk deadline, however long it lasts.
+    try std.testing.expect(shard.read_blocked and !shard.read_block_disk_failing);
+    try std.testing.expect(shard.read_block_disk_deadline_ms == null);
+
+    // The cause now turns disk-class. The deadline is set here — a full grace
+    // ahead of now — so the earlier resource wait does not count toward it, and
+    // nothing is damaged yet. (An absolute deadline, so no uptime subtraction
+    // that would underflow on a fresh host — the flo#302 trap.)
+    CountingBlock.disk_failing = true;
+    shard.read_retry_at_ms = 0;
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expect(shard.offline == null and !shard.replica.diverged);
+    try std.testing.expect(shard.read_block_disk_failing);
+    try std.testing.expect(shard.read_block_disk_deadline_ms.? > Shard.nowMs());
+    try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.unreadable_committed));
+
+    // Bring the deadline into the past: the next disk-class read is damage.
+    shard.read_block_disk_deadline_ms = 1;
+    shard.read_retry_at_ms = 0;
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expect(shard.offline != null or shard.replica.diverged);
+    try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.unreadable_committed));
+    // The block is cleared, so its gauge does not stick and `/status` shows the
+    // damage, not a stale block.
+    try std.testing.expect(!shard.read_blocked);
+    try std.testing.expect(shard.healthState() != .read_blocked);
+}
+
+test "shard: a node still catching up that also blocks a read shows catching_up, not read_blocked" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const fix = try blockedReadFixture(&tmp, pipe_fds[0]);
+    var shard = fix.shard;
+    defer shard.deinit();
+
+    // Still catching up (a cold async boot) and a committed read is blocked.
+    shard.cold_gate = true;
+    shard.read_blocked = true;
+    // catching_up is checked first, so the node stays 503 rather than flipping
+    // to read_blocked and answering 200 while it refuses reads.
+    try std.testing.expectEqual(health_mod.ShardState.catching_up, shard.healthState());
+    // Once caught up, the block is the state.
+    shard.cold_gate = false;
+    try std.testing.expectEqual(health_mod.ShardState.read_blocked, shard.healthState());
+}
+
+test "shard: a repair skip whose named entry can't be read holds its check, then damages on recovery, never dropping it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const raft = shard.raft_node;
+
+    // An entry this node applies, then pushed below the ring by larger ones
+    // that also apply. A repair later skips it: this node holds what the group
+    // dropped, so its check must damage — and must not be lost to a blocked read.
+    const x = (try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x")).index;
+    const big = try std.testing.allocator.alloc(u8, 32 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0);
+    for (0..100) |_| _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, big);
+    try shard.flushSegmentToDisk();
+    try std.testing.expect(shard.applyCommitted());
+    try std.testing.expectEqual(raft.commit_index, raft.last_applied);
+    var scratch: [1024 * 1024]u8 = undefined;
+    try std.testing.expect(raft.log.ual.readCopy(x, &scratch) == null); // below the ring now
+    const skip_idx = try proposeSkip(&shard, x);
+
+    // Reads below the ring block: applying the skip reads the named entry and
+    // can't decide. The check is held, not dropped — not damaged, not advanced.
+    const real = raft.log.catch_up.?;
+    raft.log.catch_up = .{ .ctx = real.ctx, .read_range = BlockedCatchUp.blocked };
+    for (0..3) |_| {
+        _ = shard.applyCommitted();
+        shard.read_retry_at_ms = 0;
+    }
+    try std.testing.expectEqual(skip_idx, shard.skip_check_pending);
+    try std.testing.expect(shard.read_blocked);
+    try std.testing.expect(shard.offline == null and !shard.replica.diverged);
+    try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.applied_skipped));
+
+    // The read recovers: the held check runs and finds this node applied what
+    // the repair skips — damage, not silence.
+    raft.log.catch_up = real;
+    shard.read_retry_at_ms = 0;
+    _ = shard.applyCommitted();
+    try std.testing.expectEqual(@as(u64, 0), shard.skip_check_pending);
+    try std.testing.expectEqual(@as(u64, 1), shard.losses.total(.applied_skipped));
+    try std.testing.expect(shard.offline != null or shard.replica.diverged);
+}
+
+test "shard: publishHealth sets the read-blocked gauge while blocked, and clears it on recovery" {
+    var registry = @import("../metrics/registry.zig").MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    const sm = registry.shardMetrics(0).?;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const fix = try blockedReadFixture(&tmp, pipe_fds[0]);
+    var shard = fix.shard;
+    defer shard.deinit();
+    shard.shard_metrics = sm;
+    const raft = shard.raft_node;
+
+    CountingBlock.calls = 0;
+    CountingBlock.disk_failing = false;
+    raft.log.catch_up = .{ .ctx = fix.real.ctx, .read_range = CountingBlock.read };
+    try std.testing.expect(!shard.applyCommitted());
+    try std.testing.expect(shard.read_blocked);
+    shard.publishHealth();
+    try std.testing.expectEqual(@as(u8, 1), sm.read_blocked.load(.monotonic));
+
+    // Recovers: the gauge drops back.
+    raft.log.catch_up = fix.real;
+    var rounds: usize = 0;
+    while (raft.last_applied < raft.commit_index and rounds < 1000) : (rounds += 1) {
+        shard.read_retry_at_ms = 0;
+        _ = shard.applyCommitted();
+    }
+    try std.testing.expect(!shard.read_blocked);
+    shard.publishHealth();
+    try std.testing.expectEqual(@as(u8, 0), sm.read_blocked.load(.monotonic));
+}
+
+test "shard: a committed entry that cannot be read is held unapplied, applies on recovery, and a write for it parks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    // Enough large entries that the first falls below the ring.
+    const big = try std.testing.allocator.alloc(u8, 32 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0);
+    const raft = shard.raft_node;
+    const first = raft.log.lastIndex() + 1;
+    for (0..100) |_| _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, big);
+    try shard.flushSegmentToDisk();
+    const scratch = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(scratch);
+    try std.testing.expect(raft.log.ual.readCopy(first, scratch) == null);
+
+    // Every below-ring read now blocks.
+    const real = raft.log.catch_up.?;
+    raft.log.catch_up = .{ .ctx = real.ctx, .read_range = BlockedCatchUp.blocked };
+    const before = raft.last_applied;
+    for (0..3) |_| try std.testing.expect(!shard.applyCommitted());
+    // Held, not advanced, not damaged, not spinning, and visible.
+    try std.testing.expectEqual(before, raft.last_applied);
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expect(!shard.apply_behind);
+    try std.testing.expect(shard.read_blocked);
+    try std.testing.expectEqual(health_mod.ShardState.read_blocked, shard.healthState());
+    try std.testing.expectEqual(@as(u64, 0), shard.losses.total(.unreadable_committed));
+
+    // A write whose entry is held parks rather than being refused.
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    try ParkTest.send(&shard, conn, .kv_put, 7, "k", "v");
+    var none: [0]proto.Response = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], scratch, &none);
+    try std.testing.expect(conn.response_deferred);
+
+    // The read recovers; everything applies in order and the parked write is
+    // answered. (Clear the retry back-off so the test need not wait it out.)
+    raft.log.catch_up = real;
+    shard.read_retry_at_ms = 0;
+    var rounds: usize = 0;
+    while (raft.last_applied < raft.commit_index and rounds < 1000) : (rounds += 1) {
+        shard.read_retry_at_ms = 0;
+        _ = shard.applyCommitted();
+    }
+    try std.testing.expectEqual(raft.commit_index, raft.last_applied);
+    try std.testing.expect(!shard.read_blocked);
+    try std.testing.expect(shard.offline == null);
+    try std.testing.expect(shard.halted == null);
+    var one: [1]proto.Response = undefined;
+    var rbuf: [1024]u8 = undefined;
+    try ParkTest.responses(&shard, conn, pair[1], &rbuf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
 }

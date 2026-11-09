@@ -45,6 +45,13 @@ pub const ShardState = enum(u8) {
     guarded,
     /// An entry never reached disk, so writes have stopped.
     cannot_flush,
+    /// A committed entry cannot be read to apply it (the host's disk read is
+    /// blocked): it serves reads marked stale and the leader steps down so
+    /// writes move. In a cluster another node can serve, so it is not ready; on
+    /// a lone node a 503 would pull the only copy, so `readiness` keeps it ready
+    /// (the offline-versus-diverged split). The block shows in `/status` and
+    /// `flo_shard_read_blocked`.
+    read_blocked,
     /// Its copy can no longer be trusted; it takes no part until rejoined.
     diverged,
     /// The group removed this node.
@@ -134,9 +141,25 @@ pub const ShardSlot = struct {
     halt_index: Atomic(u64) = .init(0),
     halt_term: Atomic(u64) = .init(0),
     halt_crc: Atomic(u32) = .init(0),
+    /// This node's uptime, in ms, when a committed read first blocked:
+    /// written before the state reads `read_blocked`, so `/status` can say
+    /// how long it has been stuck. The reason buffer holds what blocked it.
+    read_blocked_since_ms: Atomic(u64) = .init(0),
+    /// Set with a `read_blocked` state on a lone shard, whose only copy this is:
+    /// `readiness` keeps the node ready then, since a 503 would pull it and no
+    /// other node could serve. In a cluster it is false and `read_blocked` is a
+    /// 503, like `offline` versus `diverged`.
+    read_blocked_serves: Atomic(bool) = .init(false),
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
+    }
+
+    /// Whether this shard lets the node answer `/ready`: its state serves, or it
+    /// is a lone blocked shard that must stay ready.
+    pub fn servesReady(self: *const ShardSlot) bool {
+        const state = self.get();
+        return state.serves() or (state == .read_blocked and self.read_blocked_serves.load(.acquire));
     }
 
     pub fn set(self: *ShardSlot, state: ShardState) void {
@@ -198,12 +221,16 @@ pub const NodeHealth = struct {
     }
 
     pub fn readiness(self: *const NodeHealth) Readiness {
-        var worst: ShardState = .ok;
+        // The worst shard that does not let the node answer: a lone blocked
+        // shard still does (`servesReady`), so a 503 never pulls a node whose
+        // only copy of that shard this is.
+        var worst: ?ShardState = null;
         for (self.shards) |*s| {
+            if (s.servesReady()) continue;
             const state = s.get();
-            if (@backingInt(state) > @backingInt(worst)) worst = state;
+            if (worst == null or @backingInt(state) > @backingInt(worst.?)) worst = state;
         }
-        if (!worst.serves()) return .{ .ready = false, .word = @tagName(worst) };
+        if (worst) |w| return .{ .ready = false, .word = @tagName(w) };
         if (!self.accepting.load(.acquire)) return .{ .ready = false, .word = @tagName(ShardState.loading) };
         return .{ .ready = true, .word = "ready" };
     }
@@ -217,11 +244,12 @@ pub const NodeHealth = struct {
             const state = s.get();
             const role: Role = @fromBackingInt(@intCast(s.role.load(.monotonic)));
             try w.print("{{\"id\":{d},\"state\":\"{s}\"", .{ i, @tagName(state) });
-            if (state == .offline or state == .halted or state == .diverged) if (s.reason()) |why| {
+            if (state == .offline or state == .halted or state == .diverged or state == .read_blocked) if (s.reason()) |why| {
                 try w.writeAll(",\"reason\":");
                 try std.json.Stringify.encodeJsonString(why, .{}, w);
             };
             if (state == .halted) try w.print(",\"halt_index\":{d},\"halt_term\":{d},\"halt_crc\":{d}", .{ s.halt_index.load(.monotonic), s.halt_term.load(.monotonic), s.halt_crc.load(.monotonic) });
+            if (state == .read_blocked) try w.print(",\"read_blocked_since_ms\":{d}", .{s.read_blocked_since_ms.load(.monotonic)});
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
@@ -280,6 +308,28 @@ test "health: ready only when every shard serves and the client listener is up" 
     // A lone node's offline shard leaves it ready.
     h.shards[1].set(.offline);
     try testing.expect(h.readiness().ready);
+}
+
+test "health: a lone blocked shard keeps the node ready; a cluster one is a 503" {
+    var h = try NodeHealth.init(testing.allocator, 1, 2);
+    defer h.deinit(testing.allocator);
+    h.accepting.store(true, .release);
+    for (h.shards) |*s| s.set(.ok);
+
+    // A blocked shard whose only copy this is (lone) keeps the node ready — a
+    // 503 would pull it and nothing else could serve its data.
+    h.shards[0].read_blocked_serves.store(true, .release);
+    h.shards[0].set(.read_blocked);
+    try testing.expect(h.readiness().ready);
+
+    // In a cluster another node can serve, so the blocked shard is a 503.
+    h.shards[0].read_blocked_serves.store(false, .release);
+    try testing.expectEqualDeep(Readiness{ .ready = false, .word = "read_blocked" }, h.readiness());
+
+    // A genuinely non-serving shard still 503s even next to a lone blocked one.
+    h.shards[0].read_blocked_serves.store(true, .release);
+    h.shards[1].set(.cannot_flush);
+    try testing.expectEqualStrings("cannot_flush", h.readiness().word);
 }
 
 test "health: of several states, /ready names the one that needs someone first" {
