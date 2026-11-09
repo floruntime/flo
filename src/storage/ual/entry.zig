@@ -109,6 +109,9 @@ pub const EntryType = enum(u8) {
     workflow_complete = 0x52,
     /// A workflow disabled or enabled: `[enabled:u8]` for "namespace:name".
     workflow_enabled = 0x53,
+    /// A run's first step is taken: once, by the leader whose entry this is.
+    /// Key "namespace:run", no value.
+    workflow_step_started = 0x54,
 
     // ── Namespace ──
     namespace_create = 0x60,
@@ -144,7 +147,7 @@ pub const EntryType = enum(u8) {
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
             .cg_commit, .cg_create, .cg_delete => true,
-            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled => true,
+            .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
         };

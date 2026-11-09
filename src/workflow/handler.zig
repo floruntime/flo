@@ -81,12 +81,19 @@ pub const WorkflowHandler = struct {
     /// Mutex for cross-shard thread safety. Acquired when this handler is
     /// accessed from a different shard's thread via forwardToShard dispatch.
     mu: @import("stdx").Mutex,
-    /// Runs whose start this leader applied, in log order, for the tick to
-    /// take their first step (`advanceStartedRuns`).
-    /// No start takes its first step where it is proposed or answered: a
-    /// step proposes, and the shard applies nothing in the middle of a
-    /// module's work.
+    /// Runs whose step_started this leader applied in its term, in log
+    /// order, for the tick to take their first step (`advanceStartedRuns`).
+    /// No run takes its first step where its entry applies: a step
+    /// proposes, and the shard applies nothing in the middle of a module's
+    /// work.
     started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
+    /// Runs started and not yet stepped, by their keys in `runs`: kept by
+    /// the appliers on every replica, so whichever node leads steps them.
+    to_step: std.StringHashMapUnmanaged(void) = .empty,
+    /// Runs this leader has proposed a step_started for in `stepping_term`,
+    /// not yet applied. Leader memory: a new term starts it empty.
+    stepping: std.StringHashMapUnmanaged(void) = .empty,
+    stepping_term: u64 = 0,
     /// Runs parked on an action or a child, by their keys in `runs`: what
     /// the duty looks at, so its cost follows the work in flight and not
     /// every run ever started. Leader memory, like a step's state.
@@ -379,6 +386,8 @@ pub const WorkflowHandler = struct {
         for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.deinit(self.allocator);
         self.parked.deinit(self.allocator);
+        self.to_step.deinit(self.allocator);
+        self.stepping.deinit(self.allocator);
         self.timers.deinit(self.allocator);
         var ak = self.active_runs.keyIterator();
         while (ak.next()) |k| self.allocator.free(k.*);
@@ -565,17 +574,23 @@ pub const WorkflowHandler = struct {
     /// stepped it already, so it stays at its start (`dropStartedRuns`).
     pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
         if (entry.header.entry_type == @backingInt(entry_mod.EntryType.workflow_complete)) return self.cancelApplied(shard, entry);
-        if (entry.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start)) return;
-        if (result.refused() != null or shard.raft_node.role != .leader) return;
-        if (entry.header.term != shard.raft_node.current_term) return;
-        var r = result.reader();
-        if ((r.int(u8) orelse 0) != 1) return;
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+        if (etype != .workflow_start and etype != .workflow_step_started) return;
+        if (shard.raft_node.role != .leader or entry.header.term != shard.raft_node.current_term) return;
         // The run's key is the entry's: "namespace:run_id".
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-        if (shard.metrics_registry) |m| m.workflow.recordStarted();
         self.mu.lock();
         defer self.mu.unlock();
-        self.queueFirstStep(cmd.key, result.index);
+        if (etype == .workflow_start) {
+            if (result.refused() != null) return;
+            var r = result.reader();
+            if ((r.int(u8) orelse 0) == 1) if (shard.metrics_registry) |m| m.workflow.recordStarted();
+            return;
+        }
+        // Of this leader's term, so this leader proposed it.
+        _ = self.stepping.remove(cmd.key);
+        // Refused: another entry took its first step already.
+        if (result.refused() == null) self.queueFirstStep(cmd.key, result.index);
     }
 
     /// A completion applied: if it was the cancel this leader proposed last
@@ -906,16 +921,21 @@ pub const WorkflowHandler = struct {
 
     /// Whether the stepping duty has anything to do.
     pub fn hasDutyWork(self: *const WorkflowHandler) bool {
-        return self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
+        return self.to_step.count() > 0 or self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
     }
 
-    /// Take the first step of each queued run whose start has applied, in
-    /// queue order; one not applied yet waits for a later tick, one the log
-    /// dropped is forgotten. Leader only: a step proposes.
+    /// Most step_started entries one tick proposes.
+    const STEPS_PER_TICK: usize = 64;
+
+    /// Take the first step of each queued run whose step_started has
+    /// applied, in queue order; one not applied yet waits for a later tick,
+    /// one the log dropped is forgotten. Then propose a step_started for
+    /// runs started and not yet stepped. Leader only: a step proposes.
     pub fn advanceStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         if (shard.raft_node.role != .leader) return;
         self.mu.lock();
         defer self.mu.unlock();
+        self.proposeFirstSteps(shard);
         var keep: usize = 0;
         var i: usize = 0;
         // A step can start a child run here, which joins the queue behind
@@ -939,24 +959,41 @@ pub const WorkflowHandler = struct {
         self.started_to_advance.shrinkRetainingCapacity(keep);
     }
 
-    /// This node stopped leading: the runs it had not taken a first step
-    /// for stay at their start. Logs how many had applied (they exist and
-    /// stay `running`) and how many had not (the log may drop them).
+    /// A step_started for each run started and not yet stepped, up to
+    /// `STEPS_PER_TICK`, once per term. The caller holds `mu`.
+    fn proposeFirstSteps(self: *WorkflowHandler, shard: *Shard) void {
+        const term = shard.raft_node.current_term;
+        if (self.stepping_term != term) {
+            self.stepping.clearRetainingCapacity();
+            self.stepping_term = term;
+        }
+        var proposed: usize = 0;
+        var it = self.to_step.keyIterator();
+        while (it.next()) |k| {
+            if (proposed == STEPS_PER_TICK) break;
+            const ns_key = k.*;
+            if (self.stepping.contains(ns_key)) continue;
+            if (self.runs.getPtr(ns_key)) |run| if (cancelInFlight(shard, run)) continue;
+            const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
+            _ = persistence_mod.proposeEntry(shard, .workflow_step_started, entry_mod.Flags.NONE, ns_key[0..ns_end], ns_key, "") catch |err| {
+                if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {s}: first step not logged: {s}; tried again next tick", .{ shard.id, ns_key, @errorName(err) });
+                break;
+            };
+            self.stepping.put(self.allocator, ns_key, {}) catch break;
+            proposed += 1;
+        }
+    }
+
+    /// This node stopped leading. A run whose first step was logged but not
+    /// taken stays at its start: the next leader won't step it again. One
+    /// whose step_started wasn't logged is the next leader's to step.
     pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var applied: usize = 0;
-        for (self.started_to_advance.items) |s| {
-            if (s.index <= shard.raft_node.last_applied) {
-                // A few by name, for an operator to look up; the rest counted.
-                if (applied < 3) log.warn("shard {d}: workflow run {s} started but had not taken its first step; it stays at its start", .{ shard.id, s.ns_key });
-                applied += 1;
-            }
-            self.allocator.free(s.ns_key);
-        }
-        const unapplied = self.started_to_advance.items.len - applied;
-        if (applied + unapplied > 0) log.warn("shard {d}: stopped leading with {d} started workflow runs that had not taken their first step, and {d} starts not yet applied", .{ shard.id, applied, unapplied });
+        if (self.started_to_advance.items.len > 0) log.warn("shard {d}: stopped leading with {d} workflow runs whose first step was logged and not taken; they stay at their start", .{ shard.id, self.started_to_advance.items.len });
+        for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.clearRetainingCapacity();
+        self.stepping.clearRetainingCapacity();
     }
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
@@ -1454,6 +1491,14 @@ pub const WorkflowHandler = struct {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureCode(err).toStatus(), proto.notRun(persistence_mod.failureMessage(err, "not persisted")));
             return null;
         };
+    }
+
+    /// Apply a workflow_step_started entry: the run's first step is now
+    /// its leader's to take, once. A run already stepped, finished or
+    /// unknown is refused, and changes nothing.
+    fn replayStepStarted(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
+        if (value.len != 0) return error.Halt;
+        if (!self.to_step.remove(ns_key)) return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
     }
 
     /// Apply a workflow_enabled entry. The definition may have gone since it
@@ -3779,6 +3824,7 @@ pub const WorkflowHandler = struct {
         const built = try self.buildComplete(&entry);
 
         if (!run.status.isTerminal()) self.noteRunFinished(run);
+        _ = self.to_step.remove(run.ns_key);
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
         run.status = entry.status;
@@ -3808,6 +3854,7 @@ pub const WorkflowHandler = struct {
         registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_enabled, @ptrCast(self), replayEntryThunk);
+        registry.register(.workflow_step_started, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
@@ -3830,6 +3877,7 @@ pub const WorkflowHandler = struct {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, out),
+            .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             else => error.Halt,
         };
@@ -4021,12 +4069,18 @@ pub const WorkflowHandler = struct {
             self.allocator.free(ns_key);
             return error.OutOfMemory;
         };
+        self.to_step.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.freeRunRecord(&run);
+            self.allocator.free(ns_key);
+            return error.OutOfMemory;
+        };
         self.runs.put(ns_key, run) catch {
             self.freeRunRecord(&run);
             self.allocator.free(ns_key);
             return error.OutOfMemory;
         };
         active.* += 1;
+        if (status == .running) self.to_step.putAssumeCapacity(ns_key, {});
         out.putInt(u8, 1);
         out.putBytes(raw_run_id);
         if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
@@ -4575,7 +4629,7 @@ fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8
     };
 }
 
-test "a producer's start joins the first-step queue when it applies, then takes its step; one whose index applied without creating a run is dropped" {
+test "a producer's start leaves its run to step, its logged first step joins the queue, then it takes its step; one whose index applied without creating a run is dropped" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -4596,8 +4650,13 @@ test "a producer's start joins the first-step queue when it applies, then takes 
     try testing.expectEqual(@as(usize, 0), handler.started_to_advance.items.len);
     try testing.expect(handler.runs.get("default:run-p") == null);
 
-    // Applied on the leader: the run it created waits for its first step.
+    // Applied: the run it created is one to step.
     _ = shard.applyCommitted();
+    try testing.expect(handler.to_step.contains("default:run-p"));
+    // Its first step logged and applied on the leader: queued.
+    handler.advanceStartedRuns(&shard);
+    _ = shard.applyCommitted();
+    try testing.expect(!handler.to_step.contains("default:run-p"));
     try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
     // A start whose index applied without creating a run (dropped with the
     // log's tail) is dropped from the queue, not kept for ever.
