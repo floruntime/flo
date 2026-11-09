@@ -3574,3 +3574,24 @@ fn streamLeader(c: *stdx.testing.ClusterContext, skip: ?usize) !usize {
     }
     return error.NoLeader;
 }
+
+test "e2e/stream: an alter in a namespace that has no such stream is not found, and halts nothing" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 8 } });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "ns", "create", "realns" });
+    for ([_][]const u8{ "nope", "realns" }) |ns| {
+        for (0..7) |i| {
+            var name_buf: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+            var r = try ctx.cli.run(&.{ "stream", "alter", name, "--retention-count", "5", "-n", ns });
+            defer r.deinit();
+            try testing.expect(r.exit_code != 0);
+            try testing.expect(r.stderrContains("not found"));
+        }
+    }
+    // Every shard still takes writes.
+    for (0..16) |i| {
+        var name_buf: [16]u8 = undefined;
+        try ctx.exec(&.{ "stream", "append", try std.fmt.bufPrint(&name_buf, "after{d}", .{i}), "x" });
+    }
+}

@@ -327,12 +327,6 @@ pub const StreamHandler = struct {
         const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
         // A nacked entry is ready for the stream's parked group reads.
         if (op == .stream_group_nack and cmd_result == .ok) shard.waiter_pool.notify(.stream_group_read, req.key, shard_mod.wakeGroupReadWaiter, @ptrCast(shard));
-        if (op == .stream_create) {
-            switch (cmd_result) {
-                .ok => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
-                else => {},
-            }
-        }
 
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
@@ -342,7 +336,7 @@ pub const StreamHandler = struct {
     /// accepted.
     fn parkStream(shard: *Shard, conn: *Connection, req: Request, proposed: persistence_mod.ProposeResult) void {
         const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        if (op == .stream_append) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
+        if (op == .stream_append or op == .stream_create) shard.namespace_handler.markNamespaceHasData(req.namespace, shard);
         shard.park(conn, req, proposed, switch (op) {
             .stream_append => answerAppend,
             .stream_trim => answerTrim,
@@ -967,6 +961,13 @@ pub const StreamHandler = struct {
     /// them. The applier decides; the client is answered when it applies.
     fn proposeConfig(self: *StreamHandler, req: Request, config: StreamConfig) CommandResult {
         if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return NAME_TOO_LONG;
+        // An alter of a stream this shard has no settings for would be
+        // refused at apply: refused here, without the commit.
+        if (config.op == .alter) {
+            var key_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+            const key = configKey(&key_buf, req.namespace, req.key) orelse return NAME_TOO_LONG;
+            if (!self.stream.stream_metadata.contains(key)) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
+        }
         var value: [StreamConfig.SIZE]u8 = undefined;
         config.encode(&value);
         const sptr = self.shard_ptr orelse {
@@ -985,6 +986,8 @@ pub const StreamHandler = struct {
         };
         return .{ .parked = proposed };
     }
+
+    const NO_STREAM = "stream not found";
 
     /// A stream_config entry's value.
     pub const StreamConfig = struct {
@@ -1040,7 +1043,7 @@ pub const StreamHandler = struct {
                 break :blk wanted;
             },
             .alter => blk: {
-                const e = existing orelse return .{ .refused = .{ .status = .not_found, .message = "stream not found" } };
+                const e = existing orelse return .{ .refused = .{ .status = .not_found, .message = NO_STREAM } };
                 break :blk .{
                     .partition_count = e.partition_count,
                     .name_hash = e.name_hash,
@@ -2000,7 +2003,16 @@ pub const StreamHandler = struct {
                 const ns = (self.stream.resolveNamespace(cmd.namespace_hash) catch {
                     out.refuse(.unavailable, .unclassified, stream_mod.NOT_CREATED_MESSAGE);
                     return;
-                }) orelse return error.Halt;
+                }) orelse {
+                    // A create's namespace is bound before it is proposed
+                    // (the edge's `prepareWrite`), so a create reaching here
+                    // unbound is a Flo bug, and halts. An alter isn't: in a
+                    // namespace this shard never bound, its stream can't
+                    // exist. Every replica binds from the same log, so every
+                    // one refuses it.
+                    if (config.op == .create) return error.Halt;
+                    return out.refuse(.not_found, .not_found, NO_STREAM);
+                };
                 switch (self.applyConfig(ns, cmd.namespace_hash, cmd.key, config)) {
                     .ok => {},
                     .refused => |r| {
@@ -2492,6 +2504,17 @@ test "stream handler: stream_config entries give every replica a stream's settin
     out = try applyLogged(&handler, &again);
     try testing.expectEqual(proto.StatusCode.conflict, out.refused().?.status);
     try testing.expectEqual(@as(u32, 3), handler.stream.stream_metadata.get("r").?.partition_count);
+
+    // An alter merges: what it names changes, the rest stays.
+    (StreamHandler.StreamConfig{ .op = .alter, .partition_count = 0, .retention_age_s = 0, .retention_count = 7 }).encode(&value);
+    var pbuf3: [128]u8 = undefined;
+    const alter = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 3, 0, ns, "r", &value, &pbuf3).?;
+    out = try applyLogged(&handler, &alter);
+    try testing.expect(out.refused() == null);
+    const merged = handler.stream.stream_metadata.get("r").?;
+    try testing.expectEqual(@as(u32, 3), merged.partition_count);
+    try testing.expectEqual(@as(u64, 60), merged.retention_age_s);
+    try testing.expectEqual(@as(u64, 7), merged.retention_count);
 }
 
 test "stream handler: dispatcher registration" {

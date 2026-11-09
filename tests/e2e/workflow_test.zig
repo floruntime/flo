@@ -4032,8 +4032,12 @@ test "e2e/workflow: a disabled workflow stays disabled across a restart: listed 
     try ctx.restartServer();
 
     const list = try ctx.execCapture(&.{ "workflow", "list" });
-    try testing.expect(std.mem.indexOf(u8, list, "paused") != null);
-    try testing.expect(std.mem.indexOf(u8, list, "no") != null);
+    // Its row: name, version, enabled.
+    var rows = std.mem.splitScalar(u8, list, '\n');
+    const row = while (rows.next()) |r| {
+        if (std.mem.startsWith(u8, r, "paused ")) break r;
+    } else return error.NotListed;
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, row, " "), "no"));
     var start = try ctx.cli.run(&.{ "workflow", "start", "paused", "{}" });
     defer start.deinit();
     try testing.expect(start.stderrContains("workflow is disabled"));
