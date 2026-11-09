@@ -139,7 +139,14 @@ fn writeSeries(ctx: *stdx.testing.TestContext) !void {
             try ctx.exec(&.{ "ts", "write", "same", "--tags", host, "--value", "1", "--timestamp", try std.fmt.bufPrint(&ts, "{d}", .{1000 + k}), "-n", ns });
         }
         try ctx.exec(&.{ "ts", "write", try std.fmt.bufPrint(&only, "only_{s}", .{ns}), "--value", "1", "--timestamp", "1000", "-n", ns });
+        // The same measurement and tag set in both: each namespace's tag
+        // dictionary resolves it apart, so a delete by tag in the first
+        // leaves the second's.
+        for (1..count(i) + 1) |k| {
+            try ctx.exec(&.{ "ts", "write", "shared", "--tags", "site=x", "--value", "1", "--timestamp", try std.fmt.bufPrint(&ts, "{d}", .{1000 + k}), "-n", ns });
+        }
     }
+    try ctx.exec(&.{ "ts", "delete", "shared", "--tags", "site=x", "--confirm", "-n", NAMESPACES[0] });
 }
 
 fn verifySeries(ctx: *stdx.testing.TestContext, _: bool) !void {
@@ -155,17 +162,32 @@ fn verifySeries(ctx: *stdx.testing.TestContext, _: bool) !void {
         defer testing.allocator.free(tagged);
         try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "0 {d}.000000", .{count(i)}), tagged);
 
-        // A listing: this namespace's two measurements, and no other's.
+        // A listing: this namespace's measurements, and no other's; the
+        // first namespace's "shared" is deleted, the second's is not.
         const listed = try run(ctx, &.{ "ts", "list", "-o", "json", "-n", ns }, 0);
         defer testing.allocator.free(listed);
         const names = try parse([]const []const u8, listed);
         defer names.deinit();
         const mine = try std.fmt.bufPrint(&only, "only_{s}", .{ns});
-        try testing.expectEqual(2, names.value.len);
-        const sorted = std.mem.lessThan(u8, names.value[0], names.value[1]);
-        try testing.expectEqualStrings(mine, names.value[if (sorted) 0 else 1]);
-        try testing.expectEqualStrings("same", names.value[if (sorted) 1 else 0]);
+        var want_names: [3][]const u8 = .{ mine, "same", "shared" };
+        const n_want: usize = if (i == 0) 2 else 3;
+        var got: [3][]const u8 = undefined;
+        try testing.expectEqual(n_want, names.value.len);
+        @memcpy(got[0..n_want], names.value);
+        std.mem.sort([]const u8, got[0..n_want], {}, lessThanStr);
+        std.mem.sort([]const u8, want_names[0..n_want], {}, lessThanStr);
+        for (want_names[0..n_want], got[0..n_want]) |w, g| try testing.expectEqualStrings(w, g);
+
+        if (i == 1) {
+            const shared = try run(ctx, &.{ "ts", "query", "shared", "--tags", "site=x", "--from", "1", "--to", "100000", "--window", "1h", "--agg", "count", "-o", "raw", "-n", ns }, 0);
+            defer testing.allocator.free(shared);
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "0 {d}.000000", .{count(i)}), shared);
+        }
     }
+}
+
+fn lessThanStr(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.lessThan(u8, x, y);
 }
 
 test "e2e/namespace/isolation: the pair the tests use once collided on the 32-bit hash" {

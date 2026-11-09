@@ -1647,8 +1647,9 @@ pub const ProcessingHandler = struct {
         // Tags are part of the series key now, so a configured tag set selects
         // the series directly instead of being scanned for after the fact (which
         // also wasted the point budget on non-matching points).
+        const src_ns = shard.namespaceId(pipe.src_namespace);
         const result = shard.ts_handler.ts.queryRange(
-            shard.namespaceId(pipe.src_namespace),
+            src_ns,
             pipe.src_measurement,
             pipe.src_field,
             if (pipe.src_tag_hash != 0) pipe.src_tag_hash else null,
@@ -1678,11 +1679,11 @@ pub const ProcessingHandler = struct {
             if (output_records) |records| {
                 defer if (records.len > 0) shard.allocator.free(records);
                 for (records) |rec| {
-                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), rec.tags);
+                    self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), rec.tags);
                 }
             } else {
                 // No operators — direct passthrough
-                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(pt.tag_hash), 0);
+                self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), 0);
             }
 
             // Advance cursor past this point
