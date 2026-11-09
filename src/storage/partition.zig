@@ -374,7 +374,7 @@ test "partition: apply and read entries" {
 
     // Apply a KV put
     var payload_buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
+    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
     const idx1 = try part.apply(&e1);
     try testing.expectEqual(@as(u64, 1), idx1);
 
@@ -403,7 +403,7 @@ test "partition: queue projection wired through router" {
 
     // Enqueue via UAL entry
     var buf1: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q1", "msg", &buf1) orelse unreachable;
+    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, .default, "q1", "msg", &buf1) orelse unreachable;
     _ = try part.apply(&e1);
 
     try testing.expectEqual(@as(u64, 1), part.queue.stats.enqueued);

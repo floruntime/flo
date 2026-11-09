@@ -18,6 +18,7 @@ pub const protocol = struct {
     pub const kv_entries = @import("protocol/kv_entries.zig");
     pub const action_entries = @import("protocol/action_entries.zig");
     pub const schema = @import("protocol/schema.zig");
+    pub const limits = @import("protocol/limits.zig");
     pub const request_builder = @import("protocol/request_builder.zig");
     pub const result = @import("protocol/result.zig");
 };

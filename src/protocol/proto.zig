@@ -1,4 +1,5 @@
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const reason_mod = @import("reason.zig");
@@ -656,6 +657,10 @@ pub const Request = struct {
     key: []const u8,
     value: []const u8,
     options: []const u8 = "", // TLV-encoded options blob
+    /// The namespace's id, as the node's table has it: resolved from
+    /// `namespace` where the request enters a shard, never sent or read on
+    /// the wire. `.invalid` for a name the table doesn't have.
+    ns_id: NamespaceId = .invalid,
 
     /// Parse request from wire format
     pub fn parse(data: []const u8) !Request {

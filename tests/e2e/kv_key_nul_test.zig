@@ -1,6 +1,8 @@
-//! A KV key is stored bare in "default", so one holding a NUL could name
-//! another namespace's "ns\x00key". Such keys are refused by client requests
-//! and pipeline KV sinks, and a kv_lookup built from one finds nothing.
+//! A KV key holding a NUL is refused by client requests and pipeline KV
+//! sinks, and a kv_lookup built from one finds nothing. A stored key leads
+//! with its namespace's fixed-width id, so a NUL could name no other
+//! namespace's key; the refusal stands because the CLI and SDKs have always
+//! refused such a key, so no client holds one to read back.
 
 const std = @import("std");
 const testing = std.testing;

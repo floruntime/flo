@@ -20,8 +20,8 @@
 //!
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const entry_mod = @import("ual/entry.zig");
-const router = @import("../node/router.zig");
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
 const ns_keys = @import("../namespace/handler.zig");
@@ -230,7 +230,7 @@ pub const ReplayRegistry = struct {
 pub const ProposeResult = @import("../raft/types.zig").ProposeResult;
 
 /// Propose a key-value command through Raft: a CommandPayload
-/// (namespace_hash + key + value) in the log, not yet committed or
+/// (namespace_id + key + value) in the log, not yet committed or
 /// applied. The caller parks on the result or, for a producer that does
 /// not read the outcome, moves on. The leader stamps the entry; the
 /// result carries the stamp for a responder that answers from it.
@@ -245,13 +245,38 @@ pub fn proposeEntry(
     value: []const u8,
 ) !ProposeResult {
     if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
-    const ns_hash = router.namespaceHash(namespace);
+    // A write runs once its namespace is known here (`prepareWrite`):
+    // published, or, on shard 0, proposed ahead of it.
+    // This resolves the name a second time, after the edge resolved it
+    // into the request's id. Both reads agree because the table and the
+    // shard's maps only grow, and nothing deletes a namespace. (A leader's
+    // pending creates are dropped only when it stops leading, and then it
+    // proposes nothing.) The one way a name gets a second id is a shard 0
+    // that lost a create's tail and created the name again; a shard that
+    // still binds the old id refuses the namespace before any write
+    // (`Shard.boundElsewhere`). A namespace delete would have to stamp from
+    // the request's id instead.
+    const ns_id = shard.namespaceId(namespace);
+    return proposeEntryIn(shard, entry_type, flags, ns_id, key, value);
+}
+
+/// `proposeEntry` for a caller that holds the namespace's id.
+pub fn proposeEntryIn(
+    shard: anytype,
+    entry_type: EntryType,
+    flags: u16,
+    ns_id: NamespaceId,
+    key: []const u8,
+    value: []const u8,
+) !ProposeResult {
+    if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
+    if (ns_id == .invalid) return error.NamespaceUnknown;
 
     // The shard's own buffer: one on the stack is filled on every call in
     // a safe build.
     const payload_buf = shard.entry_buf;
     const cmd = CommandPayload{
-        .namespace_hash = ns_hash,
+        .namespace_id = ns_id,
         .key_length = @intCast(key.len),
         .value_length = @intCast(value.len),
         .key = key,
@@ -272,7 +297,7 @@ pub fn failureStatus(err: anyerror) proto.StatusCode {
 /// The same, for handlers that answer with a `CommandResult`.
 pub fn failureCode(err: anyerror) result_mod.CommandResult.ErrorCode {
     return switch (err) {
-        error.NotLeader, error.WritesStopped, error.Halted => .unavailable,
+        error.NotLeader, error.WritesStopped, error.Halted, error.NamespaceUnknown => .unavailable,
         error.Overloaded => .overloaded,
         error.PayloadTooLarge, error.KeyTooLarge => .invalid_request,
         else => .internal_error,
@@ -305,6 +330,7 @@ pub fn failureMessage(err: anyerror, fallback: []const u8) []const u8 {
         error.Halted => "unavailable: this shard is halted at an entry every replica fails; this write was not run. Restarting won't help — the node's /status says where it halted",
         error.Overloaded => "overloaded: too many writes waiting for commit — back off and retry",
         error.PayloadTooLarge => "bad request: too large to write — a stream append, queue message or run input takes at most 64 KiB",
+        error.NamespaceUnknown => "unavailable: the namespace isn't created on this node yet; the write was not run — retry",
         error.KeyTooLarge => std.fmt.comptimePrint("bad request: key or name too long — at most {d} bytes, namespace included", .{MAX_ENTRY_KEY}),
         else => fallback,
     };
@@ -329,7 +355,14 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
         }
     };
     var entry_buf: [MAX_PERSIST_PAYLOAD]u8 = undefined;
-    const shard = struct { raft_node: FakeRaft, entry_buf: []u8 }{ .raft_node = .{}, .entry_buf = &entry_buf };
+    const FakeShard = struct {
+        raft_node: FakeRaft,
+        entry_buf: []u8,
+        pub fn namespaceId(_: *const @This(), _: []const u8) NamespaceId {
+            return .default;
+        }
+    };
+    const shard: FakeShard = .{ .raft_node = .{}, .entry_buf = &entry_buf };
     const long = @as([(MAX_ENTRY_KEY + 1)]u8, @splat('k'));
     try std.testing.expectError(error.KeyTooLarge, proposeEntry(&shard, .stream_append, 0, "", &long, "v"));
     try std.testing.expectError(error.NotLeader, proposeEntry(&shard, .stream_append, 0, "", long[0..MAX_ENTRY_KEY], "v"));
@@ -337,7 +370,7 @@ test "persistence: a key over MAX_ENTRY_KEY is refused before it is proposed" {
 }
 
 test "persistence: a write that couldn't be proposed never ran, whatever stopped it" {
-    inline for (.{ error.NotLeader, error.WritesStopped, error.Overloaded, error.PayloadTooLarge, error.KeyTooLarge, error.IndexGap }) |err| {
+    inline for (.{ error.NotLeader, error.WritesStopped, error.NamespaceUnknown, error.Overloaded, error.PayloadTooLarge, error.KeyTooLarge, error.IndexGap }) |err| {
         try std.testing.expectEqual(proto.Ran.no, failureRefusal(err, "x").ran);
         try std.testing.expectEqual(proto.Ran.no, failureError(err, "x").refusal().ran);
     }

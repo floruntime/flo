@@ -349,7 +349,7 @@ fn expectMetric(ctx: *stdx.testing.TestContext, line: []const u8) !void {
 /// Which shard the server routes `key` to in "default" on `shards` shards.
 fn shardOf(shards: u16, key: []const u8) u16 {
     const r = src.node.router.Router.init(0, shards, 0);
-    return switch (r.route(src.node.router.hashKeyWithNamespace("default", key))) {
+    return switch (r.route(src.node.router.routeNsKey(.default, key))) {
         .local => 0,
         .shard => |t| t.shard_id,
     };
@@ -431,8 +431,14 @@ test "e2e/halt: a pipeline whose KV sink can reach a halted shard reads nothing 
         .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
     });
     defer ctx.deinit();
-    const halted = shardOf(2, HALT_KEY);
-    const serving: u16 = 1 - halted;
+    // Every submit runs its job on shard 0, so the halt goes to the other
+    // shard: a key that ends in the fault's and routes there.
+    const serving: u16 = 0;
+    var halt_buf: [64]u8 = undefined;
+    const halt_key = for (0..256) |i| {
+        const k = try std.fmt.bufPrint(&halt_buf, "{d}-{s}", .{ i, HALT_KEY });
+        if (shardOf(2, k) == 1) break k;
+    } else return error.NoName;
     // The source stream, and the keys its records write, on the shard that
     // keeps serving.
     var name_buf: [32]u8 = undefined;
@@ -478,7 +484,7 @@ test "e2e/halt: a pipeline whose KV sink can reach a halted shard reads nothing 
     try testing.expect(try kvWait(ctx, try std.fmt.bufPrint(&k0, "held:{s}", .{id0}), 6000));
 
     {
-        var r = try ctx.execResult(&.{ "kv", "set", HALT_KEY, "x" });
+        var r = try ctx.execResult(&.{ "kv", "set", halt_key, "x" });
         defer r.deinit();
         try testing.expectEqual(@as(u8, 6), r.exit_code);
     }

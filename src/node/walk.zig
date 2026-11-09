@@ -57,14 +57,14 @@ pub const PageError = error{ NotAWalk, ScanShort, EntryTooLarge };
 /// entries take at most `room` bytes of the client's answer. An item the
 /// list names but holds no entry for is listed with an empty one, so
 /// offsets count it as the scan did.
-pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8, cursor: ?[]const u8, skip: u32, limit: u32, room: u32, buf: []u8) PageError!Response.Value {
+pub fn ownPage(shard: *Shard, op: u16, ns: dispatcher_mod.WalkNamespace, filter: []const u8, cursor: ?[]const u8, skip: u32, limit: u32, room: u32, buf: []u8) PageError!Response.Value {
     if (op >= proto.MAX_OPCODES) return error.NotAWalk;
     const ctx = shard.dispatcher.walk_context[op] orelse return error.NotAWalk;
     const walker = shard.dispatcher.walker(op, @intCast(shard.shardCount())) orelse return error.NotAWalk;
     _ = dispatcher_mod.takeScanShort();
     // A page of nothing resumes where it was asked from, and the walk
     // would ask again forever: a limit of 0 is one.
-    const page = walker.localPage(ctx, namespace, filter, cursor, skip, std.math.clamp(limit, 1, system_ops.MAX_PAGE));
+    const page = walker.localPage(ctx, ns, filter, cursor, skip, std.math.clamp(limit, 1, system_ops.MAX_PAGE));
     if (dispatcher_mod.takeScanShort()) return error.ScanShort;
 
     // A family that writes its own entries writes the page's at once.
@@ -73,7 +73,7 @@ pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8
     var ends: std.ArrayList(u32) = .empty;
     defer ends.deinit(shard.allocator);
     const by_family = shard.dispatcher.walk_entry[op];
-    if (by_family) |write| write(ctx, namespace, page.items, shard.allocator, &written, &ends) catch return error.ScanShort;
+    if (by_family) |write| write(ctx, ns, page.items, shard.allocator, &written, &ends) catch return error.ScanShort;
 
     var entries = Entries.Builder.init(buf);
     var more = page.more;
@@ -86,7 +86,7 @@ pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8
             if (e.len > system_ops.MAX_ENTRY) return error.EntryTooLarge;
             break :blk e;
         } else blk: {
-            try writeEntry(@fromBackingInt(@intCast(op)), ctx, namespace, name, &w);
+            try writeEntry(@fromBackingInt(@intCast(op)), ctx, ns, name, &w);
             break :blk w.buffered();
         };
         // Out of room: the rest is the next page's.
@@ -101,11 +101,12 @@ pub fn ownPage(shard: *Shard, op: u16, namespace: []const u8, filter: []const u8
 
 /// `name`'s entry as `op`'s answer lists it, read from `ctx`, this shard's
 /// own; nothing for a name with no entry.
-fn writeEntry(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) PageError!void {
-    writeEntryTo(op, ctx, namespace, name, w) catch return error.EntryTooLarge;
+fn writeEntry(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, name: []const u8, w: *std.Io.Writer) PageError!void {
+    writeEntryTo(op, ctx, ns, name, w) catch return error.EntryTooLarge;
 }
 
-fn writeEntryTo(op: OpCode, ctx: *anyopaque, namespace: []const u8, name: []const u8, w: *std.Io.Writer) (std.Io.Writer.Error || PageError)!void {
+fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, name: []const u8, w: *std.Io.Writer) (std.Io.Writer.Error || PageError)!void {
+    const namespace = ns.name;
     switch (op) {
         // [name_len:u32][name][partition_count:u32][retention_age_s:u64]
         // [retention_count:u64], from the stream's metadata, keyed by the
@@ -185,7 +186,7 @@ pub fn handlePage(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Reques
     const buf = shard.allocator.alloc(u8, Entries.max_size) catch
         return outOfMemoryFor(shard, conn, req.header.request_id);
     defer shard.allocator.free(buf);
-    const v = ownPage(shard, r.op, req.namespace, req.key, if (r.cursor.len == 0) null else r.cursor, r.skip, r.limit, r.room, buf) catch |err| {
+    const v = ownPage(shard, r.op, .{ .name = req.namespace, .id = req.ns_id }, req.key, if (r.cursor.len == 0) null else r.cursor, r.skip, r.limit, r.room, buf) catch |err| {
         const why = refusal(err);
         return shard.sendRefusal(conn, req.header.request_id, why.status, why.refusal);
     };
@@ -350,7 +351,7 @@ pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, shard_count: 
         if (s == shard.id) {
             const page_buf = shard.allocator.alloc(u8, Entries.max_size) catch return .{ .refused = OUT_OF_MEMORY };
             defer shard.allocator.free(page_buf);
-            const v = ownPage(shard, op, req.namespace, req.key, if (lc.len == 0) null else lc, skip, limit, room, page_buf) catch |err|
+            const v = ownPage(shard, op, .{ .name = req.namespace, .id = req.ns_id }, req.key, if (lc.len == 0) null else lc, skip, limit, room, page_buf) catch |err|
                 return .{ .refused = refusal(err) };
             const size = Response.encodedSize(v) catch return .{ .refused = OUT_OF_MEMORY };
             own = shard.allocator.alloc(u8, size) catch return .{ .refused = OUT_OF_MEMORY };

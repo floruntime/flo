@@ -131,7 +131,7 @@ fn getDef(shard: *Shard, ns: []const u8, name: []const u8) ?machine.Def.Value {
 /// The shard that owns action `name` in `ns`: invokes are routed there, so
 /// its runs are there.
 fn ownerOf(shard: *Shard, ns: []const u8, name: []const u8) u16 {
-    return switch (shard.router.route(router.hashKeyWithNamespace(ns, name))) {
+    return switch (shard.router.route(router.routeNsKey(shard.namespaceId(ns), name))) {
         .local => @intCast(shard.id),
         .shard => |t| t.shard_id,
     };
@@ -311,7 +311,7 @@ pub const ActionsHandler = struct {
 
     fn preRouteByAction(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -427,7 +427,7 @@ pub const ActionsHandler = struct {
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(req.namespace, name), &id_buf);
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(req.ns_id, name), &id_buf);
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns, .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
@@ -491,7 +491,8 @@ pub const ActionsHandler = struct {
 
     /// The action walk's names: one shard's actions in the namespace that
     /// start with `prefix`, the request's key.
-    fn localScanActions(ctx: *anyopaque, namespace: []const u8, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
+    fn localScanActions(ctx: *anyopaque, walk_ns: dispatcher_mod.WalkNamespace, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = walk_ns.name;
         const shard: *Shard = @ptrCast(@alignCast(ctx));
         const ns = homeOf(namespace);
         const name_buf = dispatcher_mod.scanScratch(@intCast(storeOf(shard).family(machine.Defs.ID).count));
@@ -1775,7 +1776,7 @@ pub const ActionsHandler = struct {
         const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
         const ns = homeOf(namespace);
         if (!actionExists(shard, ns, action_name)) return null;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(namespace, action_name), id_buf);
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name), id_buf);
         const index = proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard) orelse return null;
         return .{ .id = run_id, .index = index };
     }

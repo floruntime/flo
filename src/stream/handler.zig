@@ -268,7 +268,7 @@ pub const StreamHandler = struct {
     /// Uses namespace-qualified hash: hash(namespace \0 stream_name)
     fn preRouteByStream(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     // ── Shard Walker: Local Scan ────────────────────────────────────────
@@ -278,11 +278,12 @@ pub const StreamHandler = struct {
     /// Filters by namespace prefix and strips prefix from results.
     pub fn localScanStreams(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const stream: *StreamProjection = @ptrCast(@alignCast(ctx));
         const S = struct {
             threadlocal var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -475,7 +476,7 @@ pub const StreamHandler = struct {
             // entry ready (`wakeGroupReadWaiter`).
             // (A wildcard key is already rejected by handleCommand above, so the
             // key here is always a single concrete stream.)
-            const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+            const name_hash = router.nameHash(req.ns_id, req.key);
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .reply_to = conn.replyTo(),
@@ -665,7 +666,7 @@ pub const StreamHandler = struct {
     /// What a read request covers. `stream_start` is exclusive: a reader
     /// passes back the last id it saw and gets what came after it.
     pub fn readWindow(self: *StreamHandler, req: Request) waiter_pool_mod.StreamWindow {
-        const name_hash = router.nameHash(router.namespaceHash(req.namespace), req.key);
+        const name_hash = router.nameHash(req.ns_id, req.key);
         var window: waiter_pool_mod.StreamWindow = .{
             .name_hash = name_hash,
             .limit = readLimit(req),
@@ -760,7 +761,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const name_hash = router.nameHash(ns_hash, req.key);
 
         if (req.value.len > 0) {
@@ -864,7 +865,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const name_hash = router.nameHash(ns_hash, req.key);
 
         // Whether the stream is empty is decided as the entry applies: here, an
@@ -888,7 +889,7 @@ pub const StreamHandler = struct {
     // ── INFO ────────────────────────────────────────────────────────────
 
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const name_hash = router.nameHash(ns_hash, req.key);
         var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const meta_key = metaKey(&meta_buf, req) orelse return NAME_TOO_LONG;
@@ -972,7 +973,7 @@ pub const StreamHandler = struct {
         config.encode(&value);
         const sptr = self.shard_ptr orelse {
             // Without a shard (unit tests), the applier runs here.
-            return switch (self.applyConfig(req.namespace, router.namespaceHash(req.namespace), req.key, config)) {
+            return switch (self.applyConfig(req.namespace, req.ns_id, req.key, config)) {
                 .ok => .ok,
                 .refused => |r| .{ .err = .{ .code = switch (r.status) {
                     .not_found => .not_found,
@@ -1029,13 +1030,13 @@ pub const StreamHandler = struct {
     /// What a stream_config applies, on every replica alike. A create of a
     /// stream that has settings is answered ok if it asks for the same ones,
     /// as a retry does, and refused if not: changing them is `alter`'s.
-    fn applyConfig(self: *StreamHandler, namespace: []const u8, ns_hash: u32, name: []const u8, c: StreamConfig) ConfigOutcome {
+    fn applyConfig(self: *StreamHandler, namespace: []const u8, ns_id: router.NamespaceId, name: []const u8, c: StreamConfig) ConfigOutcome {
         var key_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
         const key = configKey(&key_buf, namespace, name) orelse return .{ .refused = .{ .status = .bad_request, .message = "stream name too long" } };
         const existing = self.stream.stream_metadata.get(key);
         const meta: stream_mod.StreamMetadata = switch (c.op) {
             .create => blk: {
-                const wanted: stream_mod.StreamMetadata = .{ .partition_count = c.partition_count, .name_hash = router.nameHash(ns_hash, name), .retention_age_s = c.retention_age_s, .retention_count = c.retention_count };
+                const wanted: stream_mod.StreamMetadata = .{ .partition_count = c.partition_count, .name_hash = router.nameHash(ns_id, name), .retention_age_s = c.retention_age_s, .retention_count = c.retention_count };
                 if (existing) |e| {
                     if (e.partition_count == wanted.partition_count and e.retention_age_s == wanted.retention_age_s and e.retention_count == wanted.retention_count) return .ok;
                     return .{ .refused = .{ .status = .conflict, .message = "conflict: the stream exists with other settings; change them with stream alter" } };
@@ -1275,7 +1276,7 @@ pub const StreamHandler = struct {
 
         const capped: usize = readLimit(req);
 
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const name_hash = router.nameHash(ns_hash, req.key);
 
         // Ready pending entries (nacked, or idle past the ack timeout) come
@@ -1558,7 +1559,7 @@ pub const StreamHandler = struct {
         };
 
         // Resolve claimed IDs → full records (payload + headers) in one hop.
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const name_hash = router.nameHash(ns_hash, req.key);
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
@@ -1760,6 +1761,17 @@ pub const StreamHandler = struct {
         return buf;
     }
 
+    /// The id of namespace `name` as the node's table has it: a pipeline or
+    /// trigger names its source by name, and may read from another shard's
+    /// thread, which the table allows and the shard's own maps don't. A
+    /// namespace not yet published is `.invalid`, and reads as empty.
+    fn namespaceId(self: *const StreamHandler, name: []const u8) router.NamespaceId {
+        const effective = if (name.len == 0) "default" else name;
+        if (std.mem.eql(u8, effective, "default")) return .default;
+        const sptr = self.shard_ptr orelse return .invalid;
+        return shardFromPtr(sptr).namespace_handler.table.lookup(effective) orelse .invalid;
+    }
+
     /// Append payload to a named stream (used by processing pipelines).
     /// Computes the namespace-qualified name hash for proper stream isolation.
     /// Wraps the payload in batch format for consistency with all other appends.
@@ -1803,8 +1815,7 @@ pub const StreamHandler = struct {
         var count: usize = 0;
         const capped = @min(limit, MAX_READ_BATCH);
 
-        const ns_hash_u32 = router.namespaceHash(namespace);
-        const name_hash = router.nameHash(ns_hash_u32, stream_name);
+        const name_hash = router.nameHash(self.namespaceId(namespace), stream_name);
 
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const read_n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
@@ -1888,7 +1899,7 @@ pub const StreamHandler = struct {
     /// UAL index is assigned from the partition's committed_index so it stays
     /// monotonic and lines up with lookups.
     fn applyLocalStreamAppend(self: *StreamHandler, req: Request, payload_value: []const u8, partition_index: u32) !StreamID {
-        const ns_hash = router.namespaceHash(req.namespace);
+        const ns_hash = req.ns_id;
         const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
         const next_index = self.partition.committed_index + 1;
 
@@ -1946,14 +1957,10 @@ pub const StreamHandler = struct {
 
         switch (etype) {
             .stream_append => {
-                const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                const name_hash = router.nameHash(cmd.namespace_id, cmd.key);
                 // Before anything changes: a namespace this shard never bound
                 // halts here on every replica, never lands in "default".
-                // One whose create the log refused is refused here too.
-                const ns = (self.stream.resolveNamespace(cmd.namespace_hash) catch {
-                    out.refuse(.unavailable, .unclassified, stream_mod.NOT_CREATED_MESSAGE);
-                    return;
-                }) orelse return error.Halt;
+                const ns = self.stream.resolveNamespace(cmd.namespace_id) orelse return error.Halt;
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
@@ -2000,10 +2007,7 @@ pub const StreamHandler = struct {
             },
             .stream_config => {
                 const config = StreamConfig.decode(cmd.value) orelse return error.Halt;
-                const ns = (self.stream.resolveNamespace(cmd.namespace_hash) catch {
-                    out.refuse(.unavailable, .unclassified, stream_mod.NOT_CREATED_MESSAGE);
-                    return;
-                }) orelse {
+                const ns = self.stream.resolveNamespace(cmd.namespace_id) orelse {
                     // A create's namespace is bound before it is proposed
                     // (the edge's `prepareWrite`), so a create reaching here
                     // unbound is a Flo bug, and halts. An alter isn't: in a
@@ -2013,7 +2017,7 @@ pub const StreamHandler = struct {
                     if (config.op == .create) return error.Halt;
                     return out.refuse(.not_found, .not_found, NO_STREAM);
                 };
-                switch (self.applyConfig(ns, cmd.namespace_hash, cmd.key, config)) {
+                switch (self.applyConfig(ns, cmd.namespace_id, cmd.key, config)) {
                     .ok => {},
                     .refused => |r| {
                         if (r.status == .internal_error) return error.OutOfMemory;
@@ -2025,7 +2029,7 @@ pub const StreamHandler = struct {
             // Applied from the committed log everywhere, like stream_trim.
             .stream_delete => {
                 if (cmd.key.len == 0) return error.Halt;
-                const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+                const name_hash = router.nameHash(cmd.namespace_id, cmd.key);
                 // In log order, so an append committed before the delete counts
                 // on every replica, whatever its proposer had applied.
                 if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(name_hash) > 0) {
@@ -2069,7 +2073,7 @@ pub const StreamHandler = struct {
 
     /// A delete entry: key = raw stream name, value = namespace-qualified
     /// name, so followers and replay clear the name registry without the
-    /// namespace string (they only carry `namespace_hash`).
+    /// namespace string (they only carry `namespace_id`).
     fn proposeDelete(self: *StreamHandler, shard: *Shard, namespace: []const u8, raw_name: []const u8, force: bool) !persistence_mod.ProposeResult {
         _ = self;
         var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
@@ -2355,6 +2359,7 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
     return .{
         .header = proto.RequestHeader.init(op, 1),
         .namespace = "default",
+        .ns_id = .default,
         .key = key,
         .value = value,
         .options = options,
@@ -2484,7 +2489,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const ns = router.namespaceHash("default");
+    const ns: router.NamespaceId = .default;
     var value: [StreamHandler.StreamConfig.SIZE]u8 = undefined;
     var pbuf: [128]u8 = undefined;
     (StreamHandler.StreamConfig{ .op = .create, .partition_count = 3, .retention_age_s = 60, .retention_count = 0 }).encode(&value);
@@ -2666,7 +2671,7 @@ test "stream handler: append refuses a batch over the limit or malformed, by nam
         .err => |e| try testing.expectEqualStrings("stream append: malformed batch", e.message),
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
+    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(router.nameHash(.default, "s1")));
 }
 
 test "stream handler: a read returns whole appends and its cursor passes them" {
@@ -2755,7 +2760,7 @@ test "stream handler: one maximal append's answer is within its bound" {
         else => return error.TestUnexpectedResult,
     }
 
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     var recs: [1]StreamRecord = undefined;
     try testing.expectEqual(@as(usize, 1), handler.stream.readStreamAfter(h, StreamID.MIN, null, &recs));
     const data = try handler.serializeStreamRecordsWithPayloads(&recs, StreamID.MIN, null);
@@ -2773,7 +2778,7 @@ test "stream handler: a read steps past an append it can't read" {
     defer handler.deinit();
 
     // An append the projection knows but whose payload is in no tier.
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
@@ -2813,7 +2818,7 @@ test "stream handler: a group read skips and counts an append in no tier, and it
     // last, so only the cursor moving past it shows it was passed.
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     _ = try handler.stream.appendToStreamAt(h, 999_999, 0, 4_000_000_000_000, 1, 10);
 
     for ([_]u32{ 1, 0 }) |want| {
@@ -2838,7 +2843,7 @@ test "stream handler: a processing read skips and counts an append in no tier, a
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
 
     const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
@@ -2893,7 +2898,7 @@ test "stream handler: a ready entry that can't be read is dropped, not left to l
 
     // An append the projection knows but whose payload is in no tier, then
     // one that reads.
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
@@ -3042,7 +3047,7 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb1, "o1"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "shipments", makeBatchValue(&vb2, "s1"), ""));
 
-    const ns_hash = router.namespaceHash("default");
+    const ns_hash: router.NamespaceId = .default;
     const orders_hash = router.nameHash(ns_hash, "orders");
     const ship_hash = router.nameHash(ns_hash, "shipments");
     try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
@@ -3076,9 +3081,9 @@ test "stream handler: a stream_delete entry without force is refused for a strea
 
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
-    const orders_hash = router.nameHash(router.namespaceHash("default"), "orders");
+    const orders_hash = router.nameHash(.default, "orders");
     var pbuf: [128]u8 = undefined;
-    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, .default, "orders", "orders", &pbuf).?;
     const out = try applyLogged(&handler, &del);
     const refused = out.refused().?;
     try testing.expectEqual(proto.StatusCode.conflict, refused.status);
@@ -3087,7 +3092,7 @@ test "stream handler: a stream_delete entry without force is refused for a strea
 
     // An empty stream, or none, is deleted all the same.
     var ebuf: [128]u8 = undefined;
-    const none = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 2, 1, router.namespaceHash("default"), "never", "never", &ebuf).?;
+    const none = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 2, 1, .default, "never", "never", &ebuf).?;
     try testing.expect((try applyLogged(&handler, &none)).refused() == null);
 }
 
@@ -3102,14 +3107,14 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
 
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
-    const ns_hash = router.namespaceHash("default");
+    const ns_hash: router.NamespaceId = .default;
     const orders_hash = router.nameHash(ns_hash, "orders");
     try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
 
     // A replicated/replayed stream_delete entry (key = raw name, value = qualified)
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
-    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, router.namespaceHash("default"), "orders", "orders", &pbuf).?;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, .default, "orders", "orders", &pbuf).?;
     _ = try applyLogged(&handler, &del);
     try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
@@ -3135,7 +3140,7 @@ test "stream handler: trim" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbd, "d"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbe, "e"), ""));
 
-    const s1_hash = router.nameHash(router.namespaceHash("default"), "s1");
+    const s1_hash = router.nameHash(.default, "s1");
 
     // Keep the newest 2: a dry run counts the 3 it would remove and removes none.
     var dry_buf: [32]u8 = undefined;
@@ -3232,7 +3237,7 @@ test "stream handler: trim refuses what it would otherwise ignore" {
     try expectTrimRefused(&handler, "", big.getOptions(), "stream trim: maxage is over 100 years");
 
     // Nothing was trimmed by any of them.
-    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(router.namespaceHash("default"), "s1")));
+    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(.default, "s1")));
 }
 
 test "stream handler: a trim by age cuts at its entry's stamp, not the host's clock" {
@@ -3247,7 +3252,7 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         var handler = StreamHandler.init(allocator, &partition);
         defer handler.deinit();
 
-        const h = router.nameHash(router.namespaceHash("default"), "aged");
+        const h = router.nameHash(.default, "aged");
         // 3 s old exactly is not older than 3 s: it stays.
         for ([_]u64{ 10_000, 5_000, 3_000, 1_000 }, 1..) |age, i| {
             _ = try handler.stream.appendToStreamAt(h, i, 0, stamp_ms - age, 1, 10);
@@ -3257,14 +3262,14 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         std.mem.writeInt(u64, &val, h, .little);
         var pbuf: [128]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old records.
-        const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
+        const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
         var trimmed_out = try applyLogged(&handler, &trim);
         var tr = trimmed_out.reader();
         try testing.expectEqual(@as(?u64, 2), tr.int(u64));
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
 
         // An age past the stamp trims nothing, never everything.
-        const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, router.namespaceHash("default"), (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
+        const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
         trimmed_out = try applyLogged(&handler, &past);
         tr = trimmed_out.reader();
         try testing.expectEqual(@as(?u64, 0), tr.int(u64));
@@ -3280,7 +3285,7 @@ test "stream handler: --maxage counts in seconds" {
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
     _ = try handler.stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
     _ = try handler.stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
@@ -3338,7 +3343,7 @@ test "stream handler: --maxlen cutting inside the first batch trims nothing" {
     // One 3-record batch: keeping 1 would cut inside it.
     const batch = [_]u8{ 3, 0, 0, 0, 1, 0, 0, 0, 'a', 0, 0, 1, 0, 0, 0, 'b', 0, 0, 1, 0, 0, 0, 'c', 0, 0 };
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", &batch, ""));
-    const h = router.nameHash(router.namespaceHash("default"), "s1");
+    const h = router.nameHash(.default, "s1");
     try testing.expectEqual(@as(u64, 3), handler.stream.streamLogicalCount(h));
 
     for ([_]bool{ true, false }) |dry| {
@@ -3737,6 +3742,7 @@ test "stream handler: pre-route by stream" {
     // Same stream, different namespace → different hash (namespace isolation)
     var req_ns = makeRequest(.stream_append, "stream-a", "", "");
     req_ns.namespace = "other";
+    req_ns.ns_id = .of(16);
     try testing.expect(StreamHandler.preRouteByStream(req1) != StreamHandler.preRouteByStream(req_ns));
 }
 
@@ -3755,6 +3761,7 @@ test "stream handler: a group name must come in the wire format, and is always i
     try std.testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("g"), "")) != .err);
     var other = makeRequest(.stream_group_create, "s1", groupWire("g"), "");
     other.namespace = "other";
+    other.ns_id = .of(16);
     try std.testing.expect(handler.handleCommand(other) != .err);
 }
 
@@ -3770,11 +3777,13 @@ test "stream handler: a stream or group name too long to qualify, or holding a N
     for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
         var req = makeRequest(op, long, groupWire("g"), "");
         req.namespace = "b";
+        req.ns_id = .of(16);
         try testing.expect(handler.handleCommand(req) == .err);
     }
     // The stream fits qualified ("b\x00" + 4090), but not with its group.
     var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
     near.namespace = "b";
+    near.ns_id = .of(16);
     try testing.expect(handler.handleCommand(near) == .err);
     // A NUL in either name could spell another namespace's key.
     try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b\x00orders", groupWire("g"), "")) == .err);

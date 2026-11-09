@@ -9,7 +9,7 @@
 //! ## Lifecycle
 //!
 //! ```
-//! BEGIN(routing_key)        → server pins txn to hash(namespace, routing_key)
+//! BEGIN(routing_key)        → server pins txn to hash(namespace id, routing_key)
 //!                             returns txn_id (per-shard, monotonically increasing)
 //! PUT/DEL/INCR/...(--txn T) → buffered in TxnState.write_set
 //! GET/EXISTS(--txn T)       → checks write_set first (read-your-writes),
@@ -37,6 +37,7 @@
 //! shard's reactor thread. No locks needed.
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
@@ -66,7 +67,8 @@ pub const TxnOpKind = kv_entries.BatchKind;
 /// One buffered op inside a transaction. Owns the key and value bytes.
 pub const TxnOp = struct {
     kind: TxnOpKind,
-    /// Namespace-qualified key (already prefixed with `namespace\0`).
+    /// The key as the client named it: every op is in its transaction's
+    /// namespace (`TxnState.ns_id`), which the batch names once.
     key: []u8,
     /// Op-specific value bytes:
     ///   put    → arbitrary value
@@ -86,11 +88,11 @@ pub const TxnOp = struct {
 
 pub const TxnState = struct {
     txn_id: u64,
-    /// Wyhash of `namespace \0 routing_key` — the pinned partition routing hash.
+    /// The pinned partition's routing hash: the namespace's id and the
+    /// routing key (`router.routeNsKey`).
     pinned_hash: u64,
-    /// Wyhash of the namespace the txn was begun in; it is found only from
-    /// there.
-    namespace_hash: u32,
+    /// The namespace the txn was begun in; it is found only from there.
+    ns_id: NamespaceId,
     /// When a request last used it, on the monotonic clock (ms).
     last_active_ms: u64,
     /// Buffered ops in submission order.
@@ -185,7 +187,7 @@ pub const TxnTable = struct {
 
     /// Begin a new transaction pinned to `pinned_hash`. Returns the new id.
     /// Returns `error.TooManyOpenTxns` when the cap is reached.
-    pub fn begin(self: *TxnTable, pinned_hash: u64, namespace_hash: u32) !u64 {
+    pub fn begin(self: *TxnTable, pinned_hash: u64, ns_id: NamespaceId) !u64 {
         if (self.map.count() >= MAX_OPEN_TXNS) return error.TooManyOpenTxns;
 
         const id = makeId(self.shard_id, self.next_id);
@@ -194,7 +196,7 @@ pub const TxnTable = struct {
         try self.map.put(id, .{
             .txn_id = id,
             .pinned_hash = pinned_hash,
-            .namespace_hash = namespace_hash,
+            .ns_id = ns_id,
             .last_active_ms = stdx_time.monotonicMs(),
             .ops = .empty,
             .payload_bytes = 0,
@@ -298,15 +300,9 @@ pub const TxnTable = struct {
 // The commit's log entry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// The batch's only field is its op list, so the list's encoding is the
-// whole payload.
-comptime {
-    std.debug.assert(kv_entries.Batch.field_list.len == 1 and kv_entries.Batch.field_list[0].T == kv_entries.BatchOps);
-}
-
 /// A commit's `kv.batch` payload for `ops`, allocated. An op that breaks
 /// its kind's rule is a bug in buffering, refused here rather than logged.
-pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {
+pub fn encodeBatch(allocator: Allocator, ns: NamespaceId, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {
     const values = try allocator.alloc(kv_entries.BatchOp.Value, ops.len);
     defer allocator.free(values);
     for (ops, values) |op, *v| {
@@ -314,11 +310,11 @@ pub fn encodeBatch(allocator: Allocator, ops: []const TxnOp) (error{ OutOfMemory
         if (kv_entries.batchOpRule(v.*) != null) return error.InvalidBatch;
     }
     var counter: schema.Writer = .{ .buf = &.{}, .counting = true };
-    try kv_entries.BatchOps.encodeSlice(&counter, values);
+    try kv_entries.encodeBatch(&counter, ns.int(), values);
     const buf = try allocator.alloc(u8, counter.pos);
     errdefer allocator.free(buf);
     var w: schema.Writer = .{ .buf = buf };
-    try kv_entries.BatchOps.encodeSlice(&w, values);
+    try kv_entries.encodeBatch(&w, ns.int(), values);
     return buf;
 }
 
@@ -345,10 +341,10 @@ test "TxnTable: two tables start their ids at different counters" {
     defer a.deinit();
     var b = TxnTable.init(std.testing.allocator);
     defer b.deinit();
-    const first = try a.begin(0, 0);
+    const first = try a.begin(0, .default);
     // A restart's table: the id a client held from before isn't open in it.
     try std.testing.expect(b.get(first) == null);
-    try std.testing.expect(try b.begin(0, 0) != first);
+    try std.testing.expect(try b.begin(0, .default) != first);
     try std.testing.expect(first & ID_COUNTER_MASK != 0);
 }
 
@@ -357,11 +353,11 @@ test "TxnTable: begin / appendOp / drop lifecycle" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(0xDEADBEEF, 0xABCD);
+    const id = try tt.begin(0xDEADBEEF, .of(0xABCD));
     try t.expectEqual(@as(usize, 1), tt.count());
 
-    try tt.appendOp(id, .put, "default\x00k1", "v1", 0, .always, null);
-    try tt.appendOp(id, .delete, "default\x00k2", "", 0, .always, null);
+    try tt.appendOp(id, .put, "k1", "v1", 0, .always, null);
+    try tt.appendOp(id, .delete, "k2", "", 0, .always, null);
     const txn = tt.get(id).?;
     try t.expectEqual(@as(usize, 2), txn.ops.items.len);
     try t.expectEqual(@as(u64, 0xDEADBEEF), txn.pinned_hash);
@@ -375,15 +371,15 @@ test "TxnTable: lastOpForKey returns most recent buffered op" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
 
-    const id = try tt.begin(1, 0);
-    try tt.appendOp(id, .put, "ns\x00k", "v1", 0, .always, null);
-    try tt.appendOp(id, .put, "ns\x00other", "x", 0, .always, null);
-    try tt.appendOp(id, .put, "ns\x00k", "v2", 0, .always, null);
+    const id = try tt.begin(1, .default);
+    try tt.appendOp(id, .put, "k", "v1", 0, .always, null);
+    try tt.appendOp(id, .put, "other", "x", 0, .always, null);
+    try tt.appendOp(id, .put, "k", "v2", 0, .always, null);
 
-    const op = tt.lastOpForKey(id, "ns\x00k").?;
+    const op = tt.lastOpForKey(id, "k").?;
     try t.expectEqualStrings("v2", op.value);
 
-    try t.expectEqual(@as(?*const TxnOp, null), tt.lastOpForKey(id, "ns\x00missing"));
+    try t.expectEqual(@as(?*const TxnOp, null), tt.lastOpForKey(id, "missing"));
 }
 
 test "TxnTable: by default a transaction holds the largest value a plain set takes, under the longest key" {
@@ -391,7 +387,7 @@ test "TxnTable: by default a transaction holds the largest value a plain set tak
     comptime std.debug.assert(limits.MAX_QUALIFIED_KEY + @import("../protocol/kv_ops.zig").MAX_VALUE <= limits.DEFAULT_MAX_BYTES_PER_TXN);
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
-    const id = try tt.begin(1, 0);
+    const id = try tt.begin(1, .default);
     const key = try t.allocator.alloc(u8, limits.MAX_QUALIFIED_KEY);
     defer t.allocator.free(key);
     @memset(key, 'k');
@@ -406,13 +402,13 @@ test "TxnTable: max_bytes and max_ops move their refusal points" {
     var tt = TxnTable.init(t.allocator);
     defer tt.deinit();
     tt.max_bytes = 10;
-    const a = try tt.begin(1, 0);
+    const a = try tt.begin(1, .default);
     try tt.appendOp(a, .put, "k", "123456789", 0, .always, null);
     // One byte over.
     try t.expectError(error.TxnTooLarge, tt.appendOp(a, .put, "k", "", 0, .always, null));
     tt.max_bytes = limits.MAX_PAYLOAD_PER_TXN;
     tt.max_ops = 2;
-    const b = try tt.begin(2, 0);
+    const b = try tt.begin(2, .default);
     try tt.appendOp(b, .put, "a", "", 0, .always, null);
     try tt.appendOp(b, .put, "b", "", 0, .always, null);
     try t.expectError(error.TxnTooLarge, tt.appendOp(b, .put, "c", "", 0, .always, null));
@@ -424,7 +420,7 @@ test "TxnTable: enforces MAX_PAYLOAD_PER_TXN" {
     defer tt.deinit();
     tt.max_bytes = MAX_PAYLOAD_PER_TXN;
 
-    const id = try tt.begin(1, 0);
+    const id = try tt.begin(1, .default);
     const big = try t.allocator.alloc(u8, MAX_PAYLOAD_PER_TXN);
     defer t.allocator.free(big);
     @memset(big, 'a');
@@ -444,14 +440,14 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
     // More idle ones than one gathering pass holds.
     var idle: [150]u64 = undefined;
     for (&idle) |*id| {
-        id.* = try tt.begin(1, 0);
+        id.* = try tt.begin(1, .default);
         tt.get(id.*).?.last_active_ms = 1_000;
     }
-    try tt.appendOp(idle[0], .put, "ns\x00k", "v", 0, .always, null);
-    const committing = try tt.begin(1, 0);
+    try tt.appendOp(idle[0], .put, "k", "v", 0, .always, null);
+    const committing = try tt.begin(1, .default);
     tt.get(committing).?.last_active_ms = 1_000;
     tt.get(committing).?.committing = true;
-    const used = try tt.begin(1, 0);
+    const used = try tt.begin(1, .default);
     tt.get(used).?.last_active_ms = 1_000 + IDLE_TIMEOUT_MS;
 
     const now = 1_000 + IDLE_TIMEOUT_MS;
@@ -466,19 +462,20 @@ test "TxnTable: reapIdle drops idle transactions, but not a used or committing o
 test "kv_batch: a commit's ops decode from its payload as they were buffered" {
     const t = std.testing;
     var ops: [4]TxnOp = .{
-        .{ .kind = .put, .key = @constCast("ns\x00alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
+        .{ .kind = .put, .key = @constCast("alpha"), .value = @constCast("hello"), .ttl_ms = 1_000 },
         .{ .kind = .delete, .key = @constCast("beta"), .value = @constCast(""), .ttl_ms = 0 },
         .{ .kind = .incr, .key = @constCast("counter"), .value = @constCast("\xf9\xff\xff\xff\xff\xff\xff\xff"), .ttl_ms = 0 },
         .{ .kind = .expire, .key = @constCast("gamma"), .value = @constCast(""), .ttl_ms = 0 },
     };
-    const payload = try encodeBatch(t.allocator, &ops);
+    const payload = try encodeBatch(t.allocator, .of(17), &ops);
     defer t.allocator.free(payload);
     var diag: schema.Diagnostic = .{};
     const batch = try kv_entries.Batch.decodeAll(payload, &diag);
+    try t.expectEqual(@as(u32, 17), batch.ns);
     var it = batch.ops.iterator();
     const a = (try it.next()).?;
     try t.expectEqual(TxnOpKind.put, a.kind);
-    try t.expectEqualStrings("ns\x00alpha", a.key);
+    try t.expectEqualStrings("alpha", a.key);
     try t.expectEqualStrings("hello", a.value.?);
     try t.expectEqual(@as(?u64, 1_000), a.ttl_ms);
     const b = (try it.next()).?;
@@ -494,7 +491,7 @@ test "kv_batch: a commit's ops decode from its payload as they were buffered" {
 
 test "kv_batch: an op that breaks its kind's rule is refused, not logged" {
     var ops = [_]TxnOp{.{ .kind = .incr, .key = @constCast("k"), .value = @constCast(""), .ttl_ms = 0 }};
-    try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, &ops));
+    try std.testing.expectError(error.InvalidBatch, encodeBatch(std.testing.allocator, .default, &ops));
 }
 
 test "txn: an id names its shard" {
@@ -506,5 +503,5 @@ test "txn: an id names its shard" {
     var t = TxnTable.init(std.testing.allocator);
     defer t.deinit();
     t.shard_id = 7;
-    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, 0)));
+    try std.testing.expectEqual(@as(u16, 7), idShard(try t.begin(0, .default)));
 }

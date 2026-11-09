@@ -11,6 +11,7 @@ const log = @import("stdx").log;
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
+const NamespaceId = @import("../namespace/table.zig").Id;
 
 /// The longest namespace name a key holds.
 pub const MAX_NAMESPACE = std.math.maxInt(u8);
@@ -24,6 +25,17 @@ pub fn key(buf: []u8, ns: []const u8, k: []const u8) error{NoSpaceLeft}![]u8 {
     @memcpy(buf[1..][0..ns.len], ns);
     @memcpy(buf[1 + ns.len ..][0..k.len], k);
     return buf[0 .. 1 + ns.len + k.len];
+}
+
+/// A key as a family keyed by namespace id stores it: the id's fixed-width
+/// bytes, then the key, so every key of a namespace sorts together and the
+/// id is a prefix no other namespace's key starts with.
+pub fn idKey(buf: []u8, ns: NamespaceId, k: []const u8) error{NoSpaceLeft}![]u8 {
+    const id = ns.bytes();
+    if (buf.len < id.len + k.len) return error.NoSpaceLeft;
+    @memcpy(buf[0..id.len], &id);
+    @memcpy(buf[id.len..][0..k.len], k);
+    return buf[0 .. id.len + k.len];
 }
 
 /// A key within its family.
@@ -73,6 +85,17 @@ pub const KeySet = struct {
     pub fn add(self: *KeySet, fam: u16, ns: []const u8, k: []const u8) Allocator.Error!void {
         const bytes = try self.allocator.alloc(u8, 1 + ns.len + k.len);
         _ = key(bytes, ns, k) catch unreachable;
+        try self.addKey(fam, bytes);
+    }
+
+    /// `add` for a family keyed by namespace id (`idKey`).
+    pub fn addIn(self: *KeySet, fam: u16, ns: NamespaceId, k: []const u8) Allocator.Error!void {
+        const bytes = try self.allocator.alloc(u8, @sizeOf(u32) + k.len);
+        _ = idKey(bytes, ns, k) catch unreachable;
+        try self.addKey(fam, bytes);
+    }
+
+    fn addKey(self: *KeySet, fam: u16, bytes: []const u8) Allocator.Error!void {
         try self.exact.append(self.allocator, .{ .fam = fam, .key = bytes });
         if (self.exact.items.len == SCAN_LIMIT + 1) {
             for (self.exact.items) |d| try self.exact_index.put(self.allocator, d, {});
@@ -88,6 +111,15 @@ pub const KeySet = struct {
         if (ns.len == 0) return error.NoNamespace;
         const bytes = try self.allocator.alloc(u8, 1 + ns.len + prefix.len);
         _ = key(bytes, ns, prefix) catch unreachable;
+        try self.ranges.append(self.allocator, .{ .fam = fam, .key = bytes });
+    }
+
+    /// `addRange` for a family keyed by namespace id (`idKey`); the id that
+    /// names no namespace is refused as no namespace is.
+    pub fn addRangeIn(self: *KeySet, fam: u16, ns: NamespaceId, prefix: []const u8) (Allocator.Error || error{NoNamespace})!void {
+        if (ns == .invalid) return error.NoNamespace;
+        const bytes = try self.allocator.alloc(u8, @sizeOf(u32) + prefix.len);
+        _ = idKey(bytes, ns, prefix) catch unreachable;
         try self.ranges.append(self.allocator, .{ .fam = fam, .key = bytes });
     }
 

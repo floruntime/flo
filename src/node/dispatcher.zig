@@ -47,6 +47,7 @@ const shard_walker_mod = @import("shard_walker.zig");
 /// ShardWalker specialized for name-list operations (ts_list, stream_list, etc.).
 /// All list/scan walk opcodes return `[]const u8` names.
 pub const NameWalker = shard_walker_mod.ShardWalker([]const u8);
+pub const WalkNamespace = shard_walker_mod.Namespace;
 pub const scanScratch = shard_walker_mod.scanScratch;
 pub const takeScanShort = shard_walker_mod.takeScanShort;
 pub const noteScanShort = shard_walker_mod.noteScanShort;
@@ -217,7 +218,7 @@ pub const Dispatcher = struct {
     /// A page's entries in a walk op's answer, one per name, read from the
     /// op's scan context in one go: each appended to `out`, its end in
     /// `ends`. An empty one for a name with no entry.
-    pub const WalkEntriesFn = *const fn (context: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void;
+    pub const WalkEntriesFn = *const fn (context: *anyopaque, ns: WalkNamespace, names: []const []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void;
 
     /// Set how a walk op's family writes its entries. `registerWalk` clears
     /// it, since another scan's entries would read its own context, so it

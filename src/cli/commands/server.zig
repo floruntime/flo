@@ -925,7 +925,7 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
         return;
     }
     const at = offline.repairSkip(ctx.allocator, dir, shard, &sum, &halted, ctx.getString("reason") orelse "") catch |err| switch (err) {
-        error.IsSkip, error.NotSkippable, error.NotHalted => return skipRefusal(ctx, err, shard, index, &halted),
+        error.IsSkip, error.NotSkippable, error.NamespaceEntry, error.NotHalted => return skipRefusal(ctx, err, shard, index, &halted),
         else => return outcome.localRefusal(ctx, "cannot write the repair: {}", .{err}),
     };
     ctx.print("Entry {d} is skipped (repair at index {d}). Start the server: shard {d} comes up past it.\n", .{ index, at, shard });
@@ -935,6 +935,7 @@ fn skipRefusal(ctx: *commander.Context, err: anyerror, shard: u16, index: u64, h
     return switch (err) {
         error.IsSkip => outcome.localRefusal(ctx, "entry {d} is itself a repair; a skip is never skipped", .{index}),
         error.NotSkippable => outcome.localRefusal(ctx, "entry {d} is a config or a term's no-op, which a shard applies even while halted; it is never skipped", .{index}),
+        error.NamespaceEntry => outcome.localRefusal(ctx, "entry {d} creates or binds a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take. It is never skipped; cut the log before it instead (flo server salvage --shard {d} --truncate-after {d}), which drops those writes with it", .{ index, shard, index -| 1 }),
         else => outcome.localRefusal(ctx, "shard {d} is not halted at entry {d} (term {d}): only the entry a shard halted at is skipped. Start the server to see where it halts", .{ shard, index, halted.header.term }),
     };
 }

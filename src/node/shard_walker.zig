@@ -26,6 +26,13 @@
 //! ```
 
 const std = @import("std");
+
+/// The namespace a walk scans: its name, and its id as the node's table has
+/// it, so each family keys its lookup by what it stores.
+pub const Namespace = struct {
+    name: []const u8,
+    id: @import("../namespace/table.zig").Id = .invalid,
+};
 const log = @import("stdx").log;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -92,13 +99,13 @@ pub fn ShardWalker(comptime ResultT: type) type {
         ///
         /// Parameters:
         ///   ctx:           domain-specific context (e.g., the projection)
-        ///   namespace:     namespace filter
+        ///   ns:            namespace to scan, by name and id
         ///   filter:        prefix/pattern filter (empty = no filter)
         ///   local_cursor:  resume position (null = start of shard)
         ///   limit:         max items to return
         pub const LocalScanFn = *const fn (
             ctx: *anyopaque,
-            namespace: []const u8,
+            ns: Namespace,
             filter: []const u8,
             local_cursor: ?[]const u8,
             limit: u32,
@@ -148,7 +155,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
         ///
         /// Parameters:
         ///   contexts:   per-shard scan contexts (index = shard_id)
-        ///   namespace:  namespace to scan
+        ///   ns:         namespace to scan
         ///   filter:     prefix/pattern filter (empty = no filter)
         ///   cursor:     raw encoded cursor (null = start)
         ///   limit:      max items to return
@@ -157,7 +164,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
         pub fn walk(
             self: *const Self,
             contexts: []const *anyopaque,
-            namespace: []const u8,
+            ns: Namespace,
             filter: []const u8,
             cursor: ?[]const u8,
             limit: u32,
@@ -186,7 +193,7 @@ pub fn ShardWalker(comptime ResultT: type) type {
                 // scan that stops at its limit without a cursor still shows
                 // there's more. A scan resuming from its own cursor pages itself.
                 const ask: u32 = if (local_cursor != null or self.pages_itself) remaining else @intCast(@min(@as(u64, skip) + remaining + 1, std.math.maxInt(u32)));
-                const scan = self.local_scan(ctx, namespace, filter, local_cursor, ask);
+                const scan = self.local_scan(ctx, ns, filter, local_cursor, ask);
                 const items = scan.items[@min(skip, scan.items.len)..];
 
                 // Copy results into buffer (bounded by remaining to prevent underflow)
@@ -276,14 +283,14 @@ pub fn ShardWalker(comptime ResultT: type) type {
 
         /// The owner's page of its own scan, from `local_cursor` for a scan
         /// that pages itself, else after the first `skip` items.
-        pub fn localPage(self: *const Self, ctx: *anyopaque, namespace: []const u8, filter: []const u8, local_cursor: ?[]const u8, skip: u32, limit: u32) Page {
+        pub fn localPage(self: *const Self, ctx: *anyopaque, ns: Namespace, filter: []const u8, local_cursor: ?[]const u8, skip: u32, limit: u32) Page {
             if (self.pages_itself) {
-                const scan = self.local_scan(ctx, namespace, filter, local_cursor, limit);
+                const scan = self.local_scan(ctx, ns, filter, local_cursor, limit);
                 return .{ .items = scan.items, .more = scan.next_cursor != null };
             }
             // One more than fits shows whether more follow.
             const ask: u32 = @intCast(@min(@as(u64, skip) + limit + 1, std.math.maxInt(u32)));
-            const scan = self.local_scan(ctx, namespace, filter, null, ask);
+            const scan = self.local_scan(ctx, ns, filter, null, ask);
             const items = scan.items[@min(skip, scan.items.len)..];
             return .{ .items = items[0..@min(items.len, limit)], .more = items.len > limit };
         }
@@ -377,7 +384,7 @@ const MockScanCtx = struct {
     shard_id: u16,
 };
 
-fn mockLocalScan(ctx_raw: *anyopaque, _: []const u8, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
+fn mockLocalScan(ctx_raw: *anyopaque, _: Namespace, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
 
     // Decode local cursor as a u32 offset
@@ -455,7 +462,7 @@ test "ShardWalker: walk single shard, all items fit" {
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
 
-    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, .{ .name = "" }, "", null, 10, &result_buf, &cursor_buf);
 
     try std.testing.expectEqual(@as(usize, 3), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
@@ -480,14 +487,14 @@ test "ShardWalker: walk with pagination (limit < items)" {
     var cursor_buf: [64]u8 = undefined;
 
     // First page: limit 3
-    const page1 = walker.walk(&contexts, "", "", null, 3, &result_buf, &cursor_buf);
+    const page1 = walker.walk(&contexts, .{ .name = "" }, "", null, 3, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 3), page1.items.len);
     try std.testing.expect(page1.next_cursor != null); // more items
 
     // Second page: use cursor
     var result_buf2: [16]TestItem = undefined;
     var cursor_buf2: [64]u8 = undefined;
-    const page2 = walker.walk(&contexts, "", "", page1.next_cursor, 3, &result_buf2, &cursor_buf2);
+    const page2 = walker.walk(&contexts, .{ .name = "" }, "", page1.next_cursor, 3, &result_buf2, &cursor_buf2);
     try std.testing.expectEqual(@as(usize, 2), page2.items.len); // remaining 2
     try std.testing.expectEqual(@as(?[]const u8, null), page2.next_cursor);
 }
@@ -514,7 +521,7 @@ test "ShardWalker: walk multiple shards" {
     var cursor_buf: [64]u8 = undefined;
 
     // Get all items across both shards
-    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, .{ .name = "" }, "", null, 10, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 5), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
 
@@ -546,7 +553,7 @@ test "ShardWalker: walk multiple shards with limit across boundary" {
     var cursor_buf: [64]u8 = undefined;
 
     // Limit 4 — should get 3 from shard 0, 1 from shard 1
-    const result = walker.walk(&contexts, "", "", null, 4, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, .{ .name = "" }, "", null, 4, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 4), result.items.len);
 
     // Next cursor should point to shard 1 with offset 1
@@ -555,7 +562,7 @@ test "ShardWalker: walk multiple shards with limit across boundary" {
     // Continue from cursor
     var result_buf2: [16]TestItem = undefined;
     var cursor_buf2: [64]u8 = undefined;
-    const page2 = walker.walk(&contexts, "", "", result.next_cursor, 10, &result_buf2, &cursor_buf2);
+    const page2 = walker.walk(&contexts, .{ .name = "" }, "", result.next_cursor, 10, &result_buf2, &cursor_buf2);
     try std.testing.expectEqual(@as(usize, 1), page2.items.len); // 1 remaining on shard 1
     try std.testing.expectEqual(@as(?[]const u8, null), page2.next_cursor);
 }
@@ -572,7 +579,7 @@ test "ShardWalker: empty shards" {
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
 
-    const result = walker.walk(&contexts, "", "", null, 10, &result_buf, &cursor_buf);
+    const result = walker.walk(&contexts, .{ .name = "" }, "", null, 10, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
     try std.testing.expectEqual(@as(?[]const u8, null), result.next_cursor);
 }
@@ -590,20 +597,20 @@ test "ShardWalker: a page filled exactly at a shard's end continues at the next 
     var cursor_buf: [64]u8 = undefined;
 
     // Shard 0 holds exactly the page; shard 1's item must still be reachable.
-    const first = walker.walk(&contexts, "", "", null, 2, &result_buf, &cursor_buf);
+    const first = walker.walk(&contexts, .{ .name = "" }, "", null, 2, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 2), first.items.len);
     const cursor = first.next_cursor orelse return error.TestExpectedCursor;
 
     var cursor_copy: [64]u8 = undefined;
     @memcpy(cursor_copy[0..cursor.len], cursor);
-    const second = walker.walk(&contexts, "", "", cursor_copy[0..cursor.len], 2, &result_buf, &cursor_buf);
+    const second = walker.walk(&contexts, .{ .name = "" }, "", cursor_copy[0..cursor.len], 2, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 1), second.items.len);
     try std.testing.expectEqual(@as(u16, 1), second.items[0].shard);
     try std.testing.expectEqual(@as(?[]const u8, null), second.next_cursor);
 }
 
 /// A scan that ignores its cursor and limit and returns everything.
-fn mockScanAll(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, _: u32) ShardWalker(TestItem).ScanResult {
+fn mockScanAll(ctx_raw: *anyopaque, _: Namespace, _: []const u8, _: ?[]const u8, _: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
     return .{ .items = ctx.items, .next_cursor = null };
 }
@@ -624,7 +631,7 @@ test "ShardWalker: a scan returning more than fits resumes by offset, losing not
     var cursor: ?[]const u8 = null;
     var pages: usize = 0;
     while (pages < 10) : (pages += 1) {
-        const r = walker.walk(&contexts, "", "", cursor, 2, &result_buf, &cursor_buf);
+        const r = walker.walk(&contexts, .{ .name = "" }, "", cursor, 2, &result_buf, &cursor_buf);
         try std.testing.expect(r.items.len <= 2);
         for (r.items) |it| seen[std.mem.readInt(u32, it.key[0..4], .little)] += 1;
         const next = r.next_cursor orelse break;
@@ -635,7 +642,7 @@ test "ShardWalker: a scan returning more than fits resumes by offset, losing not
 }
 
 /// A scan that stops at its limit and returns no cursor.
-fn mockScanCapped(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
+fn mockScanCapped(ctx_raw: *anyopaque, _: Namespace, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
     return .{ .items = ctx.items[0..@min(limit, ctx.items.len)], .next_cursor = null };
 }
@@ -654,7 +661,7 @@ test "ShardWalker: a scan that caps at its limit without a cursor loses nothing"
     var cursor: ?[]const u8 = null;
     var pages: usize = 0;
     while (pages < 10) : (pages += 1) {
-        const r = walker.walk(&contexts, "", "", cursor, 2, &result_buf, &cursor_buf);
+        const r = walker.walk(&contexts, .{ .name = "" }, "", cursor, 2, &result_buf, &cursor_buf);
         for (r.items) |it| seen[std.mem.readInt(u32, it.key[0..4], .little)] += 1;
         const next = r.next_cursor orelse break;
         @memcpy(cursor_copy[0..next.len], next);
@@ -665,7 +672,7 @@ test "ShardWalker: a scan that caps at its limit without a cursor loses nothing"
 
 /// Pages by key, as KV does: the items after the cursor's key, which is
 /// the last item the page before returned.
-fn mockScanByKey(ctx_raw: *anyopaque, _: []const u8, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
+fn mockScanByKey(ctx_raw: *anyopaque, _: Namespace, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker(TestItem).ScanResult {
     const ctx: *const MockScanCtx = @ptrCast(@alignCast(ctx_raw));
     const after: ?u32 = if (local_cursor) |lc| std.mem.readInt(u32, lc[0..4], .little) else null;
     var start: usize = 0;
@@ -694,13 +701,13 @@ test "ShardWalker: a key cursor resumes only its own shard; the next shard start
     var result_buf: [16]TestItem = undefined;
     var cursor_buf: [64]u8 = undefined;
     var cursor_copy: [64]u8 = undefined;
-    const first = walker.walk(&contexts, "", "", null, 1, &result_buf, &cursor_buf);
+    const first = walker.walk(&contexts, .{ .name = "" }, "", null, 1, &result_buf, &cursor_buf);
     try std.testing.expectEqual(@as(usize, 1), first.items.len);
     const next = first.next_cursor.?;
     @memcpy(cursor_copy[0..next.len], next);
 
     // Shard 0 finishes under the limit; shard 1 is read from its start.
-    const second = walker.walk(&contexts, "", "", cursor_copy[0..next.len], 8, &result_buf, &cursor_buf);
+    const second = walker.walk(&contexts, .{ .name = "" }, "", cursor_copy[0..next.len], 8, &result_buf, &cursor_buf);
     var got: [3]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 3), second.items.len);
     for (second.items, &got) |item, *g| g.* = std.mem.readInt(u32, item.key[0..4], .little);
@@ -711,12 +718,12 @@ test "ShardWalker: a key cursor resumes only its own shard; the next shard start
 /// Names in key order on one shard, scanned by offset or after a key.
 const NameShard = struct { names: []const []const u8 };
 
-fn nameScanByOffset(ctx_raw: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
+fn nameScanByOffset(ctx_raw: *anyopaque, _: Namespace, _: []const u8, _: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
     const ctx: *const NameShard = @ptrCast(@alignCast(ctx_raw));
     return .{ .items = ctx.names[0..@min(limit, ctx.names.len)], .next_cursor = null };
 }
 
-fn nameScanByKey(ctx_raw: *anyopaque, _: []const u8, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
+fn nameScanByKey(ctx_raw: *anyopaque, _: Namespace, _: []const u8, local_cursor: ?[]const u8, limit: u32) ShardWalker([]const u8).ScanResult {
     const ctx: *const NameShard = @ptrCast(@alignCast(ctx_raw));
     var start: usize = 0;
     if (local_cursor) |after| {
@@ -766,9 +773,9 @@ test "ShardWalker: asked pages, merged a window of shards at a time, return ever
                 var asked: [6]Walker.Page = undefined;
                 for (start.shard..last, 0..) |s, j| {
                     asked[j] = if (j == 0)
-                        walker.localPage(contexts[s], "", "", start.local_cursor, start.skip, limit)
+                        walker.localPage(contexts[s], .{ .name = "" }, "", start.local_cursor, start.skip, limit)
                     else
-                        walker.localPage(contexts[s], "", "", null, 0, limit);
+                        walker.localPage(contexts[s], .{ .name = "" }, "", null, 0, limit);
                 }
                 // Sized to what the pages carry, as the shard's merge sizes it.
                 var carried: usize = 0;

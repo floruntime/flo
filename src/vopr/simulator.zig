@@ -1931,7 +1931,7 @@ pub const Simulator = struct {
             });
             return;
         }
-        if (node.kv.counter(workload_mod.TXN_APPLIED_KEY) != txns_before + 1) self.checker.fail(.{
+        if (node.kv.counter(workload_mod.TXN_APPLIED_STORED_KEY) != txns_before + 1) self.checker.fail(.{
             .invariant = .applied_integrity,
             .node = node.id,
             .index = idx,
@@ -2156,7 +2156,7 @@ pub const Simulator = struct {
         // counts once, not once per replica and replay.
         const first = idx > self.checker.states.items.len or self.checker.states.items[idx - 1] == null;
         const is_txn = is_op and self.scenario.hasTxnLimits() and e.header.entry_type == @backingInt(entry_mod.EntryType.kv_batch);
-        const txns_before = if (is_txn) node.kv.counter(workload_mod.TXN_APPLIED_KEY) else 0;
+        const txns_before = if (is_txn) node.kv.counter(workload_mod.TXN_APPLIED_STORED_KEY) else 0;
         if (is_op and families.Kv.owns(e.header.entry_type)) if (node.kv.apply(e, replica)) |effect| {
             if (first) self.kv_counts.count(effect);
             self.checkBatchAnswer(node, e, idx, first, effect);

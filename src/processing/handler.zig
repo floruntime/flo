@@ -22,6 +22,7 @@
 //! | processing_list      | (unused)   | [limit:u32][cursor...]?        |
 
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
 const proto = @import("../protocol/proto.zig");
@@ -98,6 +99,9 @@ pub const ProcessingHandler = struct {
     peer_stream_handlers: ?[]const *stream_handler_mod.StreamHandler = null,
     peer_shard_count: u16 = 1,
     peer_partition_count: u32 = 0,
+    /// The node's namespace table, wired by the shard: a sink routes by its
+    /// namespace's id, as the dispatcher does.
+    ns_table: ?*const @import("../namespace/table.zig").Table = null,
 
     /// KV handlers — one per shard, wired by Runtime.
     peer_kv_handlers: ?[]const *kv_handler_mod.KVHandler = null,
@@ -217,6 +221,8 @@ pub const ProcessingHandler = struct {
         job_id_owned: []const u8,
         name_owned: []const u8,
         namespace_owned: []const u8,
+        /// The id its submit carried: the namespace a remove must name.
+        ns_id: NamespaceId,
         status: JobStatus,
         batch_size: u32,
         yaml_owned: []const u8,
@@ -290,10 +296,8 @@ pub const ProcessingHandler = struct {
     }
 
     /// Resolve the correct StreamHandler for a given stream name + namespace.
-    /// Uses hashKeyWithNamespace (namespace + key) to match the Dispatcher's
-    /// stream_append routing — the Dispatcher uses preRouteByStream which
-    /// hashes with hashKeyWithNamespace(namespace, key), so stream data lives
-    /// on the shard selected by that composite hash.
+    /// Routes as the dispatcher routes stream_append (`peerShardId`), so the
+    /// stream's data is on the shard chosen.
     fn resolveStreamHandler(self: *ProcessingHandler, local: *stream_handler_mod.StreamHandler, stream_name: []const u8, namespace: []const u8) *stream_handler_mod.StreamHandler {
         const peers = self.peer_stream_handlers orelse return local;
         if (peers.len <= 1) return local;
@@ -304,9 +308,18 @@ pub const ProcessingHandler = struct {
     /// dispatchers use to route stream/kv/queue/ts commands. Sinks resolve through
     /// this so a write lands on the shard a subsequent read will query.
     fn peerShardId(self: *const ProcessingHandler, namespace: []const u8, key: []const u8) u16 {
-        const hash = router.hashKeyWithNamespace(namespace, key);
+        const hash = router.routeNsKey(self.namespaceIdOf(namespace), key);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
         return @intCast(partition_id % self.peer_shard_count);
+    }
+
+    /// The id of namespace `namespace` (empty is "default") as the node's
+    /// table has it; `.invalid` for one it doesn't.
+    fn namespaceIdOf(self: *const ProcessingHandler, namespace: []const u8) router.NamespaceId {
+        const name = if (namespace.len == 0) "default" else namespace;
+        if (std.mem.eql(u8, name, "default")) return .default;
+        const t = self.ns_table orelse return .invalid;
+        return t.lookup(name) orelse .invalid;
     }
 
     /// A stream or queue sink proposes its write on the shard that owns its
@@ -314,11 +327,42 @@ pub const ProcessingHandler = struct {
     /// Outside "default" that shard may never have bound the namespace, and
     /// its log would then hold a write it cannot apply. Such a sink is
     /// refused until sinks write through the shard that owns their target.
+    /// A namespace not yet published has no id to route by, so whether
+    /// its target is here isn't known yet: `sinksReady` asks again once it
+    /// is, before the pipeline writes anything.
     fn crossShardSink(self: *const ProcessingHandler, kind: definition.SinkKind, namespace: []const u8, target: []const u8) bool {
         if (kind != .stream and kind != .queue) return false;
         if (std.mem.eql(u8, namespace, "default")) return false;
         if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) return false;
+        if (self.namespaceIdOf(namespace) == .invalid) return false;
         return self.peerShardId(namespace, target) != self.own_shard;
+    }
+
+    const SinksReady = union(enum) { ready, wait, refused: []const u8 };
+
+    /// Whether `pipe` may write now. Every sink routes by its namespace's
+    /// published id: before shard 0 publishes it, a sink can't tell which
+    /// shard owns its target, so the pipeline reads nothing and waits,
+    /// its cursor where it was. Once every id is known, a stream or queue
+    /// sink whose target is on another shard is refused, as at submit.
+    fn sinksReady(self: *const ProcessingHandler, shard: *Shard, pipe: *const PipelineState, buf: []u8) SinksReady {
+        var wait = false;
+        for (pipe.sinks) |snk| {
+            if (self.namespaceIdOf(snk.namespace) != .invalid) continue;
+            // A namespace this shard refuses for good takes no write; its
+            // records are dropped and counted as they come. One only shard
+            // 0 can publish is waited for.
+            if (shard.namespace_handler.admission(snk.namespace)) |r| if (r.status != .unavailable) continue;
+            shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
+            wait = true;
+        }
+        if (wait) return .wait;
+        for (pipe.sinks) |snk| {
+            if (!self.crossShardSink(snk.kind, snk.namespace, snk.target)) continue;
+            return .{ .refused = std.fmt.bufPrint(buf, "a {s} sink outside the default namespace must be on the job's shard, and '{s}' is on another; use the default namespace, or one shard (--shards 1)", .{ @tagName(snk.kind), snk.target }) catch
+                "a stream or queue sink outside the default namespace must be on the job's shard; use the default namespace, or one shard (--shards 1)" };
+        }
+        return .ready;
     }
 
     /// Why a job's sinks can't run here: one that `crossShardSink` refuses.
@@ -465,11 +509,12 @@ pub const ProcessingHandler = struct {
     /// no cursor either, so the walker pages it by offset.
     fn localScanJobs(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8,
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(handler.jobs.count());
 
@@ -664,9 +709,8 @@ pub const ProcessingHandler = struct {
 
     /// Whether `job` lives in the namespace an entry's hash names; a bare
     /// namespace is "default", as it is for ownedJob.
-    fn inNamespace(job: *const JobRecord, ns_hash: u32) bool {
-        if (ns_hash == router.namespaceHash(job.namespace_owned)) return true;
-        return ns_hash == router.namespaceHash("") and std.mem.eql(u8, job.namespace_owned, "default");
+    fn inNamespace(job: *const JobRecord, ns_id: NamespaceId) bool {
+        return ns_id == job.ns_id;
     }
 
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -1016,10 +1060,10 @@ pub const ProcessingHandler = struct {
         const stamp_ms: i64 = @intCast(entry.header.timestamp_ns / std.time.ns_per_ms);
 
         return switch (etype) {
-            .processing_submit => self.replaySubmit(cmd.key, cmd.value, stamp_ms, out),
+            .processing_submit => self.replaySubmit(cmd.key, cmd.value, cmd.namespace_id, stamp_ms, out),
             .processing_stop => self.replayStatusChange(cmd.key, .stopped, out),
             .processing_cancel => self.replayStatusChange(cmd.key, .cancelled, out),
-            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_hash, out),
+            .processing_remove => self.replayRemove(cmd.key, cmd.namespace_id, out),
             .processing_checkpoint => self.replayCheckpoint(cmd.key, cmd.value),
             else => error.Halt,
         };
@@ -1027,7 +1071,7 @@ pub const ProcessingHandler = struct {
 
     /// Replay a processing_submit entry. Rebuilds JobRecord from persisted bytes.
     /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
+    fn replaySubmit(self: *ProcessingHandler, key: []const u8, value: []const u8, ns_id: NamespaceId, created_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         const job_id = key;
         if (value.len == 0 or value[0] != SUBMIT_LAYOUT) {
             log.err("processing job {s} not started: its submit entry is from an older server, with a parallelism the server no longer takes; submit the job again", .{job_id});
@@ -1111,6 +1155,7 @@ pub const ProcessingHandler = struct {
             .job_id_owned = owned_id,
             .name_owned = name,
             .namespace_owned = namespace,
+            .ns_id = ns_id,
             .status = status,
             .batch_size = batch_size,
             .yaml_owned = owned_yaml,
@@ -1167,11 +1212,11 @@ pub const ProcessingHandler = struct {
     /// Replay a processing_remove entry: drop the job and any pipelines it
     /// left. A running job stays, refused in log order on every replica; a
     /// job already gone was removed by an earlier entry.
-    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_hash: u32, out: *Result) persistence_mod.ApplyError!void {
+    fn replayRemove(self: *ProcessingHandler, key: []const u8, ns_id: NamespaceId, out: *Result) persistence_mod.ApplyError!void {
         const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
         // The leader checked this too (ownedJob); every replica holds the
         // entry to it, so a remove never reaches another namespace's job.
-        if (!inNamespace(job, ns_hash)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        if (!inNamespace(job, ns_id)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
         if (job.status == .running) return out.refuse(.conflict, .job_running, "job is running: stop or cancel it, then remove it");
         self.dropPipelines(key);
         var removed = self.jobs.fetchRemove(key).?;
@@ -1452,10 +1497,7 @@ pub const ProcessingHandler = struct {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const handlers = self.peer_kv_handlers orelse return null;
         if (self.own_shard >= handlers.len) return null;
-        const ns_handler = @import("../namespace/handler.zig");
-        var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
-        const entry = handlers[self.own_shard].*.kv.get(qkey) orelse return null;
+        const entry = handlers[self.own_shard].*.kv.getIn(self.namespaceIdOf(namespace), key) orelse return null;
         return entry.value;
     }
 
@@ -1554,11 +1596,20 @@ pub const ProcessingHandler = struct {
 
             // Only run for RUNNING jobs
             const job = self.jobs.getPtr(base_job_id) orelse continue;
-            if (job.status != .running) continue;
+            if (job.status != .running or job.held) continue;
 
             // Enforce poll interval
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
+            var why_buf: [256]u8 = undefined;
+            switch (self.sinksReady(shard, pipe, &why_buf)) {
+                .ready => {},
+                .wait => continue,
+                .refused => |why| {
+                    self.holdJob(job, why);
+                    continue;
+                },
+            }
             if (self.sinksHeld(shard, pipe)) {
                 held = true;
                 continue;
@@ -1597,7 +1648,7 @@ pub const ProcessingHandler = struct {
         // the series directly instead of being scanned for after the fact (which
         // also wasted the point budget on non-matching points).
         const result = shard.ts_handler.ts.queryRange(
-            router.namespaceHash(pipe.src_namespace),
+            shard.namespaceId(pipe.src_namespace),
             pipe.src_measurement,
             pipe.src_field,
             if (pipe.src_tag_hash != 0) pipe.src_tag_hash else null,
@@ -1838,7 +1889,11 @@ pub const ProcessingHandler = struct {
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`).
+                    // only to "default" (`crossShardSink`, `sinksReady`).
+                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
+                        continue;
+                    }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -1849,7 +1904,7 @@ pub const ProcessingHandler = struct {
                     const ts_h = self.resolveTsHandler(shard.ts_handler, snk.namespace, snk.measurement);
                     const ual_idx = ts_h.nextUalIndex();
                     ts_h.ts.insert(
-                        router.namespaceHash(snk.namespace),
+                        shard.namespaceId(snk.namespace),
                         snk.measurement,
                         snk.value_field,
                         field_value,
@@ -1886,7 +1941,11 @@ pub const ProcessingHandler = struct {
                     // The applier names the stream by resolving its
                     // namespace. Only this shard's handler may be touched
                     // from this thread; a sink on another shard writes
-                    // only to "default" (`crossShardSink`).
+                    // only to "default" (`crossShardSink`, `sinksReady`).
+                    if (sink_handler != shard.stream_handler and !std.mem.eql(u8, snk.namespace, "default")) {
+                        self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, "the stream is on another shard");
+                        continue;
+                    }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
@@ -1923,7 +1982,7 @@ pub const ProcessingHandler = struct {
                     continue;
                 }
                 const ual_idx = ts_h.nextUalIndex();
-                ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
+                ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, pair.key, value, now_ns, ual_idx, sink_tags) catch |err| {
                     self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
                     continue;
                 };
@@ -1936,7 +1995,7 @@ pub const ProcessingHandler = struct {
             (std.fmt.parseFloat(f64, payload) catch return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the record is not a number"));
         if (!std.math.isFinite(value)) return self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, "the value is not a finite number");
         const ual_idx = ts_h.nextUalIndex();
-        ts_h.ts.insert(router.namespaceHash(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
+        ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
     }
 
     const MAX_SINK_KEY = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
@@ -1971,17 +2030,14 @@ pub const ProcessingHandler = struct {
     fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_keys.qualifyKey(&qbuf, snk.namespace, full_key) catch |err| return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, switch (err) {
-            error.KeyHasNul => "key must not contain NUL",
-            error.KeyTooLarge => "namespace + key too large",
-        });
+        // As a client's key: the CLI and SDKs have never written one with NUL.
+        if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
         const owner = self.kvOwner(shard, snk.namespace, full_key);
         if (owner == shard.id) {
-            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, qkey, payload, snk.kv_ttl_ms)) |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
             return;
         }
-        const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .qkey = qkey, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
+        const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .key = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
             return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "out of memory");
         if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .kv_sink_put, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
             shard.allocator.free(message);
@@ -2010,6 +2066,10 @@ pub const ProcessingHandler = struct {
         const req = proto.Request{
             .header = makeSinkHeader(.queue_enqueue),
             .namespace = snk.namespace,
+            // The enqueue registers the queue under this id, as the applier
+            // files its messages: published before any sink writes
+            // (`sinksReady`).
+            .ns_id = self.namespaceIdOf(snk.namespace),
             .key = snk.target, // queue name
             .value = payload,
             .options = opt_buf[0..ob.offset],
@@ -2017,7 +2077,10 @@ pub const ProcessingHandler = struct {
         const q = self.resolveQueueHandler(shard.queue_handler, snk.namespace, snk.target);
         // The applier labels the queue by resolving its namespace; only
         // this shard's handler may be touched from this thread, and a sink
-        // on another shard writes only to "default" (`crossShardSink`).
+        // on another shard writes only to "default" (`crossShardSink`,
+        // `sinksReady`).
+        if (q != shard.queue_handler and !std.mem.eql(u8, snk.namespace, "default"))
+            return self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, "the queue is on another shard");
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
@@ -2152,7 +2215,7 @@ pub const ProcessingHandler = struct {
 
 fn applySubmit(h: *ProcessingHandler, key: []const u8, value: []const u8, created_at_ms: i64) persistence_mod.ApplyError!Result {
     var out: Result = .{};
-    try h.replaySubmit(key, value, created_at_ms, &out);
+    try h.replaySubmit(key, value, .default, created_at_ms, &out);
     return out;
 }
 
@@ -2361,7 +2424,7 @@ test "ProcessingHandler: a job is created at its submit entry's stamp, not the h
         @memcpy(value[8..15], "default");
         @memcpy(value[15 .. 15 + yaml.len], yaml);
         var pbuf: [1024]u8 = undefined;
-        _ = try applyLogged(&handler, &entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, 0, "job-1", value[0 .. 15 + yaml.len], &pbuf).?);
+        _ = try applyLogged(&handler, &entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, @as(u64, @intCast(stamp_ms)) * std.time.ns_per_ms, .default, "job-1", value[0 .. 15 + yaml.len], &pbuf).?);
         try std.testing.expectEqual(stamp_ms, (handler.jobs.get("job-1") orelse return error.JobNotCreated).created_at_ms);
     }
 }
@@ -2560,7 +2623,7 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
     var pbuf: [1024]u8 = undefined;
     const value = testSubmitValue(&buf, .stopped, yaml);
     for ([_]struct { []const u8, bool }{ .{ "job-1", false }, .{ "job-2", true }, .{ "job-1", false } }) |c| {
-        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, 0, c[0], value, &pbuf).?;
+        const entry = entry_mod.buildCommandEntry(.processing_submit, 0, 1, 1, 0, .default, c[0], value, &pbuf).?;
         var out = Result.start(&entry);
         try handler.replayEntry(&entry, &out);
         try std.testing.expectEqual(c[1], out.refused() != null);
@@ -2571,12 +2634,12 @@ test "ProcessingHandler: a submit past the job limit is refused in log order" {
 
 /// Applies a keyed entry of `etype` for job `key`, as the log does.
 fn applyKeyed(h: *ProcessingHandler, etype: EntryType, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
-    return applyKeyedIn(h, etype, router.namespaceHash(""), key, value);
+    return applyKeyedIn(h, etype, .default, key, value);
 }
 
-fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_hash: u32, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
+fn applyKeyedIn(h: *ProcessingHandler, etype: EntryType, ns_id: NamespaceId, key: []const u8, value: []const u8) persistence_mod.ApplyError!Result {
     var pbuf: [1024]u8 = undefined;
-    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_hash, key, value, &pbuf).?;
+    const entry = entry_mod.buildCommandEntry(etype, 0, 1, 1, 0, ns_id, key, value, &pbuf).?;
     return applyLogged(h, &entry);
 }
 
@@ -2599,13 +2662,13 @@ test "ProcessingHandler: a remove is refused while its job runs, and frees the s
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 2)).refused() != null);
 
     // Another namespace's remove finds no such job, on every replica.
-    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("other"), "job-1", "")).refused().?;
+    const elsewhere = (try applyKeyedIn(&handler, .processing_remove, .of(16), "job-1", "")).refused().?;
     try std.testing.expectEqual(proto.StatusCode.not_found, elsewhere.status);
     try std.testing.expect(handler.jobs.contains("job-1"));
 
     // Removed: the job, its pipeline and its slot are gone; "default" by
     // name is the bare namespace.
-    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, router.namespaceHash("default"), "job-1", "")).refused() == null);
+    try std.testing.expect((try applyKeyedIn(&handler, .processing_remove, .default, "job-1", "")).refused() == null);
     try std.testing.expectEqual(@as(usize, 0), handler.jobs.count());
     try std.testing.expectEqual(@as(usize, 0), handler.pipelines.count());
     try std.testing.expect((try applySubmit(&handler, "job-2", testSubmitValue(&buf, .stopped, lookup_yaml), 3)).refused() == null);
@@ -2678,10 +2741,10 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
         if (handler.peerShardId("default", c) == 1) elsewhere = c;
     }
     try std.testing.expect(elsewhere.len > 0);
-    const ns_handler = @import("../namespace/handler.zig");
-    var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
-    try t0.put(try ns_handler.qualifyKey(&qbuf, "default", elsewhere), "here", 0);
-    try t1.put(try ns_handler.qualifyKey(&qbuf, "default", "only-there"), "there", 0);
+    const Key = @import("../kv/state.zig").Key;
+    var kbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
+    try t0.put(Key.init(&kbuf, .default, elsewhere).stored, "here", 0);
+    try t1.put(Key.init(&kbuf, .default, "only-there").stored, "there", 0);
 
     try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
     try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);
@@ -2843,6 +2906,11 @@ test "ProcessingHandler: a stream or queue sink outside default on another shard
     handler.peer_shard_count = 4;
     handler.peer_partition_count = 256;
     handler.own_shard = 0;
+    // Routed by the id the node's table publishes for it.
+    const table = try @import("../namespace/table.zig").Table.create(allocator);
+    defer table.destroy();
+    try table.publish(@import("../namespace/table.zig").FIRST_ALLOCATED, "acme", 1);
+    handler.ns_table = table;
     // A target on this shard and one on another, in "acme".
     var here_buf: [16]u8 = undefined;
     var there_buf: [16]u8 = undefined;
@@ -3024,7 +3092,7 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     const ids = [_][]const u8{ "job-a", "job-b", "job-c" };
     for (ids, 1..) |id, i| _ = try applySubmit(&handler, id, testSubmitValue(&buf, .stopped, lookup_yaml), @intCast(i));
 
-    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), "", "", null, 0);
+    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), .{ .name = "" }, "", null, 0);
     try std.testing.expectEqual(ids.len, page.items.len);
     var seen: [ids.len]bool = @splat(false);
     for (page.items) |item| {

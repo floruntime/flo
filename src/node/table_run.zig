@@ -137,10 +137,10 @@ pub fn routeByKey(comptime name: []const u8) dispatcher_mod.PreRouteFn {
             if (@hasField(Request.Value, "routing_key")) {
                 var diag: schema.Diagnostic = .{};
                 if (Request.decodeAll(req.value, &diag)) |body| {
-                    if (body.routing_key) |k| return router.hashKeyWithNamespace(req.namespace, k);
+                    if (body.routing_key) |k| return router.routeNsKey(req.ns_id, k);
                 } else |_| {}
             }
-            return router.hashKeyWithNamespace(req.namespace, req.key);
+            return router.routeNsKey(req.ns_id, req.key);
         }
     }.route;
 }
@@ -155,7 +155,7 @@ pub fn routeByField(comptime name: []const u8) dispatcher_mod.PreRouteFn {
             var diag: schema.Diagnostic = .{};
             const body = o.request.decodeAll(req.value, &diag) catch return null;
             const v = @field(body, field) orelse return null;
-            return router.hashKeyWithNamespace(req.namespace, v);
+            return router.routeNsKey(req.ns_id, v);
         }
     }.route;
 }
