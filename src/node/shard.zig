@@ -15674,7 +15674,7 @@ test "queues: a dequeue with block_ms 0 answers at once with none; one that wait
     try std.testing.expectEqualStrings("woken", v.payloadOf(0));
 }
 
-test "queues: a report on a queue the leader doesn't hold, or in a namespace never made, answers each message gone and logs nothing" {
+test "queues: a report or purge on a queue the leader doesn't hold logs nothing, answering each message gone, or the namespace not found" {
     var t: QueuesTest = undefined;
     try t.init();
     defer t.deinit();
@@ -15682,24 +15682,77 @@ test "queues: a report on a queue the leader doesn't hold, or in a namespace nev
     const got = try t.dequeue("c1", 1, null, false);
     const before = t.a.shard.raft_node.log.lastIndex();
     var ib: [QueuesTest.Items.max_size]u8 = undefined;
-    var b: [QueuesTest.Complete.request.max_size]u8 = undefined;
-    const body = try QueuesTest.Complete.request.encodeInto(&b, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try QueuesTest.itemsOf(&ib, got) });
-    for ([_][]const u8{ "default", "never-made" }) |ns| {
+    const items = try QueuesTest.itemsOf(&ib, got);
+    var cb: [QueuesTest.Complete.request.max_size]u8 = undefined;
+    var fb: [QueuesTest.Fail.request.max_size]u8 = undefined;
+    var tb: [QueuesTest.Touch.request.max_size]u8 = undefined;
+    const ops_ = [_]struct { op: proto.OpCode, body: []const u8 }{
+        .{ .op = .queue_complete, .body = try QueuesTest.Complete.request.encodeInto(&cb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items }) },
+        .{ .op = .queue_fail, .body = try QueuesTest.Fail.request.encodeInto(&fb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items, .delay_ms = 0, .dead = true, .@"error" = "" }) },
+        .{ .op = .queue_touch, .body = try QueuesTest.Touch.request.encodeInto(&tb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = items }) },
+        .{ .op = .queue_purge, .body = "" },
+    };
+    for (ops_) |o| for ([_][]const u8{ "default", "never-made" }) |ns| {
         t.a.next_id += 1;
-        const frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_complete, t.a.next_id, ns, "other", body, ""));
+        const frame = try Shard.serializeRequest(std.testing.allocator, testReq(o.op, t.a.next_id, ns, "other", o.body, ""));
         defer std.testing.allocator.free(frame);
         _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
         _ = t.a.shard.applyCommitted();
         const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+        const named = std.mem.eql(u8, ns, "default");
+        if (o.op == .queue_purge) {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, resp.data[0..4], .little));
+            continue;
+        }
+        if (!named) {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), resp.header.status);
+            continue;
+        }
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
         var diag: schema.Diagnostic = .{};
-        const v = try QueuesTest.Complete.response.decodeAll(resp.data, &diag);
-        try std.testing.expectEqual(@as(u32, 0), v.applied);
-        var it = v.refused.iterator();
-        try std.testing.expect(std.mem.indexOf(u8, (try it.next()).?.reason, "no such message in this queue") != null);
-    }
+        const refused = if (o.op == .queue_touch) (try QueuesTest.Touch.response.decodeAll(resp.data, &diag)).refused else (try QueuesTest.Complete.response.decodeAll(resp.data, &diag)).refused;
+        var it = refused.iterator();
+        try std.testing.expectEqual(queue_machine.Why.gone, (try it.next()).?.why);
+    };
     try std.testing.expectEqual(before, t.a.shard.raft_node.log.lastIndex());
     try std.testing.expect(t.a.shard.halted == null);
+    // The real queue's message is untouched.
+    try std.testing.expectEqual(queue_machine.Status.leased, t.msg(got.seq[0]).?.status);
+}
+
+test "queues: an enqueue wakes one waiting dequeue per message: the rest keep waiting, and nothing more is logged" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    var waiting: [3]u64 = undefined;
+    for (&waiting, 0..) |*w, i| {
+        const consumer = [_]u8{ 'c', @intCast('0' + i) };
+        try t.a.feed(.queue_dequeue, "q", try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = &consumer, .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+        w.* = t.a.next_id;
+    }
+    const before = t.a.shard.raft_node.log.lastIndex();
+    try t.a.feed(.queue_enqueue, "q", "one");
+    _ = t.a.shard.applyCommitted();
+    // The enqueue and one deliver.
+    try std.testing.expectEqual(before + 2, t.a.shard.raft_node.log.lastIndex());
+    var rs: [2]proto.Response = undefined;
+    var buf: [4096]u8 = undefined;
+    try ParkTest.responses(&t.a.shard, t.a.c.conn, t.a.c.pair[1], &buf, &rs);
+    var answered: usize = 0;
+    for (rs) |r| for (waiting) |w| {
+        if (r.header.request_id == w) {
+            answered += 1;
+            try std.testing.expectEqualStrings("one", (try QueuesTest.gotOf(r.data)).payloadOf(0));
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1), answered);
+    try std.testing.expectEqual(@as(u16, 2), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+    // The duty's wake proposes nothing while nothing is due.
+    _ = t.a.shard.queue_handler.expireDue(&t.a.shard);
+    try std.testing.expectEqual(before + 2, t.a.shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u16, 2), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
 }
 
 test "queues: an enqueue's delay holds its message back until due, and a dedup key is refused" {

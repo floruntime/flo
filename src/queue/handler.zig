@@ -160,12 +160,14 @@ const DueReady = struct {
     }
 };
 
-/// Whether a queue has a ready message due by `now`, among the keys a
-/// deliver would look at.
-fn hasDue(shard: *Shard, ns: NamespaceId, hash: [8]u8, now: u64) bool {
+/// How many of a queue's ready messages are due by `now`, counting no
+/// further than `enough`, among the keys a deliver would look at.
+fn countDue(shard: *Shard, ns: NamespaceId, hash: [8]u8, now: u64, enough: u32) u32 {
     var pb: [4 + 9]u8 = undefined;
     var due = DueReady.init(shard, &pb, ns, &hash, now, machine.MAX_LOOKED_AT);
-    return due.next() != null;
+    var n: u32 = 0;
+    while (n < enough and due.next() != null) n += 1;
+    return n;
 }
 
 pub const QueueHandler = struct {
@@ -198,6 +200,12 @@ pub const QueueHandler = struct {
     /// Dequeues with ack, answered when their complete applies.
     acking: std.ArrayListUnmanaged(Acking) = .empty,
 
+    /// Per queue (namespace id, name hash), the messages delivers in
+    /// flight will take: a dequeue proposes one only for messages due
+    /// beyond these, so waiting consumers woken together don't each log a
+    /// deliver that finds nothing.
+    claimed: std.AutoHashMapUnmanaged([12]u8, u32) = .empty,
+
     const Acking = struct { index: u64, term: u64, reply_to: ReplyTo, request_id: u64, answer: []u8 };
 
     const Pending = struct {
@@ -207,7 +215,19 @@ pub const QueueHandler = struct {
         request_id: u64,
         /// A one-shot consume: completed as soon as it is answered.
         ack: bool,
+        queue: [12]u8,
+        claims: u32,
     };
+
+    fn queueKey(ns: NamespaceId, hash: [8]u8) [12]u8 {
+        return ns.bytes() ++ hash;
+    }
+
+    fn unclaim(self: *QueueHandler, queue: [12]u8, n: u32) void {
+        const got = self.claimed.getPtr(queue) orelse return;
+        got.* -|= n;
+        if (got.* == 0) _ = self.claimed.remove(queue);
+    }
 
     pub fn init(allocator: Allocator) QueueHandler {
         return .{ .allocator = allocator };
@@ -216,6 +236,7 @@ pub const QueueHandler = struct {
     pub fn deinit(self: *QueueHandler) void {
         if (self.answer_buf) |b| self.allocator.free(b);
         self.pending.deinit(self.allocator);
+        self.claimed.deinit(self.allocator);
         for (self.acking.items) |a| self.allocator.free(a.answer);
         self.acking.deinit(self.allocator);
     }
@@ -629,15 +650,22 @@ pub const QueueHandler = struct {
     fn deliverHere(self: *QueueHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, name: []const u8, p: Params) Error!bool {
         const hash = machine.hashOf(name);
         if (metaOf(shard, p.ns, name) == null) return false;
-        // The clock the deliver's stamp will read.
-        if (!hasDue(shard, p.ns, hash, shard.raft_node.now())) return false;
+        const queue = queueKey(p.ns, hash);
+        const held = self.claimed.get(queue) orelse 0;
+        // The clock the deliver's stamp will read. Messages delivers in
+        // flight will take aren't this dequeue's to propose for.
+        const due = countDue(shard, p.ns, hash, shard.raft_node.now(), held +| p.count);
+        if (due <= held) return false;
+        const take = @min(p.count, due - held);
         try self.pending.ensureUnusedCapacity(self.allocator, 1);
-        const max_bytes = queue_ops.MESSAGES_BYTES - p.count * MESSAGE_FRAMING;
-        const proposed = propose(shard, .queue_deliver, qe.Deliver.Value{ .ns = p.ns.int(), .queue = name, .count = p.count, .max_bytes = max_bytes, .holder = p.consumer, .lease_ms = p.lease_ms }) catch |err| {
+        try self.claimed.ensureUnusedCapacity(self.allocator, 1);
+        const max_bytes = queue_ops.MESSAGES_BYTES - take * MESSAGE_FRAMING;
+        const proposed = propose(shard, .queue_deliver, qe.Deliver.Value{ .ns = p.ns.int(), .queue = name, .count = take, .max_bytes = max_bytes, .holder = p.consumer, .lease_ms = p.lease_ms }) catch |err| {
             if (!shard.quietHalted(err)) log.warn("shard {d}: dequeue from queue {s} not proposed: {s}", .{ shard.id, name, @errorName(err) });
             return false;
         };
-        self.pending.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = reply_to, .request_id = request_id, .ack = p.ack });
+        self.claimed.putAssumeCapacity(queue, held + take);
+        self.pending.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = reply_to, .request_id = request_id, .ack = p.ack, .queue = queue, .claims = take });
         return true;
     }
 
@@ -648,8 +676,14 @@ pub const QueueHandler = struct {
             if (pd.index == e.header.index and pd.term == e.header.term) break i;
         } else return;
         const pd = self.pending.swapRemove(at);
+        self.unclaim(pd.queue, pd.claims);
         var diag: schema.Diagnostic = .{};
         const p = qe.Deliver.decodeAll(e.payload, &diag) catch return;
+        // A deliver that took fewer than it claimed left messages for the
+        // dequeues still waiting.
+        var took_r = result.reader();
+        const took = took_r.int(u32) orelse 0;
+        defer if (took < pd.claims) self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
         const ns: NamespaceId = .of(p.ns);
         const hash = machine.hashOf(p.queue);
         const buf = shard.allocator.create([@sizeOf(proto.ResponseHeader) + DequeueResponse.max_size]u8) catch
@@ -773,8 +807,8 @@ pub const QueueHandler = struct {
         return .{ .bytes = buf[0..items.bytes.len], .count = items.count };
     }
 
-    /// A report on a queue this leader doesn't hold, in a namespace that
-    /// may not exist: each message is gone, and nothing is logged.
+    /// A report on a queue this leader doesn't hold: each message is gone,
+    /// and nothing is logged.
     fn allGone(buf: []u8, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Value {
         var b = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Builder.init(buf);
         var it = messages.iterator();
@@ -785,6 +819,8 @@ pub const QueueHandler = struct {
     fn runComplete(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        // A namespace this node can't name, answered as a read of it is.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -801,6 +837,8 @@ pub const QueueHandler = struct {
     fn runFail(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value, delay_ms: u64, dead: bool, err_text: []const u8) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        // A namespace this node can't name, answered as a read of it is.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -820,6 +858,8 @@ pub const QueueHandler = struct {
     fn runTouch(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(TouchResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        // A namespace this node can't name, answered as a read of it is.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .expires_at_ms = 0, .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -939,8 +979,12 @@ pub const QueueHandler = struct {
         var w: usize = 0;
         var n: u32 = 0;
         var it = machine.pastDue(readOf(shard), now);
+        // Leases still in a new leader's grace are passed over, and count
+        // toward what one tick reads, so a backlog of them is read in steps.
+        var visited: usize = 0;
         while (it.next()) |due| {
-            if (n == ae.MAX_EXPIRE_ITEMS) break;
+            if (n == ae.MAX_EXPIRE_ITEMS or visited == 4 * ae.MAX_EXPIRE_ITEMS) break;
+            visited += 1;
             const k = due.key;
             if (k.id.len != qe.ID_LEN) continue;
             if (msgOf(shard, k.ns, k.id[0..8].*, machine.seqOf(k.id))) |m| if (m.status == .leased and m.expiry_ns == k.expiry_ns) {
@@ -967,6 +1011,7 @@ pub const QueueHandler = struct {
             shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages were given; any it leased come back once their lease runs out — retry" });
         }
         self.pending.clearRetainingCapacity();
+        self.claimed.clearRetainingCapacity();
         for (self.acking.items) |a| {
             shard.deliverDeferredRefusal(a.reply_to, a.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages' complete applied; if it didn't, they come back once their lease runs out" });
             self.allocator.free(a.answer);

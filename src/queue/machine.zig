@@ -264,7 +264,10 @@ pub const NO_QUEUE = "not found: no such queue";
 pub const NAME_TAKEN = "conflict: another queue's name hashes as this one's; choose another name";
 
 /// The most ready keys one deliver looks at: past it, a deliver takes what
-/// it found, so one held back by a long run of delayed messages is bounded.
+/// it found. A priority whose head isn't due is passed in one seek, so this
+/// bounds the seeks too: one per priority level, of which a u8 priority
+/// (`proto.Request.getPriority`) gives 256. A wider priority would let
+/// delayed levels use up the looks before a due one.
 pub const MAX_LOOKED_AT: usize = 256;
 
 /// Why a report applied nothing to one of its messages.
@@ -1006,7 +1009,7 @@ test "queue machine: a replica that replays the log holds the same state" {
     try testing.expectEqual(t.sums(), other.sums());
 }
 
-test "queue machine: a ready message costs its payload and a fixed few hundred bytes" {
+test "queue machine: a ready message's encoded state is its payload and a fixed few hundred bytes" {
     const store_mod = @import("../contract/store.zig");
     var m = emptyMsgForTest();
     const fixed = try Msg.encodedSize(m);
@@ -1017,7 +1020,8 @@ test "queue machine: a ready message costs its payload and a fixed few hundred b
     var rb: [M.MAX_KEY]u8 = undefined;
     const ready_key = 4 + M.readyKeyOf(&rb, m, 0, &idOf(hashOf("q"), 1)).len;
     const per_message = fixed + (4 + qe.ID_LEN) + ready_key + 2 * (@sizeOf(store_mod.Record) + store_mod.RECORD_OVERHEAD);
-    // 309 bytes on a 64-bit build: 104 encoded, a 41-byte ready key, two 64-byte records.
+    // 309 bytes as encoded state; measured in RAM (macOS, ReleaseSafe,
+    // 100,000 messages of 100 bytes), 336 bytes besides the payload.
     try testing.expect(per_message < 400);
 }
 
