@@ -321,3 +321,189 @@ test "e2e/halt: a follower that halts where its leader applied halted alone and 
         try testing.expectEqualStrings("x", std.mem.trim(u8, x, &std.ascii.whitespace));
     }
 }
+
+// =============================================================================
+// Held duties
+// =============================================================================
+
+fn metricsBody(ctx: *stdx.testing.TestContext) ![]u8 {
+    const http = try ctx.createMetricsHttp();
+    defer http.deinit();
+    var resp = try http.get("/metrics");
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    return testing.allocator.dupe(u8, resp.body);
+}
+
+fn expectMetric(ctx: *stdx.testing.TestContext, line: []const u8) !void {
+    for (0..40) |_| {
+        const body = try metricsBody(ctx);
+        defer testing.allocator.free(body);
+        if (std.mem.indexOf(u8, body, line) != null) return;
+        stdx.time.sleep(250 * std.time.ns_per_ms);
+    }
+    std.debug.print("no metric line {s}\n", .{line});
+    return error.TestUnexpectedResult;
+}
+
+/// Which shard the server routes `key` to in "default" on `shards` shards.
+fn shardOf(shards: u16, key: []const u8) u16 {
+    const r = src.node.router.Router.init(0, shards, 0);
+    return switch (r.route(src.node.router.hashKeyWithNamespace("default", key))) {
+        .local => 0,
+        .shard => |t| t.shard_id,
+    };
+}
+
+test "e2e/halt: a halted shard's schedule stops starting runs, and shows as a held duty" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    const path = try stdx.testing.writeTempYaml(testing.allocator,
+        \\kind: Workflow
+        \\name: ticking
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 100
+        \\  max_concurrent: 1000
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , "ticking.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+    try expectMetric(ctx, "flo_shard_duties_held{shard_id=\"0\"} 0");
+    {
+        var r = try ctx.execResult(&.{ "kv", "set", HALT_KEY, "x" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 6), r.exit_code);
+    }
+    try expectMetric(ctx, "flo_shard_duties_held{shard_id=\"0\"} 1");
+    const runs = try ctx.execCapture(&.{ "workflow", "list-runs", "-w", "ticking", "--limit", "1000" });
+    const before = std.mem.count(u8, runs, "\n");
+    stdx.time.sleep(600 * std.time.ns_per_ms);
+    const later = try ctx.execCapture(&.{ "workflow", "list-runs", "-w", "ticking", "--limit", "1000" });
+    try testing.expectEqual(before, std.mem.count(u8, later, "\n"));
+    try testing.expect(try ctx.server.logsContain("leader duties held: schedules"));
+
+    // Across a restart the shard leads again, halted and never ready: its
+    // duties are still held, and said so.
+    try ctx.restartServer();
+    try expectMetric(ctx, "flo_shard_duties_held{shard_id=\"0\"} 1");
+    try testing.expect(try ctx.server.logsContain("leader duties held: schedules"));
+}
+
+test "e2e/halt: a halted shard's own processing job reads nothing, and shows as a held duty" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 1, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    try ctx.exec(&.{ "stream", "append", "job-in", "a" });
+    const path = try stdx.testing.writeTempYaml(testing.allocator,
+        \\kind: Processing
+        \\name: own-job
+        \\sources:
+        \\  - stream:
+        \\      name: job-in
+        \\sinks:
+        \\  - stream:
+        \\      name: job-out
+    , "own-job.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "processing", "submit", path });
+    {
+        var r = try ctx.execResult(&.{ "kv", "set", HALT_KEY, "x" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 6), r.exit_code);
+    }
+    try expectMetric(ctx, "flo_shard_duties_held{shard_id=\"0\"} 1");
+    try testing.expect(try ctx.server.logsContain("leader duties held: processing"));
+}
+
+test "e2e/halt: a pipeline whose KV sink can reach a halted shard reads nothing until it serves, even for keys a serving shard owns" {
+    if (!test_faults.enabled) return error.SkipZigTest;
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
+        .server = .{ .shards = 2, .durability = .sync, .metrics_enabled = true },
+    });
+    defer ctx.deinit();
+    const halted = shardOf(2, HALT_KEY);
+    const serving: u16 = 1 - halted;
+    // The source stream, and the keys its records write, on the shard that
+    // keeps serving.
+    var name_buf: [32]u8 = undefined;
+    const stream = for (0..256) |i| {
+        const n = try std.fmt.bufPrint(&name_buf, "held-src-{d}", .{i});
+        if (shardOf(2, n) == serving) break n;
+    } else return error.NoName;
+    var ids: [2][16]u8 = undefined;
+    var found: usize = 0;
+    var key_buf: [32]u8 = undefined;
+    for (0..256) |i| {
+        if (found == ids.len) break;
+        const id = try std.fmt.bufPrint(&ids[found], "u{d}", .{i});
+        if (shardOf(2, try std.fmt.bufPrint(&key_buf, "held:{s}", .{id})) == serving) found += 1;
+    }
+    try testing.expectEqual(ids.len, found);
+
+    var record_buf: [64]u8 = undefined;
+    var id0_buf: [16]u8 = undefined;
+    var id1_buf: [16]u8 = undefined;
+    const id0 = idOf(&ids[0], &id0_buf);
+    const id1 = idOf(&ids[1], &id1_buf);
+    try ctx.exec(&.{ "stream", "append", stream, try std.fmt.bufPrint(&record_buf, "{{\"user_id\":\"{s}\"}}", .{id0}) });
+    var job_buf: [512]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf,
+        \\kind: Processing
+        \\name: held-job
+        \\sources:
+        \\  - stream:
+        \\      name: {s}
+        \\operators:
+        \\  - type: keyby
+        \\    name: by-user
+        \\    key_expression: $.user_id
+        \\sinks:
+        \\  - kv:
+        \\      key_prefix: held
+    , .{stream});
+    const path = try stdx.testing.writeTempYaml(testing.allocator, job, "held-job.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "processing", "submit", path });
+    var k0: [32]u8 = undefined;
+    try testing.expect(try kvWait(ctx, try std.fmt.bufPrint(&k0, "held:{s}", .{id0}), 6000));
+
+    {
+        var r = try ctx.execResult(&.{ "kv", "set", HALT_KEY, "x" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 6), r.exit_code);
+    }
+    var metric_buf: [64]u8 = undefined;
+    try expectMetric(ctx, try std.fmt.bufPrint(&metric_buf, "flo_shard_duties_held{{shard_id=\"{d}\"}} 1", .{serving}));
+    try ctx.exec(&.{ "stream", "append", stream, try std.fmt.bufPrint(&record_buf, "{{\"user_id\":\"{s}\"}}", .{id1}) });
+    // Its key's shard serves, but the pipeline holds.
+    var k1: [32]u8 = undefined;
+    try testing.expect(!try kvWait(ctx, try std.fmt.bufPrint(&k1, "held:{s}", .{id1}), 1500));
+}
+
+fn idOf(raw: *const [16]u8, out: *[16]u8) []const u8 {
+    var n: usize = 1;
+    while (n < raw.len and std.ascii.isDigit(raw[n])) n += 1;
+    @memcpy(out[0..n], raw[0..n]);
+    return out[0..n];
+}
+
+/// Whether `key` is set within `ms`.
+fn kvWait(ctx: *stdx.testing.TestContext, key: []const u8, ms: u64) !bool {
+    for (0..ms / 100) |_| {
+        var r = try ctx.execResult(&.{ "kv", "get", key });
+        defer r.deinit();
+        if (r.exit_code == 0 and r.stdout.len > 0) return true;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    return false;
+}

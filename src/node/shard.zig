@@ -81,6 +81,7 @@ const contract_machines = @import("../contract/machines.zig");
 const repair = @import("repair.zig");
 const Scratch = @import("scratch.zig").Scratch;
 const health_mod = @import("health.zig");
+const duties_mod = @import("duties.zig");
 const build_options = @import("build_options");
 const txn_mod = @import("../kv/txn.zig");
 const stream_mod = @import("../projection/stream.zig");
@@ -480,6 +481,11 @@ pub const Shard = struct {
     losses: silent_loss.Counts,
     /// Where this shard publishes its state for `/ready` and `/status`.
     health: ?*health_mod.ShardSlot = null,
+    /// Every shard's slot on this node, this one's among them: how a duty
+    /// here knows the shard it writes to is halted.
+    node_health: []health_mod.ShardSlot = &.{},
+    /// The leader duties held back, and since when.
+    duties: duties_mod.Duties = .{},
     join_first_asked_ms: u64,
     join_warned_ms: u64,
     join_refused_warn_ms: u64,
@@ -630,6 +636,8 @@ pub const Shard = struct {
     pub const Boot = struct {
         /// Where replay progress is published while the shard boots.
         health: ?*health_mod.ShardSlot = null,
+        /// Every shard's slot on the node.
+        node_health: []health_mod.ShardSlot = &.{},
         /// Set when another shard's boot failed: replay stops early, so the
         /// failure is reported without waiting for every replay to finish.
         cancel: ?*const std.atomic.Value(bool) = null,
@@ -1078,6 +1086,7 @@ pub const Shard = struct {
             .offline_published = .init(cluster_role == .single and boot_damage != null),
             .losses = losses,
             .health = boot.health,
+            .node_health = boot.node_health,
             .join_first_asked_ms = 0,
             .join_warned_ms = 0,
             .join_refused_warn_ms = 0,
@@ -4053,10 +4062,13 @@ pub const Shard = struct {
     /// before the client port opens, so the first answers are already right.
     pub fn publishHealth(self: *Shard) void {
         self.publishLiveKeys();
+        self.duties.summarize(self.id, nowMs());
         if (self.shard_metrics) |sm| {
             sm.setSilentLoss(self.losses.counts, self.losses.duplicate_index, self.offline != null);
             sm.processing_failed_jobs.store(self.processing_handler.failed_jobs, .monotonic);
             sm.processing_held_jobs.store(self.processing_handler.held_jobs, .monotonic);
+            sm.duties_held.store(self.duties.held(), .monotonic);
+            sm.duty_oldest_held_ms.store(self.duties.oldestMs(nowMs()), .monotonic);
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
         }
         const slot = self.health orelse return;
@@ -4681,13 +4693,10 @@ pub const Shard = struct {
         // cursors and counts are behind what the log says.
         const leads = self.raft_node.leaderReady() and self.offline == null;
         if (leads) self.producer_ticks += 1;
-        if (leads) self.processing_handler.tickPipelines(self);
-
-        // Drive workflow stream triggers (poll streams → start runs)
-        if (leads) self.workflow_handler.tickStreamTriggers(self);
-
-        // Drive workflow scheduled triggers (interval → start runs)
-        if (leads) self.workflow_handler.tickSchedules(self);
+        // A halted shard's leader is never ready (its applied index stops
+        // short of the halt), yet its duties are still its own: held.
+        const holds = self.raft_node.role == .leader and self.offline == null and self.halted != null;
+        if (leads or holds) self.runProducers() else self.duties.clear();
 
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
@@ -4698,34 +4707,88 @@ pub const Shard = struct {
         // node's table, and what waited for them is answered.
         self.namespace_handler.settle(self);
 
-        if (leads) {
-            // Take the first step of runs whose start has applied, then
-            // resume waiting runs whose action or child finished (both
-            // propose the run's next entries, so leader-only too). On a
-            // single node what a pass proposes applies at once, so a child
-            // started in one pass takes its first step in the next rather
-            // than a tick later.
-            var pass: u8 = 0;
-            self.more_work = true;
-            while (pass < STEP_PASSES) : (pass += 1) {
-                const before = self.raft_node.last_applied;
-                self.workflow_handler.advanceStartedRuns(self);
-                self.workflow_handler.checkPendingActions(self);
-                _ = self.applyCommitted();
-                // Only what applied can be stepped; in a cluster what a
-                // pass proposed waits for an ack, so one pass is all.
-                if (self.raft_node.last_applied == before) {
-                    self.more_work = false;
-                    break;
-                }
-            }
-            // What the tick proposed goes to the followers now, not at the
-            // next poll.
-            if (self.raft_node.role == .leader) self.replica.pump(nowMs());
-        }
+        if (leads or holds) self.runStepping();
 
         self.settleConnections();
         return events.len;
+    }
+
+    /// The leader's stepping duty: first steps of runs whose start has
+    /// applied, and runs whose action or child finished.
+    pub fn runStepping(self: *Shard) void {
+        if (self.heldIfHalted(.workflow_steps, self.workflow_handler.hasDutyWork())) {
+            // Nothing will step while halted: the loop needn't poll again
+            // at once for it.
+            self.more_work = false;
+            return;
+        }
+        self.duties.note(.workflow_steps, null, nowMs());
+        // Take the first step of runs whose start has applied, then
+        // resume waiting runs whose action or child finished (both
+        // propose the run's next entries, so leader-only too). On a
+        // single node what a pass proposes applies at once, so a child
+        // started in one pass takes its first step in the next rather
+        // than a tick later.
+        var pass: u8 = 0;
+        self.more_work = true;
+        while (pass < STEP_PASSES) : (pass += 1) {
+            const before = self.raft_node.last_applied;
+            self.workflow_handler.advanceStartedRuns(self);
+            self.workflow_handler.checkPendingActions(self);
+            _ = self.applyCommitted();
+            // Only what applied can be stepped; in a cluster what a
+            // pass proposed waits for an ack, so one pass is all.
+            if (self.raft_node.last_applied == before) {
+                self.more_work = false;
+                break;
+            }
+        }
+        // What the tick proposed goes to the followers now, not at the
+        // next poll.
+        if (self.raft_node.role == .leader) self.replica.pump(nowMs());
+    }
+
+    /// The producers a leader runs each tick: processing pulls, then stream
+    /// triggers and schedules starting runs. They only propose.
+    pub fn runProducers(self: *Shard) void {
+        const now = nowMs();
+        // Drive processing pipelines (poll sources → write sinks)
+        if (!self.heldIfHalted(.processing, self.processing_handler.pipelines.count() > 0)) {
+            self.duties.note(.processing, if (self.processing_handler.tickPipelines(self)) .sink_halted else null, now);
+        }
+        // Drive workflow stream triggers (poll streams → start runs)
+        if (!self.heldIfHalted(.stream_triggers, self.workflow_handler.stream_triggers.count() > 0)) {
+            self.workflow_handler.tickStreamTriggers(self);
+            self.duties.note(.stream_triggers, null, now);
+        }
+        // Drive workflow scheduled triggers (interval → start runs)
+        if (!self.heldIfHalted(.schedules, self.workflow_handler.schedules.count() > 0)) {
+            self.workflow_handler.tickSchedules(self);
+            self.duties.note(.schedules, null, now);
+        }
+    }
+
+    /// A halted shard's duties stop: state before the halt is all there is,
+    /// and a proposal would be refused. One with work to do counts as held.
+    /// Returns whether `d` is held; when it isn't, the caller notes how it
+    /// ran.
+    pub fn heldIfHalted(self: *Shard, d: duties_mod.Duty, has_work: bool) bool {
+        if (self.halted == null) return false;
+        self.duties.note(d, if (has_work) .shard_halted else null, nowMs());
+        return true;
+    }
+
+    /// Whether shard `id` on this node is halted, as it last published.
+    pub fn shardHalted(self: *const Shard, id: u16) bool {
+        if (id == self.id) return self.halted != null;
+        if (id >= self.node_health.len) return false;
+        return self.node_health[id].get() == .halted;
+    }
+
+    /// Whether any other shard on this node is halted.
+    pub fn peerHalted(self: *const Shard) bool {
+        for (self.node_health, 0..) |*slot, i| if (i != self.id and slot.get() == .halted) return true;
+        return false;
     }
 
     /// Enter the main reactor loop. Blocks until `shutdown()` is called.
@@ -5084,6 +5147,8 @@ pub const Shard = struct {
         // Trims are proposals: only the leader makes them.
         if (self.raft_node.role != .leader) return 0;
         const proj = self.stream_handler.stream;
+        if (self.heldIfHalted(.stream_retention, self.halted != null and anyRetention(proj))) return 0;
+        self.duties.note(.stream_retention, null, nowMs());
         const now_ns = self.raft_node.now();
         var trims_proposed: u64 = 0;
 
@@ -5122,6 +5187,12 @@ pub const Shard = struct {
         }
 
         return trims_proposed;
+    }
+
+    fn anyRetention(proj: anytype) bool {
+        var it = proj.stream_metadata.valueIterator();
+        while (it.next()) |meta| if (meta.hasRetention()) return true;
+        return false;
     }
 
     /// TaskScheduler callback: on the leader, end action leases past their
@@ -17102,6 +17173,131 @@ test "a workflow cancel whose entry a later leader replaces is told the leader c
     try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
     try std.testing.expect(!WorkflowHandler.cancelInFlight(&t.shard, run));
+}
+
+test "a halted shard's duties stop, and one with work counts as held until the shard serves again" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    // A workflow whose schedule is due on every tick.
+    const def =
+        \\{"kind":"Workflow","name":"tick","version":"1.0.0","schedule":{"interval":1,"max_concurrent":1000},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 1, "tick", def);
+    try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.schedules.count());
+
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    const before = shard.raft_node.log.lastIndex();
+    @import("stdx").time.sleep(2 * std.time.ns_per_ms);
+    shard.runProducers();
+    try std.testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
+
+    shard.halted = null;
+    @import("stdx").time.sleep(2 * std.time.ns_per_ms);
+    shard.runProducers();
+    try std.testing.expect(shard.raft_node.log.lastIndex() > before);
+    try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
+
+    // A run started and not yet stepped, held while halted.
+    _ = shard.applyCommitted();
+    try std.testing.expect(shard.workflow_handler.started_to_advance.items.len > 0);
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    const queued = shard.workflow_handler.started_to_advance.items.len;
+    shard.runStepping();
+    try std.testing.expectEqual(queued, shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
+    shard.halted = null;
+    shard.runStepping();
+    try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
+
+    // A stream past its retention: no trim while halted.
+    const h = node_router.nameHash(node_router.namespaceHash(""), "kept");
+    try shard.stream_handler.stream.registerStreamMetadata("kept", .{ .name_hash = h, .retention_count = 1 });
+    for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 1, 1, 1);
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
+    try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
+    shard.halted = null;
+    try std.testing.expect(Shard.streamRetentionTask(@ptrCast(&shard)) > 0);
+    try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
+}
+
+test "a halted shard's leader, ready or not, holds its duties and doesn't spin the loop for them" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const scheduled =
+        \\{"kind":"Workflow","name":"tick","version":"1.0.0","schedule":{"interval":1,"max_concurrent":1000},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 1, "tick", scheduled);
+    const triggered =
+        \\{"kind":"Workflow","name":"on-events","version":"1.0.0","trigger":{"stream":"events"},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 2, "on-events", triggered);
+    try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.stream_triggers.count());
+    // A run waiting on its first step: stepping has work.
+    try ParkTest.send(&shard, conn, .workflow_start, 3, "tick", "");
+    try std.testing.expect(shard.workflow_handler.hasDutyWork());
+
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    for ([_]bool{ true, false }) |ready| {
+        // Elected again while halted, a leader's applied index stops short
+        // of what it must apply first: never ready.
+        const r = shard.raft_node;
+        const ready_index = r.ready_index;
+        if (!ready) r.ready_index = r.last_applied + 100;
+        defer r.ready_index = ready_index;
+        try std.testing.expectEqual(ready, r.leaderReady());
+        shard.duties.clear();
+        shard.more_work = true;
+        const before = r.log.lastIndex();
+        _ = try shard.tick(0);
+        _ = try shard.tick(0);
+        try std.testing.expect(!shard.more_work);
+        try std.testing.expectEqual(before, r.log.lastIndex());
+        // Schedules, stream triggers and stepping.
+        try std.testing.expectEqual(@as(u32, 3), shard.duties.held());
+    }
+    shard.halted = null;
+}
+
+test "a shard reads whether another on its node is halted from that one's published state" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 3, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    var slots: [3]health_mod.ShardSlot = @splat(.{});
+    shard.node_health = &slots;
+    try std.testing.expect(!shard.peerHalted());
+    slots[0].set(.halted); // its own slot: its own state says
+    try std.testing.expect(!shard.peerHalted());
+    try std.testing.expect(!shard.shardHalted(0));
+    slots[2].set(.halted);
+    try std.testing.expect(shard.peerHalted());
+    try std.testing.expect(shard.shardHalted(2));
+    try std.testing.expect(!shard.shardHalted(1));
 }
 
 test "an entry stamped no later than the one before it halts its shard" {
