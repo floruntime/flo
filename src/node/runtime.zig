@@ -118,6 +118,11 @@ pub const RuntimeConfig = struct {
     worker_heartbeat_timeout_ms: u64 = 90_000,
     max_txn_ops: u16 = @import("../protocol/limits.zig").DEFAULT_MAX_OPS_PER_TXN,
     max_txn_bytes: u32 = @import("../protocol/limits.zig").DEFAULT_MAX_BYTES_PER_TXN,
+    /// How many client connections the node holds at once. 0 derives it from
+    /// the open-file limit (limit minus a reserve, capped for memory); a set
+    /// value is used as given. Over it, a new connection is accepted and closed
+    /// at once rather than held.
+    max_connections: u32 = 0,
     worker_remove_after_ms: u64 = 600_000,
     /// How long a workflow step waits for its action to be registered.
     missing_action_wait_ms: u64 = 600_000,
@@ -296,6 +301,13 @@ pub const Runtime = struct {
 
     /// Effective shard count (auto-detected or configured).
     shard_count: u16,
+
+    /// The node's live count of held client connections, for the acceptor's
+    /// connection cap: the acceptor reserves a slot before hand-off, a shard
+    /// releases it when the connection closes. Owned here so the cap holds
+    /// whether or not metrics are on, and lives as long as the shards and the
+    /// acceptor that point at it.
+    active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Per-shard state. Each shard runs on its own thread.
     shards: ?[]Shard,
@@ -815,6 +827,7 @@ pub const Runtime = struct {
         // Must happen after shards are at final heap addresses.
         // Also wire shard back-pointers for handlers that need Raft access.
         for (0..self.shard_count) |i| {
+            shards[i].active_connections = &self.active_connections;
             shards[i].worker_handler.heartbeat_timeout_ms = self.config.worker_heartbeat_timeout_ms;
             shards[i].kv_handler.txn_table.max_ops = self.config.max_txn_ops;
             shards[i].kv_handler.txn_table.max_bytes = self.config.max_txn_bytes;
@@ -950,6 +963,23 @@ pub const Runtime = struct {
 
         // 4. Create and start acceptor
         var acceptor = Acceptor.init(write_ends, shards[0].router);
+        const acceptor_mod = @import("acceptor.zig");
+        const soft_limit = stdx.process.softOpenFileLimit();
+        const cap = acceptor_mod.connectionCap(self.config.max_connections, soft_limit, self.shard_count);
+        acceptor.active_connections = &self.active_connections;
+        acceptor.max_connections = cap.value;
+        if (self.metrics_registry) |m| acceptor.server_metrics = &m.server;
+        log.info("holding up to {d} client connections at once; over that, a connection is accepted and closed", .{cap.value});
+        if (cap.limit_unreadable) {
+            log.warn("could not read the open-file limit; holding a fixed {d} client connections. Set [server] max_connections, or check the limit", .{cap.value});
+        } else if (cap.floored or cap.value < 1024) {
+            log.warn("the open-file limit ({d}) is low, so only {d} client connections are held; raise the limit (a packaged unit sets LimitNOFILE) or set [server] max_connections", .{ soft_limit, cap.value });
+        }
+        // A configured value above what the limit leaves is allowed, but say so:
+        // the node may run out of descriptors for its files, HTTP and peers.
+        if (self.config.max_connections > 0 and soft_limit > 0 and self.config.max_connections > soft_limit -| acceptor_mod.connectionReserve(self.shard_count)) {
+            log.warn("[server] max_connections = {d} is above what the open-file limit ({d}) leaves after the reserve; the node may run short of descriptors for files, HTTP and peers", .{ self.config.max_connections, soft_limit });
+        }
         try acceptor.listenOn(client_fd);
         client_fd_owned = false;
         try self.listenAdmin(&acceptor, data_dir);
@@ -1354,10 +1384,13 @@ fn shardThread(shard: *Shard) void {
 fn acceptorThread(acc: *Acceptor) void {
     acc.running.store(true, .release);
     while (acc.running.load(.acquire)) {
-        _ = acc.acceptOne() catch {};
+        // An error (not a no-op "nothing pending") means accept itself failed —
+        // the open-file limit reached, say. Without a longer pause it would
+        // retry thousands of times a second; wait as the HTTP servers do until a
+        // descriptor frees, rather than busy-spin.
+        const accept_failed = if (acc.acceptOne()) |_| false else |_| true;
         acc.acceptAdmin() catch {};
-        // Small yield to avoid busy-spin when no connections pending
-        stdx.time.sleep(100_000); // 100μs
+        stdx.time.sleep(if (accept_failed) 10_000_000 else 100_000); // 10ms on failure, else a 100μs yield
     }
 }
 

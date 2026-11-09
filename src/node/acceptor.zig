@@ -24,6 +24,7 @@ const proto = @import("../protocol/proto.zig");
 const Router = @import("router.zig").Router;
 const routing = @import("router.zig");
 const connection = @import("connection.zig");
+const ServerMetrics = @import("../metrics/registry.zig").ServerMetrics;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Acceptor
@@ -32,6 +33,74 @@ const connection = @import("connection.zig");
 /// Set on an fd handed to a shard when it came from the admin socket. Fds
 /// are small non-negative numbers, so the bit is free.
 pub const ADMIN_TAG: i32 = 1 << 30;
+
+/// Fds a node needs that are not client connections. Roughly fixed: the listen
+/// sockets, stdio, the two HTTP servers (64 connections each) and peer links
+/// (RaftNode.MAX_PEERS). Per shard: its hand-off pipe and the handful of files
+/// it keeps open. Sealed segments are opened to read and closed again, not held
+/// open while idle, so they are not in here. The cap leaves this many below the
+/// open-file limit so those keep working while connections are held.
+pub const RESERVE_FIXED: u32 = 224;
+pub const RESERVE_PER_SHARD: u32 = 8;
+
+/// A ceiling on held connections regardless of how high the open-file limit is:
+/// each connection costs roughly 125 KiB of RSS (two 64 KiB I/O buffers), so on
+/// a host whose limit is very high (a packaged Linux unit allows ~1M) memory
+/// would go before descriptors. About 2 GiB of connection buffers. An operator
+/// who wants more sets `max_connections`.
+pub const MAX_CONNECTIONS_CEILING: u32 = 16_384;
+
+/// The cap when the open-file limit can't be read: a fixed, usable number
+/// rather than a derived one (and never 1), with a warning at start.
+pub const UNREADABLE_LIMIT_CAP: u32 = 1024;
+
+/// The reserve to leave below the open-file limit, given the shard count.
+pub fn connectionReserve(shards: u16) u32 {
+    return RESERVE_FIXED + RESERVE_PER_SHARD * @as(u32, shards);
+}
+
+/// The connection cap, with whether a floor or fallback worth a warning applied.
+pub const Cap = struct {
+    value: u32,
+    /// The quarter-of-the-limit floor applied — the reserve would have left too
+    /// few — so the limit is low and worth raising.
+    floored: bool = false,
+    /// The limit could not be read; `value` is the fixed fallback.
+    limit_unreadable: bool = false,
+};
+
+/// A configured value is used as given. Otherwise the cap is the open-file limit
+/// minus the reserve, floored at a quarter of the limit (so a low limit still
+/// holds a useful number rather than almost none) and bounded by the memory
+/// ceiling. An unreadable limit (0) uses a fixed fallback. Pure, so the
+/// derivation is tested without a host whose limit varies.
+pub fn connectionCap(configured: u32, open_file_limit: u64, shards: u16) Cap {
+    if (configured > 0) return .{ .value = configured };
+    if (open_file_limit == 0) return .{ .value = UNREADABLE_LIMIT_CAP, .limit_unreadable = true };
+    const floor = open_file_limit / 4;
+    const after_reserve = open_file_limit -| connectionReserve(shards);
+    const base = @max(after_reserve, floor);
+    const value: u32 = @intCast(@max(@min(base, @as(u64, MAX_CONNECTIONS_CEILING)), 1));
+    return .{ .value = value, .floored = after_reserve < floor };
+}
+
+test "acceptor: the connection cap derives from the limit, floors at a quarter, caps at the ceiling, and falls back when unreadable" {
+    const E = std.testing.expectEqual;
+    // A configured value wins outright.
+    try E(@as(u32, 5000), connectionCap(5000, 256, 4).value);
+    // Derived: the limit minus the reserve (224 + 8 × shards).
+    try E(@as(u32, 10_240 - connectionReserve(4)), connectionCap(0, 10_240, 4).value);
+    // The memory ceiling bounds a very high limit (e.g. a packaged Linux unit).
+    try E(MAX_CONNECTIONS_CEILING, connectionCap(0, 1_048_576, 4).value);
+    // A low limit floors at a quarter, not near-zero, and flags it.
+    const low = connectionCap(0, 256, 1); // reserve 232 → 24 after reserve, floor 64
+    try E(@as(u32, 64), low.value);
+    try E(true, low.floored);
+    // An unreadable limit uses the fixed fallback, flagged, never 1.
+    const unread = connectionCap(0, 0, 4);
+    try E(UNREADABLE_LIMIT_CAP, unread.value);
+    try E(true, unread.limit_unreadable);
+}
 
 pub const Acceptor = struct {
     /// Listen socket fd.
@@ -63,6 +132,21 @@ pub const Acceptor = struct {
 
     /// Stats: connections round-robined.
     routed_round_robin: u64,
+
+    /// The node's live count of held client connections, owned here and
+    /// decremented by a shard when one closes — not a metric, so the cap holds
+    /// whether or not metrics are on. The acceptor is the only writer that
+    /// increments it (reserving a slot before hand-off), so a load-then-reserve
+    /// needs no lock. Null only in unit tests that don't exercise the cap.
+    active_connections: ?*std.atomic.Value(u32) = null,
+
+    /// Where rejections are counted for `/metrics`, when metrics are on. The cap
+    /// itself does not depend on this; it is observation only.
+    server_metrics: ?*ServerMetrics = null,
+
+    /// How many connections the node holds at once; 0 means no cap. The runtime
+    /// sets it from `connectionCap` after init.
+    max_connections: u32 = 0,
 
     pub fn init(
         shard_pipes: []i32,
@@ -131,6 +215,28 @@ pub const Acceptor = struct {
             return err;
         };
         errdefer _ = std.c.close(client_fd);
+
+        // At the connection cap, take the connection off the backlog and close
+        // it at once rather than hold it: the client is told now instead of
+        // hanging, and the node keeps the descriptors and memory its
+        // connections, files and peers need. The count is the node's own, not a
+        // metric, so the cap holds with metrics off; rejections are counted for
+        // /metrics only when they are on.
+        if (self.max_connections > 0) if (self.active_connections) |active| {
+            if (active.load(.monotonic) >= self.max_connections) {
+                _ = std.c.close(client_fd);
+                if (self.server_metrics) |sm| sm.recordConnectionRejected();
+                return null;
+            }
+            // Reserve the slot before hand-off so a burst can't overshoot while
+            // a shard is still counting the ones already sent; the shard
+            // releases it when the connection closes, and the errdefer below
+            // releases it if the hand-off fails.
+            _ = active.fetchAdd(1, .monotonic);
+        };
+        errdefer if (self.max_connections > 0) if (self.active_connections) |active| {
+            _ = active.fetchSub(1, .monotonic);
+        };
 
         // Make socket non-blocking explicitly (since SOCK.NONBLOCK on accept
         // is not portable across all macOS releases).
@@ -361,6 +467,41 @@ test "Acceptor: socket options on a closed connection are ignored" {
     try std.testing.expect(accepted >= 0);
     defer _ = c.close(accepted);
     setTcpNodelay(accepted);
+}
+
+test "Acceptor: at the connection cap, a new connection is accepted and closed, and counted" {
+    const c = std.c;
+    const listener = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    defer _ = c.close(listener);
+    var addr: c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.sockaddr.in)));
+    try std.testing.expectEqual(@as(c_int, 0), c.listen(listener, 4));
+    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(listener, @ptrCast(&addr), &len));
+    @import("stdx").net.sysFcntlSetNonblocking(listener) catch {};
+
+    var pipes: [1]i32 = .{-1};
+    var acceptor = Acceptor.init(&pipes, Router.init(4096, 1, 0));
+    acceptor.listen_fd = listener;
+    var active = std.atomic.Value(u32).init(2); // already at the cap
+    var sm = ServerMetrics.init();
+    acceptor.active_connections = &active;
+    acceptor.server_metrics = &sm;
+    acceptor.max_connections = 2;
+
+    const dialer = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    defer _ = c.close(dialer);
+    try std.testing.expectEqual(@as(c_int, 0), c.connect(dialer, @ptrCast(&addr), @sizeOf(c.sockaddr.in)));
+
+    // The connection is accepted and closed at once, counted, and no slot is
+    // reserved (the count is unchanged). Retry until it lands in the backlog.
+    var tries: usize = 0;
+    while (sm.connections_rejected_total.load(.monotonic) == 0 and tries < 100) : (tries += 1) {
+        _ = try acceptor.acceptOne();
+        @import("stdx").time.sleep(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u64, 1), sm.connections_rejected_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), active.load(.monotonic));
 }
 
 test "Acceptor: round-robin routing" {
