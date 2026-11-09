@@ -3683,3 +3683,15 @@ test "vopr sim: a leader ready once it has committed, not applied, earlier terms
     // without one these seeds never catch it.
     try staleIdUnder(.ns_ready_on_commit);
 }
+
+test "vopr sim: with a leader's reads below the ring answered pending and done later, the run converges" {
+    var scenario = Scenario.pendingReads(3);
+    // Debug builds run the sim slowly: a shorter run still reaches the ring.
+    scenario.ticks_safety = 8_000;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    try testing.expect(s.ok);
+    // The path was taken, not skipped: pending reads were handed back done.
+    try testing.expect(s.pending_reads > 0);
+}
