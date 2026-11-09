@@ -206,7 +206,21 @@ pub const QueueHandler = struct {
     /// deliver that finds nothing.
     claimed: std.AutoHashMapUnmanaged([12]u8, u32) = .empty,
 
-    const Acking = struct { index: u64, term: u64, reply_to: ReplyTo, request_id: u64, answer: []u8 };
+    const Acking = struct {
+        index: u64,
+        term: u64,
+        reply_to: ReplyTo,
+        request_id: u64,
+        /// The answer once the complete applies, and the one if it can't
+        /// be confirmed: the messages leased, with their delivery.
+        answer: []u8,
+        leased: []u8,
+
+        fn free(a: Acking, allocator: Allocator) void {
+            if (a.answer.ptr != a.leased.ptr) allocator.free(a.answer);
+            allocator.free(a.leased);
+        }
+    };
 
     const Pending = struct {
         index: u64,
@@ -237,7 +251,7 @@ pub const QueueHandler = struct {
         if (self.answer_buf) |b| self.allocator.free(b);
         self.pending.deinit(self.allocator);
         self.claimed.deinit(self.allocator);
-        for (self.acking.items) |a| self.allocator.free(a.answer);
+        for (self.acking.items) |a| a.free(self.allocator);
         self.acking.deinit(self.allocator);
     }
 
@@ -711,24 +725,26 @@ pub const QueueHandler = struct {
         self.recordDequeue(shard, ns, p.queue, list.count, bytes);
         const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
         const ack = pd.ack and list.count > 0;
-        const answer: DequeueResponse.Value = .{ .messages = list.value(), .term = token.term, .index = token.index, .expires_at_ms = if (ack or list.count == 0) 0 else nsToMs(expiry) };
-        const out = table_run.encodeAnswer(DequeueResponse, buf, pd.request_id, answer) orelse
+        // As a plain dequeue: leased, with its delivery and expiry.
+        const leased: DequeueResponse.Value = .{ .messages = list.value(), .term = token.term, .index = token.index, .expires_at_ms = if (list.count == 0) 0 else nsToMs(expiry) };
+        const out = table_run.encodeAnswer(DequeueResponse, buf, pd.request_id, leased) orelse
             return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .internal_error, .{ .reason = .answer_lost, .ran = .yes, .message = "internal error: the messages didn't fit their answer; they come back once their lease runs out" });
         if (!ack) return shard.deliverDeferred(pd.reply_to, out);
-        // With ack, answered once the complete applies: until then the
-        // messages are only leased, and a complete lost with this leader
-        // lets them come back.
-        const lost: proto.Refusal = .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: the messages were taken but their complete wasn't logged; they come back once their lease runs out" };
-        self.acking.ensureUnusedCapacity(self.allocator, 1) catch
-            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
-        const owned = self.allocator.dupe(u8, out) catch
-            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
+        // With ack, answered once the complete applies. Where that can't be
+        // confirmed, the messages go as a plain dequeue's, leased with their
+        // delivery: the client always gets them, and its later ack finds them
+        // gone (done) if the complete landed, or completes them if not.
+        self.acking.ensureUnusedCapacity(self.allocator, 1) catch return shard.deliverDeferred(pd.reply_to, out);
+        const leased_owned = self.allocator.dupe(u8, out) catch return shard.deliverDeferred(pd.reply_to, out);
         const proposed = propose(shard, .queue_settle, qe.Settle.Value{ .ns = p.ns, .queue = p.queue, .holder = p.holder, .token = token, .expiry_ns = expiry, .items = .{ .bytes = items_buf[0..items_len], .count = list.count } }) catch |err| {
-            self.allocator.free(owned);
-            if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; its messages come back once their lease runs out", .{ shard.id, p.queue, @errorName(err) });
-            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
+            if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; answered as leased", .{ shard.id, p.queue, @errorName(err) });
+            defer self.allocator.free(leased_owned);
+            return shard.deliverDeferred(pd.reply_to, leased_owned);
         };
-        self.acking.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = pd.reply_to, .request_id = pd.request_id, .answer = owned });
+        var done = leased;
+        done.expires_at_ms = 0;
+        const done_owned: []u8 = if (table_run.encodeAnswer(DequeueResponse, buf, pd.request_id, done)) |d| self.allocator.dupe(u8, d) catch leased_owned else leased_owned;
+        self.acking.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = pd.reply_to, .request_id = pd.request_id, .answer = done_owned, .leased = leased_owned });
     }
 
     /// An acked dequeue's complete applied: its answer goes, as it was
@@ -738,9 +754,9 @@ pub const QueueHandler = struct {
             if (a.index == e.header.index and a.term == e.header.term) break i;
         } else return;
         const a = self.acking.swapRemove(at);
-        defer self.allocator.free(a.answer);
-        if (result.refused()) |r| return shard.deliverDeferredRefusal(a.reply_to, a.request_id, r.status, r.refusal);
-        shard.deliverDeferred(a.reply_to, a.answer);
+        defer a.free(self.allocator);
+        // Refused, the messages are only leased: so said.
+        shard.deliverDeferred(a.reply_to, if (result.refused() != null) a.leased else a.answer);
     }
 
     fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
@@ -819,8 +835,9 @@ pub const QueueHandler = struct {
     fn runComplete(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
-        // A namespace this node can't name, answered as a read of it is.
-        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
+        // A namespace this node can't name, answered as a write to it is:
+        // its table may yet learn it, so the client retries.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "report not run") } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -837,8 +854,9 @@ pub const QueueHandler = struct {
     fn runFail(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value, delay_ms: u64, dead: bool, err_text: []const u8) Error!table_run.Outcome(ReportResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
-        // A namespace this node can't name, answered as a read of it is.
-        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
+        // A namespace this node can't name, answered as a write to it is:
+        // its table may yet learn it, so the client retries.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "report not run") } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -858,8 +876,9 @@ pub const QueueHandler = struct {
     fn runTouch(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(TouchResponse) {
         if (req.key.len == 0) return error.NoQueue;
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
-        // A namespace this node can't name, answered as a read of it is.
-        if (req.ns_id == .invalid) return .{ .refused = .{ .status = .no_namespace, .refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" } } };
+        // A namespace this node can't name, answered as a write to it is:
+        // its table may yet learn it, so the client retries.
+        if (req.ns_id == .invalid) return .{ .refused = .{ .status = persistence_mod.failureStatus(error.NamespaceUnknown), .refusal = persistence_mod.failureRefusal(error.NamespaceUnknown, "report not run") } };
         if (metaOf(shard, req.ns_id, req.key) == null) {
             const self = shard.queue_handler;
             return .{ .answer = .{ .expires_at_ms = 0, .applied = 0, .refused = allGone(try self.answerBuf(), messages) } };
@@ -1004,6 +1023,22 @@ pub const QueueHandler = struct {
         return n;
     }
 
+    /// A queue entry a repair skipped: its dequeue is told it didn't run,
+    /// and an acked dequeue whose complete was skipped gets its messages as
+    /// leased.
+    pub fn skipped(self: *QueueHandler, shard: *Shard, e: *const Entry) void {
+        for (self.pending.items, 0..) |pd, i| if (pd.index == e.header.index and pd.term == e.header.term) {
+            _ = self.pending.swapRemove(i);
+            self.unclaim(pd.queue, pd.claims);
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: a repair skipped this dequeue's entry, so it took nothing — retry" });
+        };
+        for (self.acking.items, 0..) |a, i| if (a.index == e.header.index and a.term == e.header.term) {
+            _ = self.acking.swapRemove(i);
+            defer a.free(self.allocator);
+            return shard.deliverDeferred(a.reply_to, a.leased);
+        };
+    }
+
     /// This node stopped leading: dequeues waiting on a deliver are told,
     /// and the duty starts its grace again under the next term it leads.
     pub fn stoppedLeading(self: *QueueHandler, shard: *Shard) void {
@@ -1012,9 +1047,11 @@ pub const QueueHandler = struct {
         }
         self.pending.clearRetainingCapacity();
         self.claimed.clearRetainingCapacity();
+        // Their complete may yet commit under the next leader: answered as
+        // leased, so the messages are never lost to the client.
         for (self.acking.items) |a| {
-            shard.deliverDeferredRefusal(a.reply_to, a.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages' complete applied; if it didn't, they come back once their lease runs out" });
-            self.allocator.free(a.answer);
+            shard.deliverDeferred(a.reply_to, a.leased);
+            a.free(self.allocator);
         }
         self.acking.clearRetainingCapacity();
         self.expiring = null;

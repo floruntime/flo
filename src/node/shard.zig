@@ -4824,6 +4824,7 @@ pub const Shard = struct {
                             // Its client is told it didn't run; the shard is
                             // as the repair wants it.
                             self.answerPending(next_idx, e.header.term, false, &self.last_result);
+                            self.queue_handler.skipped(self, &e);
                             continue;
                         }
                         // The leader stamps each entry after the one before it,
@@ -15311,8 +15312,12 @@ const ActionsTest = struct {
     next_id: u64 = 100,
 
     fn init(t: *ActionsTest) !void {
+        return t.initAs(.single);
+    }
+
+    fn initAs(t: *ActionsTest, mode: anytype) !void {
         t.pipe_fds = try @import("stdx").io.pipe();
-        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, mode, .{}, .{});
         t.shard.wireHandlerShardPtrs();
         try std.testing.expect(t.shard.applyCommitted());
         t.c = try TestClient.open(&t.shard);
@@ -15463,6 +15468,7 @@ test "actions: an await retried with its request key gets the task the first got
 const QueuesTest = struct {
     a: ActionsTest,
     clock: Clock = .{},
+    rn: ?RaftNetwork = null,
 
     const Dequeue = table_run.op("queue.dequeue");
     const Complete = table_run.op("queue.complete");
@@ -15480,13 +15486,35 @@ const QueuesTest = struct {
     };
 
     fn init(t: *QueuesTest) !void {
+        return t.initAs(.single);
+    }
+
+    /// `.bootstrap`, for a test that adds a peer (`withPeer`).
+    fn initAs(t: *QueuesTest, mode: anytype) !void {
         t.clock = .{};
-        try t.a.init();
+        t.rn = null;
+        try t.a.initAs(mode);
         t.a.shard.raft_node.wall_clock = .{ .ctx = &t.clock, .now_ns = Clock.read };
     }
 
     fn deinit(t: *QueuesTest) void {
         t.a.deinit();
+        if (t.rn) |*rn| rn.deinit();
+    }
+
+    /// From here a peer must ack before anything commits (`ParkTest.ack`),
+    /// so a test can stop between an entry's proposal and its apply.
+    fn withPeer(t: *QueuesTest) !void {
+        t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.a.shard.raft_network = &t.rn.?;
+        try ParkTest.joinPeer(&t.a.shard);
+    }
+
+    /// `op` run on the shard, nothing applied after.
+    fn send(t: *QueuesTest, op: proto.OpCode, body: []const u8) !u64 {
+        t.a.next_id += 1;
+        t.a.shard.runRequest(t.a.c.conn, try ParkTest.request(op, t.a.next_id, proto.DEFAULT_NAMESPACE, "q", body, ""), .client);
+        return t.a.next_id;
     }
 
     fn enqueue(t: *QueuesTest, payload: []const u8) !void {
@@ -15517,8 +15545,10 @@ const QueuesTest = struct {
         while (try it.next()) |m| {
             g.seq[g.count] = m.seq;
             g.deliveries[g.count] = m.deliveries;
-            g.payload_len[g.count] = m.payload.len;
-            @memcpy(g.payload[g.count][0..m.payload.len], m.payload);
+            // Its first 16 bytes: enough to tell messages apart.
+            const n = @min(m.payload.len, 16);
+            g.payload_len[g.count] = n;
+            @memcpy(g.payload[g.count][0..n], m.payload[0..n]);
             g.count += 1;
         }
         return g;
@@ -15674,7 +15704,7 @@ test "queues: a dequeue with block_ms 0 answers at once with none; one that wait
     try std.testing.expectEqualStrings("woken", v.payloadOf(0));
 }
 
-test "queues: a report or purge on a queue the leader doesn't hold logs nothing, answering each message gone, or the namespace not found" {
+test "queues: a report or purge on a queue the leader doesn't hold logs nothing, answering each message gone, or unavailable for a namespace not known here" {
     var t: QueuesTest = undefined;
     try t.init();
     defer t.deinit();
@@ -15706,7 +15736,8 @@ test "queues: a report or purge on a queue the leader doesn't hold logs nothing,
             continue;
         }
         if (!named) {
-            try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), resp.header.status);
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+            try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
             continue;
         }
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
@@ -15753,6 +15784,115 @@ test "queues: an enqueue wakes one waiting dequeue per message: the rest keep wa
     _ = t.a.shard.queue_handler.expireDue(&t.a.shard);
     try std.testing.expectEqual(before + 2, t.a.shard.raft_node.log.lastIndex());
     try std.testing.expectEqual(@as(u16, 2), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+}
+
+test "queues: a dequeue with ack whose complete can't be confirmed before a step-down is answered as leased, so its messages are never lost" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.withPeer();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    _ = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 0, .ack = true }));
+    const qh = t.a.shard.queue_handler;
+    try std.testing.expectEqual(@as(usize, 1), qh.pending.items.len);
+    // Its deliver applies, and its complete is proposed, not applied.
+    try ParkTest.ack(&t.a.shard);
+    try std.testing.expectEqual(@as(usize, 1), qh.acking.items.len);
+    qh.stoppedLeading(&t.a.shard);
+    const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    var diag: schema.Diagnostic = .{};
+    const v = try QueuesTest.Dequeue.response.decodeAll(resp.data, &diag);
+    try std.testing.expect(v.expires_at_ms > 0);
+    const got = try QueuesTest.gotOf(resp.data);
+    try std.testing.expectEqualStrings("a", got.payloadOf(0));
+    // The complete commits after all: a later ack of the delivery finds the
+    // message gone, which for a complete means done.
+    try ParkTest.ack(&t.a.shard);
+    try std.testing.expect(t.msg(got.seq[0]) == null);
+    var ib: [QueuesTest.Items.max_size]u8 = undefined;
+    var cb: [QueuesTest.Complete.request.max_size]u8 = undefined;
+    const id = try t.send(.queue_complete, try QueuesTest.Complete.request.encodeInto(&cb, .{ .consumer = "c1", .term = got.term, .index = got.index, .messages = try QueuesTest.itemsOf(&ib, got) }));
+    try ParkTest.ack(&t.a.shard);
+    const done = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(id, done.header.request_id);
+    const r = try QueuesTest.Complete.response.decodeAll(done.data, &diag);
+    var it = r.refused.iterator();
+    try std.testing.expectEqual(queue_machine.Why.gone, (try it.next()).?.why);
+}
+
+test "queues: a dequeue whose deliver a repair skips is told it took nothing, and its claim is released" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    try t.enqueue("a");
+    try t.withPeer();
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    const id = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 1, .lease_ms = null, .block_ms = 0, .ack = false }));
+    const qh = t.a.shard.queue_handler;
+    const pd = qh.pending.items[0];
+    try std.testing.expectEqual(@as(usize, 1), qh.claimed.count());
+    // As the apply loop passes over a skipped entry.
+    var e = entry_mod.buildEntry(.queue_deliver, entry_mod.Flags.NONE, pd.term, pd.index, 0, "");
+    qh.skipped(&t.a.shard, &e);
+    try std.testing.expectEqual(@as(usize, 0), qh.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), qh.claimed.count());
+    const resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(id, resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "queues: a deliver that takes fewer than it claimed wakes the dequeues still waiting" {
+    var t: QueuesTest = undefined;
+    try t.initAs(.bootstrap);
+    defer t.deinit();
+    // Five messages too large for one answer to carry all of.
+    const big = try std.testing.allocator.alloc(u8, 60_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'm');
+    for (0..5) |_| try t.enqueue(big);
+    try t.withPeer();
+    // One dequeue claims all five; another waits behind its claim.
+    var b: [QueuesTest.Dequeue.request.max_size]u8 = undefined;
+    const first_id = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c1", .count = 5, .lease_ms = null, .block_ms = 0, .ack = false }));
+    const waiting = try t.send(.queue_dequeue, try QueuesTest.Dequeue.request.encodeInto(&b, .{ .consumer = "c2", .count = 1, .lease_ms = null, .block_ms = 30_000, .ack = false }));
+    try std.testing.expectEqual(@as(u16, 1), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
+    // The first takes four, as many as its answer holds; the waiting one is
+    // woken for the fifth.
+    try ParkTest.ack(&t.a.shard);
+    try ParkTest.ack(&t.a.shard);
+    const buf = try std.testing.allocator.alloc(u8, 600_000);
+    defer std.testing.allocator.free(buf);
+    // The first answer is larger than a socket holds at once: flushed and
+    // read until both are in.
+    var total: usize = 0;
+    var rs: [2]proto.Response = undefined;
+    var got_n: usize = 0;
+    var tries: usize = 0;
+    while (got_n < 2 and tries < 10_000) : (tries += 1) {
+        t.a.shard.flushToClient(t.a.c.conn.fd);
+        const n = std.c.recv(t.a.c.pair[1], buf[total..].ptr, buf.len - total, std.c.MSG.DONTWAIT);
+        if (n > 0) total += @intCast(n);
+        var off: usize = 0;
+        got_n = 0;
+        while (got_n < 2) {
+            const r = proto.Response.parse(buf[off..total]) catch break;
+            rs[got_n] = r;
+            off += @sizeOf(proto.ResponseHeader) + r.data.len;
+            got_n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), got_n);
+    var counts: [2]u32 = .{ 0, 0 };
+    for (rs) |r| {
+        const g = try QueuesTest.gotOf(r.data);
+        if (r.header.request_id == first_id) counts[0] = g.count;
+        if (r.header.request_id == waiting) counts[1] = g.count;
+    }
+    try std.testing.expectEqual([2]u32{ 4, 1 }, counts);
+    try std.testing.expectEqual(@as(u16, 0), t.a.shard.waiter_pool.countByKind(.queue_dequeue));
 }
 
 test "queues: an enqueue's delay holds its message back until due, and a dedup key is refused" {

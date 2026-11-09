@@ -23,11 +23,11 @@ test "e2e/scoping: a queue message is acked or nacked only from its own queue an
     const delivery = line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse return error.NoDelivery];
 
     for ([_][]const u8{ "ack", "nack" }) |verb| {
-        // qb was never made: answered as a read of it is.
+        // qb was never made: answered as a write to it is, not run.
         var r = try ctx.cli.run(&.{ "queue", verb, "q", delivery, "-n", "qb" });
         defer r.deinit();
         try testing.expect(r.exit_code != 0);
-        try stdx.testing.assertContains(r, "namespace not found");
+        try stdx.testing.assertContains(r, "the namespace isn't created on this node yet");
         var other_queue = try ctx.cli.run(&.{ "queue", verb, "other", delivery, "-n", "qa" });
         defer other_queue.deinit();
         try testing.expect(other_queue.exit_code != 0);

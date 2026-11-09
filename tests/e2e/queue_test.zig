@@ -726,3 +726,23 @@ test "e2e/queue: an enqueue's --delay holds its message back until due" {
     const due = try ctx.execCapture(&.{ "queue", "dequeue", "delay-q" });
     try testing.expect(std.mem.indexOf(u8, due, " later") != null);
 }
+
+test "e2e/queue: nack --delay holds its message back until due, and --priority past 255 is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "nack-delay-q", "retry me" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "nack-delay-q" });
+    const delivery = deliveryOf(out) orelse return error.NoDelivery;
+    try ctx.exec(&.{ "queue", "nack", "nack-delay-q", delivery, "--delay", "1500" });
+    var early = try ctx.cli.run(&.{ "queue", "dequeue", "nack-delay-q" });
+    defer early.deinit();
+    try testing.expect(early.stdoutContains("(no messages)"));
+    @import("stdx").time.sleep(1700 * std.time.ns_per_ms);
+    const due = try ctx.execCapture(&.{ "queue", "dequeue", "nack-delay-q" });
+    try testing.expect(std.mem.indexOf(u8, due, " retry me") != null);
+
+    var high = try ctx.cli.run(&.{ "queue", "enqueue", "nack-delay-q", "x", "--priority", "256" });
+    defer high.deinit();
+    try testing.expect(high.exit_code != 0);
+    try testing.expect(high.stderrContains("--priority is 0 to 255, not 256"));
+}
