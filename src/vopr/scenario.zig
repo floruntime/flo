@@ -166,6 +166,8 @@ pub const Scenario = struct {
     /// Percent of workload ops that are action entries, made from the
     /// proposing leader's own action state as its handler makes them.
     action_percent: u8 = 0,
+    /// The same for queue entries.
+    queue_percent: u8 = 0,
     /// About one workload op in sixteen creates a namespace, through shard
     /// 0's own create path. Off, the workload is what it was before
     /// creates existed.
@@ -356,6 +358,20 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The queues slice: as the actions slice, with a share of the ops
+    /// queue entries instead.
+    pub fn queues(seed: u64) Scenario {
+        var s = fromSeed(seed);
+        // The actions slice's stream: the same runs, queue entries in place
+        // of action ones.
+        var prng = PRNG.init(std.hash.Wyhash.hash(0xAC71, std.mem.asBytes(&seed)));
+        s.queue_percent = prng.random().intRangeAtMost(u8, 25, 60);
+        s.ticks_safety = @max(s.ticks_safety, prng.random().intRangeAtMost(u64, 30_000, 60_000));
+        s.crash_permille = @min(s.crash_permille, 1);
+        s.partition_permille = @min(s.partition_permille, 2);
+        return s;
+    }
+
     /// The actions slice: same sampling as `fromSeed`, with a share of the
     /// ops action entries, and a run long enough for leases to expire after
     /// a new leader's grace.
@@ -475,6 +491,7 @@ pub const Scenario = struct {
         try writer.print(
             \\  "repair_halt": {},
             \\  "action_percent": {d},
+            \\  "queue_percent": {d},
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
             \\  "apply_lag_max_ms": {d},
@@ -483,7 +500,7 @@ pub const Scenario = struct {
             \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
+        , .{ self.repair_halt, self.action_percent, self.queue_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -537,6 +554,7 @@ pub const Scenario = struct {
                 else => return error.InvalidField,
             } else false,
             .action_percent = if (obj.get("action_percent") == null) 0 else try jsonInt(u8, obj, "action_percent"),
+            .queue_percent = if (obj.get("queue_percent") == null) 0 else try jsonInt(u8, obj, "queue_percent"),
             .namespace_creates = if (obj.get("namespace_creates")) |v| switch (v) {
                 .bool => |b| b,
                 else => return error.InvalidField,

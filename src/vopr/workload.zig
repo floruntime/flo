@@ -38,7 +38,9 @@ pub const EntryType = entry_mod.EntryType;
 /// own bookkeeping, there only so an oracle can name the op; no client
 /// writes a delete this way. A third of puts are JSON patches instead
 /// (`kvPatch`), and a third of deletes also add to a counter (`kvDelete`).
-const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_batch };
+// A queue enqueue is a queue machine entry now, made by the leader
+// (`queue_workload`); its old slot here stays, so the stream of draws does.
+const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .stream_append, .ts_write, .kv_batch };
 
 /// KV ops write a few keys over and over, across two namespaces, so
 /// overwrites, deletes and history all happen.
@@ -591,7 +593,7 @@ pub const Workload = struct {
     }
 
     fn isAction(entry_type: u8) bool {
-        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire }) |t| {
+        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge }) |t| {
             if (entry_type == @backingInt(t)) return true;
         }
         return false;

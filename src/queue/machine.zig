@@ -112,6 +112,7 @@ pub const Ready = M.Ready;
 pub const Deadlines = M.Deadlines;
 
 pub const readyPrefix = M.readyPrefix;
+pub const readyKeyOf = M.readyKeyOf;
 pub const parseReadyKey = M.parseReadyKey;
 pub const parseDeadlineKey = M.parseDeadlineKey;
 pub const pastDue = M.pastDue;

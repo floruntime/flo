@@ -321,7 +321,7 @@ jobs:
         run: |
           mode=check
           if [ "${{ github.event_name }}" = pull_request ] && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
-            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|namespace|protocol)/|src/node/repair\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
+            if ! grep -qE '^(src/(vopr|raft|replica|storage/ual|stdx|kv|contract|actions|queue|namespace|protocol)/|src/node/repair\.zig|src/storage/persistence\.zig|src/plant\.zig|build\.zig|scripts/vopr-seed-undos\.sh)' <<< "$changed"; then
               mode=compile
             fi
           fi
@@ -391,6 +391,12 @@ jobs:
         # fails if fewer than 3 seeds settle and expire leases from an
         # earlier term.
         run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --actions --seed-timeout=120 --out-dir=/tmp/vopr-actions
+        timeout-minutes: 10
+      - name: Swarm with queue entries
+        # Queue entries made from the leader's own state, some spoiled, each
+        # checked against its queue before and after. It fails if fewer than
+        # 3 seeds settle and expire leases from an earlier term.
+        run: ./zig-out/bin/vopr --iterations=20 --seed=1 --jobs=4 --queues --seed-timeout=120 --out-dir=/tmp/vopr-queues
         timeout-minutes: 10
       - name: Swarm with namespace creates and lagging applies
         # Nodes fall behind on applying and win elections that way; no
