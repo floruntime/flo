@@ -473,6 +473,15 @@ pub const RaftNode = struct {
     /// When this node became leader; counts as contact with every peer for
     /// check-quorum until they answer.
     leader_since_ms: u64,
+    /// This node cannot read a committed entry to apply it (its host's disk
+    /// read is blocked). It must not lead or campaign while so: a leader that
+    /// cannot apply freezes the group, and a node that cannot apply has no
+    /// business leading. Set and cleared by the shard.
+    read_blocked: bool = false,
+    read_blocked_since_ms: u64 = 0,
+    /// Whether the current block's cause may be the disk failing, rather than a
+    /// resource shortage: only shapes the words the step-down line uses.
+    read_block_disk_failing: bool = false,
     /// This node is a voter in its latest config, or, with none, stands
     /// alone: it may campaign and counts toward its own quorum. False for
     /// a joiner the log does not yet name, and for a replica.
@@ -737,6 +746,9 @@ pub const RaftNode = struct {
     /// without it. It counts only their votes, finishes the change and
     /// steps down.
     pub fn mayCampaign(self: *const RaftNode) bool {
+        // A node that cannot apply a committed entry must not seek to lead: it
+        // would freeze the group and step down again.
+        if (self.read_blocked) return false;
         if (self.timer_enabled) return true;
         return self.membership_index > self.commit_index and self.committed_config.isVoter(self.id);
     }
@@ -912,8 +924,17 @@ pub const RaftNode = struct {
                 // A leader that cannot reach a majority is not one: a
                 // partitioned leader would otherwise hold its clients'
                 // proposals forever, since there is no per-proposal timer.
-                if (self.voterPeers() > 0 and now_ms -| self.quorumContactMs() > self.config.election_timeout_max_ms) {
-                    log.warn("Raft: no contact with a majority for {d} ms; stepping down from term {d}", .{ now_ms - self.quorumContactMs(), self.current_term });
+                const no_quorum = self.voterPeers() > 0 and now_ms -| self.quorumContactMs() > self.config.election_timeout_max_ms;
+                // A leader that cannot apply a committed entry freezes the
+                // group's writes; past an election timeout it steps down so a
+                // node that can apply takes over.
+                const blocked_too_long = self.read_blocked and now_ms -| self.read_blocked_since_ms > self.config.election_timeout_max_ms;
+                if (no_quorum or blocked_too_long) {
+                    if (blocked_too_long and !no_quorum) {
+                        log.warn("Raft: cannot apply a committed entry for {d} ms ({s}); stepping down from term {d} so another node can lead", .{ now_ms -| self.read_blocked_since_ms, if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage", self.current_term });
+                    } else {
+                        log.warn("Raft: no contact with a majority for {d} ms; stepping down from term {d}", .{ now_ms - self.quorumContactMs(), self.current_term });
+                    }
                     self.role = .follower;
                     self.leader_id = NO_VOTE;
                     self.pre_vote_term = 0;
@@ -1220,6 +1241,10 @@ pub const RaftNode = struct {
             self.noteClock(idx, resp.clock_ns);
             self.votes_received += 1;
             if (self.votes_received < self.votes_needed) return .none;
+            // A majority would vote, but the poll opened before any block: a
+            // node that cannot apply must not stand, or it would win and freeze
+            // the group until it stepped down again.
+            if (!self.mayCampaign()) return .none;
             // A majority would vote: spend the term.
             const req = self.startElectionNow() orelse return .none;
             return .{ .elect = req };
@@ -1930,6 +1955,22 @@ pub const RaftNode = struct {
     }
 
     // ── Internal ────────────────────────────────────────────────────────
+
+    /// The shard tells its Raft node when applying is blocked reading a
+    /// committed entry, and when it clears. A leader blocked past an election
+    /// timeout steps down (in `tick`), and a blocked node does not campaign
+    /// (`mayCampaign`). `disk_failing` only shapes the step-down line's words.
+    pub fn setReadBlocked(self: *RaftNode, now_ms: u64, disk_failing: bool) void {
+        self.read_block_disk_failing = disk_failing;
+        if (!self.read_blocked) {
+            self.read_blocked = true;
+            self.read_blocked_since_ms = now_ms;
+        }
+    }
+
+    pub fn clearReadBlocked(self: *RaftNode) void {
+        self.read_blocked = false;
+    }
 
     fn stepDown(self: *RaftNode, new_term: u64) void {
         log.debug("Raft: stepping down, node_id={d}, old_term={d}, new_term={d}", .{ self.id, self.current_term, new_term });
@@ -3514,6 +3555,54 @@ test "raft node: a winner that can't append its leadership noop steps down, keep
     try testing.expect(node.current_term > term);
     try testing.expect(node.handleVoteResponse(.{ .term = node.current_term, .vote_granted = true, .from = 2 }) == .won);
     try testing.expectEqual(@as(u64, 1), node.log.lastIndex());
+}
+
+test "raft node: a node blocked reading a committed entry does not campaign" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    try testing.expect(node.mayCampaign());
+    node.setReadBlocked(100, false);
+    try testing.expect(!node.mayCampaign());
+    node.clearReadBlocked();
+    try testing.expect(node.mayCampaign());
+}
+
+test "raft node: a leader that cannot apply a committed entry steps down past an election timeout" {
+    var node = try RaftNode.init(testing.allocator, 1, 1, 8192, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    _ = candidacy(&node).?;
+    try testing.expect(node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 }) == .won);
+    try testing.expectEqual(Role.leader, node.role);
+
+    // Its applier reports a committed read blocked. Within an election timeout
+    // it holds; past one it steps down so a node that can apply takes over.
+    node.setReadBlocked(1_000, true);
+    const held = node.tick(1_000 + node.config.election_timeout_max_ms);
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expect(!held.step_down);
+    const steps = node.tick(1_000 + node.config.election_timeout_max_ms + 1);
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expect(steps.step_down);
+}
+
+test "raft node: a passed pre-vote does not elect a node whose read has since blocked" {
+    var node = try RaftNode.init(testing.allocator, 1, 1000, 4096, .{});
+    defer node.deinit();
+    node.addPeer(2);
+    node.addPeer(3);
+    // Open a pre-vote poll, then a committed read blocks before it resolves.
+    const poll = node.startElection().?;
+    try testing.expect(poll.is_pre_vote);
+    node.setReadBlocked(10, false);
+    // The deciding grant arrives: a blocked node must not spend the term and
+    // win, or it would lead and freeze the group until it stepped down again.
+    const r = node.handleVoteResponse(.{ .term = node.current_term + 1, .vote_granted = true, .from = 2, .is_pre_vote = true });
+    try testing.expect(r == .none);
+    try testing.expect(node.role != .leader and node.role != .candidate);
 }
 
 test "raft node: a new leader is ready once it has applied every earlier term's entry, and not after stepping down" {

@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 9;
+pub const CURRENT: u32 = 10;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -33,8 +33,12 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     .{ .format = 7, .segment_version = 6, .entries = 0xaf37ccaa7271c1e5 },
     // A config entry names its cluster, generation and next id.
     .{ .format = 8, .segment_version = 6, .entries = 0xaf37ccaa7271c1e5 },
-    // KV keys lead with their namespace's id, and a batch names it once.
-    .{ .format = 9, .segment_version = 7, .entries = 0xa27e039b5f22bd5e },
+    // Workflow enablement and stream settings are logged; the layouts the
+    // hash covers are unchanged.
+    .{ .format = 9, .segment_version = 6, .entries = 0xaf37ccaa7271c1e5 },
+    // KV keys lead with their namespace's id, and a batch names it once;
+    // log payloads name the namespace by id.
+    .{ .format = 10, .segment_version = 7, .entries = 0xa27e039b5f22bd5e },
 };
 
 comptime {

@@ -612,8 +612,21 @@ pub const ShardMetrics = struct {
     processing_failed_jobs: Atomic(u64) = Atomic(u64).init(0),
     /// Running processing jobs this node holds without pipelines.
     processing_held_jobs: Atomic(u64) = Atomic(u64).init(0),
+    /// Leader duties held back, and how long the oldest has been.
+    duties_held: Atomic(u64) = Atomic(u64).init(0),
+    duty_oldest_held_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
+    /// 1 while a committed entry cannot be read to apply it. Alert on this:
+    /// the shard serves nothing fresh until it clears.
+    read_blocked: Atomic(u8) = Atomic(u8).init(0),
+    /// How many times a committed read began blocking, and how long the shard
+    /// has spent blocked in total (counted when a block clears or turns to
+    /// damage). An in-progress block's elapsed time is in `/status`.
+    read_blocks_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Accumulated in milliseconds so a sub-second block is not lost; exposed
+    /// as float seconds.
+    read_blocked_ms_total: Atomic(u64) = Atomic(u64).init(0),
 
     /// Labels for `connections_paused`: the shard's wait reasons, in order,
     /// then paused for unsent answers.
@@ -731,6 +744,21 @@ pub const ShardMetrics = struct {
         self.stamp_skew_ms.store(ms, .monotonic);
     }
 
+    /// A committed read just began blocking.
+    pub fn recordReadBlockStart(self: *ShardMetrics) void {
+        _ = self.read_blocks_total.fetchAdd(1, .monotonic);
+    }
+
+    /// A block ended (cleared or turned to damage) after `ms` blocked.
+    pub fn recordReadBlockEnd(self: *ShardMetrics, ms: u64) void {
+        _ = self.read_blocked_ms_total.fetchAdd(ms, .monotonic);
+    }
+
+    /// 1 while a committed read is blocked, 0 otherwise.
+    pub fn setReadBlocked(self: *ShardMetrics, blocked: bool) void {
+        self.read_blocked.store(@intFromBool(blocked), .monotonic);
+    }
+
     pub fn recordStreamSkippedAppend(self: *ShardMetrics) void {
         _ = self.stream_skipped_appends.fetchAdd(1, .monotonic);
     }
@@ -770,7 +798,12 @@ pub const ShardMetrics = struct {
         duplicate_index: u64,
         processing_failed_jobs: u64,
         processing_held_jobs: u64,
+        duties_held: u64,
+        duty_oldest_held_ms: u64,
         offline: u8,
+        read_blocked: u8,
+        read_blocks_total: u64,
+        read_blocked_ms_total: u64,
     };
 
     pub fn snapshot(self: *const ShardMetrics) Snapshot {
@@ -808,7 +841,12 @@ pub const ShardMetrics = struct {
             .duplicate_index = self.duplicate_index.load(.monotonic),
             .processing_failed_jobs = self.processing_failed_jobs.load(.monotonic),
             .processing_held_jobs = self.processing_held_jobs.load(.monotonic),
+            .duties_held = self.duties_held.load(.monotonic),
+            .duty_oldest_held_ms = self.duty_oldest_held_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
+            .read_blocked = self.read_blocked.load(.monotonic),
+            .read_blocks_total = self.read_blocks_total.load(.monotonic),
+            .read_blocked_ms_total = self.read_blocked_ms_total.load(.monotonic),
             .connections_paused = blk: {
                 var out: [PAUSE_REASONS.len]u64 = undefined;
                 for (&out, &self.connections_paused) |*o, *g| o.* = g.load(.monotonic);
@@ -1578,8 +1616,13 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     }
     try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
+    try writer.print("flo_shard_read_blocked{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocked });
+    try writer.print("flo_shard_read_blocks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocks_total });
+    try writer.print("flo_shard_read_blocked_seconds_total{{shard_id=\"{d}\"}} {d:.3}\n", .{ snap.shard_id, @as(f64, @floatFromInt(snap.read_blocked_ms_total)) / 1000.0 });
     try writer.print("flo_processing_failed_jobs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.processing_failed_jobs });
     try writer.print("flo_processing_held_jobs{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.processing_held_jobs });
+    try writer.print("flo_shard_duties_held{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duties_held });
+    try writer.print("flo_shard_duty_oldest_held_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.duty_oldest_held_ms / 1000, snap.duty_oldest_held_ms % 1000 });
     const skew = @abs(snap.stamp_skew_ms);
     try writer.print("flo_shard_stamp_skew_seconds{{shard_id=\"{d}\"}} {s}{d}.{d:0>3}\n", .{ snap.shard_id, if (snap.stamp_skew_ms < 0) "-" else "", skew / 1000, skew % 1000 });
     try writer.print("flo_stream_skipped_appends_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.stream_skipped_appends });

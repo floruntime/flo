@@ -1522,9 +1522,34 @@ pub const ProcessingHandler = struct {
         return pipe;
     }
 
-    /// Drive all running pipelines: poll sources, push to sinks.
+    /// The shard a sink writes to, or null when it can be any: a KV sink's
+    /// keys spread across shards.
+    fn sinkShard(self: *const ProcessingHandler, snk: SinkConfig) ?u16 {
+        return switch (snk.kind) {
+            .kv => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else null,
+            .stream, .queue => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else self.peerShardId(snk.namespace, snk.target),
+            // TS sinks write the owner's measurement, as stream sinks do.
+            .ts => if (self.peer_shard_count <= 1 or self.peer_partition_count == 0) self.own_shard else self.peerShardId(snk.namespace, snk.measurement),
+        };
+    }
+
+    /// Whether one of `pipe`'s sinks writes to a halted shard. Then the
+    /// pipeline reads nothing, so its cursor stays at the first record
+    /// not written. Writes already on their way are dropped and counted.
+    fn sinksHeld(self: *const ProcessingHandler, shard: *const Shard, pipe: *const PipelineState) bool {
+        for (pipe.sinks) |snk| {
+            if (self.sinkShard(snk)) |to| {
+                if (to != shard.id and shard.shardHalted(to)) return true;
+            } else if (shard.peerHalted()) return true;
+        }
+        return false;
+    }
+
+    /// Drive all running pipelines: poll sources, push to sinks. Returns
+    /// whether one was held for a halted sink shard.
     /// Called from Shard.tick() on each reactor iteration.
-    pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) void {
+    pub fn tickPipelines(self: *ProcessingHandler, shard: *Shard) bool {
+        var held = false;
         const now_ms = @import("stdx").time.milliTimestamp();
 
         var it = self.pipelines.iterator();
@@ -1545,6 +1570,10 @@ pub const ProcessingHandler = struct {
             // Enforce poll interval
             const poll_ms: i64 = @intCast(pipe.src_poll_ms);
             if (now_ms - pipe.last_poll_ms < poll_ms) continue;
+            if (self.sinksHeld(shard, pipe)) {
+                held = true;
+                continue;
+            }
             pipe.last_poll_ms = now_ms;
 
             // Time the tick, but only record latency/throughput for *productive*
@@ -1569,6 +1598,7 @@ pub const ProcessingHandler = struct {
                 pipe.tick_count += 1;
             }
         }
+        return held;
     }
 
     /// Tick a TS source pipeline: read points from TSProjection, apply operators, write to sink.
@@ -2138,6 +2168,19 @@ fn applyLogged(h: *ProcessingHandler, e: *const entry_mod.Entry) persistence_mod
     var out = Result.start(e);
     try h.replayEntry(e, &out);
     return out;
+}
+
+test "processing: a sink's shard is its target's, any for a KV sink, and its own on one shard" {
+    var h = ProcessingHandler.init(std.testing.allocator);
+    defer h.deinit();
+    h.own_shard = 1;
+    try std.testing.expectEqual(@as(?u16, 1), h.sinkShard(.{ .kind = .kv }));
+    h.peer_shard_count = 4;
+    h.peer_partition_count = 16;
+    try std.testing.expectEqual(@as(?u16, null), h.sinkShard(.{ .kind = .kv }));
+    try std.testing.expectEqual(@as(?u16, h.peerShardId("default", "cpu")), h.sinkShard(.{ .kind = .ts, .namespace = "default", .measurement = "cpu" }));
+    const snk: ProcessingHandler.SinkConfig = .{ .kind = .stream, .target = "out", .namespace = "default" };
+    try std.testing.expectEqual(@as(?u16, h.peerShardId("default", "out")), h.sinkShard(snk));
 }
 
 test "ProcessingHandler: all opcodes are registered" {

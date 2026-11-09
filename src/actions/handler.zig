@@ -2014,7 +2014,15 @@ pub const ActionsHandler = struct {
     pub fn expireDue(self: *ActionsHandler, shard: *Shard) u64 {
         self.resend(shard);
         self.pruneAt(@import("stdx").time.monotonicMs());
+        // Held on a halted shard's leader, which is never ready.
+        if (shard.raft_node.role == .leader and shard.heldIfHalted(.action_expire, storeOf(shard).family(machine.Deadlines.ID).count > 0 or self.held.count() > 0)) {
+            // The term's grace starts again when it serves: a lease that
+            // lapsed while nothing could act on it isn't ended at once.
+            self.duty_term = 0;
+            return 0;
+        }
         if (!shard.raft_node.leaderReady()) return 0;
+        shard.duties.note(.action_expire, null, @import("stdx").time.monotonicMs());
         // The clock the expire's stamp will read: a key past due by the
         // node's own clock but not by the stamp would apply as a no-op,
         // and a full one chain into another at once.

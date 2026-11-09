@@ -16,9 +16,14 @@ const RaftFrame = @import("../raft/raft_queue.zig").Frame;
 const transport = @import("../raft/transport.zig");
 const membership = @import("../raft/membership.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
+const raft_log_mod = @import("../raft/log.zig");
 
 /// Steady conditions are said once per interval, not per tick.
 pub const WARN_INTERVAL_MS: u64 = 30_000;
+
+/// How long the leader waits before re-reading a peer's catch-up batch whose
+/// below-ring read is blocked — the apply loop's back-off, so neither spins.
+pub const CATCH_UP_RETRY_MS: u64 = 250;
 
 /// Non-members whose term checks are answered at once, at most once each
 /// per election timeout; past this many, the longest-silent is forgotten.
@@ -71,6 +76,10 @@ pub fn Replica(comptime Io: type) type {
         /// One limiter per peer for each thing the leader loop says about it.
         peer_silent_warn_ms: [raft_node_mod.MAX_PEERS]u64 = @splat(0),
         peer_batch_warn_ms: [raft_node_mod.MAX_PEERS]u64 = @splat(0),
+        /// The next tick a peer's catch-up batch may be re-read, when its
+        /// entries are below the ring and the read is blocked: the leader backs
+        /// off like the apply loop rather than re-reading the disk every tick.
+        peer_catch_up_retry_ms: [raft_node_mod.MAX_PEERS]u64 = @splat(0),
 
         /// A member that missed a membership change drops the frames of a
         /// leader admitted since, and never catches up: the entries that
@@ -127,6 +136,13 @@ pub fn Replica(comptime Io: type) type {
 
         fn applyCommitted(self: *Self) bool {
             return Io.Host.applyCommitted(self);
+        }
+
+        /// A committed entry cannot be read to apply it: `applyCommitted`
+        /// returns false, but the apply loop already logs and surfaces it, so
+        /// callers stay quiet rather than log the same block each frame.
+        fn readBlocked(self: *Self) bool {
+            return Io.Host.readBlocked(self);
         }
 
         fn clearRemovalNotices(self: *Self) void {
@@ -251,7 +267,7 @@ pub fn Replica(comptime Io: type) type {
                     var buf: [transport.APPEND_RESP_SIZE]u8 = undefined;
                     const n = transport.serializeAppendResponse(resp, &buf) orelse return;
                     self.sendRaft(frame.source_node, .append_entries_response, buf[0..n]);
-                    if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                    if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                 },
                 .append_entries_response => {
                     const resp = transport.deserializeAppendResponse(frame.payload) orelse return self.badFrame(frame);
@@ -260,7 +276,7 @@ pub fn Replica(comptime Io: type) type {
                     raft.handleAppendResponse(resp);
                     // Applied first: a leader whose own removal just committed
                     // answers what it parked on that commit before it lets go.
-                    if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                    if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                     if (was == .leader and raft.role != .leader) {
                         if (raft.left_group) {
                             raft.left_group = false;
@@ -587,7 +603,7 @@ pub fn Replica(comptime Io: type) type {
                     if (raft.role == .leader) {
                         log.info("shard {d}: elected leader for term {d} as the only member", .{ self.id, raft.current_term });
                         // Alone, the win commits the whole log.
-                        if (!self.applyCommitted()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
+                        if (!self.applyCommitted() and !self.readBlocked()) log.err("shard {d}: a committed entry could not be applied", .{self.id});
                     }
                 }
             }
@@ -601,7 +617,7 @@ pub fn Replica(comptime Io: type) type {
             // A member with no leader may have missed the change that
             // admitted it.
             if (raft.self_named and raft.role != .leader and now -| raft.last_leader_contact_ms > raft.config.election_timeout_max_ms) self.askForVouch(now);
-            if (r.step_down) self.leadershipLost("no contact with a majority");
+            if (r.step_down) self.leadershipLost(if (raft.read_blocked) "cannot apply a committed entry" else "no contact with a majority");
             if (raft.role == .leader) self.pump(now);
             self.tickMembership(now);
         }
@@ -673,7 +689,7 @@ pub fn Replica(comptime Io: type) type {
                     self.peer_silent_warn_ms[i] = now;
                     log.warn("shard {d}: node {d} has not answered for {d} ms; its next index is {d}", .{ self.id, raft.peer_ids[i], now -| heard, next });
                 }
-                const want_data = behind and (!p.inflight or unanswered);
+                const want_data = behind and (!p.inflight or unanswered) and now >= self.peer_catch_up_retry_ms[i];
                 const want_heartbeat = now -| p.heartbeat_at_ms >= raft.config.heartbeat_interval_ms;
                 if (!want_data and !want_heartbeat) continue;
                 const prev_index = next - 1;
@@ -698,13 +714,23 @@ pub fn Replica(comptime Io: type) type {
                 const verdict = if (p.halt) |h| raft.haltVerdictFor(i, self.ownEntry(h.index)) else raft_node_mod.HaltVerdict{};
                 var entries: []const entry_mod.Entry = &.{};
                 if (want_data and !p.below_log) {
-                    const count = raft.log.getRange(next, self.rpc_entries, self.rpc_arena);
-                    if (count > 0) {
-                        entries = self.rpc_entries[0..count];
+                    const rr = raft.log.getRangeBlocking(next, self.rpc_entries, self.rpc_arena);
+                    if (rr.count > 0) {
+                        entries = self.rpc_entries[0..rr.count];
                         p.inflight = true;
-                        p.sent_up_to = @max(p.sent_up_to, next + count - 1);
-                        p.batch_end = next + count - 1;
+                        p.sent_up_to = @max(p.sent_up_to, next + rr.count - 1);
+                        p.batch_end = next + rr.count - 1;
                         p.sent_at_ms = now;
+                    } else if (rr.blocked) {
+                        // The entries are below the ring and can't be read right
+                        // now (a resource or IO failure on this leader's disk).
+                        // Back off before re-reading, rather than re-list the
+                        // segments every tick, and say so rarely.
+                        self.peer_catch_up_retry_ms[i] = now + CATCH_UP_RETRY_MS;
+                        if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
+                            self.peer_batch_warn_ms[i] = now;
+                            log.warn("shard {d}: the entries at index {d} can't be read to replicate to node {d} right now; holding and retrying", .{ self.id, next, raft.peer_ids[i] });
+                        }
                     } else if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                         // An empty batch here would be sent as a heartbeat and
                         // acked, and the peer would never move past this index.
@@ -783,6 +809,9 @@ const TestIo = struct {
         pub fn tickMembership(_: *TestReplica, _: u64) void {}
         pub fn applyCommitted(_: *TestReplica) bool {
             return true;
+        }
+        pub fn readBlocked(_: *TestReplica) bool {
+            return false;
         }
         pub fn clearRemovalNotices(_: *TestReplica) void {}
         pub fn strangerFrame(_: *TestReplica, _: RaftFrame) void {}
@@ -1032,6 +1061,9 @@ const VouchIo = struct {
         pub fn tickMembership(_: *VouchReplica, _: u64) void {}
         pub fn applyCommitted(_: *VouchReplica) bool {
             return true;
+        }
+        pub fn readBlocked(_: *VouchReplica) bool {
+            return false;
         }
         pub fn clearRemovalNotices(_: *VouchReplica) void {}
         pub fn strangerFrame(r: *VouchReplica, _: RaftFrame) void {
@@ -1296,4 +1328,47 @@ test "replica: a vouch admits every member of the vouched config, a replica prom
     try testing.expectEqual(@as(u64, 20), h.replica.vouchedIndex());
     h.heartbeat(1, 2);
     try testing.expectEqual(@as(u32, 1), h.raft.leader_id);
+}
+
+/// A below-the-ring catch-up source that always blocks, counting its reads so
+/// a test can tell a paced retry from one that re-reads every tick.
+const BlockingCatchUp = struct {
+    var calls: usize = 0;
+    fn read(_: *anyopaque, _: u64, _: []entry_mod.Entry, _: []u8) raft_log_mod.CatchUpResult {
+        calls += 1;
+        return .{ .blocked = true };
+    }
+};
+
+test "replica: a blocked catch-up read for a lagging follower backs off, not re-read every tick" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const raft = &h.raft;
+    // Large entries so the early ones fall below the ring, where the catch-up
+    // source answers — and here always blocks.
+    const big = try testing.allocator.alloc(u8, 32 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    for (0..6) |_| _ = try raft.propose(.kv_put, 0, big);
+    try testing.expect(raft.log.ual.readRangeCopy(1, 2, h.replica.rpc_entries[0..1], &h.arena) == 0); // index 1 is below the ring
+    raft.log.catch_up = .{ .ctx = @ptrFromInt(@alignOf(usize)), .read_range = BlockingCatchUp.read };
+
+    // Peer 2 is far behind, its next entry below the ring; peer 3 is caught up,
+    // so only peer 2 exercises the catch-up read.
+    raft.peers[0].next_index = 1;
+    raft.peers[0].inflight = false;
+    h.replica.peer_catch_up_retry_ms[0] = 0;
+    raft.peers[1].next_index = raft.log.lastIndex() + 1;
+    raft.peers[1].inflight = false;
+
+    BlockingCatchUp.calls = 0;
+    h.replica.pump(h.now);
+    try testing.expectEqual(@as(usize, 1), BlockingCatchUp.calls);
+    // Within the back-off, the leader does not re-read the disk.
+    h.replica.pump(h.now);
+    try testing.expectEqual(@as(usize, 1), BlockingCatchUp.calls);
+    // Past the back-off, it reads again — once.
+    h.replica.pump(h.now + CATCH_UP_RETRY_MS);
+    try testing.expectEqual(@as(usize, 2), BlockingCatchUp.calls);
 }

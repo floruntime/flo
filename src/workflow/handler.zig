@@ -608,8 +608,8 @@ pub const WorkflowHandler = struct {
             .workflow_history => self.handleHistory(shard, conn, req),
             .workflow_list_runs => self.handleListRuns(shard, conn, req),
             .workflow_get_definition => self.handleGetDefinition(shard, conn, req),
-            .workflow_disable => self.handleDisable(shard, conn, req),
-            .workflow_enable => self.handleEnable(shard, conn, req),
+            .workflow_disable => return self.handleSetEnabled(shard, conn, req, false),
+            .workflow_enable => return self.handleSetEnabled(shard, conn, req, true),
             .workflow_list_definitions => self.handleListDefinitions(shard, conn, req),
             else => {
                 shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "unknown workflow opcode");
@@ -902,6 +902,11 @@ pub const WorkflowHandler = struct {
             self.allocator.free(owned);
             log.err("workflow run {s} started but cannot be queued for its first step; it stays at its start", .{ns_key});
         };
+    }
+
+    /// Whether the stepping duty has anything to do.
+    pub fn hasDutyWork(self: *const WorkflowHandler) bool {
+        return self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
     }
 
     /// Take the first step of each queued run whose start has applied, in
@@ -1427,63 +1432,45 @@ pub const WorkflowHandler = struct {
         shard.sendOkResponse(conn, req.header.request_id, def.yaml_owned);
     }
 
-    // ── DISABLE ─────────────────────────────────────────────────────────
+    // ── DISABLE / ENABLE ────────────────────────────────────────────────
 
-    fn handleDisable(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const name = req.key;
-
-        if (name.len == 0) {
+    /// Logged, so every replica holds it and a restart or a new leader
+    /// keeps it; answered when it applies.
+    fn handleSetEnabled(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request, enabled: bool) ?persistence_mod.ProposeResult {
+        if (req.key.len == 0) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return;
+            return null;
         }
-
-        const ns_key = self.makeNsKey(req.namespace, name) orelse {
+        const ns_key = self.makeNsKey(req.namespace, req.key) orelse {
             shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
-        };
-
-        // Check workflow exists
-        if (!self.definitions.contains(ns_key)) {
-            self.allocator.free(ns_key);
-            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
-            return;
-        }
-
-        if (!self.disabled.contains(ns_key)) {
-            self.disabled.put(ns_key, {}) catch {
-                self.allocator.free(ns_key);
-                shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "disable failed");
-                return;
-            };
-        } else {
-            // Already disabled — free the temp key
-            self.allocator.free(ns_key);
-        }
-
-        shard.sendOkResponse(conn, req.header.request_id, "");
-    }
-
-    // ── ENABLE ──────────────────────────────────────────────────────────
-
-    fn handleEnable(self: *WorkflowHandler, shard: *Shard, conn: *Connection, req: Request) void {
-        const name = req.key;
-
-        if (name.len == 0) {
-            shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "workflow name is required");
-            return;
-        }
-
-        const ns_key = self.makeNsKey(req.namespace, name) orelse {
-            shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
-            return;
+            return null;
         };
         defer self.allocator.free(ns_key);
-
-        if (self.disabled.fetchRemove(ns_key)) |old| {
-            self.allocator.free(old.key);
+        if (!self.definitions.contains(ns_key)) {
+            shard.sendErrorResponse(conn, req.header.request_id, .not_found, "workflow not found");
+            return null;
         }
+        return persistence_mod.proposeEntry(shard, .workflow_enabled, entry_mod.Flags.NONE, req.namespace, ns_key, &.{@intFromBool(enabled)}) catch |err| {
+            shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureCode(err).toStatus(), proto.notRun(persistence_mod.failureMessage(err, "not persisted")));
+            return null;
+        };
+    }
 
-        shard.sendOkResponse(conn, req.header.request_id, "");
+    /// Apply a workflow_enabled entry. The definition may have gone since it
+    /// was proposed; then nothing changes.
+    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
+        if (value.len != 1 or value[0] > 1) return error.Halt;
+        if (!self.definitions.contains(ns_key)) return out.refuse(.not_found, .not_found, "workflow not found");
+        if (value[0] == 1) {
+            if (self.disabled.fetchRemove(ns_key)) |old| self.allocator.free(old.key);
+            return;
+        }
+        if (self.disabled.contains(ns_key)) return;
+        const owned = self.allocator.dupe(u8, ns_key) catch return error.OutOfMemory;
+        self.disabled.put(owned, {}) catch {
+            self.allocator.free(owned);
+            return error.OutOfMemory;
+        };
     }
 
     // ── LIST DEFINITIONS ────────────────────────────────────────────────
@@ -3820,6 +3807,7 @@ pub const WorkflowHandler = struct {
         registry.register(.workflow_create, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
+        registry.register(.workflow_enabled, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
@@ -3841,6 +3829,7 @@ pub const WorkflowHandler = struct {
         return switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
+            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             else => error.Halt,
         };
@@ -4397,6 +4386,8 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.shard_metrics = null;
     shard.offline = null;
     shard.halted = null;
+    shard.duties = .{};
+    shard.node_health = &.{};
     shard.marker = .{};
     shard.skips = .{};
     shard.skip_scan_from = 0;
@@ -5387,6 +5378,55 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     // Its entry cut, each goes on.
     parked.cancel_term = cancel.term + 1;
     try testing.expect(!WorkflowHandler.cancelInFlight(&shard, parked));
+}
+
+test "a halted shard's expire duty holds back the starts it holds, and lets them go once it serves" {
+    const allocator = testing.allocator;
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "held-run", "late", "{}", "wf-run", "wf", true).?;
+    defer allocator.free(message);
+    actions.startRunFromInbox(&shard, shard.id, message);
+    registerTestAction(&shard, "late");
+
+    shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 1), actions.held.count());
+    try testing.expectEqual(@as(u32, 1), shard.duties.held());
+
+    shard.halted = null;
+    _ = actions.expireDue(&shard);
+    try testing.expectEqual(@as(u32, 0), actions.held.count());
+    try testing.expectEqual(@as(u32, 0), shard.duties.held());
+}
+
+test "workflow_enabled entries disable and enable a workflow on every replica, and refuse one gone" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    var index: u64 = 0;
+    const apply = struct {
+        fn one(h: *WorkflowHandler, i: *u64, key: []const u8, enabled: bool) !Result {
+            var pbuf: [128]u8 = undefined;
+            i.* += 1;
+            const e = entry_mod.buildCommandEntry(.workflow_enabled, entry_mod.Flags.NONE, 1, i.*, 0, .default, key, &.{@intFromBool(enabled)}, &pbuf).?;
+            var out = Result.start(&e);
+            try h.replayEntry(&e, &out);
+            return out;
+        }
+    }.one;
+    _ = try apply(&handler, &index, "default:test-wf", false);
+    try testing.expect(handler.disabled.contains("default:test-wf"));
+    _ = try apply(&handler, &index, "default:test-wf", false);
+    try testing.expectEqual(@as(u32, 1), handler.disabled.count());
+    _ = try apply(&handler, &index, "default:test-wf", true);
+    try testing.expect(!handler.disabled.contains("default:test-wf"));
+    const gone = try apply(&handler, &index, "default:no-such", false);
+    try testing.expectEqual(proto.StatusCode.not_found, gone.refused().?.status);
+    try testing.expectEqual(@as(u32, 0), handler.disabled.count());
 }
 
 test "step executor: failing action follows failure transition" {
