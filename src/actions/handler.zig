@@ -2048,21 +2048,20 @@ pub const ActionsHandler = struct {
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
         var n: u32 = 0;
-        var it = readOf(shard).range(machine.Deadlines, "");
-        while (it.next() catch null) |item| {
+        var it = machine.pastDue(readOf(shard), now);
+        while (it.next()) |due| {
             if (n == ae.MAX_EXPIRE_ITEMS) break;
-            const k = machine.parseDeadlineKey(item.key[1..]) orelse continue;
-            if (k.expiry_ns > now) break;
+            const k = due.key;
             var holder: []const u8 = "";
             var request_key: ?[]const u8 = null;
-            if (getRun(shard, k.ns, k.run)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
+            if (getRun(shard, k.ns, k.id)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
                 if (now < self.duty_since_ns +| grace) continue;
                 holder = run.holder;
                 request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
             if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
             n += 1;

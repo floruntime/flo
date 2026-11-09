@@ -807,7 +807,7 @@ pub const Actions = struct {
         var kb: [512]u8 = undefined;
         switch (v.status) {
             .ready => {
-                const k = view_mod.key(&kb, ns, action_machine.readyKey(&b, v.action, v.due_ns, id)) catch return null;
+                const k = view_mod.key(&kb, ns, action_machine.readyKey(&b, v.action, {}, v.due_ns, id)) catch return null;
                 if (self.store.get(action_machine.Ready.ID, k) == null) return "a ready run has no ready key at its due time";
             },
             .leased => {

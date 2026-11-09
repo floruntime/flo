@@ -116,6 +116,7 @@ const M = delivery.Model(.{
     .max_scope = ae.MAX_ACTION_NAME,
     .max_id = ae.MAX_RUN_ID,
     .max_namespace = limits.MAX_NAMESPACE_NAME,
+    .noun = "run",
 });
 
 pub const Defs = view_mod.Family(20, "action.def", Stored(Def));
@@ -135,6 +136,7 @@ pub const readyPrefix = M.readyPrefix;
 pub const deadlineKey = M.deadlineKey;
 pub const DeadlineKey = M.DeadlineKey;
 pub const parseDeadlineKey = M.parseDeadlineKey;
+pub const pastDue = M.pastDue;
 pub const requestKey = M.requestKey;
 const after = delivery.after;
 const extendedTo = delivery.extendedTo;
@@ -161,13 +163,13 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
             try out.add(Defs.ID, p.ns, p.action);
             try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, stamp, p.run));
+            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, stamp, p.run));
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
             try out.add(Defs.ID, p.ns, p.action);
             try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, p.due_ns, p.run));
+            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, p.due_ns, p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), p.ns, p.run));
             if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
         },
@@ -180,7 +182,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return;
             try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, after(stamp, p.delay_ms), p.run));
+            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
             try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
             if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
         },
@@ -196,7 +198,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             while (it.next() catch return) |item| {
                 try out.add(Runs.ID, item.ns, item.run);
                 try out.add(Deadlines.ID, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run));
-                try out.add(Ready.ID, item.ns, readyKey(&b, item.action, stamp, item.run));
+                try out.add(Ready.ID, item.ns, readyKey(&b, item.action, {}, stamp, item.run));
                 if (item.request_key) |k| try out.add(Requests.ID, item.ns, requestKey(&rb, item.holder, k));
             }
         },
@@ -272,7 +274,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .@"error" = "",
             } });
             var b: KeyBuf = undefined;
-            try view.put(Ready, try nsKey(view, p.ns, readyKey(&b, p.action, stamp, p.run)), .{});
+            try view.put(Ready, try nsKey(view, p.ns, readyKey(&b, p.action, {}, stamp, p.run)), .{});
             out.putBytes(p.run);
         },
         .action_deliver => {
@@ -392,8 +394,8 @@ pub const OTHER_RESULT = "stale report: the run was completed with another resul
 
 const holds = delivery.holds;
 const sameDelivery = delivery.sameDelivery;
-const stale = delivery.stale;
-pub const staleWhy = delivery.staleWhy;
+const stale = M.stale;
+pub const staleWhy = M.staleWhy;
 const nsKey = delivery.nsKey;
 
 pub const machine: machine_mod.Machine = .{
@@ -489,7 +491,7 @@ pub const TestActions = struct {
             if (k.expiry_ns > stamp) break;
             const d = try Stored(Deadline).decode(rec.value);
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
+            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
             n += 1;
         }
         if (n == 0) return;
