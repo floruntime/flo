@@ -6411,7 +6411,7 @@ pub const Shard = struct {
         const ask = cluster_wire.RepairSkip.decode(req.value) catch return shard.sendErrorResponse(conn, rid, .bad_request, "bad request: a repair skip takes an entry index and a reason of at most 256 bytes");
         const raft = shard.raft_node;
         if (raft.role != .leader) return shard.sendRefusal(conn, rid, .unavailable, proto.notRun("unavailable: the leader changed — retry"));
-        var msg: [400]u8 = undefined;
+        var msg: [512]u8 = undefined;
         const e = switch (shard.replica.readOwnEntry(ask.index)) {
             .found => |e| e,
             .blocked => return shard.sendRefusal(conn, rid, .unavailable, proto.notRun("unavailable: the leader can't read that entry right now — retry")),
@@ -6425,7 +6425,7 @@ pub const Shard = struct {
         // The writes behind a create or bind carry its id: skipped, they
         // would apply under an id another namespace may take.
         if (etype == @backingInt(entry_mod.EntryType.namespace_create) or etype == @backingInt(entry_mod.EntryType.namespace_bind))
-            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} creates or binds a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take. It is never skipped", .{ask.index}) catch "a namespace create or bind is never skipped");
+            return shard.sendErrorResponse(conn, rid, .bad_request, std.fmt.bufPrint(&msg, "entry {d} creates or binds a namespace, and the writes behind it carry its id: skipped, they would land under an id another namespace may take, so it is never skipped. A member that halted here alone: stop it, wipe its data (flo server wipe), and restart it to rejoin from the others. If every member halted here, no repair keeps the writes behind it: restore from a backup, or rebuild the cluster", .{ask.index}) catch "a namespace create or bind is never skipped");
         const target: raft_node_mod.HaltAt = .{ .index = ask.index, .term = e.header.term, .crc = e.header.crc32c };
         const entry_size: u32 = @intCast(e.payload.len);
         var ids: [raft_node_mod.MAX_PEERS + 1]raft_node_mod.NodeId = undefined;
