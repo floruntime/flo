@@ -148,8 +148,22 @@ const SimDisk = struct {
     /// (a restarted node's log outgrows its ring) and are not counted.
     catch_up_reads: u64 = 0,
     applying: bool = false,
+    /// A leader's reads below the ring for a peer, answered `pending` and
+    /// done later, as the bulk I/O thread does (`Scenario.pendingReads`).
+    /// A read keeps the entries it found when asked, across any truncation
+    /// after: only the log's own check stops a stale one being sent.
+    pending_permille: u16 = 0,
+    pending_max_ticks: u32 = 0,
+    /// The sim's tick, set by it as each begins.
+    now: u64 = 0,
+    rng: std.Random.DefaultPrng = .init(0),
+    waits: std.ArrayListUnmanaged(Wait) = .empty,
+    /// Pending reads handed back done.
+    pending_served: u64 = 0,
 
     const Segment = struct { last: u64, stamp: u64 };
+
+    const Wait = struct { start: u64, ready_at: u64, entries: []DiskEntry };
 
     const DiskEntry = struct {
         entry_type: u8,
@@ -163,6 +177,18 @@ const SimDisk = struct {
         for (self.entries.items) |e| self.allocator.free(e.payload);
         self.entries.deinit(self.allocator);
         self.segments.deinit(self.allocator);
+        self.forgetWaits();
+        self.waits.deinit(self.allocator);
+    }
+
+    fn forgetWaits(self: *SimDisk) void {
+        for (self.waits.items) |w| self.freeWait(w);
+        self.waits.clearRetainingCapacity();
+    }
+
+    fn freeWait(self: *SimDisk, w: Wait) void {
+        for (w.entries) |e| self.allocator.free(e.payload);
+        self.allocator.free(w.entries);
     }
 
     /// The highest stamp any segment carries: what a restart applies
@@ -238,6 +264,44 @@ const SimDisk = struct {
         return .{ .count = n };
     }
 
+    /// A leader's read for a peer: some answer `pending` and are done a few
+    /// ticks later, with the entries as they were when asked.
+    fn readRangeAsync(ctx: *anyopaque, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
+        const self: *SimDisk = @ptrCast(@alignCast(ctx));
+        for (self.waits.items, 0..) |w, i| {
+            if (w.start != start) continue;
+            if (self.now < w.ready_at) return .{ .pending = true };
+            _ = self.waits.swapRemove(i);
+            defer self.freeWait(w);
+            self.pending_served += 1;
+            return copyEntries(w.entries, start, buf, arena);
+        }
+        if (self.rng.random().uintLessThan(u16, 1000) >= self.pending_permille) return readRange(ctx, start, buf, arena);
+        const have = self.entries.items.len -| (start - 1);
+        const n = @min(have, buf.len);
+        const copies = self.allocator.alloc(DiskEntry, n) catch @panic("sim OOM");
+        for (copies, self.entries.items[start - 1 ..][0..n]) |*c, de| {
+            c.* = de;
+            c.payload = self.allocator.dupe(u8, de.payload) catch @panic("sim OOM");
+        }
+        const ready_at = self.now + self.rng.random().intRangeAtMost(u64, 1, @max(1, self.pending_max_ticks));
+        self.waits.append(self.allocator, .{ .start = start, .ready_at = ready_at, .entries = copies }) catch @panic("sim OOM");
+        return .{ .pending = true };
+    }
+
+    fn copyEntries(from: []const DiskEntry, start: u64, buf: []entry_mod.Entry, arena: []u8) raft_log_mod.CatchUpResult {
+        var n: usize = 0;
+        var used: usize = 0;
+        while (n < buf.len and n < from.len) : (n += 1) {
+            const de = from[n];
+            if (used + de.payload.len > arena.len) break;
+            @memcpy(arena[used..][0..de.payload.len], de.payload);
+            buf[n] = entry_mod.buildEntry(@fromBackingInt(@intCast(de.entry_type)), de.flags, de.term, start + n, de.timestamp_ns, arena[used..][0..de.payload.len]);
+            used += de.payload.len;
+        }
+        return .{ .count = n };
+    }
+
     /// RaftNode persists through this before granting a vote, adopting a
     /// term, or starting or ending its lost-log guard. The sim disk never
     /// fails a write.
@@ -277,6 +341,8 @@ const SimDisk = struct {
     }
 
     fn crash(self: *SimDisk) void {
+        // Reads in flight lived in the process.
+        self.forgetWaits();
         var i = self.entries.items.len;
         while (i > self.durable_len) : (i -= 1) {
             self.allocator.free(self.entries.items[i - 1].payload);
@@ -825,6 +891,8 @@ pub const Summary = struct {
     apply_stalls: u64,
     /// Replication batches read from below the leaders' rings.
     catch_up_reads: u64,
+    /// Reads below the ring that answered pending and were handed back done.
+    pending_reads: u64 = 0,
     /// Diverged nodes wiped and rejoined (async mode, after a crash).
     divergences: u64,
     /// Diverged nodes no config could spare, left diverged; a run with one
@@ -1096,7 +1164,14 @@ pub const Simulator = struct {
         node.raft.log.ual.on_append = SimDisk.onAppend;
         node.raft.log.on_truncate_ctx = @ptrCast(&node.disk);
         node.raft.log.on_truncate = SimDisk.onTruncate;
-        if (comptime plant.active != .no_catch_up) node.raft.log.catch_up = .{ .ctx = @ptrCast(&node.disk), .read_range = SimDisk.readRange };
+        if (comptime plant.active != .no_catch_up) node.raft.log.catch_up = .{
+            .ctx = @ptrCast(&node.disk),
+            .read_range = SimDisk.readRange,
+            .read_range_async = if (self.scenario.pending_read_permille > 0) SimDisk.readRangeAsync else null,
+        };
+        node.disk.pending_permille = self.scenario.pending_read_permille;
+        node.disk.pending_max_ticks = self.scenario.pending_read_max_ticks;
+        node.disk.rng = .init(self.scenario.seed ^ (@as(u64, node.id) *% 0x9E37_79B9_7F4A_7C15) ^ 0x7E4D_1A9C);
         node.raft.log_flush_sink = .{ .ctx = @ptrCast(&node.disk), .flush = SimDisk.flushLog };
         node.disk.commit_index = &node.raft.commit_index;
         if (!self.options.volatile_hard_state) {
@@ -2370,6 +2445,7 @@ pub const Simulator = struct {
     /// tick its acker crashes was acked before the crash — the client has
     /// the response; the guarantee stands.
     fn tick(self: *Simulator) !void {
+        for (self.nodes) |*node| node.disk.now = self.now;
         for (self.nodes) |*node| node.sim = self;
         // The replicas say what a node's operator reads; the run's own
         // report is the checker's.
@@ -2487,6 +2563,11 @@ pub const Simulator = struct {
         return .{
             .seed = self.scenario.seed,
             .ok = self.checker.violations.items.len == 0,
+            .pending_reads = blk: {
+                var n: u64 = 0;
+                for (self.nodes) |*node| n += node.disk.pending_served;
+                break :blk n;
+            },
             .ticks = self.now,
             .ops_submitted = self.workload.next_op_id,
             .ops_acked = self.workload.acked_count,
@@ -3601,4 +3682,16 @@ test "vopr sim: a leader ready once it has committed, not applied, earlier terms
     // Only an apply pause leaves a committed tail unapplied at election:
     // without one these seeds never catch it.
     try staleIdUnder(.ns_ready_on_commit);
+}
+
+test "vopr sim: with a leader's reads below the ring answered pending and done later, the run converges" {
+    var scenario = Scenario.pendingReads(3);
+    // Debug builds run the sim slowly: a shorter run still reaches the ring.
+    scenario.ticks_safety = 8_000;
+    var sim = try Simulator.init(testing.allocator, scenario, .{});
+    defer sim.deinit();
+    const s = try sim.run();
+    try testing.expect(s.ok);
+    // The path was taken, not skipped: pending reads were handed back done.
+    try testing.expect(s.pending_reads > 0);
 }

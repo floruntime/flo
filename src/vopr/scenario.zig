@@ -176,6 +176,11 @@ pub const Scenario = struct {
     /// drawn for it.
     apply_lag_permille: u16 = 0,
     apply_lag_max_ms: u32 = 0,
+    /// Permille of a leader's reads below the ring for a peer that answer
+    /// pending, as one handed to the bulk I/O thread does, and are done
+    /// within `pending_read_max_ticks`, out of order across peers.
+    pending_read_permille: u16 = 0,
+    pending_read_max_ticks: u32 = 0,
     /// Each node's own limit on a KV transaction's ops, indexed by id - 1: a
     /// model of `[kv] max_txn_ops`. A leader proposes only batches within its
     /// own, and every replica applies whatever committed. All 0, the workload
@@ -383,6 +388,16 @@ pub const Scenario = struct {
         return s;
     }
 
+    /// The small ring, with a leader's reads below it for a peer answered
+    /// `pending` and done later, as the bulk I/O thread does. The draws come
+    /// from the disk's own generator, so the small ring's stream is the same.
+    pub fn pendingReads(seed: u64) Scenario {
+        var s = smallRing(seed);
+        s.pending_read_permille = 400;
+        s.pending_read_max_ticks = 300;
+        return s;
+    }
+
     /// No faults, small cluster, roomy ring — the sanity baseline:
     /// if calm fails, the harness is broken, not Flo.
     pub fn calm(seed: u64) Scenario {
@@ -463,10 +478,12 @@ pub const Scenario = struct {
             \\  "namespace_creates": {},
             \\  "apply_lag_permille": {d},
             \\  "apply_lag_max_ms": {d},
+            \\  "pending_read_permille": {d},
+            \\  "pending_read_max_ticks": {d},
             \\  "txn_limits": [{d}, {d}, {d}, {d}, {d}, {d}, {d}, {d}]
             \\}}
             \\
-        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
+        , .{ self.repair_halt, self.action_percent, self.namespace_creates, self.apply_lag_permille, self.apply_lag_max_ms, self.pending_read_permille, self.pending_read_max_ticks, self.txn_limits[0], self.txn_limits[1], self.txn_limits[2], self.txn_limits[3], self.txn_limits[4], self.txn_limits[5], self.txn_limits[6], self.txn_limits[7] });
     }
 
     /// Parse a scenario back from `writeJson` output — the pin format.
@@ -526,6 +543,8 @@ pub const Scenario = struct {
             } else false,
             .apply_lag_permille = if (obj.get("apply_lag_permille") == null) 0 else try jsonInt(u16, obj, "apply_lag_permille"),
             .apply_lag_max_ms = if (obj.get("apply_lag_max_ms") == null) 0 else try jsonInt(u32, obj, "apply_lag_max_ms"),
+            .pending_read_permille = if (obj.get("pending_read_permille") == null) 0 else try jsonInt(u16, obj, "pending_read_permille"),
+            .pending_read_max_ticks = if (obj.get("pending_read_max_ticks") == null) 0 else try jsonInt(u32, obj, "pending_read_max_ticks"),
             .txn_limits = try jsonTxnLimits(obj),
         };
         if (!scenario.validTxnLimits()) return error.InvalidField;
@@ -750,7 +769,7 @@ test "vopr scenario: json emit parses and fields pair correctly" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try testing.expectEqual(@as(usize, 38), obj.count());
+    try testing.expectEqual(@as(usize, 40), obj.count());
     try testing.expectEqual(@as(usize, MAX_NODES), obj.get("txn_limits").?.array.items.len);
     try testing.expectEqual(s.repair_halt, obj.get("repair_halt").?.bool);
     try testing.expectEqual(@as(i64, s.action_percent), obj.get("action_percent").?.integer);

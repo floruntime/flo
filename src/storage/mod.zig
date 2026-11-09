@@ -13,3 +13,4 @@ pub const partition = @import("partition.zig");
 pub const persistence = @import("persistence.zig");
 pub const tombstones = @import("tombstones.zig");
 pub const durable_log = @import("durable_log.zig");
+pub const bulk_io = @import("bulk_io.zig");

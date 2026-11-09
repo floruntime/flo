@@ -40,6 +40,9 @@ pub const DurableLog = struct {
     /// Truncations that did not reach every file; each one is a replay
     /// that may apply a suffix the leader discarded.
     truncate_failures: u64 = 0,
+    /// Truncations begun: a read made elsewhere under an older count may
+    /// hold entries a cut has since dropped, and is not used.
+    truncations: u64 = 0,
     /// The cut the files do not yet reflect, held here because the intent
     /// file may itself be what failed to write. No flush happens while it
     /// is set: a new file above the cut would be indistinguishable, at the
@@ -64,6 +67,25 @@ pub const DurableLog = struct {
     /// reads one entry per call, and re-opening and CRC-checking the whole
     /// file each time is quadratic.
     open: ?Open = null,
+    /// Where a read from `start` would come from, for a reader on another
+    /// thread: null when the writer's buffer holds it (that read stays here),
+    /// or when nothing durable does. The path is copied into `path_buf`;
+    /// `limit` is how many entries from `start` it may return, short of a
+    /// pending cut.
+    pub fn sealedSource(self: *DurableLog, start: u64, path_buf: []u8) !?struct { path: []const u8, limit: u64 } {
+        const w = self.writer;
+        if (w.entry_count > 0 and start >= w.first_index and start <= w.last_index) return null;
+        if (self.pending_cut) |cut| if (start > cut) return null;
+        for (try self.segments()) |f| {
+            if (start < f.first_index or start > f.last_index or f.unreadable) continue;
+            if (f.path.len > path_buf.len) return error.PathTooLong;
+            @memcpy(path_buf[0..f.path.len], f.path);
+            const end = if (self.pending_cut) |cut| @min(cut, f.last_index) else f.last_index;
+            return .{ .path = path_buf[0..f.path.len], .limit = end - start + 1 };
+        }
+        return null;
+    }
+
     /// What a read below the ring came to. `blocked` means it could not be
     /// read right now, kept apart from "it isn't there": a hole is damage, a
     /// blocked read is retried. `disk_failing` marks a blocked read whose
@@ -161,7 +183,7 @@ pub const DurableLog = struct {
         return .{ .count = copyFrom(data, start, buf[0..limit], arena) };
     }
 
-    const ReadBlockClass = enum {
+    pub const ReadBlockClass = enum {
         /// A resource shortage expected to pass: hold and retry indefinitely.
         resource,
         /// An IO error, or an unmapped errno that may be one: retry, but let
@@ -175,7 +197,7 @@ pub const DurableLog = struct {
     };
 
     /// Classify a failure to open or read a listed segment.
-    fn readBlockClass(err: anyerror) ReadBlockClass {
+    pub fn readBlockClass(err: anyerror) ReadBlockClass {
         return switch (err) {
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,
@@ -198,6 +220,7 @@ pub const DurableLog = struct {
     /// or an error is finished by the next boot, because a segment still
     /// holding a truncated index would win at replay.
     pub fn truncateAfter(self: *DurableLog, after_index: u64) !void {
+        self.truncations += 1;
         self.writer.truncateAfter(after_index);
         self.invalidate();
         // The log is already cut in memory; any failure from here leaves
@@ -555,7 +578,7 @@ fn readHeader(path: []const u8) !segment.SegmentHeader {
 }
 
 /// Copy entries at or above `start` out of a self-delimiting byte run.
-fn copyFrom(data: []const u8, start: u64, buf: []Entry, arena: []u8) usize {
+pub fn copyFrom(data: []const u8, start: u64, buf: []Entry, arena: []u8) usize {
     var offset: usize = 0;
     var count: usize = 0;
     var arena_used: usize = 0;
