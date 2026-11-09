@@ -16,8 +16,10 @@
 //! delete that key when it is still the item's; one that misses leaves its
 //! key to the expire duty, which drops every past-due key it reads.
 //!
-//! An item is a record with the fields `Lease` names, read and written
-//! here by name, and a scope field the caller names (`Config.scope`).
+//! An item is a record the model reads and writes by name: `status`
+//! (`.ready`, `.leased`), `due_ns`, `deliveries`, `holder`, `request_key`,
+//! `token`, `lease_ms`, `delivered_ns`, `expiry_ns`, `ended`, `started_ns`,
+//! and a scope field the caller names (`Config.scope`).
 
 const std = @import("std");
 const schema = @import("../protocol/schema.zig");
@@ -101,6 +103,8 @@ pub fn Model(comptime cfg: Config) type {
 
         comptime {
             std.debug.assert(8 + 1 + cfg.max_namespace + cfg.max_id <= MAX_KEY);
+            // `Deadline.scope` and `Request.run` hold at most these.
+            std.debug.assert(cfg.max_scope <= ae.MAX_ACTION_NAME and cfg.max_id <= ae.MAX_RUN_ID);
         }
 
         /// `[scope][0][due:u64 BE][id]`: a scope's ready items, earliest
@@ -191,7 +195,7 @@ pub fn Model(comptime cfg: Config) type {
 
         /// An extend at `stamp` of the live lease: a no-op while more than
         /// half of it remains or at the hold ceiling; otherwise the lease
-        /// moves on. Returns the expiry it leaves.
+        /// moves on. Returns the new expiry, or null when it stands.
         pub fn extend(view: *View, ns: []const u8, id: []const u8, item: anytype, seen_expiry: u64, stamp: u64) ApplyError!?u64 {
             if (item.expiry_ns -| stamp > (item.lease_ms *| std.time.ns_per_ms) / 2) return null;
             const to = extendedTo(stamp, item.lease_ms, item.delivered_ns);
@@ -203,8 +207,8 @@ pub fn Model(comptime cfg: Config) type {
         }
 
         /// One expire item: its key goes if past due at `stamp`, unless it
-        /// is a live lease of another scope's item; whether it is `item`'s
-        /// live lease, which the caller then ends.
+        /// is the live lease of an item in another scope. Returns whether it
+        /// is `found`'s live lease, which the caller then ends.
         pub fn expireKey(view: *View, ns: []const u8, id: []const u8, scope: []const u8, expiry_ns: u64, found: anytype, stamp: u64) ApplyError!bool {
             if (expiry_ns > stamp) return false;
             const live = if (found) |r| r.status == .leased and r.expiry_ns == expiry_ns else false;

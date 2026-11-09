@@ -10,7 +10,7 @@
 //!   no namespace, so the expire duty reads the earliest without a scan.
 //!
 //! The ready, deadline and request families and the lease rules are the
-//! delivery model's (`contract/delivery.zig`), shared with queues.
+//! delivery model's (`contract/delivery.zig`).
 //!
 //! A lease's identity is its deadline key: a run leased until exactly that
 //! instant is the lease the key names. Deliver and extend each write one.
