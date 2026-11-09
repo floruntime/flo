@@ -2061,7 +2061,7 @@ pub const ActionsHandler = struct {
                 request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.action, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
             if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
             n += 1;
