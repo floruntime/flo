@@ -134,6 +134,17 @@ pub fn routeNsKey(ns: NamespaceId, key: []const u8) u64 {
     return h.final();
 }
 
+/// The key a named thing (a stream, queue, measurement, group) is kept
+/// under in its namespace: the id, then the name's hash, both big-endian,
+/// so one namespace's keys sort together and a 64-bit collision can only
+/// be between names in one namespace.
+pub fn nsNameKey(ns: NamespaceId, name: []const u8) [12]u8 {
+    var k: [12]u8 = undefined;
+    k[0..4].* = ns.bytes();
+    std.mem.writeInt(u64, k[4..12], std.hash.Wyhash.hash(HASH_SEED, name), .big);
+    return k;
+}
+
 /// Hash a resource name (stream, queue, measurement) in a namespace, seeded
 /// with the namespace's id: the same from a request, which the edge
 /// resolved, and from a committed entry, which carries the id.
@@ -299,4 +310,13 @@ test "Router: nameHash is the namespace's own" {
     // Different namespace + same name → different hash (isolated)
     try std.testing.expect(nameHash(.of(16), "events") != nameHash(.of(17), "events"));
     try std.testing.expect(nameHash(.default, "events") != nameHash(.of(16), "events"));
+}
+
+test "Router: nsNameKey is the id then the name's hash, big-endian" {
+    const k = nsNameKey(.of(0x01020304), "orders");
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, k[0..4]);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(HASH_SEED, "orders"), std.mem.readInt(u64, k[4..12], .big));
+    // One namespace's keys share a prefix and sort after a lower id's.
+    try std.testing.expectEqualSlices(u8, k[0..4], nsNameKey(.of(0x01020304), "other")[0..4]);
+    try std.testing.expect(std.mem.order(u8, &nsNameKey(.of(16), "zz"), &nsNameKey(.of(17), "aa")) == .lt);
 }
