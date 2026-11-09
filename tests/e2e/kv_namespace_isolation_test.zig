@@ -1,16 +1,19 @@
-//! Two namespaces holding the same keys keep them apart: every key is stored
+//! Namespaces holding the same keys keep them apart: every key is stored
 //! behind its namespace's id, so a read, a listing or a transaction in one
 //! never reaches the other's, on one shard or many, and after a restart
-//! replays the log.
+//! replays the log. Two of the namespaces are a pair whose names once hashed
+//! to the same 32 bits.
 
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
+const colliding = @import("helpers/colliding_namespaces.zig");
 
-const NAMESPACES = [_][]const u8{ "default", "iso" };
+const NAMESPACES = [_][]const u8{ "default", colliding.a, colliding.b };
 
-fn other(ns: []const u8) []const u8 {
-    return if (std.mem.eql(u8, ns, "default")) "iso" else "default";
+/// The namespace after `i`, whose own key namespace `i` must not see.
+fn other(i: usize) []const u8 {
+    return NAMESPACES[(i + 1) % NAMESPACES.len];
 }
 
 /// What the CLI prints for `args`, its exit code checked.
@@ -53,16 +56,19 @@ fn write(ctx: *stdx.testing.TestContext) !void {
 fn verify(ctx: *stdx.testing.TestContext) !void {
     var want: [128]u8 = undefined;
     var key: [64]u8 = undefined;
-    for (NAMESPACES) |ns| {
+    for (NAMESPACES, 0..) |ns, i| {
         for ([_][2][]const u8{ .{ "{t}same", "v3" }, .{ "two", "two" }, .{ "{t}txn", "txn" } }) |kv| {
             const got = try run(ctx, &.{ "kv", "get", kv[0], "-o", "raw", "-n", ns }, 0);
             defer testing.allocator.free(got);
             try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s}-{s}", .{ ns, kv[1] }), got);
         }
-        // The other namespace's own key isn't here.
-        const theirs = try std.fmt.bufPrint(&key, "only-{s}", .{other(ns)});
-        const missing = try run(ctx, &.{ "kv", "get", theirs, "-n", ns }, 1);
-        testing.allocator.free(missing);
+        // No other namespace's own key is here.
+        for (NAMESPACES) |them| {
+            if (std.mem.eql(u8, them, ns)) continue;
+            const missing = try run(ctx, &.{ "kv", "get", try std.fmt.bufPrint(&key, "only-{s}", .{them}), "-n", ns }, 1);
+            testing.allocator.free(missing);
+        }
+        const theirs = try std.fmt.bufPrint(&key, "only-{s}", .{other(i)});
 
         // A listing: this namespace's keys, as named, and no other's.
         const listed = try run(ctx, &.{ "kv", "scan", "-o", "raw", "-n", ns }, 0);
@@ -114,10 +120,10 @@ fn isolated(shards: u8) !void {
     try verify(ctx);
 }
 
-test "e2e/kv: two namespaces with the same keys keep them apart through set, get, scan, mget, history and a transaction, on 1 shard and after a restart" {
+test "e2e/kv: three namespaces with the same keys keep them apart through set, get, scan, mget, history and a transaction, on 1 shard and after a restart" {
     try isolated(1);
 }
 
-test "e2e/kv: two namespaces with the same keys keep them apart through set, get, scan, mget, history and a transaction, on 4 shards and after a restart" {
+test "e2e/kv: three namespaces with the same keys keep them apart through set, get, scan, mget, history and a transaction, on 4 shards and after a restart" {
     try isolated(4);
 }
