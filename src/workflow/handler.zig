@@ -335,7 +335,16 @@ pub const WorkflowHandler = struct {
         interval_ms: i64,
         max_concurrent: u32,
         input_owned: ?[]const u8,
-        last_trigger_ms: i64,
+        /// Slots count from here: the stamp of the entry that created or
+        /// last enabled the workflow, the same on every replica.
+        anchor_ms: i64,
+        /// The latest slot a run started for, set as that start applies
+        /// on every replica, so a new leader fires only later slots.
+        fired_ms: i64 = std.math.minInt(i64),
+        /// The slot this leader proposed a start for, in `proposed_term`;
+        /// not proposed again while that term lasts.
+        proposed_ms: i64 = std.math.minInt(i64),
+        proposed_term: u64 = 0,
     };
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
@@ -1503,11 +1512,16 @@ pub const WorkflowHandler = struct {
 
     /// Apply a workflow_enabled entry. The definition may have gone since it
     /// was proposed; then nothing changes.
-    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
+    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         if (value.len != 1 or value[0] > 1) return error.Halt;
         if (!self.definitions.contains(ns_key)) return out.refuse(.not_found, .not_found, "workflow not found");
         if (value[0] == 1) {
-            if (self.disabled.fetchRemove(ns_key)) |old| self.allocator.free(old.key);
+            // Enabled again, its schedule counts slots from now: those
+            // missed while disabled don't fire.
+            if (self.disabled.fetchRemove(ns_key)) |old| {
+                self.allocator.free(old.key);
+                if (self.schedules.getPtr(ns_key)) |schedule| schedule.anchor_ms = stamp_ms;
+            }
             return;
         }
         if (self.disabled.contains(ns_key)) return;
@@ -3165,6 +3179,7 @@ pub const WorkflowHandler = struct {
         namespace: []const u8,
         workflow_name: []const u8,
         schedule: definition.ScheduleDef,
+        anchor_ms: i64,
     ) void {
         // Only interval-based schedules are supported for now
         const interval_ms = schedule.interval_ms orelse return;
@@ -3173,10 +3188,13 @@ pub const WorkflowHandler = struct {
 
         const sched_key = self.makeNsKey(namespace, workflow_name) orelse return;
 
-        // Remove old schedule if re-creating workflow
+        // A redefinition replaces the schedule; the slots it fired stay
+        // fired.
+        var fired_ms: i64 = std.math.minInt(i64);
         if (self.schedules.fetchRemove(sched_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
+            fired_ms = state.fired_ms;
             self.freeScheduleState(&state);
         }
 
@@ -3200,7 +3218,8 @@ pub const WorkflowHandler = struct {
             .interval_ms = interval_ms,
             .max_concurrent = schedule.max_concurrent,
             .input_owned = owned_input,
-            .last_trigger_ms = 0,
+            .anchor_ms = anchor_ms,
+            .fired_ms = fired_ms,
         }) catch {
             self.allocator.free(sched_key);
             self.allocator.free(owned_wf);
@@ -3220,20 +3239,31 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// Check all active schedules and start runs when the interval has elapsed.
-    /// Called from shard.tick() on every reactor cycle.
+    /// The latest slot due at `now_ms`, or null before the first. Slot k
+    /// is at anchor + k·interval; slot 0 is the anchor itself.
+    fn dueSlot(schedule: *const ScheduleState, now_ms: i64) ?i64 {
+        if (now_ms < schedule.anchor_ms) return null;
+        const k = @divFloor(now_ms - schedule.anchor_ms, schedule.interval_ms);
+        return schedule.anchor_ms + k * schedule.interval_ms;
+    }
+
+    /// Start a run for each schedule whose latest slot hasn't fired. Slots
+    /// missed while no leader was ready fire once, as the latest one: a
+    /// failover or restart neither bursts nor skips. A leader whose clock
+    /// runs ahead fires early by as much.
     pub fn tickSchedules(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
+        const term = shard.raft_node.current_term;
 
         var it = self.schedules.iterator();
         while (it.next()) |entry| {
             const schedule = entry.value_ptr;
-
-            // Enforce interval
-            if (now_ms - schedule.last_trigger_ms < schedule.interval_ms) continue;
+            const slot = dueSlot(schedule, now_ms) orelse continue;
+            if (slot <= schedule.fired_ms) continue;
+            if (schedule.proposed_term == term and slot <= schedule.proposed_ms) continue;
 
             // Skip disabled workflows
             if (self.disabled.contains(entry.key_ptr.*)) continue;
@@ -3243,25 +3273,44 @@ pub const WorkflowHandler = struct {
                 if ((self.active_runs.get(entry.key_ptr.*) orelse 0) >= schedule.max_concurrent) continue;
             }
 
-            schedule.last_trigger_ms = now_ms;
-            self.startRunFromSchedule(shard, schedule);
+            if (self.startRunFromSchedule(shard, schedule, slot)) {
+                schedule.proposed_ms = slot;
+                schedule.proposed_term = term;
+            }
         }
     }
 
-    /// Start a workflow run from a schedule trigger.
+    /// Start a workflow run for a schedule's slot. Its idempotency key
+    /// names the schedule and the slot, so a slot starts one run however
+    /// many leaders propose it. Returns whether it was proposed.
     fn startRunFromSchedule(
         self: *WorkflowHandler,
         shard: *Shard,
         schedule: *const ScheduleState,
-    ) void {
+        slot_ms: i64,
+    ) bool {
         const input = schedule.input_owned orelse "{}";
+
+        var key_buf: [512]u8 = undefined;
+        const idem = std.fmt.bufPrint(&key_buf, "schedule:{s}:{s}:{d}:{d}", .{ schedule.namespace_owned, schedule.workflow_name_owned, schedule.anchor_ms, slot_ms }) catch return false;
 
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(schedule.namespace_owned), schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
-        _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
+        return self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, idem, "schedule_started") != null;
+    }
+
+    /// A schedule's start applied: its slot, the key's last part, has
+    /// fired.
+    fn restoreScheduleSlot(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, idem: []const u8) void {
+        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
+        const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
+        const key = self.makeNsKey(namespace, wf_name) orelse return;
+        defer self.allocator.free(key);
+        const schedule = self.schedules.getPtr(key) orelse return;
+        schedule.fired_ms = @max(schedule.fired_ms, slot);
     }
 
     /// Poll all active stream triggers and start workflow runs for new events.
@@ -3876,7 +3925,7 @@ pub const WorkflowHandler = struct {
         return switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
-            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, out),
+            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             else => error.Halt,
@@ -3945,7 +3994,7 @@ pub const WorkflowHandler = struct {
             self.unregisterStreamTrigger(namespace, raw_name);
         }
         if (def.schedule) |schedule| {
-            self.registerSchedule(namespace, raw_name, schedule);
+            self.registerSchedule(namespace, raw_name, schedule, created_at_ms);
         } else {
             self.unregisterSchedule(namespace, raw_name);
         }
@@ -4060,6 +4109,9 @@ pub const WorkflowHandler = struct {
         if (idem) |k| {
             if (std.mem.eql(u8, event_type, "trigger_started") and std.mem.startsWith(u8, k, "trigger:")) {
                 self.restoreTriggerCursor(namespace, wf_name, k);
+            }
+            if (std.mem.eql(u8, event_type, "schedule_started") and std.mem.startsWith(u8, k, "schedule:")) {
+                self.restoreScheduleSlot(namespace, wf_name, k);
             }
         }
 
@@ -5316,10 +5368,12 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
 
     // A start's entry carries its namespace's id: "a" is created first.
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
-    handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 });
+    handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 }, 0);
     const runsOf = struct {
         fn count(h: *WorkflowHandler, shard_: *Shard) usize {
-            h.schedules.getPtr("a:wf").?.last_trigger_ms = 0;
+            const sched = h.schedules.getPtr("a:wf").?;
+            sched.fired_ms = std.math.minInt(i64);
+            sched.proposed_ms = std.math.minInt(i64);
             const before = shard_.raft_node.log.lastIndex();
             h.tickSchedules(shard_);
             return shard_.raft_node.log.lastIndex() - before;
@@ -5338,6 +5392,88 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(?u32, 1), handler.active_runs.get("a:wf"));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+}
+
+/// A workflow_start's value, as `proposeStart` encodes it.
+fn startValue(buf: []u8, wf: []const u8, event_type: []const u8, idem: []const u8) []const u8 {
+    var off: usize = 0;
+    for ([_][]const u8{ wf, "1" }) |p| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(p.len), .little);
+        @memcpy(buf[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    buf[off] = @backingInt(WorkflowHandler.RunStatus.running);
+    off += 1;
+    for ([_][]const u8{ event_type, idem }) |p| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(p.len), .little);
+        @memcpy(buf[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    return buf[0..off];
+}
+
+test "workflow schedule: slots count from the anchor, and the latest one due is the one that fires" {
+    var s: WorkflowHandler.ScheduleState = .{ .workflow_name_owned = "", .namespace_owned = "", .interval_ms = 1000, .max_concurrent = 1, .input_owned = null, .anchor_ms = 10_500 };
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, 10_499));
+    try testing.expectEqual(@as(?i64, 10_500), WorkflowHandler.dueSlot(&s, 10_500));
+    try testing.expectEqual(@as(?i64, 10_500), WorkflowHandler.dueSlot(&s, 11_499));
+    try testing.expectEqual(@as(?i64, 11_500), WorkflowHandler.dueSlot(&s, 11_500));
+    // Hours missed: the latest slot, not each of them.
+    try testing.expectEqual(@as(?i64, 10_500 + 3600 * 1000), WorkflowHandler.dueSlot(&s, 10_500 + 3600 * 1000 + 999));
+    s.anchor_ms = 0;
+    try testing.expectEqual(@as(?i64, 7000), WorkflowHandler.dueSlot(&s, 7999));
+}
+
+test "workflow schedule: a slot starts one run however many leaders propose it, and a missed one fires once" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    // Created ten intervals ago; slot 0 fired then, nothing since.
+    const interval: i64 = 3_600_000;
+    const now = @import("stdx").time.milliTimestamp();
+    const anchor = now - 10 * interval;
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    handler.registerSchedule("a", "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
+    var buf: [256]u8 = undefined;
+    var key_buf: [128]u8 = undefined;
+    var out: Result = .{};
+    const slot0 = try std.fmt.bufPrint(&key_buf, "schedule:a:wf:{d}:{d}", .{ anchor, anchor });
+    try handler.replayStart("a:r0", startValue(&buf, "wf", "schedule_started", slot0), 1, &out);
+    const sched = handler.schedules.getPtr("a:wf").?;
+    try testing.expectEqual(anchor, sched.fired_ms);
+
+    // The nine missed slots and the current one fire as one run.
+    var before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    const latest = anchor + 10 * interval;
+    try testing.expectEqual(latest, sched.proposed_ms);
+    // Proposed: this term doesn't propose it again.
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    // The next leader, its start unapplied, proposes the same slot.
+    shard.raft_node.current_term += 1;
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+
+    // Both commit: the second creates nothing, and the slot has fired.
+    const key = try std.fmt.bufPrint(&key_buf, "schedule:a:wf:{d}:{d}", .{ anchor, latest });
+    try handler.replayStart("a:r1", startValue(&buf, "wf", "schedule_started", key), 2, &out);
+    try handler.replayStart("a:r2", startValue(&buf, "wf", "schedule_started", key), 3, &out);
+    try testing.expect(handler.runs.contains("a:r1"));
+    try testing.expect(!handler.runs.contains("a:r2"));
+    try testing.expectEqual(latest, sched.fired_ms);
+    // A later leader proposes nothing until the next slot.
+    shard.raft_node.current_term += 1;
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 
 /// An entry proposed and not yet applied, as a cancel's is: its index and term.
