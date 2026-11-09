@@ -50,6 +50,7 @@ const DashboardServerConfig = @import("dashboard/mod.zig").DashboardServerConfig
 const DashboardContext = @import("dashboard/api.zig").DashboardContext;
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
 const HttpMetricsServer = @import("../metrics/http_server.zig").HttpMetricsServer;
+const BulkIo = @import("../storage/bulk_io.zig").BulkIo;
 const NodeHealth = @import("health.zig").NodeHealth;
 
 /// Runtime configuration produced by ServerConfig.toRuntimeConfig()
@@ -328,6 +329,9 @@ pub const Runtime = struct {
 
     /// Raft networking layer for cluster entry replication.
     raft_network: ?*RaftNetwork,
+    /// Reads of sealed segments off the shard threads, for a leader's peers:
+    /// only when there can be peers.
+    bulk_io: ?*BulkIo = null,
     /// Frames from peers to shard 0; owned here, outlives both ends.
     raft_queue: ?*RaftQueue,
 
@@ -548,6 +552,12 @@ pub const Runtime = struct {
             metrics.deinit();
             self.allocator.destroy(metrics);
             self.metrics_registry = null;
+        }
+
+        if (self.bulk_io) |bulk| {
+            bulk.deinit();
+            self.allocator.destroy(bulk);
+            self.bulk_io = null;
         }
 
         // Last: everything that writes to the data dir has stopped.
@@ -941,6 +951,17 @@ pub const Runtime = struct {
             }
         }
 
+        // 3.6. The bulk I/O thread, before any shard can ask it for a read.
+        if (self.raft_network != null) {
+            const bulk = try self.allocator.create(BulkIo);
+            errdefer self.allocator.destroy(bulk);
+            bulk.* = try BulkIo.init(self.allocator);
+            errdefer bulk.deinit();
+            try bulk.start();
+            self.bulk_io = bulk;
+            for (shards) |*shard| shard.attachBulkIo(bulk);
+        }
+
         // 3.7. Spawn shard threads
         for (0..self.shard_count) |i| {
             threads[i] = try std.Thread.spawn(.{}, shardThread, .{&shards[i]});
@@ -1245,6 +1266,10 @@ pub const Runtime = struct {
                 t.join();
             }
         }
+
+        // 5. Then the bulk thread: no shard asks it for anything now, and it
+        //    stops before the shards' buffers it writes into are freed.
+        if (self.bulk_io) |bulk| bulk.stop();
 
         self.started = false;
         log.debug("Runtime.stop: shutdown complete", .{});

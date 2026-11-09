@@ -11,6 +11,7 @@
 //! term lookup, and index management on top.
 
 const std = @import("std");
+const plant = @import("../plant.zig");
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -35,7 +36,9 @@ pub const TermRun = struct {
 /// out of entries. A blocked read is retried; it is never a hole.
 /// `disk_failing` marks a block whose cause may be the disk, so a caller that
 /// has waited long enough can give up and damage rather than wait forever.
-pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false };
+/// `pending` says the read was started elsewhere and the caller should ask
+/// again once woken; it is never a hole either.
+pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, pending: bool = false };
 
 /// Where an entry the ring no longer holds can still be read from: the
 /// durable log in production, the simulated disk under VOPR. Reads are
@@ -44,6 +47,9 @@ pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false, disk
 pub const CatchUpSource = struct {
     ctx: *anyopaque,
     read_range: *const fn (ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult,
+    /// The same read for a leader replicating to a peer, which may answer
+    /// `pending` rather than wait on the disk. Null reads in place.
+    read_range_async: ?*const fn (ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult = null,
 };
 
 /// One entry read for the apply loop: found, genuinely not there (a hole,
@@ -191,7 +197,7 @@ pub const RaftLog = struct {
     /// What a range read came to: how many entries, and whether a below-ring
     /// read was blocked (so the replication path can back off rather than
     /// re-read every tick) rather than folding the block into a zero count.
-    pub const RangeRead = struct { count: usize, blocked: bool = false };
+    pub const RangeRead = struct { count: usize, blocked: bool = false, pending: bool = false };
 
     /// Below the ring the catch-up source answers, bounded to this log's
     /// tip so a stale durable tail can never be handed out as live entries.
@@ -211,8 +217,19 @@ pub const RaftLog = struct {
         const src = self.catch_up orelse return .{ .count = 0 };
         // A blocked source returns no entries, as a partial read does; the
         // leader sends what it has and the catch-up resumes after a back-off.
-        const r = src.read_range(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena);
-        return .{ .count = r.count, .blocked = r.blocked };
+        const read = src.read_range_async orelse src.read_range;
+        const r = read(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena);
+        if (r.pending) return .{ .count = 0, .pending = true };
+        // Read elsewhere, it may predate a truncation: only entries this log
+        // still holds, term for term, are sent. A stale one is read again.
+        var n: usize = 0;
+        while (n < r.count) : (n += 1) {
+            if (comptime plant.active == .stale_catch_up_read) continue;
+            const e = buf[n];
+            if (e.header.index != start_index + n or self.entryTerm(e.header.index) != e.header.term) break;
+        }
+        if (n == 0 and r.count > 0) return .{ .count = 0, .pending = src.read_range_async != null };
+        return .{ .count = n, .blocked = r.blocked };
     }
 
     // ── Truncation ──────────────────────────────────────────────────────
@@ -876,4 +893,48 @@ test "raft log: readForApply tells a blocked read from a hole, and getEntryCopy 
     // Past the tip is a genuine hole whether or not the source is blocked.
     source.blocked = true;
     try testing.expect(log.readForApply(99, &buf) == .absent);
+}
+
+/// A source read elsewhere that hands back what it read some time ago: its
+/// first entry with `first_term`, the rest with `term`.
+const StaleSource = struct {
+    var first_term: u64 = 0;
+    var term: u64 = 0;
+    var count: usize = 0;
+    fn readNow(_: *anyopaque, _: u64, _: []Entry, _: []u8) CatchUpResult {
+        unreachable;
+    }
+    fn read(_: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
+        const n = @min(count, buf.len);
+        for (buf[0..n], 0..) |*e, i| {
+            arena[i] = 'x';
+            e.* = makeEntry(.kv_put, start + i, if (i == 0) first_term else term, arena[i..][0..1]);
+        }
+        return .{ .count = n };
+    }
+};
+
+test "raft log: a read made elsewhere is sent only as far as this log still holds it, term for term" {
+    var log = try RaftLog.init(testing.allocator, 512);
+    defer log.deinit();
+    log.catch_up = .{ .ctx = @ptrFromInt(@alignOf(usize)), .read_range = StaleSource.readNow, .read_range_async = StaleSource.read };
+    for (1..41) |i| {
+        var e = makeEntry(.kv_put, @intCast(i), 1, stdx.repeat("0123456789", 4));
+        _ = try log.append(&e);
+    }
+    var buf: [8]Entry = undefined;
+    var arena: [64]u8 = undefined;
+    // All of term 1, as the log holds them: all sent.
+    StaleSource.first_term = 1;
+    StaleSource.term = 1;
+    StaleSource.count = 3;
+    try testing.expectEqual(@as(usize, 3), log.getRangeBlocking(1, &buf, &arena).count);
+    // Past the first, a term the log doesn't have there: only the first.
+    StaleSource.term = 7;
+    try testing.expectEqual(@as(usize, 1), log.getRangeBlocking(1, &buf, &arena).count);
+    // Stale from its first entry: nothing sent, and asked again.
+    StaleSource.first_term = 7;
+    const none = log.getRangeBlocking(2, &buf, &arena);
+    try testing.expectEqual(@as(usize, 0), none.count);
+    try testing.expect(none.pending);
 }
