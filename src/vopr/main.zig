@@ -16,6 +16,8 @@
 //!        [--mode=volatile|persisted] hard-state model (persisted is the default)
 //!        [--small-ring]             shrink the ring so eviction outruns
 //!                                   replication and repairs read below it
+//!        [--pending-reads]          the small ring, with a leader's reads below it
+//!                                   for a peer answered pending and done later
 //!        [--wipes]                  crashes often lose a disk or its hard
 //!                                   state, up to two nodes at once
 //!        [--membership]             the leader changes the membership often
@@ -51,6 +53,7 @@ const Args = struct {
     seed_timeout_s: u64 = 300,
     volatile_mode: bool = false,
     small_ring: bool = false,
+    pending_reads: bool = false,
     wipes: bool = false,
     membership: bool = false,
     byzantine: bool = false,
@@ -76,7 +79,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -97,6 +100,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.volatile_mode = false;
         } else if (std.mem.eql(u8, arg, "--small-ring")) {
             args.small_ring = true;
+        } else if (std.mem.eql(u8, arg, "--pending-reads")) {
+            args.pending_reads = true;
         } else if (std.mem.eql(u8, arg, "--wipes")) {
             args.wipes = true;
         } else if (std.mem.eql(u8, arg, "--membership")) {
@@ -165,6 +170,8 @@ fn writeScenario(scenario: *const Scenario, path: []const u8) !void {
 fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     var scenario = if (args.scenario_in) |path|
         try loadScenario(allocator, path)
+    else if (args.pending_reads)
+        Scenario.pendingReads(seed)
     else if (args.small_ring)
         Scenario.smallRing(seed)
     else if (args.wipes)
@@ -259,6 +266,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     );
     if (scenario.action_percent > 0) printActionCounts(s.actions);
     if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
+    if (scenario.pending_read_permille > 0) std.debug.print("[vopr] pending reads served: {d}\n", .{s.pending_reads});
     if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
     if (scenario.outsider_permille > 0) std.debug.print("[vopr] outsider sent {d} vote requests, {d} appends, {d} term checks\n", .{ sim.outsider_sent[0], sim.outsider_sent[1], sim.outsider_sent[2] });
     if (!s.ok) {
@@ -278,11 +286,12 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
                 if (args.small_ring) " --small-ring" else "",
+                if (args.pending_reads) " --pending-reads" else "",
                 if (args.wipes) " --wipes" else "",
                 if (args.membership) " --membership" else "",
                 if (args.byzantine) " --byzantine" else "",
@@ -393,6 +402,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     try argv.appendSlice(allocator, &.{ args.self_exe, seed_arg, log_arg });
     if (args.volatile_mode) try argv.append(allocator, "--mode=volatile");
     if (args.small_ring) try argv.append(allocator, "--small-ring");
+    if (args.pending_reads) try argv.append(allocator, "--pending-reads");
     if (args.wipes) try argv.append(allocator, "--wipes");
     if (args.membership) try argv.append(allocator, "--membership");
     if (args.byzantine) try argv.append(allocator, "--byzantine");
@@ -664,13 +674,13 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up or args.txn_limits)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--wipes/--membership/--byzantine/--halts/--actions/--catching-up/--txn-limits (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.pending_reads or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up or args.txn_limits)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--pending-reads/--wipes/--membership/--byzantine/--halts/--actions/--catching-up/--txn-limits (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) + @intFromBool(args.txn_limits) > 1) {
-        std.debug.print("--small-ring, --wipes, --membership, --byzantine, --halts, --actions, --catching-up and --txn-limits are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.pending_reads) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) + @intFromBool(args.txn_limits) > 1) {
+        std.debug.print("--small-ring, --pending-reads, --wipes, --membership, --byzantine, --halts, --actions, --catching-up and --txn-limits are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 
