@@ -27,6 +27,9 @@
 //!        [--actions]                a share of the ops are action entries;
 //!                                   a swarm fails if no seed settles or
 //!                                   expires a lease from an earlier term
+//!        [--queues]                 a share of the ops are queue entries;
+//!                                   a swarm fails if no seed settles or
+//!                                   expires a lease from an earlier term
 //!        [--family-mutant=NAME]     plant a family mutant (`families.Mutant`):
 //!                                   the run must fail
 //!        [--catching-up]            namespace creates, and nodes that fall
@@ -59,6 +62,7 @@ const Args = struct {
     byzantine: bool = false,
     halts: bool = false,
     actions: bool = false,
+    queues: bool = false,
     family_mutant: vopr.families.Mutant = .none,
     catching_up: bool = false,
     txn_limits: bool = false,
@@ -79,7 +83,7 @@ const Args = struct {
 fn usage() void {
     std.debug.print(
         "usage: vopr [--seed=N] [--iterations=K] [--seed-timeout=SECS] [--jobs=N] [--out-dir=DIR] " ++
-            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
+            "[--skip=N,M,...] [--mode=volatile|persisted] [--small-ring] [--pending-reads] [--wipes] [--membership] [--byzantine] [--halts] [--actions] [--queues] [--catching-up] [--txn-limits] [--max-delivered=N] " ++
             "[--family-mutant=NAME] [--scenario-out=PATH] [--scenario-in=PATH] [--verbose]\n",
         .{},
     );
@@ -112,6 +116,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.halts = true;
         } else if (std.mem.eql(u8, arg, "--actions")) {
             args.actions = true;
+        } else if (std.mem.eql(u8, arg, "--queues")) {
+            args.queues = true;
         } else if (std.mem.startsWith(u8, arg, "--family-mutant=")) {
             args.family_mutant = std.meta.stringToEnum(vopr.families.Mutant, arg["--family-mutant=".len..]) orelse return error.Usage;
         } else if (std.mem.eql(u8, arg, "--catching-up")) {
@@ -184,6 +190,8 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         Scenario.halting(seed)
     else if (args.actions)
         Scenario.actions(seed)
+    else if (args.queues)
+        Scenario.queues(seed)
     else if (args.catching_up)
         Scenario.catchingUp(seed)
     else if (args.txn_limits)
@@ -198,6 +206,10 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
     }
     if (args.family_mutant.inActions() and scenario.action_percent == 0) {
         std.debug.print("--family-mutant={t} is in the actions machine: run it with --actions, or a scenario with action entries\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
+    if (args.family_mutant.inQueues() and scenario.queue_percent == 0) {
+        std.debug.print("--family-mutant={t} is in the queue machine: run it with --queues, or a scenario with queue entries\n", .{args.family_mutant});
         std.process.exit(2);
     }
 
@@ -265,6 +277,7 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
         },
     );
     if (scenario.action_percent > 0) printActionCounts(s.actions);
+    if (scenario.queue_percent > 0) printQueueCounts(s.queues);
     if (scenario.hasTxnLimits()) printTxnCounts(s.txn);
     if (scenario.pending_read_permille > 0) std.debug.print("[vopr] pending reads served: {d}\n", .{s.pending_reads});
     if (scenario.namespace_creates) std.debug.print("[vopr] namespace creates: proposed={d} catching_up={d} refused={d} stale_host={d}; applied created={d} past_next={d} stale_id={d} (from ready leaders {d}) refused={d}\n", .{ s.ns_submits.proposed, s.ns_submits.catching_up, s.ns_submits.refused, s.ns_submits.stale_host, s.ns.created, s.ns.past_next, s.ns.stale_ids, s.ns_stale_from_ready, s.ns.refusals });
@@ -286,10 +299,11 @@ fn runOne(allocator: std.mem.Allocator, args: Args, seed: u64) !bool {
                 if (args.volatile_mode) " --mode=volatile" else "",
             });
         } else {
-            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+            std.debug.print("[vopr] reproduce with: vopr --seed={d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}\n", .{
                 s.seed,
                 mutant,
                 if (args.actions) " --actions" else "",
+                if (args.queues) " --queues" else "",
                 if (args.small_ring) " --small-ring" else "",
                 if (args.pending_reads) " --pending-reads" else "",
                 if (args.wipes) " --wipes" else "",
@@ -341,6 +355,53 @@ fn readActionCounts(allocator: std.mem.Allocator, log_path: []const u8) ?ActionC
             const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
             c.applied[@backingInt(k)] = std.fmt.parseInt(u64, value[0..slash], 10) catch return null;
             c.refused[@backingInt(k)] = std.fmt.parseInt(u64, value[slash + 1 ..], 10) catch return null;
+        }
+    }
+    return c;
+}
+
+const QueueCounts = vopr.families.Queues.Counts;
+const QUEUE_KINDS = std.enums.values(vopr.families.Queues.Kind);
+
+/// One line a parent can read back: each kind as applied/refused, then the
+/// messages reports applied to and refused.
+fn printQueueCounts(c: QueueCounts) void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("[vopr] queues:") catch {};
+    for (QUEUE_KINDS, c.applied, c.refused) |k, a, r| w.print(" {t}={d}/{d}", .{ k, a, r }) catch {};
+    w.print(" items={d}/{d} cross_term_settles={d} cross_term_expires={d}\n", .{ c.items_applied, c.items_refused, c.cross_term_settles, c.cross_term_expires }) catch {};
+    std.debug.print("{s}", .{w.buffered()});
+}
+
+/// A child's queue counts, from its log.
+fn readQueueCounts(allocator: std.mem.Allocator, log_path: []const u8) ?QueueCounts {
+    const text = stdx.fs.readFileAlloc(allocator, log_path, 4 * 1024 * 1024) catch return null;
+    defer allocator.free(text);
+    const at = std.mem.indexOf(u8, text, "[vopr] queues:") orelse return null;
+    const line = text[at..(std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len)];
+    var c: QueueCounts = .{};
+    var it = std.mem.tokenizeScalar(u8, line["[vopr] queues:".len..], ' ');
+    while (it.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse return null;
+        const name = field[0..eq];
+        const value = field[eq + 1 ..];
+        if (std.mem.eql(u8, name, "cross_term_settles")) {
+            c.cross_term_settles = std.fmt.parseInt(u64, value, 10) catch return null;
+        } else if (std.mem.eql(u8, name, "cross_term_expires")) {
+            c.cross_term_expires = std.fmt.parseInt(u64, value, 10) catch return null;
+        } else {
+            const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+            const a = std.fmt.parseInt(u64, value[0..slash], 10) catch return null;
+            const r = std.fmt.parseInt(u64, value[slash + 1 ..], 10) catch return null;
+            if (std.mem.eql(u8, name, "items")) {
+                c.items_applied = a;
+                c.items_refused = r;
+                continue;
+            }
+            const k = std.meta.stringToEnum(vopr.families.Queues.Kind, name) orelse return null;
+            c.applied[@backingInt(k)] = a;
+            c.refused[@backingInt(k)] = r;
         }
     }
     return c;
@@ -408,6 +469,7 @@ fn spawnChild(allocator: std.mem.Allocator, args: Args, seed: u64, log_path: []c
     if (args.byzantine) try argv.append(allocator, "--byzantine");
     if (args.halts) try argv.append(allocator, "--halts");
     if (args.actions) try argv.append(allocator, "--actions");
+    if (args.queues) try argv.append(allocator, "--queues");
     var mutant_arg: [64]u8 = undefined;
     if (args.family_mutant != .none) try argv.append(allocator, try std.fmt.bufPrint(&mutant_arg, "--family-mutant={t}", .{args.family_mutant}));
     if (args.catching_up) try argv.append(allocator, "--catching-up");
@@ -491,6 +553,7 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
     var excused_seeds: std.ArrayListUnmanaged(u64) = .empty;
     defer excused_seeds.deinit(allocator);
     var action_totals: ActionCounts = .{};
+    var queue_totals: QueueCounts = .{};
     var settle_seeds: u64 = 0;
     var expire_seeds: u64 = 0;
     var unread_counts: u64 = 0;
@@ -539,6 +602,13 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
                         if (args.actions) {
                             if (readActionCounts(allocator, r.log_path)) |c| {
                                 action_totals.add(c);
+                                if (c.cross_term_settles > 0) settle_seeds += 1;
+                                if (c.cross_term_expires > 0) expire_seeds += 1;
+                            } else unread_counts += 1;
+                        }
+                        if (args.queues) {
+                            if (readQueueCounts(allocator, r.log_path)) |c| {
+                                queue_totals.add(c);
                                 if (c.cross_term_settles > 0) settle_seeds += 1;
                                 if (c.cross_term_expires > 0) expire_seeds += 1;
                             } else unread_counts += 1;
@@ -625,6 +695,22 @@ fn runSwarm(allocator: std.mem.Allocator, args: Args) !bool {
             covered = false;
         }
     }
+    if (args.queues) {
+        std.debug.print("[vopr] queues, applied/refused (refused share):", .{});
+        for (QUEUE_KINDS, queue_totals.applied, queue_totals.refused) |k, a, rf| {
+            std.debug.print(" {t}={d}/{d} ({d}%)", .{ k, a, rf, if (a + rf == 0) 0 else rf * 100 / (a + rf) });
+        }
+        std.debug.print("; messages applied/refused {d}/{d}\n[vopr] across a term change: {d} settles in {d} seeds, {d} expires in {d} seeds\n", .{ queue_totals.items_applied, queue_totals.items_refused, queue_totals.cross_term_settles, settle_seeds, queue_totals.cross_term_expires, expire_seeds });
+        if (unread_counts > 0) {
+            std.debug.print("[vopr] FAILED: {d} passing seeds printed no queue counts\n", .{unread_counts});
+            covered = false;
+        }
+        const want = @min(MIN_TAKEOVER_SEEDS, ok_count);
+        if (settle_seeds < want or expire_seeds < want) {
+            std.debug.print("[vopr] FAILED: fewer than {d} seeds settled and expired queue leases from an earlier term\n", .{want});
+            covered = false;
+        }
+    }
     // Limits that no batch ever went past tested nothing: it fails, as above.
     if (args.txn_limits) {
         printTxnCounts(txn_totals);
@@ -674,13 +760,13 @@ pub fn main(init: std.process.Init) !void {
     }
     // A pinned scenario is the whole input; a seed or ring flag beside it
     // would be silently overridden — refuse rather than guess.
-    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.pending_reads or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.catching_up or args.txn_limits)) {
-        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--pending-reads/--wipes/--membership/--byzantine/--halts/--actions/--catching-up/--txn-limits (the pin carries them)\n", .{});
+    if (args.scenario_in != null and (args.seed != null or args.small_ring or args.pending_reads or args.wipes or args.membership or args.byzantine or args.halts or args.actions or args.queues or args.catching_up or args.txn_limits)) {
+        std.debug.print("--scenario-in is exclusive with --seed/--small-ring/--pending-reads/--wipes/--membership/--byzantine/--halts/--actions/--queues/--catching-up/--txn-limits (the pin carries them)\n", .{});
         std.process.exit(2);
     }
 
-    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.pending_reads) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.catching_up) + @intFromBool(args.txn_limits) > 1) {
-        std.debug.print("--small-ring, --pending-reads, --wipes, --membership, --byzantine, --halts, --actions, --catching-up and --txn-limits are separate slices; pick one\n", .{});
+    if (@as(u8, @intFromBool(args.small_ring)) + @intFromBool(args.pending_reads) + @intFromBool(args.wipes) + @intFromBool(args.membership) + @intFromBool(args.byzantine) + @intFromBool(args.halts) + @intFromBool(args.actions) + @intFromBool(args.queues) + @intFromBool(args.catching_up) + @intFromBool(args.txn_limits) > 1) {
+        std.debug.print("--small-ring, --pending-reads, --wipes, --membership, --byzantine, --halts, --actions, --queues, --catching-up and --txn-limits are separate slices; pick one\n", .{});
         std.process.exit(2);
     }
 
@@ -691,6 +777,10 @@ pub fn main(init: std.process.Init) !void {
     // A swarm's children would each refuse these, and read as caught.
     if (args.iterations != null and args.family_mutant.needsTxnLimits() and !args.txn_limits) {
         std.debug.print("--family-mutant={t} is in a node's transaction limit: run the swarm with --txn-limits\n", .{args.family_mutant});
+        std.process.exit(2);
+    }
+    if (args.iterations != null and args.family_mutant.inQueues() and !args.queues) {
+        std.debug.print("--family-mutant={t} is in the queue machine: run the swarm with --queues\n", .{args.family_mutant});
         std.process.exit(2);
     }
     if (args.iterations != null and args.family_mutant.inActions() and !args.actions) {

@@ -12,6 +12,8 @@
 //! is the same for action runs, and also checks each entry it applies
 //! against the state before and after it.
 //!
+//! `Queues` is the same for queues' messages (`queue_family.zig`).
+//!
 //! `Namespaces` is shard 0's own namespace handler, its creates applied
 //! through the handler's replay path.
 //!
@@ -106,6 +108,24 @@ pub const Mutant = enum {
     /// A leader that steps down keeps its in-flight namespace id: won
     /// again, it allocates past what the group created.
     ns_keeps_alloc,
+    // Bugs in the queue machine, planted as the actions ones are: by
+    // rewriting the entry it applies, or the state just before it.
+    /// A settle completes the message whatever delivery it names.
+    queue_settle_ignores_token,
+    /// A fail removes its message, as a settle would.
+    queue_release_removes,
+    /// An expire ends leases before their deadline.
+    queue_expire_ignores_deadline,
+    /// A deliver passes over the first due message and takes the next.
+    queue_deliver_wrong_order,
+    /// A deliver takes at most one message, whatever its count.
+    queue_deliver_short,
+    /// An expire ends only its first item's lease.
+    queue_expire_first_only,
+    /// A settle also changes a message it doesn't name.
+    queue_report_changes_unnamed,
+    /// Queue entries apply at the replica's own clock.
+    queue_node_clock,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -119,6 +139,16 @@ pub const Mutant = enum {
         return switch (m) {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => false,
+        };
+    }
+
+    /// Whether the bug is in the queue machine: a run with no queue entries
+    /// never reaches it.
+    pub fn inQueues(m: Mutant) bool {
+        return switch (m) {
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => true,
+            else => false,
         };
     }
 };
@@ -168,7 +198,7 @@ pub const Counter = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(entry_mod.EntryType, @fromBackingInt(entry_type))) {
-            .kv_put, .kv_delete, .stream_append, .queue_enqueue, .ts_write => true,
+            .kv_put, .kv_delete, .stream_append, .ts_write => true,
             else => false,
         };
     }
@@ -927,6 +957,8 @@ pub const Actions = struct {
         return sums;
     }
 };
+
+pub const Queues = @import("queue_family.zig").Queues;
 
 /// Shard 0's namespace registry: the server's handler, on a table of its
 /// own. The simulator proposes creates through it as shard 0's leader does

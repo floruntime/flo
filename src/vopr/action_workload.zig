@@ -33,6 +33,8 @@ const MAX_GRACE_MS: u64 = 30_000;
 pub const Leader = struct {
     now_ns: u64,
     term_since_ns: u64,
+    /// Its term, where a workload needs it.
+    term: u64 = 0,
 };
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
