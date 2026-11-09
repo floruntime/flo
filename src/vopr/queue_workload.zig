@@ -48,7 +48,7 @@ pub fn make(q: *families.Queues, l: Leader, r: std.Random, op_id: u64, buf: []u8
     // soon as the deliver applies.
     // A lagging leader would propose it again until it applies; half the
     // time is enough to keep acked messages from ever being released.
-    if (r.boolean()) if (ackSettle(q, out) catch null) |m| return m;
+    if (r.boolean()) if (ackSettle(q, out, l.term) catch null) |m| return m;
     var roll = r.uintLessThan(u8, 100);
     const kind: Kind = for (WEIGHTS, 0..) |w, i| {
         if (roll < w) break @fromBackingInt(@intCast(i));
@@ -76,13 +76,17 @@ fn held(q: *families.Queues, queue: []const u8) u64 {
 
 fn enqueue(q: *families.Queues, out: []u8, r: std.Random, queue: []const u8, tag: []const u8) !?Made {
     if (held(q, queue) >= MAX_HELD) return null;
+    var payload_buf: [64]u8 = undefined;
+    @memcpy(payload_buf[0..tag.len], tag);
+    @memset(payload_buf[tag.len..], '.');
     const p = try qe.Enqueue.encodeInto(out, .{
         .ns = NS.int(),
         .queue = queue,
         .priority = r.uintLessThan(u32, 4),
         // A few held back, so a priority's head is sometimes not due.
         .delay_ms = if (r.uintLessThan(u8, 5) == 0) r.uintLessThan(u64, 4_000) else 0,
-        .payload = tag,
+        // Of varied length, so a deliver's byte budget stops it short.
+        .payload = payload_buf[0 .. tag.len + r.uintLessThan(usize, 40)],
     });
     return .{ .entry_type = .queue_enqueue, .payload = p };
 }
@@ -95,7 +99,9 @@ fn deliver(q: *families.Queues, out: []u8, l: Leader, r: std.Random, queue: []co
         .ns = NS.int(),
         .queue = queue,
         .count = r.intRangeAtMost(u32, 1, 5),
-        .max_bytes = 1 << 20,
+        // Now and then a budget a few messages pass, as a large answer's
+        // room does.
+        .max_bytes = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u32, 1, 100) else 1 << 20,
         .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 8)) {
             0, 1, 2 => DEAD,
             3 => SLOW,
@@ -165,11 +171,14 @@ fn itemsOf(q: *families.Queues, buf: []u8, queue: []const u8, p: Picked, all: bo
     return .{ .bytes = buf[0..w], .count = n };
 }
 
-/// The settle of a delivery made with ack, if one is still leased.
-fn ackSettle(q: *families.Queues, out: []u8) !?Made {
+/// The settle of a delivery made with ack in this leader's term, if one is
+/// still leased. The handler proposes it from the leader that delivered,
+/// and a step-down drops it: a later leader never does.
+fn ackSettle(q: *families.Queues, out: []u8, term: u64) !?Made {
     for (QUEUES) |queue| {
         var prng = std.Random.DefaultPrng.init(0);
         const p = pick(q, prng.random(), queue, isAcked) orelse continue;
+        if (p.msg.token.term != term) continue;
         var ib: [qe.Items.max_size]u8 = undefined;
         const items = try itemsOf(q, &ib, queue, p, true, 0);
         const payload = try qe.Settle.encodeInto(out, .{ .ns = NS.int(), .queue = queue, .holder = p.msg.holder, .token = p.msg.token, .expiry_ns = p.msg.expiry_ns, .items = items });

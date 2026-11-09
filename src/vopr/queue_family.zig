@@ -88,7 +88,7 @@ pub const Queues = struct {
     };
 
     pub fn init(allocator: Allocator) Queues {
-        var q: Queues = .{ .store = store_mod.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator), .rewrite = allocator.alloc(u8, qe.Release.max_size) catch @panic("sim OOM") };
+        var q: Queues = .{ .store = store_mod.Store.init(allocator), .scratch = std.heap.ArenaAllocator.init(allocator), .rewrite = allocator.alloc(u8, @max(qe.Release.max_size, qe.Settle.max_size, qe.Expire.max_size, qe.Deliver.max_size)) catch @panic("sim OOM") };
         q.store.strict_keys = true;
         return q;
     }
@@ -143,6 +143,8 @@ pub const Queues = struct {
         ns: NamespaceId,
         hash: [8]u8,
         msgs: std.AutoArrayHashMapUnmanaged(u64, Msg) = .empty,
+        /// Each message's payload length: a deliver's byte budget counts it.
+        sizes: std.AutoArrayHashMapUnmanaged(u64, usize) = .empty,
         dead_lettered: u64 = 0,
     };
 
@@ -153,6 +155,7 @@ pub const Queues = struct {
         var it = self.read().range(qm.Msgs, qm.storeKey(&pb, ns, &hash));
         while (it.next() catch null) |item| {
             var v = item.value.v;
+            try s.sizes.put(a, qm.seqOf(item.key[4..]), v.payload.len);
             v.holder = try a.dupe(u8, v.holder);
             v.payload = "";
             v.queue = try a.dupe(u8, v.queue);
@@ -228,7 +231,7 @@ pub const Queues = struct {
     /// Whether a message's state moved: what a report that doesn't hold it
     /// must leave alone.
     fn moved(pre: Msg, post: Msg) bool {
-        return pre.status != post.status or pre.deliveries != post.deliveries or pre.failures != post.failures or pre.expiry_ns != post.expiry_ns or pre.due_ns != post.due_ns or pre.token.index != post.token.index or pre.ended != post.ended;
+        return pre.status != post.status or pre.priority != post.priority or pre.deliveries != post.deliveries or pre.failures != post.failures or pre.expiry_ns != post.expiry_ns or pre.due_ns != post.due_ns or pre.token.index != post.token.index or pre.token.term != post.token.term or pre.ended != post.ended or !std.mem.eql(u8, pre.holder, post.holder);
     }
 
     /// The rules an applied entry must keep, by the entry as it was
@@ -250,27 +253,46 @@ pub const Queues = struct {
             .settle, .release, .extend => return self.checkReport(e, s, effect),
             .expire => {
                 const p = qe.Expire.decodeAll(e.payload, &diag) catch unreachable;
+                // First, any lease ended early: what an expire must never do.
                 for (snaps) |sn| {
                     var it = sn.msgs.iterator();
                     while (it.next()) |kv| {
                         const pre = kv.value_ptr.*;
-                        const post = self.msg(sn.ns, sn.hash, kv.key_ptr.*) orelse return "an expire removed a message";
+                        const post = self.msg(sn.ns, sn.hash, kv.key_ptr.*) orelse continue;
+                        if (pre.status == .leased and post.status != .leased and pre.expiry_ns > stamp) return "an expire ended a lease before its deadline";
+                    }
+                }
+                for (snaps) |sn| {
+                    var died: u64 = 0;
+                    var evicted: u64 = 0;
+                    var it = sn.msgs.iterator();
+                    while (it.next()) |kv| {
+                        const pre = kv.value_ptr.*;
+                        const seq = kv.key_ptr.*;
+                        const due_item = namedDue(p.items, sn, seq, pre, stamp);
+                        const post = self.msg(sn.ns, sn.hash, seq) orelse {
+                            // Only the oldest dead go, past the cap.
+                            if (pre.status != .dead) return "an expire removed a message";
+                            evicted += 1;
+                            continue;
+                        };
                         if (pre.status == .leased and post.status != .leased) {
-                            var named = false;
-                            var items = p.items.iterator();
-                            while (items.next() catch null) |item| {
-                                if (item.ns == sn.ns.int() and item.id.len == qe.ID_LEN and std.mem.eql(u8, item.id[0..8], &sn.hash) and qm.seqOf(item.id) == kv.key_ptr.* and item.expiry_ns == pre.expiry_ns) named = true;
-                            }
-                            if (!named) return "an expire ended a lease none of its items named the deadline of";
-                            if (pre.expiry_ns > stamp) return "an expire ended a lease before its deadline";
+                            if (!due_item) return "an expire ended a lease none of its items named the deadline of";
                             if (post.failures != pre.failures + 1) return "a message's failures don't count the lease that expired";
                             if (post.failures >= qe.MAX_ATTEMPTS) {
                                 if (post.status != .dead) return "a message whose attempts are spent isn't dead";
+                                died += 1;
                             } else if (post.status != .ready or post.due_ns != stamp) return "an expired message isn't ready again at once";
                             effect.applied += 1;
                             effect.cross_term = effect.cross_term or pre.token.term < e.header.term;
-                        } else if (moved(pre, post)) return "an expire changed a message without ending its lease";
+                        } else {
+                            // A live lease it named, past due, must end.
+                            if (due_item) return "an expire left a live lease it named past its deadline";
+                            if (moved(pre, post)) return "an expire changed a message without ending its lease";
+                        }
                     }
+                    if (evicted > died) return "an expire removed a dead message no death pushed past the cap";
+                    if (self.meta(sn.ns, sn.hash)) |m| if (m.dead_lettered != sn.dead_lettered + died) return "a dead message isn't counted dead once";
                 }
             },
             .purge => {
@@ -288,6 +310,17 @@ pub const Queues = struct {
             }
         }
         return null;
+    }
+
+    /// Whether an expire's items name `seq`'s live lease, past due at
+    /// `stamp`: one the expire must end.
+    fn namedDue(items: anytype, sn: Snapshot, seq: u64, pre: Msg, stamp: u64) bool {
+        if (pre.status != .leased or pre.expiry_ns > stamp) return false;
+        var it = items.iterator();
+        while (it.next() catch null) |item| {
+            if (item.ns == sn.ns.int() and item.id.len == qe.ID_LEN and std.mem.eql(u8, item.id[0..8], &sn.hash) and qm.seqOf(item.id) == seq and item.expiry_ns == pre.expiry_ns) return true;
+        }
+        return false;
     }
 
     const Due = struct { seq: u64, priority: u32, due_ns: u64 };
@@ -313,13 +346,16 @@ pub const Queues = struct {
         std.mem.sort(Due, due.items, {}, dueLess);
         // What this delivery leased.
         var taken: u32 = 0;
+        // A change to a message it didn't lease, said after the order: what
+        // it took is the first thing to judge.
+        var changed_other = false;
         it = s.msgs.iterator();
         while (it.next()) |kv| {
             const pre = kv.value_ptr.*;
             const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse return "a deliver removed a message";
             const ours = post.status == .leased and post.token.term == e.header.term and post.token.index == e.header.index;
             if (!ours) {
-                if (moved(pre, post)) return "a deliver changed a message it didn't lease";
+                if (moved(pre, post)) changed_other = true;
                 continue;
             }
             taken += 1;
@@ -329,16 +365,28 @@ pub const Queues = struct {
             if (post.lease_ms != p.lease_ms or post.delivered_ns != stamp or post.expiry_ns != after(stamp, p.lease_ms)) return "a deliver's lease doesn't run from its stamp for its lease";
         }
         if (taken > p.count) return "a deliver leased more messages than it asked for";
-        // The ones it leased are the first `taken` due, in order, when the
-        // picker could see them all.
+        // When the picker could see every due message: it takes exactly the
+        // first k in order, stopping at its count, at the end of the due
+        // ones, or at the first whose payload would pass its byte budget
+        // (the first is always taken).
         if (due.items.len <= qm.MAX_LOOKED_AT / 2) {
+            var k: u32 = 0;
+            var bytes: u64 = 0;
+            for (due.items) |d| {
+                if (k == p.count) break;
+                const size = s.sizes.get(d.seq) orelse 0;
+                if (k > 0 and bytes + size > p.max_bytes) break;
+                bytes += size;
+                k += 1;
+            }
             for (due.items[0..@min(taken, due.items.len)]) |d| {
                 const post = self.msg(s.ns, s.hash, d.seq) orelse return "a deliver removed a message";
                 if (!(post.status == .leased and post.token.index == e.header.index and post.token.term == e.header.term)) return "a deliver didn't take the first due messages";
             }
-            // It stops short only at its count or its answer's room.
-            if (taken < @min(p.count, due.items.len) and taken == 0) return "a deliver with due messages took none";
+            if (taken < k) return "a deliver took fewer messages than its count and budget allow";
+            if (taken > k) return "a deliver took more messages than its byte budget allows";
         }
+        if (changed_other) return "a deliver changed a message it didn't lease";
         effect.applied = taken;
         return null;
     }
@@ -414,6 +462,21 @@ pub const Queues = struct {
             const m = self.meta(s.ns, s.hash) orelse return "a release left its queue with no meta";
             if (m.dead_lettered != s.dead_lettered + died) return "a dead message isn't counted dead once";
         }
+        // Every message it didn't name is as it was, but the oldest dead
+        // pushed out past the cap by one it killed.
+        var evicted: u64 = 0;
+        var rest = s.msgs.iterator();
+        while (rest.next()) |kv| {
+            if (named.contains(kv.key_ptr.*)) continue;
+            const pre = kv.value_ptr.*;
+            const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse {
+                if (pre.status != .dead) return "a report changed a message it didn't name";
+                evicted += 1;
+                continue;
+            };
+            if (moved(pre, post)) return "a report changed a message it didn't name";
+        }
+        if (evicted > died) return "a report removed a dead message no death pushed past the cap";
         return null;
     }
 
@@ -441,6 +504,17 @@ pub const Queues = struct {
         }
         const m = self.meta(ns, hash) orelse return if (counts[0] + counts[1] + counts[2] == 0) null else "a queue holds messages but no meta";
         if (m.ready != counts[0] or m.leased != counts[1] or m.dead != counts[2]) return "a queue's counts aren't what it holds";
+        // And no ready or dead key is left over from a message that moved on.
+        var rb: [9]u8 = undefined;
+        var rk: [16]u8 = undefined;
+        var ready_keys: u64 = 0;
+        var ri = self.read().range(qm.Ready, qm.storeKey(&rk, ns, qm.readyPrefix(&rb, &hash)));
+        while (ri.next() catch null) |_| ready_keys += 1;
+        if (ready_keys != counts[0]) return "a queue has a ready key no ready message holds";
+        var dead_keys: u64 = 0;
+        var di = self.read().range(qm.Dead, qm.storeKey(&pb, ns, &hash));
+        while (di.next() catch null) |_| dead_keys += 1;
+        if (dead_keys != counts[2]) return "a queue has a dead key no dead message holds";
         return null;
     }
 
@@ -453,7 +527,43 @@ pub const Queues = struct {
         switch (r.mutant) {
             .queue_node_clock => out.header.timestamp_ns = r.node_wall_ns,
             .queue_expire_ignores_deadline => if (kind == .expire) {
-                out.header.timestamp_ns = std.math.maxInt(u64) / 2;
+                // As late as its latest named live lease: one not yet due
+                // then ends.
+                const p = qe.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |item| {
+                    if (item.id.len != qe.ID_LEN) continue;
+                    for (snaps) |sn| if (sn.ns.int() == item.ns and std.mem.eql(u8, &sn.hash, item.id[0..8])) if (sn.msgs.get(qm.seqOf(item.id))) |v| {
+                        if (v.status == .leased and v.expiry_ns == item.expiry_ns) out.header.timestamp_ns = @max(out.header.timestamp_ns, item.expiry_ns);
+                    };
+                }
+            },
+            .queue_expire_first_only => if (kind == .expire) {
+                const p = qe.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
+                if (p.items.count > 1) {
+                    var it = p.items.iterator();
+                    const first = (it.next() catch return error.Halt).?;
+                    const one = qe.ExpireItem.encodeInto(try self.scratch.allocator().alloc(u8, qe.ExpireItem.max_size), first) catch return error.Halt;
+                    out.payload = qe.Expire.encodeInto(self.rewrite, .{ .items = .{ .bytes = one, .count = 1 } }) catch return error.Halt;
+                }
+            },
+            .queue_report_changes_unnamed => if (kind == .settle) {
+                // The settle also moves a ready message it doesn't name.
+                const p = qe.Settle.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = snaps[0];
+                var it = s.msgs.iterator();
+                outer: while (it.next()) |kv| {
+                    if (kv.value_ptr.status != .ready) continue;
+                    var items = p.items.iterator();
+                    while (items.next() catch null) |item| if (item.seq == kv.key_ptr.*) continue :outer;
+                    try self.demote(s.ns, s.hash, kv.key_ptr.*);
+                    break;
+                }
+            },
+            .queue_deliver_short => if (kind == .deliver) {
+                var p = qe.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
+                p.count = 1;
+                out.payload = qe.Deliver.encodeInto(self.rewrite, p) catch return error.Halt;
             },
             .queue_settle_ignores_token => if (kind == .settle) {
                 // Every item named as its message's live delivery.
@@ -512,13 +622,16 @@ pub const Queues = struct {
         var kb: [72]u8 = undefined;
         const old = qm.storeKey(&kb, ns, qm.readyKeyOf(&b, v, v.due_ns, &id));
         const old_node = self.store.find(qm.Ready.ID, old) orelse return;
-        self.store.unlink(qm.Ready.ID, old_node);
         v.priority = std.math.maxInt(u32);
+        // The new key first: `v` points into the record `replace` frees.
+        var nb: [64]u8 = undefined;
+        var nkb: [72]u8 = undefined;
+        const new = qm.storeKey(&nkb, ns, qm.readyKeyOf(&nb, v, v.due_ns, &id));
+        const rec = try self.store.allocRecord(new);
         const bytes = try self.store.allocator.alloc(u8, qm.Msg.encodedSize(v) catch return error.Halt);
         _ = qm.Msg.encodeInto(bytes, v) catch return error.Halt;
+        self.store.unlink(qm.Ready.ID, old_node);
         self.store.replace(qm.Msgs.ID, node, bytes);
-        const new = qm.storeKey(&kb, ns, qm.readyKeyOf(&b, v, v.due_ns, &id));
-        const rec = try self.store.allocRecord(new);
         self.store.link(qm.Ready.ID, rec, try self.store.allocator.alloc(u8, 0));
     }
 

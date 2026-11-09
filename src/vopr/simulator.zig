@@ -1908,7 +1908,7 @@ pub const Simulator = struct {
             target.queues_term = target.raft.current_term;
             target.queues_term_since_ns = now;
         }
-        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.queues_term_since_ns };
+        const leader: action_workload.Leader = .{ .now_ns = now, .term_since_ns = target.queues_term_since_ns, .term = target.raft.current_term };
         const op_id = self.workload.next_op_id;
         const made = queue_workload.make(&target.queues, leader, self.action_prng.random(), op_id, self.action_buf, self.scenario.payload_max) orelse return;
         const id = try self.workload.nextActionOp(made.entry_type, made.payload);

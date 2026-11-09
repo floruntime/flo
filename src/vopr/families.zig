@@ -118,6 +118,12 @@ pub const Mutant = enum {
     queue_expire_ignores_deadline,
     /// A deliver passes over the first due message and takes the next.
     queue_deliver_wrong_order,
+    /// A deliver takes at most one message, whatever its count.
+    queue_deliver_short,
+    /// An expire ends only its first item's lease.
+    queue_expire_first_only,
+    /// A settle also changes a message it doesn't name.
+    queue_report_changes_unnamed,
     /// Queue entries apply at the replica's own clock.
     queue_node_clock,
 
@@ -133,7 +139,7 @@ pub const Mutant = enum {
         return switch (m) {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
-            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_node_clock => false,
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => false,
         };
     }
 
@@ -141,7 +147,7 @@ pub const Mutant = enum {
     /// never reaches it.
     pub fn inQueues(m: Mutant) bool {
         return switch (m) {
-            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_node_clock => true,
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => true,
             else => false,
         };
     }
