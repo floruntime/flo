@@ -539,13 +539,26 @@ pub const Queues = struct {
                 }
             },
             .queue_expire_first_only => if (kind == .expire) {
+                // The first live lease named ends; later live ones are
+                // dropped from the entry, stale keys kept.
                 const p = qe.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
-                if (p.items.count > 1) {
-                    var it = p.items.iterator();
-                    const first = (it.next() catch return error.Halt).?;
-                    const one = qe.ExpireItem.encodeInto(try self.scratch.allocator().alloc(u8, qe.ExpireItem.max_size), first) catch return error.Halt;
-                    out.payload = qe.Expire.encodeInto(self.rewrite, .{ .items = .{ .bytes = one, .count = 1 } }) catch return error.Halt;
+                var w: schema.Writer = .{ .buf = try self.scratch.allocator().alloc(u8, qe.Expire.max_size) };
+                var n: u32 = 0;
+                var lives: u32 = 0;
+                var it = p.items.iterator();
+                while (it.next() catch return error.Halt) |item| {
+                    var live = false;
+                    if (item.id.len == qe.ID_LEN) for (snaps) |sn| if (sn.ns.int() == item.ns and std.mem.eql(u8, &sn.hash, item.id[0..8])) if (sn.msgs.get(qm.seqOf(item.id))) |v| {
+                        live = v.status == .leased and v.expiry_ns == item.expiry_ns and item.expiry_ns <= e.header.timestamp_ns;
+                    };
+                    if (live) {
+                        lives += 1;
+                        if (lives > 1) continue;
+                    }
+                    qe.ExpireItem.encode(&w, item) catch return error.Halt;
+                    n += 1;
                 }
+                out.payload = qe.Expire.encodeInto(self.rewrite, .{ .items = .{ .bytes = w.buf[0..w.pos], .count = n } }) catch return error.Halt;
             },
             .queue_report_changes_unnamed => if (kind == .settle) {
                 // The settle also moves a ready message it doesn't name.
