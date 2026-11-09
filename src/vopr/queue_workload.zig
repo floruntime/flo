@@ -62,7 +62,7 @@ pub fn make(q: *families.Queues, l: Leader, r: std.Random, op_id: u64, buf: []u8
         .enqueue => enqueue(q, out, r, queue, tag),
         .deliver => deliver(q, out, l, r, queue, tag),
         .settle, .release, .extend => report(q, out, kind, l, r, queue, spoil),
-        .expire => expire(q, out, l, spoil),
+        .expire => expire(q, out, l, r, spoil),
         // Rare: a purge ends every lease in its queue, the dead holders'
         // too, which then never expire.
         .purge => if (r.uintLessThan(u8, 10) == 0) purge(out, queue) else null,
@@ -95,14 +95,24 @@ fn deliver(q: *families.Queues, out: []u8, l: Leader, r: std.Random, queue: []co
     // The leader proposes only when something is due by its clock.
     if (!anyDue(q, queue, l.now_ns)) return null;
     var hb: [24]u8 = undefined;
+    const who = r.uintLessThan(u8, 8);
+    const dead = who <= 2;
+    // A dead consumer takes several at the full budget: its leases share
+    // an expiry, so one expire names several live, due leases at once.
+    const count: u32 = if (dead) r.intRangeAtMost(u32, 2, 5) else r.intRangeAtMost(u32, 1, 5);
     const p = try qe.Deliver.encodeInto(out, .{
         .ns = NS.int(),
         .queue = queue,
-        .count = r.intRangeAtMost(u32, 1, 5),
+        .count = count,
         // Now and then a budget a few messages pass, as a large answer's
-        // room does.
-        .max_bytes = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u32, 1, 100) else 1 << 20,
-        .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (r.uintLessThan(u8, 8)) {
+        // room does, or exactly what the first `count` take, so the budget's
+        // edge is reached.
+        .max_bytes = if (dead) 1 << 20 else switch (r.uintLessThan(u8, 8)) {
+            0, 1 => r.intRangeAtMost(u32, 1, 100),
+            2 => exactBudget(q, queue, l.now_ns, count),
+            else => 1 << 20,
+        },
+        .holder = try std.fmt.bufPrint(&hb, "{s}{s}", .{ switch (who) {
             0, 1, 2 => DEAD,
             3 => SLOW,
             4 => ACK,
@@ -111,6 +121,33 @@ fn deliver(q: *families.Queues, out: []u8, l: Leader, r: std.Random, queue: []co
         .lease_ms = r.intRangeAtMost(u64, 5_000, 8_000),
     });
     return .{ .entry_type = .queue_deliver, .payload = p };
+}
+
+/// What the first `count` due ready messages' payloads take, in the order a
+/// deliver takes them: a budget they fit exactly.
+fn exactBudget(q: *families.Queues, queue: []const u8, now: u64, count: u32) u32 {
+    const Due = struct { priority: u32, due_ns: u64, seq: u64, size: u32 };
+    var due: [MAX_HELD]Due = undefined;
+    var n: usize = 0;
+    var pb: [12]u8 = undefined;
+    const hash = qm.hashOf(queue);
+    var it = q.read().range(qm.Msgs, qm.storeKey(&pb, NS, &hash));
+    while (it.next() catch null) |item| {
+        const v = item.value.v;
+        if (v.status != .ready or v.due_ns > now or n == due.len) continue;
+        due[n] = .{ .priority = v.priority, .due_ns = v.due_ns, .seq = qm.seqOf(item.key[4..]), .size = @intCast(v.payload.len) };
+        n += 1;
+    }
+    std.mem.sort(Due, due[0..n], {}, struct {
+        fn less(_: void, x: Due, y: Due) bool {
+            if (x.priority != y.priority) return x.priority < y.priority;
+            if (x.due_ns != y.due_ns) return x.due_ns < y.due_ns;
+            return x.seq < y.seq;
+        }
+    }.less);
+    var sum: u32 = 0;
+    for (due[0..@min(n, count)]) |d| sum += d.size;
+    return @max(sum, 1);
 }
 
 fn anyDue(q: *families.Queues, queue: []const u8, now: u64) bool {
@@ -176,9 +213,13 @@ fn itemsOf(q: *families.Queues, buf: []u8, queue: []const u8, p: Picked, all: bo
 /// and a step-down drops it: a later leader never does.
 fn ackSettle(q: *families.Queues, out: []u8, term: u64) !?Made {
     for (QUEUES) |queue| {
-        var prng = std.Random.DefaultPrng.init(0);
-        const p = pick(q, prng.random(), queue, isAcked) orelse continue;
-        if (p.msg.token.term != term) continue;
+        // The first acked delivery of this term, by seq.
+        var pb: [12]u8 = undefined;
+        const hash = qm.hashOf(queue);
+        var it = q.read().range(qm.Msgs, qm.storeKey(&pb, NS, &hash));
+        const p: Picked = while (it.next() catch null) |item| {
+            if (isAcked(item.value.v) and item.value.v.token.term == term) break .{ .seq = qm.seqOf(item.key[4..]), .msg = item.value.v };
+        } else continue;
         var ib: [qe.Items.max_size]u8 = undefined;
         const items = try itemsOf(q, &ib, queue, p, true, 0);
         const payload = try qe.Settle.encodeInto(out, .{ .ns = NS.int(), .queue = queue, .holder = p.msg.holder, .token = p.msg.token, .expiry_ns = p.msg.expiry_ns, .items = items });
@@ -253,10 +294,11 @@ fn report(q: *families.Queues, out: []u8, kind: Kind, l: Leader, r: std.Random, 
 /// The duty's expire: deadline keys past due, a live lease's only after
 /// the term's grace.
 /// Spoiled, it names a live lease not yet due, which the machine leaves.
-fn expire(q: *families.Queues, out: []u8, l: Leader, spoil: bool) !?Made {
+fn expire(q: *families.Queues, out: []u8, l: Leader, r: std.Random, spoil: bool) !?Made {
     var items: [ae.MAX_EXPIRE_ITEMS * qe.ExpireItem.max_size]u8 = undefined;
     var w: usize = 0;
     var n: u32 = 0;
+    var live_named: u32 = 0;
     var it = qm.pastDue(q.read(), if (spoil) std.math.maxInt(u64) else l.now_ns);
     while (it.next()) |due| {
         if (n == ae.MAX_EXPIRE_ITEMS) break;
@@ -277,11 +319,15 @@ fn expire(q: *families.Queues, out: []u8, l: Leader, spoil: bool) !?Made {
         if (live) {
             const grace = @as(u64, @min(m.?.lease_ms, MAX_GRACE_MS)) * std.time.ns_per_ms;
             if (l.now_ns < l.term_since_ns +| grace) continue;
+            live_named += 1;
         }
         w += (try qe.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns.int(), .id = k.id, .expiry_ns = k.expiry_ns })).len;
         n += 1;
     }
     if (n == 0) return null;
+    // Half the time the duty waits until it can end several live leases at
+    // once, so an expire naming more than one is common.
+    if (!spoil and live_named < 2 and r.boolean()) return null;
     const payload = try qe.Expire.encodeInto(out, .{ .items = .{ .bytes = items[0..w], .count = n } });
     return .{ .entry_type = .queue_expire, .payload = payload };
 }
