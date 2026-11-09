@@ -444,6 +444,11 @@ pub const ServerMetrics = struct {
     bytes_sent: Atomic(u64) = Atomic(u64).init(0),
     /// Clients refused for being built from another protocol version or table
     client_version_refused: Atomic(u64) = Atomic(u64).init(0),
+    /// Connections accepted and closed at once because the node was at its
+    /// connection cap. A rising count means clients are being turned away;
+    /// raise the open-file limit or `max_connections`, or look at which clients
+    /// have connections open.
+    connections_rejected_total: Atomic(u64) = Atomic(u64).init(0),
     /// Server start timestamp (ms)
     start_time_ms: i64,
 
@@ -477,6 +482,10 @@ pub const ServerMetrics = struct {
         _ = self.client_version_refused.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordConnectionRejected(self: *ServerMetrics) void {
+        _ = self.connections_rejected_total.fetchAdd(1, .monotonic);
+    }
+
     pub fn recordBytesReceived(self: *ServerMetrics, bytes: u64) void {
         _ = self.bytes_received.fetchAdd(bytes, .monotonic);
     }
@@ -497,6 +506,7 @@ pub const ServerMetrics = struct {
         bytes_received: u64,
         bytes_sent: u64,
         client_version_refused: u64,
+        connections_rejected_total: u64,
         uptime_seconds: u64,
     };
 
@@ -508,6 +518,7 @@ pub const ServerMetrics = struct {
             .bytes_received = self.bytes_received.load(.monotonic),
             .bytes_sent = self.bytes_sent.load(.monotonic),
             .client_version_refused = self.client_version_refused.load(.monotonic),
+            .connections_rejected_total = self.connections_rejected_total.load(.monotonic),
             .uptime_seconds = self.uptimeSeconds(),
         };
     }
@@ -1363,6 +1374,10 @@ fn writeServerMetrics(writer: anytype, snapshot: ServerMetrics.Snapshot) !void {
     try writer.print("# HELP flo_client_version_refused_total Clients refused for being built from another protocol version or op table\n", .{});
     try writer.print("# TYPE flo_client_version_refused_total counter\n", .{});
     try writer.print("flo_client_version_refused_total {d}\n", .{snapshot.client_version_refused});
+
+    try writer.print("# HELP flo_connections_rejected_total Connections accepted and closed at once because the node was at its connection cap\n", .{});
+    try writer.print("# TYPE flo_connections_rejected_total counter\n", .{});
+    try writer.print("flo_connections_rejected_total {d}\n", .{snapshot.connections_rejected_total});
 
     // Uptime
     try writer.print("# HELP flo_uptime_seconds Server uptime in seconds\n", .{});

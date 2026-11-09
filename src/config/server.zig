@@ -78,6 +78,7 @@ pub const ServerConfig = struct {
     data_dir_set: bool = false,
     shards: u16 = 0, // 0 = auto-detect CPU count; defines data topology (permanent!)
     partition_count: u32 = 0, // 0 = auto (max(4096, shards × 32)); virtual partitions for rebalancing
+    max_connections: u32 = 0, // 0 = auto from the open-file limit; client connections held at once
 
     // [storage] section — unified tier configuration
     // NOTE: memtable_size_mb removed - no SpilloverEngine in "Log is Data" architecture
@@ -158,6 +159,7 @@ pub const ServerConfig = struct {
         return RuntimeConfig{
             .num_shards = self.shards,
             .partition_count = self.partition_count,
+            .max_connections = self.max_connections,
             .data_dir = self.data_dir,
             .listen_port = self.port,
             .listen_addr = self.bind,
@@ -219,6 +221,7 @@ const sections = [_]Section{
             // Range-checked by load, which names the automatic value.
             .{ .name = "shards", .kind = .integer, .min = std.math.minInt(i64) },
             .{ .name = "partition_count", .kind = .integer, .min = std.math.minInt(i64) },
+            .{ .name = "max_connections", .kind = .integer, .min = 0, .max = std.math.maxInt(u32) },
         },
     },
     .{ .name = "storage", .keys = &.{
@@ -427,6 +430,13 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
                 return error.InvalidPartitionCount;
             }
             config.partition_count = @intCast(pc);
+        }
+        if (server.getInt("max_connections")) |mc| {
+            if (mc < 0 or mc > std.math.maxInt(u32)) {
+                log.err("[server] max_connections = {d}: must be 0 (automatic) to {d}", .{ mc, std.math.maxInt(u32) });
+                return error.InvalidSetting;
+            }
+            config.max_connections = @intCast(mc);
         }
     }
 
@@ -651,6 +661,10 @@ pub fn generateDefaultConfig() []const u8 {
     \\# Must be >= shards. A higher count enables finer-grained rebalancing.
     \\# WARNING: Cannot be changed after data exists without rebalancing!
     \\# partition_count = 0
+    \\
+    \\# Client connections held at once (0 = auto from the open-file limit).
+    \\# Over this, a new connection is accepted and closed at once.
+    \\# max_connections = 0
     \\
     \\[storage]
     \\# --- WAL Durability ---
@@ -938,6 +952,27 @@ test "config: [workflows] missing_action_wait_ms reaches the runtime config, and
     var defaults = ServerConfig.init(allocator);
     defer defaults.deinit();
     try std.testing.expectEqual(@as(u64, 600_000), defaults.toRuntimeConfig().missing_action_wait_ms);
+}
+
+test "config: [server] max_connections reaches the runtime config, and defaults to 0 (auto)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, "[server]\nmax_connections = 5000\n");
+    @import("stdx").fs.closeFile(f);
+    var set = try load(allocator, path);
+    defer set.deinit();
+    try std.testing.expectEqual(@as(u32, 5000), set.toRuntimeConfig().max_connections);
+
+    var defaults = ServerConfig.init(allocator);
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 0), defaults.toRuntimeConfig().max_connections);
 }
 
 test "config: [workers] timeouts reach the runtime config, and default when absent" {
