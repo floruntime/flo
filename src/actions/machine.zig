@@ -9,6 +9,9 @@
 //! - `action.deadline`: each lease's deadline, keyed (expiry, ns, run) in
 //!   no namespace, so the expire duty reads the earliest without a scan.
 //!
+//! The ready, deadline and request families and the lease rules are the
+//! delivery model's (`contract/delivery.zig`), shared with queues.
+//!
 //! A lease's identity is its deadline key: a run leased until exactly that
 //! instant is the lease the key names. Deliver and extend each write one.
 //! Settle, release and extend name the expiry the leader saw and delete
@@ -37,6 +40,7 @@ const action_ops = @import("../protocol/action_ops.zig");
 const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
+const delivery = @import("../contract/delivery.zig");
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
@@ -49,22 +53,7 @@ const Bytes = schema.Bytes;
 const Optional = schema.Optional;
 const Record = schema.Record;
 
-/// A family value stored as a schema record, so its codec is the schema's.
-fn Stored(comptime R: type) type {
-    return struct {
-        v: R.Value,
-
-        pub fn encode(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
-            const n = R.encodedSize(self.v) catch return error.WriteFailed;
-            _ = R.encodeInto(try w.writableSlice(n), self.v) catch return error.WriteFailed;
-        }
-
-        pub fn decode(bytes: []const u8) error{Malformed}!@This() {
-            var diag: schema.Diagnostic = .{};
-            return .{ .v = R.decodeAll(bytes, &diag) catch return error.Malformed };
-        }
-    };
-}
+const Stored = delivery.Stored;
 
 pub const Def = Record(&.{
     .{ .name = "owner", .T = Bytes(ae.MAX_OWNER) },
@@ -76,9 +65,7 @@ pub const Def = Record(&.{
 
 pub const Status = enum(u8) { ready = 0, leased = 1, completed = 2, failed = 3, timed_out = 4 };
 
-/// How the run's latest delivery ended, so a resent report is answered by
-/// what happened to it.
-pub const Ended = enum(u8) { none = 0, settled = 1, released = 2, abandoned = 3, expired = 4 };
+pub const Ended = delivery.Ended;
 
 pub const Run = Record(&.{
     .{ .name = "action", .T = ae.ActionName },
@@ -113,104 +100,44 @@ pub const Run = Record(&.{
     .{ .name = "error", .T = Bytes(action_ops.MAX_ERROR) },
 });
 
-/// The action a deadline's run belongs to, so the duty can name its ready
-/// key; the namespace and run are in the deadline key.
-pub const Deadline = Record(&.{
-    .{ .name = "action", .T = ae.ActionName },
-});
+pub const Empty = delivery.Empty;
+pub const Deadline = delivery.Deadline;
+pub const Request = delivery.Request;
 
-/// The delivery a holder's request key got, so a retried await gets it
-/// again, from whichever leader it reaches.
-pub const Request = Record(&.{
-    .{ .name = "run", .T = ae.RunId },
-    .{ .name = "term", .T = Int(u64) },
-    .{ .name = "index", .T = Int(u64) },
+/// A run's leases: the delivery model, in actions' own families.
+const M = delivery.Model(.{
+    .ready_id = 22,
+    .ready_name = "action.ready",
+    .deadline_id = 23,
+    .deadline_name = "action.deadline",
+    .request_id = 24,
+    .request_name = "action.request",
+    .scope = "action",
+    .max_scope = ae.MAX_ACTION_NAME,
+    .max_id = ae.MAX_RUN_ID,
+    .max_namespace = limits.MAX_NAMESPACE_NAME,
 });
-
-pub const Empty = struct {
-    pub fn encode(_: Empty, _: *std.Io.Writer) std.Io.Writer.Error!void {}
-    pub fn decode(bytes: []const u8) error{Malformed}!Empty {
-        if (bytes.len != 0) return error.Malformed;
-        return .{};
-    }
-};
 
 pub const Defs = view_mod.Family(20, "action.def", Stored(Def));
 pub const Runs = view_mod.Family(21, "action.run", Stored(Run));
-pub const Ready = view_mod.Family(22, "action.ready", Empty);
-pub const Deadlines = view_mod.Family(23, "action.deadline", Stored(Deadline));
-pub const Requests = view_mod.Family(24, "action.request", Stored(Request));
+pub const Ready = M.Ready;
+pub const Deadlines = M.Deadlines;
+pub const Requests = M.Requests;
 
 // ─── Keys ────────────────────────────────────────────────────────────────
 
-/// The longest key a family here holds, before its namespace prefix.
-const MAX_KEY = ae.MAX_ACTION_NAME + 1 + 8 + ae.MAX_RUN_ID;
-pub const MAX_KEY_LEN = MAX_KEY;
+pub const MAX_KEY_LEN = M.MAX_KEY;
+const KeyBuf = M.KeyBuf;
+const ReqBuf = M.ReqBuf;
 
-const KeyBuf = [MAX_KEY]u8;
-
-comptime {
-    std.debug.assert(8 + 1 + limits.MAX_NAMESPACE_NAME + ae.MAX_RUN_ID <= MAX_KEY);
-}
-
-/// `[action][0][due:u64 BE][run]`: an action's ready runs, earliest first.
-/// A name holds no NUL (the register refuses one), so one action's keys
-/// never run into another's.
-pub fn readyKey(buf: []u8, action: []const u8, due_ns: u64, run: []const u8) []const u8 {
-    @memcpy(buf[0..action.len], action);
-    buf[action.len] = 0;
-    std.mem.writeInt(u64, buf[action.len + 1 ..][0..8], due_ns, .big);
-    @memcpy(buf[action.len + 9 ..][0..run.len], run);
-    return buf[0 .. action.len + 9 + run.len];
-}
-
-/// The prefix of an action's ready keys: `[action][0]`.
-pub fn readyPrefix(buf: []u8, action: []const u8) []const u8 {
-    @memcpy(buf[0..action.len], action);
-    buf[action.len] = 0;
-    return buf[0 .. action.len + 1];
-}
-
-/// `[expiry:u64 BE][ns len:u8][ns][run]`, in no namespace: every lease,
-/// earliest first. The namespace is in it, so the same run id in two
-/// namespaces is two keys.
-pub fn deadlineKey(buf: []u8, expiry_ns: u64, ns: []const u8, run: []const u8) []const u8 {
-    std.mem.writeInt(u64, buf[0..8], expiry_ns, .big);
-    buf[8] = @intCast(ns.len);
-    @memcpy(buf[9..][0..ns.len], ns);
-    @memcpy(buf[9 + ns.len ..][0..run.len], run);
-    return buf[0 .. 9 + ns.len + run.len];
-}
-
-pub const DeadlineKey = struct { expiry_ns: u64, ns: []const u8, run: []const u8 };
-
-/// A deadline key read back, without its family's namespace prefix.
-pub fn parseDeadlineKey(k: []const u8) ?DeadlineKey {
-    if (k.len < 9 or k.len < 9 + @as(usize, k[8])) return null;
-    const ns_len = k[8];
-    return .{ .expiry_ns = std.mem.readInt(u64, k[0..8], .big), .ns = k[9..][0..ns_len], .run = k[9 + ns_len ..] };
-}
-
-/// `[holder][0][request_key]`, in the namespace: a holder's request keys.
-/// A worker id holds no NUL, so one holder's keys never run into another's.
-pub fn requestKey(buf: []u8, holder: []const u8, request_key: []const u8) []const u8 {
-    @memcpy(buf[0..holder.len], holder);
-    buf[holder.len] = 0;
-    @memcpy(buf[holder.len + 1 ..][0..request_key.len], request_key);
-    return buf[0 .. holder.len + 1 + request_key.len];
-}
-
-const ReqBuf = [ae.Holder.max_size + 1 + ae.MAX_REQUEST_KEY]u8;
-
-fn after(stamp_ns: u64, millis: u64) u64 {
-    return stamp_ns +| (millis *| std.time.ns_per_ms);
-}
-
-/// Where an extend at `stamp` moves a lease to: a lease on from now, but
-/// never past the hold ceiling from its deliver.
-fn extendedTo(stamp: u64, lease_ms: u64, held_since_ns: u64) u64 {
-    return @min(after(stamp, lease_ms), after(held_since_ns, ae.MAX_HOLD_MS));
-}
+pub const readyKey = M.readyKey;
+pub const readyPrefix = M.readyPrefix;
+pub const deadlineKey = M.deadlineKey;
+pub const DeadlineKey = M.DeadlineKey;
+pub const parseDeadlineKey = M.parseDeadlineKey;
+pub const requestKey = M.requestKey;
+const after = delivery.after;
+const extendedTo = delivery.extendedTo;
 
 fn typeOf(e: *const Entry) EntryType {
     return @fromBackingInt(@intCast(e.header.entry_type));
@@ -357,24 +284,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             // and due by the log's clock.
             if (run.v.status != .ready or run.v.due_ns != p.due_ns or p.due_ns > stamp)
                 return out.refuse(.conflict, .unclassified, NOT_READY);
-            var b: KeyBuf = undefined;
-            try view.delete(Ready, try nsKey(view, p.ns, readyKey(&b, p.action, p.due_ns, p.run)));
-            run.v.status = .leased;
-            run.v.deliveries +|= 1;
-            run.v.holder = p.holder;
-            run.v.request_key = p.request_key;
-            run.v.token = .{ .term = e.header.term, .index = e.header.index };
-            run.v.lease_ms = p.lease_ms;
-            run.v.delivered_ns = stamp;
-            run.v.expiry_ns = after(stamp, p.lease_ms);
-            run.v.ended = .none;
-            if (run.v.started_ns == 0) run.v.started_ns = stamp;
+            try M.deliver(view, p.ns, p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
             try view.put(Runs, rk, run);
-            try putDeadline(view, p.ns, p.run, run.v);
-            if (p.request_key) |k| {
-                var rb: ReqBuf = undefined;
-                try view.put(Requests, try nsKey(view, p.ns, requestKey(&rb, p.holder, k)), .{ .v = .{ .run = p.run, .term = e.header.term, .index = e.header.index } });
-            }
             out.putInt(u32, run.v.deliveries);
         },
         .action_settle => {
@@ -390,8 +301,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 }
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
-            try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
-            try dropRequest(view, p.ns, p.holder, p.request_key, p.run);
+            try M.endLease(view, p.ns, p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             run.v.status = .completed;
             run.v.ended = .settled;
             run.v.outcome = p.outcome;
@@ -409,19 +319,18 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == ended) return;
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
-            try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
-            try dropRequest(view, p.ns, p.holder, p.request_key, p.run);
+            try M.endLease(view, p.ns, p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             run.v.@"error" = p.@"error";
             if (p.abandoned) {
                 run.v.ended = .abandoned;
-                try readyAgain(view, p.ns, p.run, &run, after(stamp, p.delay_ms));
+                try M.readyAgain(view, p.ns, p.run, &run.v, after(stamp, p.delay_ms));
             } else {
                 run.v.ended = .released;
                 run.v.failures +|= 1;
                 if (!p.retry or run.v.failures >= run.v.max_attempts) {
                     run.v.status = .failed;
                     run.v.completed_ns = stamp;
-                } else try readyAgain(view, p.ns, p.run, &run, after(stamp, p.delay_ms));
+                } else try M.readyAgain(view, p.ns, p.run, &run.v, after(stamp, p.delay_ms));
             }
             try view.put(Runs, rk, run);
         },
@@ -433,13 +342,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             if (p.lease_ms != run.v.lease_ms or p.held_since_ns != run.v.delivered_ns) return out.refuse(.bad_request, .unclassified, NOT_ITS_LEASE);
             // More than half the lease left, or held to the ceiling: the
             // lease stands, and nothing is written.
-            if (run.v.expiry_ns -| stamp > (run.v.lease_ms *| std.time.ns_per_ms) / 2) return out.putInt(u64, run.v.expiry_ns);
-            const to = extendedTo(stamp, p.lease_ms, p.held_since_ns);
-            if (to <= run.v.expiry_ns) return out.putInt(u64, run.v.expiry_ns);
-            try dropDeadline(view, p.ns, p.run, run.v, p.expiry_ns);
-            run.v.expiry_ns = to;
+            const to = (try M.extend(view, p.ns, p.run, &run.v, p.expiry_ns, stamp)) orelse return out.putInt(u64, run.v.expiry_ns);
             try view.put(Runs, rk, run);
-            try putDeadline(view, p.ns, p.run, run.v);
             out.putInt(u64, to);
         },
         .action_expire => {
@@ -464,21 +368,16 @@ fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool
     if (item.expiry_ns > stamp) return false;
     const rk = try nsKey(view, item.ns, item.run);
     const found = try view.get(Runs, rk);
-    const live = if (found) |r| r.v.status == .leased and r.v.expiry_ns == item.expiry_ns else false;
-    const ours = if (found) |r| std.mem.eql(u8, r.v.action, item.action) else true;
-    if (!ours and live) return false;
-    var b: KeyBuf = undefined;
-    try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run)));
-    if (!live) return false;
+    if (!try M.expireKey(view, item.ns, item.run, item.action, item.expiry_ns, if (found) |r| r.v else null, stamp)) return false;
     var run = found.?;
-    try dropRequest(view, item.ns, item.holder, item.request_key, item.run);
+    try M.dropRequest(view, item.ns, item.holder, item.request_key, item.run);
     run.v.ended = .expired;
     run.v.failures +|= 1;
     run.v.@"error" = "lease expired";
     if (run.v.failures >= run.v.max_attempts) {
         run.v.status = .timed_out;
         run.v.completed_ns = stamp;
-    } else try readyAgain(view, item.ns, item.run, &run, stamp);
+    } else try M.readyAgain(view, item.ns, item.run, &run.v, stamp);
     try view.put(Runs, rk, run);
     return true;
 }
@@ -489,72 +388,13 @@ fn inScope(view: *View, rk: []const u8, action: []const u8) ApplyError!?Stored(R
     return if (std.mem.eql(u8, run.v.action, action)) run else null;
 }
 
-fn readyAgain(view: *View, ns: []const u8, run_id: []const u8, run: *Stored(Run), due_ns: u64) ApplyError!void {
-    run.v.status = .ready;
-    run.v.due_ns = due_ns;
-    var b: KeyBuf = undefined;
-    try view.put(Ready, try nsKey(view, ns, readyKey(&b, run.v.action, due_ns, run_id)), .{});
-}
-
-fn putDeadline(view: *View, ns: []const u8, run_id: []const u8, run: Run.Value) ApplyError!void {
-    // An extend or a redeliver landing on the same instant rewrites the
-    // same key: still one deadline for the one live lease.
-    var b: KeyBuf = undefined;
-    try view.put(Deadlines, try nsKey(view, "", deadlineKey(&b, run.expiry_ns, ns, run_id)), .{ .v = .{ .action = run.action } });
-}
-
-/// Delete the key at `seen`, the expiry the leader saw, if it is still the
-/// run's; if an extend moved it since, the duty drops it once past due.
-fn dropDeadline(view: *View, ns: []const u8, run_id: []const u8, run: Run.Value, seen: u64) ApplyError!void {
-    if (seen != run.expiry_ns) return;
-    var b: KeyBuf = undefined;
-    try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, seen, ns, run_id)));
-}
-
 pub const OTHER_RESULT = "stale report: the run was completed with another result";
 
-/// Whether the report's delivery is the run's live one, reported by its
-/// holder.
-fn holds(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
-    return run.status == .leased and sameDelivery(run, holder, deliveries, token);
-}
-
-fn sameDelivery(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
-    return run.deliveries == deliveries and run.token.term == token.term and run.token.index == token.index and std.mem.eql(u8, run.holder, holder);
-}
-
-/// A report for a delivery that has moved on, or from a worker that
-/// doesn't hold it, said by what happened.
-fn stale(out: *Result, run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) void {
-    out.refuse(.conflict, .stale_report, staleWhy(run, holder, deliveries, token));
-}
-
-pub fn staleWhy(run: Run.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) []const u8 {
-    if (run.deliveries != deliveries or run.token.term != token.term or run.token.index != token.index) return "stale report: the run was delivered again since";
-    if (!std.mem.eql(u8, run.holder, holder)) return "stale report: another worker holds this delivery";
-    return switch (run.ended) {
-        .expired => "stale report: the lease expired and the run moved on",
-        .settled => "stale report: the run was completed",
-        .released, .abandoned => "stale report: the run was released",
-        .none => "stale report: the run isn't held",
-    };
-}
-
-/// A delivery's request record goes with it, if it still names the run.
-fn dropRequest(view: *View, ns: []const u8, holder: []const u8, request_key: ?[]const u8, run_id: []const u8) ApplyError!void {
-    const k = request_key orelse return;
-    var rb: ReqBuf = undefined;
-    const key = try nsKey(view, ns, requestKey(&rb, holder, k));
-    const got = (try view.get(Requests, key)) orelse return;
-    if (std.mem.eql(u8, got.v.run, run_id)) try view.delete(Requests, key);
-}
-
-/// `k` in `ns`, as a family stores it, in the entry's scratch.
-fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
-    if (ns.len > view_mod.MAX_NAMESPACE) return error.Halt;
-    const buf = try view.arena.alloc(u8, 1 + ns.len + k.len);
-    return view_mod.key(buf, ns, k) catch unreachable;
-}
+const holds = delivery.holds;
+const sameDelivery = delivery.sameDelivery;
+const stale = delivery.stale;
+pub const staleWhy = delivery.staleWhy;
+const nsKey = delivery.nsKey;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
@@ -649,7 +489,7 @@ pub const TestActions = struct {
             if (k.expiry_ns > stamp) break;
             const d = try Stored(Deadline).decode(rec.value);
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.action, .run = k.run, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
+            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
             n += 1;
         }
         if (n == 0) return;
