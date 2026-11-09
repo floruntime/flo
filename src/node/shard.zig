@@ -19497,3 +19497,226 @@ test "Shard: a forward lost after it went to the leader tells a read it didn't r
         }
     }
 }
+
+/// Shard 0's log written by hand: creates with any name and id, which no
+/// ready leader would propose, and puts stamped with an id.
+const CreateLog = struct {
+    fn create(shard: *Shard, name: []const u8, id: u32) !u64 {
+        var buf: [@import("../protocol/namespace_entries.zig").Create.max_size]u8 = undefined;
+        const bytes = try @import("../protocol/namespace_entries.zig").Create.encodeInto(&buf, .{ .name = name, .id = id });
+        return (try shard.raft_node.propose(.namespace_create, entry_mod.Flags.NONE, bytes)).index;
+    }
+
+    fn put(shard: *Shard, id: ns_table.Id, value: []const u8) !u64 {
+        const key: [5]u8 = id.bytes() ++ [_]u8{'k'};
+        var buf: [64]u8 = undefined;
+        const bytes = try kv_entries.Put.encodeInto(&buf, .{ .key = &key, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null });
+        return (try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, bytes)).index;
+    }
+
+    /// The put's value under `id`, on any of the shard's partitions.
+    fn held(shard: *Shard, id: ns_table.Id) ?[]const u8 {
+        const key: [5]u8 = id.bytes() ++ [_]u8{'k'};
+        for (shard.partitions) |p| if (p.kv.get(&key)) |cur| return cur.value;
+        return null;
+    }
+
+    const Refusal = enum { full, stale, existed };
+
+    /// What comes before the create its applier refuses, applied; then the
+    /// create, and a put behind it stamped with its id. Returns the create's
+    /// index and id.
+    fn build(shard: *Shard, why: Refusal) !struct { u64, ns_table.Id } {
+        const nh = shard.namespace_handler;
+        const first = ns_table.FIRST_ALLOCATED.int();
+        var name_buf: [16]u8 = undefined;
+        switch (why) {
+            // Every live namespace there can be, default among them.
+            .full => while (nh.namespaces.count() < ns_table.MAX_LIVE) {
+                _ = try create(shard, try std.fmt.bufPrint(&name_buf, "ns{d}", .{nh.next_id}), nh.next_id);
+                try std.testing.expect(shard.applyCommitted());
+            },
+            .stale, .existed => {
+                _ = try create(shard, "first", first);
+                try std.testing.expect(shard.applyCommitted());
+            },
+        }
+        const id: u32 = switch (why) {
+            .full, .existed => nh.next_id,
+            // One another create already took.
+            .stale => first,
+        };
+        const index = try create(shard, if (why == .existed) "first" else "late", id);
+        _ = try put(shard, .of(id), "behind the create");
+        return .{ index, .of(id) };
+    }
+
+    /// Halted at the create, with nothing from it or the put behind it.
+    fn expectHaltedAt(shard: *Shard, index: u64, id: ns_table.Id, why: Refusal) !void {
+        const h = shard.halted orelse return error.NotHalted;
+        try std.testing.expectEqual(index, h.index);
+        try std.testing.expectEqual(index - 1, shard.raft_node.last_applied);
+        try std.testing.expect(held(shard, id) == null);
+        try std.testing.expect(!shard.namespace_handler.namespaces.contains("late"));
+        if (why == .full) try std.testing.expectEqual(@as(usize, ns_table.MAX_LIVE), shard.namespace_handler.namespaces.count());
+        if (why == .existed) try std.testing.expect(shard.namespace_handler.nameOf(id) == null);
+    }
+};
+
+test "Shard: a write behind a create its applier refuses never applies: shard 0 halts at the create, live and on replay at boot, on 1 and 4 shards" {
+    for ([_]u16{ 1, 4 }) |shards| {
+        for (std.enums.values(CreateLog.Refusal)) |why| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const data_dir = try testDataDir(&tmp);
+            defer std.testing.allocator.free(data_dir);
+            const pipe_fds = try @import("stdx").io.pipe();
+            defer _ = std.c.close(pipe_fds[0]);
+            defer _ = std.c.close(pipe_fds[1]);
+            var index: u64 = 0;
+            var id: ns_table.Id = .invalid;
+            {
+                // Logged and on disk, never applied here.
+                var shard = try Shard.init(std.testing.allocator, 0, shards, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+                defer shard.deinit();
+                shard.wireHandlerShardPtrs();
+                try std.testing.expect(shard.applyCommitted());
+                index, id = try CreateLog.build(&shard, why);
+                try shard.flushSegmentToDisk();
+            }
+            {
+                // Replayed at boot.
+                var shard = try Shard.init(std.testing.allocator, 0, shards, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+                defer shard.deinit();
+                shard.wireHandlerShardPtrs();
+                try std.testing.expect(!shard.applyCommitted());
+                try CreateLog.expectHaltedAt(&shard, index, id, why);
+            }
+            {
+                // Applied live.
+                var shard = try Shard.init(std.testing.allocator, 0, shards, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+                defer shard.deinit();
+                shard.wireHandlerShardPtrs();
+                try std.testing.expect(shard.applyCommitted());
+                index, id = try CreateLog.build(&shard, why);
+                try std.testing.expect(!shard.applyCommitted());
+                try CreateLog.expectHaltedAt(&shard, index, id, why);
+            }
+        }
+    }
+}
+
+test "Shard: a create cut with the log's tail by a new leader takes its write with it, and its id then holds only the new leader's namespace" {
+    // How much of the old leader's create and write the new leader kept.
+    for ([_]u64{ 0, 1 }) |kept| {
+        var t: RaceTest = undefined;
+        try t.init();
+        defer t.deinit();
+        const r = t.shard.raft_node;
+        const nh = t.shard.namespace_handler;
+        const term = r.current_term;
+        const before = r.log.lastIndex();
+        const id: ns_table.Id = .of(nh.next_id);
+        // A write to a namespace this leader doesn't know: the create, then
+        // the write stamped with its id, neither committed.
+        var set_buf: [64]u8 = undefined;
+        const body = try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "orders'", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        t.shard.runRequest(t.conn, testReq(.kv_put, 1, "orders", "k", body, ""), .client);
+        try std.testing.expectEqual(before + 2, r.log.lastIndex());
+        try std.testing.expectEqual(@as(?ns_table.Id, id), nh.idOf("orders"));
+
+        // Node 2 leads term + 1. It keeps `kept` of those entries, and in
+        // place of the rest creates "ledger", which takes the same id, and
+        // writes in it; all of it commits.
+        var entries: [2]entry_mod.Entry = undefined;
+        var create_buf: [@import("../protocol/namespace_entries.zig").Create.max_size]u8 = undefined;
+        var put_buf: [64]u8 = undefined;
+        const key: [5]u8 = id.bytes() ++ [_]u8{'k'};
+        var stamp = r.log.last_stamp;
+        const n: usize = if (kept == 0) 2 else 1;
+        for (0..n) |i| {
+            stamp += 1;
+            const at = before + kept + 1 + i;
+            entries[i] = if (kept == 0 and i == 0)
+                entry_mod.buildEntry(.namespace_create, entry_mod.Flags.NONE, term + 1, at, stamp, try @import("../protocol/namespace_entries.zig").Create.encodeInto(&create_buf, .{ .name = "ledger", .id = id.int() }))
+            else
+                entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, term + 1, at, stamp, try kv_entries.Put.encodeInto(&put_buf, .{ .key = &key, .value = "new leader's", .ttl_ms = null, .condition = .always, .cas_version = null }));
+            entries[i].header.crc32c = entries[i].computeCrc();
+        }
+        const last = before + kept + n;
+        _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before + kept, .prev_log_term = term, .entries = entries[0..n], .leader_commit = last });
+        t.shard.replica.leadershipLost("a leader with a newer term spoke");
+        try std.testing.expect(t.shard.applyCommitted());
+        try std.testing.expectEqual(last, r.last_applied);
+
+        // The client's write never applied, and it was told it might not have.
+        var buf: [1024]u8 = undefined;
+        var one: [1]proto.Response = undefined;
+        try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+        try std.testing.expect(nh.idOf("orders") == null or kept == 1);
+        if (kept == 0) {
+            // Both cut: the id is the new leader's namespace, with its data only.
+            try std.testing.expect(!nh.namespaces.contains("orders"));
+            try std.testing.expectEqualStrings("ledger", nh.nameOf(id).?);
+            try std.testing.expectEqual(id, nh.namespaces.get("ledger").?.id);
+        } else {
+            // The create kept, its write cut: the namespace is made, empty
+            // of the old leader's write.
+            try std.testing.expectEqualStrings("orders", nh.nameOf(id).?);
+            try std.testing.expect(!nh.namespaces.contains("ledger"));
+        }
+        try std.testing.expectEqualStrings("new leader's", CreateLog.held(&t.shard, id).?);
+        // Nothing this node proposed is still taken for its own.
+        try std.testing.expectEqual(@as(u32, 0), nh.pending_creates.count());
+        try std.testing.expectEqual(@as(u32, 0), nh.next_alloc);
+    }
+}
+
+test "Shard: a leader is ready only once its next id is past every create in its log, an earlier leader's committed and uncommitted ones too" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    const nh = t.shard.namespace_handler;
+    const term = r.current_term;
+    const before = r.log.lastIndex();
+    const first = nh.next_id;
+    // Node 2 leads term + 1 and creates two namespaces; this node, now
+    // following, holds both, the first committed, neither applied.
+    t.shard.replica.leadershipLost("a leader with a newer term spoke");
+    var entries: [2]entry_mod.Entry = undefined;
+    var bufs: [2][@import("../protocol/namespace_entries.zig").Create.max_size]u8 = undefined;
+    for (&entries, 0..) |*e, i| {
+        e.* = entry_mod.buildEntry(.namespace_create, entry_mod.Flags.NONE, term + 1, before + 1 + i, r.log.last_stamp + 1 + i, try @import("../protocol/namespace_entries.zig").Create.encodeInto(&bufs[i], .{ .name = if (i == 0) "a" else "b", .id = first + @as(u32, @intCast(i)) }));
+        e.header.crc32c = e.computeCrc();
+    }
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = term, .entries = &entries, .leader_commit = before + 1 });
+    try std.testing.expectEqual(first, nh.next_id);
+
+    // Elected at term + 2, as `becomeLeader` leaves it: nothing of the
+    // earlier term applied yet.
+    r.current_term = term + 2;
+    r.role = .leader;
+    r.leader_id = r.id;
+    r.ready_index = r.log.lastIndex();
+    try std.testing.expect(!r.leaderReady());
+    switch (nh.proposeCreateOn(r, "fresh")) {
+        .refused => |why| try std.testing.expectEqualStrings(NamespaceHandler.CATCHING_UP_MESSAGE, why.message),
+        else => return error.TestUnexpectedResult,
+    }
+    // The committed create applies; the other waits for this term's entry.
+    try std.testing.expect(t.shard.applyCommitted());
+    try std.testing.expect(!r.leaderReady());
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    try ParkTest.ack(&t.shard);
+    try std.testing.expect(r.leaderReady());
+    try std.testing.expectEqual(first + 2, nh.next_id);
+    try std.testing.expectEqualStrings("b", nh.nameOf(.of(first + 1)).?);
+    // Its first create takes the id after them.
+    const at = r.log.lastIndex() + 1;
+    try std.testing.expect(nh.proposeCreateOn(r, "fresh") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(first + 2)), nh.idOf("fresh"));
+    try ParkTest.ack(&t.shard);
+    try std.testing.expectEqual(at, nh.namespaces.get("fresh").?.created_index);
+}
