@@ -11431,6 +11431,30 @@ test "Shard: a leader short of memory to note its create or bind proposes neithe
     try std.testing.expect(b.halted == null);
 }
 
+test "Shard: a pipeline's stream read finds a namespace by the node's table only: unpublished, it reads nothing" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // Shard 0 creates it and appends behind the create; both apply, and
+    // nothing is published yet.
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try a.stream_handler.appendPayloadToStream("s", "fresh", "x");
+    _ = a.applyCommitted();
+    try std.testing.expect(two.namespaces.lookup("fresh") == null);
+    const sh = a.stream_handler;
+    const early = sh.readPayloadsForStream("s", "fresh", .{ .timestamp_ms = 0, .sequence = 0 }, 10);
+    sh.allocator.free(early.payloads);
+    sh.allocator.free(early.ids);
+    try std.testing.expectEqual(@as(usize, 0), early.payloads.len);
+    two.settle();
+    const later = sh.readPayloadsForStream("s", "fresh", .{ .timestamp_ms = 0, .sequence = 0 }, 10);
+    defer sh.allocator.free(later.payloads);
+    defer sh.allocator.free(later.ids);
+    try std.testing.expectEqual(@as(usize, 1), later.payloads.len);
+}
+
 test "Shard: at boot, shard 0 proposes no id another shard has bound, though its own log lacks the create" {
     var two: TwoShards = undefined;
     try two.init();

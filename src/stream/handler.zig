@@ -1761,19 +1761,20 @@ pub const StreamHandler = struct {
         return buf;
     }
 
-    /// Append payload to a named stream (used by processing pipelines).
-    /// Computes the namespace-qualified name hash for proper stream isolation.
-    /// Wraps the payload in batch format for consistency with all other appends.
     /// The id of namespace `name` as the node's table has it: a pipeline or
     /// trigger names its source by name, and may read from another shard's
-    /// thread, which the table allows.
+    /// thread, which the table allows and the shard's own maps don't. A
+    /// namespace not yet published is `.invalid`, and reads as empty.
     fn namespaceId(self: *const StreamHandler, name: []const u8) router.NamespaceId {
         const effective = if (name.len == 0) "default" else name;
         if (std.mem.eql(u8, effective, "default")) return .default;
         const sptr = self.shard_ptr orelse return .invalid;
-        return shardFromPtr(sptr).namespaceId(effective);
+        return shardFromPtr(sptr).namespace_handler.table.lookup(effective) orelse .invalid;
     }
 
+    /// Append payload to a named stream (used by processing pipelines).
+    /// Computes the namespace-qualified name hash for proper stream isolation.
+    /// Wraps the payload in batch format for consistency with all other appends.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !void {
         // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
         const batch_size = 4 + 4 + payload.len + 2;
