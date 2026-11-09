@@ -2066,6 +2066,10 @@ pub const ProcessingHandler = struct {
         const req = proto.Request{
             .header = makeSinkHeader(.queue_enqueue),
             .namespace = snk.namespace,
+            // The enqueue registers the queue under this id, as the applier
+            // files its messages: published before any sink writes
+            // (`sinksReady`).
+            .ns_id = self.namespaceIdOf(snk.namespace),
             .key = snk.target, // queue name
             .value = payload,
             .options = opt_buf[0..ob.offset],
