@@ -83,6 +83,14 @@ pub fn raiseOpenFileLimit() OpenFileLimit {
     return .{ .was = was, .now = want };
 }
 
+/// This process's current soft open-file limit, or 0 if it can't be read. Read
+/// after `raiseOpenFileLimit` at start, it is what the connection cap derives
+/// from.
+pub fn softOpenFileLimit() u64 {
+    const lim = std.posix.getrlimit(.NOFILE) catch return 0;
+    return @intCast(lim.cur);
+}
+
 test "process: the open-file target is bounded by the hard limit and the platform ceiling, and never lowers" {
     const E = std.testing.expectEqual;
     // Raises toward the hard limit.
