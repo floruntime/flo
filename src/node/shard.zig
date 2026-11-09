@@ -1685,10 +1685,6 @@ pub const Shard = struct {
             if (self.refusedRead(conn, req)) return;
             return self.findRun(conn, req, auth, req.key, null);
         }
-        if (self.startChoosesRunId(req)) |rid| {
-            if (self.refusedRead(conn, req)) return;
-            return self.findRun(conn, req, auth, rid, self.startHome(req));
-        }
 
         // A write routes by its namespace's id, so on a node of several
         // shards one into a namespace the node doesn't have yet waits for
@@ -1707,6 +1703,13 @@ pub const Shard = struct {
             var routed = req;
             routed.ns_id = self.namespaceIdOf(req);
             return self.route(conn, routed, auth);
+        }
+
+        // A start that chooses its run id is decided on its workflow's
+        // shard, found by the namespace's id: only past the wait above.
+        if (self.startChoosesRunId(req)) |rid| {
+            if (self.refusedRead(conn, req)) return;
+            return self.findRun(conn, req, auth, rid, self.startHome(req));
         }
 
         // Route to the correct shard/node, or dispatch locally.
@@ -9574,6 +9577,63 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     const job = jobs.next().?;
     try std.testing.expect(job.held);
     try std.testing.expect(std.mem.indexOf(u8, job.held_owned, "is on another") != null);
+}
+
+test "Shard: a start's retry choosing its run id, sent before its namespace is published, is decided on its workflow's shard by the namespace's id" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    for (&two.shards) |*s| s.wireHandlerShardPtrs();
+    // A workflow whose shard is 0 by the namespace's id, and 1 by none.
+    const id = nextNamespaceId(a);
+    var wbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const w = while (true) : (i += 1) {
+        const n = try std.fmt.bufPrint(&wbuf, "wf{d}", .{i});
+        const by_id = a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(id, n)));
+        const by_none = a.router.partitionToShard(a.router.hashToPartition(node_router.routeNsKey(.invalid, n)));
+        if (by_id == 0 and by_none == 1) break n;
+    };
+    var dbuf: [256]u8 = undefined;
+    const def = try std.fmt.bufPrint(&dbuf,
+        \\{{"kind":"Workflow","name":"{s}","version":"1.0.0",
+        \\"start":{{"wait_for_signal":{{"type":"go"}},"transitions":{{"success":"flo.Completed"}}}}}}
+    , .{w});
+    // Created on shard 0 with the namespace; applied, not yet published.
+    const ca = try TestClient.open(a);
+    defer _ = std.c.close(ca.pair[1]);
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_create, 1, "wfresh", w, def, ""), .client);
+    _ = a.applyCommitted();
+    var out: [512]u8 = undefined;
+    var resp = try nextAnswer(ca, a, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(two.namespaces.lookup("wfresh") == null);
+
+    // Started there, with its idempotency key and its own run id.
+    const both = [_]u8{ 0, 0, 1, 1, 0, 'z', 1, 2, 0, 'r', '1' };
+    a.runRequest(ca.conn, try ParkTest.request(.workflow_start, 2, "wfresh", w, &both, ""), .client);
+    // Every shard says whether it holds the id; nothing publishes.
+    for (0..8) |_| for (&two.shards) |*s| {
+        _ = s.drainInbox();
+        _ = s.applyCommitted();
+    };
+    resp = try nextAnswer(ca, a, &out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expect(a.workflow_handler.holdsRun("wfresh", "r1"));
+    try std.testing.expect(two.namespaces.lookup("wfresh") == null);
+
+    // Its retry from shard 1 is the same start, decided on shard 0: the
+    // run's holder is its workflow's shard, not another workflow's.
+    const cb = try TestClient.open(b);
+    defer _ = std.c.close(cb.pair[1]);
+    b.runRequest(cb.conn, try ParkTest.request(.workflow_start, 9, "wfresh", w, &both, ""), .client);
+    two.settle();
+    resp = try nextAnswer(cb, b, &out);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectError(error.IncompleteResponse, nextAnswer(cb, b, &out));
 }
 
 test "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" {
