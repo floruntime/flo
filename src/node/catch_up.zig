@@ -25,8 +25,12 @@ pub const CatchUp = struct {
     /// The node's bulk I/O thread; null reads every range in place.
     bulk: ?*bulk_io.BulkIo = null,
     notify: ?bulk_io.Notify = null,
-    /// One read in flight per peer at most.
+    /// Reads shared by the peers, each kept by its start index: as many
+    /// in flight as there are peers, at most.
     reads: [MAX_PEERS]bulk_io.SealedRead = @splat(.{}),
+    /// The leadership each read was asked for in; `forget` moves it on.
+    asked_in: [MAX_PEERS]u64 = @splat(0),
+    leadership: u64 = 0,
     /// Each read's own buffers, allocated the first time it is used.
     entry_bufs: [MAX_PEERS][]Entry = @splat(&.{}),
     arenas: [MAX_PEERS][]u8 = @splat(&.{}),
@@ -50,10 +54,10 @@ pub const CatchUp = struct {
         return .{ .ctx = self, .read_range = readInPlace, .read_range_async = readAsync };
     }
 
-    /// Finished reads, dropped: on losing leadership, nothing kept is wanted.
-    /// One still queued is left to finish, then dropped when it is asked for
-    /// or reused.
+    /// On losing leadership, every read is dropped: a finished one now, one
+    /// still queued once it finishes, unread. A later leadership asks again.
     pub fn forget(self: *CatchUp) void {
+        self.leadership += 1;
         for (&self.reads) |*r| {
             if (r.state.load(.acquire) == .done) r.state.store(.idle, .release);
         }
@@ -75,7 +79,7 @@ pub const CatchUp = struct {
     fn readAsync(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
         const self: *CatchUp = @ptrCast(@alignCast(ctx));
         const bulk = self.bulk orelse return readInPlace(ctx, start, buf, arena);
-        for (&self.reads) |*r| {
+        for (&self.reads, self.asked_in) |*r, asked_in| {
             const state = r.state.load(.acquire);
             if (r.start != start or state == .idle) continue;
             if (state == .queued) return .{ .pending = true };
@@ -83,6 +87,7 @@ pub const CatchUp = struct {
             // Before anything it came to: a fault there may only be a file a
             // cut has deleted since.
             if (r.generation != self.dl.truncations) break;
+            if (asked_in != self.leadership) break;
             return copyOut(r, buf, arena);
         }
         var path_buf: [bulk_io.MAX_PATH]u8 = undefined;
@@ -100,6 +105,7 @@ pub const CatchUp = struct {
             .notify = self.notify,
         };
         @memcpy(slot.path[0..src.path.len], src.path);
+        self.asked_in[i] = self.leadership;
         slot.state.store(.queued, .release);
         if (!bulk.submit(slot, .foreground)) {
             slot.state.store(.idle, .release);
@@ -255,6 +261,31 @@ test "catch up: a read made before a truncation is dropped, whatever it came to"
     try testing.expectEqual(@as(usize, 0), after.count);
     try testing.expect(!after.pending and !after.blocked);
     try testing.expectEqual(@as(usize, 0), cu.inFlight());
+}
+
+test "catch up: losing leadership drops every read, a queued one once it finishes" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var cu = CatchUp.init(testing.allocator, &f.dl, 8, 256);
+    defer cu.deinit();
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    var done: Done = .{};
+    cu.bulk = &bulk;
+    cu.notify = .{ .ctx = &done, .done = Done.done };
+
+    var buf: [8]Entry = undefined;
+    var arena: [256]u8 = undefined;
+    // Queued, not yet read: the thread isn't running.
+    try testing.expect(askAsync(&cu, 1, &buf, &arena).pending);
+    cu.forget();
+    try bulk.start();
+    try done.waitFor(1);
+    // Read for the old leadership: not handed out, asked again instead.
+    try testing.expect(askAsync(&cu, 1, &buf, &arena).pending);
+    try done.waitFor(2);
+    try testing.expectEqual(@as(usize, 3), askAsync(&cu, 1, &buf, &arena).count);
 }
 
 test "catch up: with no bulk thread every read is made in place" {

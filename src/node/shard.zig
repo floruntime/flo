@@ -1377,7 +1377,8 @@ pub const Shard = struct {
             log.err("shard {d}: final flush on shutdown failed: {s} (buffered entries may be lost)", .{ self.id, @errorName(err) });
         };
 
-        // The bulk thread has stopped by now, so no read still writes here.
+        // The runtime stops the bulk thread before it frees any shard, so no
+        // read still writes here.
         if (self.catch_up) |cu| {
             cu.deinit();
             self.allocator.destroy(cu);

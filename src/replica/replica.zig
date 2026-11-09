@@ -734,7 +734,11 @@ pub fn Replica(comptime Io: type) type {
                         self.peer_catch_up_retry_ms[i] = now + CATCH_UP_RETRY_MS;
                         if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                             self.peer_batch_warn_ms[i] = now;
-                            log.warn("shard {d}: the entries at index {d} can't be read to replicate to node {d} right now; holding and retrying", .{ self.id, next, raft.peer_ids[i] });
+                            if (rr.stale) {
+                                log.warn("shard {d}: the entries read at index {d} to replicate to node {d} don't match this log's terms; holding and reading them again", .{ self.id, next, raft.peer_ids[i] });
+                            } else {
+                                log.warn("shard {d}: the entries at index {d} can't be read to replicate to node {d} right now; holding and retrying", .{ self.id, next, raft.peer_ids[i] });
+                            }
                         }
                     } else if (now -| self.peer_batch_warn_ms[i] >= WARN_INTERVAL_MS) {
                         // An empty batch here would be sent as a heartbeat and

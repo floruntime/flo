@@ -530,6 +530,14 @@ pub const Runtime = struct {
             self.peer_shards_slice = null;
         }
 
+        // Before the shards: it may still be writing into their buffers, on a
+        // start that failed after it began as well as after a stop.
+        if (self.bulk_io) |bulk| {
+            bulk.deinit();
+            self.allocator.destroy(bulk);
+            self.bulk_io = null;
+        }
+
         // Clean up shards
         if (self.shards) |shards| {
             for (shards) |*shard| {
@@ -552,12 +560,6 @@ pub const Runtime = struct {
             metrics.deinit();
             self.allocator.destroy(metrics);
             self.metrics_registry = null;
-        }
-
-        if (self.bulk_io) |bulk| {
-            bulk.deinit();
-            self.allocator.destroy(bulk);
-            self.bulk_io = null;
         }
 
         // Last: everything that writes to the data dir has stopped.

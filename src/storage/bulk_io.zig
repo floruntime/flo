@@ -54,7 +54,8 @@ pub const SealedRead = struct {
     }
 };
 
-/// The most reads waiting in one lane: a shard has at most one per peer.
+/// The most reads waiting in one lane, across the node's shards. Past it a
+/// shard reads in place.
 pub const QUEUE_CAPACITY = 256;
 
 const Queue = struct {
@@ -173,8 +174,11 @@ pub const BulkIo = struct {
 
     fn perform(self: *BulkIo, r: *SealedRead) void {
         r.result = self.read(r);
+        // Once `done`, the shard may reuse the read: nothing of it is read
+        // after the store.
+        const notify = r.notify;
         r.state.store(.done, .release);
-        if (r.notify) |n| n.done(n.ctx);
+        if (notify) |n| n.done(n.ctx);
     }
 
     /// The read itself: contiguous entries from `r.start` within its one

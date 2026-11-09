@@ -196,7 +196,13 @@ pub const RaftLog = struct {
     /// What a range read came to: how many entries, and whether a below-ring
     /// read was blocked (so the replication path can back off rather than
     /// re-read every tick) rather than folding the block into a zero count.
-    pub const RangeRead = struct { count: usize, blocked: bool = false, pending: bool = false };
+    pub const RangeRead = struct {
+        count: usize,
+        blocked: bool = false,
+        pending: bool = false,
+        /// Blocked because what was read doesn't match this log's terms.
+        stale: bool = false,
+    };
 
     /// Below the ring the catch-up source answers, bounded to this log's
     /// tip so a stale durable tail can never be handed out as live entries.
@@ -220,13 +226,15 @@ pub const RaftLog = struct {
         const r = read(src.ctx, start_index, buf[0..@intCast(end_exclusive - start_index)], payload_arena);
         if (r.pending) return .{ .count = 0, .pending = true };
         // Read elsewhere, it may predate a truncation: only entries this log
-        // still holds, term for term, are sent. A stale one is read again.
+        // still holds, term for term, are sent. A first entry that doesn't
+        // match is blocked, so the caller backs off and reads it again: if
+        // disk and the term index disagree for good, that is said, not spun.
         var n: usize = 0;
         while (n < r.count) : (n += 1) {
             const e = buf[n];
             if (e.header.index != start_index + n or self.entryTerm(e.header.index) != e.header.term) break;
         }
-        if (n == 0 and r.count > 0) return .{ .count = 0, .pending = src.read_range_async != null };
+        if (n == 0 and r.count > 0) return .{ .count = 0, .blocked = true, .stale = true };
         return .{ .count = n, .blocked = r.blocked };
     }
 
@@ -930,9 +938,10 @@ test "raft log: a read made elsewhere is sent only as far as this log still hold
     // Past the first, a term the log doesn't have there: only the first.
     StaleSource.term = 7;
     try testing.expectEqual(@as(usize, 1), log.getRangeBlocking(1, &buf, &arena).count);
-    // Stale from its first entry: nothing sent, and asked again.
+    // Stale from its first entry: nothing sent, and blocked, so the caller
+    // backs off and says why rather than asking again at once.
     StaleSource.first_term = 7;
     const none = log.getRangeBlocking(2, &buf, &arena);
     try testing.expectEqual(@as(usize, 0), none.count);
-    try testing.expect(none.pending);
+    try testing.expect(none.blocked and none.stale and !none.pending);
 }
