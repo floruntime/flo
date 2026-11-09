@@ -287,7 +287,7 @@ fn expire(a: *families.Actions, out: []u8, l: Leader, spoil: bool) !?Made {
             holder = run.?.holder;
             request_key = run.?.request_key;
         }
-        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns, .action = item.value.v.action, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
+        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns, .action = item.value.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
         if (w + bytes.len > room) break;
         w += bytes.len;
         n += 1;
