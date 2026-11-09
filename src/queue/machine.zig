@@ -153,6 +153,24 @@ pub fn deadKey(hash: [8]u8, dead_ns: u64, seq: u64) [24]u8 {
     return k;
 }
 
+/// A stored ready key's priority level: its namespace's id, its queue,
+/// the NUL and its priority.
+pub const LEVEL_LEN = 4 + 8 + 1 + 4;
+
+/// A key past every ready key of `key`'s priority level, and before the
+/// next level's: a picker seeks past a level whose head isn't due.
+pub fn pastLevel(arena: std.mem.Allocator, key: []const u8) error{OutOfMemory}![]const u8 {
+    return pastLevelInto(try arena.create([PAST_LEVEL_LEN]u8), key);
+}
+
+pub const PAST_LEVEL_LEN = LEVEL_LEN + 8 + qe.ID_LEN + 1;
+
+pub fn pastLevelInto(buf: *[PAST_LEVEL_LEN]u8, key: []const u8) []const u8 {
+    @memcpy(buf[0..LEVEL_LEN], key[0..LEVEL_LEN]);
+    @memset(buf[LEVEL_LEN..], 0xff);
+    return buf;
+}
+
 /// A deadline key's prefix: its expiry, its namespace's id, its queue.
 fn deadlinePrefix(buf: *[20]u8, expiry_ns: u64, ns: NamespaceId, hash: [8]u8) []const u8 {
     std.mem.writeInt(u64, buf[0..8], expiry_ns, .big);
@@ -337,23 +355,33 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             var meta = (try view.get(Metas, mk)) orelse return out.putInt(u32, 0);
             if (!std.mem.eql(u8, meta.v.name, p.queue)) return out.putInt(u32, 0);
             // The first due ready keys, read before any is taken: a deliver
-            // moves each it takes out of this range.
+            // moves each it takes out of this range. A priority whose first
+            // key isn't due yet holds none that is: one seek passes it.
             var chosen: [qe.MAX_BATCH][qe.ID_LEN]u8 = undefined;
             var n: usize = 0;
             var bytes: u64 = 0;
             var pb: [9]u8 = undefined;
-            var it = try view.range(Ready, try M.inNs(view, ns, readyPrefix(&pb, &hash)));
+            const prefix = try M.inNs(view, ns, readyPrefix(&pb, &hash));
             var looked: usize = 0;
-            while (try it.next()) |item| {
-                if (n == p.count or looked == MAX_LOOKED_AT) break;
-                looked += 1;
-                const k = parseReadyKey(item.key[4..], 8) orelse continue;
-                if (k.due_ns > stamp or k.id.len != qe.ID_LEN) continue;
-                const msg = (try view.get(Msgs, try M.inNs(view, ns, k.id))) orelse return error.Halt;
-                if (n > 0 and bytes + msg.v.payload.len > p.max_bytes) break;
-                bytes += msg.v.payload.len;
-                chosen[n] = k.id[0..qe.ID_LEN].*;
-                n += 1;
+            var past: ?[]const u8 = null;
+            pick: while (true) {
+                var it = if (past) |a| try view.rangeAfter(Ready, prefix, a) else try view.range(Ready, prefix);
+                while (try it.next()) |item| {
+                    if (n == p.count or looked == MAX_LOOKED_AT) break :pick;
+                    looked += 1;
+                    const k = parseReadyKey(item.key[4..], 8) orelse return error.Halt;
+                    if (k.due_ns > stamp) {
+                        past = try pastLevel(view.arena, item.key);
+                        continue :pick;
+                    }
+                    if (k.id.len != qe.ID_LEN) return error.Halt;
+                    const msg = (try view.get(Msgs, try M.inNs(view, ns, k.id))) orelse return error.Halt;
+                    if (n > 0 and bytes + msg.v.payload.len > p.max_bytes) break :pick;
+                    bytes += msg.v.payload.len;
+                    chosen[n] = k.id[0..qe.ID_LEN].*;
+                    n += 1;
+                }
+                break;
             }
             const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
             out.putInt(u32, @intCast(n));
@@ -762,6 +790,44 @@ test "queue machine: a deliver leases the first due ready messages, by priority 
     try testing.expectEqual(@as(usize, 1), try deliver(&t, 4, 60 + 1000 * ms, &got));
     try testing.expectEqual(b, got[0]);
     try testing.expectEqual(@as(usize, 0), try deliver(&t, 4, 60 + 1000 * ms, &got));
+}
+
+test "queue machine: a delayed message at the head of its priority holds back only that priority" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    const urgent = try enqueue(&t, "q", 0, "urgent", 10);
+    var lower: [3]u64 = undefined;
+    for (&lower, 0..) |*seq, i| seq.* = try enqueue(&t, "q", 1, "lower", 20 + i);
+    var got: [4]u64 = undefined;
+    _ = try deliver(&t, 1, 50, &got);
+    try testing.expectEqual(urgent, got[0]);
+    // Back at priority 0, not due for a minute: priority 1 still goes, in
+    // seq order.
+    var ib: [qe.Items.max_size]u8 = undefined;
+    const m = t.msg(NS, "q", urgent).?;
+    _ = try t.apply(.queue_release, qe.Release.Value{ .ns = NS.int(), .queue = "q", .holder = "c1", .token = m.token, .expiry_ns = m.expiry_ns, .items = try itemsOf(&ib, &t, &.{urgent}), .delay_ms = 60_000, .dead = false, .@"error" = "" }, 60);
+    const n = try deliver(&t, 4, 100, &got);
+    try testing.expectEqualSlices(u64, &lower, got[0..n]);
+}
+
+test "queue machine: a priority of delayed messages longer than a deliver looks at is passed in one seek" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    for (0..300) |i| _ = try enqueue(&t, "q", 0, "later", 10 + i);
+    // Each taken, then released for a minute.
+    var stamp: u64 = 1000;
+    for (0..3) |_| {
+        var got: [100]u64 = undefined;
+        const n = try deliver(&t, 100, stamp, &got);
+        var ib: [qe.Items.max_size]u8 = undefined;
+        const m = t.msg(NS, "q", got[0]).?;
+        _ = try t.apply(.queue_release, qe.Release.Value{ .ns = NS.int(), .queue = "q", .holder = "c1", .token = m.token, .expiry_ns = m.expiry_ns, .items = try itemsOf(&ib, &t, got[0..n]), .delay_ms = 60_000, .dead = false, .@"error" = "" }, stamp + 1);
+        stamp += 10;
+    }
+    const now_due = try enqueue(&t, "q", 1, "now", stamp);
+    var got: [1]u64 = undefined;
+    try testing.expectEqual(@as(usize, 1), try deliver(&t, 1, stamp + 1, &got));
+    try testing.expectEqual(now_due, got[0]);
 }
 
 test "queue machine: a deliver stops where the next payload would pass its byte budget" {

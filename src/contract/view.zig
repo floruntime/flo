@@ -247,6 +247,16 @@ pub const View = struct {
         return .{ .base = self.store.range(F.ID, prefix), .staged = staged.items };
     }
 
+    /// `range`, from the first key past `after`.
+    pub fn rangeAfter(self: *View, comptime F: type, prefix: []const u8, after: []const u8) ApplyError!ViewRange(F) {
+        var r = try self.range(F, prefix);
+        r.base = self.store.rangeAfter(F.ID, prefix, after);
+        var skip: usize = 0;
+        while (skip < r.staged.len and std.mem.order(u8, r.staged[skip].key, after) != .gt) skip += 1;
+        r.staged = r.staged[skip..];
+        return r;
+    }
+
     fn bytesOf(self: *View, fam: u16, k: []const u8) ?[]const u8 {
         if (self.lastWrite(fam, k)) |i| return self.ops.items[i].value;
         return self.store.get(fam, k);

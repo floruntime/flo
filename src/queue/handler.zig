@@ -120,21 +120,52 @@ pub fn countQueue(shard: *Shard, ns: NamespaceId, name: []const u8) u64 {
     return m.ready + m.leased + m.dead;
 }
 
-/// Whether a queue has a ready message due by `now`: its first ready keys,
-/// as many as a deliver looks at.
+/// A queue's ready messages due by `now`, in the order a deliver takes
+/// them: a priority whose first message isn't due holds none that is, and
+/// one seek passes it. At most `max_looked` keys are read.
+const DueReady = struct {
+    read: ReadView,
+    prefix: []const u8,
+    now: u64,
+    max_looked: usize,
+    it: view_mod.ReadRange(machine.Ready),
+    looked: usize = 0,
+    after: [machine.PAST_LEVEL_LEN]u8 = undefined,
+    /// Stopped at `max_looked`, not at the queue's end.
+    cut: bool = false,
+
+    fn init(shard: *Shard, prefix_buf: []u8, ns: NamespaceId, hash: *const [8]u8, now: u64, max_looked: usize) DueReady {
+        var rb: [9]u8 = undefined;
+        const prefix = machine.storeKey(prefix_buf, ns, machine.readyPrefix(&rb, hash));
+        return .{ .read = readOf(shard), .prefix = prefix, .now = now, .max_looked = max_looked, .it = readOf(shard).range(machine.Ready, prefix) };
+    }
+
+    /// The next due message's seq.
+    fn next(self: *DueReady) ?u64 {
+        while (self.it.next() catch null) |item| {
+            if (self.looked == self.max_looked) {
+                self.cut = true;
+                return null;
+            }
+            self.looked += 1;
+            const k = machine.parseReadyKey(item.key[4..], 8) orelse continue;
+            if (k.due_ns > self.now) {
+                self.it = self.read.rangeAfter(machine.Ready, self.prefix, machine.pastLevelInto(&self.after, item.key));
+                continue;
+            }
+            if (k.id.len != qe.ID_LEN) continue;
+            return machine.seqOf(k.id);
+        }
+        return null;
+    }
+};
+
+/// Whether a queue has a ready message due by `now`, among the keys a
+/// deliver would look at.
 fn hasDue(shard: *Shard, ns: NamespaceId, hash: [8]u8, now: u64) bool {
     var pb: [4 + 9]u8 = undefined;
-    var rb: [9]u8 = undefined;
-    const prefix = machine.storeKey(&pb, ns, machine.readyPrefix(&rb, &hash));
-    var it = readOf(shard).range(machine.Ready, prefix);
-    var looked: usize = 0;
-    while (it.next() catch null) |item| {
-        if (looked == machine.MAX_LOOKED_AT) return false;
-        looked += 1;
-        const k = machine.parseReadyKey(item.key[4..], 8) orelse continue;
-        if (k.due_ns <= now) return true;
-    }
-    return false;
+    var due = DueReady.init(shard, &pb, ns, &hash, now, machine.MAX_LOOKED_AT);
+    return due.next() != null;
 }
 
 pub const QueueHandler = struct {
@@ -477,27 +508,17 @@ pub const QueueHandler = struct {
         var out = queue_ops.PeekedList.Builder.init(try self.answerBuf());
         var more = false;
         if (metaOf(shard, req.ns_id, req.key) != null) {
-            const now = shard.raft_node.now();
             var pb: [4 + 9]u8 = undefined;
-            var rb: [9]u8 = undefined;
-            var it = readOf(shard).range(machine.Ready, machine.storeKey(&pb, req.ns_id, machine.readyPrefix(&rb, &hash)));
-            var looked: usize = 0;
-            while (it.next() catch null) |item| {
-                if (looked == queue_ops.MAX_PEEK + machine.MAX_LOOKED_AT) {
-                    more = true;
-                    break;
-                }
-                looked += 1;
-                const k = machine.parseReadyKey(item.key[4..], 8) orelse continue;
-                if (k.due_ns > now or k.id.len != qe.ID_LEN) continue;
-                const m = msgOf(shard, req.ns_id, hash, machine.seqOf(k.id)) orelse continue;
+            var due = DueReady.init(shard, &pb, req.ns_id, &hash, shard.raft_node.now(), queue_ops.MAX_PEEK + machine.MAX_LOOKED_AT);
+            while (due.next()) |seq| {
+                const m = msgOf(shard, req.ns_id, hash, seq) orelse continue;
                 if (out.count == limit) {
                     more = true;
                     break;
                 }
                 const shown = m.payload[0..@min(m.payload.len, queue_ops.MAX_PEEK_PAYLOAD)];
                 const added = out.add(.{
-                    .seq = machine.seqOf(k.id),
+                    .seq = seq,
                     .priority = m.priority,
                     .attempts = m.deliveries,
                     .enqueued_at_ms = nsToMs(m.enqueued_ns),
@@ -509,6 +530,7 @@ pub const QueueHandler = struct {
                     break;
                 }
             }
+            if (due.cut) more = true;
         }
         return .{ .answer = .{ .messages = out.value(), .more = more } };
     }
