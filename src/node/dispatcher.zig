@@ -87,7 +87,8 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 pub fn opReadsAtLeader(op: proto.OpCode) bool {
     return switch (op) {
         .stream_group_info, .stream_group_pending => true,
-        // Only the leader that leased a message dead-letters it.
+        // As its leader has applied them, so a failed message is listed
+        // as soon as its fail is answered.
         .queue_dlq_list => true,
         else => false,
     };
@@ -102,7 +103,7 @@ pub fn opWrites(op: proto.OpCode) bool {
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
         // Members and pending entries live in the leader's memory alone:
         // a follower would answer none.
-        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
+        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,
         // A worker's await claims a run, and claims live in the leader's

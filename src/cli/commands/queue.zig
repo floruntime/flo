@@ -2,11 +2,12 @@
 //!
 //! Usage:
 //!   flo queue enqueue <queue> <payload> [--priority <0-255>]
-//!   flo queue dequeue <queue> [--count <n>] [--block <ms>]
-//!   flo queue watch <queue>              - Continuously watch for messages
+//!   flo queue dequeue <queue> [--count <n>] [--block <ms>] [--lease <ms>] [--consumer <id>] [--ack]
+//!   flo queue watch <queue>              - Continuously take and print messages
 //!   flo queue peek <queue> [--limit <n>]   - generated from the op table
-//!   flo queue ack <queue> <seq>...
-//!   flo queue nack <queue> <seq>...
+//!   flo queue ack <queue> <delivery>...
+//!   flo queue nack <queue> <delivery>... [--delay <ms>] [--dlq] [--error <text>]
+//!   flo queue touch <queue> <delivery>...
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,7 +42,9 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
             \\Interact with Flo's message queue system.
             \\
             \\Provides commands for enqueueing, dequeueing, and managing
-            \\messages with support for priority, delays, and acknowledgements.
+            \\messages with support for priority and acknowledgements. A dequeue
+            \\leases its messages: complete (ack) them within the lease, or they
+            \\are delivered again.
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -64,38 +67,56 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .aliases(&.{"pop"})
                 .examples(&.{
                     "flo queue dequeue myqueue",
-                    "flo queue dequeue myqueue --count 10",
+                    "flo queue dequeue myqueue --count 10 --lease 60000",
                     "flo queue dequeue myqueue --block 5000",
+                    "flo queue dequeue myqueue --ack",
                 })
                 .arg("queue", "Queue name")
-                .uintFlag("count", 'c', 1, "Number of messages to dequeue")
+                .uintFlag("count", 'c', 1, "Number of messages to dequeue (at most 100)")
                 .uintFlag("block", 'b', 0, "Block for messages (ms, at most 300000; 0 = don't wait)")
+                .uintFlag("lease", 0, 0, "How long they're held without a touch (ms, 5000 to 43200000; default 30000)")
+                .stringFlag("consumer", 0, "", "Who takes them: ack, nack and touch must name the same")
+                .boolFlag("ack", 0, "Complete them as they're taken, printing payloads only")
                 .action(wrapHandler(runDequeue)),
         )
         .subcommand(
             commander.newBuilder(allocator)
                 .name("watch")
-                .about("Continuously watch a queue; Ctrl-C ends it (exit 0), a retryable answer exits 4")
+                .about("Continuously take and print a queue's messages, completing each; Ctrl-C ends it (exit 0), a retryable answer exits 4")
                 .arg("queue", "Queue name")
                 .action(wrapHandler(runWatch)),
         )
         .subcommand(
             commander.newBuilder(allocator)
                 .name("ack")
-                .about("Acknowledge message processing")
+                .about("Complete dequeued messages: they leave the queue")
                 .aliases(&.{"complete"})
                 .arg("queue", "Queue name")
-                .arg("seq", "Sequence number(s)")
+                .variadicArg("delivery", "Deliveries as dequeue printed them (term.index.seq.deliveries), of one dequeue")
+                .stringFlag("consumer", 0, "", "The consumer that dequeued them")
                 .action(wrapHandler(runAck)),
         )
         .subcommand(
             commander.newBuilder(allocator)
                 .name("nack")
-                .about("Negative-acknowledge a message; it isn't redelivered (queues are at-most-once)")
+                .about("Fail dequeued messages: ready again, or dead once their attempts are spent")
                 .aliases(&.{"fail"})
                 .arg("queue", "Queue name")
-                .arg("seq", "Sequence number(s)")
+                .variadicArg("delivery", "Deliveries as dequeue printed them (term.index.seq.deliveries), of one dequeue")
+                .stringFlag("consumer", 0, "", "The consumer that dequeued them")
+                .uintFlag("delay", 0, 0, "How long before they're ready again (ms)")
+                .boolFlag("dlq", 0, "Dead-letter them now")
+                .stringFlag("error", 0, "", "Why they failed")
                 .action(wrapHandler(runNack)),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("touch")
+                .about("Keep dequeued messages: with half their lease or less left, it runs a full lease from now")
+                .arg("queue", "Queue name")
+                .variadicArg("delivery", "Deliveries as dequeue printed them (term.index.seq.deliveries), of one dequeue")
+                .stringFlag("consumer", 0, "", "The consumer that dequeued them")
+                .action(wrapHandler(runTouch)),
         )
         .subcommand(
             commander.newBuilder(allocator)
@@ -158,8 +179,11 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
 fn runDequeue(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
-    const count = ctx.getUint("count") orelse 1;
+    const count = @min(ctx.getUint("count") orelse 1, queue_ops.MAX_BATCH);
     const block = ctx.getChangedUint("block");
+    const lease: ?u64 = if (ctx.getChangedUint("lease")) |l| l else null;
+    const ack = ctx.getBool("ack");
+    const consumer = ctx.getString("consumer") orelse "";
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -168,58 +192,37 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.queue.dequeue(&client, namespace, queue, @intCast(count), if (block) |b| @as(u32, @intCast(b)) else null) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.queue.dequeue(&client, namespace, queue, @intCast(@max(count, 1)), if (block) |b| @as(u32, @intCast(b)) else null, ack, consumer, lease) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
+    try printMessages(ctx, result.data, ack, true);
+}
 
-    var messages = Messages.init(result.data) catch return outcome.malformed(ctx, "dequeue answer");
-    if (messages.remaining == 0) {
-        ctx.print("(no messages)\n", .{});
+/// A dequeue's messages, one a line: with `ack` or `-o raw` its payload,
+/// else its delivery (which ack, nack and touch take) then its payload.
+fn printMessages(ctx: *commander.Context, data: []const u8, ack_: bool, say_none: bool) commander.Error!void {
+    const ack = ack_ or output.getFormat(ctx) == .raw;
+    var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+    const answer = DequeueResponse.decodeAll(data, &diag) catch return outcome.malformed(ctx, "dequeue answer");
+    if (answer.messages.count == 0) {
+        if (say_none) ctx.print("(no messages)\n", .{});
         return;
     }
-    while (messages.next() catch return outcome.malformed(ctx, "dequeue answer")) |payload| {
-        ctx.print("{s}\n", .{payload});
+    var it = answer.messages.iterator();
+    while (it.next() catch return outcome.malformed(ctx, "dequeue answer")) |m| {
+        if (ack) {
+            ctx.print("{s}\n", .{m.payload});
+        } else {
+            const id: client_mod.queue.DeliveryId = .{ .term = answer.term, .index = answer.index, .seq = m.seq, .deliveries = m.deliveries };
+            ctx.print("{f} {s}\n", .{ id, m.payload });
+        }
     }
 }
 
-/// The payloads of a dequeue answer: `[count:u32]` then per message
-/// `[seq:u64][payload_len:u32][payload][enqueued_at:i64][delivery_count:u32][priority:u8]`.
-/// An empty answer is no messages; one cut short is Truncated.
-const Messages = struct {
-    reader: WireReader,
-    remaining: u32,
-
-    /// Checks every message before returning, so a cut answer prints
-    /// nothing rather than the messages before the cut.
-    fn init(data: []const u8) error{Truncated}!Messages {
-        if (data.len == 0) return .{ .reader = WireReader.init(data), .remaining = 0 };
-        var reader = WireReader.init(data);
-        const count = reader.readU32() orelse return error.Truncated;
-        const first: Messages = .{ .reader = reader, .remaining = count };
-        var check = first;
-        while (try check.next()) |_| {}
-        return first;
-    }
-
-    /// What follows the messages (a dead-letter list's total), once the
-    /// messages are read.
-    fn trailer(self: *const Messages) []const u8 {
-        return self.reader.remaining();
-    }
-
-    fn next(self: *Messages) error{Truncated}!?[]const u8 {
-        if (self.remaining == 0) return null;
-        self.remaining -= 1;
-        const r = &self.reader;
-        _ = r.readU64() orelse return error.Truncated; // seq
-        const payload = r.readLengthPrefixed(u32) orelse return error.Truncated;
-        _ = r.readI64() orelse return error.Truncated; // enqueued_at
-        _ = r.readU32() orelse return error.Truncated; // delivery_count
-        _ = r.readU8() orelse return error.Truncated; // priority
-        return payload;
-    }
-};
+const DequeueResponse = queue_ops.op("queue.dequeue").response;
+const ReportResponse = queue_ops.op("queue.complete").response;
+const TouchResponse = queue_ops.op("queue.touch").response;
 
 fn runWatch(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
@@ -238,29 +241,44 @@ fn runWatch(ctx: *commander.Context) commander.Error!void {
     outcome.endOnInterrupt();
     while (!outcome.interrupted()) {
         // Block for messages with 1 second timeout
-        var result = client_mod.queue.dequeue(&client, namespace, queue, 1, 1000) catch |err| {
+        var result = client_mod.queue.dequeue(&client, namespace, queue, 1, 1000, true, "", null) catch |err| {
             if (outcome.interrupted()) return;
             return outcome.requestFailed(ctx, err);
         };
         defer result.deinit();
 
         try outcome.check(ctx, result);
-
-        var messages = Messages.init(result.data) catch return outcome.malformed(ctx, "dequeue answer");
-        while (messages.next() catch return outcome.malformed(ctx, "dequeue answer")) |payload| {
-            ctx.print("{s}\n", .{payload});
-        }
+        try printMessages(ctx, result.data, true, false);
     }
 }
 
-fn runAck(ctx: *commander.Context) commander.Error!void {
+/// The deliveries a report names, from its arguments.
+fn deliveries(ctx: *commander.Context, buf: []client_mod.queue.DeliveryId) commander.Error![]const client_mod.queue.DeliveryId {
+    const args = ctx.getVariadicArgs("delivery") orelse &.{};
+    if (args.len == 0) return outcome.usage(ctx, "name at least one delivery, as dequeue printed it (term.index.seq.deliveries)", .{});
+    if (args.len > buf.len) return outcome.usage(ctx, "at most {d} deliveries at a time", .{buf.len});
+    for (args, 0..) |a, i| {
+        buf[i] = client_mod.queue.DeliveryId.parse(a) orelse return outcome.usage(ctx, "'{s}' isn't a delivery: dequeue prints them as term.index.seq.deliveries", .{a});
+        if (buf[i].term != buf[0].term or buf[i].index != buf[0].index) return outcome.usage(ctx, "deliveries of one dequeue at a time: '{s}' is another's", .{a});
+    }
+    return buf[0..args.len];
+}
+
+/// A report's refusals, said one a line; any refuses the command.
+fn printRefused(ctx: *commander.Context, refused: @import("../../protocol/schema.zig").List(queue_ops.Refused, queue_ops.MAX_BATCH).Value) commander.Error!void {
+    if (refused.count == 0) return;
+    var it = refused.iterator();
+    while (it.next() catch return outcome.malformed(ctx, "report answer")) |r| ctx.printErr("Error: seq {d}: {s}\n", .{ r.seq, r.reason });
+    return error.Refused;
+}
+
+const Report = enum { ack, nack, touch };
+
+fn runReport(ctx: *commander.Context, comptime kind: Report) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
-    const seq_str = ctx.getPositional("seq").?; // validated by commander
-
-    const seq = std.fmt.parseInt(u64, seq_str, 10) catch {
-        return outcome.usage(ctx, "Invalid sequence number", .{});
-    };
-
+    var buf: [queue_ops.MAX_BATCH]client_mod.queue.DeliveryId = undefined;
+    const ids = try deliveries(ctx, &buf);
+    const consumer = ctx.getString("consumer") orelse "";
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -269,36 +287,35 @@ fn runAck(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.queue.ack(&client, namespace, queue, &[_]u64{seq}) catch |err| return outcome.requestFailed(ctx, err);
+    var result = switch (kind) {
+        .ack => client_mod.queue.complete(&client, namespace, queue, consumer, ids),
+        .nack => client_mod.queue.fail(&client, namespace, queue, consumer, ids, ctx.getUint64("delay") orelse 0, ctx.getBool("dlq"), ctx.getString("error") orelse ""),
+        .touch => client_mod.queue.touch(&client, namespace, queue, consumer, ids),
+    } catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
+    var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
+    if (kind == .touch) {
+        const answer = TouchResponse.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "touch answer");
+        ctx.print("OK: {d} held until {d}\n", .{ answer.applied, answer.expires_at_ms });
+        return printRefused(ctx, answer.refused);
+    }
+    const answer = ReportResponse.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "report answer");
+    ctx.print("OK: {d}\n", .{answer.applied});
+    return printRefused(ctx, answer.refused);
+}
 
-    ctx.print("OK\n", .{});
+fn runAck(ctx: *commander.Context) commander.Error!void {
+    return runReport(ctx, .ack);
 }
 
 fn runNack(ctx: *commander.Context) commander.Error!void {
-    const queue = ctx.getPositional("queue").?; // validated by commander
-    const seq_str = ctx.getPositional("seq").?; // validated by commander
+    return runReport(ctx, .nack);
+}
 
-    const seq = std.fmt.parseInt(u64, seq_str, 10) catch {
-        return outcome.usage(ctx, "Invalid sequence number", .{});
-    };
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var result = client_mod.queue.nack(&client, namespace, queue, &[_]u64{seq}) catch |err| return outcome.requestFailed(ctx, err);
-    defer result.deinit();
-
-    try outcome.check(ctx, result);
-
-    ctx.print("OK\n", .{});
+fn runTouch(ctx: *commander.Context) commander.Error!void {
+    return runReport(ctx, .touch);
 }
 
 fn runDlqList(ctx: *commander.Context) commander.Error!void {
@@ -472,20 +489,14 @@ fn runList(ctx: *commander.Context) commander.Error!void {
     }) catch return outcome.malformed(ctx, "list");
 }
 
-test "queue: a dequeue answer cut short is Truncated, not fewer messages" {
-    // count 2: seq, len 1, "a", enqueued_at, delivery_count, priority; then the same with "b".
-    const one = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "a".* ++ @as([8]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{0};
-    const two = one[0..8].* ++ [_]u8{ 1, 0, 0, 0 } ++ "b".* ++ @as([13]u8, @splat(0));
-    const answer = [_]u8{ 2, 0, 0, 0 } ++ one ++ two;
-
-    var m = try Messages.init(&answer);
-    try std.testing.expectEqualStrings("a", (try m.next()).?);
-    try std.testing.expectEqualStrings("b", (try m.next()).?);
-    try std.testing.expectEqual(@as(?[]const u8, null), try m.next());
-
-    // Checked whole up front: a cut anywhere fails before the first message.
-    for (1..answer.len) |n| try std.testing.expectError(error.Truncated, Messages.init(answer[0..n]));
-    try std.testing.expectEqual(@as(u32, 0), (try Messages.init("")).remaining);
+test "queue: a delivery prints as it parses, and anything else is refused" {
+    const id: client_mod.queue.DeliveryId = .{ .term = 3, .index = 17, .seq = 5, .deliveries = 2 };
+    var buf: [64]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{id});
+    try std.testing.expectEqualStrings("3.17.5.2", text);
+    try std.testing.expectEqual(id, client_mod.queue.DeliveryId.parse(text).?);
+    for ([_][]const u8{ "", "5", "3.17.5", "3.17.5.2.1", "a.b.c.d", "3.17.5.-1" }) |bad|
+        try std.testing.expect(client_mod.queue.DeliveryId.parse(bad) == null);
 }
 
 test "queue watch ends with retryable (exit 4) on an overloaded answer, not a retry loop" {

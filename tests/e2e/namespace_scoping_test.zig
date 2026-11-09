@@ -17,21 +17,25 @@ fn after(output: []const u8, prefix: []const u8) ?[]const u8 {
 test "e2e/scoping: a queue message is acked or nacked only from its own queue and namespace" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
-    const enqueued = try ctx.execCapture(&.{ "queue", "enqueue", "q", "secret", "-n", "qa" });
-    const seq = after(enqueued, "Enqueued: ") orelse return error.NoSeq;
+    try ctx.exec(&.{ "queue", "enqueue", "q", "secret", "-n", "qa" });
+    const dequeued = try ctx.execCapture(&.{ "queue", "dequeue", "q", "-n", "qa" });
+    const line = std.mem.sliceTo(dequeued, '\n');
+    const delivery = line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse return error.NoDelivery];
 
     for ([_][]const u8{ "ack", "nack" }) |verb| {
-        var r = try ctx.cli.run(&.{ "queue", verb, "q", seq, "-n", "qb" });
+        var r = try ctx.cli.run(&.{ "queue", verb, "q", delivery, "-n", "qb" });
         defer r.deinit();
-        try stdx.testing.assertContains(r, "message not found in this queue");
-        var other_queue = try ctx.cli.run(&.{ "queue", verb, "other", seq, "-n", "qa" });
+        try testing.expect(r.exit_code != 0);
+        try stdx.testing.assertContains(r, "no such message in this queue");
+        var other_queue = try ctx.cli.run(&.{ "queue", verb, "other", delivery, "-n", "qa" });
         defer other_queue.deinit();
-        try stdx.testing.assertContains(other_queue, "message not found in this queue");
+        try testing.expect(other_queue.exit_code != 0);
+        try stdx.testing.assertContains(other_queue, "no such message in this queue");
     }
-    // The message is still there for its own queue, which can ack it.
-    var ack = try ctx.cli.run(&.{ "queue", "ack", "q", seq, "-n", "qa" });
+    // The message is still held for its own queue, which can ack it.
+    var ack = try ctx.cli.run(&.{ "queue", "ack", "q", delivery, "-n", "qa" });
     defer ack.deinit();
-    try stdx.testing.assertStdoutContains(ack, "OK");
+    try stdx.testing.assertStdoutContains(ack, "OK: 1");
     const left = try ctx.execCapture(&.{ "queue", "dequeue", "q", "-n", "qa" });
     try testing.expect(std.mem.indexOf(u8, left, "(no messages)") != null);
 }

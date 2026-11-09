@@ -5,7 +5,6 @@
 //! Partition calls `router.apply(entry)` which dispatches by EntryType.
 //!
 //! Routing table:
-//!   queue_enqueue, queue_ack, etc.  → QueueProjection
 //!   ts_write, ts_write_batch        → TSProjection
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
 //!   cg_commit, cg_delete            → None (applied to StreamProjection via
@@ -76,7 +75,6 @@ pub const ProjectionRouter = struct {
     applied_stamp: u64 = 0,
 
     /// Registered projection engines (optional — set to null if not present).
-    queue: ?ProjectionHandle,
     ts: ?ProjectionHandle,
     // Stream has no projection — reads go directly to UAL.
 
@@ -89,22 +87,15 @@ pub const ProjectionRouter = struct {
         entries_no_projection: u64 = 0,
         entries_error: u64 = 0,
         snapshots_triggered: u64 = 0,
-        queue_entries: u64 = 0,
         ts_entries: u64 = 0,
     };
 
     pub fn init() ProjectionRouter {
         return .{
             .applied_index = 0,
-            .queue = null,
             .ts = null,
             .stats = .{},
         };
-    }
-
-    /// Register the Queue projection.
-    pub fn registerQueue(self: *ProjectionRouter, handle: ProjectionHandle) void {
-        self.queue = handle;
     }
 
     /// Register the TS projection.
@@ -130,7 +121,6 @@ pub const ProjectionRouter = struct {
             self.applied_stamp = @max(self.applied_stamp, entry.header.timestamp_ns);
         }
         return switch (target) {
-            .queue => self.applyTo(self.queue, entry, out, &self.stats.queue_entries),
             .ts => self.applyTo(self.ts, entry, out, &self.stats.ts_entries),
             .none => blk: {
                 self.stats.entries_no_projection += 1;
@@ -204,7 +194,6 @@ pub const ProjectionRouter = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const RouteTarget = enum(u8) {
-    queue,
     ts,
     none,
     snapshot,
@@ -224,8 +213,8 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // keys). cg_create is unused (groups auto-create on first commit).
         .cg_commit, .cg_create, .cg_delete => .none,
 
-        // Queue
-        .queue_enqueue, .queue_ack, .queue_nack, .queue_lease, .queue_purge => .queue,
+        // Queues: their contract machine (queue/machine.zig).
+        .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => .none,
 
         // TimeSeries
         .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .ts,
@@ -308,11 +297,9 @@ test "router: routing table correctness" {
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_create));
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_delete));
 
-    // Queue
-    try testing.expectEqual(RouteTarget.queue, routeTarget(.queue_enqueue));
-    try testing.expectEqual(RouteTarget.queue, routeTarget(.queue_ack));
-    try testing.expectEqual(RouteTarget.queue, routeTarget(.queue_nack));
-    try testing.expectEqual(RouteTarget.queue, routeTarget(.queue_lease));
+    // Queues: a contract machine's
+    try testing.expectEqual(RouteTarget.none, routeTarget(.queue_enqueue));
+    try testing.expectEqual(RouteTarget.none, routeTarget(.queue_deliver));
 
     // TimeSeries
     try testing.expectEqual(RouteTarget.ts, routeTarget(.ts_write));
@@ -328,19 +315,6 @@ test "router: routing table correctness" {
 
     // Snapshot
     try testing.expectEqual(RouteTarget.snapshot, routeTarget(.raft_snapshot));
-}
-
-test "router: queue entry routed to queue projection" {
-    var queue_proj = TestProjection{};
-    var router = ProjectionRouter.init();
-    router.registerQueue(queue_proj.handle());
-
-    const entry = makeEntry(.queue_enqueue, 1);
-    const result = try applyOne(&router, &entry);
-
-    try testing.expectEqual(ApplyResult.applied, result);
-    try testing.expectEqual(@as(u32, 1), queue_proj.apply_count);
-    try testing.expectEqual(@as(u64, 1), router.stats.queue_entries);
 }
 
 test "router: ts entry routed to ts projection" {
@@ -362,14 +336,14 @@ test "router: consumer group entry not routed to a projection" {
     // registry, so the projection router must not route them to a projection.
     var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(q_proj.handle());
+    router.registerTS(q_proj.handle());
 
     const entry = makeEntry(.cg_commit, 1);
     const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
     try testing.expectEqual(@as(u32, 0), q_proj.apply_count);
-    try testing.expectEqual(@as(u64, 0), router.stats.queue_entries);
+    try testing.expectEqual(@as(u64, 0), router.stats.ts_entries);
 }
 
 test "router: stream entry has no projection" {
@@ -401,9 +375,9 @@ test "router: raft snapshot triggers installation" {
 test "router: idempotency — duplicate entries skipped" {
     var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(q_proj.handle());
+    router.registerTS(q_proj.handle());
 
-    const entry = makeEntry(.queue_enqueue, 1);
+    const entry = makeEntry(.ts_write, 1);
 
     // Apply once
     _ = try applyOne(&router, &entry);
@@ -419,18 +393,18 @@ test "router: idempotency — duplicate entries skipped" {
 test "router: entries must be applied in order" {
     var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(q_proj.handle());
+    router.registerTS(q_proj.handle());
 
     // Apply index 1, 2, 3 in order
-    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 1));
-    _ = try applyOne(&router, &makeEntry(.queue_ack, 2));
-    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 3));
+    _ = try applyOne(&router, &makeEntry(.ts_write, 1));
+    _ = try applyOne(&router, &makeEntry(.ts_write_batch, 2));
+    _ = try applyOne(&router, &makeEntry(.ts_write, 3));
 
     try testing.expectEqual(@as(u32, 3), q_proj.apply_count);
     try testing.expectEqual(@as(u64, 3), router.applied_index);
 
     // Index 2 again — skipped
-    const r = try applyOne(&router, &makeEntry(.queue_enqueue, 2));
+    const r = try applyOne(&router, &makeEntry(.ts_write, 2));
     try testing.expectEqual(ApplyResult.skipped_already_applied, r);
     try testing.expectEqual(@as(u32, 3), q_proj.apply_count);
 }
@@ -438,9 +412,9 @@ test "router: entries must be applied in order" {
 test "router: apply error counted but index advances" {
     var err_proj = ErrorProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(err_proj.handle());
+    router.registerTS(err_proj.handle());
 
-    const entry = makeEntry(.queue_enqueue, 1);
+    const entry = makeEntry(.ts_write, 1);
     try testing.expectError(error.Halt, applyOne(&router, &entry));
     try testing.expectEqual(@as(u64, 1), router.stats.entries_error);
     // Index still advances — we don't retry
@@ -451,24 +425,22 @@ test "router: unregistered projection acts as no_projection" {
     var router = ProjectionRouter.init();
     // No projections registered
 
-    const entry = makeEntry(.queue_enqueue, 1);
+    const entry = makeEntry(.ts_write, 1);
     const result = try applyOne(&router, &entry);
 
-    // Queue projection not registered — treated as no projection
+    // TS projection not registered — treated as no projection
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
     try testing.expectEqual(@as(u64, 1), router.applied_index);
 }
 
 test "router: batch apply" {
-    var queue_proj = TestProjection{};
     var ts_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(queue_proj.handle());
     router.registerTS(ts_proj.handle());
 
     const entries = [_]Entry{
         makeEntry(.ts_write, 1),
-        makeEntry(.queue_enqueue, 2),
+        makeEntry(.queue_enqueue, 2), // a contract machine's
         makeEntry(.stream_append, 3), // no projection
         makeEntry(.ts_delete, 4),
         makeEntry(.raft_noop, 5), // no projection
@@ -476,31 +448,25 @@ test "router: batch apply" {
 
     const result = router.applyBatch(&entries);
 
-    try testing.expectEqual(@as(u32, 3), result.applied); // ts_write + queue + ts_delete
-    try testing.expectEqual(@as(u32, 2), result.no_projection); // stream + noop
+    try testing.expectEqual(@as(u32, 2), result.applied); // ts_write + ts_delete
+    try testing.expectEqual(@as(u32, 3), result.no_projection); // queue + stream + noop
     try testing.expectEqual(@as(u32, 5), result.total());
     try testing.expectEqual(@as(u64, 5), router.applied_index);
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count);
-    try testing.expectEqual(@as(u32, 1), queue_proj.apply_count);
 }
 
 test "router: mixed entry types across all projections" {
-    var queue_proj = TestProjection{};
     var ts_proj = TestProjection{};
     var router = ProjectionRouter.init();
-    router.registerQueue(queue_proj.handle());
     router.registerTS(ts_proj.handle());
 
     _ = try applyOne(&router, &makeEntry(.kv_put, 1)); // → none (the KV machine)
-    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 2));
+    _ = try applyOne(&router, &makeEntry(.queue_enqueue, 2)); // → none (the queue machine)
     _ = try applyOne(&router, &makeEntry(.ts_write, 3));
     _ = try applyOne(&router, &makeEntry(.cg_commit, 4)); // → none (stream replay registry)
-    _ = try applyOne(&router, &makeEntry(.queue_ack, 5));
-    _ = try applyOne(&router, &makeEntry(.ts_write_batch, 6));
+    _ = try applyOne(&router, &makeEntry(.ts_write_batch, 5));
 
-    try testing.expectEqual(@as(u32, 2), queue_proj.apply_count); // enqueue + ack
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count); // write + write_batch
-    // kv_put and cg_commit route to none, so 4 applied + 2 no-projection.
-    try testing.expectEqual(@as(u64, 4), router.stats.entries_applied);
-    try testing.expectEqual(@as(u64, 2), router.stats.entries_no_projection);
+    try testing.expectEqual(@as(u64, 2), router.stats.entries_applied);
+    try testing.expectEqual(@as(u64, 3), router.stats.entries_no_projection);
 }

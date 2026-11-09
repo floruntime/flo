@@ -7,6 +7,7 @@ const machine = @import("machine.zig");
 pub const list = [_]machine.Machine{
     @import("../kv/machine.zig").machine,
     @import("../actions/machine.zig").machine,
+    @import("../queue/machine.zig").machine,
 };
 
 comptime {

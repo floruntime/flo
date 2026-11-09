@@ -17,7 +17,6 @@ const Shard = @import("shard.zig").Shard;
 const Connection = @import("connection.zig").Connection;
 const StreamProjection = @import("../projection/stream.zig").StreamProjection;
 const StreamMetadata = @import("../projection/stream.zig").StreamMetadata;
-const QueueProjection = @import("../projection/queue.zig").QueueProjection;
 const QueueHandler = @import("../queue/handler.zig").QueueHandler;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
@@ -121,23 +120,14 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
             try w.writeInt(u64, meta.retention_age_s, .little);
             try w.writeInt(u64, meta.retention_count, .little);
         },
-        // [name_len:u32][name][ns_len:u32][ns][ready][leased][enqueued][dequeued][dlq], u64 each.
+        // [name_len:u32][name][ns_len:u32][ns][ready][leased][enqueued][delivered][dead], u64 each.
         .queue_list => {
             const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
-            const want_ns = if (namespace.len > 0) namespace else "default";
-            var meta: struct { ns: []const u8, live: QueueProjection.Live = .{}, enqueued: u64 = 0, dequeued: u64 = 0, dlq: u64 = 0 } = .{ .ns = namespace };
-            var it = handler.queue.known_queues.iterator();
-            while (it.next()) |entry| {
-                const m = entry.value_ptr;
-                if (!std.mem.eql(u8, m.name, name) or !std.mem.eql(u8, m.namespace, want_ns)) continue;
-                meta = .{ .ns = m.namespace, .live = handler.queue.liveCounts(entry.key_ptr.*), .enqueued = m.enqueued, .dequeued = m.dequeued, .dlq = @intCast(handler.queue.deadLetters(entry.key_ptr.*).len) };
-                break;
-            }
-            try w.writeInt(u32, @intCast(name.len), .little);
-            try w.writeAll(name);
-            try w.writeInt(u32, @intCast(meta.ns.len), .little);
-            try w.writeAll(meta.ns);
-            for ([_]u64{ meta.live.ready, meta.live.leased, meta.enqueued, meta.dequeued, meta.dlq }) |v| try w.writeInt(u64, v, .little);
+            const shard: *Shard = @ptrCast(@alignCast(handler.shard_ptr orelse return));
+            const id = if (ns.id == .invalid) @import("../namespace/table.zig").Id.default else ns.id;
+            const queue_handler_mod = @import("../queue/handler.zig");
+            const m = queue_handler_mod.metaOf(shard, id, name) orelse @import("../queue/machine.zig").emptyMeta(name);
+            try QueueHandler.writeListEntry(m, if (namespace.len > 0) namespace else "default", w);
         },
         .processing_list => {
             const handler: *const ProcessingHandler = @ptrCast(@alignCast(ctx));

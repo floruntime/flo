@@ -123,6 +123,17 @@ pub const KeySet = struct {
         try self.ranges.append(self.allocator, .{ .fam = fam, .key = bytes });
     }
 
+    /// Every key of `fam`, a family in no namespace whose keys name their
+    /// namespace inside (a deadline: its expiry, then its namespace's id),
+    /// that starts with `prefix`. The prefix must reach past that id, so the
+    /// range is one tenant's; `ns_at` is where the id starts in it.
+    pub fn addRangeNaming(self: *KeySet, fam: u16, ns_at: usize, prefix: []const u8) (Allocator.Error || error{NoNamespace})!void {
+        if (prefix.len < ns_at + @sizeOf(u32) or std.mem.readInt(u32, prefix[ns_at..][0..4], .big) == 0) return error.NoNamespace;
+        const bytes = try self.allocator.alloc(u8, 1 + prefix.len);
+        _ = key(bytes, "", prefix) catch unreachable;
+        try self.ranges.append(self.allocator, .{ .fam = fam, .key = bytes });
+    }
+
     pub fn covers(self: *const KeySet, fam: u16, k: []const u8) bool {
         if (self.exact.items.len > SCAN_LIMIT) {
             if (self.exact_index.contains(.{ .fam = fam, .key = k })) return true;

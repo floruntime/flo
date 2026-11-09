@@ -1,99 +1,193 @@
-//! Queue Handler — registers queue opcodes with Dispatcher and handles queue operations.
+//! Queues: the ops a client sends, on the queue machine's families
+//! (`queue/machine.zig`). Every change is an entry a leader proposes and
+//! every replica applies alike; reads are of applied state.
 //!
-//! Read operations (peek, stats, dlq_list) query the QueueProjection directly.
-//! Write operations (enqueue, ack, nack, purge) persist an entry through
-//! Raft; the projection router applies it to the QueueProjection under
-//! `Shard.applyCommitted()`. A dequeue proposes an ack for each message it
-//! hands out, so delivery is at-most-once.
-//!
-//! ## Queue Semantics
-//!
-//! - Messages are dequeued by priority (lowest first), then by sequence.
-//! - A dequeue consumes its messages: it acks each one as it hands it out,
-//!   so delivery is at-most-once and complete (ack) and fail (nack) find
-//!   nothing left to act on.
-//! - DLQ messages can be listed, requeued, or deleted.
+//! - A dequeue leases a queue's next ready messages to its consumer, until
+//!   a complete, a fail, or the lease running out. It is answered when its
+//!   deliver applies, with the messages and their delivery's token, which a
+//!   complete, fail or touch names back. Delivery is at least once: a
+//!   lease that runs out readies its messages again.
+//! - A message failed or expired `MAX_ATTEMPTS` times is dead, kept for
+//!   listing until its queue holds `MAX_DEAD` dead.
+//! - Messages go by priority (lowest first), then the time they became
+//!   ready, then seq.
 
 const std = @import("std");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const proto = @import("../protocol/proto.zig");
 const result_mod = @import("../protocol/result.zig");
-const queue_mod = @import("../projection/queue.zig");
+const schema = @import("../protocol/schema.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
 const entry_mod = @import("../storage/ual/entry.zig");
-const Partition = @import("../storage/partition.zig").Partition;
 const persistence_mod = @import("../storage/persistence.zig");
-const Result = persistence_mod.Result;
-const ReplayRegistry = persistence_mod.ReplayRegistry;
+const view_mod = @import("../contract/view.zig");
+const store_mod = @import("../contract/store.zig");
+const delivery = @import("../contract/delivery.zig");
 const MetricsRegistry = @import("../metrics/registry.zig").MetricsRegistry;
+const table_run = @import("../node/table_run.zig");
+const ops = @import("../protocol/ops.zig");
+const queue_ops = @import("../protocol/queue_ops.zig");
+const qe = @import("../protocol/queue_entries.zig");
+const ae = @import("../protocol/action_entries.zig");
+const machine = @import("machine.zig");
+const waiter_pool_mod = @import("../node/waiter_pool.zig");
+const ReplyTo = @import("../node/reply_to.zig").ReplyTo;
 
+const Result = persistence_mod.Result;
 const CommandResult = result_mod.CommandResult;
-const QueueProjection = queue_mod.QueueProjection;
-const DequeueResult = queue_mod.DequeueResult;
-const DLQEntry = queue_mod.DLQEntry;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
-const OptionsBuilder = proto.OptionsBuilder;
 const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
-const table_run = @import("../node/table_run.zig");
-const ops = @import("../protocol/ops.zig");
-const client_queue = @import("../cli/client/queue.zig");
-const queue_ops = @import("../protocol/queue_ops.zig");
-const PeekResponse = table_run.op("queue.peek").response;
-const waiter_pool_mod = @import("../node/waiter_pool.zig");
+const Waiter = waiter_pool_mod.Waiter;
+const Entry = entry_mod.Entry;
+const EntryType = entry_mod.EntryType;
+const ReadView = view_mod.ReadView;
+const NamespaceId = router.NamespaceId;
+const Msg = machine.Msg.Value;
+const Meta = machine.Meta.Value;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// QueueHandler
-// ═══════════════════════════════════════════════════════════════════════════════
+const PeekResponse = table_run.op("queue.peek").response;
+const DequeueResponse = table_run.op("queue.dequeue").response;
+const ReportResponse = table_run.op("queue.complete").response;
+const TouchResponse = table_run.op("queue.touch").response;
+
+/// How often the expire duty runs: at least every half the shortest lease,
+/// as the delivery model's key bound needs.
+pub const DUTY_INTERVAL_MS: u64 = 1000;
+comptime {
+    std.debug.assert(DUTY_INTERVAL_MS * 2 <= ae.MIN_LEASE_MS);
+}
+
+/// A new leader waits this long, or a lease if shorter, past a lease's
+/// deadline before ending it: a consumer that touched the old leader in
+/// time may not have reached this one yet.
+const MAX_GRACE_MS: u64 = 30_000;
+
+/// What each message adds to a dequeue's answer besides its payload.
+const MESSAGE_FRAMING: u32 = @intCast(queue_ops.Message.max_size - qe.MAX_MESSAGE);
+
+const MAX_DLQ_PAGE: u32 = 100;
+const MAX_DLQ_PAYLOAD: usize = 4096;
+/// `[total:u64][has_more:u8][last_seq:u64]` after a page's entries.
+const DLQ_TRAILER: usize = 8 + 1 + 8;
+
+fn storeOf(shard: *Shard) *store_mod.Store {
+    return &shard.defaultPartition().store;
+}
+
+fn readOf(shard: *Shard) ReadView {
+    return .{ .store = storeOf(shard) };
+}
+
+fn nsToMs(ns: u64) i64 {
+    return @intCast(ns / std.time.ns_per_ms);
+}
+
+/// Propose a queue entry, encoded in the shard's entry buffer when it fits.
+fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence_mod.ProposeResult {
+    const P = qe.Payload(@backingInt(etype));
+    const size = try P.encodedSize(body);
+    if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, entry_mod.Flags.NONE, try P.encodeInto(shard.entry_buf[0..size], body));
+    const buf = try shard.allocator.alloc(u8, size);
+    defer shard.allocator.free(buf);
+    return shard.raft_node.propose(etype, entry_mod.Flags.NONE, try P.encodeInto(buf, body));
+}
+
+/// A queue's meta, if it is `name`'s (another name may hash the same).
+pub fn metaOf(shard: *Shard, ns: NamespaceId, name: []const u8) ?Meta {
+    var b: [12]u8 = undefined;
+    const hash = machine.hashOf(name);
+    const got = (readOf(shard).get(machine.Metas, machine.storeKey(&b, ns, &hash)) catch return null) orelse return null;
+    return if (std.mem.eql(u8, got.v.name, name)) got.v else null;
+}
+
+pub fn msgOf(shard: *Shard, ns: NamespaceId, hash: [8]u8, seq: u64) ?Msg {
+    var b: [4 + qe.ID_LEN]u8 = undefined;
+    const id = machine.idOf(hash, seq);
+    const got = (readOf(shard).get(machine.Msgs, machine.storeKey(&b, ns, &id)) catch return null) orelse return null;
+    return got.v;
+}
+
+/// The messages a queue holds, ready, leased and dead.
+pub fn countQueue(shard: *Shard, ns: NamespaceId, name: []const u8) u64 {
+    const m = metaOf(shard, ns, name) orelse return 0;
+    return m.ready + m.leased + m.dead;
+}
+
+/// Whether a queue has a ready message due by `now`: its first ready keys,
+/// as many as a deliver looks at.
+fn hasDue(shard: *Shard, ns: NamespaceId, hash: [8]u8, now: u64) bool {
+    var pb: [4 + 9]u8 = undefined;
+    var rb: [9]u8 = undefined;
+    const prefix = machine.storeKey(&pb, ns, machine.readyPrefix(&rb, &hash));
+    var it = readOf(shard).range(machine.Ready, prefix);
+    var looked: usize = 0;
+    while (it.next() catch null) |item| {
+        if (looked == machine.MAX_LOOKED_AT) return false;
+        looked += 1;
+        const k = machine.parseReadyKey(item.key[4..], 8) orelse continue;
+        if (k.due_ns <= now) return true;
+    }
+    return false;
+}
 
 pub const QueueHandler = struct {
-    queue: *QueueProjection,
-    partition: *Partition,
     allocator: Allocator,
-    /// Without a shard (unit tests) an enqueue applies here: the id its
-    /// answer points into.
-    local_id_buf: [20]u8 = undefined,
 
-    /// Opaque pointer to owning Shard (avoids circular import).
-    /// Set after init by Shard.wireHandlerShardPtrs(). Required for Raft writes.
-    shard_ptr: ?*anyopaque,
+    /// The owning shard, set by `Shard.wireHandlerShardPtrs`.
+    shard_ptr: ?*anyopaque = null,
 
     /// Global metrics registry (optional, set by runtime when dashboard is enabled).
-    metrics_registry: ?*MetricsRegistry,
+    metrics_registry: ?*MetricsRegistry = null,
 
-    /// A peek or DLQ page's answer, encoded after the handler returns.
+    /// A peek's answer, encoded after the handler returns.
     answer_buf: ?[]u8 = null,
 
-    const MAX_DEQUEUE_BATCH: u32 = 100;
-    const DEFAULT_DEQUEUE_COUNT: u32 = 1;
+    /// Dequeues answered when their deliver applies.
+    pending: std.ArrayListUnmanaged(Pending) = .empty,
 
-    pub fn init(allocator: Allocator, partition: *Partition) QueueHandler {
-        return .{
-            .queue = &partition.queue,
-            .partition = partition,
-            .allocator = allocator,
-            .shard_ptr = null,
-            .metrics_registry = null,
-        };
+    /// The expire proposed and not yet applied: one at a time. A full one
+    /// chains into the next as it applies.
+    expiring: ?u64 = null,
+    expiring_full: bool = false,
+    /// The term the duty last ran in, and when it first ran in it.
+    duty_term: u64 = 0,
+    duty_since_ns: u64 = 0,
+
+    /// The queue an enqueue or a release just readied a message in, while
+    /// its waiters are woken: its namespace's id, then its name hash.
+    waking: [12]u8 = undefined,
+
+    const Pending = struct {
+        index: u64,
+        term: u64,
+        reply_to: ReplyTo,
+        request_id: u64,
+        /// A one-shot consume: completed as soon as it is answered.
+        ack: bool,
+    };
+
+    pub fn init(allocator: Allocator) QueueHandler {
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *QueueHandler) void {
         if (self.answer_buf) |b| self.allocator.free(b);
+        self.pending.deinit(self.allocator);
     }
-
-    // ── Dispatcher Registration ─────────────────────────────────────────
 
     pub fn register(dispatcher: *Dispatcher) void {
         dispatcher.registerWithRoute(.queue_enqueue, dispatchEnqueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_dequeue, dispatchDequeue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_complete, dispatchQueue, preRouteByQueue);
-        dispatcher.registerWithRoute(.queue_fail, dispatchQueue, preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_dequeue, table_run.handler("queue.dequeue", QueueHandler, runDequeue), preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_complete, table_run.handler("queue.complete", QueueHandler, runComplete), preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_fail, table_run.handler("queue.fail", QueueHandler, runFail), preRouteByQueue);
+        dispatcher.registerWithRoute(.queue_touch, table_run.handler("queue.touch", QueueHandler, runTouch), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_peek, table_run.handler("queue.peek", QueueHandler, runPeek), preRouteByQueue);
         dispatcher.registerWithRoute(.queue_stats, dispatchQueue, preRouteByQueue);
         dispatcher.registerWithRoute(.queue_dlq_list, dispatchQueue, preRouteByQueue);
@@ -103,8 +197,8 @@ pub const QueueHandler = struct {
         dispatcher.registerWalk(.queue_list, dispatchQueue, localScanQueues);
     }
 
-    /// ShardWalker LocalScanFn for queue_list — returns queue names
-    /// from one shard's QueueProjection registry.
+    /// ShardWalker LocalScanFn for queue_list: the queue names one shard
+    /// holds in the namespace.
     fn localScanQueues(
         ctx: *anyopaque,
         ns: dispatcher_mod.WalkNamespace,
@@ -112,28 +206,50 @@ pub const QueueHandler = struct {
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
-        const namespace = ns.name;
         const handler: *QueueHandler = @ptrCast(@alignCast(ctx));
-        const name_buf = dispatcher_mod.scanScratch(handler.queue.known_queues.count());
-
+        const shard: *Shard = @ptrCast(@alignCast(handler.shard_ptr orelse return .{ .items = &.{}, .next_cursor = null }));
+        const id = if (ns.id == .invalid) NamespaceId.default else ns.id;
+        const store = storeOf(shard);
+        const name_buf = dispatcher_mod.scanScratch(@intCast(store.family(machine.Metas.ID).count));
         var count: usize = 0;
-        var it = handler.queue.known_queues.iterator();
-        while (it.next()) |entry| {
+        const prefix = id.bytes();
+        var it = readOf(shard).range(machine.Metas, &prefix);
+        while (it.next() catch null) |item| {
             if (count >= name_buf.len) break;
-            const meta = entry.value_ptr;
-            if (namespace.len > 0 and !std.mem.eql(u8, meta.namespace, namespace)) continue;
-            name_buf[count] = meta.name;
+            name_buf[count] = item.value.v.name;
             count += 1;
         }
-
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
-
-    // ── Pre-Route ───────────────────────────────────────────────────────
 
     fn preRouteByQueue(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
         return router.routeNsKey(req.ns_id, req.key);
+    }
+
+    // ── Errors ──────────────────────────────────────────────────────────
+
+    pub const Error = error{ OutOfMemory, NotLeading, NoQueue };
+
+    pub fn refusal(err: Error) table_run.Refused {
+        return switch (err) {
+            error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory for this answer; retry") },
+            error.NotLeading => .{ .status = .unavailable, .refusal = .{ .reason = .leader_unknown, .ran = .no, .message = "unavailable: this node's leadership isn't settled yet; retry" } },
+            error.NoQueue => .{ .status = .bad_request, .refusal = proto.notRun("bad request: a queue name is required") },
+        };
+    }
+
+    // ── Enqueue, stats, DLQ, purge, list (their wire as before) ─────────
+
+    /// Enqueue on its queue's leader, notifying nothing until it applies.
+    fn dispatchEnqueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
+        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
+        const result = shard.queue_handler.handleCommand(req);
+        defer shard.queue_handler.freeResult(result);
+        if (result == .parked) return parkQueue(shard, conn, req, result.parked);
+        sendQueueResponse(shard, conn, req.header.request_id, result);
     }
 
     fn dispatchQueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
@@ -172,621 +288,168 @@ pub const QueueHandler = struct {
         sendQueueResponse(shard, conn, request_id, .ok);
     }
 
-    /// An enqueue's answer: the sequence its applier gave the message.
+    /// An enqueue's answer: the seq its applier gave the message.
     fn enqueued(result: *const Result, id_buf: *[20]u8) CommandResult {
         var r = result.reader();
         const id_str = std.fmt.bufPrint(id_buf, "{d}", .{r.int(u64) orelse 0}) catch "0";
         return .{ .queue_enqueued = .{ .message_id = id_str } };
     }
 
-    /// Dedicated dispatch for queue_enqueue — notifies blocking dequeue waiters.
-    fn dispatchEnqueue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        // The applier labels the queue by resolving its namespace, on
-        // followers and on replay, so a namespace nobody created is created
-        // first. Here, on the owning thread: a pipeline's queue sink reaches
-        // `handleCommand` from another shard's.
-        shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
-        const result = shard.queue_handler.handleCommand(req);
-        defer shard.queue_handler.freeResult(result);
-        if (result == .parked) return parkQueue(shard, conn, req, result.parked);
-        switch (result) {
-            .queue_enqueued => shard.namespace_handler.markNamespaceHasData(req.namespace, shard),
-            else => {},
-        }
-        sendQueueResponse(shard, conn, req.header.request_id, result);
-    }
-
-    /// Dedicated dispatch for queue_dequeue — supports blocking via block_ms.
-    fn dispatchDequeue(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-
-        // Check for blocking dequeue (--block → block_ms)
-        const block_ms = req.getBlockMs();
-
-        // Try dequeue first
-        const result = shard.queue_handler.handleCommand(req);
-
-        if (block_ms) |bms| {
-            // Check if we got any messages
-            switch (result) {
-                .queue_messages => |m| {
-                    if (m.data.len > 4) {
-                        const count = std.mem.readInt(u32, m.data[0..4], .little);
-                        if (count > 0) {
-                            // Got messages — return immediately
-                            defer shard.queue_handler.freeResult(result);
-                            sendQueueResponse(shard, conn, req.header.request_id, result);
-                            return;
-                        }
-                    }
-                    // Empty result — register blocking waiter
-                    shard.queue_handler.freeResult(result);
-                },
-                else => {
-                    // Error or other — send immediately
-                    defer shard.queue_handler.freeResult(result);
-                    sendQueueResponse(shard, conn, req.header.request_id, result);
-                    return;
-                },
-            }
-
-            // Register waiter — store queue_name_hash in min_version for the resolver
-            const ns_hash_w = req.ns_id;
-            const q_hash = router.nameHash(ns_hash_w, req.key);
-            const registered = shard.waiter_pool.register(.{
-                .kind = .queue_dequeue,
-                .reply_to = conn.replyTo(),
-                .request_id = req.header.request_id,
-                .key = req.key,
-                .min_version = q_hash,
-                .timeout_ms = bms,
-            });
-            if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
-            conn.response_deferred = true;
-            return;
-        }
-
-        // Non-blocking — standard path
-        defer shard.queue_handler.freeResult(result);
-        sendQueueResponse(shard, conn, req.header.request_id, result);
-    }
-
-    // ── Core Command Logic ──────────────────────────────────────────────
-
     fn handleCommand(self: *QueueHandler, req: Request) CommandResult {
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
+        if (req.key.len == 0 and op != .queue_list) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
+        const shard: *Shard = @ptrCast(@alignCast(self.shard_ptr orelse return .{ .err = .{ .code = .internal_error, .message = "queue handler has no shard" } }));
         return switch (op) {
-            .queue_enqueue => self.handleEnqueue(req),
-            .queue_dequeue => self.handleDequeue(req),
-            .queue_complete => self.handleComplete(req),
-            .queue_fail => self.handleFail(req),
-            .queue_stats => self.handleStats(req),
-            .queue_dlq_list => self.handleDlqList(req),
-            .queue_dlq_requeue => self.handleDlqRequeue(req),
-            .queue_dlq_delete => self.handleDlqDelete(req),
-            .queue_purge => self.handlePurge(req),
-            .queue_list => self.handleList(req),
+            .queue_enqueue => self.handleEnqueue(shard, req),
+            .queue_stats => self.handleStats(shard, req),
+            .queue_dlq_list => self.handleDlqList(shard, req),
+            .queue_dlq_requeue => .{ .err = .{ .code = .invalid_request, .message = "dlq requeue not yet implemented" } },
+            .queue_dlq_delete => .{ .err = .{ .code = .invalid_request, .message = "dlq delete not yet implemented" } },
+            .queue_purge => self.handlePurge(shard, req),
+            .queue_list => self.handleList(shard, req),
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown queue opcode" } },
         };
     }
 
-    // ── ENQUEUE ─────────────────────────────────────────────────────────
-
-    /// The processing queue sink's enqueue. It runs outside `run()`, until
-    /// sinks propose through the owning shard like any other writer.
+    /// A processing job's queue sink writes through here, as a client's
+    /// enqueue does.
     pub fn sinkEnqueue(self: *QueueHandler, req: Request) CommandResult {
-        return self.handleEnqueue(req);
+        const shard: *Shard = @ptrCast(@alignCast(self.shard_ptr orelse return .{ .err = .{ .code = .internal_error, .message = "queue handler has no shard" } }));
+        return self.handleEnqueue(shard, req);
     }
 
-    fn handleEnqueue(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-
-        const priority: u32 = if (req.getPriority()) |p| @as(u32, p) else 0;
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = req.ns_id;
-
-        // Register the queue with its REAL namespace before applying the entry.
-        // The apply path (queue.applyEntry) re-registers using only the namespace
-        // hash and falls back to the literal "default" string for the namespace;
-        // registering the correct namespace first makes that fallback a no-op
-        // (registerQueue keeps the first writer), so `queue list -n <ns>` works for
-        // non-default namespaces instead of mislabeling every queue as "default".
-        const q_name_hash = router.nameHash(ns_hash, req.key);
-        self.queue.registerQueue(q_name_hash, req.key, req.namespace) catch {};
-
-        // Build value: [priority:u32][payload]
-        const value_len = 4 + req.value.len;
-        var value_buf: [4 + 4096]u8 = undefined;
-        const value_slice = if (value_len <= value_buf.len) blk: {
-            std.mem.writeInt(u32, value_buf[0..4], priority, .little);
-            if (req.value.len > 0) {
-                @memcpy(value_buf[4..][0..req.value.len], req.value);
-            }
-            break :blk value_buf[0..value_len];
-        } else blk: {
-            const dyn = self.allocator.alloc(u8, value_len) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
-            };
-            std.mem.writeInt(u32, dyn[0..4], priority, .little);
-            if (req.value.len > 0) {
-                @memcpy(dyn[4..][0..req.value.len], req.value);
-            }
-            break :blk dyn;
+    fn handleEnqueue(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+        if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
+        if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
+        if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
+        const priority: u32 = if (req.getPriority()) |p| p else 0;
+        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = req.ns_id.int(), .queue = req.key, .priority = priority, .payload = req.value }) catch |err| {
+            return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
         };
-        defer if (value_len > value_buf.len) self.allocator.free(value_slice);
-
-        // Persist through Raft; the shard's applier routes the committed entry
-        // to the projection. Without a shard (unit tests) the same projection
-        // applies a locally built entry.
-        if (self.shard_ptr) |sptr| {
-            const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_enqueue, entry_mod.Flags.NONE, req.namespace, req.key, value_slice) catch |err| {
-                return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
-            };
-            return .{ .parked = proposed };
-        } else {
-            const next_index = self.partition.ual.max_index + 1;
-            const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len + value_slice.len;
-            var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256 + 4 + 4096]u8 = undefined;
-            const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
-                break :blk self.allocator.alloc(u8, payload_size) catch {
-                    return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
-                };
-            };
-            defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
-
-            const entry = entry_mod.buildCommandEntry(
-                .queue_enqueue,
-                entry_mod.Flags.NONE,
-                self.partition.current_term,
-                next_index,
-                timestamp_ns,
-                ns_hash,
-                req.key,
-                value_slice,
-                payload_buf,
-            ) orelse {
-                return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-            };
-            var out = Result.start(&entry);
-            const applied = self.partition.applyRouted(&entry, &out) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-            };
-            if (applied.failed != null) return .{ .err = .{ .code = .committed_not_applied, .message = persistence_mod.COMMITTED_NOT_APPLIED } };
-            return enqueued(&out, &self.local_id_buf);
-        }
+        return .{ .parked = proposed };
     }
 
-    // ── DEQUEUE ─────────────────────────────────────────────────────────
-
-    fn handleDequeue(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-
-        const count = req.getCount() orelse DEFAULT_DEQUEUE_COUNT;
-        const capped = @min(count, MAX_DEQUEUE_BATCH);
-        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const ns_hash = req.ns_id;
-        const queue_name_hash = router.nameHash(ns_hash, req.key);
-
-        // Expire stale leases first
-        self.queue.expireLeases(now_ns);
-
-        // Dequeue up to count messages matching this queue
-        var results: [MAX_DEQUEUE_BATCH]DequeueResult = undefined;
-        var actual: u32 = 0;
-
-        for (0..capped) |_| {
-            const maybe_result = self.queue.dequeue(now_ns, queue_name_hash) catch break;
-            if (maybe_result) |deq_result| {
-                results[actual] = deq_result;
-                actual += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Serialize dequeue results BEFORE auto-ack (ack frees message payloads).
-        const data = serializeDequeueResults(self.allocator, results[0..actual]) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "dequeue serialization failed" } };
-        };
-
-        // Persist auto-ack entries so dequeued messages don't reappear after restart.
-        // In this simplified model, dequeue = consume (not a lease-based model).
-        var dequeued_bytes: usize = 0;
-        for (results[0..actual]) |r| {
-            dequeued_bytes += r.payload.len;
-            self.persistAck(req.ns_id, queue_name_hash, r.seq);
-        }
-
-        if (self.metrics_registry) |mr| {
-            if (mr.registerQueue(req.namespace, req.key)) |qm| {
-                if (actual == 0) qm.recordEmptyDequeue() else qm.recordDequeue(actual, dequeued_bytes);
-            } else |_| {}
-        }
-
-        return .{ .queue_messages = .{ .data = data } };
+    /// One queue's numbers, in the request's namespace:
+    /// [enqueued][delivered][settled][released][dead_lettered][expired]
+    /// [ready][leased][dead], u64 each.
+    fn handleStats(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+        const m: Meta = metaOf(shard, req.ns_id, req.key) orelse machine.emptyMeta(req.key);
+        const buf = self.allocator.alloc(u8, 9 * 8) catch return .{ .err = .{ .code = .internal_error, .message = "stats serialization failed" } };
+        for ([_]u64{ m.enqueued, m.delivered, m.settled, m.released, m.dead_lettered, m.expired, m.ready, m.leased, m.dead }, 0..) |v, i|
+            std.mem.writeInt(u64, buf[i * 8 ..][0..8], v, .little);
+        return .{ .queue_messages = .{ .data = buf } };
     }
 
-    // ── COMPLETE (ACK) ──────────────────────────────────────────────────
-
-    fn handleComplete(self: *QueueHandler, req: Request) CommandResult {
-        return self.handleAckBatch(req, .queue_ack, "ack not persisted");
-    }
-
-    // ── FAIL (NACK) ─────────────────────────────────────────────────────
-
-    fn handleFail(self: *QueueHandler, req: Request) CommandResult {
-        return self.handleAckBatch(req, .queue_nack, "nack not persisted");
-    }
-
-    /// Most seqs one ack or nack may name.
-    const MAX_ACK_BATCH: u32 = 1024;
-
-    /// Ack or nack `[count:u32][seq:u64]*` in the request's queue. Every
-    /// message must be in that queue, in that namespace: seqs are numbered
-    /// across the partition, so the batch is refused whole if any is in
-    /// another queue. A message already gone is no error (it may have been
-    /// taken and acked) and, like a repeated seq, is not logged. Each seq
-    /// logged gets its own entry naming the queue, and the applier checks
-    /// the same.
-    fn handleAckBatch(self: *QueueHandler, req: Request, kind: entry_mod.EntryType, not_persisted: []const u8) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-        const seqs = parseSeqs(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "message sequences are required: [count:u32][seq:u64]*" } };
-        };
-        const queue_hash = router.nameHash(req.ns_id, req.key);
-        var held: [MAX_ACK_BATCH]u64 = undefined;
-        var held_count: usize = 0;
-        for (0..seqs.count) |i| {
-            const seq = seqs.at(i);
-            const msg = self.queue.messages.get(seq) orelse continue;
-            if (msg.queue_name_hash != queue_hash) {
-                return .{ .err = .{ .code = .not_found, .message = "message not found in this queue" } };
-            }
-            if (std.mem.indexOfScalar(u64, held[0..held_count], seq) == null) {
-                held[held_count] = seq;
-                held_count += 1;
-            }
-        }
-
-        var queue_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
-        var last: ?persistence_mod.ProposeResult = null;
-        for (held[0..held_count]) |seq| {
-            var seq_key: [8]u8 = undefined;
-            std.mem.writeInt(u64, &seq_key, seq, .little);
-            if (self.shard_ptr) |sptr| {
-                const shard: *Shard = @ptrCast(@alignCast(sptr));
-                last = persistence_mod.proposeEntry(shard, kind, entry_mod.Flags.NONE, req.namespace, &seq_key, &queue_key) catch |err| {
-                    // Seqs before this one are in the log: the batch ran in part.
-                    var e = persistence_mod.failureError(err, not_persisted);
-                    if (last != null) e.ran = .unknown;
-                    return .{ .err = e };
-                };
-                continue;
-            }
-            // No shard (unit tests): apply a locally built entry.
-            var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
-            const entry = entry_mod.buildCommandEntry(
-                kind,
-                entry_mod.Flags.NONE,
-                self.partition.current_term,
-                self.partition.ual.max_index + 1,
-                @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000,
-                req.ns_id,
-                &seq_key,
-                &queue_key,
-                &payload_buf,
-            ) orelse return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-            _ = self.partition.apply(&entry) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-            };
-        }
-        // Answered once the last of them applies.
-        if (last) |p| return .{ .parked = p };
-        return .ok;
-    }
-
-    // ── PEEK ────────────────────────────────────────────────────────────
-
-    pub const Error = error{OutOfMemory};
-
-    pub fn refusal(err: Error) table_run.Refused {
-        return switch (err) {
-            error.OutOfMemory => .{ .status = .overloaded, .refusal = proto.notRun("overloaded: no memory for this answer; retry") },
-        };
-    }
-
-    fn answerBuf(self: *QueueHandler) Error![]u8 {
-        if (self.answer_buf) |b| return b;
-        const b = try self.allocator.alloc(u8, queue_ops.PeekedList.byte_bound.?);
-        self.answer_buf = b;
-        return b;
-    }
-
-    /// The queue's next ready messages, as a dequeue would take them, and
-    /// none taken. A page stops where the next message wouldn't fit.
-    fn runPeek(shard: *Shard, _: *Connection, req: Request, limit: u32) Error!table_run.Outcome(PeekResponse) {
-        const self = shard.queue_handler;
-        var found: [QueueProjection.MAX_PEEK]*const queue_mod.Message = undefined;
-        const peeked = self.queue.peek(router.nameHash(req.ns_id, req.key), found[0..@min(limit, found.len)]);
-        var out = queue_ops.PeekedList.Builder.init(try self.answerBuf());
-        var more = peeked.more;
-        for (found[0..peeked.count]) |m| {
-            const shown = m.payload[0..@min(m.payload.len, queue_ops.MAX_PEEK_PAYLOAD)];
-            const added = out.add(.{
-                .seq = m.seq,
-                .priority = m.priority,
-                .attempts = m.attempts,
-                .enqueued_at_ms = @intCast(m.enqueued_at_ns / std.time.ns_per_ms),
-                .size = @intCast(m.payload.len),
-                .payload = shown,
-            }) catch false;
-            if (!added) {
-                more = true;
-                break;
-            }
-        }
-        return .{ .answer = .{ .messages = out.value(), .more = more } };
-    }
-
-    // ── STATS ───────────────────────────────────────────────────────────
-
-    /// One queue's numbers, in the request's namespace.
-    fn handleStats(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-        const queue_hash = router.nameHash(req.ns_id, req.key);
-        const counts = self.queue.queueCounts(queue_hash);
-        var stats: QueueProjection.Stats = .{};
-        if (self.queue.known_queues.get(queue_hash)) |meta| {
-            stats = .{
-                .enqueued = meta.enqueued,
-                .dequeued = meta.dequeued,
-                .acked = meta.acked,
-                .nacked = meta.nacked,
-                .dlq_count = meta.dead_lettered,
-                .leases_expired = meta.leases_expired,
-            };
-        }
-        const data = serializeStats(self.allocator, stats, counts.ready, counts.leased, counts.dead) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "stats serialization failed" } };
-        };
-
-        // Use queue_messages as carrier for stats data
-        return .{ .queue_messages = .{ .data = data } };
-    }
-
-    // ── DLQ LIST ────────────────────────────────────────────────────────
-
-    /// One queue's dead letters, in the request's namespace.
-    fn handleDlqList(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-        const queue_hash = router.nameHash(req.ns_id, req.key);
-        // [limit:u32][after:u64]?, both optional: a page of up to 100, after
-        // the dead letter whose seq ends the page before.
+    /// A page of a queue's dead letters, oldest first:
+    ///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
+    ///                [attempts:u32][priority:u8][moved_at_ms:i64])*
+    ///   [total:u64][has_more:u8][last_seq:u64]
+    /// `[limit:u32][after:u64]?` picks the page: up to 100, after the dead
+    /// letter whose seq ends the page before, or from the oldest if that one
+    /// is gone. Each payload is cut to 4 KiB (`size` is its whole length).
+    fn handleDlqList(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
         var limit: u32 = MAX_DLQ_PAGE;
         var after: ?u64 = null;
         if (req.value.len >= 4) limit = std.math.clamp(std.mem.readInt(u32, req.value[0..4], .little), 1, MAX_DLQ_PAGE);
         if (req.value.len >= 12) after = std.mem.readInt(u64, req.value[4..12], .little);
-        const data = serializeDlqPage(self.allocator, self.queue, queue_hash, limit, after) catch {
+        const data = self.dlqPage(shard, req.ns_id, req.key, limit, after) catch
             return .{ .err = .{ .code = .internal_error, .message = "dlq list serialization failed" } };
-        };
-
         return .{ .queue_dlq_messages = .{ .data = data } };
     }
 
-    // ── DLQ REQUEUE ─────────────────────────────────────────────────────
-
-    fn handleDlqRequeue(self: *QueueHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // DLQ requeue not yet implemented — requires moving DLQ entries back to ready
-        return .{ .err = .{ .code = .invalid_request, .message = "dlq requeue not yet implemented" } };
-    }
-
-    // ── DLQ DELETE ──────────────────────────────────────────────────────
-
-    fn handleDlqDelete(self: *QueueHandler, req: Request) CommandResult {
-        _ = self;
-        _ = req;
-        // DLQ delete not yet implemented
-        return .{ .err = .{ .code = .invalid_request, .message = "dlq delete not yet implemented" } };
-    }
-
-    // ── PURGE ───────────────────────────────────────────────────────────
-
-    fn handlePurge(self: *QueueHandler, req: Request) CommandResult {
-        if (req.key.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
-        }
-
-        const ns_hash = req.ns_id;
-        const q_name_hash = router.nameHash(ns_hash, req.key);
-
-        // The applier purges the projection and records what it removed;
-        // the client is answered from that.
-        if (self.shard_ptr) |sptr| {
-            const shard: *Shard = @ptrCast(@alignCast(sptr));
-            const proposed = persistence_mod.proposeEntry(shard, .queue_purge, entry_mod.Flags.NONE, req.namespace, req.key, &[_]u8{}) catch |err| {
-                return .{ .err = persistence_mod.failureError(err, "purge not persisted") };
+    fn dlqPage(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, limit: u32, after: ?u64) ![]u8 {
+        const hash = machine.hashOf(name);
+        const total: u64 = if (metaOf(shard, ns, name)) |m| m.dead else 0;
+        var pb: [12]u8 = undefined;
+        const prefix = machine.storeKey(&pb, ns, &hash);
+        var ab: [4 + 24]u8 = undefined;
+        var it = blk: {
+            if (total > 0) if (after) |seq| if (msgOf(shard, ns, hash, seq)) |m| if (m.status == .dead) {
+                const dk = machine.deadKey(hash, m.dead_ns, seq);
+                break :blk readOf(shard).rangeAfter(machine.Dead, prefix, machine.storeKey(&ab, ns, &dk));
             };
-            return .{ .parked = proposed };
-        }
-        const count: u32 = @intCast(@min(self.queue.countQueue(q_name_hash), std.math.maxInt(u32)));
-
-        // No shard (unit tests): apply a locally built entry.
-        const next_index = self.partition.ual.max_index + 1;
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + req.key.len;
-        var payload_stack: [entry_mod.COMMAND_PREFIX_SIZE + 256]u8 = undefined;
-        const payload_buf = if (payload_size <= payload_stack.len) payload_stack[0..payload_size] else blk: {
-            break :blk self.allocator.alloc(u8, payload_size) catch {
-                return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
-            };
+            break :blk readOf(shard).range(machine.Dead, if (total > 0) prefix else "\xff\xff\xff\xff\xff");
         };
-        defer if (payload_size > payload_stack.len) self.allocator.free(payload_buf);
-
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const entry = entry_mod.buildCommandEntry(
-            .queue_purge,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_hash,
-            req.key,
-            &[_]u8{},
-            payload_buf,
-        ) orelse {
-            return .{ .err = .{ .code = .internal_error, .message = "entry build failed" } };
-        };
-
-        _ = self.partition.apply(&entry) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "UAL append failed" } };
-        };
-
-        return .{ .queue_purged = .{ .count = count } };
-    }
-
-    // ── LIST ────────────────────────────────────────────────────────────
-
-    fn handleList(self: *QueueHandler, req: Request) CommandResult {
-        // Serialize known queues for this shard.
-        // Wire format: [count:u32] ([name_len:u32][name][ns_len:u32][ns]
-        //   [pending:u64][available:u64][enqueued:u64][dequeued:u64][dlq:u64])*
-        //   [has_more:u8] [cursor_len:u16]
-        const target_ns = req.namespace;
-
-        // First pass: count matching queues and total size
-        var match_count: u32 = 0;
-        var body_size: usize = 0;
-        {
-            var it = self.queue.known_queues.iterator();
-            while (it.next()) |kv| {
-                const meta = kv.value_ptr;
-                if (std.mem.eql(u8, meta.namespace, target_ns)) {
-                    body_size += 4 + meta.name.len + 4 + meta.namespace.len + 5 * 8;
-                    match_count += 1;
-                }
+        var w: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer w.deinit();
+        try w.writer.writeInt(u32, 0, .little);
+        var count: u32 = 0;
+        var last: u64 = 0;
+        var more = false;
+        while (it.next() catch null) |item| {
+            if (count == limit) {
+                more = true;
+                break;
             }
-        }
-
-        const total = 4 + body_size + 1 + 2; // count + entries + has_more + cursor_len
-        const buf = self.allocator.alloc(u8, total) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
-        };
-        errdefer self.allocator.free(buf);
-        var offset: usize = 0;
-
-        // Count
-        std.mem.writeInt(u32, buf[offset..][0..4], match_count, .little);
-        offset += 4;
-
-        // Entries
-        {
-            var it = self.queue.known_queues.iterator();
-            while (it.next()) |kv| {
-                const meta = kv.value_ptr;
-                if (!std.mem.eql(u8, meta.namespace, target_ns)) continue;
-
-                // name_len + name
-                std.mem.writeInt(u32, buf[offset..][0..4], @intCast(meta.name.len), .little);
-                offset += 4;
-                @memcpy(buf[offset..][0..meta.name.len], meta.name);
-                offset += meta.name.len;
-
-                // ns_len + ns
-                std.mem.writeInt(u32, buf[offset..][0..4], @intCast(meta.namespace.len), .little);
-                offset += 4;
-                @memcpy(buf[offset..][0..meta.namespace.len], meta.namespace);
-                offset += meta.namespace.len;
-
-                // ready and leased, as the walk's entry has them: enqueued
-                // less dequeued stays high after a purge.
-                const live = self.queue.liveCounts(kv.key_ptr.*);
-                std.mem.writeInt(u64, buf[offset..][0..8], live.ready, .little);
-                offset += 8;
-                std.mem.writeInt(u64, buf[offset..][0..8], live.leased, .little);
-                offset += 8;
-
-                // enqueued
-                std.mem.writeInt(u64, buf[offset..][0..8], meta.enqueued, .little);
-                offset += 8;
-
-                // dequeued
-                std.mem.writeInt(u64, buf[offset..][0..8], meta.dequeued, .little);
-                offset += 8;
-
-                // dlq
-                std.mem.writeInt(u64, buf[offset..][0..8], @intCast(self.queue.deadLetters(kv.key_ptr.*).len), .little);
-                offset += 8;
+            const k = item.key[4..];
+            if (k.len != 24) continue;
+            const seq = std.mem.readInt(u64, k[16..24], .big);
+            const msg = msgOf(shard, ns, hash, seq) orelse continue;
+            const shown = msg.payload[0..@min(msg.payload.len, MAX_DLQ_PAYLOAD)];
+            const size = 8 + 4 + 4 + shown.len + 8 + 4 + 1 + 8;
+            if (w.written().len + size + DLQ_TRAILER > ops.MAX_RESPONSE_BODY) {
+                more = true;
+                break;
             }
+            try w.writer.writeInt(u64, seq, .little);
+            try w.writer.writeInt(u32, @intCast(msg.payload.len), .little);
+            try w.writer.writeInt(u32, @intCast(shown.len), .little);
+            try w.writer.writeAll(shown);
+            try w.writer.writeInt(i64, nsToMs(msg.enqueued_ns), .little);
+            try w.writer.writeInt(u32, msg.deliveries, .little);
+            try w.writer.writeInt(u8, @intCast(@min(msg.priority, 255)), .little);
+            try w.writer.writeInt(i64, nsToMs(msg.dead_ns), .little);
+            count += 1;
+            last = seq;
         }
-
-        // has_more = 0 (single-shard response, CLI does shard walking)
-        buf[offset] = 0;
-        offset += 1;
-
-        // cursor_len = 0 (no cursor)
-        std.mem.writeInt(u16, buf[offset..][0..2], 0, .little);
-        offset += 2;
-
-        return .{ .queue_messages = .{ .data = buf } };
+        try w.writer.writeInt(u64, total, .little);
+        try w.writer.writeByte(@intFromBool(more));
+        try w.writer.writeInt(u64, last, .little);
+        const out = try w.toOwnedSlice();
+        std.mem.writeInt(u32, out[0..4], count, .little);
+        return out;
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────
+    fn handlePurge(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+        if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
+        const proposed = propose(shard, .queue_purge, qe.Purge.Value{ .ns = req.ns_id.int(), .queue = req.key }) catch |err|
+            return .{ .err = persistence_mod.failureError(err, "purge not persisted") };
+        return .{ .parked = proposed };
+    }
 
-    /// Persist a queue_ack UAL entry for a dequeued message, naming its queue
-    /// as any ack does, so consumed messages don't reappear after restart.
-    fn persistAck(self: *QueueHandler, ns_id: router.NamespaceId, queue_hash: u64, seq: u64) void {
-        var seq_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_key, seq, .little);
-        var queue_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &queue_key, queue_hash, .little);
+    /// This shard's queues in the request's namespace:
+    /// [count:u32] ([name_len:u32][name][ns_len:u32][ns]
+    ///   [ready:u64][leased:u64][enqueued:u64][delivered:u64][dead:u64])*
+    /// [has_more:u8][cursor_len:u16]
+    fn handleList(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+        var w: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer w.deinit();
+        writeList(shard, req.ns_id, req.namespace, &w.writer) catch return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
+        const data = w.toOwnedSlice() catch return .{ .err = .{ .code = .internal_error, .message = "list serialization failed" } };
+        return .{ .queue_messages = .{ .data = data } };
+    }
 
-        // Persist through Raft; the applier acks the projection. A failed
-        // persist means the message can reappear after a restart, which
-        // the operator must hear about.
-        if (self.shard_ptr) |sptr| {
-            const shard: *Shard = @ptrCast(@alignCast(sptr));
-            _ = persistence_mod.proposeEntryIn(shard, .queue_ack, entry_mod.Flags.NONE, ns_id, &seq_key, &queue_key) catch |err| {
-                if (!shard.quietHalted(err)) log.err("queue ack for seq {d} not persisted: {s}; message delivered, may be redelivered after a restart", .{ seq, @errorName(err) });
-            };
-            return;
+    fn writeList(shard: *Shard, ns: NamespaceId, namespace: []const u8, w: *std.Io.Writer) !void {
+        var count: u32 = 0;
+        const prefix = ns.bytes();
+        var it = readOf(shard).range(machine.Metas, &prefix);
+        try w.writeInt(u32, 0, .little);
+        while (it.next() catch null) |item| {
+            try writeListEntry(item.value.v, namespace, w);
+            count += 1;
         }
+        try w.writeByte(0);
+        try w.writeInt(u16, 0, .little);
+        if (w.buffered().len >= 4) std.mem.writeInt(u32, w.buffered()[0..4], count, .little);
+    }
 
-        // No shard (unit tests): apply a locally built entry.
-        const timestamp_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-        const next_index = self.partition.ual.max_index + 1;
-
-        const payload_size = entry_mod.COMMAND_PREFIX_SIZE + 16;
-        var payload_buf: [entry_mod.COMMAND_PREFIX_SIZE + 16]u8 = undefined;
-
-        const entry = entry_mod.buildCommandEntry(
-            .queue_ack,
-            entry_mod.Flags.NONE,
-            self.partition.current_term,
-            next_index,
-            timestamp_ns,
-            ns_id,
-            &seq_key,
-            &queue_key,
-            payload_buf[0..payload_size],
-        ) orelse return;
-
-        _ = self.partition.apply(&entry) catch {};
+    /// One queue as a list shows it.
+    pub fn writeListEntry(m: Meta, namespace: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeInt(u32, @intCast(m.name.len), .little);
+        try w.writeAll(m.name);
+        try w.writeInt(u32, @intCast(namespace.len), .little);
+        try w.writeAll(namespace);
+        for ([_]u64{ m.ready, m.leased, m.enqueued, m.delivered, m.dead }) |v| try w.writeInt(u64, v, .little);
     }
 
     pub fn freeResult(self: *QueueHandler, cmd_result: CommandResult) void {
@@ -795,6 +458,436 @@ pub const QueueHandler = struct {
             .queue_dlq_messages => |r| self.allocator.free(r.data),
             else => {},
         }
+    }
+
+    // ── Peek ────────────────────────────────────────────────────────────
+
+    fn answerBuf(self: *QueueHandler) Error![]u8 {
+        if (self.answer_buf) |b| return b;
+        const b = try self.allocator.alloc(u8, queue_ops.PeekedList.byte_bound.?);
+        self.answer_buf = b;
+        return b;
+    }
+
+    /// The queue's next ready messages, as a dequeue would take them now,
+    /// and none taken. A page stops where the next message wouldn't fit.
+    fn runPeek(shard: *Shard, _: *Connection, req: Request, limit: u32) Error!table_run.Outcome(PeekResponse) {
+        const self = shard.queue_handler;
+        const hash = machine.hashOf(req.key);
+        var out = queue_ops.PeekedList.Builder.init(try self.answerBuf());
+        var more = false;
+        if (metaOf(shard, req.ns_id, req.key) != null) {
+            const now = shard.raft_node.now();
+            var pb: [4 + 9]u8 = undefined;
+            var rb: [9]u8 = undefined;
+            var it = readOf(shard).range(machine.Ready, machine.storeKey(&pb, req.ns_id, machine.readyPrefix(&rb, &hash)));
+            var looked: usize = 0;
+            while (it.next() catch null) |item| {
+                if (looked == queue_ops.MAX_PEEK + machine.MAX_LOOKED_AT) {
+                    more = true;
+                    break;
+                }
+                looked += 1;
+                const k = machine.parseReadyKey(item.key[4..], 8) orelse continue;
+                if (k.due_ns > now or k.id.len != qe.ID_LEN) continue;
+                const m = msgOf(shard, req.ns_id, hash, machine.seqOf(k.id)) orelse continue;
+                if (out.count == limit) {
+                    more = true;
+                    break;
+                }
+                const shown = m.payload[0..@min(m.payload.len, queue_ops.MAX_PEEK_PAYLOAD)];
+                const added = out.add(.{
+                    .seq = machine.seqOf(k.id),
+                    .priority = m.priority,
+                    .attempts = m.deliveries,
+                    .enqueued_at_ms = nsToMs(m.enqueued_ns),
+                    .size = @intCast(m.payload.len),
+                    .payload = shown,
+                }) catch false;
+                if (!added) {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        return .{ .answer = .{ .messages = out.value(), .more = more } };
+    }
+
+    // ── Dequeue ─────────────────────────────────────────────────────────
+
+    /// Lease the queue's next ready messages to `consumer`. A leader whose
+    /// term's entries have applied proposes a deliver if any is due, and
+    /// answers when it applies; with none, a blocking dequeue waits for an
+    /// enqueue, a release or a lease running out, and another answers empty.
+    fn runDequeue(shard: *Shard, conn: *Connection, req: Request, consumer: []const u8, count: u32, lease_ms: ?u64, block_ms: u64, ack: bool) Error!table_run.Outcome(DequeueResponse) {
+        if (req.key.len == 0) return error.NoQueue;
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        if (req.key.len > qe.QueueName.max_size) return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: queue name too long") } };
+        const params: Params = .{ .ns = req.ns_id, .count = count, .lease_ms = lease_ms orelse qe.DEFAULT_LEASE_MS, .ack = ack, .consumer = consumer };
+        const self = shard.queue_handler;
+        if (try self.deliverHere(shard, conn.replyTo(), req.header.request_id, req.key, params)) return .wait;
+        self.recordDequeue(shard, req.ns_id, req.key, 0, 0);
+        if (block_ms == 0) return .{ .answer = empty };
+        var kb: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
+        const key = params.waiterKey(&kb, machine.hashOf(req.key)) orelse
+            return .{ .refused = .{ .status = .bad_request, .refusal = proto.notRun("bad request: consumer id too long to wait on") } };
+        const registered = shard.waiter_pool.register(.{
+            .kind = .queue_dequeue,
+            .reply_to = conn.replyTo(),
+            .request_id = req.header.request_id,
+            .key = key,
+            .min_version = 0,
+            .timeout_ms = @intCast(block_ms),
+        });
+        if (!registered) return .{ .refused = .{ .status = .overloaded, .refusal = proto.notRun("overloaded: too many blocking reads are waiting; retry") } };
+        return .wait;
+    }
+
+    const empty: DequeueResponse.Value = .{ .messages = .{ .bytes = "", .count = 0 }, .term = 0, .index = 0, .expires_at_ms = 0 };
+
+    /// A waiting dequeue whose wait ran out: no messages.
+    pub fn answerEmpty(shard: *Shard, reply_to: ReplyTo, request_id: u64) void {
+        var buf: [@sizeOf(proto.ResponseHeader) + 64]u8 = undefined;
+        const body = DequeueResponse.encodeInto(buf[@sizeOf(proto.ResponseHeader)..], empty) catch unreachable;
+        shard.deliverDeferred(reply_to, proto.Response.sealOk(request_id, &buf, body.len));
+    }
+
+    /// A dequeue's asks, as it was sent and as its waiter keeps them.
+    const Params = struct {
+        ns: NamespaceId,
+        count: u32,
+        lease_ms: u64,
+        ack: bool,
+        consumer: []const u8,
+
+        /// `[ns id][name hash][count:u8][lease_ms:u32][ack:u8][consumer]`:
+        /// the queue first, so an enqueue wakes only its own waiters.
+        fn waiterKey(p: Params, buf: []u8, hash: [8]u8) ?[]const u8 {
+            const n = 12 + 1 + 4 + 1 + p.consumer.len;
+            if (n > buf.len) return null;
+            buf[0..4].* = p.ns.bytes();
+            buf[4..12].* = hash;
+            buf[12] = @intCast(p.count);
+            std.mem.writeInt(u32, buf[13..17], @intCast(p.lease_ms), .little);
+            buf[17] = @intFromBool(p.ack);
+            @memcpy(buf[18..n], p.consumer);
+            return buf[0..n];
+        }
+
+        fn ofWaiterKey(k: []const u8) ?struct { params: Params, hash: [8]u8 } {
+            if (k.len < 18) return null;
+            return .{ .params = .{
+                .ns = .of(std.mem.readInt(u32, k[0..4], .big)),
+                .count = k[12],
+                .lease_ms = std.mem.readInt(u32, k[13..17], .little),
+                .ack = k[17] != 0,
+                .consumer = k[18..],
+            }, .hash = k[4..12].* };
+        }
+    };
+
+    /// Propose a deliver of `name`'s due messages, to be answered to
+    /// `reply_to` when it applies. False when none is due, or it couldn't be
+    /// proposed (and is answered as none).
+    fn deliverHere(self: *QueueHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, name: []const u8, p: Params) Error!bool {
+        const hash = machine.hashOf(name);
+        if (metaOf(shard, p.ns, name) == null) return false;
+        // The clock the deliver's stamp will read.
+        if (!hasDue(shard, p.ns, hash, shard.raft_node.now())) return false;
+        try self.pending.ensureUnusedCapacity(self.allocator, 1);
+        const max_bytes = queue_ops.MESSAGES_BYTES - p.count * MESSAGE_FRAMING;
+        const proposed = propose(shard, .queue_deliver, qe.Deliver.Value{ .ns = p.ns.int(), .queue = name, .count = p.count, .max_bytes = max_bytes, .holder = p.consumer, .lease_ms = p.lease_ms }) catch |err| {
+            if (!shard.quietHalted(err)) log.warn("shard {d}: dequeue from queue {s} not proposed: {s}", .{ shard.id, name, @errorName(err) });
+            return false;
+        };
+        self.pending.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = reply_to, .request_id = request_id, .ack = p.ack });
+        return true;
+    }
+
+    /// A deliver applied on the leader: answer the dequeue waiting for it
+    /// with the messages it leased, read back from state.
+    fn deliverApplied(self: *QueueHandler, shard: *Shard, e: *const Entry, result: *const Result) void {
+        const at = for (self.pending.items, 0..) |pd, i| {
+            if (pd.index == e.header.index and pd.term == e.header.term) break i;
+        } else return;
+        const pd = self.pending.swapRemove(at);
+        var diag: schema.Diagnostic = .{};
+        const p = qe.Deliver.decodeAll(e.payload, &diag) catch return;
+        const ns: NamespaceId = .of(p.ns);
+        const hash = machine.hashOf(p.queue);
+        const buf = shard.allocator.create([@sizeOf(proto.ResponseHeader) + DequeueResponse.max_size]u8) catch
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .internal_error, .{ .reason = .answer_lost, .ran = .yes, .message = "internal error: out of memory for the messages; they come back once their lease runs out" });
+        defer shard.allocator.destroy(buf);
+        const list_buf = shard.allocator.alloc(u8, queue_ops.MESSAGES_BYTES) catch
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .internal_error, .{ .reason = .answer_lost, .ran = .yes, .message = "internal error: out of memory for the messages; they come back once their lease runs out" });
+        defer shard.allocator.free(list_buf);
+        var list = queue_ops.Messages.Builder.init(list_buf);
+        var items_buf: [qe.MAX_BATCH * qe.Item.max_size]u8 = undefined;
+        var items_len: usize = 0;
+        var r = result.reader();
+        const n = r.int(u32) orelse 0;
+        var expiry: u64 = 0;
+        var bytes: usize = 0;
+        for (0..n) |_| {
+            const seq = r.int(u64) orelse break;
+            const m = msgOf(shard, ns, hash, seq) orelse continue;
+            expiry = m.expiry_ns;
+            bytes += m.payload.len;
+            const added = list.add(.{ .seq = seq, .priority = m.priority, .deliveries = m.deliveries, .enqueued_at_ms = nsToMs(m.enqueued_ns), .payload = m.payload }) catch false;
+            if (!added) break;
+            items_len += (qe.Item.encodeInto(items_buf[items_len..], .{ .seq = seq, .deliveries = m.deliveries }) catch break).len;
+        }
+        self.recordDequeue(shard, ns, p.queue, list.count, bytes);
+        const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
+        if (pd.ack and list.count > 0) {
+            _ = propose(shard, .queue_settle, qe.Settle.Value{ .ns = p.ns, .queue = p.queue, .holder = p.holder, .token = token, .expiry_ns = expiry, .items = .{ .bytes = items_buf[0..items_len], .count = list.count } }) catch |err| {
+                if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; its messages come back once their lease runs out", .{ shard.id, p.queue, @errorName(err) });
+            };
+        }
+        const answer: DequeueResponse.Value = .{ .messages = list.value(), .term = token.term, .index = token.index, .expires_at_ms = if (pd.ack) 0 else nsToMs(expiry) };
+        const out = table_run.encodeAnswer(DequeueResponse, buf, pd.request_id, answer) orelse
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .internal_error, .{ .reason = .answer_lost, .ran = .yes, .message = "internal error: the messages didn't fit their answer; they come back once their lease runs out" });
+        shard.deliverDeferred(pd.reply_to, out);
+    }
+
+    fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
+        const mr = self.metrics_registry orelse return;
+        const namespace = shard.namespace_handler.nameOf(ns) orelse return;
+        const qm = mr.registerQueue(namespace, name) catch return;
+        if (n == 0) qm.recordEmptyDequeue() else qm.recordDequeue(n, bytes);
+    }
+
+    // ── Waking ──────────────────────────────────────────────────────────
+
+    /// Messages may be ready in the queue `e` names: wake its waiting
+    /// dequeues, each proposing a deliver if any is due.
+    fn wakeQueue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, hash: [8]u8) void {
+        self.waking[0..4].* = ns.bytes();
+        self.waking[4..12].* = hash;
+        shard.waiter_pool.notifyAny(.queue_dequeue, resolveWaiter, @ptrCast(shard));
+    }
+
+    /// A waiting dequeue for the queue being woken (`waking`), or for any
+    /// queue with a message due, from the duty: delivered to if one is due.
+    pub fn resolveWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
+        const shard: *Shard = @ptrCast(@alignCast(ctx));
+        const self = shard.queue_handler;
+        const k = waiter.key();
+        if (k.len < 12 or !std.mem.eql(u8, k[0..12], &self.waking)) return false;
+        return self.resolve(shard, waiter);
+    }
+
+    fn resolveAny(waiter: *Waiter, ctx: *anyopaque) bool {
+        const shard: *Shard = @ptrCast(@alignCast(ctx));
+        return shard.queue_handler.resolve(shard, waiter);
+    }
+
+    fn resolve(self: *QueueHandler, shard: *Shard, waiter: *Waiter) bool {
+        if (!shard.raft_node.leaderReady()) return false;
+        const got = Params.ofWaiterKey(waiter.key()) orelse return false;
+        // The name is the meta's: the waiter holds only its hash.
+        var b: [12]u8 = undefined;
+        const meta = (readOf(shard).get(machine.Metas, machine.storeKey(&b, got.params.ns, &got.hash)) catch return false) orelse return false;
+        return self.deliverHere(shard, waiter.reply_to, waiter.request_id, meta.v.name, got.params) catch false;
+    }
+
+    // ── Reports ─────────────────────────────────────────────────────────
+
+    /// The expiry of the delivery a report names, as this leader holds it:
+    /// the first of its messages still leased under that token. 0 when
+    /// none is, and the report is answered message by message.
+    fn leaseOf(shard: *Shard, ns: NamespaceId, hash: [8]u8, consumer: []const u8, token: ae.Token.Value, items: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) ?Msg {
+        var it = items.iterator();
+        while (it.next() catch null) |item| {
+            const m = msgOf(shard, ns, hash, item.seq) orelse continue;
+            if (delivery.holds(m, consumer, item.deliveries, token)) return m;
+        }
+        return null;
+    }
+
+    /// The report's messages, as its entry names them.
+    fn entryItems(buf: []u8, items: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) ?qe.Items.Value {
+        // The op's item and the entry's are the same two fields.
+        comptime std.debug.assert(queue_ops.Item.max_size == qe.Item.max_size);
+        if (items.bytes.len > buf.len) return null;
+        @memcpy(buf[0..items.bytes.len], items.bytes);
+        return .{ .bytes = buf[0..items.bytes.len], .count = items.count };
+    }
+
+    fn runComplete(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(ReportResponse) {
+        if (req.key.len == 0) return error.NoQueue;
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        const token: ae.Token.Value = .{ .term = term, .index = index };
+        const lease = leaseOf(shard, req.ns_id, machine.hashOf(req.key), consumer, token, messages);
+        var ib: [qe.Items.max_size]u8 = undefined;
+        const items = entryItems(&ib, messages) orelse return error.OutOfMemory;
+        const proposed = propose(shard, .queue_settle, qe.Settle.Value{ .ns = req.ns_id.int(), .queue = req.key, .holder = consumer, .token = token, .expiry_ns = if (lease) |m| m.expiry_ns else 0, .items = items }) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "complete not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerReport } };
+    }
+
+    fn runFail(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value, delay_ms: u64, dead: bool, err_text: []const u8) Error!table_run.Outcome(ReportResponse) {
+        if (req.key.len == 0) return error.NoQueue;
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        const token: ae.Token.Value = .{ .term = term, .index = index };
+        const lease = leaseOf(shard, req.ns_id, machine.hashOf(req.key), consumer, token, messages);
+        var ib: [qe.Items.max_size]u8 = undefined;
+        const items = entryItems(&ib, messages) orelse return error.OutOfMemory;
+        const proposed = propose(shard, .queue_release, qe.Release.Value{ .ns = req.ns_id.int(), .queue = req.key, .holder = consumer, .token = token, .expiry_ns = if (lease) |m| m.expiry_ns else 0, .items = items, .delay_ms = delay_ms, .dead = dead, .@"error" = err_text }) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "fail not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerReport } };
+    }
+
+    /// Keep a delivery: answered with the lease as it stands while more
+    /// than half of it is left; otherwise an extend is proposed and
+    /// answered when it applies.
+    fn runTouch(shard: *Shard, _: *Connection, req: Request, consumer: []const u8, term: u64, index: u64, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) Error!table_run.Outcome(TouchResponse) {
+        if (req.key.len == 0) return error.NoQueue;
+        if (!shard.raft_node.leaderReady()) return error.NotLeading;
+        const token: ae.Token.Value = .{ .term = term, .index = index };
+        const hash = machine.hashOf(req.key);
+        const lease = leaseOf(shard, req.ns_id, hash, consumer, token, messages);
+        // More than half the lease left, on every message named: it stands,
+        // and nothing is logged.
+        if (lease) |held| if (held.expiry_ns -| shard.raft_node.now() > (held.lease_ms *| std.time.ns_per_ms) / 2) {
+            var all = true;
+            var it = messages.iterator();
+            while (it.next() catch null) |item| {
+                const m = msgOf(shard, req.ns_id, hash, item.seq) orelse {
+                    all = false;
+                    break;
+                };
+                if (!delivery.holds(m, consumer, item.deliveries, token) or m.expiry_ns != held.expiry_ns) all = false;
+            }
+            if (all) return .{ .answer = .{ .expires_at_ms = nsToMs(held.expiry_ns), .applied = messages.count, .refused = .{ .bytes = "", .count = 0 } } };
+        };
+        var ib: [qe.Items.max_size]u8 = undefined;
+        const items = entryItems(&ib, messages) orelse return error.OutOfMemory;
+        const m = lease orelse Msg{ .queue = "", .priority = 0, .status = .ready, .payload = "", .enqueued_ns = 0, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = token, .lease_ms = ae.MIN_LEASE_MS, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };
+        const proposed = propose(shard, .queue_extend, qe.Extend.Value{ .ns = req.ns_id.int(), .queue = req.key, .holder = consumer, .token = token, .expiry_ns = m.expiry_ns, .held_since_ns = m.delivered_ns, .lease_ms = std.math.clamp(m.lease_ms, ae.MIN_LEASE_MS, ae.MAX_LEASE_MS), .items = items }) catch |err|
+            return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "touch not persisted") } };
+        return .{ .park = .{ .proposed = proposed, .answer = answerTouch } };
+    }
+
+    /// A report's answer, from its result: how many it applied to, then
+    /// each it didn't, and why.
+    fn reportAnswer(r: *Result.Reader, buf: []u8) schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Value {
+        var b = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Builder.init(buf);
+        while (r.int(u64)) |seq| {
+            const why: machine.Why = std.enums.fromInt(machine.Why, r.int(u8) orelse break) orelse break;
+            _ = b.add(.{ .seq = seq, .reason = why.text() }) catch break;
+        }
+        return b.value();
+    }
+
+    fn answerReport(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        const applied = r.int(u32) orelse 0;
+        var buf: [queue_ops.MAX_BATCH * queue_ops.Refused.max_size]u8 = undefined;
+        table_run.answer(ReportResponse, shard, conn, request_id, .{ .applied = applied, .refused = reportAnswer(&r, &buf) });
+    }
+
+    fn answerTouch(shard: *Shard, conn: *Connection, request_id: u64, result: *const Result) void {
+        var r = result.reader();
+        const applied = r.int(u32) orelse 0;
+        const to = r.int(u64) orelse 0;
+        var buf: [queue_ops.MAX_BATCH * queue_ops.Refused.max_size]u8 = undefined;
+        table_run.answer(TouchResponse, shard, conn, request_id, .{ .expires_at_ms = nsToMs(to), .applied = applied, .refused = reportAnswer(&r, &buf) });
+    }
+
+    // ── After apply ─────────────────────────────────────────────────────
+
+    /// What the leader does once a queue entry applies: answer the dequeue
+    /// a deliver was for, wake dequeues for messages newly ready, and chain
+    /// a full expire into the next. Every replica runs it; only a leader
+    /// holds anything it acts on.
+    pub fn afterApply(self: *QueueHandler, shard: *Shard, e: *const Entry, result: *const Result) void {
+        const etype: EntryType = @fromBackingInt(@intCast(e.header.entry_type));
+        const leads = shard.raft_node.role == .leader;
+        var diag: schema.Diagnostic = .{};
+        switch (etype) {
+            .queue_deliver => if (leads) self.deliverApplied(shard, e, result),
+            .queue_enqueue => if (leads and result.refused() == null) {
+                const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return;
+                self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
+            },
+            .queue_release => if (leads and result.refused() == null) {
+                const p = qe.Release.decodeAll(e.payload, &diag) catch return;
+                if (p.delay_ms == 0) self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
+            },
+            .queue_expire => {
+                if (self.expiring) |i| if (i == e.header.index) {
+                    self.expiring = null;
+                    if (self.expiring_full and shard.raft_node.leaderReady()) _ = self.expireNext(shard, shard.raft_node.now());
+                };
+                if (leads) shard.waiter_pool.notifyAny(.queue_dequeue, resolveAny, @ptrCast(shard));
+            },
+            else => {},
+        }
+    }
+
+    // ── The expire duty, and leadership ─────────────────────────────────
+
+    /// The leader's tick: end leases past their deadline, as one expire of
+    /// the earliest keys past due; a key whose lease moved on is dropped by
+    /// the same entry. A new leader ends a lease only past a grace of
+    /// min(lease, 30 s) after it first ran in its term. Also wakes dequeues
+    /// waiting on a queue whose delayed messages came due. Returns how many
+    /// keys it named.
+    pub fn expireDue(self: *QueueHandler, shard: *Shard) u64 {
+        if (shard.raft_node.role == .leader and shard.heldIfHalted(.queue_expire, storeOf(shard).family(machine.Deadlines.ID).count > 0)) {
+            self.duty_term = 0;
+            return 0;
+        }
+        if (!shard.raft_node.leaderReady()) return 0;
+        shard.duties.note(.queue_expire, null, @import("stdx").time.monotonicMs());
+        const now = shard.raft_node.now();
+        if (self.duty_term != shard.raft_node.current_term) {
+            self.duty_term = shard.raft_node.current_term;
+            self.duty_since_ns = now;
+        }
+        shard.waiter_pool.notifyAny(.queue_dequeue, resolveAny, @ptrCast(shard));
+        return self.expireNext(shard, now);
+    }
+
+    /// Propose an expire of the leases past their deadline at `now`, up to
+    /// a full entry, if none is in flight. Returns how many keys it named.
+    fn expireNext(self: *QueueHandler, shard: *Shard, now: u64) u64 {
+        if (self.expiring != null) return 0;
+        var items: [ae.MAX_EXPIRE_ITEMS * qe.ExpireItem.max_size]u8 = undefined;
+        var w: usize = 0;
+        var n: u32 = 0;
+        var it = machine.pastDue(readOf(shard), now);
+        while (it.next()) |due| {
+            if (n == ae.MAX_EXPIRE_ITEMS) break;
+            const k = due.key;
+            if (k.id.len != qe.ID_LEN) continue;
+            if (msgOf(shard, k.ns, k.id[0..8].*, machine.seqOf(k.id))) |m| if (m.status == .leased and m.expiry_ns == k.expiry_ns) {
+                const grace = @as(u64, @min(m.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
+                if (now < self.duty_since_ns +| grace) continue;
+            };
+            w += (qe.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns.int(), .id = k.id, .expiry_ns = k.expiry_ns }) catch break).len;
+            n += 1;
+        }
+        if (n == 0) return 0;
+        const proposed = propose(shard, .queue_expire, qe.Expire.Value{ .items = .{ .bytes = items[0..w], .count = n } }) catch |err| {
+            if (!shard.quietHalted(err)) log.warn("shard {d}: queue leases past their deadline not ended: {s}", .{ shard.id, @errorName(err) });
+            return 0;
+        };
+        self.expiring = proposed.index;
+        self.expiring_full = n == ae.MAX_EXPIRE_ITEMS;
+        return n;
+    }
+
+    /// This node stopped leading: dequeues waiting on a deliver are told,
+    /// and the duty starts its grace again under the next term it leads.
+    pub fn stoppedLeading(self: *QueueHandler, shard: *Shard) void {
+        for (self.pending.items) |pd| {
+            shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages were given; any it leased come back once their lease runs out — retry" });
+        }
+        self.pending.clearRetainingCapacity();
+        self.expiring = null;
+        self.duty_term = 0;
     }
 };
 
@@ -805,694 +898,66 @@ pub const QueueHandler = struct {
 /// Convert a CommandResult to a wire response and queue it on the connection.
 fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_result: CommandResult) void {
     switch (cmd_result) {
-        .ok => {
-            shard.sendOkResponse(conn, request_id, "");
-        },
-        .err => |e| {
-            shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal());
-        },
+        .ok => shard.sendOkResponse(conn, request_id, ""),
+        .err => |e| shard.sendRefusal(conn, request_id, e.code.toStatus(), e.refusal()),
         .queue_enqueued => |q| {
-            // Parse message_id string back to u64 and send as 8-byte LE
             const seq = std.fmt.parseInt(u64, q.message_id, 10) catch 0;
             var seq_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &seq_buf, seq, .little);
             shard.sendOkResponse(conn, request_id, &seq_buf);
         },
-        .queue_messages => |m| {
-            shard.sendOkResponse(conn, request_id, m.data);
-        },
-        .queue_dlq_messages => |m| {
-            shard.sendOkResponse(conn, request_id, m.data);
-        },
+        .queue_messages => |m| shard.sendOkResponse(conn, request_id, m.data),
+        .queue_dlq_messages => |m| shard.sendOkResponse(conn, request_id, m.data),
         .queue_purged => |p| {
             var cnt_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &cnt_buf, p.count, .little);
             shard.sendOkResponse(conn, request_id, &cnt_buf);
         },
-        .kv_not_found => {
-            shard.sendErrorResponse(conn, request_id, .not_found, "queue not found");
-        },
-        else => {
-            shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled queue response");
-        },
+        else => shard.sendErrorResponse(conn, request_id, .internal_error, "unhandled queue response"),
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Serialization
+// For tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const Seqs = struct {
-    bytes: []const u8,
-    count: u32,
-    fn at(self: Seqs, i: usize) u64 {
-        return std.mem.readInt(u64, self.bytes[i * 8 ..][0..8], .little);
-    }
-};
-
-/// `[count:u32][seq:u64]*`, exactly, with 1..MAX_ACK_BATCH seqs.
-fn parseSeqs(value: []const u8) ?Seqs {
-    if (value.len < 4) return null;
-    const count = std.mem.readInt(u32, value[0..4], .little);
-    if (count == 0 or count > QueueHandler.MAX_ACK_BATCH) return null;
-    if (value.len != 4 + @as(usize, count) * 8) return null;
-    return .{ .bytes = value[4..], .count = count };
-}
-/// Serialize dequeue results.
-/// Wire format: [count:u32] ([seq:u64][payload_len:u32][payload][enqueued_at:i64][delivery_count:u32][priority:u8])*
-fn serializeDequeueResults(allocator: Allocator, results: []const DequeueResult) ![]u8 {
-    return serializeDequeueResultsPub(allocator, results);
+/// An enqueue's payload, encoded into `buf`.
+pub fn enqueuePayload(buf: []u8, ns: NamespaceId, name: []const u8, payload: []const u8) []const u8 {
+    return qe.Enqueue.encodeInto(buf, .{ .ns = ns.int(), .queue = name, .priority = 0, .payload = payload }) catch unreachable;
 }
 
-/// Public variant of serializeDequeueResults — used by the WaiterPool resolver
-/// in shard.zig to build queue responses for blocking dequeue.
-pub fn serializeDequeueResultsPub(allocator: Allocator, results: []const DequeueResult) ![]u8 {
-    // Calculate total size: count header + per-message (seq + payload_len + payload + enqueued_at + delivery_count + priority)
-    var total: usize = 4; // u32 count
-    for (results) |r| {
-        total += 8; // seq: u64
-        total += 4; // payload_len: u32
-        total += r.payload.len; // payload bytes
-        total += 8; // enqueued_at: i64
-        total += 4; // delivery_count: u32
-        total += 1; // priority: u8
-    }
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-    var offset: usize = 0;
-
-    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(results.len), .little);
-    offset += 4;
-
-    for (results) |r| {
-        std.mem.writeInt(u64, buf[offset..][0..8], r.seq, .little);
-        offset += 8;
-        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(r.payload.len), .little);
-        offset += 4;
-        if (r.payload.len > 0) {
-            @memcpy(buf[offset..][0..r.payload.len], r.payload);
-            offset += r.payload.len;
-        }
-        // enqueued_at as i64 (convert from u64 ns to ms for the CLI)
-        const enqueued_ms: i64 = @intCast(r.enqueued_at_ns / 1_000_000);
-        std.mem.writeInt(i64, buf[offset..][0..8], enqueued_ms, .little);
-        offset += 8;
-        std.mem.writeInt(u32, buf[offset..][0..4], r.attempts, .little);
-        offset += 4;
-        // The wire carries a u8; a client can't set more, but a stored u32 can hold it.
-        buf[offset] = @intCast(@min(r.priority, std.math.maxInt(u8)));
-        offset += 1;
-    }
-
-    return buf;
+/// Propose an enqueue to the default namespace's queue `name`.
+pub fn proposeEnqueue(shard: *Shard, name: []const u8, payload: []const u8) !persistence_mod.ProposeResult {
+    return propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = NamespaceId.default.int(), .queue = name, .priority = 0, .payload = payload });
 }
 
-/// Serialize queue stats.
-/// Wire format: [enqueued:u64][dequeued:u64][acked:u64][nacked:u64][dlq:u64]
-///              [leases_expired:u64][ready:u64][leased:u64][dlq_current:u64]
-fn serializeStats(allocator: Allocator, stats: QueueProjection.Stats, ready: usize, leased: usize, dlq_current: usize) ![]u8 {
-    const total: usize = 9 * 8; // 9 x u64
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-    var offset: usize = 0;
-
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.enqueued, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.dequeued, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.acked, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.nacked, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.dlq_count, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], stats.leases_expired, .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], @intCast(ready), .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], @intCast(leased), .little);
-    offset += 8;
-    std.mem.writeInt(u64, buf[offset..][0..8], @intCast(dlq_current), .little);
-
-    return buf;
-}
-
-/// Serialize DLQ summary.
-/// Wire format: [count:u32][total_dlq:u64]
-/// The most dead letters one page lists, and the most of each payload.
-const MAX_DLQ_PAGE: u32 = 100;
-const MAX_DLQ_PAYLOAD: usize = 4096;
-/// `[total:u64][has_more:u8][last_seq:u64]` after a page's entries.
-const DLQ_TRAILER: usize = 8 + 1 + 8;
-
-/// A page of a queue's dead letters, oldest first:
-///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-///                [attempts:u32][priority:u8][moved_at_ms:i64])*
-///   [total:u64][has_more:u8][last_seq:u64]
-/// Each payload is cut to 4 KiB (`size` is its whole length). The page
-/// stops at `limit` or where the next entry wouldn't fit one answer. It
-/// starts after the entry whose seq is `after`; if that one was evicted
-/// since, from the oldest. The list is capped at the queue's DLQ limit, so
-/// finding it is bounded.
-fn serializeDlqPage(allocator: Allocator, q: *const QueueProjection, queue_hash: u64, limit: u32, after: ?u64) ![]u8 {
-    const dead = q.deadLetters(queue_hash);
-    var start: usize = 0;
-    if (after) |seq| for (dead, 0..) |d, i| {
-        if (d.seq == seq) {
-            start = i + 1;
-            break;
-        }
-    };
-    var w: std.Io.Writer.Allocating = .init(allocator);
-    errdefer w.deinit();
-    try w.writer.writeInt(u32, 0, .little);
-    var count: u32 = 0;
-    var last: u64 = 0;
-    var next = start;
-    while (next < dead.len and count < limit) : (next += 1) {
-        const d = dead[next];
-        const msg = q.messages.get(d.seq) orelse continue;
-        const shown = msg.payload[0..@min(msg.payload.len, MAX_DLQ_PAYLOAD)];
-        const size = 8 + 4 + 4 + shown.len + 8 + 4 + 1 + 8;
-        if (w.written().len + size + DLQ_TRAILER > ops.MAX_RESPONSE_BODY) break;
-        try w.writer.writeInt(u64, d.seq, .little);
-        try w.writer.writeInt(u32, @intCast(msg.payload.len), .little);
-        try w.writer.writeInt(u32, @intCast(shown.len), .little);
-        try w.writer.writeAll(shown);
-        try w.writer.writeInt(i64, @intCast(msg.enqueued_at_ns / std.time.ns_per_ms), .little);
-        try w.writer.writeInt(u32, d.attempts, .little);
-        try w.writer.writeInt(u8, @intCast(@min(msg.priority, 255)), .little);
-        try w.writer.writeInt(i64, @intCast(d.moved_at_ns / std.time.ns_per_ms), .little);
-        count += 1;
-        last = d.seq;
-    }
-    try w.writer.writeInt(u64, dead.len, .little);
-    try w.writer.writeByte(@intFromBool(next < dead.len));
-    try w.writer.writeInt(u64, last, .little);
-    const out = try w.toOwnedSlice();
-    std.mem.writeInt(u32, out[0..4], count, .little);
-    return out;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const testing = std.testing;
-
-/// One seq as an ack carries it: [count:u32][seq:u64].
-fn seqBatch(buf: []u8, seq: u64) []const u8 {
-    std.mem.writeInt(u32, buf[0..4], 1, .little);
-    std.mem.writeInt(u64, buf[4..12], seq, .little);
-    return buf[0..12];
-}
-
-fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
-    return .{
-        .header = proto.RequestHeader.init(op, 1),
-        .namespace = "default",
-        .ns_id = .default,
-        .key = key,
-        .value = value,
-        .options = options,
-    };
-}
-
-fn initTestPartition(allocator: Allocator) !*Partition {
-    const partition = try allocator.create(Partition);
-    partition.* = try Partition.init(allocator, 0, 4096, 0);
-    partition.wireProjections();
-    return partition;
-}
-
-fn deinitTestPartition(allocator: Allocator, partition: *Partition) void {
-    partition.deinit();
-    allocator.destroy(partition);
+/// A message in the default namespace's queue `name`, put straight into
+/// this shard's state as an applied enqueue would, at stamp 1.
+pub fn enqueueHere(shard: *Shard, name: []const u8, payload: []const u8) !void {
+    var buf: [qe.Enqueue.max_size]u8 = undefined;
+    const e = entry_mod.buildEntry(.queue_enqueue, entry_mod.Flags.NONE, 1, 1, 1, enqueuePayload(&buf, .default, name, payload));
+    var scratch = std.heap.ArenaAllocator.init(shard.allocator);
+    defer scratch.deinit();
+    var out = Result.start(&e);
+    try @import("../contract/machine.zig").applyEntry(&machine.machine, storeOf(shard), &scratch, &e, &out);
 }
 
 test "queue handler: dispatcher registration" {
     var dispatcher = Dispatcher.init();
     QueueHandler.register(&dispatcher);
-
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_enqueue));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_dequeue));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_complete));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_fail));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_peek));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_stats));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_list));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_requeue));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_dlq_delete));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_purge));
-    try testing.expect(dispatcher.hasHandler(OpCode.queue_list));
-
-    try testing.expectEqual(@as(u16, 11), dispatcher.handler_count);
+    inline for (.{ OpCode.queue_enqueue, OpCode.queue_dequeue, OpCode.queue_complete, OpCode.queue_fail, OpCode.queue_touch, OpCode.queue_peek, OpCode.queue_stats, OpCode.queue_dlq_list, OpCode.queue_purge }) |op|
+        try std.testing.expect(dispatcher.hasHandler(op));
 }
 
-test "queue handler: enqueue" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    const result = handler.handleCommand(makeRequest(.queue_enqueue, "tasks", "payload", ""));
-    switch (result) {
-        .queue_enqueued => |e| {
-            try testing.expect(e.message_id.len > 0);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqual(@as(u64, 1), partition.queue.stats.enqueued);
-    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
-}
-
-test "queue handler: enqueue with priority" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    // Enqueue with priority 5
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU8(.priority, 5);
-    const opts = builder.getOptions();
-
-    const result = handler.handleCommand(makeRequest(.queue_enqueue, "tasks", "hi-pri", opts));
-    switch (result) {
-        .queue_enqueued => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
-}
-
-test "queue handler: enqueue empty queue name" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-    const result = handler.handleCommand(makeRequest(.queue_enqueue, "", "data", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: dequeue" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    // Enqueue 3 messages
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "a", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "b", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "c", ""));
-
-    // Dequeue 2
-    var opts_buf: [32]u8 = undefined;
-    var builder = OptionsBuilder.init(&opts_buf);
-    try builder.addU32(.count, 2);
-    const opts = builder.getOptions();
-
-    const result = handler.handleCommand(makeRequest(.queue_dequeue, "q1", "", opts));
-    switch (result) {
-        .queue_messages => |m| {
-            defer handler.freeResult(result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 2), count);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Dequeue is auto-ack (consume), so 0 leased, 1 ready
-    try testing.expectEqual(@as(usize, 0), partition.queue.leasedCount());
-    try testing.expectEqual(@as(usize, 1), partition.queue.readyCount());
-}
-
-test "queue handler: dequeue empty queue" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    const result = handler.handleCommand(makeRequest(.queue_dequeue, "q1", "", ""));
-    switch (result) {
-        .queue_messages => |m| {
-            defer handler.freeResult(result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: complete (ack)" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    // Enqueue and dequeue
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "msg", ""));
-
-    const deq = handler.handleCommand(makeRequest(.queue_dequeue, "q1", "", ""));
-    var deq_seq: u64 = 0;
-    switch (deq) {
-        .queue_messages => |m| {
-            defer handler.freeResult(deq);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 1), count);
-            // Read seq from first result (after count header)
-            deq_seq = std.mem.readInt(u64, m.data[4..12], .little);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Complete the message
-    var buf: [20]u8 = undefined;
-    const ack_result = handler.handleCommand(makeRequest(.queue_complete, "q1", seqBatch(&buf, deq_seq), ""));
-    switch (ack_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Auto-ack already consumed the message during dequeue, so:
-    // - stats.acked = 1 (from auto-ack during dequeue)
-    // - explicit ack is a no-op (message already removed)
-    try testing.expectEqual(@as(u64, 1), partition.queue.stats.acked);
-    try testing.expectEqual(@as(usize, 0), partition.queue.leasedCount());
-}
-
-test "queue handler: fail (nack)" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    // Enqueue and dequeue
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "msg", ""));
-    const deq = handler.handleCommand(makeRequest(.queue_dequeue, "q1", "", ""));
-    var deq_seq: u64 = 0;
-    switch (deq) {
-        .queue_messages => |m| {
-            defer handler.freeResult(deq);
-            deq_seq = std.mem.readInt(u64, m.data[4..12], .little);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Fail the message
-    var buf: [20]u8 = undefined;
-    const nack_result = handler.handleCommand(makeRequest(.queue_fail, "q1", seqBatch(&buf, deq_seq), ""));
-    switch (nack_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // With auto-ack, the message was already consumed during dequeue.
-    // Nack on a consumed message is a no-op.
-    try testing.expectEqual(@as(u64, 0), partition.queue.stats.nacked);
-    try testing.expectEqual(@as(usize, 0), partition.queue.readyCount());
-}
-
-test "queue handler: stats" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "a", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "q1", "b", ""));
-
-    const result = handler.handleCommand(makeRequest(.queue_stats, "q1", "", ""));
-    switch (result) {
-        .queue_messages => |m| {
-            defer handler.freeResult(result);
-            // First u64 is enqueued count
-            const enqueued = std.mem.readInt(u64, m.data[0..8], .little);
-            try testing.expectEqual(@as(u64, 2), enqueued);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: dlq list" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    const result = handler.handleCommand(makeRequest(.queue_dlq_list, "q1", "", ""));
-    switch (result) {
-        .queue_dlq_messages => |m| {
-            defer handler.freeResult(result);
-            // Count should be 0
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: complete invalid seq" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    // ack on non-existent seq is a silent no-op in the projection
-    var buf: [12]u8 = undefined;
-    const result = handler.handleCommand(makeRequest(.queue_complete, "q1", seqBatch(&buf, 999), ""));
-    switch (result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: complete missing seq" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-
-    var handler = QueueHandler.init(allocator, partition);
-
-    const result = handler.handleCommand(makeRequest(.queue_complete, "q1", "", ""));
-    switch (result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.invalid_request, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "queue handler: pre-route by queue" {
-    const req1 = makeRequest(.queue_enqueue, "queue-a", "", "");
-    const req2 = makeRequest(.queue_enqueue, "queue-a", "", "");
-    const req3 = makeRequest(.queue_enqueue, "queue-b", "", "");
-
-    try testing.expectEqual(QueueHandler.preRouteByQueue(req1), QueueHandler.preRouteByQueue(req2));
-    try testing.expect(QueueHandler.preRouteByQueue(req1) != QueueHandler.preRouteByQueue(req3));
-
-    const req_empty = makeRequest(.queue_enqueue, "", "", "");
-    try testing.expectEqual(@as(?u64, 0), QueueHandler.preRouteByQueue(req_empty));
-
-    // Same queue, different namespace → different hash (namespace isolation)
-    var req_ns = makeRequest(.queue_enqueue, "queue-a", "", "");
-    req_ns.namespace = "other";
-    req_ns.ns_id = .of(16);
-    try testing.expect(QueueHandler.preRouteByQueue(req1) != QueueHandler.preRouteByQueue(req_ns));
-}
-
-test "queue handler: an ack batch naming another queue's message is refused whole" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    var handler = QueueHandler.init(allocator, partition);
-
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "b", ""));
-    var mine: u64 = 0;
-    var theirs: u64 = 0;
-    var it = handler.queue.messages.iterator();
-    while (it.next()) |kv| {
-        if (std.mem.eql(u8, kv.value_ptr.payload, "a")) mine = kv.key_ptr.* else theirs = kv.key_ptr.*;
-    }
-
-    var batch: [4 + 16]u8 = undefined;
-    std.mem.writeInt(u32, batch[0..4], 2, .little);
-    std.mem.writeInt(u64, batch[4..12], mine, .little);
-    std.mem.writeInt(u64, batch[12..20], theirs, .little);
-    switch (handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, ""))) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.not_found, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-    try testing.expectEqual(@as(usize, 2), handler.queue.messages.count());
-
-    // Malformed batches are refused, not read as something else.
-    for ([_][]const u8{ "", "\x00\x00\x00\x00", "\x01\x00\x00\x00\x01" }) |bad| {
-        try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", bad, "")) == .err);
-    }
-
-    var one: [12]u8 = undefined;
-    try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", seqBatch(&one, mine), "")) != .err);
-    try testing.expectEqual(@as(usize, 1), handler.queue.messages.count());
-}
-
-test "queue handler: stats and the dead-letter count are one queue's, in its namespace" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    var handler = QueueHandler.init(allocator, partition);
-
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "b", ""));
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "theirs", "c", ""));
-    const result = handler.handleCommand(makeRequest(.queue_stats, "mine", "", ""));
-    defer handler.freeResult(result);
-    const data = switch (result) {
-        .queue_messages => |m| m.data,
-        else => return error.TestUnexpectedResult,
-    };
-    // [enqueued][dequeued][acked][nacked][dlq][expired][ready][leased][dead]
-    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, data[48..56], .little));
-    try testing.expect(handler.handleCommand(makeRequest(.queue_stats, "", "", "")) == .err);
-}
-
-test "queue handler: an ack batch logs each held message once, and nothing for one already gone" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    var handler = QueueHandler.init(allocator, partition);
-
-    _ = handler.handleCommand(makeRequest(.queue_enqueue, "mine", "a", ""));
-    var it = handler.queue.messages.keyIterator();
-    const seq = it.next().?.*;
-    const before = handler.partition.ual.max_index;
-
-    var batch: [4 + 24]u8 = undefined;
-    std.mem.writeInt(u32, batch[0..4], 3, .little);
-    std.mem.writeInt(u64, batch[4..12], seq, .little);
-    std.mem.writeInt(u64, batch[12..20], seq, .little);
-    std.mem.writeInt(u64, batch[20..28], 99_999, .little);
-    try testing.expect(handler.handleCommand(makeRequest(.queue_complete, "mine", &batch, "")) != .err);
-    try testing.expectEqual(before + 1, handler.partition.ual.max_index);
-    try testing.expectEqual(@as(usize, 0), handler.queue.messages.count());
-}
-
-test "queue handler: a listing gives each queue its own dead-letter count" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    var handler = QueueHandler.init(allocator, partition);
-
-    const q = &partition.queue;
-    const ns: router.NamespaceId = .default;
-    for ([_]struct { name: []const u8, dead: usize }{ .{ .name = "mine", .dead = 1 }, .{ .name = "theirs", .dead = 2 } }) |c| {
-        const hash = router.nameHash(ns, c.name);
-        try q.registerQueue(hash, c.name, "default");
-        for (0..c.dead) |i| {
-            const seq = try q.enqueue(100 + i, 0, 1, hash, "x");
-            try std.testing.expectEqual(seq, (try q.dequeue(1, hash)).?.seq);
-            q.messages.getPtr(seq).?.attempts = q.max_attempts;
-            try q.nack(seq, 2);
-        }
-    }
-
-    const result = handler.handleCommand(makeRequest(.queue_list, "", "", ""));
-    defer handler.freeResult(result);
-    const data = switch (result) {
-        .queue_messages => |m| m.data,
-        else => return error.TestUnexpectedResult,
-    };
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, data[0..4], .little));
-    var off: usize = 4;
-    var seen: usize = 0;
-    for (0..2) |_| {
-        const name_len = std.mem.readInt(u32, data[off..][0..4], .little);
-        const name = data[off + 4 ..][0..name_len];
-        off += 4 + name_len;
-        off += 4 + std.mem.readInt(u32, data[off..][0..4], .little);
-        const dead = std.mem.readInt(u64, data[off + 32 ..][0..8], .little);
-        off += 40;
-        const want: u64 = if (std.mem.eql(u8, name, "mine")) 1 else 2;
-        try testing.expectEqual(want, dead);
-        seen += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), seen);
-}
-
-/// `n` messages of `size` bytes dead-lettered in queue 42 of `q`, the
-/// oldest first: each dequeued and nacked past its last attempt.
-fn deadLetter(q: *QueueProjection, n: usize, size: usize) !void {
-    q.max_attempts = 1;
-    const payload = try testing.allocator.alloc(u8, size);
-    defer testing.allocator.free(payload);
-    @memset(payload, 'p');
-    for (0..n) |i| {
-        const seq = try q.enqueue(i, 0, i, 42, payload);
-        _ = (try q.dequeue(i, 42)).?;
-        try q.nack(seq, 1000 + i);
-    }
-}
-
-test "queue handler: a dead-letter page lists oldest first, and the next starts after its last" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    const q = &partition.queue;
-    try deadLetter(q, 5, 3);
-
-    const first = try serializeDlqPage(allocator, q, 42, 2, null);
-    defer allocator.free(first);
-    const p1 = client_queue.DlqPage.decode(first).?;
-    try testing.expectEqual(@as(u32, 2), p1.count);
-    try testing.expectEqual(@as(u64, 5), p1.total);
-    try testing.expect(p1.more);
-    var it = p1.iterator();
-    try testing.expectEqual(@as(u64, 1), it.next().?.seq);
-    try testing.expectEqual(@as(u64, 2), it.next().?.seq);
-
-    const rest = try serializeDlqPage(allocator, q, 42, MAX_DLQ_PAGE, p1.last_seq);
-    defer allocator.free(rest);
-    const p2 = client_queue.DlqPage.decode(rest).?;
-    try testing.expectEqual(@as(u32, 3), p2.count);
-    try testing.expect(!p2.more);
-    var it2 = p2.iterator();
-    try testing.expectEqual(@as(u64, 3), it2.next().?.seq);
-
-    // Another queue's are its own.
-    const none = try serializeDlqPage(allocator, q, 7, MAX_DLQ_PAGE, null);
-    defer allocator.free(none);
-    try testing.expectEqual(@as(u64, 0), client_queue.DlqPage.decode(none).?.total);
-}
-
-test "queue handler: a dead-letter page of full-size payloads stops where one answer ends" {
-    const allocator = testing.allocator;
-    const partition = try initTestPartition(allocator);
-    defer deinitTestPartition(allocator, partition);
-    const q = &partition.queue;
-    try deadLetter(q, MAX_DLQ_PAGE, 2 * MAX_DLQ_PAYLOAD);
-
-    const page = try serializeDlqPage(allocator, q, 42, MAX_DLQ_PAGE, null);
-    defer allocator.free(page);
-    try testing.expect(page.len <= ops.MAX_RESPONSE_BODY);
-    const p = client_queue.DlqPage.decode(page).?;
-    try testing.expect(p.count > 0 and p.count < MAX_DLQ_PAGE);
-    try testing.expect(p.more);
-    var it = p.iterator();
-    const e = it.next().?;
-    try testing.expectEqual(@as(usize, MAX_DLQ_PAYLOAD), e.payload.len);
-    try testing.expectEqual(@as(u32, 2 * MAX_DLQ_PAYLOAD), e.size);
+test "queue handler: a dequeue's waiter key keeps what it asked for" {
+    const p: QueueHandler.Params = .{ .ns = .of(9), .count = 7, .lease_ms = 60_000, .ack = true, .consumer = "c1" };
+    var buf: [64]u8 = undefined;
+    const k = p.waiterKey(&buf, machine.hashOf("q")).?;
+    const back = QueueHandler.Params.ofWaiterKey(k).?;
+    try std.testing.expectEqual(p.ns, back.params.ns);
+    try std.testing.expectEqual(p.count, back.params.count);
+    try std.testing.expectEqual(p.lease_ms, back.params.lease_ms);
+    try std.testing.expect(back.params.ack);
+    try std.testing.expectEqualStrings("c1", back.params.consumer);
+    try std.testing.expectEqual(machine.hashOf("q"), back.hash);
 }
