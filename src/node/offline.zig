@@ -91,7 +91,9 @@ pub fn summarizeDir(allocator: std.mem.Allocator, dir: []const u8) !Summary {
     var batch: [256]Entry = undefined;
     var idx = sum.first_index;
     while (idx <= sum.last_index) {
-        const n = dl.readRange(idx, &batch, arena).count;
+        const r = dl.readRange(idx, &batch, arena);
+        if (r.blocked) return error.LogReadBlocked;
+        const n = r.count;
         if (n == 0) return error.LogUnreadable;
         for (batch[0..n]) |*e| {
             sum.last_term = e.header.term;
@@ -164,7 +166,7 @@ pub fn forceMembers(allocator: std.mem.Allocator, data_dir: []const u8, sum: *co
     if (hs.lost_log) try hard_state_mod.save(dir, cleared);
 }
 
-pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, IsSkip, NotSkippable, NotHalted };
+pub const SkipError = error{ NoLog, TruncationIncomplete, NotInLog, LogReadBlocked, IsSkip, NotSkippable, NotHalted };
 
 /// Shard `dir`'s entry at `index`, its payload in `arena`.
 pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena: []u8) !Entry {
@@ -175,7 +177,9 @@ pub fn entryAt(allocator: std.mem.Allocator, dir: []const u8, index: u64, arena:
     var dl = try durable_log_mod.DurableLog.init(allocator, &writer, segs);
     defer dl.deinit();
     var one: [1]Entry = undefined;
-    if (dl.readRange(index, &one, arena).count != 1 or one[0].header.index != index) return error.NotInLog;
+    const r = dl.readRange(index, &one, arena);
+    if (r.blocked) return error.LogReadBlocked;
+    if (r.count != 1 or one[0].header.index != index) return error.NotInLog;
     return one[0];
 }
 
@@ -650,6 +654,30 @@ test "offline: a skip is only of the entry the shard is halted at, and never of 
     try testing.expectError(error.NotHalted, skippable(root, 1, &es[3]));
     m.halted(4, 2, es[3].header.crc32c);
     try testing.expectError(error.NotHalted, skippable(root, 0, &es[3]));
+}
+
+test "offline: an entry the repair can't read for a resource failure is not taken as missing from the log" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    try writeLog(dir, &kvEntries(1, 3), 3);
+    var arena: [1024]u8 = undefined;
+    try testing.expectEqual(@as(u64, 2), (try entryAt(testing.allocator, dir, 2, &arena)).header.index);
+    try testing.expectError(error.NotInLog, entryAt(testing.allocator, dir, 9, &arena));
+    // Reading the segment in fails to allocate: a "not now", not a hole.
+    var blocked = false;
+    for (0..64) |n| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = n });
+        _ = entryAt(failing.allocator(), dir, 2, &arena) catch |err| {
+            // An allocation outside the read (the listing) may fail first.
+            if (err == error.NotInLog) return error.TakenAsMissing;
+            if (err == error.LogReadBlocked) blocked = true;
+            continue;
+        };
+        break;
+    }
+    try testing.expect(blocked);
 }
 
 fn kvEntries(comptime first: u64, comptime n: usize) [n]Entry {

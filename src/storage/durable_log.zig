@@ -175,7 +175,7 @@ pub const DurableLog = struct {
     };
 
     /// Classify a failure to open or read a listed segment.
-    fn readBlockClass(err: anyerror) ReadBlockClass {
+    pub fn readBlockClass(err: anyerror) ReadBlockClass {
         return switch (err) {
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,

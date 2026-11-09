@@ -900,8 +900,9 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
     }
     const arena = ctx.allocator.alloc(u8, 4 * 1024 * 1024) catch return outcome.localRefusal(ctx, "out of memory", .{});
     defer ctx.allocator.free(arena);
-    const halted = offline.entryAt(ctx.allocator, dir, index, arena) catch {
-        return outcome.localRefusal(ctx, "shard {d}'s log doesn't hold entry {d} (it holds {d}..{d})", .{ shard, index, sum.first_index, sum.last_index });
+    const halted = offline.entryAt(ctx.allocator, dir, index, arena) catch |err| switch (err) {
+        error.LogReadBlocked => return outcome.localRefusal(ctx, "shard {d}'s entry {d} can't be read right now (a resource or IO failure); try again", .{ shard, index }),
+        else => return outcome.localRefusal(ctx, "shard {d}'s log doesn't hold entry {d} (it holds {d}..{d})", .{ shard, index, sum.first_index, sum.last_index }),
     };
     const type_name = std.enums.tagName(@import("../../storage/ual/entry.zig").EntryType, @fromBackingInt(halted.header.entry_type)) orelse "unknown";
     ctx.print("\nshard {d}, entry {d}: {s}, term {d}, {d} bytes{s}\n", .{ shard, index, type_name, halted.header.term, halted.payload.len, if (index > sum.commit) " (not committed as last flushed)" else "" });
