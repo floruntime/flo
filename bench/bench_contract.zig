@@ -200,7 +200,7 @@ pub fn main() !void {
                     };
                     _ = try ops.add(.{ .kind = .put, .key = k, .value = value, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null });
                 }
-                const payload = try kve.Batch.encodeInto(pbuf, .{ .ops = ops.value() });
+                const payload = try kve.Batch.encodeInto(pbuf, .{ .ns = src.node.router.NamespaceId.default.int(), .ops = ops.value() });
                 const e = entry_mod.buildEntry(.kv_batch, entry_mod.Flags.NONE, 1, j + 1, j + 1, payload);
                 var out: persistence.Result = .{};
                 out.reset(&e);
