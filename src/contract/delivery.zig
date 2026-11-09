@@ -346,6 +346,8 @@ pub fn Model(comptime cfg: Config) type {
             return switch (cfg.ns) {
                 .name => nsKey(view, ns, k),
                 .id => blk: {
+                    // An entry naming no namespace was never proposed.
+                    if (ns == .invalid) return error.Halt;
                     const buf = try view.arena.alloc(u8, @sizeOf(u32) + k.len);
                     break :blk view_mod.idKey(buf, ns, k) catch unreachable;
                 },
@@ -416,6 +418,10 @@ test "delivery model: ready keys sort by order, then due time, then id, and read
     try testing.expect(std.mem.order(u8, late_first, early_second) == .lt);
     var c: ById.KeyBuf = undefined;
     try testing.expect(std.mem.order(u8, ById.readyKey(&c, "q0000000", 1, 99, "z"), early_second) == .lt);
+    // The order is big-endian: 255 sorts before 256.
+    var e: ById.KeyBuf = undefined;
+    var f: ById.KeyBuf = undefined;
+    try testing.expect(std.mem.order(u8, ById.readyKey(&e, "q0000000", 255, 0, "a"), ById.readyKey(&f, "q0000000", 256, 0, "a")) == .lt);
     try testing.expect(std.mem.startsWith(u8, early_second, ById.orderPrefix(&c, "q0000000", 1)));
     const back = ById.parseReadyKey(early_second, 8).?;
     try testing.expectEqual(@as(u64, 100), back.due_ns);
@@ -451,6 +457,30 @@ test "delivery model: a stale report says what became of the item, in the family
     try testing.expectEqualStrings("stale report: the run was delivered again since", ByName.staleWhy(item, "w1", 2, tok));
     try testing.expectEqualStrings("stale report: another worker holds this delivery", ById.staleWhy(item, "w2", 3, tok));
     try testing.expectEqualStrings("stale report: the lease expired and the message moved on", ById.staleWhy(item, "w1", 3, tok));
+    const ends = [_]struct { Ended, []const u8 }{
+        .{ .settled, "stale report: the message was completed" },
+        .{ .released, "stale report: the message was released" },
+        .{ .abandoned, "stale report: the message was released" },
+        .{ .none, "stale report: the message isn't held" },
+    };
+    for (ends) |e| {
+        var it = item;
+        it.ended = e[0];
+        try testing.expectEqualStrings(e[1], ById.staleWhy(it, "w1", 3, tok));
+    }
+}
+
+test "delivery model: an item in no namespace halts, by id as by name" {
+    var store = store_mod.Store.init(testing.allocator);
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var keys = view_mod.KeySet.init(arena.allocator());
+    var view = View.init(&store, arena.allocator(), &keys);
+    try testing.expectError(error.Halt, ById.inNs(&view, .invalid, "m1"));
+    const long: [view_mod.MAX_NAMESPACE + 1]u8 = @splat('n');
+    try testing.expectError(error.Halt, ByName.inNs(&view, &long, "r1"));
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x07m1", try ById.inNs(&view, .of(7), "m1"));
 }
 
 test "delivery model: the duty's walk reads deadlines earliest first and stops at the first not yet due" {
