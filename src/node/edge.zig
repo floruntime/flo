@@ -4,6 +4,11 @@
 //! published, waits for its own to get there, and looks again. This holds
 //! those reads, and remembers for a moment the names that turned out to be
 //! missing, so asking about them again doesn't load the leader.
+//!
+//! On a leader it also holds writes a follower forwarded with a namespace
+//! id this node's table doesn't have yet, from a follower whose table is
+//! further along: the create is committed, and this node's table gets
+//! there once it applies it.
 
 const std = @import("std");
 const ReplyTo = @import("reply_to.zig").ReplyTo;
@@ -20,6 +25,26 @@ pub const WAIT_MS: u64 = 2000;
 pub const MISS_MS: u64 = 100;
 /// Names remembered missing at once, each shard.
 pub const MISSES: usize = 1024;
+
+/// Forwarded writes held at once, each shard. Past it one is refused
+/// overloaded, not run.
+pub const HELD_FORWARDS: usize = 64;
+/// How long a forwarded write waits for this node's table to reach the
+/// forwarder's, before it is answered unavailable, not run.
+pub const FORWARD_WAIT_MS: u64 = 1000;
+
+pub const HeldForward = struct {
+    active: bool = false,
+    /// The forward as it came, run again once the table has caught up.
+    payload: []u8 = &.{},
+    source_node: u32 = 0,
+    group_id: u32 = 0,
+    forward_id: u32 = 0,
+    request_id: u64 = 0,
+    /// The forwarder's published index: this node's table must reach it.
+    published: u64 = 0,
+    deadline_ms: u64 = 0,
+};
 
 pub const Wait = struct {
     active: bool = false,
@@ -47,9 +72,12 @@ pub const Edge = struct {
     /// A ring: the oldest name is the one replaced.
     misses: ?*[MISSES]Miss = null,
     next_miss: usize = 0,
+    held: [HELD_FORWARDS]HeldForward = @splat(.{}),
+    held_count: u32 = 0,
 
     pub fn deinit(self: *Edge, allocator: std.mem.Allocator) void {
         for (&self.waits) |*w| if (w.active) self.drop(allocator, w);
+        for (&self.held) |*h| if (h.active) self.dropHeld(allocator, h);
         if (self.misses) |m| allocator.destroy(m);
         self.misses = null;
     }
@@ -73,6 +101,17 @@ pub const Edge = struct {
             w.index = index;
             w.deadline_ms = @max(w.deadline_ms, now_ms + WAIT_MS / 2);
         };
+    }
+
+    pub fn freeHeld(self: *Edge) ?*HeldForward {
+        for (&self.held) |*h| if (!h.active) return h;
+        return null;
+    }
+
+    pub fn dropHeld(self: *Edge, allocator: std.mem.Allocator, h: *HeldForward) void {
+        allocator.free(h.payload);
+        h.* = .{};
+        self.held_count -= 1;
     }
 
     pub fn drop(self: *Edge, allocator: std.mem.Allocator, w: *Wait) void {

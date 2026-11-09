@@ -3475,19 +3475,21 @@ pub const Shard = struct {
         // one that names another namespace, never reaches the handler. The
         // table only grows, so an id it has under this name is admitted
         // however far behind the forwarder's it is; only an unknown id
-        // waits for it to catch up.
+        // waits for it to catch up. The forwarder's table published it, so
+        // the create is committed and this node's table gets there as it
+        // applies: a moment's wait, not a retry the client has to make.
         if (ns_id != .invalid) {
             var err_buf: [256]u8 = undefined;
             const t = self.namespace_handler.table;
             const want = if (req.namespace.len == 0) "default" else req.namespace;
-            const not_found: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" };
-            const refusal: ?struct { proto.StatusCode, proto.Refusal } = if (t.nameOf(ns_id)) |name|
-                (if (std.mem.eql(u8, name, want)) null else .{ .no_namespace, not_found })
-            else if (t.publishedIndex() < published)
-                .{ .unavailable, proto.notRun("unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry") }
+            const name = t.nameOf(ns_id) orelse if (t.publishedIndex() < published)
+                return self.holdForwardForTable(frame, id, req.header.request_id, published)
             else
-                .{ .no_namespace, not_found };
-            if (refusal) |r| return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(r[0], req.header.request_id, r[1], &err_buf));
+                null;
+            if (name == null or !std.mem.eql(u8, name.?, want)) {
+                const not_found: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" };
+                return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.no_namespace, req.header.request_id, not_found, &err_buf));
+            }
         }
         const proxy = self.forward_proxy;
         loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
@@ -3503,6 +3505,51 @@ pub const Shard = struct {
         } else if (!proxy.response_deferred) {
             const serialized = proto.Response.serializeRefusal(.internal_error, req.header.request_id, proto.unclassified(.internal_error, self.noAnswer(req)), &err_buf);
             self.sendForwardReply(frame.source_node, id, serialized);
+        }
+    }
+
+    pub const HELD_FORWARDS_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many forwarded writes are waiting for this leader to catch up with their namespaces; the write was not run — retry" };
+    pub const FORWARD_NOT_CAUGHT_UP: proto.Refusal = proto.notRun("unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry");
+
+    /// Hold a forwarded write until this node's table reaches the
+    /// forwarder's published index (`sweepHeldForwards`).
+    fn holdForwardForTable(self: *Shard, frame: RaftFrame, id: u32, request_id: u64, published: u64) void {
+        var err_buf: [256]u8 = undefined;
+        const h = self.edge.freeHeld() orelse
+            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.overloaded, request_id, HELD_FORWARDS_FULL, &err_buf));
+        const payload = self.allocator.dupe(u8, frame.payload) catch
+            return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.internal_error, request_id, proto.notRun("internal error: out of memory"), &err_buf));
+        h.* = .{
+            .active = true,
+            .payload = payload,
+            .source_node = frame.source_node,
+            .group_id = frame.group_id,
+            .forward_id = id,
+            .request_id = request_id,
+            .published = published,
+            .deadline_ms = nowMs() + edge_mod.FORWARD_WAIT_MS,
+        };
+        self.edge.held_count += 1;
+    }
+
+    /// Held forwards whose wait is over: this node's table reached the
+    /// forwarder's index, so the write is checked again and runs or is
+    /// refused as on arrival, or the wait ran out and it never ran.
+    fn sweepHeldForwards(self: *Shard, now: u64) void {
+        for (&self.edge.held) |*h| {
+            if (!h.active) continue;
+            if (self.namespace_handler.table.publishedIndex() >= h.published) {
+                const payload = h.payload;
+                h.payload = &.{};
+                const frame: RaftFrame = .{ .source_node = h.source_node, .group_id = h.group_id, .msg_type = .forward_write, .payload = payload };
+                self.edge.dropHeld(self.allocator, h);
+                defer self.allocator.free(payload);
+                self.runForwardedWrite(frame);
+            } else if (now >= h.deadline_ms) {
+                var err_buf: [256]u8 = undefined;
+                self.sendForwardReply(h.source_node, h.forward_id, proto.Response.serializeRefusal(.unavailable, h.request_id, FORWARD_NOT_CAUGHT_UP, &err_buf));
+                self.edge.dropHeld(self.allocator, h);
+            }
         }
     }
 
@@ -4747,6 +4794,9 @@ pub const Shard = struct {
         // Shard 0: namespaces created this tick go to disk, then into the
         // node's table, and what waited for them is answered.
         self.namespace_handler.settle(self);
+        // After shard 0 publishes, so a forward held there for this tick's
+        // creates runs now.
+        if (self.edge.held_count > 0) self.sweepHeldForwards(nowMs());
 
         if (leads) {
             // Take the first step of runs whose start has applied, then
@@ -10687,8 +10737,6 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
         .{ .id = 4000, .published = 0, .status = .no_namespace, .says = "namespace not found" },
         // Another namespace's id under this request's name.
         .{ .id = ledger.int(), .published = 0, .status = .no_namespace, .says = "namespace not found" },
-        // An id this node doesn't know yet, from a forwarder whose table is ahead.
-        .{ .id = 4000, .published = 1 << 40, .status = .unavailable, .says = "unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry" },
     }, 0..) |c, i| {
         std.mem.writeInt(u32, frame[0..4], @intCast(100 + i), .little);
         std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], c.id, .little);
@@ -10711,6 +10759,159 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
         shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
         try std.testing.expectEqual(last + 1, shard.raft_node.log.lastIndex());
     }
+}
+
+/// A leader of member 2, with a client, sent forwarded writes by member 2.
+const HeldForwardTest = struct {
+    rn: RaftNetwork,
+    shard: Shard,
+    pipe_fds: [2]std.posix.fd_t,
+    pair: [2]std.posix.fd_t,
+    conn: *Connection,
+
+    fn init(t: *HeldForwardTest) !void {
+        t.pipe_fds = try @import("stdx").io.pipe();
+        t.rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+        t.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, t.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+        t.shard.raft_network = &t.rn;
+        t.shard.wireHandlerShardPtrs();
+        try ParkTest.joinPeer(&t.shard);
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &t.pair));
+        t.conn = try t.shard.addConnection(t.pair[0]);
+    }
+
+    fn deinit(t: *HeldForwardTest) void {
+        for (t.rn.outbound.items) |o| std.testing.allocator.free(o.frame);
+        t.rn.outbound.clearRetainingCapacity();
+        t.shard.deinit();
+        t.rn.deinit();
+        _ = std.c.close(t.pair[1]);
+        _ = std.c.close(t.pipe_fds[0]);
+        _ = std.c.close(t.pipe_fds[1]);
+    }
+
+    /// Member 2 forwards a put to `ns`, resolved there as `id`, from a table
+    /// published through `published`.
+    fn forward(t: *HeldForwardTest, forward_id: u32, ns: []const u8, id: ns_table.Id, published: u64) !void {
+        const wire = try Shard.serializeRequest(std.testing.allocator, testReq(.kv_put, 900 + forward_id, ns, "k", "v", ""));
+        defer std.testing.allocator.free(wire);
+        const frame = try std.testing.allocator.alloc(u8, FORWARD_PREFIX + FORWARD_FIELDS + wire.len);
+        defer std.testing.allocator.free(frame);
+        std.mem.writeInt(u32, frame[0..4], forward_id, .little);
+        std.mem.writeInt(u16, frame[4..6], FORWARD_FIELDS, .little);
+        std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], id.int(), .little);
+        std.mem.writeInt(u64, frame[FORWARD_PREFIX + 4 ..][0..8], published, .little);
+        @memcpy(frame[FORWARD_PREFIX + FORWARD_FIELDS ..], wire);
+        t.shard.runForwardedWrite(.{ .source_node = 2, .group_id = 0, .msg_type = .forward_write, .payload = frame });
+    }
+
+    /// Member 2's answer to forward `forward_id`, if one went out.
+    fn reply(t: *HeldForwardTest, forward_id: u32) !?proto.Response {
+        var i = t.rn.outbound.items.len;
+        while (i > 0) {
+            i -= 1;
+            const o = t.rn.outbound.items[i];
+            if (!o.forward) continue;
+            const body = o.frame[transport.HEADER_SIZE..];
+            if (std.mem.readInt(u32, body[0..4], .little) != forward_id) continue;
+            return try proto.Response.parse(body[12..]);
+        }
+        return null;
+    }
+
+    /// A client creates `name`; member 2 acks it, and shard 0 publishes it.
+    fn create(t: *HeldForwardTest, name: []const u8) !void {
+        t.shard.runRequest(t.conn, try ParkTest.request(.namespace_create, 50, "", name, "", ""), .client);
+        try ParkTest.ack(&t.shard);
+        t.shard.namespace_handler.settle(&t.shard);
+        try std.testing.expect(t.shard.namespace_handler.table.lookup(name) != null);
+    }
+};
+
+test "Shard: a forward naming a namespace the leader publishes 100 ms later waits for it, runs, and is answered ok" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const nh = t.shard.namespace_handler;
+    const raft = t.shard.raft_node;
+    // The follower applied the create, at the index it will have here, and
+    // resolved the write to its id; this node hasn't applied it yet.
+    const id: ns_table.Id = .of(nh.next_id);
+    const published = raft.log.lastIndex() + 1;
+    try t.forward(7, "orders", id, published);
+    try std.testing.expectEqual(@as(u32, 1), t.shard.edge.held_count);
+    try std.testing.expect((try t.reply(7)) == null);
+    const start = Shard.nowMs();
+    t.shard.sweepHeldForwards(start + 50);
+    try std.testing.expectEqual(@as(u32, 1), t.shard.edge.held_count);
+    try std.testing.expect((try t.reply(7)) == null);
+
+    try t.create("orders");
+    try std.testing.expectEqual(@as(?ns_table.Id, id), nh.table.lookup("orders"));
+    try std.testing.expect(nh.table.publishedIndex() >= published);
+    const before = raft.log.lastIndex();
+    t.shard.sweepHeldForwards(start + 100);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
+    try std.testing.expectEqual(before + 1, raft.log.lastIndex());
+    try ParkTest.ack(&t.shard);
+    const resp = (try t.reply(7)).?;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 907), resp.header.request_id);
+}
+
+test "Shard: a forward whose namespace the leader hasn't published within a second is answered unavailable, not run" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const before = raft.log.lastIndex();
+    try t.forward(8, "orders", .of(t.shard.namespace_handler.next_id), before + 1);
+    t.shard.sweepHeldForwards(Shard.nowMs() + edge_mod.FORWARD_WAIT_MS - 100);
+    try std.testing.expect((try t.reply(8)) == null);
+    t.shard.sweepHeldForwards(Shard.nowMs() + edge_mod.FORWARD_WAIT_MS + 1);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
+    try std.testing.expectEqual(before, raft.log.lastIndex());
+    const resp = (try t.reply(8)).?;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 908), resp.header.request_id);
+    const why = try resp.refused();
+    try std.testing.expectEqual(proto.Ran.no, why.ran);
+    try std.testing.expectEqualStrings(Shard.FORWARD_NOT_CAUGHT_UP.message, why.message);
+}
+
+test "Shard: a held forward whose id the leader publishes under another name is refused no_namespace, not run" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const id: ns_table.Id = .of(t.shard.namespace_handler.next_id);
+    try t.forward(9, "orders", id, raft.log.lastIndex() + 1);
+    try t.create("ledger");
+    try std.testing.expectEqual(@as(?ns_table.Id, id), t.shard.namespace_handler.table.lookup("ledger"));
+    const before = raft.log.lastIndex();
+    t.shard.sweepHeldForwards(Shard.nowMs());
+    try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
+    try std.testing.expectEqual(before, raft.log.lastIndex());
+    const resp = (try t.reply(9)).?;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), resp.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: past the held-forward bound a forward is refused overloaded, not run, and held ones are freed at shutdown" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const before = raft.log.lastIndex();
+    const id: ns_table.Id = .of(t.shard.namespace_handler.next_id);
+    for (0..edge_mod.HELD_FORWARDS) |i| try t.forward(@intCast(100 + i), "orders", id, before + 1);
+    try std.testing.expectEqual(@as(u32, edge_mod.HELD_FORWARDS), t.shard.edge.held_count);
+    try t.forward(99, "orders", id, before + 1);
+    try std.testing.expectEqual(before, raft.log.lastIndex());
+    const resp = (try t.reply(99)).?;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), resp.header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+    // deinit frees the 64 still held: the testing allocator checks.
 }
 
 test "Shard: a shard's processing knows its shard and the partitions before the log replays" {
