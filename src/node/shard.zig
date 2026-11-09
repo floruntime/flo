@@ -1649,6 +1649,14 @@ pub const Shard = struct {
         return self.namespace_handler.table.lookup(effective) orelse self.namespace_handler.idOf(effective) orelse .invalid;
     }
 
+    /// The id a forward to the leader carries: only one this node's table
+    /// has published. The leader holds an unknown id until its own table
+    /// reaches this one's published index, so an id applied here and not
+    /// yet published could be one that index doesn't cover.
+    fn forwardedNamespaceId(self: *const Shard, name: []const u8) ns_table.Id {
+        return self.namespace_handler.table.lookup(if (name.len == 0) "default" else name) orelse .invalid;
+    }
+
     /// A client's request: walked across shards, sent to the shard that
     /// owns it, or run here. Walk opcodes (list/scan) aggregate across
     /// shards unless the pre-route narrows to a single partition.
@@ -3166,7 +3174,7 @@ pub const Shard = struct {
         std.mem.writeInt(u16, buf[4..6], FORWARD_FIELDS, .little);
         const req_ns = if (proto.Request.parse(f.bytes)) |r| r.namespace else |_| "";
         // An ask names no namespace of its own.
-        const ns_id: ns_table.Id = if (f.ask != null) .invalid else self.namespaceId(req_ns);
+        const ns_id: ns_table.Id = if (f.ask != null) .invalid else self.forwardedNamespaceId(req_ns);
         std.mem.writeInt(u32, buf[FORWARD_PREFIX..][0..4], ns_id.int(), .little);
         std.mem.writeInt(u64, buf[FORWARD_PREFIX + 4 ..][0..8], self.namespace_handler.table.publishedIndex(), .little);
         @memcpy(buf[body_at..][0..f.bytes.len], f.bytes);
@@ -3584,10 +3592,11 @@ pub const Shard = struct {
                 return self.holdForwardForTable(frame, id, req.header.request_id, published)
             else
                 null;
-            if (name == null or !std.mem.eql(u8, name.?, want)) {
-                const not_found: proto.Refusal = .{ .reason = .not_found, .ran = .no, .message = "namespace not found" };
-                return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.no_namespace, req.header.request_id, not_found, &err_buf));
-            }
+            // This node's table vouches for no namespace by that id under
+            // that name, but can't say there is none: the client retries,
+            // and the forwarder resolves the name again.
+            if (name == null or !std.mem.eql(u8, name.?, want))
+                return self.sendForwardReply(frame.source_node, id, proto.Response.serializeRefusal(.unavailable, req.header.request_id, FORWARD_ID_UNKNOWN, &err_buf));
         }
         const proxy = self.forward_proxy;
         loadProxy(proxy, .{ .remote = .{ .node = frame.source_node, .forward_id = id } });
@@ -3607,6 +3616,7 @@ pub const Shard = struct {
     }
 
     pub const HELD_FORWARDS_FULL: proto.Refusal = .{ .reason = .shard_busy, .ran = .no, .message = "overloaded: too many forwarded writes are waiting for this leader to catch up with their namespaces; the write was not run — retry" };
+    pub const FORWARD_ID_UNKNOWN: proto.Refusal = proto.notRun("unavailable: the leader's namespaces don't name this request's namespace by the id it was sent with; the write was not run — retry");
     pub const FORWARD_NOT_CAUGHT_UP: proto.Refusal = proto.notRun("unavailable: the leader hasn't caught up with this namespace yet; the write was not run — retry");
 
     /// Hold a forwarded write until this node's table reaches the
@@ -11200,7 +11210,7 @@ test "Shard: a forwarded write carrying fields this node does not read is answer
     try std.testing.expectEqualStrings("internal error: the leader cannot read this forwarded request — are all nodes on the same version?", (try resp.refused()).message);
 }
 
-test "Shard: a forwarded write's namespace is admitted only as this node's table has it, under its name, however far ahead the forwarder is" {
+test "Shard: a forwarded write's namespace is admitted only as this node's table has it, under its name, however far ahead the forwarder is; otherwise it is refused unavailable" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
     defer _ = std.c.close(pipe_fds[1]);
@@ -11227,9 +11237,9 @@ test "Shard: a forwarded write's namespace is admitted only as this node's table
     const Case = struct { id: u32, published: u64, status: proto.StatusCode, says: []const u8 };
     for ([_]Case{
         // An id this node never published: a forged or future one.
-        .{ .id = 4000, .published = 0, .status = .no_namespace, .says = "namespace not found" },
+        .{ .id = 4000, .published = 0, .status = .unavailable, .says = Shard.FORWARD_ID_UNKNOWN.message },
         // Another namespace's id under this request's name.
-        .{ .id = ledger.int(), .published = 0, .status = .no_namespace, .says = "namespace not found" },
+        .{ .id = ledger.int(), .published = 0, .status = .unavailable, .says = Shard.FORWARD_ID_UNKNOWN.message },
     }, 0..) |c, i| {
         std.mem.writeInt(u32, frame[0..4], @intCast(100 + i), .little);
         std.mem.writeInt(u32, frame[FORWARD_PREFIX..][0..4], c.id, .little);
@@ -11372,7 +11382,7 @@ test "Shard: a forward whose namespace the leader hasn't published within a seco
     try std.testing.expectEqualStrings(Shard.FORWARD_NOT_CAUGHT_UP.message, why.message);
 }
 
-test "Shard: a held forward whose id the leader publishes under another name is refused no_namespace, not run" {
+test "Shard: a held forward whose id the leader publishes under another name is refused unavailable, not run" {
     var t: HeldForwardTest = undefined;
     try t.init();
     defer t.deinit();
@@ -11386,8 +11396,23 @@ test "Shard: a held forward whose id the leader publishes under another name is 
     try std.testing.expectEqual(@as(u32, 0), t.shard.edge.held_count);
     try std.testing.expectEqual(before, raft.log.lastIndex());
     const resp = (try t.reply(9)).?;
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), resp.header.status);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
     try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
+test "Shard: a forward carries a namespace's id only once this node's table has published it" {
+    var t: HeldForwardTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const nh = t.shard.namespace_handler;
+    try std.testing.expectEqual(ns_table.DEFAULT, t.shard.forwardedNamespaceId(""));
+    // Applied here, not yet on disk and published.
+    const id: ns_table.Id = .of(nh.next_id);
+    try std.testing.expect(nh.applyCreateAt("orders", id, 1, t.shard.raft_node.last_applied) == .created);
+    try std.testing.expectEqual(@as(?ns_table.Id, id), nh.idOf("orders"));
+    try std.testing.expectEqual(ns_table.INVALID, t.shard.forwardedNamespaceId("orders"));
+    nh.settle(&t.shard);
+    try std.testing.expectEqual(id, t.shard.forwardedNamespaceId("orders"));
 }
 
 test "Shard: past the held-forward bound a forward is refused overloaded, not run, and held ones are freed at shutdown" {
