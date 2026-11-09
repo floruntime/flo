@@ -689,3 +689,40 @@ test "e2e/queue: enqueue prints the sequence number its delivery names" {
     defer ack.deinit();
     try testing.expectEqual(@as(u8, 0), ack.exit_code);
 }
+
+test "e2e/queue: dequeue refuses -o raw without --ack, and a count or lease out of range, naming the range" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "flags-q", "kept" });
+    const cases = [_]struct { args: []const []const u8, says: []const u8 }{
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "-o", "raw" }, .says = "add --ack" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--count", "0" }, .says = "--count is 1 to 100" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--count", "101" }, .says = "--count is 1 to 100" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--lease", "1000" }, .says = "--lease is 5000 to 43200000 ms" },
+    };
+    for (cases) |c| {
+        var r = try ctx.cli.run(c.args);
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains(c.says));
+    }
+    // None of them took the message.
+    var json = try ctx.cli.run(&.{ "queue", "dequeue", "flags-q", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    try testing.expect(json.stdoutContains("\"payload\":\"kept\""));
+    try testing.expect(json.stdoutContains("\"deliveries\":1"));
+    try testing.expect(json.stdoutContains("\"delivery\":\""));
+}
+
+test "e2e/queue: an enqueue's --delay holds its message back until due" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "delay-q", "later", "--delay", "1500" });
+    var early = try ctx.cli.run(&.{ "queue", "dequeue", "delay-q" });
+    defer early.deinit();
+    try testing.expect(early.stdoutContains("(no messages)"));
+    @import("stdx").time.sleep(1700 * std.time.ns_per_ms);
+    const due = try ctx.execCapture(&.{ "queue", "dequeue", "delay-q" });
+    try testing.expect(std.mem.indexOf(u8, due, " later") != null);
+}

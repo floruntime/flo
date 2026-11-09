@@ -277,6 +277,8 @@ pub const OptionTag = enum(u8) {
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255; lower is taken first)
+    delay_ms = 0x11, // u64: How long before an enqueued message is ready (at most a day)
+    dedup_key = 0x13, // string: Refused: queues keep no deduplication window
     count = 0x15, // u32: Number of messages to dequeue
     block_ms = 0x17, // u32: Block timeout - wait until exists (at most 5 min; 0 = don't wait)
 

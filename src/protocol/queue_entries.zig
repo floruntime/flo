@@ -33,7 +33,7 @@ pub const MAX_BATCH: u32 = 100;
 /// message is dead.
 pub const DEFAULT_LEASE_MS: u64 = 30 * 1000;
 pub const MAX_ATTEMPTS: u32 = 5;
-/// The longest a release may hold a message back.
+/// The longest an enqueue or a release may hold a message back.
 pub const MAX_DELAY_MS: u64 = ae.MAX_DELAY_MS;
 /// The most dead messages a queue keeps: past it, the oldest goes.
 pub const MAX_DEAD: u32 = 10_000;
@@ -48,6 +48,7 @@ pub const Enqueue = Record(&.{
     .{ .name = "queue", .T = QueueName },
     // Lower first; 0 is the highest.
     .{ .name = "priority", .T = Int(u32) },
+    .{ .name = "delay_ms", .T = schema.DurationMs(MAX_DELAY_MS) },
     .{ .name = "payload", .T = Bytes(MAX_MESSAGE) },
 });
 
@@ -135,7 +136,7 @@ pub const Purge = Record(&.{
 });
 
 pub const table = [_]entries.Entry{
-    .{ .name = "queue.enqueue", .type_code = 0x20, .payload = Enqueue, .max_payload = Enqueue.max_size, .doc = "A message added to a queue, ready at once." },
+    .{ .name = "queue.enqueue", .type_code = 0x20, .payload = Enqueue, .max_payload = Enqueue.max_size, .doc = "A message added to a queue, ready once its delay passes." },
     .{ .name = "queue.deliver", .type_code = 0x21, .payload = Deliver, .max_payload = Deliver.max_size, .doc = "A queue's next ready messages leased to a consumer under a new token." },
     .{ .name = "queue.settle", .type_code = 0x22, .payload = Settle, .max_payload = Settle.max_size, .doc = "Leased messages completed by their holder." },
     .{ .name = "queue.release", .type_code = 0x23, .payload = Release, .max_payload = Release.max_size, .doc = "Leased messages failed by their holder: ready again, or dead." },

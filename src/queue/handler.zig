@@ -195,6 +195,11 @@ pub const QueueHandler = struct {
     /// its waiters are woken: its namespace's id, then its name hash.
     waking: [12]u8 = undefined,
 
+    /// Dequeues with ack, answered when their complete applies.
+    acking: std.ArrayListUnmanaged(Acking) = .empty,
+
+    const Acking = struct { index: u64, term: u64, reply_to: ReplyTo, request_id: u64, answer: []u8 };
+
     const Pending = struct {
         index: u64,
         term: u64,
@@ -211,6 +216,8 @@ pub const QueueHandler = struct {
     pub fn deinit(self: *QueueHandler) void {
         if (self.answer_buf) |b| self.allocator.free(b);
         self.pending.deinit(self.allocator);
+        for (self.acking.items) |a| self.allocator.free(a.answer);
+        self.acking.deinit(self.allocator);
     }
 
     pub fn register(dispatcher: *Dispatcher) void {
@@ -354,11 +361,14 @@ pub const QueueHandler = struct {
         if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
         const priority: u32 = if (req.getPriority()) |p| p else 0;
+        if (req.findOption(.dedup_key) != null) return .{ .err = .{ .code = .invalid_request, .message = "bad request: dedup_key isn't supported: a queue keeps no deduplication window" } };
+        const delay_ms: u64 = if (req.findOption(.delay_ms)) |o| o.asU64() orelse return .{ .err = .{ .code = .invalid_request, .message = "bad request: delay_ms is a u64" } } else 0;
+        if (delay_ms > qe.MAX_DELAY_MS) return .{ .err = .{ .code = .invalid_request, .message = "bad request: delay_ms is at most 86400000 (a day)" } };
         // As every write resolves its namespace here (`persistence.proposeEntry`):
         // published, or on shard 0 proposed ahead of this write.
         const ns = shard.namespaceId(req.namespace);
         if (ns == .invalid) return .{ .err = persistence_mod.failureError(error.NamespaceUnknown, "enqueue not persisted") };
-        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = ns.int(), .queue = req.key, .priority = priority, .payload = req.value }) catch |err| {
+        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = ns.int(), .queue = req.key, .priority = priority, .delay_ms = delay_ms, .payload = req.value }) catch |err| {
             return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
         };
         return .{ .parked = proposed };
@@ -666,15 +676,37 @@ pub const QueueHandler = struct {
         }
         self.recordDequeue(shard, ns, p.queue, list.count, bytes);
         const token: ae.Token.Value = .{ .term = e.header.term, .index = e.header.index };
-        if (pd.ack and list.count > 0) {
-            _ = propose(shard, .queue_settle, qe.Settle.Value{ .ns = p.ns, .queue = p.queue, .holder = p.holder, .token = token, .expiry_ns = expiry, .items = .{ .bytes = items_buf[0..items_len], .count = list.count } }) catch |err| {
-                if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; its messages come back once their lease runs out", .{ shard.id, p.queue, @errorName(err) });
-            };
-        }
-        const answer: DequeueResponse.Value = .{ .messages = list.value(), .term = token.term, .index = token.index, .expires_at_ms = if (pd.ack) 0 else nsToMs(expiry) };
+        const ack = pd.ack and list.count > 0;
+        const answer: DequeueResponse.Value = .{ .messages = list.value(), .term = token.term, .index = token.index, .expires_at_ms = if (ack or list.count == 0) 0 else nsToMs(expiry) };
         const out = table_run.encodeAnswer(DequeueResponse, buf, pd.request_id, answer) orelse
             return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .internal_error, .{ .reason = .answer_lost, .ran = .yes, .message = "internal error: the messages didn't fit their answer; they come back once their lease runs out" });
-        shard.deliverDeferred(pd.reply_to, out);
+        if (!ack) return shard.deliverDeferred(pd.reply_to, out);
+        // With ack, answered once the complete applies: until then the
+        // messages are only leased, and a complete lost with this leader
+        // lets them come back.
+        const lost: proto.Refusal = .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: the messages were taken but their complete wasn't logged; they come back once their lease runs out" };
+        self.acking.ensureUnusedCapacity(self.allocator, 1) catch
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
+        const owned = self.allocator.dupe(u8, out) catch
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
+        const proposed = propose(shard, .queue_settle, qe.Settle.Value{ .ns = p.ns, .queue = p.queue, .holder = p.holder, .token = token, .expiry_ns = expiry, .items = .{ .bytes = items_buf[0..items_len], .count = list.count } }) catch |err| {
+            self.allocator.free(owned);
+            if (!shard.quietHalted(err)) log.warn("shard {d}: an acked dequeue from queue {s} not completed: {s}; its messages come back once their lease runs out", .{ shard.id, p.queue, @errorName(err) });
+            return shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, lost);
+        };
+        self.acking.appendAssumeCapacity(.{ .index = proposed.index, .term = proposed.term, .reply_to = pd.reply_to, .request_id = pd.request_id, .answer = owned });
+    }
+
+    /// An acked dequeue's complete applied: its answer goes, as it was
+    /// read when its deliver applied.
+    fn ackApplied(self: *QueueHandler, shard: *Shard, e: *const Entry, result: *const Result) void {
+        const at = for (self.acking.items, 0..) |a, i| {
+            if (a.index == e.header.index and a.term == e.header.term) break i;
+        } else return;
+        const a = self.acking.swapRemove(at);
+        defer self.allocator.free(a.answer);
+        if (result.refused()) |r| return shard.deliverDeferredRefusal(a.reply_to, a.request_id, r.status, r.refusal);
+        shard.deliverDeferred(a.reply_to, a.answer);
     }
 
     fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
@@ -746,7 +778,7 @@ pub const QueueHandler = struct {
     fn allGone(buf: []u8, messages: schema.List(queue_ops.Item, queue_ops.MAX_BATCH).Value) schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Value {
         var b = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Builder.init(buf);
         var it = messages.iterator();
-        while (it.next() catch null) |item| _ = b.add(.{ .seq = item.seq, .reason = machine.Why.gone.text() }) catch break;
+        while (it.next() catch null) |item| _ = b.add(.{ .seq = item.seq, .why = .gone, .reason = machine.Why.gone.text() }) catch break;
         return b.value();
     }
 
@@ -823,7 +855,7 @@ pub const QueueHandler = struct {
         var b = schema.List(queue_ops.Refused, queue_ops.MAX_BATCH).Builder.init(buf);
         while (r.int(u64)) |seq| {
             const why: machine.Why = std.enums.fromInt(machine.Why, r.int(u8) orelse break) orelse break;
-            _ = b.add(.{ .seq = seq, .reason = why.text() }) catch break;
+            _ = b.add(.{ .seq = seq, .why = why, .reason = why.text() }) catch break;
         }
         return b.value();
     }
@@ -855,6 +887,7 @@ pub const QueueHandler = struct {
         var diag: schema.Diagnostic = .{};
         switch (etype) {
             .queue_deliver => if (leads) self.deliverApplied(shard, e, result),
+            .queue_settle => if (leads) self.ackApplied(shard, e, result),
             .queue_enqueue => if (leads and result.refused() == null) {
                 const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return;
                 self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
@@ -934,6 +967,11 @@ pub const QueueHandler = struct {
             shard.deliverDeferredRefusal(pd.reply_to, pd.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages were given; any it leased come back once their lease runs out — retry" });
         }
         self.pending.clearRetainingCapacity();
+        for (self.acking.items) |a| {
+            shard.deliverDeferredRefusal(a.reply_to, a.request_id, .unavailable, .{ .reason = .leader_unknown, .ran = .unknown, .message = "unavailable: this node stopped leading before the messages' complete applied; if it didn't, they come back once their lease runs out" });
+            self.allocator.free(a.answer);
+        }
+        self.acking.clearRetainingCapacity();
         self.expiring = null;
         self.duty_term = 0;
     }
@@ -971,12 +1009,12 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
 
 /// An enqueue's payload, encoded into `buf`.
 pub fn enqueuePayload(buf: []u8, ns: NamespaceId, name: []const u8, payload: []const u8) []const u8 {
-    return qe.Enqueue.encodeInto(buf, .{ .ns = ns.int(), .queue = name, .priority = 0, .payload = payload }) catch unreachable;
+    return qe.Enqueue.encodeInto(buf, .{ .ns = ns.int(), .queue = name, .priority = 0, .delay_ms = 0, .payload = payload }) catch unreachable;
 }
 
 /// Propose an enqueue to the default namespace's queue `name`.
 pub fn proposeEnqueue(shard: *Shard, name: []const u8, payload: []const u8) !persistence_mod.ProposeResult {
-    return propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = NamespaceId.default.int(), .queue = name, .priority = 0, .payload = payload });
+    return propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = NamespaceId.default.int(), .queue = name, .priority = 0, .delay_ms = 0, .payload = payload });
 }
 
 /// A message in the default namespace's queue `name`, put straight into

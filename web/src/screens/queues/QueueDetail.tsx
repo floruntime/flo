@@ -97,7 +97,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
         <Stat label="Ready" value={d ? cfmt(d.ready) : '…'} sub="available to deliver" />
         <Stat label="In-flight" value={d ? d.inflight : '…'} valueColor={d?.inflight ? 'var(--info)' : undefined} sub="leased" />
         <Stat label="Dead letters" value={d?.dlq_count ?? 0} valueColor={d?.dlq_count ? 'var(--crit)' : undefined} sub={d?.dlq_count ? 'needs triage' : 'none'} />
-        <Stat label="Throughput" value={<span style={{ fontSize: 20 }}>{cfmt(d?.enqueued ?? 0)}<span className="u">/ {cfmt(d?.dequeued ?? 0)}</span></span>} sub="enqueued / dequeued" />
+        <Stat label="Throughput" value={<span style={{ fontSize: 20 }}>{cfmt(d?.enqueued ?? 0)}<span className="u">/ {cfmt(d?.dequeued ?? 0)}</span></span>} sub="enqueued / delivered" />
       </Stats>
 
       {msgsQ.isLoading ? (

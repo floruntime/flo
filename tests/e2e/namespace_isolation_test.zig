@@ -111,17 +111,17 @@ fn verifyQueues(ctx: *stdx.testing.TestContext, restarted: bool) !void {
         try testing.expectEqual(count(i) - taken, s.ready);
 
         if (!restarted) {
-            const first = try run(ctx, &.{ "queue", "dequeue", "same", "-o", "raw", "-n", ns }, 0);
+            const first = try run(ctx, &.{ "queue", "dequeue", "same", "--ack", "-o", "raw", "-n", ns }, 0);
             defer testing.allocator.free(first);
             try testing.expectEqualStrings(try payload(&buf, ns, 1), first);
             continue;
         }
-        const rest = try run(ctx, &.{ "queue", "dequeue", "same", "--count", "16", "-o", "raw", "-n", ns }, 0);
+        const rest = try run(ctx, &.{ "queue", "dequeue", "same", "--count", "16", "--ack", "-o", "raw", "-n", ns }, 0);
         defer testing.allocator.free(rest);
         var lines = std.mem.splitScalar(u8, rest, '\n');
         for (2..count(i) + 1) |k| try testing.expectEqualStrings(try payload(&buf, ns, k), lines.next() orelse return error.TooFewMessages);
         try testing.expect(lines.next() == null);
-        const empty = try run(ctx, &.{ "queue", "dequeue", "same", "-o", "raw", "-n", ns }, 0);
+        const empty = try run(ctx, &.{ "queue", "dequeue", "same", "--ack", "-o", "raw", "-n", ns }, 0);
         defer testing.allocator.free(empty);
         try testing.expectEqualStrings("(no messages)", empty);
     }

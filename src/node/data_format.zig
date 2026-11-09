@@ -40,7 +40,7 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // log payloads name the namespace by id.
     .{ .format = 10, .segment_version = 7, .entries = 0xa27e039b5f22bd5e },
     // Queue entries are schemas, and deliveries and leases are logged.
-    .{ .format = 11, .segment_version = 8, .entries = 0x166626ac4b8c7bf9 },
+    .{ .format = 11, .segment_version = 8, .entries = 0xd744c48806095be5 },
 };
 
 comptime {

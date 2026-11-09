@@ -54,10 +54,12 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                 .examples(&.{
                     "flo queue enqueue myqueue 'Hello, World!'",
                     "flo queue enqueue tasks '{\"id\":1}' --priority 10",
+                    "flo queue enqueue reminders 'ping' --delay 60000",
                 })
                 .arg("queue", "Queue name")
                 .arg("payload", "Message payload")
                 .uintFlag("priority", 0, 0, "Priority (0-255; lower is taken first)")
+                .uintFlag("delay", 0, 0, "How long before it is ready (ms, at most 86400000)")
                 .action(wrapHandler(runEnqueue)),
         )
         .subcommand(
@@ -157,7 +159,9 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
     const payload = ctx.getPositional("payload").?; // validated by commander
 
     const priority_val = ctx.getUint("priority") orelse 0;
-    const priority: u8 = if (priority_val > 255) 255 else @intCast(priority_val);
+    if (priority_val > 255) return outcome.usage(ctx, "--priority is 0 to 255, not {d}", .{priority_val});
+    const priority: u8 = @intCast(priority_val);
+    const delay: u64 = ctx.getUint("delay") orelse 0;
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
 
@@ -166,7 +170,7 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.queue.enqueue(&client, namespace, queue, payload, priority) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.queue.enqueue(&client, namespace, queue, payload, priority, delay) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
@@ -179,10 +183,15 @@ fn runEnqueue(ctx: *commander.Context) commander.Error!void {
 fn runDequeue(ctx: *commander.Context) commander.Error!void {
     const queue = ctx.getPositional("queue").?; // validated by commander
 
-    const count = @min(ctx.getUint("count") orelse 1, queue_ops.MAX_BATCH);
+    const count = ctx.getUint("count") orelse 1;
+    if (count < 1 or count > queue_ops.MAX_BATCH) return outcome.usage(ctx, "--count is 1 to {d}, not {d}", .{ queue_ops.MAX_BATCH, count });
     const block = ctx.getChangedUint("block");
     const lease: ?u64 = if (ctx.getChangedUint("lease")) |l| l else null;
+    if (lease) |l| if (l < ae.MIN_LEASE_MS or l > ae.MAX_LEASE_MS) return outcome.usage(ctx, "--lease is {d} to {d} ms, not {d}", .{ ae.MIN_LEASE_MS, ae.MAX_LEASE_MS, l });
     const ack = ctx.getBool("ack");
+    // Payloads alone carry no delivery, so nothing could ack them: with
+    // --ack they're taken for good, without it they'd come back.
+    if (output.getFormat(ctx) == .raw and !ack) return outcome.usage(ctx, "-o raw prints payloads only, and nothing could ack them: add --ack to consume them, or use the default or -o json output for their deliveries", .{});
     const consumer = ctx.getString("consumer") orelse "";
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
@@ -192,19 +201,20 @@ fn runDequeue(ctx: *commander.Context) commander.Error!void {
 
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    var result = client_mod.queue.dequeue(&client, namespace, queue, @intCast(@max(count, 1)), if (block) |b| @as(u32, @intCast(b)) else null, ack, consumer, lease) catch |err| return outcome.requestFailed(ctx, err);
+    var result = client_mod.queue.dequeue(&client, namespace, queue, count, if (block) |b| @as(u32, @intCast(b)) else null, ack, consumer, lease) catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
 
     try outcome.check(ctx, result);
     try printMessages(ctx, result.data, ack, true);
 }
 
-/// A dequeue's messages, one a line: with `ack` or `-o raw` its payload,
-/// else its delivery (which ack, nack and touch take) then its payload.
-fn printMessages(ctx: *commander.Context, data: []const u8, ack_: bool, say_none: bool) commander.Error!void {
-    const ack = ack_ or output.getFormat(ctx) == .raw;
+/// A dequeue's messages, one a line: with `ack` its payload, else its
+/// delivery (which ack, nack and touch take) then its payload. `-o json`
+/// prints the answer as an object, each message with its delivery.
+fn printMessages(ctx: *commander.Context, data: []const u8, ack: bool, say_none: bool) commander.Error!void {
     var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
     const answer = DequeueResponse.decodeAll(data, &diag) catch return outcome.malformed(ctx, "dequeue answer");
+    if (output.getFormat(ctx) == .json) return printJson(ctx, answer);
     if (answer.messages.count == 0) {
         if (say_none) ctx.print("(no messages)\n", .{});
         return;
@@ -221,6 +231,19 @@ fn printMessages(ctx: *commander.Context, data: []const u8, ack_: bool, say_none
 }
 
 const DequeueResponse = queue_ops.op("queue.dequeue").response;
+const ae = @import("../../protocol/action_entries.zig");
+
+fn printJson(ctx: *commander.Context, answer: DequeueResponse.Value) commander.Error!void {
+    ctx.print("{{\"term\":{d},\"index\":{d},\"expires_at_ms\":{d},\"messages\":[", .{ answer.term, answer.index, answer.expires_at_ms });
+    var it = answer.messages.iterator();
+    var first = true;
+    while (it.next() catch return outcome.malformed(ctx, "dequeue answer")) |m| {
+        const id: client_mod.queue.DeliveryId = .{ .term = answer.term, .index = answer.index, .seq = m.seq, .deliveries = m.deliveries };
+        ctx.print("{s}{{\"delivery\":\"{f}\",\"seq\":{d},\"priority\":{d},\"deliveries\":{d},\"enqueued_at_ms\":{d},\"payload\":{f}}}", .{ if (first) "" else ",", id, m.seq, m.priority, m.deliveries, m.enqueued_at_ms, output.jsonString(m.payload) });
+        first = false;
+    }
+    ctx.print("]}}\n", .{});
+}
 const ReportResponse = queue_ops.op("queue.complete").response;
 const TouchResponse = queue_ops.op("queue.touch").response;
 
@@ -289,7 +312,7 @@ fn runReport(ctx: *commander.Context, comptime kind: Report) commander.Error!voi
 
     var result = switch (kind) {
         .ack => client_mod.queue.complete(&client, namespace, queue, consumer, ids),
-        .nack => client_mod.queue.fail(&client, namespace, queue, consumer, ids, ctx.getUint64("delay") orelse 0, ctx.getBool("dlq"), ctx.getString("error") orelse ""),
+        .nack => client_mod.queue.fail(&client, namespace, queue, consumer, ids, ctx.getUint("delay") orelse 0, ctx.getBool("dlq"), ctx.getString("error") orelse ""),
         .touch => client_mod.queue.touch(&client, namespace, queue, consumer, ids),
     } catch |err| return outcome.requestFailed(ctx, err);
     defer result.deinit();
@@ -298,12 +321,26 @@ fn runReport(ctx: *commander.Context, comptime kind: Report) commander.Error!voi
     var diag: @import("../../protocol/schema.zig").Diagnostic = .{};
     if (kind == .touch) {
         const answer = TouchResponse.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "touch answer");
-        ctx.print("OK: {d} held until {d}\n", .{ answer.applied, answer.expires_at_ms });
+        var tb: [64]u8 = undefined;
+        ctx.print("OK: {d} held until {s}\n", .{ answer.applied, untilText(&tb, answer.expires_at_ms) });
         return printRefused(ctx, answer.refused);
     }
     const answer = ReportResponse.decodeAll(result.data, &diag) catch return outcome.malformed(ctx, "report answer");
     ctx.print("OK: {d}\n", .{answer.applied});
     return printRefused(ctx, answer.refused);
+}
+
+/// When a lease runs out, as a person reads it: UTC and how far off.
+fn untilText(buf: []u8, at_ms: i64) []const u8 {
+    if (at_ms <= 0) return "(not held)";
+    const secs: u64 = @intCast(@divFloor(at_ms, 1000));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    const now_ms = @import("stdx").time.milliTimestamp();
+    const left = @divFloor(at_ms - now_ms, 1000);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC ({d} s)", .{ day.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(), left }) catch "?";
 }
 
 fn runAck(ctx: *commander.Context) commander.Error!void {
@@ -484,7 +521,7 @@ fn runList(ctx: *commander.Context) commander.Error!void {
         .{ .field = "ready", .header = "READY", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "leased", .header = "LEASED", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "enqueued", .header = "ENQUEUED", .field_type = .uint_u64, .alignment = .right },
-        .{ .field = "dequeued", .header = "DEQUEUED", .field_type = .uint_u64, .alignment = .right },
+        .{ .field = "dequeued", .header = "DELIVERED", .field_type = .uint_u64, .alignment = .right },
         .{ .field = "dlq", .header = "DLQ", .field_type = .uint_u64, .alignment = .right },
     }) catch return outcome.malformed(ctx, "list");
 }

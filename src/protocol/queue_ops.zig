@@ -35,7 +35,8 @@ pub const PeekedList = schema.BoundedList(Peeked, MAX_PEEK, @intCast(ops.MAX_RES
 pub const MAX_BATCH: u32 = qe.MAX_BATCH;
 /// The longest a dequeue waits for a message.
 pub const MAX_WAIT_MS: u64 = 300_000;
-pub const ConsumerId = Bytes(@intCast(ops.MAX_KEY));
+/// A consumer's id, short enough that a blocking dequeue can wait on it.
+pub const ConsumerId = Bytes(@intCast(ops.MAX_KEY - 14));
 
 /// A dequeued message. With the answer's term and index, its seq and
 /// deliveries name its delivery, and a complete, fail or touch names it
@@ -60,10 +61,42 @@ pub const Item = Record(&.{
     .{ .name = "deliveries", .T = Int(u32), .doc = "Its deliveries, as dequeued" },
 });
 
+/// Why a report applied nothing to a message. A client reads this, never
+/// the text.
+pub const Why = enum(u8) {
+    /// No such message in this queue: completed, purged, dead and evicted,
+    /// or never there. For a complete, gone means done: a resent complete
+    /// whose first applied is answered gone.
+    gone = 0,
+    /// Its lease ran out or it was failed, and it was dequeued again: this
+    /// delivery is over.
+    delivered_again = 1,
+    /// Another consumer holds this delivery.
+    other_holder = 2,
+    /// Its lease ran out, and it is ready again or dead.
+    expired = 3,
+    /// It was failed, and is ready again or dead.
+    released = 4,
+    /// It isn't leased.
+    not_held = 5,
+
+    pub fn text(w: Why) []const u8 {
+        return switch (w) {
+            .gone => "not found: no such message in this queue",
+            .delivered_again => "stale report: the message was delivered again since",
+            .other_holder => "stale report: another consumer holds this delivery",
+            .expired => "stale report: the lease expired and the message moved on",
+            .released => "stale report: the message was released",
+            .not_held => "stale report: the message isn't held",
+        };
+    }
+};
+
 /// A message a report applied nothing to, and why.
 pub const Refused = Record(&.{
     .{ .name = "seq", .T = Int(u64), .doc = "The message's seq" },
-    .{ .name = "reason", .T = Bytes(128), .doc = "What became of it: completed, delivered again, expired, or gone" },
+    .{ .name = "why", .T = schema.Enum(Why), .doc = "Why: gone (for a complete, already done), delivered_again, other_holder, expired, released or not_held" },
+    .{ .name = "reason", .T = Bytes(128), .doc = "The same, said for a person" },
 });
 
 const report_fields = [_]schema.Field{
@@ -114,10 +147,10 @@ pub const table = [_]ops.Op{
             .{ .name = "messages", .T = Messages, .doc = "The messages taken, or none" },
             .{ .name = "term", .T = Int(u64), .doc = "The delivery's term" },
             .{ .name = "index", .T = Int(u64), .doc = "The delivery's index" },
-            .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without a touch, in Unix milliseconds" },
+            .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without a touch, in Unix milliseconds; 0 when no message was taken, or with ack" },
         }),
         .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
-        .doc = "Take a queue's next ready messages, leased until completed, failed or expired.",
+        .doc = "Take a queue's next ready messages, leased until completed, failed or expired. With ack, answered once their complete applies.",
     },
     .{
         .name = "queue.complete",
@@ -127,7 +160,7 @@ pub const table = [_]ops.Op{
         .request = Record(&report_fields),
         .response = Record(&report_answer),
         .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
-        .doc = "Complete dequeued messages: they leave the queue.",
+        .doc = "Complete dequeued messages: they leave the queue. A message answered gone was completed already, or isn't in this queue.",
     },
     .{
         .name = "queue.fail",

@@ -15601,16 +15601,18 @@ test "queues: a dequeue leases the next ready messages to its consumer under one
     r = try t.complete("c1", stale);
     try std.testing.expectEqual(@as(u32, 0), r.applied);
     var rit = r.refused.iterator();
-    try std.testing.expect(std.mem.indexOf(u8, (try rit.next()).?.reason, "delivered again") != null);
+    const stale_one = (try rit.next()).?;
+    try std.testing.expectEqual(queue_machine.Why.delivered_again, stale_one.why);
+    try std.testing.expect(std.mem.indexOf(u8, stale_one.reason, "delivered again") != null);
 
     r = try t.complete("c1", got);
     try std.testing.expectEqual(@as(u32, 2), r.applied);
     try std.testing.expect(t.msg(seq) == null);
-    // A resend: the messages are gone, and it says so.
+    // A resend: the messages are gone, which for a complete means done.
     r = try t.complete("c1", got);
     try std.testing.expectEqual(@as(u32, 0), r.applied);
     rit = r.refused.iterator();
-    try std.testing.expect(std.mem.indexOf(u8, (try rit.next()).?.reason, "no such message") != null);
+    try std.testing.expectEqual(queue_machine.Why.gone, (try rit.next()).?.why);
 }
 
 test "queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on" {
@@ -15700,14 +15702,44 @@ test "queues: a report on a queue the leader doesn't hold, or in a namespace nev
     try std.testing.expect(t.a.shard.halted == null);
 }
 
-test "queues: a dequeue with ack completes what it takes, so nothing comes back" {
+test "queues: an enqueue's delay holds its message back until due, and a dedup key is refused" {
+    var t: QueuesTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var ob_buf: [32]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU64(.delay_ms, 60_000);
+    t.a.next_id += 1;
+    var frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_enqueue, t.a.next_id, "default", "q", "later", ob.getOptions()));
+    _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+    std.testing.allocator.free(frame);
+    _ = t.a.shard.applyCommitted();
+    var resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
+    try std.testing.expectEqual(@as(u32, 0), (try t.dequeue("c1", 1, null, false)).count);
+    t.clock.ahead_ns = 61 * std.time.ns_per_s;
+    try std.testing.expectEqualStrings("later", (try t.dequeue("c1", 1, null, false)).payloadOf(0));
+
+    var dd_buf: [32]u8 = undefined;
+    var dd = proto.OptionsBuilder.init(&dd_buf);
+    try dd.addBytes(.dedup_key, "k1");
+    t.a.next_id += 1;
+    frame = try Shard.serializeRequest(std.testing.allocator, testReq(.queue_enqueue, t.a.next_id, "default", "q", "dup", dd.getOptions()));
+    _ = feedClient(t.a.c.pair[1], &t.a.shard, t.a.c.conn.fd, frame);
+    std.testing.allocator.free(frame);
+    resp = try nextAnswer(t.a.c, &t.a.shard, &t.a.out);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), resp.header.status);
+    try std.testing.expect(std.mem.indexOf(u8, (try resp.refused()).message, "dedup_key isn't supported") != null);
+}
+
+test "queues: a dequeue with ack is answered once its complete applies, so nothing comes back" {
     var t: QueuesTest = undefined;
     try t.init();
     defer t.deinit();
     try t.enqueue("a");
     const got = try t.dequeue("c1", 1, null, true);
     try std.testing.expectEqualStrings("a", got.payloadOf(0));
-    _ = t.a.shard.applyCommitted();
+    // Answered once its complete applied: the message is gone already.
     try std.testing.expect(t.msg(try QueuesTest.first(got)) == null);
     try std.testing.expectEqual(@as(u64, 0), queue_handler_mod.countQueue(&t.a.shard, .default, "q"));
 }

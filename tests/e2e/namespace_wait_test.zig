@@ -60,7 +60,7 @@ fn wokenBy(ctx: *stdx.testing.TestContext, args: []const []const u8, wake: []con
 fn existing(ctx: *stdx.testing.TestContext) !void {
     try ctx.exec(&.{ "namespace", "create", "made" });
 
-    var dequeued = try wokenBy(ctx, &.{ "queue", "dequeue", "jobs", "--block", BLOCK_MS, "-o", "raw", "-n", "made" }, &.{ "queue", "enqueue", "jobs", "the-job", "-n", "made" });
+    var dequeued = try wokenBy(ctx, &.{ "queue", "dequeue", "jobs", "--block", BLOCK_MS, "--ack", "-o", "raw", "-n", "made" }, &.{ "queue", "enqueue", "jobs", "the-job", "-n", "made" });
     defer dequeued.deinit();
     try testing.expectEqualStrings("the-job", dequeued.stdoutTrimmed());
 

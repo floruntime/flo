@@ -268,26 +268,7 @@ pub const NAME_TAKEN = "conflict: another queue's name hashes as this one's; cho
 pub const MAX_LOOKED_AT: usize = 256;
 
 /// Why a report applied nothing to one of its messages.
-pub const Why = enum(u8) {
-    /// No such message in this queue: completed, purged, or never there.
-    gone = 0,
-    delivered_again = 1,
-    other_holder = 2,
-    expired = 3,
-    released = 4,
-    not_held = 5,
-
-    pub fn text(w: Why) []const u8 {
-        return switch (w) {
-            .gone => "not found: no such message in this queue",
-            .delivered_again => "stale report: the message was delivered again since",
-            .other_holder => "stale report: another consumer holds this delivery",
-            .expired => "stale report: the lease expired and the message moved on",
-            .released => "stale report: the message was released",
-            .not_held => "stale report: the message isn't held",
-        };
-    }
-};
+pub const Why = @import("../protocol/queue_ops.zig").Why;
 
 fn why(m: Msg.Value, holder: []const u8, deliveries: u32, token: ae.Token.Value) Why {
     if (m.deliveries != deliveries or m.token.term != token.term or m.token.index != token.index) return .delivered_again;
@@ -327,7 +308,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .status = .ready,
                 .payload = p.payload,
                 .enqueued_ns = stamp,
-                .due_ns = stamp,
+                .due_ns = after(stamp, p.delay_ms),
                 .deliveries = 0,
                 .failures = 0,
                 .holder = "",
@@ -454,8 +435,9 @@ const Report = union(enum) {
 };
 
 /// A report's messages, each applied to on its own: one it holds changes,
-/// and one it doesn't is answered by what became of it. A resend of a
-/// settle or release that applied answers as it did.
+/// and one it doesn't is answered by what became of it. A resent release
+/// whose first applied counts as applied; a resent settle finds its
+/// message gone, as the settle removed it, and is answered gone.
 fn report(view: *View, out: *Result, ns: NamespaceId, queue: []const u8, holder: []const u8, token: ae.Token.Value, items: qe.Items.Value, kind: Report, seen_expiry: u64, stamp: u64) ApplyError!void {
     const hash = hashOf(queue);
     const mk = try M.inNs(view, ns, &hash);
@@ -706,7 +688,7 @@ const LEASE = LEASE_MS * ms;
 const NS: NamespaceId = .default;
 
 fn enqueue(t: *TestQueues, queue: []const u8, priority: u32, payload: []const u8, stamp: u64) !u64 {
-    const r = try t.apply(.queue_enqueue, qe.Enqueue.Value{ .ns = NS.int(), .queue = queue, .priority = priority, .payload = payload }, stamp);
+    const r = try t.apply(.queue_enqueue, qe.Enqueue.Value{ .ns = NS.int(), .queue = queue, .priority = priority, .delay_ms = 0, .payload = payload }, stamp);
     try testing.expect(r.refused() == null);
     var rd = r.reader();
     return rd.int(u64).?;
@@ -968,7 +950,7 @@ test "queue machine: the same name in two namespaces is two queues, and a purge 
     var t = TestQueues.init(testing.allocator);
     defer t.deinit();
     _ = try enqueue(&t, "q", 0, "a", 10);
-    _ = try t.apply(.queue_enqueue, qe.Enqueue.Value{ .ns = 7, .queue = "q", .priority = 0, .payload = "x" }, 20);
+    _ = try t.apply(.queue_enqueue, qe.Enqueue.Value{ .ns = 7, .queue = "q", .priority = 0, .delay_ms = 0, .payload = "x" }, 20);
     var got: [1]u64 = undefined;
     _ = try deliver(&t, 1, 100, &got);
     const r = try t.apply(.queue_purge, qe.Purge.Value{ .ns = NS.int(), .queue = "q" }, 200);

@@ -19,10 +19,12 @@ pub fn enqueue(
     queue: []const u8,
     payload: []const u8,
     priority: u8,
+    delay_ms: u64,
 ) !Response {
-    var options_buf: [8]u8 = undefined;
+    var options_buf: [16]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
     try builder.addU8(.priority, priority);
+    if (delay_ms > 0) try builder.addU64(.delay_ms, delay_ms);
 
     return client.sendRequestWithOptions(.queue_enqueue, namespace, queue, payload, builder.getOptions());
 }
