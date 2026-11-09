@@ -83,6 +83,7 @@ pub const Batch = Record(&.{
 /// slice, which a decoded batch's list is not, so it is written here rather
 /// than through `Batch.encode`.
 pub fn encodeBatch(w: *schema.Writer, ns: u32, ops: []const BatchOp.Value) schema.EncodeError!void {
+    comptime std.debug.assert(Batch.field_list.len == 2 and Batch.field_list[0].T == NamespaceId and Batch.field_list[1].T == BatchOps);
     try NamespaceId.encode(w, ns);
     try BatchOps.encodeSlice(w, ops);
 }

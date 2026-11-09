@@ -308,11 +308,18 @@ pub const ProcessingHandler = struct {
     /// dispatchers use to route stream/kv/queue/ts commands. Sinks resolve through
     /// this so a write lands on the shard a subsequent read will query.
     fn peerShardId(self: *const ProcessingHandler, namespace: []const u8, key: []const u8) u16 {
-        const name = if (namespace.len == 0) "default" else namespace;
-        const id = if (std.mem.eql(u8, name, "default")) .default else if (self.ns_table) |t| t.lookup(name) orelse .invalid else .invalid;
-        const hash = router.routeNsKey(id, key);
+        const hash = router.routeNsKey(self.namespaceIdOf(namespace), key);
         const partition_id: u32 = @intCast(hash % self.peer_partition_count);
         return @intCast(partition_id % self.peer_shard_count);
+    }
+
+    /// The id of namespace `namespace` (empty is "default") as the node's
+    /// table has it; `.invalid` for one it doesn't.
+    fn namespaceIdOf(self: *const ProcessingHandler, namespace: []const u8) router.NamespaceId {
+        const name = if (namespace.len == 0) "default" else namespace;
+        if (std.mem.eql(u8, name, "default")) return .default;
+        const t = self.ns_table orelse return .invalid;
+        return t.lookup(name) orelse .invalid;
     }
 
     /// A stream or queue sink proposes its write on the shard that owns its
@@ -1459,10 +1466,7 @@ pub const ProcessingHandler = struct {
         const self: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const handlers = self.peer_kv_handlers orelse return null;
         if (self.own_shard >= handlers.len) return null;
-        const ns_handler = @import("../namespace/handler.zig");
-        var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_handler.qualifyKey(&qbuf, namespace, key) catch return null;
-        const entry = handlers[self.own_shard].*.kv.get(qkey) orelse return null;
+        const entry = handlers[self.own_shard].*.kv.getIn(self.namespaceIdOf(namespace), key) orelse return null;
         return entry.value;
     }
 
@@ -1948,17 +1952,14 @@ pub const ProcessingHandler = struct {
     fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
-        var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qkey = ns_keys.qualifyKey(&qbuf, snk.namespace, full_key) catch |err| return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, switch (err) {
-            error.KeyHasNul => "key must not contain NUL",
-            error.KeyTooLarge => "namespace + key too large",
-        });
+        // As a client's key: the CLI and SDKs have never written one with NUL.
+        if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
         const owner = self.kvOwner(shard, snk.namespace, full_key);
         if (owner == shard.id) {
-            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, qkey, payload, snk.kv_ttl_ms)) |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
             return;
         }
-        const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .qkey = qkey, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
+        const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .key = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
             return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "out of memory");
         if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .kv_sink_put, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
             shard.allocator.free(message);
@@ -2642,10 +2643,10 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
         if (handler.peerShardId("default", c) == 1) elsewhere = c;
     }
     try std.testing.expect(elsewhere.len > 0);
-    const ns_handler = @import("../namespace/handler.zig");
-    var qbuf: [ns_handler.MAX_QUALIFIED_KEY]u8 = undefined;
-    try t0.put(try ns_handler.qualifyKey(&qbuf, "default", elsewhere), "here", 0);
-    try t1.put(try ns_handler.qualifyKey(&qbuf, "default", "only-there"), "there", 0);
+    const Key = @import("../kv/state.zig").Key;
+    var kbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
+    try t0.put(Key.init(&kbuf, .default, elsewhere).stored, "here", 0);
+    try t1.put(Key.init(&kbuf, .default, "only-there").stored, "there", 0);
 
     try std.testing.expectEqualStrings("here", ProcessingHandler.shardKvLookup(&handler, "default", elsewhere).?);
     try std.testing.expect(ProcessingHandler.shardKvLookup(&handler, "default", "only-there") == null);

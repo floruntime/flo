@@ -7658,8 +7658,8 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     var out: [512]u8 = undefined;
     _ = try readAnswer(pair[1], &shard, conn.fd, &out, @sizeOf(proto.ResponseHeader));
 
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    const present = try handler_mod.qualifyKey(&qbuf, "", "w");
+    var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    const present = testKvKey(&qbuf, "w");
     const version = shard.defaultPartition().kv.get(present).?.version;
     // A TTL far off, so the timeout's answer must carry it.
     const expires_at_ms: i64 = 4_000_000_000_000;
@@ -7677,8 +7677,8 @@ test "Shard: a KV watch that times out answers the value still there, and a wait
     try std.testing.expectEqual(@as(?i64, expires_at_ms), got.expires_at_ms);
     try std.testing.expectEqual(version, got.version);
 
-    var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
+    var mbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    const missing = testKvKey(&mbuf, "nope");
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = conn.replyTo(), .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
@@ -7697,8 +7697,8 @@ test "Shard: on a halted shard a read whose wait runs out is answered marked sta
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
     haltForTest(&shard, shard.raft_node.last_applied + 1);
-    var mbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    const missing = try handler_mod.qualifyKey(&mbuf, "", "nope");
+    var mbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    const missing = testKvKey(&mbuf, "nope");
     try std.testing.expect(shard.waiter_pool.register(.{ .kind = .kv_get, .reply_to = c.conn.replyTo(), .request_id = 8, .key = missing, .min_version = 0, .timeout_ms = 1 }));
     shard.waiter_pool.waiters[0].expires_at_ms = 0;
     shard.expireWaiters();
@@ -8200,9 +8200,9 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
         const k = try std.fmt.bufPrint(&name_bufs[1], "k{d}", .{i});
         if (shardOf(a, k) == 0) break k;
     } else return error.TestUnexpectedResult;
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    try two.shards[1].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "", far), "routed");
-    try two.shards[shardOf(a, "own")].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "", "own"), "plain");
+    var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    try two.shards[1].defaultPartition().kv.putForTest(testKvKey(&qbuf, far), "routed");
+    try two.shards[shardOf(a, "own")].defaultPartition().kv.putForTest(testKvKey(&qbuf, "own"), "plain");
 
     const op = table_run.op("kv.mget");
     const Keys = op.request.field_list[0].T;
@@ -8285,11 +8285,11 @@ const MgetGatherFixture = struct {
         }
         const value = try std.testing.allocator.alloc(u8, value_len);
         defer std.testing.allocator.free(value);
-        var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+        var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
         for (self.keys, 0..) |k, n| {
             // Each value names its key, so order shows in the answer.
             @memset(value, @intCast('a' + n));
-            try self.two.shards[n % 2].defaultPartition().kv.putForTest(try handler_mod.qualifyKey(&qbuf, "default", k), value);
+            try self.two.shards[n % 2].defaultPartition().kv.putForTest(testKvKey(&qbuf, k), value);
         }
         self.client = try TestClient.open(a);
         self.out = try std.testing.allocator.alloc(u8, proto.MAX_ANSWER_BYTES);
@@ -10359,8 +10359,8 @@ test "Shard: a request larger than the read buffer is read whole; one that canno
     var resp = try proto.Response.parse(out[0..n]);
     try std.testing.expectEqual(@as(u64, 4), resp.header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    const stored = shard.defaultPartition().kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?;
+    var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
+    const stored = shard.defaultPartition().kv.get(testKvKey(&qbuf, "k")).?;
     try std.testing.expectEqualSlices(u8, value, stored.value);
     try std.testing.expect(!conn.closing);
     // Grown for it, given back once it is taken.
@@ -11807,10 +11807,10 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
     try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
     try std.testing.expectEqual(@as(u16, 1), (try commit.response.decodeAll(one[0].data, &diag)).ops);
     try std.testing.expect(shard.kv_handler.txn_table.get(id) == null);
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
     const kv = &shard.defaultPartition().kv;
-    try std.testing.expectEqualStrings("v", kv.get(try handler_mod.qualifyKey(&qbuf, "", "k")).?.value);
-    try std.testing.expect(kv.get(try handler_mod.qualifyKey(&qbuf, "", "k2")) == null);
+    try std.testing.expectEqualStrings("v", kv.get(testKvKey(&qbuf, "k")).?.value);
+    try std.testing.expect(kv.get(testKvKey(&qbuf, "k2")) == null);
 }
 
 /// Two clients of a leader whose writes wait on member 2's ack, for KV's
@@ -11865,8 +11865,8 @@ const CondTest = struct {
     }
 
     fn held(self: *CondTest, key: []const u8) ?@import("../kv/machine.zig").Current {
-        var q: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-        return self.t.shard.defaultPartition().kv.get(handler_mod.qualifyKey(&q, "", key) catch unreachable);
+        var q: [limits.MAX_KV_KEY]u8 = undefined;
+        return self.t.shard.defaultPartition().kv.get(testKvKey(&q, key));
     }
 };
 
@@ -11920,7 +11920,7 @@ test "Shard: a condition counts a write its leader inherited, committed and not 
     var pbuf: [64]u8 = undefined;
     // Committed by its one member, not yet applied: as a new leader holds
     // what the last leader committed.
-    _ = try t.shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "default\x00k", .value = "from-old-leader", .ttl_ms = null, .condition = .always, .cas_version = null }));
+    _ = try t.shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "from-old-leader", .ttl_ms = null, .condition = .always, .cas_version = null }));
     var enc: [64]u8 = undefined;
     const body = try table_run.op("kv.set").request.encodeInto(&enc, .{ .value = "mine", .ttl_ms = null, .condition = .if_absent, .cas_version = null, .routing_key = null, .txn = null });
     t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = body }, .client);
@@ -11929,8 +11929,8 @@ test "Shard: a condition counts a write its leader inherited, committed and not 
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
     try CondTest.expectConflict(one[0], .condition_failed);
-    var q: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    try std.testing.expectEqualStrings("from-old-leader", t.shard.defaultPartition().kv.get(try handler_mod.qualifyKey(&q, "", "k")).?.value);
+    var q: [limits.MAX_KV_KEY]u8 = undefined;
+    try std.testing.expectEqualStrings("from-old-leader", t.shard.defaultPartition().kv.get(testKvKey(&q, "k")).?.value);
 }
 
 test "Shard: an incr is decided as it applies: a write not yet applied can make the key a counter, or stop it being one" {
@@ -13031,8 +13031,7 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
 
     const table_ = &shard.kv_handler.txn_table;
     const id = try table_.begin(node_router.routeNsKey(.default, "k"), .default);
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    try table_.appendOp(id, .put, try handler_mod.qualifyKey(&qbuf, "", "k"), "v", 0, .always, null);
+    try table_.appendOp(id, .put, "k", "v", 0, .always, null);
     const c = try TestClient.open(&shard);
     defer _ = std.c.close(c.pair[1]);
     var buf: [64]u8 = undefined;
@@ -13132,7 +13131,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
             last_applied_seen = shard_inner.raft_node.last_applied;
             _ = kv_handler_mod.KVHandler.testProposePut(shard_inner, "nested", "v") catch unreachable;
             _ = shard_inner.applyCommitted();
-            nested_saw_kv = shard_inner.kv_handler.kv.get("nested") != null;
+            nested_saw_kv = shard_inner.kv_handler.kv.getIn(.default, "nested") != null;
         }
     };
     Probe.shard_ptr = &shard;
@@ -13147,7 +13146,7 @@ test "applyCommitted: an applier that proposes does not re-enter the drain" {
     // leaving the nested proposal to the outer loop.
     try std.testing.expectEqual(idx, Probe.last_applied_seen);
     try std.testing.expect(!Probe.nested_saw_kv);
-    try std.testing.expect(shard.kv_handler.kv.get("nested") != null);
+    try std.testing.expect(shard.kv_handler.kv.getIn(.default, "nested") != null);
     try std.testing.expectEqual(shard.raft_node.commit_index, shard.raft_node.last_applied);
     try std.testing.expectEqual(@as(u32, 1), Probe.calls);
 }
@@ -13242,11 +13241,13 @@ fn testCommandEntry(entry_type: entry_mod.EntryType, index: u64, key: []const u8
 }
 
 /// A kv put of `value` at `key`, as the log holds it, at `index`.
+/// A put of `key` in "default", as the log carries it.
 fn testPutEntry(index: u64, key: []const u8, value: []const u8) entry_mod.Entry {
     const S = struct {
         var payload_buf: [256]u8 = undefined;
+        var key_buf: [limits.MAX_KV_KEY]u8 = undefined;
     };
-    const payload = kv_entries.Put.encodeInto(&S.payload_buf, .{ .key = key, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null }) catch unreachable;
+    const payload = kv_entries.Put.encodeInto(&S.payload_buf, .{ .key = testKvKey(&S.key_buf, key), .value = value, .ttl_ms = null, .condition = .always, .cas_version = null }) catch unreachable;
     var e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, index, index * 1000, payload);
     e.header.crc32c = e.computeCrc();
     return e;
@@ -13899,7 +13900,7 @@ test "a truncated suffix is gone from the segments a restart replays" {
         shard.raft_node.log.truncateAfter(2);
         _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k", "D");
         try std.testing.expect(shard.applyCommitted());
-        try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
+        try std.testing.expectEqualStrings("D", shard.kv_handler.kv.getIn(.default, "k").?.value);
     }
 
     var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
@@ -13907,7 +13908,7 @@ test "a truncated suffix is gone from the segments a restart replays" {
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
     // Index 3 is D, once; the file that held C was rewritten without it.
-    try std.testing.expectEqualStrings("D", shard.kv_handler.kv.get("k").?.value);
+    try std.testing.expectEqualStrings("D", shard.kv_handler.kv.getIn(.default, "k").?.value);
     try std.testing.expectEqual(@as(u64, 4), shard.raft_node.log.lastIndex());
 }
 
@@ -13984,7 +13985,7 @@ test "a truncation the previous run recorded is finished before replay" {
     shard.wireHandlerShardPtrs();
     shard.applyDeferredTail();
 
-    try std.testing.expectEqualStrings("A", shard.kv_handler.kv.get("k").?.value);
+    try std.testing.expectEqualStrings("A", shard.kv_handler.kv.getIn(.default, "k").?.value);
     try std.testing.expectEqual(@as(u64, 3), shard.raft_node.log.lastIndex());
     try std.testing.expectError(error.FileNotFound, @import("stdx").fs.access(intent, .{}));
 }
@@ -14049,12 +14050,12 @@ test "KV reads on a shard judge expiry by its Raft node's time, not the host's w
     var ahead: Ahead = .{ .ns = @intCast(@import("stdx").time.nanoTimestamp() + std.time.ns_per_day) };
     shard.raft_node.wall_clock = .{ .ctx = &ahead, .now_ns = Ahead.read };
     var buf: [64]u8 = undefined;
-    const put = try kv_entries.Put.encodeInto(&buf, .{ .key = "k", .value = "v", .ttl_ms = 1_000, .condition = .always, .cas_version = null });
+    const put = try kv_entries.Put.encodeInto(&buf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = 1_000, .condition = .always, .cas_version = null });
     _ = try shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, put);
     try std.testing.expect(shard.applyCommitted());
-    try std.testing.expect(shard.kv_handler.kv.get("k") != null);
+    try std.testing.expect(shard.kv_handler.kv.getIn(.default, "k") != null);
     ahead.ns += 2 * std.time.ns_per_s;
-    try std.testing.expect(shard.kv_handler.kv.get("k") == null);
+    try std.testing.expect(shard.kv_handler.kv.getIn(.default, "k") == null);
 }
 
 /// A lone shard answering one client over a socket pair; `client` is the
@@ -14197,14 +14198,14 @@ test "Shard: alone with sync durability, a write whose flush fails is not acked,
     const refused = try s.put(1, "k1", &buf);
     try std.testing.expectEqual(proto.StatusCode.unavailable, refused.getStatus());
     try std.testing.expect(std.mem.indexOf(u8, refused.data, "not on disk") != null);
-    try std.testing.expect(s.shard.kv_handler.kv.get("k1") == null);
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") == null);
 
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(s.segs_z, 0o700));
     const acked = try s.put(2, "k2", &buf);
     try std.testing.expectEqual(proto.StatusCode.ok, acked.getStatus());
     // The refused write was in the log; it reached disk with this one.
-    try std.testing.expect(s.shard.kv_handler.kv.get("k1") != null);
-    try std.testing.expect(s.shard.kv_handler.kv.get("k2") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k1") != null);
+    try std.testing.expect(s.shard.kv_handler.kv.getIn(.default, "k2") != null);
 }
 
 test "Shard: an entry the writer could not buffer is buffered again from the log before the flush" {
@@ -18489,6 +18490,16 @@ test "Shard: action.status for a run on another shard goes there, by the run id'
     try std.testing.expectEqual(@import("../protocol/action_ops.zig").RunStatus.pending, s.status);
 }
 
+/// For tests: "k" in "default", as state and a single-key entry keep it.
+const TEST_KV_K = ns_table.DEFAULT.bytes() ++ "k";
+
+/// For tests: `raw` in "default", as state and a single-key entry keep it.
+fn testKvKey(buf: *[limits.MAX_KV_KEY]u8, raw: []const u8) []const u8 {
+    return kv_state.Key.init(buf, .default, raw).stored;
+}
+
+const HandlerOutcome = handler_mod.NamespaceHandler.CreateOutcome;
+
 test "Shard: a follower and the leader publish the same live key count for the same KV entries, down to 0" {
     var t: FollowerTest = undefined;
     try t.init();
@@ -18508,21 +18519,27 @@ test "Shard: a follower and the leader publish the same live key count for the s
     t.shard.setMetricsRegistry(&follower_metrics);
     leader.setMetricsRegistry(&leader_metrics);
 
+    // Each shard knows "orders", as its log would make it known, by the
+    // same id: the metrics name a namespace from the id its keys carry.
+    try std.testing.expectEqual(HandlerOutcome.created, t.shard.namespace_handler.applyCreate("orders"));
+    try std.testing.expectEqual(HandlerOutcome.created, leader.namespace_handler.applyCreate("orders"));
+    const orders = t.shard.namespace_handler.idOf("orders").?;
+    try std.testing.expectEqual(orders, leader.namespace_handler.idOf("orders").?);
     const txn = @import("../kv/txn.zig");
-    const batch = try txn.encodeBatch(std.testing.allocator, &.{
-        .{ .kind = .put, .key = @constCast("orders\x00c"), .value = @constCast("v"), .ttl_ms = 0 },
-        .{ .kind = .delete, .key = @constCast("orders\x00a"), .value = @constCast(""), .ttl_ms = 0 },
+    const batch = try txn.encodeBatch(std.testing.allocator, orders, &.{
+        .{ .kind = .put, .key = @constCast("c"), .value = @constCast("v"), .ttl_ms = 0 },
+        .{ .kind = .delete, .key = @constCast("a"), .value = @constCast(""), .ttl_ms = 0 },
     });
     defer std.testing.allocator.free(batch);
     const Op = union(enum) { put: []const u8, delete: []const u8, batch };
     // Each run of entries, then the count published after it.
     const runs = [_]struct { ops: []const Op, keys: u64 }{
         // Put a, put b, delete a missing key, delete a, put a again.
-        .{ .ops = &.{ .{ .put = "orders\x00a" }, .{ .put = "orders\x00b" }, .{ .delete = "orders\x00missing" }, .{ .delete = "orders\x00a" }, .{ .put = "orders\x00a" } }, .keys = 2 },
+        .{ .ops = &.{ .{ .put = "a" }, .{ .put = "b" }, .{ .delete = "missing" }, .{ .delete = "a" }, .{ .put = "a" } }, .keys = 2 },
         // A batch: put c, delete a.
         .{ .ops = &.{.batch}, .keys = 2 },
         // Every key gone: the published count goes to 0, not left where it was.
-        .{ .ops = &.{ .{ .delete = "orders\x00b" }, .{ .delete = "orders\x00c" } }, .keys = 0 },
+        .{ .ops = &.{ .{ .delete = "b" }, .{ .delete = "c" } }, .keys = 0 },
     };
     var indices = [2]u64{ t.shard.raft_node.last_applied, leader.raft_node.last_applied };
     for (runs) |run| {
@@ -18530,10 +18547,11 @@ test "Shard: a follower and the leader publish the same live key count for the s
             for (run.ops) |op| {
                 index.* += 1;
                 var buf: [64]u8 = undefined;
+                var kb: [limits.MAX_KV_KEY]u8 = undefined;
                 const term = shard.raft_node.current_term;
                 const e = switch (op) {
-                    .put => |key| entry_mod.buildEntry(.kv_put, 0, term, index.*, 1, try kv_entries.Put.encodeInto(&buf, .{ .key = key, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null })),
-                    .delete => |key| entry_mod.buildEntry(.kv_delete, 0, term, index.*, 1, try kv_entries.Delete.encodeInto(&buf, .{ .key = key, .cas_version = null })),
+                    .put => |key| entry_mod.buildEntry(.kv_put, 0, term, index.*, 1, try kv_entries.Put.encodeInto(&buf, .{ .key = kv_state.Key.init(&kb, orders, key).stored, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null })),
+                    .delete => |key| entry_mod.buildEntry(.kv_delete, 0, term, index.*, 1, try kv_entries.Delete.encodeInto(&buf, .{ .key = kv_state.Key.init(&kb, orders, key).stored, .cas_version = null })),
                     .batch => entry_mod.buildEntry(.kv_batch, 0, term, index.*, 1, batch),
                 };
                 var out = persistence_mod.Result.start(&e);
@@ -18554,14 +18572,14 @@ test "Shard: a diverged member applies nothing more, and its reads say they are 
     try std.testing.expect(t.shard.applyCommitted());
     try ParkTest.joinPeer(&t.shard);
     var pbuf: [64]u8 = undefined;
-    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v1", .ttl_ms = null, .condition = .always, .cas_version = null }));
+    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "v1", .ttl_ms = null, .condition = .always, .cas_version = null }));
     try ParkTest.ack(&t.shard);
     const frozen = raft.last_applied;
     var buf: [512]u8 = undefined;
     try std.testing.expectEqual(@as(u8, 0), (try t.ask(.cluster_status, "", &buf)).header.flags & proto.RESPONSE_STALE);
 
     // Diverged, then entries keep committing: none applies.
-    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v2", .ttl_ms = null, .condition = .always, .cas_version = null }));
+    _ = try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "v2", .ttl_ms = null, .condition = .always, .cas_version = null }));
     t.shard.replica.markDiverged(2, raft.current_term);
     const last = raft.log.lastIndex();
     raft.commit_index = last;
@@ -18583,7 +18601,7 @@ test "Shard: a repair skip runs only from the admin socket, on a leader halted a
     var ids: [8]u32 = undefined;
 
     var pbuf: [64]u8 = undefined;
-    const applied = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }))).index;
+    const applied = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }))).index;
     try ParkTest.ack(&t.shard);
     // An entry every replica fails: the leader halts at it once it commits.
     const h = (try raft.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
@@ -18647,7 +18665,7 @@ test "Shard: a leader that applied the entry its followers halted at says to upg
     try ParkTest.joinPeer(&t.shard);
     var buf: [1024]u8 = undefined;
     var pbuf: [64]u8 = undefined;
-    const h = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }))).index;
+    const h = (try raft.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }))).index;
     try ParkTest.ack(&t.shard);
     var ebuf: [512]u8 = undefined;
     const e = raft.log.getEntryCopy(h, &ebuf).?;
@@ -18725,13 +18743,13 @@ test "applyEntryCore: a KV entry delivered twice applies once" {
     part.wireProjections();
     var registry: ReplayRegistry = .{};
     var buf: [64]u8 = undefined;
-    const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
+    const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(&buf, .{ .key = TEST_KV_K, .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null }));
     for (0..2) |_| {
         var out: persistence_mod.Result = .{};
         out.reset(&e);
         try std.testing.expect(applyEntryCore(&part, &registry, &e, &out) == .applied);
     }
-    try std.testing.expectEqual(@as(u64, 1), part.kv.get("k").?.version);
+    try std.testing.expectEqual(@as(u64, 1), part.kv.getIn(.default, "k").?.version);
 }
 
 // ─── The edge ────────────────────────────────────────────────────────────

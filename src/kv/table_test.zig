@@ -9,7 +9,6 @@ const kv_ops = @import("../protocol/kv_ops.zig");
 const router = @import("../node/router.zig");
 const table_run = @import("../node/table_run.zig");
 const txn_mod = @import("txn.zig");
-const ns_keys = @import("../namespace/handler.zig");
 const shard_mod = @import("../node/shard.zig");
 const Shard = shard_mod.Shard;
 const Connection = @import("../node/connection.zig").Connection;
@@ -169,8 +168,9 @@ fn expectRefused(resp: proto.Response, status: proto.StatusCode, reason: proto.R
     return r;
 }
 
-fn qualified(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, key: []const u8) []const u8 {
-    return ns_keys.qualifyKey(buf, "", key) catch unreachable;
+/// `key` in "default", as state keeps it.
+fn qualified(buf: *[@import("../protocol/limits.zig").MAX_KV_KEY]u8, key: []const u8) []const u8 {
+    return @import("state.zig").Key.init(buf, .default, key).stored;
 }
 
 test "kv table: a body that doesn't decode is refused unrun, naming its field and the bound it broke" {
@@ -204,7 +204,7 @@ test "kv table: a body that doesn't decode is refused unrun, naming its field an
     try testing.expectEqual(@as(u16, 0), h.shard.waiter_pool.countByKind(.kv_get));
     _ = h.send(set_op.code, "k", &.{0});
     _ = try expectRefused((try h.answer()).?, .bad_request, .malformed);
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try testing.expect(h.shard.defaultPartition().kv.get(qualified(&qbuf, "k")) == null);
 }
 
@@ -283,7 +283,7 @@ test "kv table: ttl_ms is written with the value, get answers when it runs out, 
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try expectSet(try h.set("t", setBody("v", .{ .ttl_ms = 60_000 })), 1);
     const e = h.shard.defaultPartition().kv.get(qualified(&qbuf, "t")).?;
     try testing.expectEqual(e.timestamp_ns + 60_000 * std.time.ns_per_ms, e.expiry_ns);
@@ -297,7 +297,7 @@ test "kv table: a waiting get answers the key's expiry too" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try testing.expect((try h.get("t", getBody(.{ .wait_ms = 5000 }))) == null);
     var buf: [1024]u8 = undefined;
     _ = h.send(set_op.code, "t", try set_op.request.encodeInto(&buf, setBody("v", .{ .ttl_ms = 60_000 })));
@@ -462,7 +462,7 @@ test "kv table: the longest value applies with the longest key and routing key, 
             try testing.expectEqualStrings("bad request: kv.set: value is longer than 253817 bytes", r.message);
         }
     }
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try testing.expectEqual(@as(usize, kv_ops.MAX_VALUE), h.shard.defaultPartition().kv.get(qualified(&qbuf, key)).?.value.len);
 }
 
@@ -509,7 +509,7 @@ test "kv ops: delete, incr, expire and exists in a transaction are buffered, and
     try h.no("kv.incr", "count", .{ .delta = 1, .routing_key = "other", .txn = txn }, .bad_request, .wrong_routing_key);
 
     try testing.expectEqual(@as(u16, 3), (try h.ok("kv.txn.commit", "", .{ .txn = txn })).ops);
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     const kv = &h.shard.defaultPartition().kv;
     try testing.expect(kv.get(qualified(&qbuf, "gone")) == null);
     try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, kv.get(qualified(&qbuf, "count")).?.value[0..8], .little));
@@ -538,7 +538,7 @@ test "kv ops: scan pages names by limit and cursor, under a prefix, without rese
     defer h.deinit();
     for ([_][]const u8{ "a1", "a2", "a3", "a4", "a5", "b1" }) |k| try expectSet(try h.set(k, setBody("v", .{})), 1);
     // Reserved keys only come from the server itself.
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try h.shard.defaultPartition().kv.putForTest(qualified(&qbuf, "_flo:x"), "v");
 
     var seen: [5][2]u8 = undefined;
@@ -572,7 +572,7 @@ test "kv ops: scan resumes after the last name it sent, so writes between pages 
     for ([_][]const u8{ "a1", "a2", "a3", "a4", "a5", "a6" }) |k| try expectSet(try h.set(k, setBody("v", .{})), 1);
     // Reserved keys only come from the server itself; one between names
     // doesn't cut a page short.
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try h.shard.defaultPartition().kv.putForTest(qualified(&qbuf, "_flo:x"), "v");
     try expectSet(try h.set("_e", setBody("v", .{})), 1);
     try expectSet(try h.set("_g", setBody("v", .{})), 1);
@@ -786,7 +786,7 @@ test "kv ops: expire sets a TTL from now, 0 clears it, and cas_version guards it
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     const kv = &h.shard.defaultPartition().kv;
     try expectSet(try h.set("k", setBody("v", .{})), 1);
     _ = try h.ok("kv.expire", "k", .{ .ttl_ms = 60_000, .cas_version = null, .routing_key = null, .txn = null });
@@ -857,7 +857,7 @@ test "kv ops: two json sets at different paths, both proposed before either appl
     h.shard.runRequest(h.conn, .{ .header = hd1, .namespace = "", .key = "doc", .value = p1 }, .client);
     h.conn.response_deferred = false;
     h.shard.runRequest(h.conn, .{ .header = hd2, .namespace = "", .key = "doc", .value = p2 }, .client);
-    var rq: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
+    var rq: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     try testing.expectEqualStrings("{\"a\":0,\"b\":0}", h.shard.kv_handler.kv.get(qualified(&rq, "doc")).?.value);
     h.shard.raft_node.markDurable(h.shard.raft_node.log.lastIndex());
     _ = h.shard.applyCommitted();

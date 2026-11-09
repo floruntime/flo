@@ -380,7 +380,7 @@ pub const Kv = struct {
             ops[n].cas_version = null;
         }
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0..n]) catch return null;
+        kv_entries.encodeBatch(&w, batch.ns, ops[0..n]) catch return null;
         return w.written();
     }
 
@@ -393,14 +393,14 @@ pub const Kv = struct {
         var it = batch.ops.iterator();
         while (it.next() catch return null) |op| : (n += 1) ops[n] = op;
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0 .. n / 2]) catch return null;
+        kv_entries.encodeBatch(&w, batch.ns, ops[0 .. n / 2]) catch return null;
         return w.written();
     }
 
-    /// The counter at `qkey` on this replica, 0 if there is none.
-    pub fn counter(self: *Kv, qkey: []const u8) i64 {
-        var kb: [kv_machine.MAX_KEY]u8 = undefined;
-        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(qkey))) orelse return 0;
+    /// The counter at stored key `stored` (`id ‖ key`) on this replica, 0
+    /// if there is none.
+    pub fn counter(self: *Kv, stored: []const u8) i64 {
+        const bytes = self.store.get(kv_machine.Values.ID, stored) orelse return 0;
         const current = kv_machine.Current.decode(bytes) catch return 0;
         if (current.tombstone or current.value.len != 8) return 0;
         return std.mem.readInt(i64, current.value[0..8], .little);
@@ -408,8 +408,8 @@ pub const Kv = struct {
 
     /// What `p` should be answered at `at_ns`, from the key as it stands.
     fn conditionHolds(self: *Kv, p: kv_entries.Put.Value, at_ns: u64) bool {
-        var kb: [kv_machine.MAX_KEY]u8 = undefined;
-        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(p.key)));
+        // A single-key entry carries its key as `kv.value` keeps it.
+        const bytes = self.store.get(kv_machine.Values.ID, p.key);
         const current: ?kv_machine.Current = if (bytes) |b| (kv_machine.Current.decode(b) catch null) else null;
         // Written out, not `expiredAt`: a bug there would be in both, and agree.
         const version: ?u64 = if (current) |c| (if (c.tombstone or (c.expiry_ns > 0 and c.expiry_ns <= at_ns)) null else c.version) else null;
@@ -1058,7 +1058,7 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     defer kv.deinit();
     try testing.expect(kv.store.strict_keys);
     var body_buf: [64]u8 = undefined;
-    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
     var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
     e.header.crc32c = e.computeCrc();
     const empty = kv.checksums();

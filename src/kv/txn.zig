@@ -300,12 +300,6 @@ pub const TxnTable = struct {
 // The commit's log entry
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// The batch's only field is its op list, so the list's encoding is the
-// whole payload.
-comptime {
-    std.debug.assert(kv_entries.Batch.field_list.len == 1 and kv_entries.Batch.field_list[0].T == kv_entries.BatchOps);
-}
-
 /// A commit's `kv.batch` payload for `ops`, allocated. An op that breaks
 /// its kind's rule is a bug in buffering, refused here rather than logged.
 pub fn encodeBatch(allocator: Allocator, ns: NamespaceId, ops: []const TxnOp) (error{ OutOfMemory, InvalidBatch } || schema.EncodeError)![]u8 {

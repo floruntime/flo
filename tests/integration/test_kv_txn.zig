@@ -15,6 +15,14 @@ const ual_entry = src.storage.ual.entry;
 const kv_entries = src.protocol.kv_entries;
 const schema = src.protocol.schema;
 
+/// `raw` in "default", as state and a single-key entry keep it.
+fn sk(buf: *[src.protocol.limits.MAX_KV_KEY]u8, raw: []const u8) []const u8 {
+    return src.kv.machine.Key.init(buf, .default, raw).stored;
+}
+
+/// One stored-key buffer for a test's keys: each is used before the next.
+var kb: [src.protocol.limits.MAX_KV_KEY]u8 = undefined;
+
 test "integration: kv_txn — table appends ops and drops cleanly" {
     var table = txn_mod.TxnTable.init(testing.allocator);
     defer table.deinit();
@@ -55,7 +63,7 @@ test "integration: kv_txn — batch payload round-trips through codec" {
     try table.appendOp(tid, .delete, "k3", "", 0, .always, null);
 
     const state = table.get(tid).?;
-    const payload = try txn_mod.encodeBatch(testing.allocator, state.ops.items);
+    const payload = try txn_mod.encodeBatch(testing.allocator, state.ns_id, state.ops.items);
     defer testing.allocator.free(payload);
     var diag: schema.Diagnostic = .{};
     const batch = try kv_entries.Batch.decodeAll(payload, &diag);
@@ -91,8 +99,8 @@ test "integration: kv_txn — state applies kv_batch atomically" {
     const kv = t.state();
 
     // Pre-existing state: a key that will be deleted, and a counter to incr.
-    try t.put("doomed", "old", 0);
-    try t.put("counter", &counterBytes(10), 0);
+    try t.put(sk(&kb, "doomed"), "old", 0);
+    try t.put(sk(&kb, "counter"), &counterBytes(10), 0);
 
     // Stage a 4-op batch: put, delete, incr, put-with-ttl.
     var ops: [4]txn_mod.TxnOp = undefined;
@@ -105,7 +113,7 @@ test "integration: kv_txn — state applies kv_batch atomically" {
     // A minute's TTL, counted from the batch's stamp.
     ops[3] = .{ .kind = .put, .key = @constCast("ephemeral"), .value = @constCast("temp"), .ttl_ms = 60_000 };
 
-    const payload = try txn_mod.encodeBatch(testing.allocator, &ops);
+    const payload = try txn_mod.encodeBatch(testing.allocator, .default, &ops);
     defer testing.allocator.free(payload);
 
     const entry = ual_entry.buildEntry(.kv_batch, 0, 1, 100, 12345, payload);
@@ -115,21 +123,21 @@ test "integration: kv_txn — state applies kv_batch atomically" {
     try testing.expectEqual(@as(?u16, 4), r.int(u16));
 
     // Verify final state.
-    try testing.expect(kv.get("doomed") == null); // deleted
+    try testing.expect(kv.get(sk(&kb, "doomed")) == null); // deleted
     {
-        const e = kv.get("alice").?;
+        const e = kv.get(sk(&kb, "alice")).?;
         try testing.expectEqualStrings("100", e.value);
         try testing.expectEqual(@as(u64, 100), e.lsn);
     }
     {
-        const e = kv.get("counter").?;
+        const e = kv.get(sk(&kb, "counter")).?;
         try testing.expectEqual(@as(usize, 8), e.value.len);
         const v = std.mem.readInt(i64, e.value[0..8], .little);
         try testing.expectEqual(@as(i64, 17), v); // 10 + 7
     }
     {
         // Raw: the stamp is long past by the wall clock a read judges by.
-        const e = kv.getRaw("ephemeral").?;
+        const e = kv.getRaw(sk(&kb, "ephemeral")).?;
         try testing.expectEqualStrings("temp", e.value);
         try testing.expectEqual(@as(u64, 12345 + 60 * std.time.ns_per_s), e.expiry_ns);
     }
