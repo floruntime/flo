@@ -7996,6 +7996,26 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     try std.testing.expect(std.mem.indexOf(u8, answer.data, value) != null);
 }
 
+test "Shard: a stream read held on a disk read answers retryable unavailable, ran=no, if it isn't back in time" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .stream_disk_read, .reply_to = c.conn.replyTo(), .request_id = 9, .key = "s", .timeout_ms = 1 }));
+    shard.waiter_pool.waiters[0].expires_at_ms = 0;
+    shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
+    // Never an empty answer that would look like the end of the stream.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
+}
+
 test "Shard: a KV watch that times out answers the value still there, and a wait on a missing key answers not found" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
