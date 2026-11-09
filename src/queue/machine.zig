@@ -957,3 +957,22 @@ test "queue machine: a replica that replays the log holds the same state" {
     try t.replayInto(&other);
     try testing.expectEqual(t.sums(), other.sums());
 }
+
+test "queue machine: a ready message costs its payload and a fixed few hundred bytes" {
+    const store_mod = @import("../contract/store.zig");
+    var m = emptyMsgForTest();
+    const fixed = try Msg.encodedSize(m);
+    const hundred: [100]u8 = @splat(0x78);
+    m.payload = &hundred;
+    try testing.expectEqual(fixed + 100, try Msg.encodedSize(m));
+    // Its record and its ready key's, each a key, a value and a record.
+    var rb: [M.MAX_KEY]u8 = undefined;
+    const ready_key = 4 + M.readyKeyOf(&rb, m, 0, &idOf(hashOf("q"), 1)).len;
+    const per_message = fixed + (4 + qe.ID_LEN) + ready_key + 2 * (@sizeOf(store_mod.Record) + store_mod.RECORD_OVERHEAD);
+    // 309 bytes on a 64-bit build: 104 encoded, a 41-byte ready key, two 64-byte records.
+    try testing.expect(per_message < 400);
+}
+
+fn emptyMsgForTest() Msg.Value {
+    return .{ .queue = "01234567", .priority = 0, .status = .ready, .payload = "", .enqueued_ns = 0, .due_ns = 0, .deliveries = 0, .failures = 0, .holder = "", .request_key = null, .token = .{ .term = 0, .index = 0 }, .lease_ms = 0, .delivered_ns = 0, .expiry_ns = 0, .ended = .none, .started_ns = 0, .@"error" = "", .dead_ns = 0 };
+}
