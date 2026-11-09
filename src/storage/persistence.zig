@@ -247,6 +247,12 @@ pub fn proposeEntry(
     if (key.len > MAX_ENTRY_KEY) return error.KeyTooLarge;
     // A write runs once its namespace is known here (`prepareWrite`):
     // published, or, on shard 0, proposed ahead of it.
+    // This resolves the name a second time, after the edge resolved it
+    // into the request's id. Both reads agree because the table and the
+    // shard's maps only grow: nothing deletes a namespace or gives its
+    // name another id. (A leader's pending creates are dropped only when
+    // it stops leading, and then it proposes nothing.) A namespace delete
+    // would have to stamp from the request's id instead.
     const ns_id = shard.namespaceId(namespace);
     return proposeEntryIn(shard, entry_type, flags, ns_id, key, value);
 }
