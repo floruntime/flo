@@ -39,6 +39,9 @@ pub const Flag = enum(u5) {
     /// A read the bulk I/O thread made for this shard is back: the next
     /// pump sends it.
     catch_up_read,
+    /// A stream payload read from disk is back: reads held on it are made
+    /// again.
+    stream_disk_read,
 
     pub fn bit(self: Flag) u32 {
         return @as(u32, 1) << @backingInt(self);

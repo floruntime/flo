@@ -107,6 +107,7 @@ const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
 const DurableLog = durable_log_mod.DurableLog;
 const CatchUp = @import("catch_up.zig").CatchUp;
+const DiskReads = @import("../stream/disk_reads.zig").DiskReads;
 const BulkIo = @import("../storage/bulk_io.zig").BulkIo;
 const raft_log_mod = @import("../raft/log.zig");
 const RaftLog = raft_log_mod.RaftLog;
@@ -398,6 +399,8 @@ pub const Shard = struct {
     /// Reads below the ring, a leader's for its peers made off this thread
     /// once the node's bulk I/O thread is attached (null if ephemeral).
     catch_up: ?*CatchUp = null,
+    /// Stream payloads read back from sealed segments.
+    stream_disk: ?*DiskReads = null,
 
     /// Count of segment flush failures. Surfaced instead of being silently
     /// swallowed so disk-full / IO faults are observable.
@@ -1042,6 +1045,16 @@ pub const Shard = struct {
             cu.deinit();
             allocator.destroy(cu);
         };
+        var stream_disk: ?*DiskReads = null;
+        errdefer if (stream_disk) |d| {
+            d.deinit();
+            allocator.destroy(d);
+        };
+        if (durable_log) |dl| {
+            const d = try allocator.create(DiskReads);
+            d.* = DiskReads.init(allocator, dl, &raft_node.log);
+            stream_disk = d;
+        }
         if (durable_log) |dl| {
             const cu = try allocator.create(CatchUp);
             cu.* = CatchUp.init(allocator, dl, RPC_MAX_ENTRIES, RPC_BATCH_BYTES);
@@ -1157,6 +1170,7 @@ pub const Shard = struct {
             .segment_writer = seg_writer,
             .durable_log = durable_log,
             .catch_up = catch_up,
+            .stream_disk = stream_disk,
             .persist_failures = 0,
             .durability = durability,
             .shard_data_dir = shard_data_dir,
@@ -1214,6 +1228,7 @@ pub const Shard = struct {
         self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
         self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
+        self.stream_handler.disk = self.stream_disk;
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
     }
@@ -1388,6 +1403,10 @@ pub const Shard = struct {
         if (self.catch_up) |cu| {
             cu.deinit();
             self.allocator.destroy(cu);
+        }
+        if (self.stream_disk) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
         }
         if (self.durable_log) |dl| {
             dl.deinit();
@@ -2560,6 +2579,7 @@ pub const Shard = struct {
         const flags = self.mailbox.wake.take();
         if (flags & mailbox_mod.Flag.stream_appended.bit() != 0) self.workflow_handler.triggers_dirty = true;
         if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) ActionsHandler.wakeFromPeer(self);
+        if (flags & mailbox_mod.Flag.stream_disk_read.bit() != 0) self.streamDiskReadsBack();
 
         var buf: [64]InboxMessage = undefined;
         while (true) {
@@ -4396,9 +4416,23 @@ pub const Shard = struct {
     /// From now on a leader reads sealed segments for its peers on `bulk`,
     /// which must outlive this shard's thread.
     pub fn attachBulkIo(self: *Shard, bulk: *BulkIo) void {
+        if (self.stream_disk) |d| {
+            d.bulk = bulk;
+            d.notify = .{ .ctx = self.mailbox, .done = streamDiskReadDone };
+        }
         const cu = self.catch_up orelse return;
         cu.bulk = bulk;
         cu.notify = .{ .ctx = self.mailbox, .done = catchUpReadDone };
+    }
+
+    /// Stream payloads read from disk are back: the reads held on them are
+    /// made again.
+    fn streamDiskReadsBack(self: *Shard) void {
+        const d = self.stream_disk orelse return;
+        if (!d.drain()) return;
+        self.waiter_pool.notifyAny(.stream_disk_read, resolveStreamWaiter, @ptrCast(self));
+        // A blocking read parked for new appends may have met one too.
+        self.waiter_pool.notifyAny(.stream_read, resolveStreamWaiter, @ptrCast(self));
     }
 
     fn stoppedLeading(self: *Shard, message: []const u8) void {
@@ -6652,10 +6686,15 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         .stream_read, .stream_group_read => {
             shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
         },
+        // Its payloads weren't back from disk in time: retryable, never a
+        // short answer that looks complete.
+        .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_REFUSAL)),
         // No task in time: `{task: none}`, the optional's absent byte.
         .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
     }
 }
+
+pub const DISK_READ_REFUSAL = "unavailable: the stream's records are being read from disk and weren't back in time — retry";
 
 /// KV waiter resolver: look up the key in the KV projection and send the value
 /// if version > min_version. Returns true if waiter was satisfied.
@@ -6705,6 +6744,14 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     var buf: [StreamHandler.MAX_READ_BATCH]@import("../projection/stream.zig").StreamRecord = undefined;
     const records, const result = handler.readReadable(window, &buf);
     defer handler.freeResult(result);
+    if (result == .pending) switch (handler.held) {
+        // Still being read from disk: held until it is back.
+        .pending => return false,
+        else => {
+            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_REFUSAL));
+            return true;
+        },
+    };
     if (records.len == 0) {
         // Everything up to the stream's last id (or `end`) was scanned and none
         // of it is in the window; ids only grow, so the next wake starts there
@@ -6816,6 +6863,12 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
             log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         }
     };
+}
+
+/// A stream payload the bulk I/O thread read for this shard is back.
+fn streamDiskReadDone(ctx: *anyopaque) void {
+    const mailbox: *Mailbox = @ptrCast(@alignCast(ctx));
+    mailbox.wake.set(.stream_disk_read);
 }
 
 /// A read the bulk I/O thread made for this shard is back.
@@ -12920,6 +12973,53 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
         try std.testing.expectEqual(@as(u64, 0), first_id.sequence);
         try std.testing.expectEqual(@as(u64, 0), last_id.sequence);
     }
+}
+
+test "Shard: a stream record past the hot ring and the warm store is read back from its segment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    // A small hot ring, and a warm store that keeps almost nothing.
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, 64 * 1024, 0, 0, .sync, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    shard.defaultPartition().setWarmBudget(4096);
+
+    // One record per append: [count][len][payload][header_count].
+    var batch: [4 + 4 + 2048 + 2]u8 = undefined;
+    std.mem.writeInt(u32, batch[0..4], 1, .little);
+    std.mem.writeInt(u32, batch[4..8], 2048, .little);
+    @memset(batch[8 .. 8 + 2048], 'r');
+    std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
+    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
+    defer std.testing.allocator.free(v);
+    const APPENDS = 100;
+    for (0..APPENDS) |i| {
+        _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+        try std.testing.expect(shard.applyCommitted());
+        if (i % 10 == 9) try shard.flushSegmentToDisk();
+    }
+    try shard.flushSegmentToDisk();
+
+    // From the start: every record, the first ones read back from disk (no
+    // bulk thread here, so in place), none skipped.
+    const handler = shard.stream_handler;
+    var window: waiter_pool_mod.StreamWindow = .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = 10 };
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    const records, const result = handler.readReadable(&window, &buf);
+    defer handler.freeResult(result);
+    try std.testing.expectEqual(@as(usize, 10), records.len);
+    try std.testing.expect(result == .stream_messages);
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, result.stream_messages.data[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
+    // The first record's tier byte says disk: after the count, sequence
+    // and timestamp.
+    try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
 }
 
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {

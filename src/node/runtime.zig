@@ -973,8 +973,9 @@ pub const Runtime = struct {
             }
         }
 
-        // 3.6. The bulk I/O thread, before any shard can ask it for a read.
-        if (self.raft_network != null) {
+        // 3.6. The bulk I/O thread, before any shard can ask it for a read:
+        // a leader's catch-up reads, and stream payloads read back from disk.
+        {
             const bulk = try self.allocator.create(BulkIo);
             errdefer self.allocator.destroy(bulk);
             bulk.* = try BulkIo.init(self.allocator);

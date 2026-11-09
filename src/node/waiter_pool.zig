@@ -99,6 +99,10 @@ pub const WaiterKind = enum(u8) {
 
     /// Stream group read — blocks until new messages arrive for a consumer group.
     stream_group_read,
+
+    /// A stream read whose payloads are being read back from disk: made
+    /// again once they are, and refused retryable if they aren't in time.
+    stream_disk_read,
 };
 
 /// The window a parked stream read covers: records of one stream strictly

@@ -227,6 +227,18 @@ pub const OpCode = enum(u16) {
 };
 
 /// Status codes for responses
+/// Where a stream record's payload was read from, the tier byte of each
+/// record a read returns. In the op table, so every SDK decodes the same
+/// values: hand-kept copies drifted from the server's.
+pub const StorageTier = enum(u8) {
+    /// The hot ring of recent appends.
+    hot = 0,
+    /// The warm store, past the ring.
+    warm = 1,
+    /// The sealed segment it was flushed to, past both.
+    disk = 2,
+};
+
 pub const StatusCode = enum(u8) {
     ok = 0,
     error_generic = 1,
