@@ -8,6 +8,7 @@
 //!   flo queue ack <queue> <delivery>...
 //!   flo queue nack <queue> <delivery>... [--delay <ms>] [--dlq] [--error <text>]
 //!   flo queue touch <queue> <delivery>...
+//!   flo queue purge <queue>             - Remove every message, dead letters too
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -141,6 +142,13 @@ pub fn createQueueCommand(allocator: Allocator) !*commander.Command {
                     .arg("seq", "Sequence number(s)")
                     .action(wrapHandler(runDlqRequeue)),
             ),
+        )
+        .subcommand(
+            commander.newBuilder(allocator)
+                .name("purge")
+                .about("Remove every message from a queue, ready, leased and dead")
+                .arg("queue", "Queue name")
+                .action(wrapHandler(runPurge)),
         )
         .subcommand(
         commander.newBuilder(allocator)
@@ -402,6 +410,25 @@ fn runDlqRequeue(ctx: *commander.Context) commander.Error!void {
     try outcome.check(ctx, result);
 
     ctx.print("Requeued: seq={d}\n", .{seq});
+}
+
+fn runPurge(ctx: *commander.Context) commander.Error!void {
+    const queue = ctx.getPositional("queue").?; // validated by commander
+    const namespace = cli_config.getNamespace(ctx);
+    const endpoint = cli_config.getEndpoint(ctx);
+
+    var client = Client.init(ctx.allocator, endpoint);
+    defer client.deinit();
+
+    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
+
+    var result = client_mod.queue.purge(&client, namespace, queue) catch |err| return outcome.requestFailed(ctx, err);
+    defer result.deinit();
+
+    try outcome.check(ctx, result);
+
+    if (result.data.len != 4) return outcome.malformed(ctx, "purge answer");
+    ctx.print("Purged: {d}\n", .{std.mem.readInt(u32, result.data[0..4], .little)});
 }
 
 // ==================== Testing ====================

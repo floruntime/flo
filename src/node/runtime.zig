@@ -119,6 +119,9 @@ pub const RuntimeConfig = struct {
     worker_heartbeat_timeout_ms: u64 = 90_000,
     max_txn_ops: u16 = @import("../protocol/limits.zig").DEFAULT_MAX_OPS_PER_TXN,
     max_txn_bytes: u32 = @import("../protocol/limits.zig").DEFAULT_MAX_BYTES_PER_TXN,
+    /// What queues may hold (`[queues]`), stamped into the enqueues this
+    /// node proposes when it leads.
+    queue_caps: @import("../queue/handler.zig").Caps = .{},
     /// How many client connections the node holds at once. 0 derives it from
     /// the open-file limit (limit minus a reserve, capped for memory); a set
     /// value is used as given. Over it, a new connection is accepted and closed
@@ -846,6 +849,7 @@ pub const Runtime = struct {
             shards[i].worker_handler.heartbeat_timeout_ms = self.config.worker_heartbeat_timeout_ms;
             shards[i].kv_handler.txn_table.max_ops = self.config.max_txn_ops;
             shards[i].kv_handler.txn_table.max_bytes = self.config.max_txn_bytes;
+            shards[i].queue_handler.caps = self.config.queue_caps;
             shards[i].worker_handler.remove_after_ms = self.config.worker_remove_after_ms;
             shards[i].actions_handler.missing_action_wait_ms = self.config.missing_action_wait_ms;
             shards[i].registerBackgroundTasks();

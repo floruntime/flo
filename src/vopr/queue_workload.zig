@@ -79,6 +79,21 @@ fn enqueue(q: *families.Queues, out: []u8, r: std.Random, queue: []const u8, tag
     var payload_buf: [64]u8 = undefined;
     @memcpy(payload_buf[0..tag.len], tag);
     @memset(payload_buf[tag.len..], '.');
+    const payload = payload_buf[0 .. tag.len + r.uintLessThan(usize, 40)];
+    // Mostly the default caps; now and then one at the edge, by the
+    // leader's own state: exactly full, so the message is refused, or one
+    // short, so it just fits. The leader's state can lag, so either may
+    // land on the other side; apply decides.
+    const n = held(q, queue);
+    const bytes: u64 = if (q.meta(NS, qm.hashOf(queue))) |m| m.held_bytes else 0;
+    const edge = r.boolean();
+    var caps: struct { messages: u32, bytes: u64, shard: u64 } = .{ .messages = qe.DEFAULT_MAX_MESSAGES, .bytes = qe.DEFAULT_MAX_BYTES, .shard = qe.DEFAULT_SHARD_HELD_BYTES };
+    switch (r.uintLessThan(u8, 10)) {
+        0 => caps.messages = @intCast(n + @intFromBool(edge)),
+        1 => caps.bytes = bytes + payload.len - @intFromBool(!edge),
+        2 => caps.shard = q.shardHeld() + payload.len - @intFromBool(!edge),
+        else => {},
+    }
     const p = try qe.Enqueue.encodeInto(out, .{
         .ns = NS.int(),
         .queue = queue,
@@ -86,7 +101,10 @@ fn enqueue(q: *families.Queues, out: []u8, r: std.Random, queue: []const u8, tag
         // A few held back, so a priority's head is sometimes not due.
         .delay_ms = if (r.uintLessThan(u8, 5) == 0) r.uintLessThan(u64, 4_000) else 0,
         // Of varied length, so a deliver's byte budget stops it short.
-        .payload = payload_buf[0 .. tag.len + r.uintLessThan(usize, 40)],
+        .payload = payload,
+        .max_messages = caps.messages,
+        .max_bytes = caps.bytes,
+        .shard_held_bytes = caps.shard,
     });
     return .{ .entry_type = .queue_enqueue, .payload = p };
 }

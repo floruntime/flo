@@ -13,7 +13,12 @@
 //! - an expire ends only a lease whose deadline it names, past due;
 //! - every ready, leased and dead message has its key, and a queue's
 //!   counts are what its families hold;
-//! - a purge leaves its queue empty.
+//! - a purge leaves its queue empty;
+//! - an enqueue is refused exactly when its queue's messages or payload
+//!   bytes, or its shard's, would pass the caps the entry carries, and
+//!   one that applies leaves them within those caps;
+//! - a queue's held bytes are its messages' payloads, and the shard's are
+//!   every queue's.
 
 const std = @import("std");
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -38,8 +43,8 @@ pub const Queues = struct {
     /// A mutant's rewritten payload.
     rewrite: []u8,
 
-    pub const FAMILIES = [_]u16{ qm.Metas.ID, qm.Msgs.ID, qm.Dead.ID, qm.Ready.ID, qm.Deadlines.ID };
-    pub const NAMES = [_][]const u8{ "queue.meta", "queue.msg", "queue.dead", "queue.ready", "queue.deadline" };
+    pub const FAMILIES = [_]u16{ qm.Metas.ID, qm.Msgs.ID, qm.Dead.ID, qm.Ready.ID, qm.Deadlines.ID, qm.Helds.ID };
+    pub const NAMES = [_][]const u8{ "queue.meta", "queue.msg", "queue.dead", "queue.ready", "queue.deadline", "queue.held" };
 
     pub const Kind = enum { enqueue, deliver, settle, release, extend, expire, purge };
 
@@ -120,6 +125,12 @@ pub const Queues = struct {
         return if (got) |m| m.v else null;
     }
 
+    /// The payload bytes every queue holds.
+    pub fn shardHeld(self: *Queues) u64 {
+        const bytes = self.store.get(qm.Helds.ID, qm.HELD_KEY) orelse return 0;
+        return (qm.Helds.Value.decode(bytes) catch return 0).v.bytes;
+    }
+
     pub fn meta(self: *Queues, ns: NamespaceId, hash: [8]u8) ?qm.Meta.Value {
         var b: [12]u8 = undefined;
         const got = self.read().get(qm.Metas, qm.storeKey(&b, ns, &hash)) catch return null;
@@ -146,11 +157,18 @@ pub const Queues = struct {
         /// Each message's payload length: a deliver's byte budget counts it.
         sizes: std.AutoArrayHashMapUnmanaged(u64, usize) = .empty,
         dead_lettered: u64 = 0,
+        held: u64 = 0,
+        held_bytes: u64 = 0,
+        shard_held: u64 = 0,
     };
 
     fn snapshot(self: *Queues, a: Allocator, ns: NamespaceId, hash: [8]u8) Allocator.Error!Snapshot {
-        var s: Snapshot = .{ .ns = ns, .hash = hash };
-        if (self.meta(ns, hash)) |m| s.dead_lettered = m.dead_lettered;
+        var s: Snapshot = .{ .ns = ns, .hash = hash, .shard_held = self.shardHeld() };
+        if (self.meta(ns, hash)) |m| {
+            s.dead_lettered = m.dead_lettered;
+            s.held = m.ready + m.leased + m.dead;
+            s.held_bytes = m.held_bytes;
+        }
         var pb: [12]u8 = undefined;
         var it = self.read().range(qm.Msgs, qm.storeKey(&pb, ns, &hash));
         while (it.next() catch null) |item| {
@@ -207,8 +225,15 @@ pub const Queues = struct {
         try machine_mod.applyEntry(&qm.machine, &self.store, &self.scratch, &applied, &out);
         if (out.refused() != null) {
             if (!std.mem.eql(u64, &before, &self.commits())) return error.RefusalChangedState;
-            // The machine refuses only an enqueue to a name whose hash slot
-            // holds another name, which the workload never sends.
+            // Past its caps, as the entry was proposed, an enqueue is
+            // refused. The machine refuses nothing else the workload sends:
+            // never a name whose hash slot holds another.
+            if (kind == .enqueue) {
+                const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return error.Halt;
+                const s = snaps.items[0];
+                if (over(p, s)) return .{ .kind = kind, .refused = true };
+                return .{ .kind = kind, .refused = true, .broke = "an enqueue within its caps was refused" };
+            }
             return .{ .kind = kind, .refused = true, .broke = "the queue machine refused a workload entry" };
         }
         var effect: Effect = .{ .kind = kind, .refused = false };
@@ -217,7 +242,14 @@ pub const Queues = struct {
             effect.broke = why;
             break;
         };
+        if (effect.broke == null) effect.broke = self.ruleOfShard();
         return effect;
+    }
+
+    /// Whether `p` would take its queue or its shard past the caps it
+    /// carries, from where they stood.
+    fn over(p: qe.Enqueue.Value, s: Snapshot) bool {
+        return s.held + 1 > p.max_messages or s.held_bytes + p.payload.len > p.max_bytes or s.shard_held + p.payload.len > p.shard_held_bytes;
     }
 
     fn holds(m: Msg, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
@@ -248,6 +280,9 @@ pub const Queues = struct {
                 if (v.status != .ready or v.priority != p.priority or v.due_ns != after(stamp, p.delay_ms) or v.deliveries != 0 or v.failures != 0)
                     return "an enqueued message isn't ready at its delay with its priority";
                 if (s.msgs.contains(m.next_seq - 1)) return "an enqueue reused a seq";
+                if (over(p, s)) return "an enqueue past its caps applied";
+                if (m.ready + m.leased + m.dead > p.max_messages or m.held_bytes > p.max_bytes or self.shardHeld() > p.shard_held_bytes)
+                    return "an enqueue left its queue or its shard past the caps it carried";
             },
             .deliver => return self.checkDeliver(e, s, effect),
             .settle, .release, .extend => return self.checkReport(e, s, effect),
@@ -264,18 +299,12 @@ pub const Queues = struct {
                 }
                 for (snaps) |sn| {
                     var died: u64 = 0;
-                    var evicted: u64 = 0;
                     var it = sn.msgs.iterator();
                     while (it.next()) |kv| {
                         const pre = kv.value_ptr.*;
                         const seq = kv.key_ptr.*;
                         const due_item = namedDue(p.items, sn, seq, pre, stamp);
-                        const post = self.msg(sn.ns, sn.hash, seq) orelse {
-                            // Only the oldest dead go, past the cap.
-                            if (pre.status != .dead) return "an expire removed a message";
-                            evicted += 1;
-                            continue;
-                        };
+                        const post = self.msg(sn.ns, sn.hash, seq) orelse return "an expire removed a message";
                         if (pre.status == .leased and post.status != .leased) {
                             if (!due_item) return "an expire ended a lease none of its items named the deadline of";
                             if (post.failures != pre.failures + 1) return "a message's failures don't count the lease that expired";
@@ -291,7 +320,6 @@ pub const Queues = struct {
                             if (moved(pre, post)) return "an expire changed a message without ending its lease";
                         }
                     }
-                    if (evicted > died) return "an expire removed a dead message no death pushed past the cap";
                     if (self.meta(sn.ns, sn.hash)) |m| if (m.dead_lettered != sn.dead_lettered + died) return "a dead message isn't counted dead once";
                 }
             },
@@ -462,21 +490,13 @@ pub const Queues = struct {
             const m = self.meta(s.ns, s.hash) orelse return "a release left its queue with no meta";
             if (m.dead_lettered != s.dead_lettered + died) return "a dead message isn't counted dead once";
         }
-        // Every message it didn't name is as it was, but the oldest dead
-        // pushed out past the cap by one it killed.
-        var evicted: u64 = 0;
+        // Every message it didn't name is as it was.
         var rest = s.msgs.iterator();
         while (rest.next()) |kv| {
             if (named.contains(kv.key_ptr.*)) continue;
-            const pre = kv.value_ptr.*;
-            const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse {
-                if (pre.status != .dead) return "a report changed a message it didn't name";
-                evicted += 1;
-                continue;
-            };
-            if (moved(pre, post)) return "a report changed a message it didn't name";
+            const post = self.msg(s.ns, s.hash, kv.key_ptr.*) orelse return "a report changed a message it didn't name";
+            if (moved(kv.value_ptr.*, post)) return "a report changed a message it didn't name";
         }
-        if (evicted > died) return "a report removed a dead message no death pushed past the cap";
         return null;
     }
 
@@ -484,12 +504,14 @@ pub const Queues = struct {
     /// status says, spent ones are dead, and its counts are what it holds.
     fn ruleOfQueue(self: *Queues, ns: NamespaceId, hash: [8]u8) ?[]const u8 {
         var counts: [3]u64 = .{ 0, 0, 0 };
+        var bytes: u64 = 0;
         var pb: [12]u8 = undefined;
         var it = self.read().range(qm.Msgs, qm.storeKey(&pb, ns, &hash));
         while (it.next() catch null) |item| {
             const v = item.value.v;
             const id = item.key[4..];
             counts[@backingInt(v.status)] += 1;
+            bytes += v.payload.len;
             if (v.failures >= qe.MAX_ATTEMPTS and v.status != .dead) return "a message that spent its attempts isn't dead";
             var b: [64]u8 = undefined;
             var kb: [72]u8 = undefined;
@@ -504,6 +526,7 @@ pub const Queues = struct {
         }
         const m = self.meta(ns, hash) orelse return if (counts[0] + counts[1] + counts[2] == 0) null else "a queue holds messages but no meta";
         if (m.ready != counts[0] or m.leased != counts[1] or m.dead != counts[2]) return "a queue's counts aren't what it holds";
+        if (m.held_bytes != bytes) return "a queue's held bytes aren't its messages' payloads";
         // And no ready or dead key is left over from a message that moved on.
         var rb: [9]u8 = undefined;
         var rk: [16]u8 = undefined;
@@ -515,6 +538,15 @@ pub const Queues = struct {
         var di = self.read().range(qm.Dead, qm.storeKey(&pb, ns, &hash));
         while (di.next() catch null) |_| dead_keys += 1;
         if (dead_keys != counts[2]) return "a queue has a dead key no dead message holds";
+        return null;
+    }
+
+    /// The shard's held bytes are every queue's.
+    fn ruleOfShard(self: *Queues) ?[]const u8 {
+        var sum: u64 = 0;
+        var it = self.read().range(qm.Metas, "");
+        while (it.next() catch null) |item| sum += item.value.v.held_bytes;
+        if (sum != self.shardHeld()) return "the shard's held bytes aren't its queues' held bytes";
         return null;
     }
 
@@ -572,6 +604,14 @@ pub const Queues = struct {
                     try self.demote(s.ns, s.hash, kv.key_ptr.*);
                     break;
                 }
+            },
+            .queue_cap_unchecked => if (kind == .enqueue) {
+                // Caps so high nothing is ever refused.
+                var p = qe.Enqueue.decodeAll(e.payload, &diag) catch return error.Halt;
+                p.max_messages = std.math.maxInt(u32);
+                p.max_bytes = std.math.maxInt(u64);
+                p.shard_held_bytes = std.math.maxInt(u64);
+                out.payload = qe.Enqueue.encodeInto(self.rewrite, p) catch return error.Halt;
             },
             .queue_deliver_short => if (kind == .deliver) {
                 var p = qe.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;

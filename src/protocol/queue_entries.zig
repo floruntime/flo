@@ -35,8 +35,16 @@ pub const DEFAULT_LEASE_MS: u64 = 30 * 1000;
 pub const MAX_ATTEMPTS: u32 = 5;
 /// The longest an enqueue or a release may hold a message back.
 pub const MAX_DELAY_MS: u64 = ae.MAX_DELAY_MS;
-/// The most dead messages a queue keeps: past it, the oldest goes.
-pub const MAX_DEAD: u32 = 10_000;
+/// What a queue may hold, ready, leased and dead together, unless the
+/// node's settings say otherwise (`[queues]` in flo.toml), and the most
+/// they may say. Past it, an enqueue is refused; nothing held is dropped.
+pub const DEFAULT_MAX_MESSAGES: u32 = 100_000;
+pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_MAX_MESSAGES: u32 = 16 * 1024 * 1024;
+pub const MAX_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// The payload bytes all of a shard's queues may hold together.
+pub const DEFAULT_SHARD_HELD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_SHARD_HELD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_ERROR: u32 = 1024;
 /// A delivery's holder: the consumer the dequeue named, or none.
 pub const Holder = ae.Holder;
@@ -50,6 +58,12 @@ pub const Enqueue = Record(&.{
     .{ .name = "priority", .T = Int(u32) },
     .{ .name = "delay_ms", .T = schema.DurationMs(MAX_DELAY_MS) },
     .{ .name = "payload", .T = Bytes(MAX_MESSAGE) },
+    // The proposing leader's caps: apply refuses the message when its
+    // queue or its shard would hold more. Carried in the entry, so every
+    // replica decides alike whatever its own settings.
+    .{ .name = "max_messages", .T = Int(u32) },
+    .{ .name = "max_bytes", .T = Int(u64) },
+    .{ .name = "shard_held_bytes", .T = Int(u64) },
 });
 
 /// Up to `count` of the queue's due ready messages leased to `holder`.
