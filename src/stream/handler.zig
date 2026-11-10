@@ -466,7 +466,7 @@ pub const StreamHandler = struct {
         // Past its own cap, a cold read is refused rather than take waiter
         // slots KV watches and dequeues share.
         if (shard.stream_handler.held != .pending) {
-            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READ_BLOCKED));
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard.stream_handler.diskRefusal()));
         }
         if (shard.waiter_pool.countByKind(.stream_disk_read) >= MAX_DISK_HELD) {
             return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READS_FULL));
@@ -804,9 +804,16 @@ pub const StreamHandler = struct {
         }
     }
 
-    /// What a read refused for its disk reads is told.
-    fn diskRefusal(self: *const StreamHandler) []const u8 {
-        return if (self.held == .blocked) shard_mod.DISK_READ_BLOCKED else shard_mod.DISK_READ_PENDING;
+    /// What a read refused for its disk reads is told, by why.
+    pub fn diskRefusal(self: *const StreamHandler) []const u8 {
+        if (self.held != .blocked) return shard_mod.DISK_READ_PENDING;
+        const d = self.disk orelse return shard_mod.DISK_READ_BLOCKED;
+        return switch (d.last_block) {
+            .io => shard_mod.DISK_READ_BLOCKED,
+            .full => shard_mod.DISK_READ_CACHE_FULL,
+            .mismatch => shard_mod.DISK_READ_MISMATCH,
+            .unwritten => shard_mod.DISK_READ_UNWRITTEN,
+        };
     }
 
     /// Before a read: nothing held yet.

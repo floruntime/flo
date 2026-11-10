@@ -6859,6 +6859,9 @@ pub const DISK_READ_LATE = "unavailable: the stream's records are being read fro
 pub const DISK_READ_PENDING = "unavailable: the stream's records are being read from disk — retry";
 pub const DISK_READ_BLOCKED = "unavailable: the stream's records can't be read from disk right now (a resource or IO failure) — retry";
 pub const DISK_READS_FULL = "unavailable: too many reads are waiting on this shard's disk — retry";
+pub const DISK_READ_CACHE_FULL = "unavailable: the shard's cache of records read from disk is full of ones not yet served — retry";
+pub const DISK_READ_MISMATCH = "unavailable: the stream's records read from disk don't match the log; reading them again — retry";
+pub const DISK_READ_UNWRITTEN = "unavailable: the stream's records haven't reached the durable log yet — retry";
 
 /// KV waiter resolver: look up the key in the KV projection and send the value
 /// if version > min_version. Returns true if waiter was satisfied.
@@ -6912,7 +6915,7 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         // Still being read from disk: held until it is back.
         .pending => return false,
         else => {
-            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_BLOCKED));
+            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(handler.diskRefusal()));
             return true;
         },
     };
@@ -13695,6 +13698,7 @@ test "Shard: a cold walk of a stream interleaved with another reads every record
     defer bulk.deinit();
     try bulk.start();
     c.shard.attachBulkIo(&bulk);
+    c.shard.stream_disk.?.setOwner();
     defer bulk.stop();
     const handler = c.shard.stream_handler;
     var w = ColdStream.window(100);
@@ -13795,7 +13799,7 @@ test "Shard: a job on another shard's thread reads cold records by copy, once th
     try c.init(.async_flush, 100, 0, 10);
     defer c.deinit();
     // This thread owns the shard's disk cache; the job reads from another.
-    c.shard.stream_disk.?.owner = std.Thread.getCurrentId();
+    c.shard.stream_disk.?.setOwner();
     const Job = struct {
         fn poll(handler: *StreamHandler, out: *StreamHandler.PayloadRead) void {
             out.* = handler.readPayloadsForStream("s", "", StreamID.MIN, 10);
@@ -13822,6 +13826,85 @@ test "Shard: a job on another shard's thread reads cold records by copy, once th
     var all: [1]stream_mod.StreamRecord = undefined;
     _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
     try std.testing.expect(second.ids[0].eql(all[0].id));
+}
+
+/// One poll by a job on another thread: `handler.readPayloadsForStream`
+/// from that thread.
+fn pollElsewhere(handler: *StreamHandler, after: StreamID) !StreamHandler.PayloadRead {
+    const Job = struct {
+        fn poll(h: *StreamHandler, from: StreamID, out: *StreamHandler.PayloadRead) void {
+            out.* = h.readPayloadsForStream("s", "", from, 10);
+        }
+    };
+    var out: StreamHandler.PayloadRead = undefined;
+    const t = try std.Thread.spawn(.{}, Job.poll, .{ handler, after, &out });
+    t.join();
+    return out;
+}
+
+test "Shard: a job on another shard's thread skips records the log no longer holds, once the owner says so" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    c.shard.stream_disk.?.setOwner();
+    var all: [100]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    // The segments holding the first records are gone from the durable log.
+    const dropped_through = all[25].ual_index;
+    _ = try c.shard.durable_log.?.dropThrough(dropped_through);
+    // Whole segments go: the first record kept is the first in what's left.
+    const kept_from = (try c.shard.durable_log.?.segments())[0].first_index;
+    var first_kept: usize = 0;
+    while (all[first_kept].ual_index < kept_from) first_kept += 1;
+    try std.testing.expect(first_kept > 0);
+
+    // Each poll asks the owner about the record it stops at; the owner finds
+    // it not in the log and says so, and the next poll skips it.
+    var after = StreamID.MIN;
+    for (0..200) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, after);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        if (r.payloads.len > 0) {
+            try std.testing.expect(r.ids[0].eql(all[first_kept].id));
+            return;
+        }
+        after = r.last_id;
+        _ = c.shard.stream_disk.?.drain();
+    }
+    return error.NeverSkipped;
+}
+
+test "Shard: a job on another shard's thread waits out a blocked disk read rather than skip the record" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    const d = c.shard.stream_disk.?;
+    d.setOwner();
+    var all: [1]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    c.shard.durable_log.?.test_open_error = error.SystemResources;
+    // Asked, read and blocked; asked again while backing off: still not gone.
+    for (0..3) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        try std.testing.expectEqual(@as(usize, 0), r.payloads.len);
+        try std.testing.expect(r.last_id.eql(StreamID.MIN));
+        _ = d.drain();
+    }
+    try std.testing.expect(!d.isGone(all[0].ual_index));
+    // Readable again, it gets the record.
+    c.shard.durable_log.?.test_open_error = null;
+    d.blocked_until_ms = 0;
+    for (0..20) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        if (r.payloads.len > 0) {
+            try std.testing.expect(r.ids[0].eql(all[0].id));
+            return;
+        }
+        _ = d.drain();
+    }
+    return error.NeverServed;
 }
 
 test "Shard: a stream read whose disk read is blocked is refused at once, not held" {

@@ -39,7 +39,10 @@ pub const SLOTS = 8;
 /// Entries and payload bytes one read brings back: a run of the segment
 /// from the index asked for.
 pub const READ_ENTRIES = 256;
-pub const READ_BYTES = 1024 * 1024;
+/// At least the largest entry the log holds, or one could never land.
+pub const READ_BYTES = @max(1024 * 1024, @import("../protocol/limits.zig").MAX_LOG_ENTRY_PAYLOAD);
+/// Indices kept as not readable (absent from the durable log, or damaged).
+pub const MAX_GONE = 4096;
 pub const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 /// Pinned entries may take the cache past its budget up to this many times
 /// it. Past that a landing caches no more, and reads that need what it
@@ -58,9 +61,21 @@ pub const Want = enum {
     pending,
     /// Not in the durable log (below its first segment): the reader skips it.
     absent,
-    /// Can't be read right now (a resource or IO failure, or a result that
-    /// didn't match the log): the read is answered retryable at once.
+    /// Can't be read right now: the read is answered retryable at once,
+    /// saying why (`DiskReads.last_block`).
     blocked,
+};
+
+/// Why a want was answered blocked.
+pub const BlockReason = enum {
+    /// A resource or IO failure reading the durable log.
+    io,
+    /// The cache is full of entries pinned for readers not yet served.
+    full,
+    /// What was read doesn't match the log's terms.
+    mismatch,
+    /// A committed entry neither a sealed segment nor the writer holds yet.
+    unwritten,
 };
 
 /// What a reader wants landed: its stream (`router.nsNameKey` of its
@@ -86,7 +101,11 @@ const Slot = struct {
     fn add(self: *Slot, w: Window) void {
         for (self.wants[0..self.n_wants]) |*have| {
             if (std.mem.eql(u8, &have.stream, &w.stream) and have.from <= w.from) {
-                have.limit = @max(have.limit, w.limit);
+                // Its appends past `have.from`, through the end of `w`. An
+                // upper bound: the stream's appends between the two may be
+                // fewer than the indices between them.
+                const reach = w.from - have.from + w.limit;
+                have.limit = @intCast(@min(@max(@as(u64, have.limit), reach), std.math.maxInt(u32)));
                 return;
             }
         }
@@ -116,26 +135,32 @@ pub const DiskReads = struct {
     cache_bytes: usize = 0,
     cache_budget: usize = DEFAULT_CACHE_BYTES,
 
-    /// Held by `drain` while it lands and evicts, and by any read of the
-    /// cache from a thread other than the owner's.
+    /// Held while the cache, `gone` or `asked` change, and by any read of
+    /// them from a thread other than the owner's.
     mutex: stdx.Mutex = .{},
-    /// The owning shard's thread, once it runs; null in tests, where every
-    /// caller is the owner.
-    owner: ?std.Thread.Id = null,
+    /// The owning shard's thread, set as it starts (`setOwner`). Unset with
+    /// a bulk thread attached, no thread is the owner yet: another shard's
+    /// job takes the copy path. Unset with none (unit tests), every caller
+    /// is.
+    owner: std.atomic.Value(u64) = .init(0),
     /// Windows other threads asked for, taken by the owner's next drain.
     asked: [MAX_WANTS]Window = undefined,
     n_asked: usize = 0,
-    /// Indices other threads asked for that the durable log doesn't hold
-    /// (below its first segment), so their next read skips them.
-    gone: [MAX_WANTS]u64 = @splat(0),
-    gone_next: usize = 0,
+    /// Indices that won't be read: not in the durable log, or damaged.
+    /// Readers skip and count them, as before reads went to disk.
+    gone: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The in-place read's buffers, made once.
+    local_entries: []Entry = &.{},
+    local_arena: []u8 = &.{},
 
     blocked_until_ms: u64 = 0,
+    last_block: BlockReason = .io,
     /// Reads that came back blocked, results dropped for not matching the
-    /// log, and entries a full cache couldn't take.
+    /// log, entries a full cache couldn't take, and indices found damaged.
     blocked_reads: u64 = 0,
     mismatches: u64 = 0,
     over_budget: u64 = 0,
+    damaged: u64 = 0,
     /// Bulk reads made, for the reads-per-record figure.
     reads_made: u64 = 0,
     warned_ms: u64 = 0,
@@ -153,16 +178,29 @@ pub const DiskReads = struct {
             if (e.len > 0) self.allocator.free(e);
             if (a.len > 0) self.allocator.free(a);
         }
+        if (self.local_entries.len > 0) self.allocator.free(self.local_entries);
+        if (self.local_arena.len > 0) self.allocator.free(self.local_arena);
         var it = self.cache.valueIterator();
         while (it.next()) |v| self.allocator.free(v.payload);
         self.cache.deinit(self.allocator);
         self.order.deinit(self.allocator);
+        self.gone.deinit(self.allocator);
+    }
+
+    /// The calling thread owns this cache from now on.
+    pub fn setOwner(self: *DiskReads) void {
+        self.owner.store(threadId(), .release);
+    }
+
+    fn threadId() u64 {
+        return @intCast(std.Thread.getCurrentId());
     }
 
     /// Whether the calling thread is the owning shard's.
     pub fn isOwner(self: *const DiskReads) bool {
-        const o = self.owner orelse return true;
-        return o == std.Thread.getCurrentId();
+        const o = self.owner.load(.acquire);
+        if (o == 0) return self.bulk == null;
+        return o == threadId();
     }
 
     /// The raw entry payload at `index`, as the warm store keeps it, and
@@ -186,13 +224,19 @@ pub const DiskReads = struct {
         return allocator.dupe(u8, c.payload) catch null;
     }
 
-    /// For another shard's thread: whether the owner found `index` not in
-    /// the durable log when asked for it.
+    /// For another shard's thread: whether `index` won't be read (not in
+    /// the durable log, or damaged), so the job skips it.
     pub fn isGone(self: *DiskReads, index: u64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.gone) |g| if (g == index and g != 0) return true;
-        return false;
+        return self.gone.contains(index);
+    }
+
+    fn markGone(self: *DiskReads, index: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.gone.count() >= MAX_GONE) self.gone.clearRetainingCapacity();
+        self.gone.put(self.allocator, index, {}) catch {};
     }
 
     /// For another shard's thread: ask the owner to fetch window `w` on its
@@ -213,6 +257,8 @@ pub const DiskReads = struct {
     /// or evicts anything: a payload `get` returned stays valid.
     pub fn want(self: *DiskReads, index: u64, w: Window) Want {
         std.debug.assert(self.isOwner());
+        // Only the owner writes `gone`, so it reads it unlocked.
+        if (self.gone.contains(index)) return .absent;
         const now = self.now_fn();
         if (now < self.blocked_until_ms) return .blocked;
         for (&self.slots) |*s| {
@@ -223,25 +269,26 @@ pub const DiskReads = struct {
             }
         }
         var path_buf: [bulk_io.MAX_PATH]u8 = undefined;
-        const found = self.dl.sealedSource(index, &path_buf) catch return self.blocked(now);
+        const found = self.dl.sealedSource(index, &path_buf) catch return self.blocked(now, .io);
         const src = found orelse {
             // Not sealed: in the writer's buffer, read in place at the next
             // drain, or not in the durable log at all.
             const wr = self.dl.writer;
-            // Above what the writer holds: a committed entry it didn't
-            // buffer (the shard has stopped taking writes and said so), not
-            // one the log lacks. Retryable, not skipped.
-            const last = if (wr.entry_count > 0) wr.last_index else (self.dl.lastSealedIndex() catch return self.blocked(now));
+            const last = if (wr.entry_count > 0) wr.last_index else (self.dl.lastSealedIndex() catch return self.blocked(now, .io));
             if (index > last) {
+                // A committed entry the writer didn't buffer (the shard has
+                // stopped taking writes and said so): retryable, not skipped,
+                // and only this read is refused.
                 self.warn(now, "a stream entry at index {d} is in neither a sealed segment nor the segment writer's buffer; holding reads of it", .{index});
-                return self.blocked(now);
+                self.last_block = .unwritten;
+                return .blocked;
             }
             if (wr.entry_count == 0 or index < wr.first_index) return .absent;
             return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         };
         const bulk = self.bulk orelse return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         const i = self.freeSlot() orelse return .pending;
-        if (!self.ensureBuffers(i)) return self.blocked(now);
+        if (!self.ensureBuffers(i)) return self.blocked(now, .io);
         const slot = &self.slots[i];
         const n: usize = @intCast(@min(src.limit, READ_ENTRIES));
         slot.n_wants = 0;
@@ -261,7 +308,7 @@ pub const DiskReads = struct {
         slot.read.state.store(.queued, .release);
         if (!bulk.submit(&slot.read, .stream)) {
             slot.read.state.store(.idle, .release);
-            return self.blocked(now);
+            return self.blocked(now, .io);
         }
         self.reads_made += 1;
         return .pending;
@@ -273,8 +320,10 @@ pub const DiskReads = struct {
         return .pending;
     }
 
-    fn blocked(self: *DiskReads, now: u64) Want {
+    /// A blocked answer for the whole shard's cold reads, for `BACKOFF_MS`.
+    fn blocked(self: *DiskReads, now: u64, why: BlockReason) Want {
         self.blocked_until_ms = now + BACKOFF_MS;
+        self.last_block = why;
         return .blocked;
     }
 
@@ -283,7 +332,8 @@ pub const DiskReads = struct {
     /// requests: it may evict.
     pub fn drain(self: *DiskReads) bool {
         std.debug.assert(self.isOwner());
-        // What other threads asked for is fetched as the owner's own want.
+        // What other threads asked for is fetched as the owner's own want;
+        // only an index the log doesn't hold is marked gone for them.
         var asked: [MAX_WANTS]Window = undefined;
         const n_asked = blk: {
             self.mutex.lock();
@@ -293,19 +343,12 @@ pub const DiskReads = struct {
             self.n_asked = 0;
             break :blk n;
         };
-        for (asked[0..n_asked]) |w| if (self.want(w.from, w) == .absent) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.gone[self.gone_next % MAX_WANTS] = w.from;
-            self.gone_next += 1;
-        };
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        for (asked[0..n_asked]) |w| if (self.want(w.from, w) == .absent) self.markGone(w.from);
         var any = false;
         for (&self.slots) |*s| {
             if (s.read.state.load(.acquire) != .done) continue;
             const r = s.read.result;
-            self.land(s.read.entries[0..r.count], r.blocked, r.disk_failing, s.wants[0..s.n_wants]);
+            self.land(s.read.start, s.read.entries[0..r.count], r.blocked, r.disk_failing, s.wants[0..s.n_wants]);
             s.n_wants = 0;
             s.read.state.store(.idle, .release);
             any = true;
@@ -320,25 +363,41 @@ pub const DiskReads = struct {
         return any;
     }
 
+    /// Read in place, outside the lock: it may open a file, and other
+    /// shards' jobs copy under it.
     fn readInPlace(self: *DiskReads, w: Window) void {
-        var buf: [READ_ENTRIES]Entry = undefined;
-        const arena = self.allocator.alloc(u8, READ_BYTES) catch {
-            _ = self.blocked(self.now_fn());
+        if (self.local_entries.len == 0) self.local_entries = self.allocator.alloc(Entry, READ_ENTRIES) catch &.{};
+        if (self.local_arena.len == 0) self.local_arena = self.allocator.alloc(u8, READ_BYTES) catch &.{};
+        if (self.local_entries.len == 0 or self.local_arena.len == 0) {
+            _ = self.blocked(self.now_fn(), .io);
             return;
-        };
-        defer self.allocator.free(arena);
-        const r = self.dl.readRange(w.from, &buf, arena);
-        self.land(buf[0..r.count], r.blocked, r.disk_failing, &.{w});
+        }
+        const r = self.dl.readRange(w.from, self.local_entries, self.local_arena);
+        self.land(w.from, self.local_entries[0..r.count], r.blocked, r.disk_failing, &.{w});
     }
 
-    fn land(self: *DiskReads, entries: []const Entry, blocked_read: bool, disk_failing: bool, wants: []const Window) void {
+    fn land(self: *DiskReads, start: u64, entries: []const Entry, blocked_read: bool, disk_failing: bool, wants: []const Window) void {
         const now = self.now_fn();
         if (blocked_read) {
             self.blocked_reads += 1;
-            _ = self.blocked(now);
+            _ = self.blocked(now, .io);
             if (disk_failing) self.warn(now, "a stream read from the durable log failed; the disk may be failing", .{});
             return;
         }
+        if (entries.len == 0) {
+            // Not blocked, and not even its first entry: the segment holding
+            // it is corrupt or missing it. Skipped and counted, as an
+            // unreadable record was before reads went to disk, and never
+            // read again.
+            self.damaged += 1;
+            self.markGone(start);
+            self.warn(now, "the stream entry at index {d} could not be read from its segment (corrupt or missing); its records are skipped", .{start});
+            return;
+        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Room first, then once more after: never a walk per entry.
+        self.evict(now);
         var taken: [MAX_WANTS]u32 = @splat(0);
         for (entries) |*e| {
             if (e.header.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
@@ -353,14 +412,13 @@ pub const DiskReads = struct {
             if (!wanted) continue;
             if (self.raft_log.entryTerm(e.header.index) != e.header.term) {
                 self.mismatches += 1;
-                _ = self.blocked(now);
+                _ = self.blocked(now, .mismatch);
                 self.warn(now, "a stream entry read from the durable log at index {d} doesn't match the log's term; holding and reading it again", .{e.header.index});
                 continue;
             }
             self.put(e, now);
         }
-        // Released pins and served entries make room for the next.
-        self.evict(now, 0);
+        self.evict(now);
     }
 
     fn warn(self: *DiskReads, now: u64, comptime fmt: []const u8, args: anytype) void {
@@ -369,17 +427,16 @@ pub const DiskReads = struct {
         log.warn(fmt, args);
     }
 
-    /// One entry into the cache, pinned for its reader.
+    /// One entry into the cache, pinned for its reader. Under the lock.
     fn put(self: *DiskReads, e: *const Entry, now: u64) void {
         const index = e.header.index;
         if (self.cache.getPtr(index)) |c| {
             c.pinned_until_ms = now + PIN_MS;
             return;
         }
-        self.evict(now, e.payload.len);
         if (self.cache_bytes + e.payload.len > self.cache_budget * PINNED_BUDGET_TIMES) {
             self.over_budget += 1;
-            _ = self.blocked(now);
+            _ = self.blocked(now, .full);
             return;
         }
         const copy = self.allocator.dupe(u8, e.payload) catch return;
@@ -391,10 +448,10 @@ pub const DiskReads = struct {
         self.cache_bytes += copy.len;
     }
 
-    /// Room for `adding` bytes within the budget, oldest unpinned first.
-    fn evict(self: *DiskReads, now: u64, adding: usize) void {
+    /// Back within the budget, oldest unpinned first. Under the lock.
+    fn evict(self: *DiskReads, now: u64) void {
         var at = self.order_head;
-        while (self.cache_bytes + adding > self.cache_budget and at < self.order.items.len) : (at += 1) {
+        while (self.cache_bytes > self.cache_budget and at < self.order.items.len) : (at += 1) {
             const index = self.order.items[at];
             const c = self.cache.get(index) orelse continue;
             if (c.pinned_until_ms > now) continue;
@@ -522,6 +579,7 @@ test "stream disk reads: one read lands a reader's whole window, its stream's en
     var done: Done = .{};
     d.bulk = &bulk;
     d.notify = .{ .ctx = &done, .done = Done.done };
+    d.setOwner();
 
     const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
     try testing.expectEqual(Want.pending, d.want(1, a));
@@ -605,4 +663,67 @@ test "stream disk reads: a landed entry stays pinned for its reader until served
     try testing.expectEqual(Want.pending, d.want(6, .{ .stream = keyOf("b"), .from = 6, .limit = 1 }));
     _ = d.drain();
     try testing.expect(!d.cache.contains(3));
+}
+
+test "stream disk reads: a corrupt segment marks its entry damaged once, skipped, never read again" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    // One byte flipped in the sealed segment's data.
+    const seg = (try f.dl.segments())[0].path;
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, seg, 1 << 20);
+    defer testing.allocator.free(bytes);
+    bytes[bytes.len - 8] ^= 0xff;
+    {
+        const file = try stdx.fs.createFile(seg, .{});
+        defer stdx.fs.closeFile(file);
+        try stdx.fs.writeAll(file, bytes);
+    }
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    try testing.expectEqual(@as(u64, 1), d.damaged);
+    // Skipped and counted by the reader, as before reads went to disk; not
+    // read again, nor held.
+    try testing.expectEqual(Want.absent, d.want(1, a));
+    try testing.expect(!d.drain());
+    try testing.expect(d.isGone(1));
+}
+
+test "stream disk reads: an entry as large as the log takes lands, not taken as damaged" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(real);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/segs", .{real});
+    defer testing.allocator.free(path);
+    try stdx.fs.makePath(path);
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, path);
+    defer dl.deinit();
+    var raft_log = try RaftLog.init(testing.allocator, 4 << 20);
+    defer raft_log.deinit();
+
+    const limits = @import("../protocol/limits.zig");
+    const value = try testing.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD - entry_mod.COMMAND_PREFIX_SIZE - 1);
+    defer testing.allocator.free(value);
+    @memset(value, 'v');
+    const buf = try testing.allocator.alloc(u8, limits.MAX_LOG_ENTRY_PAYLOAD);
+    defer testing.allocator.free(buf);
+    const e = appendEntry(buf, 1, 1, "a", value);
+    try testing.expect(e.payload.len > 1024 * 1024);
+    try writer.addEntry(&e);
+    var mine = e;
+    _ = try raft_log.append(&mine);
+    try dl.flush(1);
+
+    var d = DiskReads.init(testing.allocator, &dl, &raft_log);
+    defer d.deinit();
+    try testing.expectEqual(Want.pending, d.want(1, .{ .stream = keyOf("a"), .from = 1, .limit = 1 }));
+    _ = d.drain();
+    try testing.expectEqual(@as(u64, 0), d.damaged);
+    try testing.expectEqual(e.payload.len, d.get(1).?.len);
 }
