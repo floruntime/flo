@@ -280,6 +280,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-workflow-idle", .source = "bench/bench_workflow_idle.zig" },
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
         .{ .name = "bench-txn-latency", .source = "bench/bench_txn_latency.zig" },
+        .{ .name = "bench-warm", .source = "bench/bench_warm.zig" },
     };
 
     // A figure is only worth having for what a release ships, so a bench takes
