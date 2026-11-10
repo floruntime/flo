@@ -73,7 +73,7 @@ pub const CatchUp = struct {
     fn readInPlace(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
         const self: *CatchUp = @ptrCast(@alignCast(ctx));
         const r = self.dl.readRange(start, buf, arena);
-        return .{ .count = r.count, .blocked = r.blocked, .disk_failing = r.disk_failing };
+        return .{ .count = r.count, .blocked = r.blocked, .disk_failing = r.disk_failing, .permission = r.permission };
     }
 
     fn readAsync(ctx: *anyopaque, start: u64, buf: []Entry, arena: []u8) CatchUpResult {
@@ -142,7 +142,7 @@ pub const CatchUp = struct {
             buf[n] = .{ .header = e.header, .payload = arena[used..][0..e.payload.len] };
             used += e.payload.len;
         }
-        return .{ .count = n, .blocked = r.result.blocked, .disk_failing = r.result.disk_failing };
+        return .{ .count = n, .blocked = r.result.blocked, .disk_failing = r.result.disk_failing, .permission = r.result.permission };
     }
 };
 

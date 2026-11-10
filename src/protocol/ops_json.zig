@@ -59,6 +59,20 @@ pub fn write(w: *std.Io.Writer) Stringify.Error!void {
     }
     try jw.endArray();
 
+    // The tier byte of each stream record a read returns.
+    try jw.objectField("storage_tiers");
+    try jw.beginArray();
+    const tiers = @typeInfo(proto.StorageTier).@"enum";
+    inline for (tiers.field_names, tiers.field_values) |name, value| {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(value);
+        try jw.objectField("name");
+        try jw.write(name);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
     try jw.objectField("groups");
     try jw.beginArray();
     inline for (table.op_groups) |g| {

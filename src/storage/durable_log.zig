@@ -43,6 +43,9 @@ pub const DurableLog = struct {
     /// Truncations begun: a read made elsewhere under an older count may
     /// hold entries a cut has since dropped, and is not used.
     truncations: u64 = 0,
+    /// Told of each cut, as it is made: what reads of this log kept above it
+    /// may have been replaced.
+    on_cut: ?Cut = null,
     /// The cut the files do not yet reflect, held here because the intent
     /// file may itself be what failed to write. No flush happens while it
     /// is set: a new file above the cut would be indistinguishable, at the
@@ -51,6 +54,8 @@ pub const DurableLog = struct {
     pending_cut: ?u64 = null,
     /// The sorted listing, valid until the next flush or truncation.
     listing: ?[]SegmentFile = null,
+    /// Directory listings made, for tests.
+    listings: u64 = 0,
     /// The segment whose header would not read, when listing failed on it.
     bad_header: [128]u8 = undefined,
     bad_header_len: usize = 0,
@@ -92,7 +97,9 @@ pub const DurableLog = struct {
     /// cause (an IO error, or an unmapped errno that may be one) should become
     /// damage if it persists, as against a resource shortage that is expected
     /// to pass on its own.
-    pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false };
+    /// `permission` marks a disk-class block that is a permission the
+    /// operator may fix, which every report says plainly.
+    pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, permission: bool = false };
 
     const Open = struct {
         first_index: u64,
@@ -130,8 +137,45 @@ pub const DurableLog = struct {
         // directory sync failed), so drop the cached listing.
         errdefer self.invalidate();
         try self.writer.writeToFile(self.segs_path);
+        const sealed: SegmentFile = .{
+            .first_index = self.writer.first_index,
+            .last_index = self.writer.last_index,
+            .commit_index_at_seal = commit_index,
+            .holds_skip = self.writer.holds_skip,
+            .path = "",
+        };
         self.writer.reset();
-        self.invalidate();
+        self.listSealed(sealed);
+    }
+
+    /// The segment just sealed, added to the cached listing rather than the
+    /// listing dropped: a read below the ring would otherwise list the
+    /// whole directory, opening every header, after every flush. Dropped
+    /// instead when it wouldn't sort last, which a flush above the log's end
+    /// never is.
+    fn listSealed(self: *DurableLog, sealed: SegmentFile) void {
+        const old = self.listing orelse return;
+        if (old.len > 0 and sealed.first_index <= old[old.len - 1].last_index) return self.invalidate();
+        var name_buf: [32]u8 = undefined;
+        const name = segment.segmentFilename(&name_buf, sealed.first_index) orelse return self.invalidate();
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.segs_path, name }) catch return self.invalidate();
+        const grown = self.allocator.realloc(old, old.len + 1) catch {
+            self.allocator.free(path);
+            return self.invalidate();
+        };
+        grown[old.len] = sealed;
+        grown[old.len].path = path;
+        self.listing = grown;
+    }
+
+    /// The last index any sealed segment holds; zero with none.
+    pub fn lastSealedIndex(self: *DurableLog) !u64 {
+        const files = try self.segments();
+        var last: u64 = 0;
+        for (files) |f| if (!f.unreadable) {
+            last = @max(last, f.last_index);
+        };
+        return last;
     }
 
     /// The highest commit index any sealed segment was flushed under: what
@@ -171,7 +215,7 @@ pub const DurableLog = struct {
             // corrupt or missing segment is a genuine fault.
             switch (readBlockClass(err)) {
                 .resource => return .{ .blocked = true },
-                .disk => return .{ .blocked = true, .disk_failing = true },
+                .disk => return .{ .blocked = true, .disk_failing = true, .permission = isPermission(err) },
                 .fault => {
                     log.err("durable log: cannot read below the ring at index {d}: {s}", .{ start, @errorName(err) });
                     return .{};
@@ -201,6 +245,11 @@ pub const DurableLog = struct {
     };
 
     /// Classify a failure to open or read a listed segment.
+    /// A permission the operator may fix, which every report names as such.
+    pub fn isPermission(err: anyerror) bool {
+        return err == error.AccessDenied or err == error.PermissionDenied;
+    }
+
     pub fn readBlockClass(err: anyerror) ReadBlockClass {
         return switch (err) {
             error.ProcessFdQuotaExceeded,
@@ -210,7 +259,13 @@ pub const DurableLog = struct {
             => .resource,
             error.InputOutput,
             error.Unexpected,
+            // Permissions an operator may fix: retried, and damage only past
+            // the disk's grace, never taken as corruption at once.
+            error.AccessDenied,
+            error.PermissionDenied,
             => .disk,
+            // Missing, or not what the file should be: the log is damaged.
+            // Anything not named above is treated so too.
             else => .fault,
         };
     }
@@ -223,8 +278,14 @@ pub const DurableLog = struct {
     /// The intent is recorded on disk first: a cut interrupted by a crash
     /// or an error is finished by the next boot, because a segment still
     /// holding a truncated index would win at replay.
+    pub const Cut = struct {
+        ctx: *anyopaque,
+        after: *const fn (ctx: *anyopaque, after_index: u64) void,
+    };
+
     pub fn truncateAfter(self: *DurableLog, after_index: u64) !void {
         self.truncations += 1;
+        if (self.on_cut) |c| c.after(c.ctx, after_index);
         self.writer.truncateAfter(after_index);
         self.invalidate();
         // The log is already cut in memory; any failure from here leaves
@@ -385,6 +446,7 @@ pub const DurableLog = struct {
     /// name is still recorded for `badHeaderSegment`). Caller frees with
     /// `freeSegments`.
     pub fn listSegments(self: *DurableLog, strict: bool) ![]SegmentFile {
+        self.listings += 1;
         var files: std.ArrayListUnmanaged(SegmentFile) = .empty;
         errdefer {
             for (files.items) |f| self.allocator.free(f.path);
@@ -408,6 +470,13 @@ pub const DurableLog = struct {
                 // good segment unreadable for good. Said at most once every 30
                 // s, because a blocked catch-up re-lists on every retry.
                 // `path`'s errdefer frees it on return.
+                // Named, so boot shows the shard offline saying so, not a bare
+                // error: the operator's to fix.
+                if (isPermission(err)) {
+                    const kept = @min(de.name.len, self.bad_header.len);
+                    @memcpy(self.bad_header[0..kept], de.name[0..kept]);
+                    self.bad_header_len = kept;
+                }
                 if (readBlockClass(err) != .fault) {
                     const now = stdx.time.monotonicMs();
                     if (self.block_warn_ms == null or now -| self.block_warn_ms.? >= 30_000) {
@@ -1319,7 +1388,8 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
     defer testing.allocator.free(path2);
     const path3: []const u8 = try testing.allocator.dupe(u8, files[2].path);
     defer testing.allocator.free(path3);
-    // A permission error is a fault, not a block: the read gives up.
+    // A permission error is an operator's to fix: held as a disk-class
+    // block, retried, and damage only past the disk's grace.
     {
         var dpath: [600:0]u8 = undefined;
         const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path3}, 0);
@@ -1329,7 +1399,8 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
             break :blk null;
         };
         const r = dl.readRange(6, &buf, &arena);
-        try testing.expect(!r.blocked);
+        // Root reads through any mode: only check the block where it bites.
+        if (std.c.getuid() != 0) try testing.expect(r.blocked and r.disk_failing);
         _ = std.c.chmod(z, 0o644);
     }
     // A truncated segment is a fault, not a block.
@@ -1361,6 +1432,48 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
     }
 }
 
+test "durable log: a flush adds its segment to the cached listing, so a read after it lists nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(real);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/segs", .{real});
+    defer testing.allocator.free(path);
+    try stdx.fs.makePath(path);
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, path);
+    defer dl.deinit();
+
+    const SEGMENTS = 2_000;
+    for (1..SEGMENTS + 1) |i| {
+        try writer.addEntry(&testEntry(i, 1, "v"));
+        try dl.flush(i);
+    }
+    _ = try dl.segments();
+    try testing.expectEqual(@as(u64, 1), dl.listings);
+    // One more segment sealed, then a read below the ring's lookup: the
+    // listing it finds is the cached one, grown by that segment.
+    try writer.addEntry(&testEntry(SEGMENTS + 1, 1, "v"));
+    try dl.flush(SEGMENTS + 1);
+    var buf: [512]u8 = undefined;
+    const t0 = stdx.time.monotonicNs();
+    const src = (try dl.sealedSource(SEGMENTS + 1, &buf)).?;
+    const first = (try dl.sealedSource(1, &buf)).?;
+    const took_us = (stdx.time.monotonicNs() - t0) / std.time.ns_per_us;
+    try testing.expectEqual(@as(u64, 1), dl.listings);
+    try testing.expectEqual(@as(u64, 1), src.limit);
+    try testing.expect(std.mem.endsWith(u8, first.path, "0000000001.flseg"));
+    // It matches a fresh listing.
+    const t1 = stdx.time.monotonicNs();
+    const fresh = try dl.listSegments(true);
+    const list_us = (stdx.time.monotonicNs() - t1) / std.time.ns_per_us;
+    defer dl.freeSegments(fresh);
+    try testing.expectEqual(fresh.len, (try dl.segments()).len);
+    try testing.expectEqual(fresh[fresh.len - 1].last_index, (try dl.segments())[fresh.len - 1].last_index);
+    std.debug.print("{d} segments: two lookups after a flush in {d} us, no listing; a full listing takes {d} us\n", .{ SEGMENTS + 1, took_us, list_us });
+}
+
 test "durable log: readBlockClass sorts a read error into resource, disk, or fault" {
     const R = DurableLog.ReadBlockClass;
     // A resource shortage holds: these clear on their own.
@@ -1374,6 +1487,8 @@ test "durable log: readBlockClass sorts a read error into resource, disk, or fau
     try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.Unexpected));
     // Corruption and a missing or unreadable file are faults, read now as a hole.
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.InvalidVersion));
-    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.AccessDenied));
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.AccessDenied));
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.PermissionDenied));
+    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.FileNotFound));
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.EndOfStream));
 }

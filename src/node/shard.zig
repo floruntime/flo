@@ -107,6 +107,7 @@ const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 const durable_log_mod = @import("../storage/durable_log.zig");
 const DurableLog = durable_log_mod.DurableLog;
 const CatchUp = @import("catch_up.zig").CatchUp;
+const DiskReads = @import("../stream/disk_reads.zig").DiskReads;
 const BulkIo = @import("../storage/bulk_io.zig").BulkIo;
 const raft_log_mod = @import("../raft/log.zig");
 const RaftLog = raft_log_mod.RaftLog;
@@ -398,6 +399,10 @@ pub const Shard = struct {
     /// Reads below the ring, a leader's for its peers made off this thread
     /// once the node's bulk I/O thread is attached (null if ephemeral).
     catch_up: ?*CatchUp = null,
+    /// Stream payloads read back from sealed segments.
+    stream_disk: ?*DiskReads = null,
+    /// The damage `answerDamaged` tells the reads it expires.
+    damage_for_waiters: ?silent_loss.Damage = null,
 
     /// Cumulative count of segment flush failures — failed attempts, not
     /// distinct incidents: in sync mode a flush is attempted per request, so
@@ -601,6 +606,8 @@ pub const Shard = struct {
     /// Whether the current block's cause may be the disk failing (an IO error),
     /// rather than a resource shortage. Shapes the reason `/status` shows.
     read_block_disk_failing: bool = false,
+    /// The disk-class block is a permission the operator may fix.
+    read_block_permission: bool = false,
     /// The clock reading at which a disk-class block becomes damage, or null
     /// while the block is not disk-class. Set when the cause first looks like
     /// the disk and left alone after, so a long resource shortage that later
@@ -1010,7 +1017,10 @@ pub const Shard = struct {
                     replayed_stamp = replayed.last_stamp;
                 } else |err| {
                     if (log_files.badHeaderSegment().len == 0) return err;
-                    boot_damage = silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
+                    boot_damage = if (DurableLog.isPermission(err))
+                        silent_loss.Damage.init(.segment_header_unreadable, "segment {s}: permission denied; fix the file's permissions and restart", .{log_files.badHeaderSegment()})
+                    else
+                        silent_loss.Damage.init(.segment_header_unreadable, "segment {s} has a header that will not read ({s})", .{ log_files.badHeaderSegment(), @errorName(err) });
                 }
             }
             // Replay clears a crash on an entry it found replaced; one past
@@ -1054,6 +1064,18 @@ pub const Shard = struct {
             cu.deinit();
             allocator.destroy(cu);
         };
+        var stream_disk: ?*DiskReads = null;
+        errdefer if (stream_disk) |d| {
+            d.deinit();
+            allocator.destroy(d);
+        };
+        if (durable_log) |dl| {
+            const d = try allocator.create(DiskReads);
+            d.* = DiskReads.init(allocator, dl, &raft_node.log);
+            d.commit = &raft_node.commit_index;
+            dl.on_cut = .{ .ctx = d, .after = DiskReads.cutHook };
+            stream_disk = d;
+        }
         if (durable_log) |dl| {
             const cu = try allocator.create(CatchUp);
             cu.* = CatchUp.init(allocator, dl, RPC_MAX_ENTRIES, RPC_BATCH_BYTES);
@@ -1169,6 +1191,7 @@ pub const Shard = struct {
             .segment_writer = seg_writer,
             .durable_log = durable_log,
             .catch_up = catch_up,
+            .stream_disk = stream_disk,
             .persist_failures = 0,
             .durability = durability,
             .shard_data_dir = shard_data_dir,
@@ -1221,6 +1244,8 @@ pub const Shard = struct {
         self.raft_node.log_flush_sink = .{ .ctx = @ptrCast(self), .flush = flushForConfig };
         self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
+        self.stream_handler.disk = self.stream_disk;
+        if (self.stream_disk) |d| d.on_damage = .{ .ctx = @ptrCast(self), .report = streamDiskDamage };
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
     }
@@ -1306,7 +1331,7 @@ pub const Shard = struct {
         // retried — so it says that instead of crying data loss.
         if (!self.applyCommitted() and self.halted == null and self.offline == null) {
             if (self.read_blocked) {
-                log.warn("shard {d}: a committed entry could not be read to apply at boot ({s}); holding and retrying", .{ self.id, if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage" });
+                log.warn("shard {d}: a committed entry could not be read to apply at boot ({s}); holding and retrying", .{ self.id, self.blockCause() });
             } else {
                 log.err("shard {d}: not every durable entry above the commit watermark could be applied at boot; projections are missing writes", .{self.id});
             }
@@ -1405,6 +1430,10 @@ pub const Shard = struct {
         if (self.catch_up) |cu| {
             cu.deinit();
             self.allocator.destroy(cu);
+        }
+        if (self.stream_disk) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
         }
         if (self.durable_log) |dl| {
             dl.deinit();
@@ -2653,6 +2682,7 @@ pub const Shard = struct {
         const flags = self.mailbox.wake.take();
         if (flags & mailbox_mod.Flag.stream_appended.bit() != 0) self.workflow_handler.triggers_dirty = true;
         if (flags & mailbox_mod.Flag.action_invoked.bit() != 0) ActionsHandler.wakeFromPeer(self);
+        if (flags & mailbox_mod.Flag.stream_disk_read.bit() != 0) self.streamDiskReadsBack();
 
         var buf: [64]InboxMessage = undefined;
         while (true) {
@@ -4036,7 +4066,7 @@ pub const Shard = struct {
                 // blocked read, not probed once per request.
                 .blocked => |b| {
                     self.skip_scan_from = idx;
-                    _ = self.noteReadBlock(b.disk_failing, idx);
+                    _ = self.noteReadBlock(b.disk_failing, b.permission, idx);
                     return false;
                 },
                 .absent => continue,
@@ -4102,7 +4132,7 @@ pub const Shard = struct {
             // applies — rather than drop it.
             .blocked => |b| {
                 self.skip_check_pending = at;
-                _ = self.noteReadBlock(b.disk_failing, skip.index);
+                _ = self.noteReadBlock(b.disk_failing, b.permission, skip.index);
                 return false;
             },
             .absent => {
@@ -4145,7 +4175,7 @@ pub const Shard = struct {
                 return false;
             },
             .blocked => |b| {
-                _ = self.noteReadBlock(b.disk_failing, at);
+                _ = self.noteReadBlock(b.disk_failing, b.permission, at);
                 return false;
             },
             // The skip entry was truncated away: nothing left to check.
@@ -4253,6 +4283,11 @@ pub const Shard = struct {
         // stick and `/status` shows the damage, not the stale block.
         self.clearReadBlocked();
         self.losses.note(damage.path, nowMs(), self.id, "{s}", .{damage.reason()});
+        // Reads held for stream records are answered with the damage, never
+        // later with records past it; nothing more is read from the log.
+        if (self.stream_disk) |d| d.stopped = true;
+        self.damage_for_waiters = damage;
+        self.waiter_pool.expireKinds(&.{ .stream_disk_read, .stream_read }, answerDamaged, @ptrCast(self));
         if (self.raft_network == null) {
             self.offline = damage;
             self.offline_published.store(true, .release);
@@ -4326,7 +4361,13 @@ pub const Shard = struct {
     /// `.damaged` means a disk-class block lasted past its grace and the node
     /// is now offline or diverged; `.hold` means keep the entry unapplied and
     /// try again after the back-off.
-    fn noteReadBlock(self: *Shard, disk_failing: bool, index: u64) ReadBlockOutcome {
+    /// What a read block is put down to, in its reports.
+    fn blockCause(self: *const Shard) []const u8 {
+        if (self.read_block_permission) return "permission denied on a segment; fix the file's permissions";
+        return if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage";
+    }
+
+    fn noteReadBlock(self: *Shard, disk_failing: bool, permission: bool, index: u64) ReadBlockOutcome {
         const raft = self.raft_node;
         const now = nowMs();
         if (!self.read_blocked) {
@@ -4335,6 +4376,7 @@ pub const Shard = struct {
             if (self.shard_metrics) |sm| sm.recordReadBlockStart();
         }
         self.read_block_disk_failing = disk_failing;
+        self.read_block_permission = permission;
         // The disk's grace is counted from when the cause first looks like the
         // disk: set the deadline on that change and leave it, and clear it when
         // the cause is a resource shortage, so a resource wait never shortens
@@ -4349,7 +4391,7 @@ pub const Shard = struct {
         // diverges and is replaced, rather than wait on a disk that is not
         // coming back. A resource shortage holds indefinitely.
         if (self.read_block_disk_deadline_ms) |deadline| if (now >= deadline) {
-            self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read for {d} ms; the disk may be failing", .{ index, blocked_for }));
+            self.damaged(silent_loss.Damage.init(.unreadable_committed, "committed entry {d} could not be read for {d} ms; {s}", .{ index, blocked_for, self.blockCause() }));
             return .damaged;
         };
         // A leader that cannot apply freezes the group: tell Raft, which steps
@@ -4357,7 +4399,7 @@ pub const Shard = struct {
         raft.setReadBlocked(self.read_blocked_since_ms, disk_failing);
         if (self.read_block_log_ms == null or now -| self.read_block_log_ms.? >= READ_BLOCK_LOG_MS) {
             self.read_block_log_ms = now;
-            log.err("shard {d}: a committed entry has not been readable to apply for {d} ms ({s}); applied {d} of {d}, holding and retrying", .{ self.id, blocked_for, if (disk_failing) "the disk may be failing" else "a resource shortage", raft.last_applied, raft.commit_index });
+            log.err("shard {d}: a committed entry has not been readable to apply for {d} ms ({s}); applied {d} of {d}, holding and retrying", .{ self.id, blocked_for, self.blockCause(), raft.last_applied, raft.commit_index });
         }
         self.read_retry_at_ms = now + READ_RETRY_MS;
         return .hold;
@@ -4371,6 +4413,7 @@ pub const Shard = struct {
         if (self.shard_metrics) |sm| sm.recordReadBlockEnd(nowMs() -| self.read_blocked_since_ms);
         self.read_blocked = false;
         self.read_block_disk_failing = false;
+        self.read_block_permission = false;
         self.read_block_disk_deadline_ms = null;
         self.read_retry_at_ms = 0;
         self.read_block_log_ms = null;
@@ -4487,7 +4530,7 @@ pub const Shard = struct {
             slot.read_blocked_for_ms.store(nowMs() -| self.read_blocked_since_ms, .monotonic);
             var buf: [health_mod.REASON_MAX]u8 = undefined;
             slot.setReason(std.fmt.bufPrint(&buf, "a committed entry has not been readable to apply ({s}); applied {d} of {d}", .{
-                if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage",
+                self.blockCause(),
                 raft.last_applied,
                 raft.commit_index,
             }) catch "a committed entry could not be read to apply");
@@ -4562,9 +4605,25 @@ pub const Shard = struct {
     /// From now on a leader reads sealed segments for its peers on `bulk`,
     /// which must outlive this shard's thread.
     pub fn attachBulkIo(self: *Shard, bulk: *BulkIo) void {
+        if (self.stream_disk) |d| {
+            d.bulk = bulk;
+            d.notify = .{ .ctx = self.mailbox, .done = streamDiskReadDone };
+        }
         const cu = self.catch_up orelse return;
         cu.bulk = bulk;
         cu.notify = .{ .ctx = self.mailbox, .done = catchUpReadDone };
+    }
+
+    /// Stream payloads read from disk are back: the reads held on them are
+    /// made again.
+    fn streamDiskReadsBack(self: *Shard) void {
+        // Damaged: the reads that were held have been answered with it.
+        if (self.offline != null or self.replica.diverged) return;
+        const d = self.stream_disk orelse return;
+        if (!d.drain()) return;
+        self.waiter_pool.notifyAny(.stream_disk_read, resolveStreamWaiter, @ptrCast(self));
+        // A blocking read parked for new appends may have met one too.
+        self.waiter_pool.notifyAny(.stream_read, resolveStreamWaiter, @ptrCast(self));
     }
 
     fn stoppedLeading(self: *Shard, message: []const u8) void {
@@ -4825,7 +4884,7 @@ pub const Shard = struct {
                         // may instead damage the node (a disk failing too long).
                         raft.last_applied = next_idx - 1;
                         all_applied = false;
-                        _ = self.noteReadBlock(b.disk_failing, next_idx);
+                        _ = self.noteReadBlock(b.disk_failing, b.permission, next_idx);
                         break :drain;
                     },
                     .found => |e| {
@@ -6837,10 +6896,22 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         .stream_read, .stream_group_read => {
             shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
         },
+        // Its payloads weren't back from disk in time: retryable, never a
+        // short answer that looks complete.
+        .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_LATE)),
         // No task in time: `{task: none}`, the optional's absent byte.
         .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
     }
 }
+
+/// What a stream read refused for its disk reads is told, by why.
+pub const DISK_READ_LATE = "unavailable: the stream's records are being read from disk and weren't back in time — retry";
+pub const DISK_READ_PENDING = "unavailable: the stream's records are being read from disk — retry";
+pub const DISK_READ_BLOCKED = "unavailable: the stream's records can't be read from disk right now (a resource or IO failure) — retry";
+pub const DISK_READS_FULL = "unavailable: too many reads are waiting on this shard's disk — retry";
+pub const DISK_READ_CACHE_FULL = "unavailable: the shard's cache of records read from disk is full of ones not yet served — retry";
+pub const DISK_READ_MISMATCH = "unavailable: the stream's records read from disk don't match the log; reading them again — retry";
+pub const DISK_READ_UNWRITTEN = "unavailable: the stream's records haven't reached the durable log yet — retry";
 
 /// KV waiter resolver: look up the key in the KV projection and send the value
 /// if version > min_version. Returns true if waiter was satisfied.
@@ -6890,6 +6961,24 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     var buf: [StreamHandler.MAX_READ_BATCH]@import("../projection/stream.zig").StreamRecord = undefined;
     const records, const result = handler.readReadable(window, &buf);
     defer handler.freeResult(result);
+    if (result == .pending) switch (handler.held) {
+        // Still being read from disk: held until it is back.
+        .pending => return false,
+        else => {
+            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(handler.diskRefusal()));
+            return true;
+        },
+    };
+    // A read held only for its disk payloads is answered as a fresh read
+    // would be now, records or none: its stream may be trimmed or deleted.
+    if (records.len == 0 and waiter.kind == .stream_disk_read) {
+        switch (result) {
+            .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
+            .err => |e| shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, e.code.toStatus(), e.refusal()),
+            else => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{ 0, 0, 0, 0 }),
+        }
+        return true;
+    }
     if (records.len == 0) {
         // Everything up to the stream's last id (or `end`) was scanned and none
         // of it is in the window; ids only grow, so the next wake starts there
@@ -6952,6 +7041,33 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
             log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         }
     };
+}
+
+/// A read held on this shard's stream when it found its log damaged.
+fn answerDamaged(waiter: *const Waiter, ctx: *anyopaque) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    var buf: [400]u8 = undefined;
+    const why = if (shard.damage_for_waiters) |*d| d.reason() else "its data is damaged";
+    const message = std.fmt.bufPrint(&buf, "unavailable: shard {d} is damaged on this node ({s}); this read was not answered with records past it", .{ shard.id, why }) catch "unavailable: the shard is damaged on this node";
+    shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(message));
+}
+
+/// The durable log couldn't give a committed stream entry back: damage, as
+/// boot and apply report it.
+fn streamDiskDamage(ctx: *anyopaque, index: u64, cause: @import("../stream/disk_reads.zig").Damage.Cause) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    const grace = shard.stream_disk.?.disk_failing_ms;
+    shard.damaged(switch (cause) {
+        .corrupt => silent_loss.Damage.init(.segment_unreadable, "the segment holding committed entry {d} is corrupt or doesn't hold it", .{index}),
+        .disk_failing => silent_loss.Damage.init(.segment_unreadable, "the segment holding committed entry {d} could not be read for {d} ms; the disk may be failing", .{ index, grace }),
+        .permission => silent_loss.Damage.init(.segment_unreadable, "the segment holding committed entry {d}: permission denied for {d} ms; fix the file's permissions and restart", .{ index, grace }),
+    });
+}
+
+/// A stream payload the bulk I/O thread read for this shard is back.
+fn streamDiskReadDone(ctx: *anyopaque) void {
+    const mailbox: *Mailbox = @ptrCast(@alignCast(ctx));
+    mailbox.wake.set(.stream_disk_read);
 }
 
 /// A read the bulk I/O thread made for this shard is back.
@@ -7521,6 +7637,7 @@ fn bootRefuses(err: anyerror) bool {
 
 /// What a segment that won't open is, as damage.
 fn segmentOpenDamage(name: []const u8, err: anyerror) silent_loss.Damage {
+    if (DurableLog.isPermission(err)) return silent_loss.Damage.init(.segment_unreadable, "segment {s}: permission denied; fix the file's permissions and restart", .{name});
     if (DurableLog.readBlockClass(err) == .disk) return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s}); the disk may be failing", .{ name, @errorName(err) });
     return silent_loss.Damage.init(.segment_unreadable, "segment {s} is unreadable ({s})", .{ name, @errorName(err) });
 }
@@ -8128,6 +8245,26 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     const answer = try proto.Response.parse(big_out[0..got]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), answer.header.status);
     try std.testing.expect(std.mem.indexOf(u8, answer.data, value) != null);
+}
+
+test "Shard: a stream read held on a disk read answers retryable unavailable, ran=no, if it isn't back in time" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    try std.testing.expect(shard.waiter_pool.register(.{ .kind = .stream_disk_read, .reply_to = c.conn.replyTo(), .request_id = 9, .key = "s", .timeout_ms = 1 }));
+    shard.waiter_pool.waiters[0].expires_at_ms = 0;
+    shard.waiter_pool.expireTimeouts(handleWaiterTimeout, &shard);
+    var out: [512]u8 = undefined;
+    const n = try readAnswer(c.pair[1], &shard, c.conn.fd, &out, @sizeOf(proto.ResponseHeader));
+    var resp = try proto.Response.parse(out[0..n]);
+    // Never an empty answer that would look like the end of the stream.
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), resp.header.status);
+    try std.testing.expectEqual(@as(u64, 9), resp.header.request_id);
+    try std.testing.expectEqual(proto.Ran.no, (try resp.refused()).ran);
 }
 
 test "Shard: a KV watch that times out answers the value still there, and a wait on a missing key answers not found" {
@@ -13589,6 +13726,397 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
     }
 }
 
+/// A lone shard with a small hot ring and a warm store that keeps almost
+/// nothing, holding one-record appends to stream "s", each followed by
+/// `filler` appends to stream "f".
+const ColdStream = struct {
+    tmp: std.testing.TmpDir,
+    data_dir: []const u8,
+    pipe_fds: [2]i32,
+    shard: Shard,
+    value: []u8,
+
+    fn init(self: *ColdStream, durability: Durability, appends: usize, filler: usize, flush_every: usize) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        self.data_dir = try testDataDir(&self.tmp);
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], self.data_dir, 64 * 1024, 0, 0, durability, 1, .single, .{}, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        self.shard.defaultPartition().setWarmBudget(4096);
+        // One record per append: [count][len][payload][header_count].
+        var batch: [4 + 4 + 2048 + 2]u8 = undefined;
+        std.mem.writeInt(u32, batch[0..4], 1, .little);
+        std.mem.writeInt(u32, batch[4..8], 2048, .little);
+        @memset(batch[8 .. 8 + 2048], 'r');
+        std.mem.writeInt(u16, batch[8 + 2048 ..][0..2], 0, .little);
+        self.value = try stream_mod.encodeAppendValue(std.testing.allocator, 0, &batch);
+        for (0..appends) |i| {
+            _ = try persistence_mod.proposeEntry(&self.shard, .stream_append, entry_mod.Flags.NONE, "", "s", self.value);
+            for (0..filler) |_| _ = try persistence_mod.proposeEntry(&self.shard, .stream_append, entry_mod.Flags.NONE, "", "f", self.value);
+            try std.testing.expect(self.shard.applyCommitted());
+            if (flush_every > 0 and i % flush_every == flush_every - 1) try self.shard.flushSegmentToDisk();
+        }
+        if (flush_every > 0) try self.shard.flushSegmentToDisk();
+    }
+
+    fn deinit(self: *ColdStream) void {
+        self.shard.deinit();
+        std.testing.allocator.free(self.value);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+        std.testing.allocator.free(self.data_dir);
+        self.tmp.cleanup();
+    }
+
+    fn window(limit: u32) waiter_pool_mod.StreamWindow {
+        return .{ .name_hash = node_router.nameHash(.default, "s"), .stream = node_router.nsNameKey(.default, "s"), .limit = limit };
+    }
+
+    /// Read `w`, landing disk reads and reading again while it is held, as
+    /// the shard's tick and a held read's wake do.
+    fn read(self: *ColdStream, w: *waiter_pool_mod.StreamWindow, buf: *[StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord) !struct { []stream_mod.StreamRecord, @import("../protocol/result.zig").CommandResult } {
+        const handler = self.shard.stream_handler;
+        for (0..5_000) |_| {
+            const records, const result = handler.readReadable(w, buf);
+            if (result != .pending) return .{ records, result };
+            if (handler.held == .blocked) return error.Blocked;
+            var waited: usize = 0;
+            while (!self.shard.stream_disk.?.drain()) : (waited += 1) {
+                if (waited == 2_000) return error.NeverLanded;
+                @import("stdx").time.sleep(std.time.ns_per_ms);
+            }
+        }
+        return error.NeverServed;
+    }
+};
+
+test "Shard: a stream record past the hot ring and the warm store is read back from its segment" {
+    var c: ColdStream = undefined;
+    // Async durability, flushed every 10 appends: segments of 10. (Under sync
+    // each commit seals a segment of its own.)
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // From the start: held once, then every record, the first ones from the
+    // durable log, none skipped.
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    const records, const result = try c.read(&w, &buf);
+    defer c.shard.stream_handler.freeResult(result);
+    try std.testing.expectEqual(@as(usize, 10), records.len);
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, result.stream_messages.data[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 0), c.shard.stream_handler.skipped_appends);
+    // The first record's tier byte says disk: after the count, sequence
+    // and timestamp.
+    try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
+}
+
+test "Shard: a stream record past the warm store but not yet flushed is read from the writer's buffer, not skipped" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 0);
+    defer c.deinit();
+    // Under async durability a burst outruns the flush: nothing is sealed.
+    try std.testing.expect(c.shard.durable_log.?.writer.entry_count > 0);
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    const records, const result = try c.read(&w, &buf);
+    defer c.shard.stream_handler.freeResult(result);
+    try std.testing.expectEqual(@as(usize, 10), records.len);
+    try std.testing.expectEqual(@as(u64, 0), c.shard.stream_handler.skipped_appends);
+    try std.testing.expectEqual(@backingInt(proto.StorageTier.disk), result.stream_messages.data[4 + 8 + 8]);
+}
+
+test "Shard: a cold walk of a stream interleaved with another reads every record, a run per read, none skipped" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 300, 2, 20);
+    defer c.deinit();
+    var bulk = try BulkIo.init(std.testing.allocator);
+    defer bulk.deinit();
+    try bulk.start();
+    c.shard.attachBulkIo(&bulk);
+    c.shard.stream_disk.?.setOwner();
+    defer bulk.stop();
+    const handler = c.shard.stream_handler;
+    var w = ColdStream.window(100);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    var served: usize = 0;
+    while (served < 300) {
+        const records, const result = try c.read(&w, &buf);
+        defer handler.freeResult(result);
+        if (records.len == 0) break;
+        served += std.mem.readInt(u32, result.stream_messages.data[0..4], .little);
+        w.after = stream_mod.lastRecordOf(records[records.len - 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 300), served);
+    try std.testing.expectEqual(@as(u64, 0), handler.skipped_appends);
+    // A read lands a run of the asking stream's window: far fewer reads
+    // than records, the filler stream's entries never cached.
+    const reads = c.shard.stream_disk.?.reads_made;
+    std.debug.print("cold walk: {d} records in {d} reads\n", .{ served, reads });
+    try std.testing.expect(reads > 0 and reads * 10 <= served);
+}
+
+/// A group request on `c`, sent again while it is refused retryable, with
+/// the shard's disk reads landed between tries; the answer in `buf`. Up to
+/// 10 s: past the pins (5 s) that may hold a full cache.
+fn untilServed(c: *ColdStream, conn: *Connection, fd: std.posix.fd_t, buf: []u8, op: proto.OpCode, id: u64, value: []const u8, options: []const u8) !proto.Response {
+    for (0..2_000) |_| {
+        c.shard.runRequest(conn, try ParkTest.request(op, id, "", "s", value, options), .client);
+        // A group read's delivery is logged: answered once it applies.
+        _ = c.shard.applyCommitted();
+        var one: [1]proto.Response = undefined;
+        try ParkTest.responses(&c.shard, conn, fd, buf, &one);
+        if (one[0].header.status != @backingInt(proto.StatusCode.unavailable)) return one[0];
+        _ = c.shard.stream_disk.?.drain();
+        @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    }
+    return error.NeverServed;
+}
+
+test "Shard: a cold group read and claim deliver and claim only what their reply carries" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 60, 0, 10);
+    defer c.deinit();
+    const d = c.shard.stream_disk.?;
+    // Small, so a landing holds a few records: replies are true prefixes,
+    // and served ones are evicted.
+    d.cache_budget = 4096;
+    var all: [60]stream_mod.StreamRecord = undefined;
+    const name_hash = node_router.nameHash(.default, "s");
+    try std.testing.expectEqual(@as(usize, 60), c.shard.stream_handler.stream.readStreamAfter(name_hash, StreamID.MIN, null, &all));
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    // Room for a whole answer: flushing one into a full socket waits on a
+    // reader that only reads once the flush returns.
+    const room: c_int = 1 << 20;
+    _ = std.c.setsockopt(pair[0], std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&room), @sizeOf(c_int));
+    _ = std.c.setsockopt(pair[1], std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&room), @sizeOf(c_int));
+    const conn = try c.shard.addConnection(pair[0]);
+    var buf: [1 << 18]u8 = undefined;
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.count, 20);
+    const c1 = "\x01\x00" ++ "g" ++ "\x02\x00" ++ "c1";
+
+    // Each group read delivers what its reply carries, a prefix, and the
+    // next one starts right after it: nothing delivered past the reply.
+    var delivered: usize = 0;
+    var id: u64 = 1;
+    while (delivered < 30) : (id += 1) {
+        const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_read, id, c1, ob.getOptions());
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        const n = std.mem.readInt(u32, r.data[0..4], .little);
+        try std.testing.expect(n > 0 and n < 20);
+        try std.testing.expectEqual(all[delivered].id.sequence, std.mem.readInt(u64, r.data[4..12], .little));
+        try std.testing.expectEqual(all[delivered].id.timestamp_ms, std.mem.readInt(u64, r.data[12..20], .little));
+        delivered += n;
+    }
+    try std.testing.expect(!d.cache.contains(all[0].ual_index));
+
+    // c2 claims c1's, cold: only the entries its reply carries are claimed.
+    var claim_buf: [2 + 1 + 2 + 2 + 4 + 8 + 8 + 4]u8 = undefined;
+    @memcpy(claim_buf[0..7], "\x01\x00" ++ "g" ++ "\x02\x00" ++ "c2");
+    @memset(claim_buf[7..27], 0);
+    std.mem.writeInt(u32, claim_buf[27..31], 30, .little);
+    const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_claim, id, &claim_buf, "");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    const answered = std.mem.readInt(u32, r.data[0..4], .little);
+    try std.testing.expect(answered > 0 and answered < delivered);
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group = try @import("../namespace/handler.zig").qualifyGroupKey(&qbuf, "", "s", "g");
+    var pending: [64]stream_mod.PendingEntry = undefined;
+    try std.testing.expectEqual(@as(usize, answered), try c.shard.stream_handler.stream.groupPending(group, "c2", &pending));
+}
+
+test "Shard: a job on another shard's thread reads cold records by copy, once the owner has fetched them" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // This thread owns the shard's disk cache; the job reads from another.
+    c.shard.stream_disk.?.setOwner();
+    const Job = struct {
+        fn poll(handler: *StreamHandler, out: *StreamHandler.PayloadRead) void {
+            out.* = handler.readPayloadsForStream("s", "", StreamID.MIN, 10);
+        }
+    };
+    var first: StreamHandler.PayloadRead = undefined;
+    var t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &first });
+    t.join();
+    defer first.deinit(c.shard.stream_handler.allocator);
+    // Cold: nothing yet, the cursor where it was, and the fetch asked of the
+    // owner, which touched nothing of the cache from the job's thread.
+    try std.testing.expectEqual(@as(usize, 0), first.payloads.len);
+    try std.testing.expect(first.last_id.eql(StreamID.MIN));
+    try std.testing.expectEqual(@as(usize, 0), c.shard.stream_disk.?.cache.count());
+    // The owner's tick fetches it.
+    _ = c.shard.stream_disk.?.drain();
+    _ = c.shard.stream_disk.?.drain();
+    var second: StreamHandler.PayloadRead = undefined;
+    t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &second });
+    t.join();
+    defer second.deinit(c.shard.stream_handler.allocator);
+    try std.testing.expect(second.payloads.len > 0);
+    try std.testing.expect(second.copies.len > 0);
+    var all: [1]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    try std.testing.expect(second.ids[0].eql(all[0].id));
+}
+
+/// One poll by a job on another thread: `handler.readPayloadsForStream`
+/// from that thread.
+fn pollElsewhere(handler: *StreamHandler, after: StreamID) !StreamHandler.PayloadRead {
+    const Job = struct {
+        fn poll(h: *StreamHandler, from: StreamID, out: *StreamHandler.PayloadRead) void {
+            out.* = h.readPayloadsForStream("s", "", from, 10);
+        }
+    };
+    var out: StreamHandler.PayloadRead = undefined;
+    const t = try std.Thread.spawn(.{}, Job.poll, .{ handler, after, &out });
+    t.join();
+    return out;
+}
+
+test "Shard: a job on another shard's thread skips records the log no longer holds, once the owner says so" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    c.shard.stream_disk.?.setOwner();
+    var all: [100]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    // The segments holding the first records are gone from the durable log.
+    const dropped_through = all[25].ual_index;
+    _ = try c.shard.durable_log.?.dropThrough(dropped_through);
+    // Whole segments go: the first record kept is the first in what's left.
+    const kept_from = (try c.shard.durable_log.?.segments())[0].first_index;
+    var first_kept: usize = 0;
+    while (all[first_kept].ual_index < kept_from) first_kept += 1;
+    try std.testing.expect(first_kept > 0);
+
+    // Each poll asks the owner about the record it stops at; the owner finds
+    // it not in the log and says so, and the next poll skips it.
+    var after = StreamID.MIN;
+    for (0..200) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, after);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        if (r.payloads.len > 0) {
+            try std.testing.expect(r.ids[0].eql(all[first_kept].id));
+            return;
+        }
+        after = r.last_id;
+        _ = c.shard.stream_disk.?.drain();
+    }
+    return error.NeverSkipped;
+}
+
+test "Shard: a job on another shard's thread waits out a blocked disk read rather than skip the record" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    const d = c.shard.stream_disk.?;
+    d.setOwner();
+    var all: [1]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    c.shard.durable_log.?.test_open_error = error.SystemResources;
+    // Asked, read and blocked; asked again while backing off: still not gone.
+    for (0..3) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        try std.testing.expectEqual(@as(usize, 0), r.payloads.len);
+        try std.testing.expect(r.last_id.eql(StreamID.MIN));
+        _ = d.drain();
+    }
+    try std.testing.expect(!d.isGone(all[0].ual_index));
+    // Readable again, it gets the record.
+    c.shard.durable_log.?.test_open_error = null;
+    d.blocked_until_ms = 0;
+    for (0..20) |_| {
+        const r = try pollElsewhere(c.shard.stream_handler, StreamID.MIN);
+        defer r.deinit(c.shard.stream_handler.allocator);
+        if (r.payloads.len > 0) {
+            try std.testing.expect(r.ids[0].eql(all[0].id));
+            return;
+        }
+        _ = d.drain();
+    }
+    return error.NeverServed;
+}
+
+test "Shard: a stream read of a corrupt sealed segment takes the shard offline, and /status says why" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // A byte flipped in the first sealed segment, past its header.
+    const seg = (try c.shard.durable_log.?.segments())[0].path;
+    const bytes = try DamageTest.readFile(seg);
+    defer std.testing.allocator.free(bytes);
+    bytes[bytes.len - 8] ^= 0xff;
+    try DamageTest.writeFile(seg, bytes);
+
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.readReadable(&w, &buf);
+    _ = c.shard.stream_disk.?.drain();
+    // Damage, as boot and apply report it: offline on a lone node, counted.
+    const damage = c.shard.offline orelse return error.ShardNotOffline;
+    try std.testing.expectEqual(silent_loss.Path.segment_unreadable, damage.path);
+    try std.testing.expectEqual(@as(u64, 1), c.shard.losses.total(.segment_unreadable));
+    var slot: health_mod.ShardSlot = .{};
+    c.shard.health = &slot;
+    c.shard.publishHealth();
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "corrupt") != null);
+}
+
+test "Shard: a read held on a disk read that finds the log damaged is refused with the damage, not answered with records past it" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    const seg = (try c.shard.durable_log.?.segments())[0].path;
+    const bytes = try DamageTest.readFile(seg);
+    defer std.testing.allocator.free(bytes);
+    bytes[bytes.len - 8] ^= 0xff;
+    try DamageTest.writeFile(seg, bytes);
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try c.shard.addConnection(pair[0]);
+    // From the start, past the hot ring: held on the disk read.
+    var ob_buf: [32]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addStreamId(.stream_start, 0, 0);
+    try ob.addU32(.count, 5);
+    c.shard.runRequest(conn, try ParkTest.request(.stream_read, 7, "", "s", "", ob.getOptions()), .client);
+    try std.testing.expectEqual(@as(u16, 1), c.shard.waiter_pool.countByKind(.stream_disk_read));
+    // The read finds the segment corrupt: the shard is damaged, and the held
+    // read is told so.
+    _ = c.shard.stream_disk.?.drain();
+    try std.testing.expect(c.shard.offline != null);
+    try std.testing.expectEqual(@as(u16, 0), c.shard.waiter_pool.countByKind(.stream_disk_read));
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&c.shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 7), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "damaged") != null);
+    // And nothing more is read from the log.
+    try std.testing.expect(c.shard.stream_disk.?.stopped);
+}
+
+test "Shard: a stream read whose disk read is blocked is refused at once, not held" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    c.shard.durable_log.?.test_open_error = error.SystemResources;
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    try std.testing.expectError(error.Blocked, c.read(&w, &buf));
+    // Backing off: asked again at once, it is still blocked, with no read.
+    _, const again = c.shard.stream_handler.readReadable(&w, &buf);
+    try std.testing.expect(again == .pending and c.shard.stream_handler.held == .blocked);
+}
+
 test "Shard: an internal op from a client is answered as an unknown one, and nothing is proposed" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);
@@ -18018,6 +18546,23 @@ test "at boot only a resource failure refuses; an IO failure is damage, and says
     try std.testing.expect(std.mem.indexOf(u8, io.reason(), "the disk may be failing") != null);
     const gone = segmentOpenDamage("00000000000000000004.flseg", error.FileNotFound);
     try std.testing.expect(std.mem.indexOf(u8, gone.reason(), "disk") == null);
+}
+
+test "a segment whose header is denied to this user at boot takes its shard offline, saying so plainly" {
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+    var t: DamageTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [512]u8 = undefined;
+    const path = try t.segment(2, &buf);
+    var z: [520:0]u8 = undefined;
+    _ = std.c.chmod(try std.fmt.bufPrintSentinel(&z, "{s}", .{path}, 0), 0);
+    defer _ = std.c.chmod(&z, 0o644);
+    var shard = try t.open();
+    defer shard.deinit();
+    const damage = shard.offline orelse return error.ShardNotOffline;
+    try std.testing.expectEqual(silent_loss.Path.segment_header_unreadable, damage.path);
+    try std.testing.expect(std.mem.indexOf(u8, damage.reason(), "permission denied; fix the file's permissions and restart") != null);
 }
 
 test "a member whose segment is damaged at boot is diverged, and /status says why" {

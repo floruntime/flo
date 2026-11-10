@@ -83,6 +83,7 @@ fn hash(comptime op_list: []const ops.Op, comptime entry_list: []const entries.E
         ops.hashEnum(&h, proto.OpCode);
         ops.hashEnum(&h, EntryType);
         ops.hashEnum(&h, proto.StatusCode);
+        ops.hashEnum(&h, proto.StorageTier);
         golden.hash(&h);
         return h.final();
     }

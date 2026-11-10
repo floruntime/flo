@@ -99,6 +99,10 @@ pub const WaiterKind = enum(u8) {
 
     /// Stream group read — blocks until new messages arrive for a consumer group.
     stream_group_read,
+
+    /// A stream read whose payloads are being read back from disk: made
+    /// again once they are, and refused retryable if they aren't in time.
+    stream_disk_read,
 };
 
 /// The window a parked stream read covers: records of one stream strictly
@@ -108,6 +112,8 @@ pub const WaiterKind = enum(u8) {
 /// read parked but applied after still wakes it.
 pub const StreamWindow = struct {
     name_hash: u64 = 0,
+    /// The stream as `router.nsNameKey` names it, for its disk reads.
+    stream: [12]u8 = @splat(0),
     after: StreamID = StreamID.MIN,
     end: StreamID = StreamID.MAX,
     partition: ?u32 = null,

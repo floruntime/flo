@@ -738,7 +738,7 @@ test "offline: a segment read that fails for a resource or IO failure is refused
     try testing.expectEqual(@as(?anyerror, error.LogDiskFailing), notNow(error.Unexpected));
     // Gone or unreadable as written: damage, and a cut may be offered.
     try testing.expectEqual(@as(?anyerror, null), notNow(error.FileNotFound));
-    try testing.expectEqual(@as(?anyerror, null), notNow(error.AccessDenied));
+    try testing.expectEqual(@as(?anyerror, error.LogDiskFailing), notNow(error.AccessDenied));
 }
 
 fn kvEntries(comptime first: u64, comptime n: usize) [n]Entry {

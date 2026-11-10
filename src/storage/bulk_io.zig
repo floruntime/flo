@@ -9,9 +9,10 @@
 //! contents whole, and the shard drops a result whose truncation generation
 //! has moved, so a read is never torn, only stale.
 //!
-//! Two lanes: foreground (reads a client or a peer waits on) and background
-//! (work nobody waits on, such as snapshots). With both waiting, they take
-//! turns, so the background is never starved.
+//! Three lanes: catch-up (a leader's reads for its peers), stream (payloads
+//! a stream reader waits on), and background (work nobody waits on, such as
+//! snapshots). With several waiting they take turns, so none is starved, and
+//! a burst of stream reads never holds a peer's catch-up behind it.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -24,7 +25,7 @@ const log = std.log.scoped(.bulk_io);
 
 pub const MAX_PATH = 512;
 
-pub const Lane = enum { foreground, background };
+pub const Lane = enum { foreground, stream, background };
 
 /// Tells the asker its read is done. Called on the bulk thread.
 pub const Notify = struct {
@@ -82,7 +83,7 @@ const Queue = struct {
 pub const BulkIo = struct {
     allocator: std.mem.Allocator,
     mutex: stdx.Mutex = .{},
-    lanes: [2]Queue = .{ .{}, .{} },
+    lanes: [3]Queue = .{ .{}, .{}, .{} },
     /// The lane that goes first when both have work; flips after each read.
     turn: Lane = .foreground,
     running: std.atomic.Value(bool) = .init(false),
@@ -148,15 +149,19 @@ pub const BulkIo = struct {
         _ = std.c.write(self.wake_wr, &b, 1);
     }
 
-    /// The next read: the turn's lane first, the other if it is empty.
+    /// The next read: the turn's lane first, then the others in order.
     fn next(self: *BulkIo) ?*SealedRead {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const first = self.turn;
-        const second: Lane = if (first == .foreground) .background else .foreground;
-        const r = self.lanes[@backingInt(first)].pop() orelse self.lanes[@backingInt(second)].pop() orelse return null;
-        self.turn = second;
-        return r;
+        const lanes = self.lanes.len;
+        const first: usize = @backingInt(self.turn);
+        for (0..lanes) |k| {
+            const at = (first + k) % lanes;
+            const r = self.lanes[at].pop() orelse continue;
+            self.turn = @fromBackingInt(@as(u2, @intCast((at + 1) % lanes)));
+            return r;
+        }
+        return null;
     }
 
     fn loop(self: *BulkIo) void {
@@ -188,7 +193,7 @@ pub const BulkIo = struct {
         const opened = self.open(r.pathSlice(), r.generation) catch |err| {
             return switch (durable_log.DurableLog.readBlockClass(err)) {
                 .resource => .{ .blocked = true },
-                .disk => .{ .blocked = true, .disk_failing = true },
+                .disk => .{ .blocked = true, .disk_failing = true, .permission = durable_log.DurableLog.isPermission(err) },
                 // Gone, as a truncation deletes a file wholly above its cut:
                 // the shard's generation check drops it before reading this.
                 .fault => .{},

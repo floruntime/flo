@@ -47,6 +47,7 @@ const GroupListResponse = table_run.op("stream.group.list").response;
 const GroupMembersResponse = table_run.op("stream.group.members").response;
 
 const CommandResult = result_mod.CommandResult;
+const disk_reads = @import("disk_reads.zig");
 const StreamProjection = stream_mod.StreamProjection;
 const StreamID = stream_mod.StreamID;
 const time_units = @import("../util/time_units.zig");
@@ -93,8 +94,23 @@ pub const StreamHandler = struct {
     /// read path does not do a registry lookup per record.
     tiered_metrics: ?*TieredLogMetrics = null,
 
-    /// Appends a read had to skip: not in hot or warm storage, or not a
-    /// well-formed batch. Each is counted and logged once.
+    /// Payloads past the hot ring and the warm store, read back from the
+    /// shard's sealed segments. Null in tests that build no durable log.
+    disk: ?*disk_reads.DiskReads = null,
+    /// Set by a read that met a payload being read from disk (`pending`) or
+    /// that can't be read right now (`blocked`): its answer is held, not
+    /// sent, and the read is made again once the disk read is back. Reset
+    /// by `beginRead`.
+    held: enum { no, pending, blocked } = .no,
+    /// The stream and window the read in progress asks the disk for, so one
+    /// read back serves the whole window.
+    disk_window: disk_reads.Window = .{ .stream = @splat(0), .from = 0, .limit = 0 },
+    /// How many of the records the last serialize was given it answered: up
+    /// to the first one being read back from disk.
+    served_records: usize = 0,
+
+    /// Appends a read had to skip: not in hot, warm or disk storage, or not
+    /// a well-formed batch. Each is counted and logged once.
     skipped_appends: u64 = 0,
     /// The highest log index counted in `skipped_appends`: reads move
     /// forward, so a re-read or a waiter's next wake doesn't count it again.
@@ -393,6 +409,7 @@ pub const StreamHandler = struct {
             const cmd_result = shard.stream_handler.handleCommand(req);
 
             switch (cmd_result) {
+                .pending => return holdForDisk(shard, conn, req, bms),
                 .stream_messages => |m| {
                     // Check if we got any actual messages (count > 0)
                     if (m.data.len > 4) {
@@ -430,8 +447,40 @@ pub const StreamHandler = struct {
 
         // Non-blocking read — standard path
         const cmd_result = shard.stream_handler.handleCommand(req);
+        if (cmd_result == .pending) return holdForDisk(shard, conn, req, DISK_READ_WAIT_MS);
         defer shard.stream_handler.freeResult(cmd_result);
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
+    }
+
+    /// The longest a read waits on payloads being read back from disk. A
+    /// local read takes milliseconds; the bound is for a failing disk.
+    pub const DISK_READ_WAIT_MS: u32 = 2_000;
+    /// Reads held on disk reads at once, per shard.
+    pub const MAX_DISK_HELD: u16 = 64;
+
+    /// A read that met payloads being read back from disk: held, and made
+    /// again once they are (`Shard.resolveStreamWaiter`). One that can't be
+    /// read right now is refused retryable at once: nothing is in flight to
+    /// wait on.
+    fn holdForDisk(shard: *Shard, conn: *Connection, req: Request, wait_ms: u32) void {
+        // Past its own cap, a cold read is refused rather than take waiter
+        // slots KV watches and dequeues share.
+        if (shard.stream_handler.held != .pending) {
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard.stream_handler.diskRefusal()));
+        }
+        if (shard.waiter_pool.countByKind(.stream_disk_read) >= MAX_DISK_HELD) {
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READS_FULL));
+        }
+        const registered = shard.waiter_pool.register(.{
+            .kind = .stream_disk_read,
+            .reply_to = conn.replyTo(),
+            .request_id = req.header.request_id,
+            .key = req.key,
+            .stream = shard.stream_handler.readWindow(req),
+            .timeout_ms = @min(wait_ms, DISK_READ_WAIT_MS),
+        });
+        if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
+        conn.response_deferred = true;
     }
 
     /// Dedicated dispatch for stream_group_read — supports blocking via block_ms.
@@ -534,6 +583,7 @@ pub const StreamHandler = struct {
 
     /// Dispatch a stream command to the appropriate handler.
     fn handleCommand(self: *StreamHandler, req: Request) CommandResult {
+        self.beginRead();
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
         if (nameRefusal(op, req)) |why| return .{ .err = .{ .code = .invalid_request, .message = why } };
         return switch (op) {
@@ -669,6 +719,7 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(req.ns_id, req.key);
         var window: waiter_pool_mod.StreamWindow = .{
             .name_hash = name_hash,
+            .stream = router.nsNameKey(req.ns_id, req.key),
             .limit = readLimit(req),
         };
 
@@ -730,15 +781,45 @@ pub const StreamHandler = struct {
     /// The window's records and their answer, past any appends that can't
     /// be read: an answer with none of a read's records would leave the
     /// reader's cursor where it was, and a follower re-reading them forever.
+    ///
+    /// The answer stops before a record being read back from disk: what the
+    /// shard holds goes out, and the rest is the next read's. Only a read
+    /// that holds none of its window is `.pending`, to be held until the
+    /// disk read is back (or refused retryable, when `held` is `.blocked`).
     pub fn readReadable(self: *StreamHandler, window: *waiter_pool_mod.StreamWindow, buf: *[MAX_READ_BATCH]StreamRecord) struct { []StreamRecord, CommandResult } {
+        self.beginRead();
+        self.disk_window.stream = window.stream;
         while (true) {
             const records = self.readRecords(window.*, buf);
             const result = self.messages(records, window.after);
-            if (records.len == 0 or result != .stream_messages) return .{ records, result };
-            if (std.mem.readInt(u32, result.stream_messages.data[0..4], .little) > 0) return .{ records, result };
+            const served = records[0..self.served_records];
+            if (served.len == 0 and self.held != .no) {
+                self.freeResult(result);
+                return .{ served, .pending };
+            }
+            if (records.len == 0 or result != .stream_messages) return .{ served, result };
+            if (std.mem.readInt(u32, result.stream_messages.data[0..4], .little) > 0) return .{ served, result };
             self.freeResult(result);
-            window.after = stream_mod.lastRecordOf(records[records.len - 1]);
+            window.after = stream_mod.lastRecordOf(served[served.len - 1]);
         }
+    }
+
+    /// What a read refused for its disk reads is told, by why.
+    pub fn diskRefusal(self: *const StreamHandler) []const u8 {
+        if (self.held != .blocked) return shard_mod.DISK_READ_PENDING;
+        const d = self.disk orelse return shard_mod.DISK_READ_BLOCKED;
+        return switch (d.want_block) {
+            .io => shard_mod.DISK_READ_BLOCKED,
+            .full => shard_mod.DISK_READ_CACHE_FULL,
+            .mismatch => shard_mod.DISK_READ_MISMATCH,
+            .unwritten => shard_mod.DISK_READ_UNWRITTEN,
+        };
+    }
+
+    /// Before a read: nothing held yet.
+    pub fn beginRead(self: *StreamHandler) void {
+        self.held = .no;
+        self.served_records = 0;
     }
 
     /// A read response carrying `records`. The caller frees it.
@@ -746,7 +827,9 @@ pub const StreamHandler = struct {
         const data = self.serializeStreamRecordsWithPayloads(records, after, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "read serialization failed" } };
         };
-        const last_id = if (records.len > 0) stream_mod.lastRecordOf(records[records.len - 1]) else StreamID.MIN;
+        // Up to the first record still being read back, if any.
+        const served = records[0..self.served_records];
+        const last_id = if (served.len > 0) stream_mod.lastRecordOf(served[served.len - 1]) else StreamID.MIN;
         return .{ .stream_messages = .{
             .data = data,
             .next_timestamp_ms = last_id.timestamp_ms,
@@ -1311,16 +1394,28 @@ pub const StreamHandler = struct {
         const count = found + fresh;
         // A group's cursor passes whole appends, so nothing is left out.
         var readable: [MAX_READ_BATCH]bool = undefined;
+        self.beginRead();
+        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
+        // The reply stops before a record being read back from disk: only
+        // what it carries is delivered, and the rest waits. With none of it
+        // held, the reader retries: a group read's state can't be held as a
+        // plain read is, and the retry finds the payloads landed.
+        const answered = self.served_records;
+        if (answered == 0 and self.held != .no) {
+            self.allocator.free(data);
+            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
+        }
         // Only appends the reply carries are delivered; the cursor passes the
         // rest too, or the next read would meet them again.
         // A ready entry whose payload can't be read can never be sent:
         // dropped with the trimmed ones, or it would lead every read.
         var served: [MAX_READ_BATCH]StreamID = undefined;
         var served_n: usize = 0;
-        for (buf[0..found], readable[0..found]) |rec, ok| {
+        const ready_end = @min(found, answered);
+        for (buf[0..ready_end], readable[0..ready_end]) |rec, ok| {
             if (ok) {
                 served[served_n] = rec.id;
                 served_n += 1;
@@ -1331,7 +1426,8 @@ pub const StreamHandler = struct {
         }
         var sent: [MAX_READ_BATCH]StreamRecord = undefined;
         var sent_n: usize = 0;
-        for (buf[found..count], readable[found..count]) |rec, ok| if (ok) {
+        const fresh_end = @max(found, answered);
+        for (buf[found..fresh_end], readable[found..fresh_end]) |rec, ok| if (ok) {
             sent[sent_n] = rec;
             sent_n += 1;
         };
@@ -1341,7 +1437,8 @@ pub const StreamHandler = struct {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
         };
-        const through = if (fresh > 0) stream_mod.lastRecordOf(buf[count - 1]) else StreamID.MIN;
+        // The cursor passes what the reply covered, not what waits on disk.
+        const through = if (fresh_end > found) stream_mod.lastRecordOf(buf[fresh_end - 1]) else StreamID.MIN;
         self.stream.groupDeliverRecords(group_name, consumer_id, sent[0..sent_n], through, now_ms) catch |err| {
             self.allocator.free(data);
             return switch (err) {
@@ -1550,9 +1647,10 @@ pub const StreamHandler = struct {
         const capped = @min(@as(usize, count), MAX_READ_BATCH);
         const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
 
-        // Claim a page of PEL entries → IDs + next cursor.
+        // A page of PEL entries → IDs + next cursor, claimed below only as
+        // far as the reply carries them.
         var id_buf: [MAX_READ_BATCH]StreamID = undefined;
-        const claim_res = self.stream.groupAutoclaim(group_name, consumer_id, min_idle_ms, now_ms, start_id, capped, id_buf[0..capped]) catch |err| {
+        const claim_res = self.stream.groupPeekClaim(group_name, consumer_id, min_idle_ms, now_ms, start_id, capped, id_buf[0..capped]) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
@@ -1564,9 +1662,28 @@ pub const StreamHandler = struct {
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
 
+        self.beginRead();
+        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
         const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
         };
+        // Stopped before a record being read back from disk: the entries from
+        // it on are not claimed, and the cursor resumes there. With none of
+        // the page held, the claimer retries.
+        const answered = self.served_records;
+        if (answered == 0 and self.held != .no) {
+            self.allocator.free(records_blob);
+            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
+        }
+        var claimed: usize = claim_res.count;
+        var next_cursor = claim_res.next_cursor;
+        if (answered < rec_count) {
+            const cut = rec_buf[answered].id.order();
+            claimed = 0;
+            while (claimed < claim_res.count and id_buf[claimed].order() < cut) claimed += 1;
+            next_cursor = rec_buf[answered].id;
+        }
+        self.stream.groupClaimIds(group_name, id_buf[0..claimed], consumer_id, now_ms) catch {};
 
         // Append the 16-byte next-cursor to the records blob.
         const data = self.allocator.alloc(u8, records_blob.len + 16) catch {
@@ -1575,8 +1692,8 @@ pub const StreamHandler = struct {
         };
         @memcpy(data[0..records_blob.len], records_blob);
         self.allocator.free(records_blob);
-        std.mem.writeInt(u64, data[records_blob.len..][0..8], claim_res.next_cursor.timestamp_ms, .little);
-        std.mem.writeInt(u64, data[records_blob.len + 8 ..][0..8], claim_res.next_cursor.sequence, .little);
+        std.mem.writeInt(u64, data[records_blob.len..][0..8], next_cursor.timestamp_ms, .little);
+        std.mem.writeInt(u64, data[records_blob.len + 8 ..][0..8], next_cursor.sequence, .little);
 
         return .{ .group_messages = .{ .data = data } };
     }
@@ -1703,9 +1820,19 @@ pub const StreamHandler = struct {
         var tiers: [MAX_READ_BATCH]u8 = undefined;
         var count: usize = 0;
         var total: usize = 4; // count header
+        // Up to the first record being read back from disk: the answer is
+        // the in-order prefix the shard holds, so a reader always moves on,
+        // and the rest waits for the next read.
+        var served = records.len;
         for (records, 0..) |rec, i| {
+            self.disk_window.from = rec.ual_index;
+            self.disk_window.limit = @intCast(records.len - i);
             const r = self.getPayloadAndTier(rec.ual_index);
-            tiers[i] = if (r) |p| p.tier else 0;
+            if (r == null and self.held != .no) {
+                served = i;
+                break;
+            }
+            tiers[i] = if (r) |p| @backingInt(p.tier) else 0;
             blobs[i] = if (r) |p| stream_mod.BatchIterator.init(p.payload) catch null else null;
             if (readable) |rd| rd[i] = blobs[i] != null;
             var it = blobs[i] orelse {
@@ -1727,7 +1854,8 @@ pub const StreamHandler = struct {
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(count), .little);
         pos += 4;
 
-        for (records, 0..) |rec, i| {
+        self.served_records = served;
+        for (records[0..served], 0..) |rec, i| {
             var it = blobs[i] orelse continue;
             var j: u64 = 0;
             while (it.next()) |br| : (j += 1) {
@@ -1807,6 +1935,16 @@ pub const StreamHandler = struct {
         /// The StreamID each payload came from, parallel to `payloads`.
         ids: []const StreamID,
         last_id: StreamID,
+        /// Payloads copied out of another shard's disk cache, which some of
+        /// `payloads` point into.
+        copies: []const []u8 = &.{},
+
+        pub fn deinit(self: PayloadRead, allocator: Allocator) void {
+            allocator.free(self.payloads);
+            allocator.free(self.ids);
+            for (self.copies) |c| allocator.free(c);
+            allocator.free(self.copies);
+        }
     };
 
     pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) PayloadRead {
@@ -1824,8 +1962,22 @@ pub const StreamHandler = struct {
         const n = stream_mod.wholeEntriesWithin(rec_buf[0..read_n], capped);
 
         var last_id = after_id;
-        for (rec_buf[0..n]) |rec| {
+        // A job on another shard's thread reads this shard's hot ring and
+        // warm store, and copies from its disk cache; the disk reads it needs
+        // are asked of this shard, and it reads again on its next poll.
+        const stream_key = router.nsNameKey(self.namespaceId(namespace), stream_name);
+        if (self.disk) |d| if (!d.isOwner()) return self.readPayloadsElsewhere(d, rec_buf[0..n], stream_key, after_id);
+        self.beginRead();
+        self.disk_window.stream = stream_key;
+        // The payloads are good until the shard's next tick lands disk reads,
+        // after this poll has used them.
+        for (rec_buf[0..n], 0..) |rec, i| {
+            self.disk_window.from = rec.ual_index;
+            self.disk_window.limit = @intCast(n - i);
             const result = self.getPayloadAndTier(rec.ual_index);
+            // Being read from disk: stop before it, and the next poll, once
+            // the read is back, resumes there.
+            if (result == null and self.held != .no) break;
             var it = if (result) |p| stream_mod.BatchIterator.init(p.payload) catch null else null;
             if (it == null) self.noteUnreadable(rec);
             if (it) |*batch| {
@@ -1853,10 +2005,76 @@ pub const StreamHandler = struct {
         return .{ .payloads = out, .ids = ids, .last_id = last_id };
     }
 
-    /// Read a payload from the UAL by entry index (zero-copy fast path).
-    /// Returns the message value and the tier byte (0=hot, 1=warm), or null
-    /// when the entry is in neither: its readers skip and count it.
-    /// Falls back to the warm store when the entry has been evicted from the hot ring.
+    /// `readPayloadsForStream` from a thread other than this shard's: it
+    /// touches no state of this handler, and takes from the disk cache only
+    /// copies.
+    fn readPayloadsElsewhere(self: *StreamHandler, d: *disk_reads.DiskReads, records: []const StreamRecord, stream_key: [12]u8, after_id: StreamID) PayloadRead {
+        const nothing: PayloadRead = .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
+        var results: [MAX_READ_BATCH][]const u8 = undefined;
+        var result_ids: [MAX_READ_BATCH]StreamID = undefined;
+        var copies: [MAX_READ_BATCH][]u8 = undefined;
+        var n_copies: usize = 0;
+        var count: usize = 0;
+        var last_id = after_id;
+        for (records, 0..) |rec, i| {
+            var payload = self.hotOrWarm(rec.ual_index);
+            if (payload == null) if (d.copyFor(rec.ual_index, self.allocator)) |copy| {
+                copies[n_copies] = copy;
+                n_copies += 1;
+                if (entry_mod.CommandPayload.deserialize(copy)) |cmd| payload = stream_mod.decodeAppendValue(cmd.value).payload;
+            } else if (!d.isGone(rec.ual_index)) {
+                // Not here yet: stop before it, and have it fetched.
+                d.askFor(.{ .stream = stream_key, .from = rec.ual_index, .limit = @intCast(records.len - i) });
+                break;
+            };
+            var it = if (payload) |p| stream_mod.BatchIterator.init(p) catch null else null;
+            if (it) |*batch| {
+                var j: u64 = 0;
+                while (batch.next()) |br| : (j += 1) {
+                    if (!recordId(rec, j).greaterThan(after_id)) continue;
+                    results[count] = br.payload;
+                    result_ids[count] = recordId(rec, j);
+                    count += 1;
+                }
+            }
+            last_id = stream_mod.lastRecordOf(rec);
+        }
+        const out = self.allocator.alloc([]const u8, count) catch {
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        const ids = self.allocator.alloc(StreamID, count) catch {
+            self.allocator.free(out);
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        const kept = self.allocator.alloc([]u8, n_copies) catch {
+            self.allocator.free(out);
+            self.allocator.free(ids);
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        @memcpy(out, results[0..count]);
+        @memcpy(ids, result_ids[0..count]);
+        @memcpy(kept, copies[0..n_copies]);
+        return .{ .payloads = out, .ids = ids, .last_id = last_id, .copies = kept };
+    }
+
+    /// A record's payload from the hot ring or the warm store, or null.
+    fn hotOrWarm(self: *StreamHandler, ual_index: u64) ?[]const u8 {
+        if (self.partition.ual.read(ual_index)) |ual_entry| {
+            if (ual_entry.commandPayload()) |cmd| return stream_mod.decodeAppendValue(cmd.value).payload;
+        }
+        if (self.partition.readPayloadWarm(ual_index)) |raw| {
+            if (entry_mod.CommandPayload.deserialize(raw)) |cmd| return stream_mod.decodeAppendValue(cmd.value).payload;
+        }
+        return null;
+    }
+
+    /// A record's payload by its log index: from the hot ring (zero-copy),
+    /// then the warm store, then the durable log (`disk`). Null when it is
+    /// in none, and the readers skip and count it; or when it is being read
+    /// back (`held` says so), and the readers stop before it.
     ///
     /// Wrap-safety: the zero-copy `read` below returns null for an entry whose
     /// payload wraps the hot-ring boundary. That is SAFE here precisely because
@@ -1864,20 +2082,37 @@ pub const StreamHandler = struct {
     /// warm fallback serves the wrapped entry as tier=1. This is the canonical
     /// "null is OK, fall through" use of `read` — do not switch it to readCopy
     /// (that would force a copy + a response-lived buffer for no correctness gain).
-    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) ?struct { payload: []const u8, tier: u8 } {
+    fn getPayloadAndTier(self: *StreamHandler, ual_index: u64) ?struct { payload: []const u8, tier: proto.StorageTier } {
         // Hot path — entry still in the UAL ring buffer. Strip the partition
         // prefix so callers see the bare batch blob `BatchIterator` reads.
         if (self.partition.ual.read(ual_index)) |ual_entry| {
             if (ual_entry.commandPayload()) |cmd| {
                 if (self.tiered_metrics) |tm| tm.recordHotHit();
-                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 0 };
+                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .hot };
             }
         }
         // Warm fallback — payload copied to partition warm store on apply()
         if (self.partition.readPayloadWarm(ual_index)) |raw| {
             if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
                 if (self.tiered_metrics) |tm| tm.recordWarmHit();
-                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = 1 };
+                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .warm };
+            }
+        }
+        // Then the durable log: its sealed segment, or the writer's buffer.
+        if (self.disk) |d| {
+            if (d.get(ual_index)) |raw| if (entry_mod.CommandPayload.deserialize(raw)) |cmd| {
+                return .{ .payload = stream_mod.decodeAppendValue(cmd.value).payload, .tier = .disk };
+            };
+            switch (d.want(ual_index, self.disk_window)) {
+                .pending => {
+                    self.held = .pending;
+                    return null;
+                },
+                .blocked => {
+                    if (self.held == .no) self.held = .blocked;
+                    return null;
+                },
+                .absent => {},
             }
         }
         if (self.tiered_metrics) |tm| tm.recordMiss();

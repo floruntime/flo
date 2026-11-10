@@ -3398,8 +3398,7 @@ pub const WorkflowHandler = struct {
                 cursor,
                 @max(batch_limit, 1) * 10, // read ahead for batching
             );
-            defer stream_handler.allocator.free(result.payloads);
-            defer stream_handler.allocator.free(result.ids);
+            defer result.deinit(stream_handler.allocator);
             if (result.payloads.len == 0) {
                 // Appends that couldn't be read still move the cursor past
                 // them (the stream handler logged them), so the trigger
