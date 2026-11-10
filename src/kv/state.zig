@@ -1,6 +1,7 @@
 //! KV's applied state as reads see it: committed state only, through the
 //! contract's store, which the KV machine (machine.zig) alone changes.
-//! Keys are namespace-qualified (`ns\0key`) here as on the wire.
+//! A key is read as a `machine.Key`: its namespace's id and the key the
+//! client named, stored as `id ‖ key`.
 //!
 //! A read borrows the store's bytes: a value or key it returns is good on
 //! the shard thread until the next apply.
@@ -15,7 +16,8 @@ pub const Current = machine.Current;
 pub const Version = machine.Version;
 pub const Counts = machine.Counts;
 pub const ValueType = machine.ValueType;
-pub const Qualified = machine.Qualified;
+pub const Key = machine.Key;
+pub const NamespaceId = machine.NamespaceId;
 
 pub const KvState = struct {
     store: *store_mod.Store,
@@ -24,12 +26,10 @@ pub const KvState = struct {
     /// The `kv.ns_counts` commits the shard last published.
     published_commits: u64 = std.math.maxInt(u64),
     /// Where the shard publishes each namespace's counts, once looked up:
-    /// node-local, never state. Keys owned, from the shard's allocator.
-    publish_to: std.StringHashMapUnmanaged(*anyopaque) = .empty,
+    /// node-local, never state.
+    publish_to: std.AutoHashMapUnmanaged(NamespaceId, *anyopaque) = .empty,
 
     pub fn deinit(self: *KvState, allocator: std.mem.Allocator) void {
-        var it = self.publish_to.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
         self.publish_to.deinit(allocator);
     }
 
@@ -54,26 +54,32 @@ pub const KvState = struct {
         return .{ .store = self.store };
     }
 
-    /// `qkey`'s live, unexpired value, or null.
-    pub fn get(self: *const KvState, qkey: []const u8) ?Current {
-        const c = self.getRaw(qkey) orelse return null;
+    /// The live, unexpired value at `stored` (`Key.stored`, as a waiter
+    /// keeps it), or null.
+    pub fn get(self: *const KvState, stored: []const u8) ?Current {
+        const c = self.getRaw(stored) orelse return null;
         if (c.tombstone or c.expiredAt(self.readNow())) return null;
         return c;
     }
 
-    /// `qkey`'s current version, tombstone or expired included.
-    pub fn getRaw(self: *const KvState, qkey: []const u8) ?Current {
-        var kb: [machine.MAX_KEY]u8 = undefined;
+    /// The current version at `stored`, tombstone or expired included.
+    pub fn getRaw(self: *const KvState, stored: []const u8) ?Current {
         // State that won't decode was written by this build's own encode.
-        return self.read().get(machine.Values, machine.valueKey(&kb, Qualified.of(qkey))) catch unreachable;
+        return self.read().get(machine.Values, stored) catch unreachable;
+    }
+
+    /// `raw`'s live, unexpired value in namespace `ns`, or null.
+    pub fn getIn(self: *const KvState, ns: NamespaceId, raw: []const u8) ?Current {
+        var kb: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
+        return self.get(Key.init(&kb, ns, raw).stored);
     }
 
     /// A key's versions, newest first, from below `before` (exclusive)
     /// when given.
-    pub fn history(self: *const KvState, qkey: []const u8, before: ?u64) History {
-        var h: History = .{ .current = self.getRaw(qkey), .before = before };
+    pub fn history(self: *const KvState, key: Key, before: ?u64) History {
+        var h: History = .{ .current = self.getRaw(key.stored), .before = before };
         var pb: [machine.MAX_KEY]u8 = undefined;
-        var r = self.read().range(machine.History, machine.historyPrefix(&pb, Qualified.of(qkey)));
+        var r = self.read().range(machine.History, machine.historyPrefix(&pb, key));
         while (r.next() catch unreachable) |item| {
             std.debug.assert(h.len < h.chain.len);
             h.chain[h.len] = item.value;
@@ -120,13 +126,15 @@ pub const KvState = struct {
 
     /// The names of `ns`'s live, unexpired keys that start with `prefix`,
     /// in key order, after `after` when given, into `out`: borrowed, without
-    /// the namespace. Returns how many.
-    pub fn scanKeyNames(self: *const KvState, ns: []const u8, prefix: []const u8, after: ?[]const u8, out: [][]const u8) usize {
+    /// the namespace. Returns how many. The walk is the namespace's id
+    /// prefix, so it never reaches another namespace's key.
+    pub fn scanKeyNames(self: *const KvState, ns: NamespaceId, prefix: []const u8, after: ?[]const u8, out: [][]const u8) usize {
+        if (ns == .invalid) return 0;
         var pb: [machine.MAX_KEY]u8 = undefined;
-        const p = view_mod.key(&pb, ns, prefix) catch return 0;
+        const p = view_mod.idKey(&pb, ns, prefix) catch return 0;
         var ab: [machine.MAX_KEY]u8 = undefined;
-        const a = if (after) |k| view_mod.key(&ab, ns, k) catch return 0 else null;
-        const head = 1 + ns.len;
+        const a = if (after) |k| view_mod.idKey(&ab, ns, k) catch return 0 else null;
+        const head = @import("../protocol/limits.zig").NAMESPACE_ID_BYTES;
         const now = self.readNow();
         var r = if (a) |from| self.read().rangeAfter(machine.Values, p, from) else self.read().range(machine.Values, p);
         var n: usize = 0;
@@ -145,13 +153,13 @@ pub const KvState = struct {
     }
 
     /// `ns`'s counts.
-    pub fn countsOf(self: *const KvState, ns: []const u8) Counts {
+    pub fn countsOf(self: *const KvState, ns: NamespaceId) Counts {
         var kb: [machine.MAX_KEY]u8 = undefined;
         return (self.read().get(machine.NsCounts, machine.countsKey(&kb, ns)) catch unreachable) orelse .{};
     }
 
     /// Live keys in `ns`.
-    pub fn liveKeys(self: *const KvState, ns: []const u8) u64 {
+    pub fn liveKeys(self: *const KvState, ns: NamespaceId) u64 {
         return self.countsOf(ns).live;
     }
 
@@ -164,7 +172,7 @@ pub const KvState = struct {
         self.published_commits = self.store.family(machine.NsCounts.ID).commits;
     }
 
-    /// Every namespace's counts, in name order.
+    /// Every namespace's counts, in id order.
     pub fn namespaces(self: *const KvState) Namespaces {
         return .{ .inner = self.read().range(machine.NsCounts, "") };
     }
@@ -176,9 +184,9 @@ pub const KvState = struct {
     pub const Namespaces = struct {
         inner: view_mod.ReadRange(machine.NsCounts),
 
-        pub fn next(self: *Namespaces) ?struct { ns: []const u8, counts: Counts } {
+        pub fn next(self: *Namespaces) ?struct { ns: NamespaceId, counts: Counts } {
             const item = (self.inner.next() catch unreachable) orelse return null;
-            return .{ .ns = item.key[1 .. 1 + item.key[0]], .counts = item.value };
+            return .{ .ns = machine.countsNamespace(item.key), .counts = item.value };
         }
     };
 };
@@ -197,11 +205,12 @@ fn countLiveImpl(self: *const KvState) u64 {
     return n;
 }
 
-/// For tests: a put of `value` at `qkey`, applied through the KV machine
-/// as a committed entry would be, outside any log.
-fn putForTestImpl(self: *KvState, qkey: []const u8, value: []const u8) !void {
+/// For tests: a put of `value` at stored key `stored` (`id ‖ raw`),
+/// applied through the KV machine as a committed entry would be, outside
+/// any log.
+fn putForTestImpl(self: *KvState, stored: []const u8, value: []const u8) !void {
     const allocator = self.store.allocator;
-    const body: kv_entries.Put.Value = .{ .key = qkey, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
+    const body: kv_entries.Put.Value = .{ .key = stored, .value = value, .ttl_ms = null, .condition = .always, .cas_version = null };
     const buf = try allocator.alloc(u8, try kv_entries.Put.encodedSize(body));
     defer allocator.free(buf);
     const e = entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 1, 0, try kv_entries.Put.encodeInto(buf, body));
@@ -212,16 +221,16 @@ fn putForTestImpl(self: *KvState, qkey: []const u8, value: []const u8) !void {
     try @import("../contract/machine.zig").applyEntry(&machine.machine, self.store, &scratch, &e, &out);
 }
 
-/// For tests: `qkey`'s expiry set outright, past any TTL an entry may carry.
-fn setExpiryForTestImpl(self: *KvState, qkey: []const u8, expiry_ns: u64) !void {
+/// For tests: the expiry at stored key `stored` set outright, past any TTL
+/// an entry may carry.
+fn setExpiryForTestImpl(self: *KvState, stored: []const u8, expiry_ns: u64) !void {
     var scratch = std.heap.ArenaAllocator.init(self.store.allocator);
     defer scratch.deinit();
     var keys = view_mod.KeySet.init(scratch.allocator());
-    const q = Qualified.of(qkey);
-    try keys.add(machine.Values.ID, q.ns, q.key);
+    const q = Key.ofStored(stored) orelse return error.NotFound;
+    try keys.addIn(machine.Values.ID, q.ns, q.raw);
     var view = view_mod.View.init(self.store, scratch.allocator(), &keys);
-    var kb: [machine.MAX_KEY]u8 = undefined;
-    const vk = machine.valueKey(&kb, q);
+    const vk = machine.valueKey(q);
     var cur = (try view.get(machine.Values, vk)) orelse return error.NotFound;
     cur.expiry_ns = expiry_ns;
     try view.put(machine.Values, vk, cur);

@@ -76,7 +76,7 @@ export function Queues() {
                 <div className="c r">Ready</div>
                 <div className="c r">In-flight</div>
                 <div className="c r">Enqueued</div>
-                <div className="c r">Dequeued</div>
+                <div className="c r">Delivered</div>
                 <div className="c r">DLQ</div>
               </div>
               {queues.map((x) => (

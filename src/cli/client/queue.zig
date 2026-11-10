@@ -19,10 +19,12 @@ pub fn enqueue(
     queue: []const u8,
     payload: []const u8,
     priority: u8,
+    delay_ms: u64,
 ) !Response {
-    var options_buf: [8]u8 = undefined;
+    var options_buf: [16]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
     try builder.addU8(.priority, priority);
+    if (delay_ms > 0) try builder.addU64(.delay_ms, delay_ms);
 
     return client.sendRequestWithOptions(.queue_enqueue, namespace, queue, payload, builder.getOptions());
 }
@@ -33,40 +35,75 @@ pub fn purge(client: *Client, namespace: []const u8, queue: []const u8) !Respons
     return client.sendRequest(.queue_purge, namespace, queue, "");
 }
 
-/// Dequeue messages from a queue
-/// block_ms: null or 0 = no blocking, >0 = block for N ms (the server refuses more than 5 minutes)
-pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count: u32, block_ms: ?u32) !Response {
-    var options_buf: [48]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&options_buf);
+const queue_ops = @import("../../protocol/queue_ops.zig");
 
-    try builder.addU32(.count, count);
+/// Take up to `count` of a queue's next ready messages, leased to
+/// `consumer` for `lease_ms` (null: the server's 30 s), or with `ack`
+/// completed as they're taken. `block_ms`: null or 0 answers at once, more
+/// waits that long for a message (the server refuses more than 5 minutes).
+pub fn dequeue(client: *Client, namespace: []const u8, queue: []const u8, count: u32, block_ms: ?u32, ack: bool, consumer: []const u8, lease_ms: ?u64) !Response {
+    const ms: u64 = block_ms orelse 0;
+    // Read for as long as the server waits, plus 5 s.
+    if (ms > 0) client.setReadTimeoutSec(@intCast(ms / 1000 + 5));
+    return client.call(queue_ops.op("queue.dequeue"), namespace, queue, .{ .consumer = consumer, .count = count, .lease_ms = lease_ms, .block_ms = ms, .ack = ack });
+}
 
-    // Only add block_ms option if blocking is requested
-    if (block_ms) |ms| {
-        try builder.addU32(.block_ms, ms);
-        // Read for as long as the server waits, plus 5 s; 0 does not wait.
-        if (ms > 0) client.setReadTimeoutSec(ms / 1000 + 5);
+/// A dequeued message's delivery, as the CLI prints and takes it:
+/// `term.index.seq.deliveries`.
+pub const DeliveryId = struct {
+    term: u64,
+    index: u64,
+    seq: u64,
+    deliveries: u32,
+
+    pub fn parse(s: []const u8) ?DeliveryId {
+        var it = std.mem.splitScalar(u8, s, '.');
+        const term = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        const index = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        const seq = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        const deliveries = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+        if (it.next() != null) return null;
+        return .{ .term = term, .index = index, .seq = seq, .deliveries = deliveries };
     }
 
-    return client.sendRequestWithOptions(.queue_dequeue, namespace, queue, "", builder.getOptions());
+    pub fn format(self: DeliveryId, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d}.{d}.{d}.{d}", .{ self.term, self.index, self.seq, self.deliveries });
+    }
+};
+
+const Items = @import("../../protocol/schema.zig").List(queue_ops.Item, queue_ops.MAX_BATCH);
+
+/// `ids`, which must name one delivery, as a report names its messages.
+fn itemsOf(buf: []u8, ids: []const DeliveryId) !Items.Value {
+    if (ids.len == 0 or ids.len > queue_ops.MAX_BATCH) return error.InvalidRequest;
+    var b = Items.Builder.init(buf);
+    for (ids) |id| {
+        if (id.term != ids[0].term or id.index != ids[0].index) return error.InvalidRequest;
+        if (!(b.add(.{ .seq = id.seq, .deliveries = id.deliveries }) catch false)) return error.InvalidRequest;
+    }
+    return b.value();
 }
 
-/// Acknowledge message processing (complete)
-pub fn ack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64) !Response {
-    // Format: [count:u32][seq:u64]*
-    var writer = FixedWireWriter(4096).init();
-    try writer.writeU64ArrayWithCount(seqs);
-
-    return client.sendRequest(.queue_complete, namespace, queue, writer.bytes());
+/// Complete messages of one delivery: they leave the queue.
+pub fn complete(client: *Client, namespace: []const u8, queue: []const u8, consumer: []const u8, ids: []const DeliveryId) !Response {
+    var buf: [Items.max_size]u8 = undefined;
+    const items = try itemsOf(&buf, ids);
+    return client.call(queue_ops.op("queue.complete"), namespace, queue, .{ .consumer = consumer, .term = ids[0].term, .index = ids[0].index, .messages = items });
 }
 
-/// Negative acknowledge (return to queue or send to DLQ)
-pub fn nack(client: *Client, namespace: []const u8, queue: []const u8, seqs: []const u64) !Response {
-    // Format: [count:u32][seq:u64]*
-    var writer = FixedWireWriter(4096).init();
-    try writer.writeU64ArrayWithCount(seqs);
+/// Fail messages of one delivery: ready again after `delay_ms`, or dead
+/// at once with `dead` or once their attempts are spent.
+pub fn fail(client: *Client, namespace: []const u8, queue: []const u8, consumer: []const u8, ids: []const DeliveryId, delay_ms: u64, dead: bool, error_message: []const u8) !Response {
+    var buf: [Items.max_size]u8 = undefined;
+    const items = try itemsOf(&buf, ids);
+    return client.call(queue_ops.op("queue.fail"), namespace, queue, .{ .consumer = consumer, .term = ids[0].term, .index = ids[0].index, .messages = items, .delay_ms = delay_ms, .dead = dead, .@"error" = error_message });
+}
 
-    return client.sendRequest(.queue_fail, namespace, queue, writer.bytes());
+/// Keep messages of one delivery: their lease runs on.
+pub fn touch(client: *Client, namespace: []const u8, queue: []const u8, consumer: []const u8, ids: []const DeliveryId) !Response {
+    var buf: [Items.max_size]u8 = undefined;
+    const items = try itemsOf(&buf, ids);
+    return client.call(queue_ops.op("queue.touch"), namespace, queue, .{ .consumer = consumer, .term = ids[0].term, .index = ids[0].index, .messages = items });
 }
 
 /// A queue's dead-letter count; listing the messages themselves isn't

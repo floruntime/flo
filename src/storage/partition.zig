@@ -16,7 +16,6 @@ const tombstones = @import("tombstones.zig");
 const router_mod = @import("../projection/router.zig");
 const kv_state = @import("../kv/state.zig");
 const kv_machine = @import("../kv/machine.zig");
-const queue_mod = @import("../projection/queue.zig");
 const stream_mod = @import("../projection/stream.zig");
 const ts_mod = @import("../projection/ts.zig");
 const log = @import("stdx").log;
@@ -42,7 +41,6 @@ pub const Partition = struct {
     /// Projections (owned by partition).
     /// KV's state as reads see it: the KV machine's families in `store`.
     kv: kv_state.KvState,
-    queue: queue_mod.QueueProjection,
     stream: stream_mod.StreamProjection,
     ts: ts_mod.TSProjection,
 
@@ -79,7 +77,6 @@ pub const Partition = struct {
         var ual = try UAL.init(allocator, ual_capacity, max_hot_entries);
         errdefer ual.deinit();
 
-        const queue = queue_mod.QueueProjection.init(allocator, .{});
         const stream = stream_mod.StreamProjection.init(allocator);
         const ts = ts_mod.TSProjection.init(allocator, .{});
 
@@ -90,7 +87,6 @@ pub const Partition = struct {
             .router = ProjectionRouter.init(),
             // Pointed at `store` once the partition is where it stays.
             .kv = .{ .store = undefined },
-            .queue = queue,
             .stream = stream,
             .ts = ts,
             .store = contract_store.Store.init(allocator),
@@ -115,7 +111,6 @@ pub const Partition = struct {
     /// MUST be called after init(), once the Partition is at its final address.
     pub fn wireProjections(self: *Partition) void {
         self.kv.store = &self.store;
-        self.router.registerQueue(self.queue.projectionHandle());
         self.router.registerTS(self.ts.projectionHandle());
     }
 
@@ -137,7 +132,6 @@ pub const Partition = struct {
         self.store.deinit();
         self.ts.deinit();
         self.stream.deinit();
-        self.queue.deinit();
         self.ual.deinit();
     }
 
@@ -292,11 +286,6 @@ pub const Partition = struct {
         return self.stream.highWaterMark();
     }
 
-    /// Get the queue ready count.
-    pub fn queueReady(self: *const Partition) usize {
-        return self.queue.readyCount();
-    }
-
     // ── Snapshot ────────────────────────────────────────────────────────
 
     // ── Queries ─────────────────────────────────────────────────────────
@@ -374,7 +363,7 @@ test "partition: apply and read entries" {
 
     // Apply a KV put
     var payload_buf: [128]u8 = undefined;
-    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
+    const e1 = kvTestEntry(&payload_buf, .kv_put, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "key1", .value = "val1", .ttl_ms = null, .condition = .always, .cas_version = null }, 1, 1000);
     const idx1 = try part.apply(&e1);
     try testing.expectEqual(@as(u64, 1), idx1);
 
@@ -392,21 +381,6 @@ test "partition: apply and read entries" {
 
     try testing.expectEqual(@as(u64, 2), part.appliedIndex());
     try testing.expectEqual(@as(u64, 2), part.committed_index);
-}
-
-test "partition: queue projection wired through router" {
-    const allocator = testing.allocator;
-
-    var part = try Partition.init(allocator, 0, 8192, 0);
-    defer part.deinit();
-    part.wireProjections();
-
-    // Enqueue via UAL entry
-    var buf1: [128]u8 = undefined;
-    const e1 = entry_mod.buildCommandEntry(.queue_enqueue, 0, 1, 1, 1000, 0, "q1", "msg", &buf1) orelse unreachable;
-    _ = try part.apply(&e1);
-
-    try testing.expectEqual(@as(u64, 1), part.queue.stats.enqueued);
 }
 
 test "partition: contains check" {

@@ -12,6 +12,8 @@
 //! is the same for action runs, and also checks each entry it applies
 //! against the state before and after it.
 //!
+//! `Queues` is the same for queues' messages (`queue_family.zig`).
+//!
 //! `Namespaces` is shard 0's own namespace handler, its creates applied
 //! through the handler's replay path.
 //!
@@ -106,6 +108,24 @@ pub const Mutant = enum {
     /// A leader that steps down keeps its in-flight namespace id: won
     /// again, it allocates past what the group created.
     ns_keeps_alloc,
+    // Bugs in the queue machine, planted as the actions ones are: by
+    // rewriting the entry it applies, or the state just before it.
+    /// A settle completes the message whatever delivery it names.
+    queue_settle_ignores_token,
+    /// A fail removes its message, as a settle would.
+    queue_release_removes,
+    /// An expire ends leases before their deadline.
+    queue_expire_ignores_deadline,
+    /// A deliver passes over the first due message and takes the next.
+    queue_deliver_wrong_order,
+    /// A deliver takes at most one message, whatever its count.
+    queue_deliver_short,
+    /// An expire ends only the first live lease it names past due.
+    queue_expire_first_only,
+    /// A settle also changes a message it doesn't name.
+    queue_report_changes_unnamed,
+    /// Queue entries apply at the replica's own clock.
+    queue_node_clock,
 
     /// Whether the bug is in a node's transaction limit: a run with none
     /// never reaches it.
@@ -119,6 +139,16 @@ pub const Mutant = enum {
         return switch (m) {
             .none, .node_clock, .local_refusal, .map_order, .live_only_effect, .kv_replay_skips_batches, .kv_refused_commits, .kv_condition_local, .kv_if_absent_holds, .kv_batch_conditions_ignored, .kv_refuses_over_own_limit, .leader_ignores_limit, .kv_refuses_large, .kv_stops_batch_short, .ns_ungated, .ns_ready_on_commit, .ns_keeps_alloc => false,
             .deliver_ignores_due, .expire_ignores_deadline, .expire_matches_delivery, .settle_ignores_token, .release_counts_nothing, .settle_keeps_request, .extend_ignores_held_since, .action_node_clock => true,
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => false,
+        };
+    }
+
+    /// Whether the bug is in the queue machine: a run with no queue entries
+    /// never reaches it.
+    pub fn inQueues(m: Mutant) bool {
+        return switch (m) {
+            .queue_settle_ignores_token, .queue_release_removes, .queue_expire_ignores_deadline, .queue_deliver_wrong_order, .queue_deliver_short, .queue_expire_first_only, .queue_report_changes_unnamed, .queue_node_clock => true,
+            else => false,
         };
     }
 };
@@ -168,7 +198,7 @@ pub const Counter = struct {
 
     pub fn owns(entry_type: u8) bool {
         return switch (@as(entry_mod.EntryType, @fromBackingInt(entry_type))) {
-            .kv_put, .kv_delete, .stream_append, .queue_enqueue, .ts_write => true,
+            .kv_put, .kv_delete, .stream_append, .ts_write => true,
             else => false,
         };
     }
@@ -380,7 +410,7 @@ pub const Kv = struct {
             ops[n].cas_version = null;
         }
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0..n]) catch return null;
+        kv_entries.encodeBatch(&w, batch.ns, ops[0..n]) catch return null;
         return w.written();
     }
 
@@ -393,14 +423,14 @@ pub const Kv = struct {
         var it = batch.ops.iterator();
         while (it.next() catch return null) |op| : (n += 1) ops[n] = op;
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0 .. n / 2]) catch return null;
+        kv_entries.encodeBatch(&w, batch.ns, ops[0 .. n / 2]) catch return null;
         return w.written();
     }
 
-    /// The counter at `qkey` on this replica, 0 if there is none.
-    pub fn counter(self: *Kv, qkey: []const u8) i64 {
-        var kb: [kv_machine.MAX_KEY]u8 = undefined;
-        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(qkey))) orelse return 0;
+    /// The counter at stored key `stored` (`id ‖ key`) on this replica, 0
+    /// if there is none.
+    pub fn counter(self: *Kv, stored: []const u8) i64 {
+        const bytes = self.store.get(kv_machine.Values.ID, stored) orelse return 0;
         const current = kv_machine.Current.decode(bytes) catch return 0;
         if (current.tombstone or current.value.len != 8) return 0;
         return std.mem.readInt(i64, current.value[0..8], .little);
@@ -408,8 +438,8 @@ pub const Kv = struct {
 
     /// What `p` should be answered at `at_ns`, from the key as it stands.
     fn conditionHolds(self: *Kv, p: kv_entries.Put.Value, at_ns: u64) bool {
-        var kb: [kv_machine.MAX_KEY]u8 = undefined;
-        const bytes = self.store.get(kv_machine.Values.ID, kv_machine.valueKey(&kb, kv_machine.Qualified.of(p.key)));
+        // A single-key entry carries its key as `kv.value` keeps it.
+        const bytes = self.store.get(kv_machine.Values.ID, p.key);
         const current: ?kv_machine.Current = if (bytes) |b| (kv_machine.Current.decode(b) catch null) else null;
         // Written out, not `expiredAt`: a bug there would be in both, and agree.
         const version: ?u64 = if (current) |c| (if (c.tombstone or (c.expiry_ns > 0 and c.expiry_ns <= at_ns)) null else c.version) else null;
@@ -807,7 +837,7 @@ pub const Actions = struct {
         var kb: [512]u8 = undefined;
         switch (v.status) {
             .ready => {
-                const k = view_mod.key(&kb, ns, action_machine.readyKey(&b, v.action, v.due_ns, id)) catch return null;
+                const k = view_mod.key(&kb, ns, action_machine.readyKey(&b, v.action, {}, v.due_ns, id)) catch return null;
                 if (self.store.get(action_machine.Ready.ID, k) == null) return "a ready run has no ready key at its due time";
             },
             .leased => {
@@ -928,6 +958,8 @@ pub const Actions = struct {
     }
 };
 
+pub const Queues = @import("queue_family.zig").Queues;
+
 /// Shard 0's namespace registry: the server's handler, on a table of its
 /// own. The simulator proposes creates through it as shard 0's leader does
 /// (`proposeCreateOn`) and applies them through its replay path. Nothing
@@ -984,13 +1016,16 @@ pub const Namespaces = struct {
         var out: persistence.Result = .{};
         out.reset(e);
         const next = self.handler.next_id;
-        try self.handler.replayEntry(e, &out);
-        const r = out.refused() orelse {
-            var diag: schema.Diagnostic = .{};
-            const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return error.Halt;
-            return if (c.id == next) .created else .past_next;
+        var diag: schema.Diagnostic = .{};
+        const c = namespace_entries.Create.decodeAll(e.payload, &diag) catch return error.Halt;
+        // The server halts on a create its applier refuses (a ready leader
+        // never proposes one); the model says which, so the checker can.
+        if (c.id < next) return .stale_id;
+        self.handler.replayEntry(e, &out) catch |err| return switch (err) {
+            error.Halt => .refused,
+            else => err,
         };
-        return if (std.mem.eql(u8, r.refusal.message, ns_handler.NamespaceHandler.STALE_ID_MESSAGE)) .stale_id else .refused;
+        return if (c.id == next) .created else .past_next;
     }
 
     /// The registry, the creates this log refused, and the next id, in no
@@ -1004,11 +1039,9 @@ pub const Namespaces = struct {
             var hasher = std.hash.Wyhash.init(HASH_SEED);
             hasher.update(kv.key_ptr.*);
             const m = kv.value_ptr.*;
-            hasher.update(std.mem.asBytes(&[3]u64{ m.id, m.created_at_ns, m.created_index }));
+            hasher.update(std.mem.asBytes(&[3]u64{ m.id.int(), m.created_at_ns, m.created_index }));
             sum +%= hasher.final();
         }
-        var refused = h.refused_hashes.keyIterator();
-        while (refused.next()) |hash| sum +%= std.hash.Wyhash.hash(HASH_SEED +% 1, std.mem.asBytes(hash));
         return sum;
     }
 };
@@ -1057,7 +1090,7 @@ test "families: a KV replica's store is strict, and stays so once reset" {
     defer kv.deinit();
     try testing.expect(kv.store.strict_keys);
     var body_buf: [64]u8 = undefined;
-    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
+    const p = try @import("../protocol/kv_entries.zig").Put.encodeInto(&body_buf, .{ .key = @import("../namespace/table.zig").DEFAULT.bytes() ++ "k", .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null });
     var e = entry_mod.buildEntry(.kv_put, 0, 1, 1, 1, p);
     e.header.crc32c = e.computeCrc();
     const empty = kv.checksums();
@@ -1218,8 +1251,8 @@ fn nsCreate(n: *Namespaces, index: u64, name: []const u8, id: u32) !Namespaces.E
     return n.apply(&e);
 }
 
-test "families: a namespace create refused for its id folds into the checksum, and resets" {
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+test "families: a namespace create refused for its id leaves the checksum as it was, and resets" {
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED.int();
     var a = Namespaces.init(testing.allocator);
     defer a.deinit();
     var b = Namespaces.init(testing.allocator);
@@ -1229,11 +1262,10 @@ test "families: a namespace create refused for its id folds into the checksum, a
     try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&b, 1, "orders", first));
     try testing.expectEqual(a.checksum(), b.checksum());
     const created = a.checksum();
-    // "ledger" asks for the id "orders" took: refused on both alike, and
-    // the refusal is part of the state.
+    // "ledger" asks for the id "orders" took: refused on both alike. No
+    // write waits behind a create, so the refusal leaves nothing to keep.
     try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&a, 2, "ledger", first));
-    try testing.expect(a.checksum() != created);
-    try testing.expect(a.checksum() != b.checksum());
+    try testing.expectEqual(created, a.checksum());
     try testing.expectEqual(Namespaces.Effect.stale_id, try nsCreate(&b, 2, "ledger", first));
     try testing.expectEqual(a.checksum(), b.checksum());
     a.reset();
@@ -1241,7 +1273,7 @@ test "families: a namespace create refused for its id folds into the checksum, a
 }
 
 test "families: a namespace create past the next free id is told apart from one at it" {
-    const first = @import("../namespace/table.zig").FIRST_ALLOCATED;
+    const first = @import("../namespace/table.zig").FIRST_ALLOCATED.int();
     var n = Namespaces.init(testing.allocator);
     defer n.deinit();
     try testing.expectEqual(Namespaces.Effect.created, try nsCreate(&n, 1, "orders", first));

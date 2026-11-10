@@ -4,7 +4,7 @@
 const std = @import("std");
 const log = @import("stdx").log;
 
-pub const Duty = enum { processing, stream_triggers, schedules, workflow_steps, action_expire, stream_retention };
+pub const Duty = enum { processing, stream_triggers, schedules, workflow_steps, action_expire, queue_expire, stream_retention };
 
 pub const Reason = enum {
     shard_halted,

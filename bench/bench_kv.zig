@@ -15,8 +15,10 @@ const kv_entries = src.protocol.kv_entries;
 
 const BENCH_ITERS = 100_000;
 
+/// The stored key: default's id, then the key, as the KV state keeps it.
 fn formatKey(buf: *[32]u8, i: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "bench-key-{d:0>8}", .{i}) catch "bench-key";
+    buf[0..4].* = src.node.router.NamespaceId.default.bytes();
+    return buf[0 .. 4 + (std.fmt.bufPrint(buf[4..], "bench-key-{d:0>8}", .{i}) catch unreachable).len];
 }
 
 fn formatVal(buf: *[64]u8, i: usize) []const u8 {
@@ -50,12 +52,12 @@ pub fn main() !void {
 
     var names: [100][]const u8 = undefined;
     start = stdx.time.nanoTimestamp();
-    for (0..10_000) |_| found += st.scanKeyNames("default", "", null, &names);
+    for (0..10_000) |_| found += st.scanKeyNames(.default, "", null, &names);
     std.mem.doNotOptimizeAway(found);
     report("KV Scan:", 10_000, start, ", batch=100");
 
     start = stdx.time.nanoTimestamp();
-    for (0..10_000) |_| found += st.scanKeyNames("default", "bench-key-0000", null, &names);
+    for (0..10_000) |_| found += st.scanKeyNames(.default, "bench-key-0000", null, &names);
     std.mem.doNotOptimizeAway(found);
     report("KV ScanPfx:", 10_000, start, ", prefix=14B");
 

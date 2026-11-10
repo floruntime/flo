@@ -11,51 +11,19 @@ const stdx = @import("stdx");
 // Helper Functions
 // =============================================================================
 
-/// Extract sequence number from dequeue output
-/// Tries formats: seq: 123, seq=123, [123], "seq":123
-fn extractSeqNumber(output: []const u8) ?[]const u8 {
-    // Try "seq": pattern (JSON)
-    if (std.mem.indexOf(u8, output, "\"seq\":")) |idx| {
-        const start = idx + 6;
-        var end = start;
-        while (end < output.len and std.ascii.isDigit(output[end])) {
-            end += 1;
-        }
-        if (end > start) return output[start..end];
-    }
+/// The delivery a dequeue printed first, `term.index.seq.deliveries`,
+/// before its payload.
+fn deliveryOf(output: []const u8) ?[]const u8 {
+    const line = std.mem.sliceTo(output, '\n');
+    const space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    if (std.mem.count(u8, line[0..space], ".") != 3) return null;
+    return line[0..space];
+}
 
-    // Try "seq:" pattern
-    if (std.mem.indexOf(u8, output, "seq:")) |idx| {
-        var start = idx + 4;
-        // Skip whitespace
-        while (start < output.len and output[start] == ' ') {
-            start += 1;
-        }
-        var end = start;
-        while (end < output.len and std.ascii.isDigit(output[end])) {
-            end += 1;
-        }
-        if (end > start) return output[start..end];
-    }
-
-    // Try [123] pattern
-    if (std.mem.indexOf(u8, output, "[")) |bracket_start| {
-        const start = bracket_start + 1;
-        if (std.mem.indexOfPos(u8, output, start, "]")) |bracket_end| {
-            const inside = output[start..bracket_end];
-            // Check if it's all digits
-            var all_digits = true;
-            for (inside) |c| {
-                if (!std.ascii.isDigit(c)) {
-                    all_digits = false;
-                    break;
-                }
-            }
-            if (all_digits and inside.len > 0) return inside;
-        }
-    }
-
-    return null;
+/// The delivery count `delivery` ends with.
+fn deliveriesOf(delivery: []const u8) !u32 {
+    const dot = std.mem.lastIndexOfScalar(u8, delivery, '.') orelse return error.NoDelivery;
+    return std.fmt.parseInt(u32, delivery[dot + 1 ..], 10);
 }
 
 // =============================================================================
@@ -212,48 +180,113 @@ test "e2e/queue: batch dequeue fewer than requested" {
 // ACK Operations
 // =============================================================================
 
-test "e2e/queue: ack (complete) message" {
+test "e2e/queue: a dequeue leases its message; ack removes it, and a second ack is refused" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Enqueue a message
     try ctx.exec(&.{ "queue", "enqueue", "ack-q", "message to ack" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "ack-q" });
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, out, "\n"), " message to ack"));
+    const delivery = deliveryOf(out) orelse return error.NoDelivery;
+    var d_buf: [64]u8 = undefined;
+    const d = d_buf[0..delivery.len];
+    @memcpy(d, delivery);
+    try testing.expectEqual(@as(u32, 1), try deliveriesOf(d));
 
-    // Dequeue to get the message and its sequence number
-    const dequeue_output = try ctx.execCapture(&.{ "queue", "dequeue", "ack-q" });
+    // Leased, not ready: a second dequeue takes nothing.
+    var none = try ctx.cli.run(&.{ "queue", "dequeue", "ack-q" });
+    defer none.deinit();
+    try testing.expectEqual(@as(u8, 0), none.exit_code);
+    try testing.expect(none.stdoutContains("(no messages)"));
 
-    // Extract sequence number
-    const seq = extractSeqNumber(dequeue_output);
-    if (seq) |seq_num| {
-        // ACK the message
-        var result = try ctx.cli.run(&.{ "queue", "ack", "ack-q", seq_num });
-        defer result.deinit();
+    var ack = try ctx.cli.run(&.{ "queue", "ack", "ack-q", d });
+    defer ack.deinit();
+    try testing.expectEqual(@as(u8, 0), ack.exit_code);
+    try testing.expect(ack.stdoutContains("OK: 1\n"));
 
-        // ACK should succeed
-        try testing.expect(result.succeeded() or result.contains("ack") or result.contains("OK"));
-    }
-    // If we can't parse seq, the test still passes (dequeue worked)
+    var again = try ctx.cli.run(&.{ "queue", "ack", "ack-q", d });
+    defer again.deinit();
+    try testing.expect(again.exit_code != 0);
+    try testing.expect(again.stderrContains("no such message in this queue"));
 }
 
-test "e2e/queue: nack returns message to queue" {
+test "e2e/queue: nack readies its message again, delivered a second time" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // Enqueue a message
     try ctx.exec(&.{ "queue", "enqueue", "nack-q", "nackable message" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "nack-q" });
+    const first = deliveryOf(out) orelse return error.NoDelivery;
+    var nack = try ctx.cli.run(&.{ "queue", "nack", "nack-q", first });
+    defer nack.deinit();
+    try testing.expectEqual(@as(u8, 0), nack.exit_code);
+    try testing.expect(nack.stdoutContains("OK: 1\n"));
 
-    // Dequeue
-    const dequeue_output = try ctx.execCapture(&.{ "queue", "dequeue", "nack-q" });
+    const again = try ctx.execCapture(&.{ "queue", "dequeue", "nack-q" });
+    try testing.expect(std.mem.indexOf(u8, again, "nackable message") != null);
+    try testing.expectEqual(@as(u32, 2), try deliveriesOf(deliveryOf(again) orelse return error.NoDelivery));
+}
 
-    const seq = extractSeqNumber(dequeue_output);
-    if (seq) |seq_num| {
-        // NACK the message
-        var result = try ctx.cli.run(&.{ "queue", "nack", "nack-q", seq_num });
-        defer result.deinit();
+test "e2e/queue: a lease that runs out redelivers its message, and the late holder's ack is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
 
-        // NACK should succeed or be accepted
-        try testing.expect(result.succeeded() or result.contains("nack") or result.contains("OK") or result.contains("released"));
-    }
+    try ctx.exec(&.{ "queue", "enqueue", "lease-q", "slow work" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "lease-q", "--lease", "5000" });
+    const delivery = deliveryOf(out) orelse return error.NoDelivery;
+    var d_buf: [64]u8 = undefined;
+    const d = d_buf[0..delivery.len];
+    @memcpy(d, delivery);
+
+    // The lease, then the duty's tick: the message is back.
+    var waited: usize = 0;
+    const again = while (waited < 40) : (waited += 1) {
+        @import("stdx").time.sleep(250 * std.time.ns_per_ms);
+        const got = try ctx.execCapture(&.{ "queue", "dequeue", "lease-q" });
+        if (std.mem.indexOf(u8, got, "slow work") != null) break got;
+    } else return error.NotRedelivered;
+    try testing.expectEqual(@as(u32, 2), try deliveriesOf(deliveryOf(again) orelse return error.NoDelivery));
+
+    var late = try ctx.cli.run(&.{ "queue", "ack", "lease-q", d });
+    defer late.deinit();
+    try testing.expect(late.exit_code != 0);
+    try testing.expect(late.stderrContains("delivered again"));
+}
+
+test "e2e/queue: nack --dlq dead-letters its message at once" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "queue", "enqueue", "dead-q", "poison" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "dead-q" });
+    const delivery = deliveryOf(out) orelse return error.NoDelivery;
+    try ctx.exec(&.{ "queue", "nack", "dead-q", delivery, "--dlq", "--error", "bad input" });
+
+    var list = try ctx.cli.run(&.{ "queue", "dlq", "list", "dead-q" });
+    defer list.deinit();
+    try testing.expectEqual(@as(u8, 0), list.exit_code);
+    try testing.expect(list.stdoutContains("Dead-letter queue for: dead-q (1 messages)\n"));
+    try testing.expect(list.stdoutContains("poison"));
+    var none = try ctx.cli.run(&.{ "queue", "dequeue", "dead-q" });
+    defer none.deinit();
+    try testing.expect(none.stdoutContains("(no messages)"));
+}
+
+test "e2e/queue: dequeue --ack takes its messages for good, printing payloads only" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.exec(&.{ "queue", "enqueue", "once-q", "consumed" });
+    var r = try ctx.cli.run(&.{ "queue", "dequeue", "once-q", "--ack" });
+    defer r.deinit();
+    try testing.expectEqual(@as(u8, 0), r.exit_code);
+    try testing.expectEqualStrings("consumed\n", r.stdout);
+    var stats = try ctx.cli.run(&.{ "queue", "list" });
+    defer stats.deinit();
+    try testing.expect(stats.stdoutContains("once-q"));
+    var none = try ctx.cli.run(&.{ "queue", "dequeue", "once-q" });
+    defer none.deinit();
+    try testing.expect(none.stdoutContains("(no messages)"));
 }
 
 // =============================================================================
@@ -519,30 +552,6 @@ test "e2e/queue: queue keeps its namespace label across restart" {
 }
 
 // =============================================================================
-// Unit Tests for Helper Functions
-// =============================================================================
-
-test "extractSeqNumber: JSON format" {
-    try testing.expectEqualStrings("123", extractSeqNumber("{\"seq\":123}").?);
-    try testing.expectEqualStrings("456", extractSeqNumber("{\"payload\":\"test\",\"seq\":456}").?);
-}
-
-test "extractSeqNumber: colon format" {
-    try testing.expectEqualStrings("789", extractSeqNumber("seq: 789").?);
-    try testing.expectEqualStrings("100", extractSeqNumber("message seq:100 done").?);
-}
-
-test "extractSeqNumber: bracket format" {
-    try testing.expectEqualStrings("42", extractSeqNumber("[42]").?);
-    try testing.expectEqualStrings("999", extractSeqNumber("msg [999] payload").?);
-}
-
-test "extractSeqNumber: no match" {
-    try testing.expect(extractSeqNumber("no sequence here") == null);
-    try testing.expect(extractSeqNumber("") == null);
-}
-
-// =============================================================================
 // Queue List (ls) Operations
 // =============================================================================
 
@@ -650,7 +659,7 @@ test "e2e/queue: a blocking dequeue woken by an enqueue leaves the metrics regis
     try testing.expectEqual(any, woken);
 }
 
-test "e2e/queue: enqueue prints the sequence number ack takes" {
+test "e2e/queue: enqueue prints the sequence number its delivery names" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -669,10 +678,71 @@ test "e2e/queue: enqueue prints the sequence number ack takes" {
     const seq_b = try std.fmt.parseInt(u64, b[prefix.len..], 10);
     try testing.expect(seq_b > seq_a);
 
-    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "seq-q" });
-    defer deq.deinit();
-    try testing.expectEqual(@as(u8, 0), deq.exit_code);
-    var ack = try ctx.cli.run(&.{ "queue", "ack", "seq-q", a[prefix.len..] });
+    // The delivery dequeue prints names the message by that seq.
+    const deq = try ctx.execCapture(&.{ "queue", "dequeue", "seq-q" });
+    const delivery = deliveryOf(deq) orelse return error.NoDelivery;
+    var parts = std.mem.splitScalar(u8, delivery, '.');
+    _ = parts.next();
+    _ = parts.next();
+    try testing.expectEqual(seq_a, try std.fmt.parseInt(u64, parts.next().?, 10));
+    var ack = try ctx.cli.run(&.{ "queue", "ack", "seq-q", delivery });
     defer ack.deinit();
     try testing.expectEqual(@as(u8, 0), ack.exit_code);
+}
+
+test "e2e/queue: dequeue refuses -o raw without --ack, and a count or lease out of range, naming the range" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "flags-q", "kept" });
+    const cases = [_]struct { args: []const []const u8, says: []const u8 }{
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "-o", "raw" }, .says = "add --ack" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--count", "0" }, .says = "--count is 1 to 100" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--count", "101" }, .says = "--count is 1 to 100" },
+        .{ .args = &.{ "queue", "dequeue", "flags-q", "--lease", "1000" }, .says = "--lease is 5000 to 43200000 ms" },
+    };
+    for (cases) |c| {
+        var r = try ctx.cli.run(c.args);
+        defer r.deinit();
+        try testing.expect(r.exit_code != 0);
+        try testing.expect(r.stderrContains(c.says));
+    }
+    // None of them took the message.
+    var json = try ctx.cli.run(&.{ "queue", "dequeue", "flags-q", "-o", "json" });
+    defer json.deinit();
+    try testing.expectEqual(@as(u8, 0), json.exit_code);
+    try testing.expect(json.stdoutContains("\"payload\":\"kept\""));
+    try testing.expect(json.stdoutContains("\"deliveries\":1"));
+    try testing.expect(json.stdoutContains("\"delivery\":\""));
+}
+
+test "e2e/queue: an enqueue's --delay holds its message back until due" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "delay-q", "later", "--delay", "1500" });
+    var early = try ctx.cli.run(&.{ "queue", "dequeue", "delay-q" });
+    defer early.deinit();
+    try testing.expect(early.stdoutContains("(no messages)"));
+    @import("stdx").time.sleep(1700 * std.time.ns_per_ms);
+    const due = try ctx.execCapture(&.{ "queue", "dequeue", "delay-q" });
+    try testing.expect(std.mem.indexOf(u8, due, " later") != null);
+}
+
+test "e2e/queue: nack --delay holds its message back until due, and --priority past 255 is refused" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.exec(&.{ "queue", "enqueue", "nack-delay-q", "retry me" });
+    const out = try ctx.execCapture(&.{ "queue", "dequeue", "nack-delay-q" });
+    const delivery = deliveryOf(out) orelse return error.NoDelivery;
+    try ctx.exec(&.{ "queue", "nack", "nack-delay-q", delivery, "--delay", "1500" });
+    var early = try ctx.cli.run(&.{ "queue", "dequeue", "nack-delay-q" });
+    defer early.deinit();
+    try testing.expect(early.stdoutContains("(no messages)"));
+    @import("stdx").time.sleep(1700 * std.time.ns_per_ms);
+    const due = try ctx.execCapture(&.{ "queue", "dequeue", "nack-delay-q" });
+    try testing.expect(std.mem.indexOf(u8, due, " retry me") != null);
+
+    var high = try ctx.cli.run(&.{ "queue", "enqueue", "nack-delay-q", "x", "--priority", "256" });
+    defer high.deinit();
+    try testing.expect(high.exit_code != 0);
+    try testing.expect(high.stderrContains("--priority is 0 to 255, not 256"));
 }

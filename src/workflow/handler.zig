@@ -488,18 +488,19 @@ pub const WorkflowHandler = struct {
     /// operations for a given workflow land on the same shard.
     fn preRouteByWorkflow(req: proto.Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     /// ShardWalker LocalScanFn for workflow_list_definitions — returns
     /// workflow definition names from one shard's WorkflowHandler registry.
     fn localScanWorkflowDefs(
         ctx: *anyopaque,
-        namespace: []const u8,
+        ns: dispatcher_mod.WalkNamespace,
         _: []const u8, // filter
         _: ?[]const u8, // cursor
         _: u32, // limit
     ) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = ns.name;
         const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
         handler.mu.lock();
         defer handler.mu.unlock();
@@ -830,7 +831,7 @@ pub const WorkflowHandler = struct {
         const run_id_str = if (explicit_run_id) |rid|
             rid
         else blk: {
-            const partition_id = shard.router.keyToPartitionNs(req.namespace, workflow_name);
+            const partition_id = shard.router.keyToPartitionNs(req.ns_id, workflow_name);
             break :blk shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
         };
 
@@ -1818,7 +1819,7 @@ pub const WorkflowHandler = struct {
     /// Compute the shard ID that owns the given workflow (definition + runs).
     fn resolveWorkflowShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, workflow_name: []const u8) u16 {
         _ = self;
-        const hash = router.hashKeyWithNamespace(namespace, workflow_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), workflow_name);
         const target = shard.router.route(hash);
         return switch (target) {
             .local => shard.id,
@@ -1840,7 +1841,7 @@ pub const WorkflowHandler = struct {
         id_buf: *[32]u8,
         index: *u64,
     ) ?[]const u8 {
-        const partition_id = shard.router.keyToPartitionNs(namespace, wf_name);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(namespace), wf_name);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf);
         index.* = self.proposeRun(shard, namespace, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
         return run_id_str;
@@ -2031,7 +2032,7 @@ pub const WorkflowHandler = struct {
         // message while the action isn't registered, so a step waits for
         // its action wherever the two are placed.
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(namespace, action_name);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name);
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
         const message = ActionsHandler.encodeStartRunMessage(shard.allocator, namespace, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned, can_wait) orelse {
             return definition.StepOutcome.execution_failure;
@@ -2096,7 +2097,7 @@ pub const WorkflowHandler = struct {
     /// rather than the local shard (which is merely wherever the triggering
     /// workflow definition happened to be created). Falls back to local.
     fn resolveStreamHandler(shard: *Shard, namespace: []const u8, stream_name: []const u8) @TypeOf(shard.stream_handler) {
-        const hash = router.hashKeyWithNamespace(namespace, stream_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), stream_name);
         const target = shard.router.route(hash);
         switch (target) {
             .local => return shard.stream_handler,
@@ -2112,7 +2113,7 @@ pub const WorkflowHandler = struct {
     /// Compute the shard ID that owns the given action.
     fn resolveActionShardId(self: *WorkflowHandler, shard: *Shard, namespace: []const u8, action_name: []const u8) u16 {
         _ = self;
-        const hash = router.hashKeyWithNamespace(namespace, action_name);
+        const hash = router.routeNsKey(shard.namespaceId(namespace), action_name);
         const target = shard.router.route(hash);
         return switch (target) {
             .local => shard.id,
@@ -3212,7 +3213,7 @@ pub const WorkflowHandler = struct {
 
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(schedule.namespace_owned, schedule.workflow_name_owned);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(schedule.namespace_owned), schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
@@ -3347,7 +3348,7 @@ pub const WorkflowHandler = struct {
     ) void {
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
-        const partition_id = shard.router.keyToPartitionNs(trigger.namespace_owned, trigger.workflow_name_owned);
+        const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(trigger.namespace_owned), trigger.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
         // Room for the longest stream name a trigger may have, and both
@@ -4422,6 +4423,11 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.wake_workers = false;
     shard.replies_held = 0;
     shard.forward_count = 0;
+    // A write's entry carries its namespace's id, from the node's table.
+    const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
+    const namespaces = try std.testing.allocator.create(NamespaceHandler);
+    namespaces.* = try NamespaceHandler.init(std.testing.allocator);
+    shard.namespace_handler = namespaces;
     return shard;
 }
 
@@ -4436,6 +4442,8 @@ fn destroyTestShard(shard: *Shard) void {
     std.testing.allocator.free(shard.entry_buf);
     shard.scratch.deinit(std.testing.allocator);
     std.testing.allocator.free(shard.pending);
+    shard.namespace_handler.deinit();
+    std.testing.allocator.destroy(shard.namespace_handler);
 }
 
 fn createTestRun(handler: *WorkflowHandler, ns_key: []const u8, run_id: []const u8, wf_name: []const u8) void {
@@ -5246,6 +5254,8 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try handler.replayStart("a:r1", value[0..off], 1, &out);
     try testing.expectEqual(@as(?u32, 2), handler.active_runs.get("a:wf"));
 
+    // A start's entry carries its namespace's id: "a" is created first.
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
     handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 });
     const runsOf = struct {
         fn count(h: *WorkflowHandler, shard_: *Shard) usize {
@@ -5401,7 +5411,7 @@ test "workflow_enabled entries disable and enable a workflow on every replica, a
         fn one(h: *WorkflowHandler, i: *u64, key: []const u8, enabled: bool) !Result {
             var pbuf: [128]u8 = undefined;
             i.* += 1;
-            const e = entry_mod.buildCommandEntry(.workflow_enabled, entry_mod.Flags.NONE, 1, i.*, 0, router.namespaceHash("default"), key, &.{@intFromBool(enabled)}, &pbuf).?;
+            const e = entry_mod.buildCommandEntry(.workflow_enabled, entry_mod.Flags.NONE, 1, i.*, 0, .default, key, &.{@intFromBool(enabled)}, &pbuf).?;
             var out = Result.start(&e);
             try h.replayEntry(&e, &out);
             return out;
@@ -5931,10 +5941,10 @@ test "workflow replay: a run starts and completes at its entries' stamps, not th
         var pbuf: [128]u8 = undefined;
         // Through `replayEntry`, as the log applies them.
         var out: Result = .{};
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, 0, "default:r1", &start, &pbuf).?, &out);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, stamp_ns, .default, "default:r1", &start, &pbuf).?, &out);
         try testing.expectEqual(stamp_ms, handler.runs.get("default:r1").?.created_at_ms);
         // completed, no output, no steps, no history, no tags
-        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, 0, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
+        try handler.replayEntry(&entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 2, stamp_ns + 9 * std.time.ns_per_ms, .default, "default:r1", &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }, &pbuf).?, &out);
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
         try testing.expectEqual(@as(?i64, stamp_ms + 9), run.completed_at_ms);

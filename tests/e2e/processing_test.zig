@@ -1217,6 +1217,15 @@ test "e2e/processing: ts source to ts sink - derived metrics pipeline" {
     try testing.expect(tsReadHasPoints(read_result.stdout));
     try testing.expect(read_result.stdoutContains("["));
 
+    // The sink series keeps the source's tags: the source looks them up in
+    // its own namespace, so each sensor's points are its own series here.
+    for ([_][]const u8{ "sensor=A1", "sensor=A2" }) |tag| {
+        var tagged = try ctx.cli.run(&.{ "ts", "read", "derived_temp", "--tags", tag, "-n", "proc_ts2ts", "--from", "0", "--limit", "100", "--output", "json" });
+        defer tagged.deinit();
+        try stdx.testing.assertSucceeded(tagged);
+        try testing.expect(tsReadHasPoints(tagged.stdout));
+    }
+
     // Step 5: Verify derived_temp appears in ts list
     var list_result = try ctx.cli.run(&.{ "ts", "list", "-n", "proc_ts2ts" });
     defer list_result.deinit();
@@ -2593,6 +2602,27 @@ test "e2e/processing: queue sink enqueues records" {
 
     try ctx.exec(&.{ "processing", "stop", job_id, "-n", "proc_bug_qsink" });
     try testing.expect(appeared); // queue sink must enqueue the record.
+    // Counted where a client's enqueue is, live and as the log replays: a
+    // queue registered under another key shows by name with nothing in it.
+    try expectQueueCounts(ctx, "bug-task-queue", "proc_bug_qsink", 1, 1);
+    try ctx.restartServer();
+    try expectQueueCounts(ctx, "bug-task-queue", "proc_bug_qsink", 1, 1);
+}
+
+/// `queue` in `ns` lists once, with `enqueued` messages, `ready` of them ready.
+fn expectQueueCounts(ctx: *stdx.testing.TestContext, queue: []const u8, ns: []const u8, enqueued: u64, ready: u64) !void {
+    const listed = try ctx.execCapture(&.{ "queue", "list", "-o", "json", "-n", ns });
+    const Stats = struct { name: []const u8, enqueued: u64, ready: u64 };
+    const stats = try std.json.parseFromSlice([]const Stats, testing.allocator, listed, .{ .ignore_unknown_fields = true });
+    defer stats.deinit();
+    var found: usize = 0;
+    for (stats.value) |q| {
+        if (!std.mem.eql(u8, q.name, queue)) continue;
+        found += 1;
+        try testing.expectEqual(enqueued, q.enqueued);
+        try testing.expectEqual(ready, q.ready);
+    }
+    try testing.expectEqual(@as(usize, 1), found);
 }
 
 // Regression: `json:$.<path>` conditions in `filter` used to match nothing.

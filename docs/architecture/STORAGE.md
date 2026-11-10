@@ -4,7 +4,7 @@
 
 This document is a companion to the [Architecture Overview](OVERVIEW.md). Where that document covers the full system — Acceptor, Shards, Dispatcher, clustering — this one zooms in on the storage layer: the Unified Append Log, projection engines, and snapshots.
 
-If you're trying to understand why a KV put eventually lands on disk, or how a queue's priority heap survives a crash, this is the right document.
+If you're trying to understand why a KV put eventually lands on disk, or how a queue's leases survive a crash, this is the right document.
 
 ---
 
@@ -17,7 +17,7 @@ If you're trying to understand why a KV put eventually lands on disk, or how a q
   - [Segment Format](#segment-format)
 - [Projections](#projections)
   - [KV Projection](#kv-projection)
-  - [Queue Projection](#queue-projection)
+  - [Queues](#queues)
   - [Stream Projection](#stream-projection)
   - [Time-Series Projection](#time-series-projection)
   - [Projection Router](#projection-router)
@@ -40,7 +40,7 @@ Flo doesn't do this. The log *is* the primary data structure.
 
 The Unified Append Log captures every mutation — KV puts, queue enqueues, stream appends, time-series writes — as a sequenced, typed entry. The Raft consensus log and the storage log are the same thing. There is no separate WAL.
 
-Everything else — the KV hash table, the queue's priority heap, the time-series columnar buffers — is a **projection**: a derived view rebuilt deterministically from the log. If you deleted every projection and replayed the log from the beginning, you'd get back to exactly the same state. The projections exist for performance (you don't want to scan the entire log to answer a KV get), but they are not the source of truth.
+Everything else — KV's and queues' families, the time-series columnar buffers — is a **projection**: a derived view rebuilt deterministically from the log. If you deleted every projection and replayed the log from the beginning, you'd get back to exactly the same state. The projections exist for performance (you don't want to scan the entire log to answer a KV get), but they are not the source of truth.
 
 This has a few consequences that might feel strange at first:
 
@@ -67,7 +67,7 @@ Every UAL entry has a 40-byte header followed by a variable-length payload:
 
 The `entry_type` field tells you what kind of mutation this is: `kv_put`, `queue_enqueue`, `stream_append`, `ts_write`, `raft_noop`, and so on — around 30 types total, with room for more. The CRC covers the header and payload together.
 
-Payload layout varies by entry type. KV entries are declared as schemas in the entry table (`protocol/kv_entries.zig`): a put carries the namespace-qualified key, the value and an optional TTL in milliseconds from the entry's stamp; a transaction's batch carries its ops as a list. Other families use a `CommandPayload` with key length, value length, namespace hash, and then the key and value bytes inline. For queue operations, it includes priority and delay metadata. The projections know how to parse their own payloads.
+Payload layout varies by entry type. KV, action and queue entries are declared as schemas in the entry table (`protocol/kv_entries.zig`, `action_entries.zig`, `queue_entries.zig`): a put carries the namespace-qualified key, the value and an optional TTL in milliseconds from the entry's stamp; a transaction's batch carries its ops as a list. Other families use a `CommandPayload` with key length, value length, namespace hash, and then the key and value bytes inline. The projections know how to parse their own payloads.
 
 ### Two-Tier Storage
 
@@ -136,21 +136,19 @@ KV reads are O(1) hash table lookups. No Raft round-trip needed. Historical vers
 
 Serialization for snapshots writes every key-value pair, including metadata (LSN, expiry, version chains), into a flat byte buffer with length-prefixed fields. Deserialization rebuilds the hash table from that buffer.
 
-### Queue Projection
+### Queues
 
-Queues in the old system stored each message as 8 separate KV entries — message body, metadata, index entries, consumer state. At ~180 bytes of overhead per KV entry, that's roughly 1.5 KB per message before you even count the payload. Not great for a queue that might hold millions of messages.
+Queues are a contract state machine (`queue/machine.zig`) on the delivery model actions use (`contract/delivery.zig`), not a projection. Every change is a log entry applied through a `View`, so every replica, a restarted node and a new leader hold the same messages, leases and dead letters.
 
-The new queue projection uses native data structures:
+- **`queue.meta`** — one record per queue, keyed by namespace id and name hash: its name, next seq and counts.
+- **`queue.msg`** — each message, keyed by namespace id, name hash and seq: its payload, priority, status (ready, leased, dead), deliveries, failures and its latest delivery's holder, token and lease.
+- **`queue.ready`** — each ready message, keyed (priority, due time, seq) under its queue, so the next message is the first key.
+- **`queue.deadline`** — each lease's expiry, earliest first, which the leader's expire duty reads.
+- **`queue.dead`** — each dead message, oldest first; past 10,000 in a queue, the oldest goes.
 
-- **Ready heap** — a min-heap ordered by priority, holding `(sequence, ual_index)` pairs. Dequeue pops the top. Since the actual message payload stays in the UAL (or warm store), the heap node is just 16 bytes.
-- **Lease tracker** — maps sequence numbers to lease expiry timestamps. When a consumer dequeues, the message is leased, not removed. If the consumer doesn't ACK before the lease expires, the message goes back to the ready heap.
-- **DLQ state** — messages that exceed the retry limit are moved to a dead-letter queue. The projection tracks attempt counts per message.
+`queue_enqueue` adds a message, ready once its delay passes. `queue_deliver` leases a queue's first due ready messages to a consumer under a token, the (term, index) of that entry. `queue_settle` (complete) removes messages; `queue_release` (fail) readies them again or dead-letters them; `queue_extend` moves a lease out; `queue_expire`, proposed by the leader's duty, ends leases past their deadline. A report naming any other delivery's token applies nothing. A message failed or expired 5 times is dead.
 
-On `queue_enqueue`, the projection stores a lightweight metadata record and pushes the sequence onto the ready heap (or delay wheel, if a delivery delay was specified). On `queue_ack`, it removes the message from the lease tracker. On `queue_requeue`, it pushes the message back onto the ready heap.
-
-This brings per-message overhead down to around 64 bytes — a 23× reduction from the old KV-based design.
-
-Serialization writes the queue name, last sequence, and each message's metadata. It does *not* copy message payloads — those live in the UAL. Deserialization rebuilds the heaps and trackers from the serialized metadata.
+A ready message costs its payload plus about 300 bytes: its record, its ready key and their store records.
 
 ### Stream Projection
 
@@ -186,7 +184,7 @@ The router is the single fan-out point between the UAL and the projections. When
 1. Is `entry.index <= applied_index`? If yes, skip (idempotent replay guard).
 2. What's the entry type? Route to the appropriate projection:
    - `kv_put`, `kv_delete`, `kv_batch`, `kv_incr`, `kv_expire` → KV Projection
-   - `queue_enqueue`, `queue_ack`, `queue_requeue` → Queue Projection
+   - `queue_*` → Nothing (the queue machine applies them)
    - `ts_write`, `ts_write_batch` → TS Projection
    - `stream_append` → Nothing (data stays in UAL)
    - `raft_noop`, `raft_config` → Nothing (consensus layer)

@@ -47,6 +47,7 @@ const shard_walker_mod = @import("shard_walker.zig");
 /// ShardWalker specialized for name-list operations (ts_list, stream_list, etc.).
 /// All list/scan walk opcodes return `[]const u8` names.
 pub const NameWalker = shard_walker_mod.ShardWalker([]const u8);
+pub const WalkNamespace = shard_walker_mod.Namespace;
 pub const scanScratch = shard_walker_mod.scanScratch;
 pub const takeScanShort = shard_walker_mod.takeScanShort;
 pub const noteScanShort = shard_walker_mod.noteScanShort;
@@ -86,7 +87,8 @@ pub const ErrorFn = *const fn (shard: *anyopaque, conn: *anyopaque, request_id: 
 pub fn opReadsAtLeader(op: proto.OpCode) bool {
     return switch (op) {
         .stream_group_info, .stream_group_pending => true,
-        // Only the leader that leased a message dead-letters it.
+        // As its leader has applied them, so a failed message is listed
+        // as soon as its fail is answered.
         .queue_dlq_list => true,
         else => false,
     };
@@ -101,7 +103,7 @@ pub fn opWrites(op: proto.OpCode) bool {
         .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_claim, .stream_group_configure_sweeper, .stream_group_nack, .stream_group_touch, .stream_group_delete => true,
         // Members and pending entries live in the leader's memory alone:
         // a follower would answer none.
-        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
+        .queue_enqueue, .queue_dequeue, .queue_complete, .queue_fail, .queue_touch, .queue_dlq_delete, .queue_dlq_requeue, .queue_purge => true,
         .ts_write, .ts_delete, .ts_retention => true,
         .action_register, .action_invoke, .action_delete, .action_complete, .action_fail, .action_touch => true,
         // A worker's await claims a run, and claims live in the leader's
@@ -217,7 +219,7 @@ pub const Dispatcher = struct {
     /// A page's entries in a walk op's answer, one per name, read from the
     /// op's scan context in one go: each appended to `out`, its end in
     /// `ends`. An empty one for a name with no entry.
-    pub const WalkEntriesFn = *const fn (context: *anyopaque, namespace: []const u8, names: []const []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void;
+    pub const WalkEntriesFn = *const fn (context: *anyopaque, ns: WalkNamespace, names: []const []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), ends: *std.ArrayList(u32)) error{OutOfMemory}!void;
 
     /// Set how a walk op's family writes its entries. `registerWalk` clears
     /// it, since another scan's entries would read its own context, so it

@@ -33,6 +33,8 @@ const MAX_GRACE_MS: u64 = 30_000;
 pub const Leader = struct {
     now_ns: u64,
     term_since_ns: u64,
+    /// Its term, where a workload needs it.
+    term: u64 = 0,
 };
 
 pub const Made = struct { entry_type: EntryType, payload: []const u8 };
@@ -274,7 +276,7 @@ fn expire(a: *families.Actions, out: []u8, l: Leader, spoil: bool) !?Made {
         const k = action_machine.parseDeadlineKey(item.key[1..]) orelse continue;
         var holder: []const u8 = "";
         var request_key: ?[]const u8 = null;
-        const run = a.run(k.ns, k.run);
+        const run = a.run(k.ns, k.id);
         const live = if (run) |v| v.status == .leased and v.expiry_ns == k.expiry_ns else false;
         if (k.expiry_ns > l.now_ns) {
             // Not yet due: the duty stops here; a spoiled entry names one.
@@ -287,7 +289,7 @@ fn expire(a: *families.Actions, out: []u8, l: Leader, spoil: bool) !?Made {
             holder = run.?.holder;
             request_key = run.?.request_key;
         }
-        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns, .action = item.value.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
+        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns, .action = item.value.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
         if (w + bytes.len > room) break;
         w += bytes.len;
         n += 1;

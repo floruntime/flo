@@ -131,7 +131,7 @@ fn getDef(shard: *Shard, ns: []const u8, name: []const u8) ?machine.Def.Value {
 /// The shard that owns action `name` in `ns`: invokes are routed there, so
 /// its runs are there.
 fn ownerOf(shard: *Shard, ns: []const u8, name: []const u8) u16 {
-    return switch (shard.router.route(router.hashKeyWithNamespace(ns, name))) {
+    return switch (shard.router.route(router.routeNsKey(shard.namespaceId(ns), name))) {
         .local => @intCast(shard.id),
         .shard => |t| t.shard_id,
     };
@@ -311,7 +311,7 @@ pub const ActionsHandler = struct {
 
     fn preRouteByAction(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
-        return router.hashKeyWithNamespace(req.namespace, req.key);
+        return router.routeNsKey(req.ns_id, req.key);
     }
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -427,7 +427,7 @@ pub const ActionsHandler = struct {
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(req.namespace, name), &id_buf);
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(req.ns_id, name), &id_buf);
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns, .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
@@ -491,7 +491,8 @@ pub const ActionsHandler = struct {
 
     /// The action walk's names: one shard's actions in the namespace that
     /// start with `prefix`, the request's key.
-    fn localScanActions(ctx: *anyopaque, namespace: []const u8, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
+    fn localScanActions(ctx: *anyopaque, walk_ns: dispatcher_mod.WalkNamespace, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
+        const namespace = walk_ns.name;
         const shard: *Shard = @ptrCast(@alignCast(ctx));
         const ns = homeOf(namespace);
         const name_buf = dispatcher_mod.scanScratch(@intCast(storeOf(shard).family(machine.Defs.ID).count));
@@ -1775,7 +1776,7 @@ pub const ActionsHandler = struct {
         const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
         const ns = homeOf(namespace);
         if (!actionExists(shard, ns, action_name)) return null;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(namespace, action_name), id_buf);
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name), id_buf);
         const index = proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard) orelse return null;
         return .{ .id = run_id, .index = index };
     }
@@ -2047,21 +2048,20 @@ pub const ActionsHandler = struct {
         var items: std.ArrayListUnmanaged(u8) = .empty;
         defer items.deinit(self.allocator);
         var n: u32 = 0;
-        var it = readOf(shard).range(machine.Deadlines, "");
-        while (it.next() catch null) |item| {
+        var it = machine.pastDue(readOf(shard), now);
+        while (it.next()) |due| {
             if (n == ae.MAX_EXPIRE_ITEMS) break;
-            const k = machine.parseDeadlineKey(item.key[1..]) orelse continue;
-            if (k.expiry_ns > now) break;
+            const k = due.key;
             var holder: []const u8 = "";
             var request_key: ?[]const u8 = null;
-            if (getRun(shard, k.ns, k.run)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
+            if (getRun(shard, k.ns, k.id)) |run| if (run.status == .leased and run.expiry_ns == k.expiry_ns) {
                 const grace = @as(u64, @min(run.lease_ms, MAX_GRACE_MS)) *| std.time.ns_per_ms;
                 if (now < self.duty_since_ns +| grace) continue;
                 holder = run.holder;
                 request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = item.value.v.scope, .run = k.run, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
             if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
             n += 1;

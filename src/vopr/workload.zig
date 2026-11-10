@@ -22,6 +22,7 @@ const kv_ops = @import("../protocol/kv_ops.zig");
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 const limits = @import("../protocol/limits.zig");
 const schema = @import("../protocol/schema.zig");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const scenario_mod = @import("scenario.zig");
 const Scenario = scenario_mod.Scenario;
 
@@ -37,13 +38,21 @@ pub const EntryType = entry_mod.EntryType;
 /// own bookkeeping, there only so an oracle can name the op; no client
 /// writes a delete this way. A third of puts are JSON patches instead
 /// (`kvPatch`), and a third of deletes also add to a counter (`kvDelete`).
-const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .queue_enqueue, .ts_write, .kv_batch };
+// A queue enqueue is a queue machine entry now, made by the leader
+// (`queue_workload`); its old slot here stays, so the stream of draws does.
+const OP_TYPES = [_]EntryType{ .kv_put, .stream_append, .stream_append, .ts_write, .kv_batch };
 
 /// KV ops write a few keys over and over, across two namespaces, so
 /// overwrites, deletes and history all happen.
 const KV_SLOTS = 32;
-/// Where a delete's marker key lives: `del\0d` and the op id in hex.
-const MARKER_PREFIX = "del\x00d";
+/// Where a delete's marker key lives: `del:d` and the op id in hex.
+const MARKER_PREFIX = "del:d";
+/// Every third slot's key is in this namespace rather than "default". The KV
+/// machine needs no create for it.
+const OTHER_NS: NamespaceId = .of(17);
+/// A transaction is in one namespace, which its batch names once: a large
+/// one's is "default"; a small one's is its deleted slot's (`kvDelete`).
+const BATCH_NS: NamespaceId = .default;
 /// A patch's document opens with the op id, and a patch that deletes names
 /// it in a field it deletes: `$.d` and the op id in hex.
 const DOC_PREFIX = "{\"op\":";
@@ -75,6 +84,8 @@ const TXN_COUNTER_PREFIX = "c";
 /// exactly 1, on every replica. Every replica applying the same part of a batch
 /// would agree on any checksum.
 pub const TXN_APPLIED_KEY = TXN_COUNTER_PREFIX ++ "applied";
+/// `TXN_APPLIED_KEY` as state keeps it, its namespace's id in front.
+pub const TXN_APPLIED_STORED_KEY = BATCH_NS.bytes() ++ TXN_APPLIED_KEY;
 
 pub const OpState = enum {
     /// Proposed to a leader; commit outcome not yet observed.
@@ -201,7 +212,7 @@ pub const Workload = struct {
     /// Null when it can't fit in `buf`.
     fn kvPut(buf: []u8, op_id: u64, len: u32, r: std.Random) ?[]u8 {
         var key_buf: [16]u8 = undefined;
-        const key = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
+        const key = storedSlotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
         const ttl_ms: ?u64 = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null;
         // A quarter ask something of the key, as it stands when they apply. The
         // low versions are the ones a slot's key reaches in a run.
@@ -284,7 +295,7 @@ pub const Workload = struct {
     /// field, no key) is refused. Null when it can't fit in `buf`.
     fn kvPatch(buf: []u8, d: Draws, op_id: u64, shape: PatchShape, len: u32, r: std.Random) ?[]u8 {
         var key_buf: [16]u8 = undefined;
-        const key = if (shape.raw) slotKey(&key_buf, shape.slot) else jsonKey(&key_buf, shape.slot);
+        const key = if (shape.raw) storedSlotKey(&key_buf, shape.slot) else jsonKey(&key_buf, shape.slot);
         var path_buf: [DEL_PATH_PREFIX.len + 16]u8 = undefined;
         const path: []const u8 = switch (shape.kind) {
             .set_root => "$",
@@ -401,7 +412,10 @@ pub const Workload = struct {
         var counter_buf: [16]u8 = undefined;
         var marker_buf: [MARKER_PREFIX.len + 16]u8 = undefined;
         const marker = std.fmt.bufPrint(&marker_buf, MARKER_PREFIX ++ "{x:0>16}", .{op_id}) catch unreachable;
-        const slot = slotKey(&key_buf, r.uintLessThan(u8, KV_SLOTS));
+        const slot_n = r.uintLessThan(u8, KV_SLOTS);
+        const slot = slotKey(&key_buf, slot_n);
+        // In the namespace puts write the deleted slot's key in.
+        const ns = slotNs(slot_n);
         const with_incr = r.uintLessThan(u8, 3) == 0;
         const counter = slotKey(&counter_buf, r.uintLessThan(u8, KV_SLOTS));
         const delete: kv_entries.BatchOp.Value = .{ .kind = .delete, .key = slot, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null };
@@ -411,16 +425,17 @@ pub const Workload = struct {
         ops[asked] = delete;
         ops[asked + 1] = incr;
         var w: schema.Writer = .{ .buf = buf };
-        if (kv_entries.BatchOps.encodeSlice(&w, ops[0 .. asked + @as(usize, if (with_incr) 2 else 1)])) |_| {
+        if (kv_entries.encodeBatch(&w, ns.int(), ops[0 .. asked + @as(usize, if (with_incr) 2 else 1)])) |_| {
             return buf[0..w.written().len];
         } else |_| {}
-        // The smallest payloads hold three ops: keep what names the op, then a
-        // refusal for its condition if one was drawn, or else for an add.
+        // The smallest payloads hold two or three ops: keep what names the
+        // op, then a refusal for its condition if one was drawn, or else the
+        // delete and perhaps an add.
         const can_refuse = asked == MARKER_OPS and markerOpRefuses(ops[2]);
         ops[1] = if (can_refuse) ops[2] else delete;
-        ops[2] = if (can_refuse) delete else incr;
+        ops[2] = incr;
         w = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0..if (can_refuse or with_incr) 3 else 2]) catch return null;
+        kv_entries.encodeBatch(&w, ns.int(), ops[0..if (!can_refuse and with_incr) 3 else 2]) catch return null;
         return buf[0..w.written().len];
     }
 
@@ -448,7 +463,7 @@ pub const Workload = struct {
         const asked = markerOps(ops[0..MARKER_OPS], marker, r);
         for (ops[asked .. count - 1], key_bufs[asked .. count - 1]) |*op, *key_buf| {
             const slot = r.uintLessThan(u16, TXN_KEYS);
-            const key = std.fmt.bufPrint(key_buf, "{s}t{x:0>3}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
+            const key = std.fmt.bufPrint(key_buf, "t{x:0>3}", .{slot}) catch unreachable;
             op.* = switch (r.uintLessThan(u8, 3)) {
                 0 => .{ .kind = .put, .key = key, .value = &value, .ttl_ms = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u64, 1, 2000) else null, .delta = null, .condition = .always, .cas_version = null },
                 1 => .{ .kind = .delete, .key = key, .value = null, .ttl_ms = null, .delta = null, .condition = .always, .cas_version = null },
@@ -458,7 +473,7 @@ pub const Workload = struct {
         if (r.uintLessThan(u8, 8) == 0 and count - 1 > asked) ops[asked + (count - 1 - asked) / 2] = .{ .kind = .incr, .key = slotKey(&key_bufs[0], r.uintLessThan(u8, KV_SLOTS)), .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
         ops[count - 1] = .{ .kind = .incr, .key = TXN_APPLIED_KEY, .value = null, .ttl_ms = null, .delta = 1, .condition = .always, .cas_version = null };
         var w: schema.Writer = .{ .buf = buf };
-        kv_entries.BatchOps.encodeSlice(&w, ops[0..count]) catch return null;
+        kv_entries.encodeBatch(&w, BATCH_NS.int(), ops[0..count]) catch return null;
         return buf[0..w.written().len];
     }
 
@@ -494,14 +509,26 @@ pub const Workload = struct {
         return std.fmt.bufPrint(buf, "o{x:0>16}", .{op_id}) catch unreachable;
     }
 
-    /// A JSON slot's key: one only patches write.
+    /// A JSON slot's key, as a single-key entry carries it: one only
+    /// patches write.
     fn jsonKey(buf: *[16]u8, slot: u8) []const u8 {
-        return std.fmt.bufPrint(buf, "j{d}", .{slot}) catch unreachable;
+        return std.fmt.bufPrint(buf, "{s}j{d}", .{ &NamespaceId.default.bytes(), slot }) catch unreachable;
     }
 
-    /// A slot's key: every third slot in a namespace of its own.
+    /// A slot's key as a single-key entry carries it: every third slot in a
+    /// namespace of its own.
+    fn storedSlotKey(buf: *[16]u8, slot: u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}k{d:0>2}", .{ &slotNs(slot).bytes(), slot }) catch unreachable;
+    }
+
+    /// The namespace puts write a slot's key in.
+    fn slotNs(slot: u8) NamespaceId {
+        return if (slot % 3 == 0) OTHER_NS else .default;
+    }
+
+    /// A slot's key as a batch op carries it, in the batch's namespace.
     fn slotKey(buf: *[16]u8, slot: u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}k{d:0>2}", .{ if (slot % 3 == 0) "ns\x00" else "", slot }) catch unreachable;
+        return std.fmt.bufPrint(buf, "k{d:0>2}", .{slot}) catch unreachable;
     }
 
     /// Generate the next op. The payload points into the workload's
@@ -566,7 +593,7 @@ pub const Workload = struct {
     }
 
     fn isAction(entry_type: u8) bool {
-        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire }) |t| {
+        for ([_]EntryType{ .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire, .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge }) |t| {
             if (entry_type == @backingInt(t)) return true;
         }
         return false;

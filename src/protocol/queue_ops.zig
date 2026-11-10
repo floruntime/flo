@@ -4,6 +4,7 @@
 const std = @import("std");
 const ops = @import("ops.zig");
 const schema = @import("schema.zig");
+const qe = @import("queue_entries.zig");
 
 const Int = schema.Int;
 const Bytes = schema.Bytes;
@@ -30,6 +31,86 @@ const more_size = schema.Bool.max_size;
 /// doesn't fit, so a page stops where the next one wouldn't.
 pub const PeekedList = schema.BoundedList(Peeked, MAX_PEEK, @intCast(ops.MAX_RESPONSE_BODY - @sizeOf(u32) - more_size));
 
+/// The most messages one dequeue takes, and one report names.
+pub const MAX_BATCH: u32 = qe.MAX_BATCH;
+/// The longest a dequeue waits for a message.
+pub const MAX_WAIT_MS: u64 = 300_000;
+/// A consumer's id, short enough that a blocking dequeue can wait on it.
+pub const ConsumerId = Bytes(@intCast(ops.MAX_KEY - 14));
+
+/// A dequeued message. With the answer's term and index, its seq and
+/// deliveries name its delivery, and a complete, fail or touch names it
+/// back; one naming any other delivery of it is refused stale.
+pub const Message = Record(&.{
+    .{ .name = "seq", .T = Int(u64), .doc = "Its seq, in its queue" },
+    .{ .name = "priority", .T = Int(u32), .doc = "Its priority: lower goes first" },
+    .{ .name = "deliveries", .T = Int(u32), .doc = "Its deliveries, this one included" },
+    .{ .name = "enqueued_at_ms", .T = Int(i64), .doc = "When it was enqueued, in Unix milliseconds" },
+    .{ .name = "payload", .T = Bytes(qe.MAX_MESSAGE), .doc = "Its payload" },
+});
+
+/// As many as one answer holds: a dequeue stops where the next message
+/// wouldn't fit.
+const DEQUEUE_FIXED = 8 + 8 + 8;
+pub const MESSAGES_BYTES: u32 = @intCast(ops.MAX_RESPONSE_BODY - DEQUEUE_FIXED - @sizeOf(u32));
+pub const Messages = schema.BoundedList(Message, MAX_BATCH, MESSAGES_BYTES);
+
+/// A message a report names: its seq and the deliveries it came with.
+pub const Item = Record(&.{
+    .{ .name = "seq", .T = Int(u64), .doc = "The message's seq" },
+    .{ .name = "deliveries", .T = Int(u32), .doc = "Its deliveries, as dequeued" },
+});
+
+/// Why a report applied nothing to a message. A client reads this, never
+/// the text.
+pub const Why = enum(u8) {
+    /// No such message in this queue: completed, purged, dead and evicted,
+    /// or never there. For a complete, gone means done: a resent complete
+    /// whose first applied is answered gone.
+    gone = 0,
+    /// Its lease ran out or it was failed, and it was dequeued again: this
+    /// delivery is over.
+    delivered_again = 1,
+    /// Another consumer holds this delivery.
+    other_holder = 2,
+    /// Its lease ran out, and it is ready again or dead.
+    expired = 3,
+    /// It was failed, and is ready again or dead.
+    released = 4,
+    /// It isn't leased.
+    not_held = 5,
+
+    pub fn text(w: Why) []const u8 {
+        return switch (w) {
+            .gone => "not found: no such message in this queue",
+            .delivered_again => "stale report: the message was delivered again since",
+            .other_holder => "stale report: another consumer holds this delivery",
+            .expired => "stale report: the lease expired and the message moved on",
+            .released => "stale report: the message was released",
+            .not_held => "stale report: the message isn't held",
+        };
+    }
+};
+
+/// A message a report applied nothing to, and why.
+pub const Refused = Record(&.{
+    .{ .name = "seq", .T = Int(u64), .doc = "The message's seq" },
+    .{ .name = "why", .T = schema.Enum(Why), .doc = "Why: gone (for a complete, already done), delivered_again, other_holder, expired, released or not_held" },
+    .{ .name = "reason", .T = Bytes(128), .doc = "The same, said for a person" },
+});
+
+const report_fields = [_]schema.Field{
+    .{ .name = "consumer", .T = Defaulted(ConsumerId, ""), .doc = "The consumer reporting: the one that dequeued them, or the report is refused" },
+    .{ .name = "term", .T = Int(u64), .doc = "The dequeue's term" },
+    .{ .name = "index", .T = Int(u64), .doc = "The dequeue's index" },
+    .{ .name = "messages", .T = schema.List(Item, MAX_BATCH), .doc = "The messages, by seq and deliveries" },
+};
+
+const report_answer = [_]schema.Field{
+    .{ .name = "applied", .T = Int(u32), .doc = "How many it applied to" },
+    .{ .name = "refused", .T = schema.List(Refused, MAX_BATCH), .doc = "The rest, and why" },
+};
+
 pub const table = [_]ops.Op{
     .{
         .name = "queue.peek",
@@ -48,6 +129,65 @@ pub const table = [_]ops.Op{
         .cli = .{ .expose = .command, .key = .{ .name = "queue", .doc = "The queue's name" }, .render = .record, .examples = &.{"flo queue peek orders --limit 5"} },
         .doc = "The next ready messages of a queue, in dequeue order, without taking them. Each shows up to 4 KiB of its payload.",
     },
+    .{
+        .name = "queue.dequeue",
+        .code = 0x181,
+        .class = .write,
+        .takes_items = true,
+        .wait = .{ .field = "block_ms", .default_ms = 0, .max_ms = MAX_WAIT_MS },
+        .route = .key,
+        .request = Record(&.{
+            .{ .name = "consumer", .T = Defaulted(ConsumerId, ""), .doc = "Who takes them: a complete, fail or touch must name the same" },
+            .{ .name = "count", .T = Defaulted(schema.Range(u32, 1, MAX_BATCH), 1), .doc = "Most messages to take" },
+            .{ .name = "lease_ms", .T = schema.Optional(qe.LeaseMs), .doc = "How long they're held without a touch; 30 s when none is named" },
+            .{ .name = "block_ms", .T = Defaulted(schema.DurationMs(MAX_WAIT_MS), 0), .doc = "How long to wait for a message; 0 answers at once" },
+            .{ .name = "ack", .T = Defaulted(schema.Bool, false), .doc = "Complete them as they're taken, a one-shot consume; if the leader fails in between, they come back once their lease runs out" },
+        }),
+        .response = Record(&.{
+            .{ .name = "messages", .T = Messages, .doc = "The messages taken, or none" },
+            .{ .name = "term", .T = Int(u64), .doc = "The delivery's term" },
+            .{ .name = "index", .T = Int(u64), .doc = "The delivery's index" },
+            .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without a touch, in Unix milliseconds; 0 when no message was taken, or with ack" },
+        }),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Take a queue's next ready messages, leased until completed, failed or expired. With ack, answered once their complete applies.",
+    },
+    .{
+        .name = "queue.complete",
+        .code = 0x182,
+        .class = .write,
+        .route = .key,
+        .request = Record(&report_fields),
+        .response = Record(&report_answer),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Complete dequeued messages: they leave the queue. A message answered gone was completed already, or isn't in this queue.",
+    },
+    .{
+        .name = "queue.fail",
+        .code = 0x183,
+        .class = .write,
+        .route = .key,
+        .request = Record(&(report_fields ++ [_]schema.Field{
+            .{ .name = "delay_ms", .T = Defaulted(schema.DurationMs(qe.MAX_DELAY_MS), 0), .doc = "How long before they're ready again" },
+            .{ .name = "dead", .T = Defaulted(schema.Bool, false), .doc = "Dead-letter them now, whatever attempts are left" },
+            .{ .name = "error", .T = Defaulted(Bytes(qe.MAX_ERROR), ""), .doc = "Why they failed" },
+        })),
+        .response = Record(&report_answer),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Fail dequeued messages: ready again, or dead once their attempts are spent.",
+    },
+    .{
+        .name = "queue.touch",
+        .code = 0x184,
+        .class = .write,
+        .route = .key,
+        .request = Record(&report_fields),
+        .response = Record(&([_]schema.Field{
+            .{ .name = "expires_at_ms", .T = Int(i64), .doc = "When the lease runs out without another touch, in Unix milliseconds" },
+        } ++ report_answer)),
+        .cli = .{ .expose = .hand, .key = .{ .name = "queue", .doc = "The queue's name" } },
+        .doc = "Keep dequeued messages: with half their lease or less left, it runs a full lease from now, up to 12 h from their dequeue.",
+    },
 };
 
 /// The op in this table named `name`; a name not there fails the build.
@@ -63,4 +203,9 @@ comptime {
 test "a peek's answer fits one response body, though a full page of the largest payloads doesn't" {
     try std.testing.expect(op("queue.peek").response.max_size <= ops.MAX_RESPONSE_BODY);
     try std.testing.expect(MAX_PEEK * Peeked.max_size > PeekedList.byte_bound.?);
+}
+
+test "a dequeue's answer fits one response body, and holds one message of the largest" {
+    try std.testing.expect(op("queue.dequeue").response.max_size <= ops.MAX_RESPONSE_BODY);
+    try std.testing.expect(Message.max_size <= MESSAGES_BYTES);
 }

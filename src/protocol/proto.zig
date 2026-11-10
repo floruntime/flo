@@ -1,4 +1,5 @@
 const std = @import("std");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const stdx = @import("stdx");
 const Allocator = std.mem.Allocator;
 const reason_mod = @import("reason.zig");
@@ -147,9 +148,8 @@ pub const OpCode = enum(u16) {
 
     // ── Queues (0x170 – 0x19F) ───────────────────────────────────────────────
     queue_enqueue = 0x170,
-    queue_dequeue = 0x171,
-    queue_complete = 0x172,
-    queue_fail = 0x174,
+    // 0x171, 0x172 and 0x174 were dequeue, complete and fail before they
+    // moved onto the op table at 0x181-0x183.
     queue_dlq_list = 0x176,
     queue_dlq_delete = 0x177,
     queue_dlq_requeue = 0x178,
@@ -158,6 +158,10 @@ pub const OpCode = enum(u16) {
     queue_purge = 0x17F,
 
     queue_peek = 0x180,
+    queue_dequeue = 0x181,
+    queue_complete = 0x182,
+    queue_fail = 0x183,
+    queue_touch = 0x184,
     queue_list = 0x198,
 
     // ── Time-Series (0x1A0 – 0x1BF) ─────────────────────────────────────────
@@ -287,6 +291,8 @@ pub const OptionTag = enum(u8) {
 
     // Queue Options (0x10 - 0x1F)
     priority = 0x10, // u8: Message priority (0-255; lower is taken first)
+    delay_ms = 0x11, // u64: How long before an enqueued message is ready (at most a day)
+    dedup_key = 0x13, // string: Refused: queues keep no deduplication window
     count = 0x15, // u32: Number of messages to dequeue
     block_ms = 0x17, // u32: Block timeout - wait until exists (at most 5 min; 0 = don't wait)
 
@@ -670,6 +676,10 @@ pub const Request = struct {
     key: []const u8,
     value: []const u8,
     options: []const u8 = "", // TLV-encoded options blob
+    /// The namespace's id, as the node's table has it: resolved from
+    /// `namespace` where the request enters a shard, never sent or read on
+    /// the wire. `.invalid` for a name the table doesn't have.
+    ns_id: NamespaceId = .invalid,
 
     /// Parse request from wire format
     pub fn parse(data: []const u8) !Request {

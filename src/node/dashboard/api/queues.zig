@@ -325,7 +325,7 @@ pub fn enqueueMessage(allocator: Allocator, queue_name: []const u8, body: []cons
 
     var client = loopback.connect(allocator, ctx) catch return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority) catch
+    var resp = client_mod.queue.enqueue(&client, ns_q, queue_name, body, priority, 0) catch
         return try h.jsonError(allocator, "Enqueue failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

@@ -15,19 +15,12 @@
 //!
 //! ## Domain Routing
 //!
-//! Each domain constructs its hash input differently:
-//! - KV: `namespace \0 routing_key`
-//! - Stream metadata: `namespace \0 stream_name`
-//! - Stream data: `namespace : stream : partition_bytes`
-//! - Queue/Actions/Workflow: `namespace \0 entity_name`
-//! - Namespace/Cluster ops: always Shard 0
-//!
-//! ## Ported from
-//!
-//! `src/node/dispatch/routing.zig` — same Wyhash seed, same hash tag
-//! extraction, same two-level mapping.
+//! Every namespaced key routes by `routeNsKey`: the namespace's id, then
+//! the key's routing part (a KV key, or a stream's, queue's, action's or
+//! workflow's name). Namespace and cluster ops always go to shard 0.
 
 const std = @import("std");
+pub const NamespaceId = @import("../namespace/table.zig").Id;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -41,9 +34,6 @@ const MIN_PARTITION_COUNT: u32 = 4096;
 
 /// Wyhash seed — must never change (wire compat)
 const HASH_SEED: u64 = 0;
-
-/// Separator for domain-specific hash inputs (NUL byte, not ':')
-const DOMAIN_SEP: u8 = 0x00;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RouteTarget
@@ -114,19 +104,14 @@ pub const Router = struct {
         return self.route(hashKey(key));
     }
 
-    /// Route a namespaced key (with hash tag extraction).
-    pub fn routeNamespacedKey(self: Router, namespace: []const u8, key: []const u8) RouteTarget {
-        return self.route(hashKeyWithNamespace(namespace, key));
-    }
-
     /// Key → partition (convenience).
     pub fn keyToPartition(self: Router, key: []const u8) u32 {
         return self.hashToPartition(hashKey(key));
     }
 
     /// Namespaced key → partition.
-    pub fn keyToPartitionNs(self: Router, namespace: []const u8, key: []const u8) u32 {
-        return self.hashToPartition(hashKeyWithNamespace(namespace, key));
+    pub fn keyToPartitionNs(self: Router, ns: NamespaceId, key: []const u8) u32 {
+        return self.hashToPartition(routeNsKey(ns, key));
     }
 };
 
@@ -140,51 +125,31 @@ pub fn hashKey(key: []const u8) u64 {
     return std.hash.Wyhash.hash(HASH_SEED, routing_key);
 }
 
-/// Hash a namespaced key: `namespace \0 routing_key`.
-pub fn hashKeyWithNamespace(namespace: []const u8, key: []const u8) u64 {
-    const routing_key = extractRoutingKey(key);
+/// Hash a namespaced key: the namespace's id, fixed width, then the key's
+/// routing part (with hash tag extraction).
+pub fn routeNsKey(ns: NamespaceId, key: []const u8) u64 {
     var h = std.hash.Wyhash.init(HASH_SEED);
-    h.update(namespace);
-    h.update(&[_]u8{DOMAIN_SEP});
-    h.update(routing_key);
+    h.update(&ns.bytes());
+    h.update(extractRoutingKey(key));
     return h.final();
 }
 
-/// Hash for an explicit key (no hash tag extraction): `namespace \0 key`.
-pub fn hashExplicitKey(namespace: []const u8, key: []const u8) u64 {
-    var h = std.hash.Wyhash.init(HASH_SEED);
-    h.update(namespace);
-    h.update(&[_]u8{DOMAIN_SEP});
-    h.update(key);
-    return h.final();
+/// The key a named thing (a stream, queue, measurement, group) is kept
+/// under in its namespace: the id, then the name's hash, both big-endian,
+/// so one namespace's keys sort together and a 64-bit collision can only
+/// be between names in one namespace.
+pub fn nsNameKey(ns: NamespaceId, name: []const u8) [12]u8 {
+    var k: [12]u8 = undefined;
+    k[0..4].* = ns.bytes();
+    std.mem.writeInt(u64, k[4..12], std.hash.Wyhash.hash(HASH_SEED, name), .big);
+    return k;
 }
 
-/// Hash for stream data partitions: `namespace : stream : partition_bytes`.
-pub fn hashStreamPartition(namespace: []const u8, stream: []const u8, partition_id: u32) u64 {
-    var h = std.hash.Wyhash.init(HASH_SEED);
-    h.update(namespace);
-    h.update(":");
-    h.update(stream);
-    h.update(":");
-    h.update(std.mem.asBytes(&partition_id));
-    return h.final();
-}
-
-/// Compute a compact 32-bit namespace hash for storage in UAL command entries.
-/// Returns 0 for empty namespace (backward-compatible: existing entries have 0).
-pub fn namespaceHash(namespace: []const u8) u32 {
-    if (namespace.len == 0) return 0;
-    return @truncate(std.hash.Wyhash.hash(HASH_SEED, namespace));
-}
-
-/// Hash a resource name (stream, queue, measurement) incorporating the namespace
-/// hash as the Wyhash seed. This allows both live lookups (with full namespace)
-/// and recovery from persisted entries (with only the stored namespace_hash: u32).
-///
-/// Backward-compatible: when namespace_hash=0, produces the same result as
-/// `Wyhash.hash(0, name)` which is what pre-isolation code used.
-pub fn nameHash(namespace_hash: u32, name: []const u8) u64 {
-    return std.hash.Wyhash.hash(@as(u64, namespace_hash), name);
+/// Hash a resource name (stream, queue, measurement) in a namespace, seeded
+/// with the namespace's id: the same from a request, which the edge
+/// resolved, and from a committed entry, which carries the id.
+pub fn nameHash(ns: NamespaceId, name: []const u8) u64 {
+    return std.hash.Wyhash.hash(@as(u64, ns.int()), name);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -316,13 +281,17 @@ test "Router: namespaced routing" {
     const router = Router.init(4096, 4, 0);
 
     // Same key, different namespace → different partition
-    const p1 = router.keyToPartitionNs("ns-a", "mykey");
-    const p2 = router.keyToPartitionNs("ns-b", "mykey");
+    const p1 = router.keyToPartitionNs(.of(16), "mykey");
+    const p2 = router.keyToPartitionNs(.of(17), "mykey");
     try std.testing.expect(p1 != p2);
 
     // Same namespace + same key → same partition
-    const p3 = router.keyToPartitionNs("ns-a", "mykey");
+    const p3 = router.keyToPartitionNs(.of(16), "mykey");
     try std.testing.expectEqual(p1, p3);
+
+    // A hash tag routes within its namespace, not across them.
+    try std.testing.expectEqual(routeNsKey(.of(16), "user:{alice}:a"), routeNsKey(.of(16), "user:{alice}:b"));
+    try std.testing.expect(routeNsKey(.of(16), "{alice}") != routeNsKey(.of(17), "{alice}"));
 }
 
 test "Router: effective partition count" {
@@ -335,44 +304,19 @@ test "Router: effective partition count" {
     try std.testing.expectEqual(@as(u32, 8192), effectivePartitionCount(0, 256)); // 256*32=8192 > 4096
 }
 
-test "Router: stream partition hashing" {
-    // Stream data routing is deterministic
-    const h1 = hashStreamPartition("prod", "events", 0);
-    const h2 = hashStreamPartition("prod", "events", 0);
-    try std.testing.expectEqual(h1, h2);
-
-    // Different partition IDs → (likely) different hashes
-    const h3 = hashStreamPartition("prod", "events", 1);
-    try std.testing.expect(h1 != h3);
+test "Router: nameHash is the namespace's own" {
+    // Same namespace + same name → same hash (deterministic)
+    try std.testing.expectEqual(nameHash(.of(16), "events"), nameHash(.of(16), "events"));
+    // Different namespace + same name → different hash (isolated)
+    try std.testing.expect(nameHash(.of(16), "events") != nameHash(.of(17), "events"));
+    try std.testing.expect(nameHash(.default, "events") != nameHash(.of(16), "events"));
 }
 
-test "Router: namespaceHash and nameHash" {
-    // Default namespace always produces a non-zero hash
-    const ns_default = namespaceHash("default");
-    try std.testing.expect(ns_default != 0);
-
-    // Non-empty namespace → non-zero
-    const ns_a = namespaceHash("prod");
-    try std.testing.expect(ns_a != 0);
-
-    // Different namespaces → different hashes
-    const ns_b = namespaceHash("staging");
-    try std.testing.expect(ns_a != ns_b);
-
-    // nameHash with namespace_hash=0 matches Wyhash.hash(0, name) — backward compat
-    const legacy_hash = std.hash.Wyhash.hash(0, "events");
-    const new_hash = nameHash(0, "events");
-    try std.testing.expectEqual(legacy_hash, new_hash);
-
-    // nameHash with non-zero namespace_hash produces different result — isolation
-    const ns_hash = nameHash(ns_a, "events");
-    try std.testing.expect(ns_hash != legacy_hash);
-
-    // Same namespace + same name → same hash (deterministic)
-    const ns_hash2 = nameHash(ns_a, "events");
-    try std.testing.expectEqual(ns_hash, ns_hash2);
-
-    // Different namespace + same name → different hash (isolated)
-    const ns_hash3 = nameHash(ns_b, "events");
-    try std.testing.expect(ns_hash != ns_hash3);
+test "Router: nsNameKey is the id then the name's hash, big-endian" {
+    const k = nsNameKey(.of(0x01020304), "orders");
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, k[0..4]);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(HASH_SEED, "orders"), std.mem.readInt(u64, k[4..12], .big));
+    // One namespace's keys share a prefix and sort after a lower id's.
+    try std.testing.expectEqualSlices(u8, k[0..4], nsNameKey(.of(0x01020304), "other")[0..4]);
+    try std.testing.expect(std.mem.order(u8, &nsNameKey(.of(16), "zz"), &nsNameKey(.of(17), "aa")) == .lt);
 }

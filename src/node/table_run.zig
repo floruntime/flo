@@ -137,10 +137,10 @@ pub fn routeByKey(comptime name: []const u8) dispatcher_mod.PreRouteFn {
             if (@hasField(Request.Value, "routing_key")) {
                 var diag: schema.Diagnostic = .{};
                 if (Request.decodeAll(req.value, &diag)) |body| {
-                    if (body.routing_key) |k| return router.hashKeyWithNamespace(req.namespace, k);
+                    if (body.routing_key) |k| return router.routeNsKey(req.ns_id, k);
                 } else |_| {}
             }
-            return router.hashKeyWithNamespace(req.namespace, req.key);
+            return router.routeNsKey(req.ns_id, req.key);
         }
     }.route;
 }
@@ -155,7 +155,7 @@ pub fn routeByField(comptime name: []const u8) dispatcher_mod.PreRouteFn {
             var diag: schema.Diagnostic = .{};
             const body = o.request.decodeAll(req.value, &diag) catch return null;
             const v = @field(body, field) orelse return null;
-            return router.hashKeyWithNamespace(req.namespace, v);
+            return router.routeNsKey(req.ns_id, v);
         }
     }.route;
 }
@@ -339,6 +339,26 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "worker.list", .field = "action", .tests = &.{"worker.list: an action filter pages only that action's workers, each page full, to the last"} },
     .{ .op = "stream.group.members", .field = "group", .tests = &.{"Shard: stream.group.members answers the named group's members by id, and a group that isn't there is not found"} },
     .{ .op = "queue.peek", .field = "limit", .tests = &.{"Shard: queue.peek shows as many of the next ready messages as its limit asks, and takes none"} },
+    .{ .op = "queue.dequeue", .field = "consumer", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.dequeue", .field = "count", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.dequeue", .field = "lease_ms", .tests = &.{"queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on"} },
+    .{ .op = "queue.dequeue", .field = "block_ms", .tests = &.{"queues: a dequeue with block_ms 0 answers at once with none; one that waits is answered when a message is enqueued"} },
+    .{ .op = "queue.dequeue", .field = "ack", .tests = &.{"queues: a dequeue with ack is answered once its complete applies, so nothing comes back"} },
+    .{ .op = "queue.complete", .field = "consumer", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.complete", .field = "term", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.complete", .field = "index", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.complete", .field = "messages", .tests = &.{"queues: a dequeue leases the next ready messages to its consumer under one delivery; a complete naming it removes them, and one naming another delivery or consumer is refused message by message"} },
+    .{ .op = "queue.fail", .field = "consumer", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "term", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "index", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "messages", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "delay_ms", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "dead", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.fail", .field = "error", .tests = &.{"queues: a fail readies a message again after delay_ms with its error kept, and one with dead dead-letters it"} },
+    .{ .op = "queue.touch", .field = "consumer", .tests = &.{"queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on"} },
+    .{ .op = "queue.touch", .field = "term", .tests = &.{"queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on"} },
+    .{ .op = "queue.touch", .field = "index", .tests = &.{"queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on"} },
+    .{ .op = "queue.touch", .field = "messages", .tests = &.{"queues: a dequeue's lease is the one it names, or 30 s; a touch with half of it left or less runs a full lease from then, and one past it finds the message moved on"} },
 };
 
 /// The files that bind table ops' functions: where `_ = field;` would

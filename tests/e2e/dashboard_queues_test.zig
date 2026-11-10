@@ -68,7 +68,7 @@ test "e2e/dashboard: a queue's counts are exact after a dequeue, and after a res
     defer ctx.deinit();
 
     for ([_][]const u8{ "a", "b", "c" }) |m| try ctx.exec(&.{ "queue", "enqueue", "rq", m });
-    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "rq" });
+    var deq = try ctx.cli.run(&.{ "queue", "dequeue", "rq", "--ack" });
     defer deq.deinit();
     try stdx.testing.assertSucceeded(deq);
 
@@ -82,8 +82,8 @@ test "e2e/dashboard: a queue's counts are exact after a dequeue, and after a res
 fn expectExactCounts(ctx: *stdx.testing.TestContext) !void {
     var http = try ctx.createDashboardHttp();
     defer http.deinit();
-    // A dequeue takes its message for good (queues are at-most-once): its
-    // lease ends when the dequeue's ack applies, so it is in flight until then.
+    // A dequeue with --ack completes its message as it takes it: its lease
+    // ends when that complete applies, so it is in flight until then.
     const want = "\"name\":\"rq\",\"namespace\":\"default\",\"ready\":2,\"inflight\":0,\"pending\":2,\"available\":2,\"enqueued\":3,\"dequeued\":1,";
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
