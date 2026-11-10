@@ -119,10 +119,14 @@ pub const DurableLog = struct {
     /// Seal the buffered entries into a new segment stamped with the commit
     /// index they were flushed under. Nothing to flush is not an error.
     pub fn flush(self: *DurableLog, commit_index: u64) !void {
-        if (self.writer.entry_count == 0) return;
+        // A pending cut owes a write even when no new entries do, and its write
+        // can fail: try it before the empty-buffer return, so a caller tracking
+        // flush failures doesn't see this as a clean flush while the disk is
+        // still failing the cut.
         if (self.pending_cut != null) {
             self.recoverTruncation() catch return error.TruncationIncomplete;
         }
+        if (self.writer.entry_count == 0) return;
         self.writer.commit_index_at_seal = commit_index;
         // A failed write may still leave the file in place (only the
         // directory sync failed), so drop the cached listing.
@@ -672,6 +676,44 @@ const TestDir = struct {
         self.tmp.cleanup();
     }
 };
+
+test "durable log: flush tries a pending cut before the empty-buffer return, so a failing cut is not a clean flush" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+    // Two sealed segments on disk, 1..3 and 4..6; the buffer is empty.
+    try writer.addEntry(&testEntry(1, 1, "a"));
+    try writer.addEntry(&testEntry(2, 1, "b"));
+    try writer.addEntry(&testEntry(3, 1, "c"));
+    try dl.flush(3);
+    try writer.addEntry(&testEntry(4, 1, "d"));
+    try writer.addEntry(&testEntry(5, 1, "e"));
+    try writer.addEntry(&testEntry(6, 1, "f"));
+    try dl.flush(6);
+
+    // The directory can't be written, so truncating to 4 can't rewrite the
+    // 4..6 segment: the cut stays pending and the buffer stays empty.
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{td.path}, 0);
+    _ = std.c.chmod(z, 0o500);
+    defer _ = std.c.chmod(z, 0o700);
+    dl.truncateAfter(4) catch {};
+    try testing.expect(dl.pending_cut != null);
+    try testing.expectEqual(@as(u64, 0), dl.writer.entry_count);
+
+    // An empty-buffer flush must still try the pending cut, and fails — not a
+    // clean flush. (Trying the cut only after the empty-buffer return would
+    // report success while the disk is still failing it.)
+    try testing.expectError(error.TruncationIncomplete, dl.flush(6));
+
+    // Writable again: the flush completes the cut and clears it.
+    _ = std.c.chmod(z, 0o700);
+    try dl.flush(6);
+    try testing.expect(dl.pending_cut == null);
+}
 
 fn fileNames(dir_path: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
     var dir = try stdx.fs.openDir(dir_path, .{ .iterate = true });
