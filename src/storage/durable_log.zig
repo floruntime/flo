@@ -97,7 +97,9 @@ pub const DurableLog = struct {
     /// cause (an IO error, or an unmapped errno that may be one) should become
     /// damage if it persists, as against a resource shortage that is expected
     /// to pass on its own.
-    pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false };
+    /// `permission` marks a disk-class block that is a permission the
+    /// operator may fix, which every report says plainly.
+    pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, permission: bool = false };
 
     const Open = struct {
         first_index: u64,
@@ -213,7 +215,7 @@ pub const DurableLog = struct {
             // corrupt or missing segment is a genuine fault.
             switch (readBlockClass(err)) {
                 .resource => return .{ .blocked = true },
-                .disk => return .{ .blocked = true, .disk_failing = true },
+                .disk => return .{ .blocked = true, .disk_failing = true, .permission = isPermission(err) },
                 .fault => {
                     log.err("durable log: cannot read below the ring at index {d}: {s}", .{ start, @errorName(err) });
                     return .{};
@@ -243,6 +245,11 @@ pub const DurableLog = struct {
     };
 
     /// Classify a failure to open or read a listed segment.
+    /// A permission the operator may fix, which every report names as such.
+    pub fn isPermission(err: anyerror) bool {
+        return err == error.AccessDenied or err == error.PermissionDenied;
+    }
+
     pub fn readBlockClass(err: anyerror) ReadBlockClass {
         return switch (err) {
             error.ProcessFdQuotaExceeded,
@@ -463,6 +470,13 @@ pub const DurableLog = struct {
                 // good segment unreadable for good. Said at most once every 30
                 // s, because a blocked catch-up re-lists on every retry.
                 // `path`'s errdefer frees it on return.
+                // Named, so boot shows the shard offline saying so, not a bare
+                // error: the operator's to fix.
+                if (isPermission(err)) {
+                    const kept = @min(de.name.len, self.bad_header.len);
+                    @memcpy(self.bad_header[0..kept], de.name[0..kept]);
+                    self.bad_header_len = kept;
+                }
                 if (readBlockClass(err) != .fault) {
                     const now = stdx.time.monotonicMs();
                     if (self.block_warn_ms == null or now -| self.block_warn_ms.? >= 30_000) {

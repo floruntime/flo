@@ -37,7 +37,7 @@ pub const TermRun = struct {
 /// has waited long enough can give up and damage rather than wait forever.
 /// `pending` says the read was started elsewhere and the caller should ask
 /// again once woken; it is never a hole either.
-pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, pending: bool = false };
+pub const CatchUpResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, permission: bool = false, pending: bool = false };
 
 /// Where an entry the ring no longer holds can still be read from: the
 /// durable log in production, the simulated disk under VOPR. Reads are
@@ -54,7 +54,7 @@ pub const CatchUpSource = struct {
 /// One entry read for the apply loop: found, genuinely not there (a hole,
 /// which is damage), or blocked (read it again later). A blocked read reports
 /// whether the disk may be failing, which bounds how long the caller waits.
-pub const ApplyRead = union(enum) { found: Entry, absent, blocked: struct { disk_failing: bool } };
+pub const ApplyRead = union(enum) { found: Entry, absent, blocked: struct { disk_failing: bool, permission: bool = false } };
 
 pub const RaftLog = struct {
     ual: UAL,
@@ -173,7 +173,7 @@ pub const RaftLog = struct {
         const src = self.catch_up orelse return .absent;
         var one: [1]Entry = undefined;
         const r = src.read_range(src.ctx, index, &one, payload_buf);
-        if (r.blocked) return .{ .blocked = .{ .disk_failing = r.disk_failing } };
+        if (r.blocked) return .{ .blocked = .{ .disk_failing = r.disk_failing, .permission = r.permission } };
         if (r.count != 1) return .absent;
         return .{ .found = one[0] };
     }

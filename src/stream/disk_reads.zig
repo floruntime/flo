@@ -70,8 +70,21 @@ const no_commit_limit: u64 = std.math.maxInt(u64);
 
 pub const Damage = struct {
     ctx: *anyopaque,
-    report: *const fn (ctx: *anyopaque, index: u64, disk_failing: bool) void,
+    report: *const fn (ctx: *anyopaque, index: u64, cause: Cause) void,
+
+    pub const Cause = enum {
+        /// The segment is corrupt or doesn't hold the entry.
+        corrupt,
+        /// The disk failed past its grace.
+        disk_failing,
+        /// A permission denied past the disk's grace.
+        permission,
+    };
 };
+
+/// A disk-class failure with no other for this long since is a new one: its
+/// grace starts again, as apply's does once a read gets through.
+pub const DISK_QUIET_MS: u64 = 30_000;
 
 /// Why a want was answered blocked.
 pub const BlockReason = enum {
@@ -158,6 +171,8 @@ pub const DiskReads = struct {
     gone: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// The in-place read's buffers, made once.
     local_entries: []Entry = &.{},
+    /// The cut count when the in-place wants were queued.
+    local_generation: u64 = 0,
     local_arena: []u8 = &.{},
 
     blocked_until_ms: u64 = 0,
@@ -169,10 +184,13 @@ pub const DiskReads = struct {
     /// When a disk-class block began, while it lasts. Past `disk_failing_ms`
     /// it is damage, as apply's is.
     disk_failing_since_ms: ?u64 = null,
+    disk_failing_last_ms: u64 = 0,
     disk_failing_ms: u64 = 5 * 60 * 1000,
     /// The shard's commit index: nothing above it is cached, since a cut may
     /// still replace it.
     commit: *const u64 = &no_commit_limit,
+    /// The shard found its data damaged: nothing more is read.
+    stopped: bool = false,
     /// The shard's damage report, called on the owner's thread when its
     /// durable log can't give a committed entry back: corrupt or missing,
     /// or a disk failing past its grace.
@@ -279,6 +297,10 @@ pub const DiskReads = struct {
     /// or evicts anything: a payload `get` returned stays valid.
     pub fn want(self: *DiskReads, index: u64, w: Window) Want {
         std.debug.assert(self.isOwner());
+        if (self.stopped) {
+            self.want_block = .io;
+            return .blocked;
+        }
         // Only the owner writes `gone`, so it reads it unlocked.
         if (self.gone.contains(index)) return .absent;
         const now = self.now_fn();
@@ -340,6 +362,7 @@ pub const DiskReads = struct {
     }
 
     fn inPlace(self: *DiskReads, w: Window) Want {
+        if (self.local.n_wants == 0) self.local_generation = self.dl.truncations;
         self.local.add(w);
         if (self.notify) |n| n.done(n.ctx);
         return .pending;
@@ -362,6 +385,14 @@ pub const DiskReads = struct {
     }
 
     pub fn onTruncate(self: *DiskReads, after_index: u64) void {
+        // In-place reads queued above the cut would read nothing there, and
+        // nothing is no damage: the readers ask again.
+        var kept: usize = 0;
+        for (self.local.wants[0..self.local.n_wants]) |w| if (w.from <= after_index) {
+            self.local.wants[kept] = w;
+            kept += 1;
+        };
+        self.local.n_wants = kept;
         self.mutex.lock();
         defer self.mutex.unlock();
         var drop: std.ArrayListUnmanaged(u64) = .empty;
@@ -378,9 +409,9 @@ pub const DiskReads = struct {
         for (drop.items) |index| _ = self.gone.remove(index);
     }
 
-    fn damage(self: *DiskReads, index: u64, disk_failing: bool) void {
+    fn damage(self: *DiskReads, index: u64, cause: Damage.Cause) void {
         self.markGone(index);
-        if (self.on_damage) |d| d.report(d.ctx, index, disk_failing);
+        if (self.on_damage) |d| d.report(d.ctx, index, cause);
     }
 
     /// Land every finished read, and make the in-place ones. True when any
@@ -411,7 +442,7 @@ pub const DiskReads = struct {
                 continue;
             }
             const r = s.read.result;
-            self.land(s.read.start, s.read.entries[0..r.count], r.blocked, r.disk_failing, s.wants[0..s.n_wants]);
+            self.land(s.read.start, s.read.entries[0..r.count], r.blocked, r.disk_failing, r.permission, s.wants[0..s.n_wants]);
             s.n_wants = 0;
             s.read.state.store(.idle, .release);
             any = true;
@@ -420,7 +451,11 @@ pub const DiskReads = struct {
             const wants = self.local.wants;
             const n = self.local.n_wants;
             self.local.n_wants = 0;
-            for (wants[0..n]) |w| self.readInPlace(w);
+            // Queued before a cut: asked again rather than read, so a read
+            // that finds nothing is only ever damage under the log it asked.
+            if (self.local_generation == self.dl.truncations) {
+                for (wants[0..n]) |w| self.readInPlace(w);
+            }
             any = true;
         }
         return any;
@@ -436,10 +471,10 @@ pub const DiskReads = struct {
             return;
         }
         const r = self.dl.readRange(w.from, self.local_entries, self.local_arena);
-        self.land(w.from, self.local_entries[0..r.count], r.blocked, r.disk_failing, &.{w});
+        self.land(w.from, self.local_entries[0..r.count], r.blocked, r.disk_failing, r.permission, &.{w});
     }
 
-    fn land(self: *DiskReads, start: u64, entries: []const Entry, blocked_read: bool, disk_failing: bool, wants: []const Window) void {
+    fn land(self: *DiskReads, start: u64, entries: []const Entry, blocked_read: bool, disk_failing: bool, permission: bool, wants: []const Window) void {
         const now = self.now_fn();
         if (blocked_read) {
             self.blocked_reads += 1;
@@ -449,12 +484,17 @@ pub const DiskReads = struct {
                 return;
             }
             // A failing disk: retried, but past its grace it is damage, as
-            // a committed entry apply can't read is.
+            // a committed entry apply can't read is. One with none other for
+            // a while is a new failure, whose grace starts now.
+            if (now -| self.disk_failing_last_ms >= DISK_QUIET_MS) self.disk_failing_since_ms = null;
+            self.disk_failing_last_ms = now;
             const since = self.disk_failing_since_ms orelse now;
             self.disk_failing_since_ms = since;
             if (now -| since >= self.disk_failing_ms) {
                 self.damaged += 1;
-                self.damage(start, true);
+                self.damage(start, if (permission) .permission else .disk_failing);
+            } else if (permission) {
+                self.warn(now, "a stream read from the durable log was refused: permission denied on a segment; fix the file's permissions", .{});
             } else self.warn(now, "a stream read from the durable log failed; the disk may be failing", .{});
             return;
         }
@@ -464,7 +504,7 @@ pub const DiskReads = struct {
             // a committed entry is corrupt or missing it. Damage to the log,
             // reported as boot and apply report it; never read again.
             self.damaged += 1;
-            self.damage(start, false);
+            self.damage(start, .corrupt);
             return;
         }
         self.mutex.lock();
@@ -747,10 +787,10 @@ const Reported = struct {
     fn hook(self: *Reported) Damage {
         return .{ .ctx = self, .report = report };
     }
-    fn report(ctx: *anyopaque, index: u64, disk_failing: bool) void {
+    fn report(ctx: *anyopaque, index: u64, cause: Damage.Cause) void {
         const self: *Reported = @ptrCast(@alignCast(ctx));
         self.index = index;
-        self.disk_failing = disk_failing;
+        self.disk_failing = cause != .corrupt;
     }
 };
 
@@ -909,4 +949,69 @@ test "stream disk reads: a window asked inside a read in flight widens it to rea
     _ = d.drain();
     try testing.expect(d.get(1) != null);
     try testing.expect(d.get(3) != null);
+}
+
+test "stream disk reads: a bulk read made before a cut is dropped when it lands, never taken as damage" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    f.dl.on_cut = .{ .ctx = &d, .after = DiskReads.cutHook };
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    var done: Done = .{};
+    d.bulk = &bulk;
+    d.notify = .{ .ctx = &done, .done = Done.done };
+    d.setOwner();
+    var reported: Reported = .{};
+    d.on_damage = reported.hook();
+    // Queued for 5, then the log is cut after 2: the segment is rewritten
+    // without it, so the read finds nothing there.
+    try testing.expectEqual(Want.pending, d.want(5, .{ .stream = keyOf("a"), .from = 5, .limit = 1 }));
+    try f.dl.truncateAfter(2);
+    try bulk.start();
+    try done.waitFor(1);
+    _ = d.drain();
+    try testing.expect(reported.index == null);
+    try testing.expectEqual(@as(u64, 0), d.damaged);
+}
+
+test "stream disk reads: an in-place read queued before a cut below it is dropped, never taken as damage" {
+    var f: Fixture = undefined;
+    try f.init(1, false);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    f.dl.on_cut = .{ .ctx = &d, .after = DiskReads.cutHook };
+    var reported: Reported = .{};
+    d.on_damage = reported.hook();
+    // Queued for 5 in the writer's buffer, then the log is cut after 2.
+    try testing.expectEqual(Want.pending, d.want(5, .{ .stream = keyOf("a"), .from = 5, .limit = 1 }));
+    try f.dl.truncateAfter(2);
+    _ = d.drain();
+    try testing.expect(reported.index == null);
+    try testing.expectEqual(@as(u64, 0), d.damaged);
+}
+
+test "stream disk reads: a disk failure after a quiet spell starts its grace again" {
+    Clock.now = 1_000;
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    d.now_fn = Clock.get;
+    d.disk_failing_ms = 10_000;
+    var reported: Reported = .{};
+    d.on_damage = reported.hook();
+    f.dl.test_open_error = error.InputOutput;
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    // An hour of nothing, then one more: a new failure, not one an hour long.
+    Clock.now += 60 * 60 * 1000;
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    try testing.expect(reported.index == null);
 }

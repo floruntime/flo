@@ -193,7 +193,7 @@ pub const BulkIo = struct {
         const opened = self.open(r.pathSlice(), r.generation) catch |err| {
             return switch (durable_log.DurableLog.readBlockClass(err)) {
                 .resource => .{ .blocked = true },
-                .disk => .{ .blocked = true, .disk_failing = true },
+                .disk => .{ .blocked = true, .disk_failing = true, .permission = durable_log.DurableLog.isPermission(err) },
                 // Gone, as a truncation deletes a file wholly above its cut:
                 // the shard's generation check drops it before reading this.
                 .fault => .{},
