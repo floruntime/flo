@@ -12,6 +12,7 @@ const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
 const NamespaceId = @import("../namespace/table.zig").Id;
+const Streams = @import("streams.zig").Streams;
 
 /// The longest namespace name a key holds.
 pub const MAX_NAMESPACE = std.math.maxInt(u8);
@@ -181,9 +182,18 @@ pub const View = struct {
     last: FamKey.Map(usize) = .empty,
     /// Fail on an undeclared key rather than count it (`Store.strict_keys`).
     strict: bool,
+    /// The shard's streams, read-only, when the apply was handed them.
+    streams_read: ?Streams = null,
 
     pub fn init(store: *Store, arena: Allocator, declared: *const KeySet) View {
         return .{ .store = store, .arena = arena, .declared = declared, .strict = store.strict_keys };
+    }
+
+    /// The shard's streams as of this entry. A machine that reads them is
+    /// applied with them (`machine.applyEntryWith`); asked without them,
+    /// this is a Flo bug, and the entry halts.
+    pub fn streams(self: *const View) ApplyError!Streams {
+        return self.streams_read orelse error.Halt;
     }
 
     pub fn get(self: *View, comptime F: type, k: []const u8) ApplyError!?F.Value {
