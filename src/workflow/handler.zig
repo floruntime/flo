@@ -37,6 +37,7 @@ const list_runs = @import("list_runs.zig");
 const parser = @import("parser.zig");
 
 const definition = @import("definition.zig");
+const cron_mod = @import("cron.zig");
 const plan_types = @import("plan_types.zig");
 const validator = @import("validator.zig");
 const jsonpath = @import("jsonpath.zig");
@@ -81,12 +82,23 @@ pub const WorkflowHandler = struct {
     /// Mutex for cross-shard thread safety. Acquired when this handler is
     /// accessed from a different shard's thread via forwardToShard dispatch.
     mu: @import("stdx").Mutex,
-    /// Runs whose start this leader applied, in log order, for the tick to
-    /// take their first step (`advanceStartedRuns`).
-    /// No start takes its first step where it is proposed or answered: a
-    /// step proposes, and the shard applies nothing in the middle of a
-    /// module's work.
+    /// Runs whose step_started this leader applied in its term, in log
+    /// order, for the tick to take their first step (`advanceStartedRuns`).
+    /// No run takes its first step where its entry applies: a step
+    /// proposes, and the shard applies nothing in the middle of a module's
+    /// work.
     started_to_advance: std.ArrayListUnmanaged(Started) = .empty,
+    /// Runs started and not yet stepped, by their keys in `runs`: kept by
+    /// the appliers on every replica, so whichever node leads steps them.
+    /// Their first steps go in this map's order, not their starts'.
+    to_step: std.StringHashMapUnmanaged(void) = .empty,
+    /// Where the last pass over `to_step` stopped, so a burst of starts is
+    /// walked once rather than from the top each pass.
+    to_step_cursor: u32 = 0,
+    /// Runs this leader has proposed a step_started for in `stepping_term`,
+    /// not yet applied. Leader memory: a new term starts it empty.
+    stepping: std.StringHashMapUnmanaged(void) = .empty,
+    stepping_term: u64 = 0,
     /// Runs parked on an action or a child, by their keys in `runs`: what
     /// the duty looks at, so its cost follows the work in flight and not
     /// every run ever started. Leader memory, like a step's state.
@@ -325,10 +337,26 @@ pub const WorkflowHandler = struct {
     pub const ScheduleState = struct {
         workflow_name_owned: []const u8,
         namespace_owned: []const u8,
+        /// Slots every `interval_ms` from the anchor, or at `cron`'s fire
+        /// times (UTC) from the anchor on.
         interval_ms: i64,
+        cron: ?cron_mod.Cron = null,
         max_concurrent: u32,
         input_owned: ?[]const u8,
-        last_trigger_ms: i64,
+        /// A cron's latest fire time changes on the minute: the last one
+        /// found, until `cron_until_ms`.
+        cron_latest_ms: ?i64 = null,
+        cron_until_ms: i64 = std.math.minInt(i64),
+        /// Slots count from here: the stamp of the entry that created or
+        /// last enabled the workflow, the same on every replica.
+        anchor_ms: i64,
+        /// The latest slot a run started for, set as that start applies
+        /// on every replica, so a new leader fires only later slots.
+        fired_ms: i64 = std.math.minInt(i64),
+        /// The slot this leader proposed a start for, in `proposed_term`;
+        /// not proposed again while that term lasts.
+        proposed_ms: i64 = std.math.minInt(i64),
+        proposed_term: u64 = 0,
     };
 
     const Timer = struct { at_ms: i64, ns_key: []const u8 };
@@ -379,6 +407,8 @@ pub const WorkflowHandler = struct {
         for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.deinit(self.allocator);
         self.parked.deinit(self.allocator);
+        self.to_step.deinit(self.allocator);
+        self.stepping.deinit(self.allocator);
         self.timers.deinit(self.allocator);
         var ak = self.active_runs.keyIterator();
         while (ak.next()) |k| self.allocator.free(k.*);
@@ -565,17 +595,23 @@ pub const WorkflowHandler = struct {
     /// stepped it already, so it stays at its start (`dropStartedRuns`).
     pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
         if (entry.header.entry_type == @backingInt(entry_mod.EntryType.workflow_complete)) return self.cancelApplied(shard, entry);
-        if (entry.header.entry_type != @backingInt(entry_mod.EntryType.workflow_start)) return;
-        if (result.refused() != null or shard.raft_node.role != .leader) return;
-        if (entry.header.term != shard.raft_node.current_term) return;
-        var r = result.reader();
-        if ((r.int(u8) orelse 0) != 1) return;
+        const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+        if (etype != .workflow_start and etype != .workflow_step_started) return;
+        if (shard.raft_node.role != .leader or entry.header.term != shard.raft_node.current_term) return;
         // The run's key is the entry's: "namespace:run_id".
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
-        if (shard.metrics_registry) |m| m.workflow.recordStarted();
         self.mu.lock();
         defer self.mu.unlock();
-        self.queueFirstStep(cmd.key, result.index);
+        if (etype == .workflow_start) {
+            if (result.refused() != null) return;
+            var r = result.reader();
+            if ((r.int(u8) orelse 0) == 1) if (shard.metrics_registry) |m| m.workflow.recordStarted();
+            return;
+        }
+        // Of this leader's term, so this leader proposed it.
+        _ = self.stepping.remove(cmd.key);
+        // Refused: another entry took its first step already.
+        if (result.refused() == null) self.queueFirstStep(cmd.key, result.index);
     }
 
     /// A completion applied: if it was the cancel this leader proposed last
@@ -906,16 +942,23 @@ pub const WorkflowHandler = struct {
 
     /// Whether the stepping duty has anything to do.
     pub fn hasDutyWork(self: *const WorkflowHandler) bool {
-        return self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
+        return self.to_step.count() > 0 or self.started_to_advance.items.len > 0 or self.parked.count() > 0 or self.timers.count() > 0 or self.completion_retries.items.len > 0;
     }
 
-    /// Take the first step of each queued run whose start has applied, in
-    /// queue order; one not applied yet waits for a later tick, one the log
-    /// dropped is forgotten. Leader only: a step proposes.
+    /// Most step_started entries one pass proposes, and most runs it looks
+    /// at doing so.
+    const STEPS_PER_PASS: usize = 64;
+    const VISITS_PER_PASS: usize = 4 * STEPS_PER_PASS;
+
+    /// Propose a step_started for runs started and not yet stepped, then
+    /// take the first step of each run whose step_started applied, in log
+    /// order; one whose cancel is in flight waits. Leader only: a step
+    /// proposes.
     pub fn advanceStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         if (shard.raft_node.role != .leader) return;
         self.mu.lock();
         defer self.mu.unlock();
+        self.proposeFirstSteps(shard);
         var keep: usize = 0;
         var i: usize = 0;
         // A step can start a child run here, which joins the queue behind
@@ -939,24 +982,57 @@ pub const WorkflowHandler = struct {
         self.started_to_advance.shrinkRetainingCapacity(keep);
     }
 
-    /// This node stopped leading: the runs it had not taken a first step
-    /// for stay at their start. Logs how many had applied (they exist and
-    /// stay `running`) and how many had not (the log may drop them).
+    /// A step_started for each run started and not yet stepped, up to
+    /// `STEPS_PER_PASS`, once per term. Picks up where the last pass
+    /// stopped. The caller holds `mu`.
+    fn proposeFirstSteps(self: *WorkflowHandler, shard: *Shard) void {
+        const term = shard.raft_node.current_term;
+        if (self.stepping_term != term) {
+            self.stepping.clearRetainingCapacity();
+            self.stepping_term = term;
+        }
+        if (self.to_step.count() == 0) return;
+        var proposed: usize = 0;
+        var visited: usize = 0;
+        var it = self.to_step.iterator();
+        // A cursor past the end (the map grew or shrank) starts over.
+        const start: u32 = if (self.to_step_cursor <= self.to_step.capacity()) self.to_step_cursor else 0;
+        it.index = start;
+        var wrapped = start == 0;
+        defer self.to_step_cursor = it.index;
+        while (proposed < STEPS_PER_PASS and visited < VISITS_PER_PASS) {
+            if (wrapped and start != 0 and it.index >= start) break;
+            const entry = it.next() orelse {
+                // At the end: once more from the top, up to where it began.
+                if (wrapped) break;
+                wrapped = true;
+                it = self.to_step.iterator();
+                continue;
+            };
+            visited += 1;
+            const ns_key = entry.key_ptr.*;
+            if (self.stepping.contains(ns_key)) continue;
+            if (self.runs.getPtr(ns_key)) |run| if (cancelInFlight(shard, run)) continue;
+            const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
+            _ = persistence_mod.proposeEntry(shard, .workflow_step_started, entry_mod.Flags.NONE, ns_key[0..ns_end], ns_key, "") catch |err| {
+                if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {s}: first step not logged: {s}; tried again next tick", .{ shard.id, ns_key, @errorName(err) });
+                break;
+            };
+            self.stepping.put(self.allocator, ns_key, {}) catch break;
+            proposed += 1;
+        }
+    }
+
+    /// This node stopped leading. A run whose first step was logged but not
+    /// taken stays at its start: the next leader won't step it again. One
+    /// whose step_started wasn't logged is the next leader's to step.
     pub fn dropStartedRuns(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var applied: usize = 0;
-        for (self.started_to_advance.items) |s| {
-            if (s.index <= shard.raft_node.last_applied) {
-                // A few by name, for an operator to look up; the rest counted.
-                if (applied < 3) log.warn("shard {d}: workflow run {s} started but had not taken its first step; it stays at its start", .{ shard.id, s.ns_key });
-                applied += 1;
-            }
-            self.allocator.free(s.ns_key);
-        }
-        const unapplied = self.started_to_advance.items.len - applied;
-        if (applied + unapplied > 0) log.warn("shard {d}: stopped leading with {d} started workflow runs that had not taken their first step, and {d} starts not yet applied", .{ shard.id, applied, unapplied });
+        if (self.started_to_advance.items.len > 0 or self.stepping.count() > 0) log.warn("shard {d}: stopped leading with {d} workflow runs whose first step was logged and not taken, and {d} whose step_started was proposed and not applied; those whose entry commits stay at their start", .{ shard.id, self.started_to_advance.items.len, self.stepping.count() });
+        for (self.started_to_advance.items) |s| self.allocator.free(s.ns_key);
         self.started_to_advance.clearRetainingCapacity();
+        self.stepping.clearRetainingCapacity();
     }
 
     // ── SIGNAL ──────────────────────────────────────────────────────────
@@ -1456,13 +1532,26 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    /// Apply a workflow_step_started entry: the run's first step is now
+    /// its leader's to take, once. A run already stepped, finished or
+    /// unknown is refused, and changes nothing.
+    fn replayStepStarted(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
+        if (value.len != 0) return error.Halt;
+        if (!self.to_step.remove(ns_key)) return out.refuse(.conflict, .unclassified, "conflict: the run's first step was taken");
+    }
+
     /// Apply a workflow_enabled entry. The definition may have gone since it
     /// was proposed; then nothing changes.
-    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, out: *Result) persistence_mod.ApplyError!void {
+    fn replayEnabled(self: *WorkflowHandler, ns_key: []const u8, value: []const u8, stamp_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         if (value.len != 1 or value[0] > 1) return error.Halt;
         if (!self.definitions.contains(ns_key)) return out.refuse(.not_found, .not_found, "workflow not found");
         if (value[0] == 1) {
-            if (self.disabled.fetchRemove(ns_key)) |old| self.allocator.free(old.key);
+            // Enabled again, its schedule counts slots from now: those
+            // missed while disabled don't fire.
+            if (self.disabled.fetchRemove(ns_key)) |old| {
+                self.allocator.free(old.key);
+                if (self.schedules.getPtr(ns_key)) |schedule| schedule.anchor_ms = stamp_ms;
+            }
             return;
         }
         if (self.disabled.contains(ns_key)) return;
@@ -3120,18 +3209,27 @@ pub const WorkflowHandler = struct {
         namespace: []const u8,
         workflow_name: []const u8,
         schedule: definition.ScheduleDef,
+        anchor_ms: i64,
     ) void {
-        // Only interval-based schedules are supported for now
-        const interval_ms = schedule.interval_ms orelse return;
-        if (interval_ms <= 0) return;
         if (schedule.paused) return;
+        // The validator lets through exactly one of a valid cron or an
+        // interval; a stored definition holds the same.
+        var parsed: ?cron_mod.Cron = null;
+        const interval_ms: i64 = if (schedule.cron_expr) |expr| blk: {
+            parsed = cron_mod.Cron.parse(expr) orelse return;
+            break :blk 0;
+        } else schedule.interval_ms orelse return;
+        if (parsed == null and interval_ms <= 0) return;
 
         const sched_key = self.makeNsKey(namespace, workflow_name) orelse return;
 
-        // Remove old schedule if re-creating workflow
+        // A redefinition replaces the schedule; the slots it fired stay
+        // fired.
+        var fired_ms: i64 = std.math.minInt(i64);
         if (self.schedules.fetchRemove(sched_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
+            fired_ms = state.fired_ms;
             self.freeScheduleState(&state);
         }
 
@@ -3153,9 +3251,11 @@ pub const WorkflowHandler = struct {
             .workflow_name_owned = owned_wf,
             .namespace_owned = owned_ns,
             .interval_ms = interval_ms,
+            .cron = parsed,
             .max_concurrent = schedule.max_concurrent,
             .input_owned = owned_input,
-            .last_trigger_ms = 0,
+            .anchor_ms = anchor_ms,
+            .fired_ms = fired_ms,
         }) catch {
             self.allocator.free(sched_key);
             self.allocator.free(owned_wf);
@@ -3175,20 +3275,40 @@ pub const WorkflowHandler = struct {
         }
     }
 
-    /// Check all active schedules and start runs when the interval has elapsed.
-    /// Called from shard.tick() on every reactor cycle.
+    /// The latest slot due at `now_ms`, or null before the first. Slot k
+    /// is at anchor + k·interval; slot 0 is the anchor itself. A cron's
+    /// slots are its fire times at or after the anchor.
+    fn dueSlot(schedule: *ScheduleState, now_ms: i64) ?i64 {
+        if (now_ms < schedule.anchor_ms) return null;
+        if (schedule.cron) |c| {
+            if (now_ms >= schedule.cron_until_ms) {
+                schedule.cron_latest_ms = c.latest(now_ms);
+                schedule.cron_until_ms = now_ms - @mod(now_ms, 60_000) + 60_000;
+            }
+            const latest = schedule.cron_latest_ms orelse return null;
+            return if (latest >= schedule.anchor_ms) latest else null;
+        }
+        const k = @divFloor(now_ms - schedule.anchor_ms, schedule.interval_ms);
+        return schedule.anchor_ms + k * schedule.interval_ms;
+    }
+
+    /// Start a run for each schedule whose latest slot hasn't fired. Slots
+    /// missed while no leader was ready fire once, as the latest one: a
+    /// failover or restart neither bursts nor skips. A leader whose clock
+    /// runs ahead fires early by as much.
     pub fn tickSchedules(self: *WorkflowHandler, shard: *Shard) void {
         self.mu.lock();
         defer self.mu.unlock();
 
         const now_ms: i64 = @import("stdx").time.milliTimestamp();
+        const term = shard.raft_node.current_term;
 
         var it = self.schedules.iterator();
         while (it.next()) |entry| {
             const schedule = entry.value_ptr;
-
-            // Enforce interval
-            if (now_ms - schedule.last_trigger_ms < schedule.interval_ms) continue;
+            const slot = dueSlot(schedule, now_ms) orelse continue;
+            if (slot <= schedule.fired_ms) continue;
+            if (schedule.proposed_term == term and slot <= schedule.proposed_ms) continue;
 
             // Skip disabled workflows
             if (self.disabled.contains(entry.key_ptr.*)) continue;
@@ -3198,25 +3318,46 @@ pub const WorkflowHandler = struct {
                 if ((self.active_runs.get(entry.key_ptr.*) orelse 0) >= schedule.max_concurrent) continue;
             }
 
-            schedule.last_trigger_ms = now_ms;
-            self.startRunFromSchedule(shard, schedule);
+            if (self.startRunFromSchedule(shard, schedule, slot)) {
+                schedule.proposed_ms = slot;
+                schedule.proposed_term = term;
+            }
         }
     }
 
-    /// Start a workflow run from a schedule trigger.
+    /// Start a workflow run for a schedule's slot. Its idempotency key
+    /// names the schedule and the slot's time, so a slot starts one run
+    /// however many leaders propose it. The time alone names the slot: a
+    /// re-anchor moves later slots off the old ones' times, and `fired_ms`
+    /// outlives it. Returns whether it was proposed.
     fn startRunFromSchedule(
         self: *WorkflowHandler,
         shard: *Shard,
         schedule: *const ScheduleState,
-    ) void {
+        slot_ms: i64,
+    ) bool {
         const input = schedule.input_owned orelse "{}";
+
+        var key_buf: [512]u8 = undefined;
+        const idem = std.fmt.bufPrint(&key_buf, "schedule:{s}:{s}:{d}", .{ schedule.namespace_owned, schedule.workflow_name_owned, slot_ms }) catch return false;
 
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(shard.namespaceId(schedule.namespace_owned), schedule.workflow_name_owned);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, &run_id_buf);
 
-        _ = self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, null, "schedule_started");
+        return self.proposeRun(shard, schedule.namespace_owned, run_id_str, schedule.workflow_name_owned, "latest", input, idem, "schedule_started") != null;
+    }
+
+    /// A schedule's start applied: its slot, the key's last part, has
+    /// fired.
+    fn restoreScheduleSlot(self: *WorkflowHandler, namespace: []const u8, wf_name: []const u8, idem: []const u8) void {
+        const colon = std.mem.lastIndexOfScalar(u8, idem, ':') orelse return;
+        const slot = std.fmt.parseInt(i64, idem[colon + 1 ..], 10) catch return;
+        const key = self.makeNsKey(namespace, wf_name) orelse return;
+        defer self.allocator.free(key);
+        const schedule = self.schedules.getPtr(key) orelse return;
+        schedule.fired_ms = @max(schedule.fired_ms, slot);
     }
 
     /// Poll all active stream triggers and start workflow runs for new events.
@@ -3778,6 +3919,7 @@ pub const WorkflowHandler = struct {
         const built = try self.buildComplete(&entry);
 
         if (!run.status.isTerminal()) self.noteRunFinished(run);
+        _ = self.to_step.remove(run.ns_key);
         // The entry carries the whole terminal state; whatever the run held
         // (the live producer's copy, or an earlier apply) is replaced.
         run.status = entry.status;
@@ -3807,6 +3949,7 @@ pub const WorkflowHandler = struct {
         registry.register(.workflow_start, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_complete, @ptrCast(self), replayEntryThunk);
         registry.register(.workflow_enabled, @ptrCast(self), replayEntryThunk);
+        registry.register(.workflow_step_started, @ptrCast(self), replayEntryThunk);
     }
 
     fn replayEntryThunk(ctx: *anyopaque, entry: *const entry_mod.Entry, out: *Result) persistence_mod.ApplyError!void {
@@ -3828,7 +3971,8 @@ pub const WorkflowHandler = struct {
         return switch (etype) {
             .workflow_create => self.replayCreate(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / 1_000_000), out),
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
-            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, out),
+            .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
+            .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
             .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
             else => error.Halt,
         };
@@ -3896,7 +4040,7 @@ pub const WorkflowHandler = struct {
             self.unregisterStreamTrigger(namespace, raw_name);
         }
         if (def.schedule) |schedule| {
-            self.registerSchedule(namespace, raw_name, schedule);
+            self.registerSchedule(namespace, raw_name, schedule, created_at_ms);
         } else {
             self.unregisterSchedule(namespace, raw_name);
         }
@@ -4012,10 +4156,18 @@ pub const WorkflowHandler = struct {
             if (std.mem.eql(u8, event_type, "trigger_started") and std.mem.startsWith(u8, k, "trigger:")) {
                 self.restoreTriggerCursor(namespace, wf_name, k);
             }
+            if (std.mem.eql(u8, event_type, "schedule_started") and std.mem.startsWith(u8, k, "schedule:")) {
+                self.restoreScheduleSlot(namespace, wf_name, k);
+            }
         }
 
         run.ns_key = ns_key;
         const active = self.activeRuns(namespace, wf_name) orelse {
+            self.freeRunRecord(&run);
+            self.allocator.free(ns_key);
+            return error.OutOfMemory;
+        };
+        self.to_step.ensureUnusedCapacity(self.allocator, 1) catch {
             self.freeRunRecord(&run);
             self.allocator.free(ns_key);
             return error.OutOfMemory;
@@ -4026,6 +4178,7 @@ pub const WorkflowHandler = struct {
             return error.OutOfMemory;
         };
         active.* += 1;
+        if (status == .running) self.to_step.putAssumeCapacity(ns_key, {});
         out.putInt(u8, 1);
         out.putBytes(raw_run_id);
         if (idem) |k| self.indexIdempotencyKey(namespace, wf_name, k, ns_key);
@@ -4574,7 +4727,7 @@ fn createTestDef(handler: *WorkflowHandler, ns_key: []const u8, name: []const u8
     };
 }
 
-test "a producer's start joins the first-step queue when it applies, then takes its step; one whose index applied without creating a run is dropped" {
+test "a producer's start leaves its run to step, its logged first step joins the queue, then it takes its step; one whose index applied without creating a run is dropped" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -4595,8 +4748,13 @@ test "a producer's start joins the first-step queue when it applies, then takes 
     try testing.expectEqual(@as(usize, 0), handler.started_to_advance.items.len);
     try testing.expect(handler.runs.get("default:run-p") == null);
 
-    // Applied on the leader: the run it created waits for its first step.
+    // Applied: the run it created is one to step.
     _ = shard.applyCommitted();
+    try testing.expect(handler.to_step.contains("default:run-p"));
+    // Its first step logged and applied on the leader: queued.
+    handler.advanceStartedRuns(&shard);
+    _ = shard.applyCommitted();
+    try testing.expect(!handler.to_step.contains("default:run-p"));
     try testing.expectEqual(@as(usize, 1), handler.started_to_advance.items.len);
     // A start whose index applied without creating a run (dropped with the
     // log's tail) is dropped from the queue, not kept for ever.
@@ -5256,10 +5414,12 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
 
     // A start's entry carries its namespace's id: "a" is created first.
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
-    handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 });
+    handler.registerSchedule("a", "wf", .{ .interval_ms = 1, .max_concurrent = 2 }, 0);
     const runsOf = struct {
         fn count(h: *WorkflowHandler, shard_: *Shard) usize {
-            h.schedules.getPtr("a:wf").?.last_trigger_ms = 0;
+            const sched = h.schedules.getPtr("a:wf").?;
+            sched.fired_ms = std.math.minInt(i64);
+            sched.proposed_ms = std.math.minInt(i64);
             const before = shard_.raft_node.log.lastIndex();
             h.tickSchedules(shard_);
             return shard_.raft_node.log.lastIndex() - before;
@@ -5278,6 +5438,157 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     try testing.expectEqual(@as(?u32, 1), handler.active_runs.get("a:wf"));
     // Room now: it fires once.
     try testing.expectEqual(@as(usize, 1), runsOf(&handler, &shard));
+}
+
+/// A workflow_start's value, as `proposeStart` encodes it.
+fn startValue(buf: []u8, wf: []const u8, event_type: []const u8, idem: []const u8) []const u8 {
+    var off: usize = 0;
+    for ([_][]const u8{ wf, "1" }) |p| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(p.len), .little);
+        @memcpy(buf[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    buf[off] = @backingInt(WorkflowHandler.RunStatus.running);
+    off += 1;
+    for ([_][]const u8{ event_type, idem }) |p| {
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(p.len), .little);
+        @memcpy(buf[off + 2 ..][0..p.len], p);
+        off += 2 + p.len;
+    }
+    return buf[0..off];
+}
+
+test "workflow first steps: a burst bigger than a pass is logged across passes, each run once" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    // An entry carries its namespace's id: "a" is created first.
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    var keys: [200][16]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        const key = try std.fmt.bufPrint(k, "a:r{d:0>5}", .{i});
+        try handler.to_step.put(allocator, key, {});
+    }
+    var counts: [5]u64 = undefined;
+    for (&counts) |*c| {
+        const before = shard.raft_node.log.lastIndex();
+        handler.mu.lock();
+        handler.proposeFirstSteps(&shard);
+        handler.mu.unlock();
+        c.* = shard.raft_node.log.lastIndex() - before;
+    }
+    try testing.expectEqualSlices(u64, &.{ 64, 64, 64, 8, 0 }, &counts);
+    try testing.expectEqual(@as(u32, 200), handler.stepping.count());
+}
+
+test "workflow schedule: slots count from the anchor, and the latest one due is the one that fires" {
+    var s: WorkflowHandler.ScheduleState = .{ .workflow_name_owned = "", .namespace_owned = "", .interval_ms = 1000, .max_concurrent = 1, .input_owned = null, .anchor_ms = 10_500 };
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, 10_499));
+    try testing.expectEqual(@as(?i64, 10_500), WorkflowHandler.dueSlot(&s, 10_500));
+    try testing.expectEqual(@as(?i64, 10_500), WorkflowHandler.dueSlot(&s, 11_499));
+    try testing.expectEqual(@as(?i64, 11_500), WorkflowHandler.dueSlot(&s, 11_500));
+    // Hours missed: the latest slot, not each of them.
+    try testing.expectEqual(@as(?i64, 10_500 + 3600 * 1000), WorkflowHandler.dueSlot(&s, 10_500 + 3600 * 1000 + 999));
+    s.anchor_ms = 0;
+    try testing.expectEqual(@as(?i64, 7000), WorkflowHandler.dueSlot(&s, 7999));
+}
+
+test "workflow schedule: a cron's slots are its fire times from the anchor on" {
+    const minute = cron_mod.calendarToEpochMs(2024, 1, 15, 10, 0);
+    var s: WorkflowHandler.ScheduleState = .{ .workflow_name_owned = "", .namespace_owned = "", .interval_ms = 0, .cron = cron_mod.Cron.parse("*/5 * * * *").?, .max_concurrent = 1, .input_owned = null, .anchor_ms = minute + 30_000 };
+    // Created after 10:00 struck: nothing until 10:05.
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, minute + 50_000));
+    try testing.expectEqual(@as(?i64, null), WorkflowHandler.dueSlot(&s, minute + 4 * 60_000 + 59_999));
+    try testing.expectEqual(@as(?i64, minute + 5 * 60_000), WorkflowHandler.dueSlot(&s, minute + 5 * 60_000));
+    // A day missed: the latest fire, once.
+    try testing.expectEqual(@as(?i64, minute + 86_400_000), WorkflowHandler.dueSlot(&s, minute + 86_400_000 + 4 * 60_000));
+}
+
+test "workflow schedule: enabled again, slots count from the enable, and those missed while disabled don't fire" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var out: Result = .{};
+    try handler.replayCreate("a:wf",
+        \\kind: Workflow
+        \\name: wf
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 1000
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , 1000, &out);
+    const s = handler.schedules.getPtr("a:wf").?;
+    try testing.expectEqual(@as(?i64, 4000), WorkflowHandler.dueSlot(s, 4999));
+
+    try handler.replayEnabled("a:wf", &.{0}, 5000, &out);
+    try handler.replayEnabled("a:wf", &.{1}, 9500, &out);
+    // Not 9000, the old anchor's slot: the enable is slot 0.
+    try testing.expectEqual(@as(?i64, 9500), WorkflowHandler.dueSlot(s, 9600));
+    try testing.expectEqual(@as(?i64, 10_500), WorkflowHandler.dueSlot(s, 10_600));
+    // An enable of an enabled workflow moves nothing.
+    try handler.replayEnabled("a:wf", &.{1}, 12_250, &out);
+    try testing.expectEqual(@as(?i64, 12_500), WorkflowHandler.dueSlot(s, 12_600));
+}
+
+test "workflow schedule: a slot starts one run however many leaders propose it, and a missed one fires once" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+
+    // Created ten intervals ago; slot 0 fired then, nothing since.
+    const interval: i64 = 3_600_000;
+    const now = @import("stdx").time.milliTimestamp();
+    const anchor = now - 10 * interval;
+    try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
+    handler.registerSchedule("a", "wf", .{ .interval_ms = interval, .max_concurrent = 0 }, anchor);
+    var buf: [256]u8 = undefined;
+    var key_buf: [128]u8 = undefined;
+    var out: Result = .{};
+    const slot0 = try std.fmt.bufPrint(&key_buf, "schedule:a:wf:{d}", .{anchor});
+    try handler.replayStart("a:r0", startValue(&buf, "wf", "schedule_started", slot0), 1, &out);
+    const sched = handler.schedules.getPtr("a:wf").?;
+    try testing.expectEqual(anchor, sched.fired_ms);
+
+    // The nine missed slots and the current one fire as one run.
+    var before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+    const latest = anchor + 10 * interval;
+    try testing.expectEqual(latest, sched.proposed_ms);
+    // Proposed: this term doesn't propose it again.
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
+    // The next leader, its start unapplied, proposes the same slot.
+    shard.raft_node.current_term += 1;
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before + 1, shard.raft_node.log.lastIndex());
+
+    // Both commit: the second creates nothing, and the slot has fired.
+    const key = try std.fmt.bufPrint(&key_buf, "schedule:a:wf:{d}", .{latest});
+    try handler.replayStart("a:r1", startValue(&buf, "wf", "schedule_started", key), 2, &out);
+    try handler.replayStart("a:r2", startValue(&buf, "wf", "schedule_started", key), 3, &out);
+    try testing.expect(handler.runs.contains("a:r1"));
+    try testing.expect(!handler.runs.contains("a:r2"));
+    try testing.expectEqual(latest, sched.fired_ms);
+    // A later leader proposes nothing until the next slot.
+    shard.raft_node.current_term += 1;
+    before = shard.raft_node.log.lastIndex();
+    handler.tickSchedules(&shard);
+    try testing.expectEqual(before, shard.raft_node.log.lastIndex());
 }
 
 /// An entry proposed and not yet applied, as a cancel's is: its index and term.

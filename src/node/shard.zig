@@ -11867,19 +11867,19 @@ const FollowerTest = struct {
     }
 };
 
-test "Shard: a start that applies on a follower, or on a later leader, queues no first step; on the leader that proposed it the run it created does" {
+test "Shard: a start leaves its run to step on every replica; a step_started of the leader's own term queues its first step, once" {
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var pbuf: [128]u8 = undefined;
     const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, "default:r1", &start, &pbuf).?;
 
-    // A follower: a step proposes, and only the leader does.
+    // A follower holds the run as one to step, and queues nothing.
     var t: FollowerTest = undefined;
     try t.init();
     defer t.deinit();
     try std.testing.expect(t.shard.raft_node.role != .leader);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(t.shard.applyEntry(&e, &out));
-    try std.testing.expect(t.shard.workflow_handler.runs.contains("default:r1"));
+    try std.testing.expect(t.shard.workflow_handler.to_step.contains("default:r1"));
     try std.testing.expectEqual(@as(usize, 0), t.shard.workflow_handler.started_to_advance.items.len);
 
     // The leader of a group of one.
@@ -11890,29 +11890,84 @@ test "Shard: a start that applies on a follower, or on a later leader, queues no
     defer shard.deinit();
     shard.wireHandlerShardPtrs();
     try std.testing.expect(shard.applyCommitted());
-    try std.testing.expectEqual(raft_node_mod.Role.leader, shard.raft_node.role);
-    // Past the entries the group's start applied.
-    const next = shard.raft_node.last_applied + 1;
-    const led = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next, 0, .default, "default:r1", &start, &pbuf).?;
+    const r = shard.raft_node;
+    var next = r.last_applied + 1;
+    const led = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, "default:r1", &start, &pbuf).?;
     out = persistence_mod.Result.start(&led);
     try std.testing.expect(shard.applyEntry(&led, &out));
-    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
-    // A start from an earlier term, applied by this later leader, stays at
-    // its start: its own leader may have stepped it already.
-    try std.testing.expect(shard.raft_node.current_term > 0);
-    var earlier_buf: [128]u8 = undefined;
-    const earlier = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term - 1, next + 1, 0, .default, "default:r0", &start, &earlier_buf).?;
+    const wf = shard.workflow_handler;
+    try std.testing.expect(wf.to_step.contains("default:r1"));
+    // A start alone queues no step: the step is logged first.
+    try std.testing.expectEqual(@as(usize, 0), wf.started_to_advance.items.len);
+
+    // An earlier term's step_started, applied here, queues nothing: its own
+    // leader takes that step.
+    next += 1;
+    var sb: [64]u8 = undefined;
+    const earlier = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term - 1, next, 0, .default, "default:r1", "", &sb).?;
     out = persistence_mod.Result.start(&earlier);
     try std.testing.expect(shard.applyEntry(&earlier, &out));
-    try std.testing.expect(shard.workflow_handler.runs.contains("default:r0"));
-    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
-    // A second start of the run is refused, and queues nothing more.
-    var again_buf: [128]u8 = undefined;
-    const again = entry_mod.buildCommandEntry(.workflow_start, 0, shard.raft_node.current_term, next + 2, 0, .default, "default:r1", &start, &again_buf).?;
+    try std.testing.expect(!wf.to_step.contains("default:r1"));
+    try std.testing.expectEqual(@as(usize, 0), wf.started_to_advance.items.len);
+
+    // A second run: its step_started of this term queues its first step.
+    next += 1;
+    var pbuf2: [128]u8 = undefined;
+    const second = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, "default:r2", &start, &pbuf2).?;
+    out = persistence_mod.Result.start(&second);
+    try std.testing.expect(shard.applyEntry(&second, &out));
+    next += 1;
+    var sb2: [64]u8 = undefined;
+    const own = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, "default:r2", "", &sb2).?;
+    out = persistence_mod.Result.start(&own);
+    try std.testing.expect(shard.applyEntry(&own, &out));
+    try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
+
+    // Its step logged twice: the second is refused, and queues nothing.
+    next += 1;
+    var sb3: [64]u8 = undefined;
+    const again = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, "default:r2", "", &sb3).?;
     out = persistence_mod.Result.start(&again);
     try std.testing.expect(shard.applyEntry(&again, &out));
     try std.testing.expect(out.refused() != null);
-    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
+}
+
+test "Shard: a run whose leader stepped down before its first step takes it when a leader is next ready" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    const def =
+        \\{"kind":"Workflow","name":"wf","version":"1","start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(&shard, conn, .workflow_create, 1, "wf", def);
+
+    // Started, then this leader stepped down before taking its first step,
+    // and leads again in a later term.
+    try ParkTest.send(&shard, conn, .workflow_start, 2, "wf", "");
+    const run = blk: {
+        var it = shard.workflow_handler.runs.valueIterator();
+        break :blk it.next().?;
+    };
+    const key = run.ns_key;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
+    shard.replica.leadershipLost("test");
+    const r = shard.raft_node;
+    r.role = .leader;
+    r.current_term += 1;
+    r.ready_index = r.log.lastIndex();
+
+    shard.runStepping();
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, shard.workflow_handler.runs.get(key).?.status);
+    try std.testing.expect(!shard.workflow_handler.to_step.contains(key));
 }
 
 test "Shard: a node that stops leading forgets the expire it proposed and the runs it was delivering" {
@@ -13166,13 +13221,18 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     const a_id = a_id_buf[0..one[0].data.len];
     @memcpy(a_id, one[0].data);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.running, Run.byId(wf, a_id).status);
-    try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 1), wf.to_step.count());
 
     // Only a leader takes a step: a follower's proposal would be refused.
     raft.role = .follower;
     wf.advanceStartedRuns(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.running, Run.byId(wf, a_id).status);
     raft.role = .leader;
+
+    // The leader logs the first step; once that commits, it's queued.
+    wf.advanceStartedRuns(&shard);
+    try ParkTest.ack(&shard);
+    try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
 
     // A second client's start is parked when the first run takes its
     // step. The step proposes the invoke and moves on: nothing waits for
@@ -13193,6 +13253,8 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&shard, "default", action_run).?.status);
+    wf.advanceStartedRuns(&shard);
+    try ParkTest.ack(&shard);
     wf.advanceStartedRuns(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, Run.byId(wf, one[0].data).status);
 
@@ -13281,6 +13343,8 @@ test "Shard: a step-down forgets the queued first steps and the in-flight implic
     try ParkTest.send(&shard, conn, .workflow_create, 20, "gate", def);
     try ParkTest.ack(&shard);
     try ParkTest.send(&shard, conn, .workflow_start, 21, "gate", "");
+    try ParkTest.ack(&shard);
+    shard.workflow_handler.advanceStartedRuns(&shard);
     try ParkTest.ack(&shard);
     shard.namespace_handler.markNamespaceHasData("other", &shard);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
@@ -13453,7 +13517,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[1].header.status);
     try std.testing.expectEqualStrings(rs[0].data, rs[1].data);
     try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.runs.count());
-    try std.testing.expectEqual(@as(usize, 1), shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(@as(u32, 1), shard.workflow_handler.to_step.count());
     // The second create finds the namespace being created.
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[2].header.status);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), rs[3].header.status);
@@ -18694,6 +18758,9 @@ fn raceTestWaitingRun(t: *RaceTest, buf: []u8, one: []proto.Response) ![]const u
     try ParkTest.ack(&t.shard);
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    // Its first step logged, then taken.
+    t.shard.workflow_handler.advanceStartedRuns(&t.shard);
+    try ParkTest.ack(&t.shard);
     t.shard.workflow_handler.advanceStartedRuns(&t.shard);
     return one[0].data;
 }
@@ -18840,14 +18907,17 @@ test "a halted shard's duties stop, and one with work counts as held until the s
 
     // A run started and not yet stepped, held while halted.
     _ = shard.applyCommitted();
-    try std.testing.expect(shard.workflow_handler.started_to_advance.items.len > 0);
+    try std.testing.expect(shard.workflow_handler.to_step.count() > 0);
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
-    const queued = shard.workflow_handler.started_to_advance.items.len;
+    const queued = shard.workflow_handler.to_step.count();
+    const logged = shard.raft_node.log.lastIndex();
     shard.runStepping();
-    try std.testing.expectEqual(queued, shard.workflow_handler.started_to_advance.items.len);
+    try std.testing.expectEqual(queued, shard.workflow_handler.to_step.count());
+    try std.testing.expectEqual(logged, shard.raft_node.log.lastIndex());
     try std.testing.expectEqual(@as(u32, 1), shard.duties.held());
     shard.halted = null;
     shard.runStepping();
+    try std.testing.expectEqual(@as(u32, 0), shard.workflow_handler.to_step.count());
     try std.testing.expectEqual(@as(usize, 0), shard.workflow_handler.started_to_advance.items.len);
     try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
 
