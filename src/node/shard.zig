@@ -4751,14 +4751,11 @@ pub const Shard = struct {
 
     // ─── The one applier ─────────────────────────────────────────────────
 
-    /// Apply one committed entry to this shard's state and wake whoever was
-    /// waiting on it. A leader, a follower and boot replay all run the same
-    /// core (`applyEntryCore`), so the three can never disagree about
-    /// what an entry means; only the live paths notify. False when the
-    /// partition refused the entry.
-    /// Apply one committed entry and tell its waiters. False, counted and
-    /// logged, when the projections are missing it; its client, if any, is
-    /// told the write committed but did not apply.
+    /// Apply one committed entry and tell its waiters. A leader, a follower
+    /// and boot replay all run the same core (`applyEntryCore`), so the three
+    /// can never disagree about what an entry means; only the live paths
+    /// notify. False, counted and logged, when the projections are missing
+    /// it; its client, if any, is told the write committed but did not apply.
     pub fn applyEntry(self: *Shard, entry: *const entry_mod.Entry, out: *persistence_mod.Result) bool {
         return self.applyOne(entry, out) == .applied;
     }
@@ -18505,7 +18502,9 @@ const RefuseSizeAllocator = struct {
     }
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *RefuseSizeAllocator = @ptrCast(@alignCast(ctx));
-        if (len == self.refuse_len) {
+        // Bytes, as a segment is read into: a map's table of the same size,
+        // aligned for its entries, isn't the read.
+        if (len == self.refuse_len and a == .@"1") {
             self.refused += 1;
             return null;
         }

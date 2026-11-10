@@ -449,6 +449,10 @@ pub const ServerMetrics = struct {
     /// raise the open-file limit or `max_connections`, or look at which clients
     /// have connections open.
     connections_rejected_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Enqueues this node applied under caps other than its own `[queues]`
+    /// settings: the leader that proposed them has different ones, and
+    /// governs. Nonzero means the nodes' settings differ.
+    queue_cap_mismatch_total: Atomic(u64) = Atomic(u64).init(0),
     /// Server start timestamp (ms)
     start_time_ms: i64,
 
@@ -486,6 +490,10 @@ pub const ServerMetrics = struct {
         _ = self.connections_rejected_total.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordQueueCapMismatch(self: *ServerMetrics) void {
+        _ = self.queue_cap_mismatch_total.fetchAdd(1, .monotonic);
+    }
+
     pub fn recordBytesReceived(self: *ServerMetrics, bytes: u64) void {
         _ = self.bytes_received.fetchAdd(bytes, .monotonic);
     }
@@ -507,6 +515,7 @@ pub const ServerMetrics = struct {
         bytes_sent: u64,
         client_version_refused: u64,
         connections_rejected_total: u64,
+        queue_cap_mismatch_total: u64,
         uptime_seconds: u64,
     };
 
@@ -519,6 +528,7 @@ pub const ServerMetrics = struct {
             .bytes_sent = self.bytes_sent.load(.monotonic),
             .client_version_refused = self.client_version_refused.load(.monotonic),
             .connections_rejected_total = self.connections_rejected_total.load(.monotonic),
+            .queue_cap_mismatch_total = self.queue_cap_mismatch_total.load(.monotonic),
             .uptime_seconds = self.uptimeSeconds(),
         };
     }
@@ -1390,6 +1400,10 @@ fn writeServerMetrics(writer: anytype, snapshot: ServerMetrics.Snapshot) !void {
     try writer.print("# TYPE flo_connections_rejected_total counter\n", .{});
     try writer.print("flo_connections_rejected_total {d}\n", .{snapshot.connections_rejected_total});
 
+    try writer.print("# HELP flo_queue_cap_mismatch_total Enqueues applied under a leader's queue caps that differ from this node's own\n", .{});
+    try writer.print("# TYPE flo_queue_cap_mismatch_total counter\n", .{});
+    try writer.print("flo_queue_cap_mismatch_total {d}\n", .{snapshot.queue_cap_mismatch_total});
+
     // Uptime
     try writer.print("# HELP flo_uptime_seconds Server uptime in seconds\n", .{});
     try writer.print("# TYPE flo_uptime_seconds gauge\n", .{});
@@ -1882,7 +1896,7 @@ test "registry: queue and stream series are exactly the ones something records" 
         "flo_queue_dequeue_ops_total",   "flo_queue_dequeue_messages_total", "flo_queue_dequeue_bytes_total",
         "flo_queue_dequeue_empty_total", "flo_stream_append_ops_total",      "flo_stream_append_records_total",
         "flo_stream_append_bytes_total", "flo_stream_read_ops_total",        "flo_stream_read_records_total",
-        "flo_stream_read_bytes_total",   "flo_stream_read_empty_total",
+        "flo_stream_read_bytes_total",   "flo_stream_read_empty_total",      "flo_queue_cap_mismatch_total",
     };
     var seen: [want.len]bool = @splat(false);
     var lines = std.mem.tokenizeScalar(u8, text, '\n');

@@ -29,8 +29,8 @@ pub fn enqueue(
     return client.sendRequestWithOptions(.queue_enqueue, namespace, queue, payload, builder.getOptions());
 }
 
-/// Purge all live (ready + leased) messages from a queue. The response's raw
-/// data is a u32 LE count of removed messages.
+/// Purge a queue's messages, ready, leased and dead. The response's raw data
+/// is a u32 LE count of removed messages.
 pub fn purge(client: *Client, namespace: []const u8, queue: []const u8) !Response {
     return client.sendRequest(.queue_purge, namespace, queue, "");
 }

@@ -358,11 +358,6 @@ pub const StreamState = struct {
         self.records.deinit(allocator);
     }
 
-    /// Append a record. Generates a new StreamID and returns it.
-    pub fn append(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, record_count: u32, byte_len: u32) !StreamID {
-        return self.appendAt(allocator, ual_index, partition_index, @as(u64, @intCast(@import("stdx").time.milliTimestamp())), record_count, byte_len);
-    }
-
     /// Append anchored to an explicit timestamp (the originating UAL entry's
     /// timestamp, in ms) so replay reproduces identical StreamIDs.
     pub fn appendAt(self: *StreamState, allocator: Allocator, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
@@ -1267,14 +1262,8 @@ pub const StreamProjection = struct {
         return gop.value_ptr;
     }
 
-    /// Append a record to a named stream. Returns the assigned StreamID.
-    pub fn appendToStream(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32) !StreamID {
-        return self.appendToStreamAt(name_hash, ual_index, partition_index, @as(u64, @intCast(@import("stdx").time.milliTimestamp())), 1, 0);
-    }
-
-    /// Append anchored to the originating UAL entry's timestamp (ms) so replay
-    /// reproduces identical StreamIDs — durable apply/replay paths must use this
-    /// instead of `appendToStream`, which reads the wall clock.
+    /// Append anchored to the originating UAL entry's timestamp (ms), so
+    /// replay reproduces identical StreamIDs.
     pub fn appendToStreamAt(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         const ss = try self.getOrCreateStream(name_hash);
         const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms, record_count, byte_len);
@@ -1710,6 +1699,8 @@ pub const StreamProjection = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+/// The stamp test appends take: ids from a fixed time, as replay's are.
+const TEST_MS: u64 = 1_700_000_000_000;
 
 test "stream: consumer group lifecycle" {
     var s = StreamProjection.init(testing.allocator);
@@ -1749,8 +1740,8 @@ test "stream: stats tracking" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    _ = try s.appendToStream(hash, 100, 0);
-    _ = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
 
     try testing.expectEqual(@as(u64, 2), s.stats.appended);
@@ -1761,7 +1752,7 @@ test "stream: memory usage estimate" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.appendToStream(42, 100, 0);
+    _ = try s.appendToStreamAt(42, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);
@@ -1776,9 +1767,9 @@ test "stream: ackFloor reflects lowest unacked" {
     _ = try s.joinGroup("g", "c1", 1000);
 
     // Append 3 records and deliver them into the PEL.
-    const id1 = try s.appendToStream(hash, 10, 0);
-    const id2 = try s.appendToStream(hash, 11, 0);
-    _ = try s.appendToStream(hash, 12, 0);
+    const id1 = try s.appendToStreamAt(hash, 10, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 11, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 12, 0, TEST_MS, 1, 0);
     var buf: [8]StreamRecord = undefined;
     const n = try s.groupDeliver("g", hash, "c1", 8, 2000, buf[0..]);
     try testing.expectEqual(@as(usize, 3), n);
@@ -1896,9 +1887,9 @@ test "stream: StreamState append and read" {
     var ss = StreamState.init(42);
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.append(testing.allocator, 100, 0, 1, 0);
-    const id2 = try ss.append(testing.allocator, 101, 0, 1, 0);
-    const id3 = try ss.append(testing.allocator, 102, 1, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
+    const id3 = try ss.appendAt(testing.allocator, 102, 1, TEST_MS, 1, 0);
 
     try testing.expectEqual(@as(usize, 3), ss.count());
     try testing.expect(ss.first_id.eql(id1));
@@ -1924,10 +1915,10 @@ test "stream: StreamState readByIds preserves order and skips missing" {
     var ss = StreamState.init(42);
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.append(testing.allocator, 100, 0, 1, 0);
-    const id2 = try ss.append(testing.allocator, 101, 0, 1, 0);
-    const id3 = try ss.append(testing.allocator, 102, 0, 1, 0);
-    const id4 = try ss.append(testing.allocator, 103, 0, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
+    const id3 = try ss.appendAt(testing.allocator, 102, 0, TEST_MS, 1, 0);
+    const id4 = try ss.appendAt(testing.allocator, 103, 0, TEST_MS, 1, 0);
 
     // Sparse query: id3, id1 (out-of-order), id4 — should preserve input order
     const query = [_]StreamID{ id3, id1, id4 };
@@ -1960,9 +1951,9 @@ test "stream: StreamState trim" {
     var ss = StreamState.init(42);
     defer ss.deinit(testing.allocator);
 
-    const id1 = try ss.append(testing.allocator, 100, 0, 1, 0);
-    const id2 = try ss.append(testing.allocator, 101, 0, 1, 0);
-    _ = try ss.append(testing.allocator, 102, 0, 1, 0);
+    const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
+    const id2 = try ss.appendAt(testing.allocator, 101, 0, TEST_MS, 1, 0);
+    _ = try ss.appendAt(testing.allocator, 102, 0, TEST_MS, 1, 0);
 
     const trimmed = ss.trim(testing.allocator, id2);
     try testing.expectEqual(@as(u64, 2), trimmed);
@@ -1971,13 +1962,13 @@ test "stream: StreamState trim" {
     try testing.expect(!ss.first_id.eql(id2));
 }
 
-test "stream: appendToStream creates stream and returns StreamID" {
+test "stream: appendToStreamAt creates stream and returns StreamID" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
     const hash: u64 = 12345;
-    const id1 = try s.appendToStream(hash, 100, 0);
-    const id2 = try s.appendToStream(hash, 101, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
 
     // StreamIDs are monotonically increasing
     try testing.expect(id2.greaterThan(id1));
@@ -2009,9 +2000,9 @@ test "stream: readStreamRange and readStreamAfter" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
-    _ = try s.appendToStream(hash, 101, 0);
-    const id3 = try s.appendToStream(hash, 102, 1);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    const id3 = try s.appendToStreamAt(hash, 102, 1, TEST_MS, 1, 0);
 
     // readStreamRange: all
     var buf: [10]StreamRecord = undefined;
@@ -2037,9 +2028,9 @@ test "stream: trimStream" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    _ = try s.appendToStream(hash, 100, 0);
-    const id2 = try s.appendToStream(hash, 101, 0);
-    _ = try s.appendToStream(hash, 102, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
 
     const trimmed = s.trimStream(hash, id2);
     try testing.expectEqual(@as(u64, 2), trimmed);
@@ -2051,9 +2042,9 @@ test "stream: groupDeliver adds to PEL" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    _ = try s.appendToStream(hash, 100, 0);
-    _ = try s.appendToStream(hash, 101, 0);
-    _ = try s.appendToStream(hash, 102, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "consumer-1", 1000);
@@ -2076,9 +2067,9 @@ test "stream: groupAck removes from PEL" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
-    const id2 = try s.appendToStream(hash, 101, 0);
-    _ = try s.appendToStream(hash, 102, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
@@ -2115,7 +2106,7 @@ test "stream: a nacked entry is served again by the group's next read, to any co
     defer s.deinit();
 
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
@@ -2143,7 +2134,7 @@ test "stream: a nacked and an expired entry are dropped after the same number of
         var s = StreamProjection.init(testing.allocator);
         defer s.deinit();
         const hash: u64 = 42;
-        const id1 = try s.appendToStream(hash, 100, 0);
+        const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
         try s.createGroup("g", 1000);
         _ = try s.joinGroup("g", "c1", 1000);
         try s.configureGroup("g", 200, 3);
@@ -2172,7 +2163,7 @@ test "stream: groupClaim transfers ownership" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
@@ -2197,7 +2188,7 @@ test "stream: the sweeper makes an idle entry ready without counting a delivery,
     defer s.deinit();
 
     const hash: u64 = 42;
-    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
@@ -2236,7 +2227,7 @@ test "stream: a consumer touching an entry that expired keeps it, but not one it
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
     try s.configureGroup("g", 200, 5);
@@ -2260,7 +2251,7 @@ test "stream: lowering max_deliver drops a ready entry already delivered that of
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
     try s.configureGroup("g", 200, 5);
@@ -2275,7 +2266,7 @@ test "stream: a ready entry whose record was trimmed is dropped by the read that
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
     var rec_buf: [10]StreamRecord = undefined;
@@ -2293,7 +2284,7 @@ test "stream: sweeper disabled when ack_timeout_ms is 0" {
     defer s.deinit();
 
     const hash: u64 = 7;
-    _ = try s.appendToStream(hash, 100, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
     try s.configureGroup("g", 0, 10); // ack_timeout_ms = 0 → sweeper off
@@ -2312,8 +2303,8 @@ test "stream: groupAutoclaim auto-transfers idle entries" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    _ = try s.appendToStream(hash, 100, 0);
-    _ = try s.appendToStream(hash, 101, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
@@ -2339,9 +2330,9 @@ test "stream: groupAutoclaim drains own pending (reconnect) and paginates" {
     defer s.deinit();
 
     const hash: u64 = 77;
-    _ = try s.appendToStream(hash, 100, 0);
-    _ = try s.appendToStream(hash, 101, 0);
-    _ = try s.appendToStream(hash, 102, 0);
+    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
 
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "me", 1000);
@@ -2368,7 +2359,7 @@ test "stream: groupTouch resets idle timer" {
     defer s.deinit();
 
     const hash: u64 = 42;
-    const id1 = try s.appendToStream(hash, 100, 0);
+    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
     _ = try s.joinGroup("mygroup", "c1", 1000);
@@ -2402,9 +2393,9 @@ test "stream: multiple streams are independent" {
     const hash_a: u64 = 1;
     const hash_b: u64 = 2;
 
-    const a1 = try s.appendToStream(hash_a, 100, 0);
-    const a2 = try s.appendToStream(hash_a, 101, 0);
-    _ = try s.appendToStream(hash_b, 200, 0);
+    const a1 = try s.appendToStreamAt(hash_a, 100, 0, TEST_MS, 1, 0);
+    const a2 = try s.appendToStreamAt(hash_a, 101, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(hash_b, 200, 0, TEST_MS, 1, 0);
 
     try testing.expectEqual(@as(usize, 2), s.streamRecordCount(hash_a));
     try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash_b));
