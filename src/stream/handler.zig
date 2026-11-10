@@ -465,8 +465,11 @@ pub const StreamHandler = struct {
     fn holdForDisk(shard: *Shard, conn: *Connection, req: Request, wait_ms: u32) void {
         // Past its own cap, a cold read is refused rather than take waiter
         // slots KV watches and dequeues share.
-        if (shard.stream_handler.held != .pending or shard.waiter_pool.countByKind(.stream_disk_read) >= MAX_DISK_HELD) {
-            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READ_REFUSAL));
+        if (shard.stream_handler.held != .pending) {
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READ_BLOCKED));
+        }
+        if (shard.waiter_pool.countByKind(.stream_disk_read) >= MAX_DISK_HELD) {
+            return shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun(shard_mod.DISK_READS_FULL));
         }
         const registered = shard.waiter_pool.register(.{
             .kind = .stream_disk_read,
@@ -799,6 +802,11 @@ pub const StreamHandler = struct {
             self.freeResult(result);
             window.after = stream_mod.lastRecordOf(served[served.len - 1]);
         }
+    }
+
+    /// What a read refused for its disk reads is told.
+    fn diskRefusal(self: *const StreamHandler) []const u8 {
+        return if (self.held == .blocked) shard_mod.DISK_READ_BLOCKED else shard_mod.DISK_READ_PENDING;
     }
 
     /// Before a read: nothing held yet.
@@ -1391,7 +1399,7 @@ pub const StreamHandler = struct {
         const answered = self.served_records;
         if (answered == 0 and self.held != .no) {
             self.allocator.free(data);
-            return .{ .err = .{ .code = .unavailable, .message = shard_mod.DISK_READ_REFUSAL, .ran = .no } };
+            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
         }
         // Only appends the reply carries are delivered; the cursor passes the
         // rest too, or the next read would meet them again.
@@ -1658,7 +1666,7 @@ pub const StreamHandler = struct {
         const answered = self.served_records;
         if (answered == 0 and self.held != .no) {
             self.allocator.free(records_blob);
-            return .{ .err = .{ .code = .unavailable, .message = shard_mod.DISK_READ_REFUSAL, .ran = .no } };
+            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
         }
         var claimed: usize = claim_res.count;
         var next_cursor = claim_res.next_cursor;

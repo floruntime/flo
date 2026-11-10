@@ -6848,13 +6848,17 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
         },
         // Its payloads weren't back from disk in time: retryable, never a
         // short answer that looks complete.
-        .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_REFUSAL)),
+        .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_LATE)),
         // No task in time: `{task: none}`, the optional's absent byte.
         .action_await => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &.{0}),
     }
 }
 
-pub const DISK_READ_REFUSAL = "unavailable: the stream's records are being read from disk and weren't back in time — retry";
+/// What a stream read refused for its disk reads is told, by why.
+pub const DISK_READ_LATE = "unavailable: the stream's records are being read from disk and weren't back in time — retry";
+pub const DISK_READ_PENDING = "unavailable: the stream's records are being read from disk — retry";
+pub const DISK_READ_BLOCKED = "unavailable: the stream's records can't be read from disk right now (a resource or IO failure) — retry";
+pub const DISK_READS_FULL = "unavailable: too many reads are waiting on this shard's disk — retry";
 
 /// KV waiter resolver: look up the key in the KV projection and send the value
 /// if version > min_version. Returns true if waiter was satisfied.
@@ -6908,7 +6912,7 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         // Still being read from disk: held until it is back.
         .pending => return false,
         else => {
-            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_REFUSAL));
+            shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_BLOCKED));
             return true;
         },
     };

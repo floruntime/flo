@@ -28,7 +28,8 @@ const client_mod = @import("../client/mod.zig");
 const Client = client_mod.Client;
 const wire = @import("../../util/wire.zig");
 const StreamID = @import("../../stream/stream_id.zig").StreamID;
-const MAX_BATCH_RECORDS = @import("../../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS;
+const proto = @import("../../protocol/proto.zig");
+const MAX_BATCH_RECORDS = proto.MAX_STREAM_BATCH_RECORDS;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
 const gen = @import("../gen.zig");
@@ -577,12 +578,8 @@ fn parseAndPrintRecords(
         const id_str = record_id.format(&id_buf) catch "0-0";
         last_id = record_id;
 
-        // Map tier byte to string: 0=hot, 1=warm
-        const tier_str = switch (tier) {
-            0 => "hot",
-            1 => "warm",
-            else => "unknown",
-        };
+        // The tier byte, as the op table names it.
+        const tier_str = if (std.enums.fromInt(proto.StorageTier, tier)) |t| @tagName(t) else "unknown";
 
         if (json_output and !is_follow) {
             if (i > 0) ctx.print(",", .{});

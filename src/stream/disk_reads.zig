@@ -228,7 +228,15 @@ pub const DiskReads = struct {
             // Not sealed: in the writer's buffer, read in place at the next
             // drain, or not in the durable log at all.
             const wr = self.dl.writer;
-            if (wr.entry_count == 0 or index < wr.first_index or index > wr.last_index) return .absent;
+            // Above what the writer holds: a committed entry it didn't
+            // buffer (the shard has stopped taking writes and said so), not
+            // one the log lacks. Retryable, not skipped.
+            const last = if (wr.entry_count > 0) wr.last_index else (self.dl.lastSealedIndex() catch return self.blocked(now));
+            if (index > last) {
+                self.warn(now, "a stream entry at index {d} is in neither a sealed segment nor the segment writer's buffer; holding reads of it", .{index});
+                return self.blocked(now);
+            }
+            if (wr.entry_count == 0 or index < wr.first_index) return .absent;
             return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         };
         const bulk = self.bulk orelse return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
@@ -544,8 +552,9 @@ test "stream disk reads: entries still in the writer's buffer are read in place 
     try testing.expect(d.drain());
     try testing.expect(d.get(1) != null and d.get(5) != null);
     try testing.expectEqual(@as(u64, 0), d.reads_made);
-    // Past the writer and every segment: absent.
-    try testing.expectEqual(Want.absent, d.want(9, a));
+    // Past the writer and every segment: a committed entry neither holds,
+    // held and retried, never skipped as absent.
+    try testing.expectEqual(Want.blocked, d.want(9, a));
 }
 
 test "stream disk reads: an entry whose term isn't the log's is not cached, and reads back off" {

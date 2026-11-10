@@ -159,6 +159,16 @@ pub const DurableLog = struct {
         self.listing = grown;
     }
 
+    /// The last index any sealed segment holds; zero with none.
+    pub fn lastSealedIndex(self: *DurableLog) !u64 {
+        const files = try self.segments();
+        var last: u64 = 0;
+        for (files) |f| if (!f.unreadable) {
+            last = @max(last, f.last_index);
+        };
+        return last;
+    }
+
     /// The highest commit index any sealed segment was flushed under: what
     /// a restart may apply into projections without waiting for commit to
     /// be re-established. Zero when there are no segments.
