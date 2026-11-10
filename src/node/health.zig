@@ -145,6 +145,11 @@ pub const ShardSlot = struct {
     /// written before the state reads `read_blocked`, so `/status` can say
     /// how long it has been stuck. The reason buffer holds what blocked it.
     read_blocked_since_ms: Atomic(u64) = .init(0),
+    /// Flushes to disk failed (cumulative), and this node's uptime in ms when
+    /// the current run of failures began (0 while flushes succeed): a disk full
+    /// or failing, which clients are told about but is otherwise only in the log.
+    persist_failures: Atomic(u64) = .init(0),
+    flushes_failing_since_ms: Atomic(u64) = .init(0),
     /// Set with a `read_blocked` state on a lone shard, whose only copy this is:
     /// `readiness` keeps the node ready then, since a 503 would pull it and no
     /// other node could serve. In a cluster it is false and `read_blocked` is a
@@ -250,6 +255,9 @@ pub const NodeHealth = struct {
             };
             if (state == .halted) try w.print(",\"halt_index\":{d},\"halt_term\":{d},\"halt_crc\":{d}", .{ s.halt_index.load(.monotonic), s.halt_term.load(.monotonic), s.halt_crc.load(.monotonic) });
             if (state == .read_blocked) try w.print(",\"read_blocked_since_ms\":{d}", .{s.read_blocked_since_ms.load(.monotonic)});
+            // Shown once any flush has failed, so a healthy shard stays quiet.
+            const persist_failures = s.persist_failures.load(.monotonic);
+            if (persist_failures > 0) try w.print(",\"persist_failures\":{d},\"flushes_failing_since_ms\":{d}", .{ persist_failures, s.flushes_failing_since_ms.load(.monotonic) });
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
@@ -389,6 +397,28 @@ test "health: a halted shard keeps the node ready, and /status names where it ha
     out.clearRetainingCapacity();
     try h.writeStatus(&out.writer, null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "out of memory") != null);
+}
+
+test "health: /status shows flush failures once any have happened, and stays quiet while flushes succeed" {
+    var h = try NodeHealth.init(testing.allocator, 1, 2);
+    defer h.deinit(testing.allocator);
+    h.accepting.store(true, .release);
+    // Shard 0 has had flushes fail; shard 1 is healthy.
+    h.shards[0].persist_failures.store(5, .monotonic);
+    h.shards[0].flushes_failing_since_ms.store(123_456, .monotonic);
+    h.shards[0].publish(.ok, .leader, 10, 10);
+    h.shards[1].publish(.ok, .follower, 10, 10);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try h.writeStatus(&out.writer, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const s0 = parsed.value.object.get("shards").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 5), s0.get("persist_failures").?.integer);
+    try testing.expectEqual(@as(i64, 123_456), s0.get("flushes_failing_since_ms").?.integer);
+    // A healthy shard stays quiet.
+    try testing.expect(parsed.value.object.get("shards").?.array.items[1].object.get("persist_failures") == null);
 }
 
 test "health: /status names each shard's state, its reason when offline, and its losses" {

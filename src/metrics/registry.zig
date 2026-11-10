@@ -626,6 +626,12 @@ pub const ShardMetrics = struct {
     /// Leader duties held back, and how long the oldest has been.
     duties_held: Atomic(u64) = Atomic(u64).init(0),
     duty_oldest_held_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// How many flushes to disk have failed (cumulative), and this node's
+    /// uptime in ms when the current run of failures began (0 while flushes
+    /// succeed). A rising count, or a non-zero "since", means writes aren't
+    /// reaching disk — the disk is full or failing.
+    persist_failures: Atomic(u64) = Atomic(u64).init(0),
+    flushes_failing_since_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
     /// 1 while a committed entry cannot be read to apply it. Alert on this:
@@ -811,6 +817,8 @@ pub const ShardMetrics = struct {
         processing_held_jobs: u64,
         duties_held: u64,
         duty_oldest_held_ms: u64,
+        persist_failures: u64,
+        flushes_failing_since_ms: u64,
         offline: u8,
         read_blocked: u8,
         read_blocks_total: u64,
@@ -854,6 +862,8 @@ pub const ShardMetrics = struct {
             .processing_held_jobs = self.processing_held_jobs.load(.monotonic),
             .duties_held = self.duties_held.load(.monotonic),
             .duty_oldest_held_ms = self.duty_oldest_held_ms.load(.monotonic),
+            .persist_failures = self.persist_failures.load(.monotonic),
+            .flushes_failing_since_ms = self.flushes_failing_since_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .read_blocked = self.read_blocked.load(.monotonic),
             .read_blocks_total = self.read_blocks_total.load(.monotonic),
@@ -1630,6 +1640,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
         try writer.print("flo_shard_silent_loss_total{{shard_id=\"{d}\",path=\"" ++ name ++ "\"}} {d}\n", .{ snap.shard_id, snap.silent_loss[i] });
     }
     try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
+    try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
+    try writer.print("flo_shard_flushes_failing_since_ms{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.flushes_failing_since_ms });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     try writer.print("flo_shard_read_blocked{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocked });
     try writer.print("flo_shard_read_blocks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocks_total });
