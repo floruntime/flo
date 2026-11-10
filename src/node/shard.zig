@@ -13556,7 +13556,7 @@ const ColdStream = struct {
     }
 
     fn window(limit: u32) waiter_pool_mod.StreamWindow {
-        return .{ .name_hash = node_router.nameHash(node_router.namespaceHash(""), "s"), .limit = limit };
+        return .{ .name_hash = node_router.nameHash(.default, "s"), .stream = node_router.nsNameKey(.default, "s"), .limit = limit };
     }
 
     /// Read `w`, landing disk reads and reading again while it is held, as
@@ -13667,7 +13667,7 @@ test "Shard: a cold group read and claim deliver and claim only what their reply
     // and served ones are evicted.
     d.cache_budget = 4096;
     var all: [60]stream_mod.StreamRecord = undefined;
-    const name_hash = node_router.nameHash(node_router.namespaceHash(""), "s");
+    const name_hash = node_router.nameHash(.default, "s");
     try std.testing.expectEqual(@as(usize, 60), c.shard.stream_handler.stream.readStreamAfter(name_hash, StreamID.MIN, null, &all));
 
     var pair: [2]std.posix.fd_t = undefined;

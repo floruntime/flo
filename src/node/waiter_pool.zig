@@ -112,6 +112,8 @@ pub const WaiterKind = enum(u8) {
 /// read parked but applied after still wakes it.
 pub const StreamWindow = struct {
     name_hash: u64 = 0,
+    /// The stream as `router.nsNameKey` names it, for its disk reads.
+    stream: [12]u8 = @splat(0),
     after: StreamID = StreamID.MIN,
     end: StreamID = StreamID.MAX,
     partition: ?u32 = null,

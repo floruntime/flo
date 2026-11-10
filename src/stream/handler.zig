@@ -104,7 +104,7 @@ pub const StreamHandler = struct {
     held: enum { no, pending, blocked } = .no,
     /// The stream and window the read in progress asks the disk for, so one
     /// read back serves the whole window.
-    disk_window: disk_reads.Window = .{ .name_hash = 0, .from = 0, .limit = 0 },
+    disk_window: disk_reads.Window = .{ .stream = @splat(0), .from = 0, .limit = 0 },
     /// How many of the records the last serialize was given it answered: up
     /// to the first one being read back from disk.
     served_records: usize = 0,
@@ -716,6 +716,7 @@ pub const StreamHandler = struct {
         const name_hash = router.nameHash(req.ns_id, req.key);
         var window: waiter_pool_mod.StreamWindow = .{
             .name_hash = name_hash,
+            .stream = router.nsNameKey(req.ns_id, req.key),
             .limit = readLimit(req),
         };
 
@@ -784,7 +785,7 @@ pub const StreamHandler = struct {
     /// disk read is back (or refused retryable, when `held` is `.blocked`).
     pub fn readReadable(self: *StreamHandler, window: *waiter_pool_mod.StreamWindow, buf: *[MAX_READ_BATCH]StreamRecord) struct { []StreamRecord, CommandResult } {
         self.beginRead();
-        self.disk_window.name_hash = window.name_hash;
+        self.disk_window.stream = window.stream;
         while (true) {
             const records = self.readRecords(window.*, buf);
             const result = self.messages(records, window.after);
@@ -1379,7 +1380,7 @@ pub const StreamHandler = struct {
         // A group's cursor passes whole appends, so nothing is left out.
         var readable: [MAX_READ_BATCH]bool = undefined;
         self.beginRead();
-        self.disk_window.name_hash = name_hash;
+        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
@@ -1647,7 +1648,7 @@ pub const StreamHandler = struct {
         const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
 
         self.beginRead();
-        self.disk_window.name_hash = name_hash;
+        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
         const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
         };
@@ -1949,9 +1950,10 @@ pub const StreamHandler = struct {
         // A job on another shard's thread reads this shard's hot ring and
         // warm store, and copies from its disk cache; the disk reads it needs
         // are asked of this shard, and it reads again on its next poll.
-        if (self.disk) |d| if (!d.isOwner()) return self.readPayloadsElsewhere(d, rec_buf[0..n], name_hash, after_id);
+        const stream_key = router.nsNameKey(self.namespaceId(namespace), stream_name);
+        if (self.disk) |d| if (!d.isOwner()) return self.readPayloadsElsewhere(d, rec_buf[0..n], stream_key, after_id);
         self.beginRead();
-        self.disk_window.name_hash = name_hash;
+        self.disk_window.stream = stream_key;
         // The payloads are good until the shard's next tick lands disk reads,
         // after this poll has used them.
         for (rec_buf[0..n], 0..) |rec, i| {
@@ -1991,7 +1993,7 @@ pub const StreamHandler = struct {
     /// `readPayloadsForStream` from a thread other than this shard's: it
     /// touches no state of this handler, and takes from the disk cache only
     /// copies.
-    fn readPayloadsElsewhere(self: *StreamHandler, d: *disk_reads.DiskReads, records: []const StreamRecord, name_hash: u64, after_id: StreamID) PayloadRead {
+    fn readPayloadsElsewhere(self: *StreamHandler, d: *disk_reads.DiskReads, records: []const StreamRecord, stream_key: [12]u8, after_id: StreamID) PayloadRead {
         const nothing: PayloadRead = .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
         var results: [MAX_READ_BATCH][]const u8 = undefined;
         var result_ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -2007,7 +2009,7 @@ pub const StreamHandler = struct {
                 if (entry_mod.CommandPayload.deserialize(copy)) |cmd| payload = stream_mod.decodeAppendValue(cmd.value).payload;
             } else if (!d.isGone(rec.ual_index)) {
                 // Not here yet: stop before it, and have it fetched.
-                d.askFor(.{ .name_hash = name_hash, .from = rec.ual_index, .limit = @intCast(records.len - i) });
+                d.askFor(.{ .stream = stream_key, .from = rec.ual_index, .limit = @intCast(records.len - i) });
                 break;
             };
             var it = if (payload) |p| stream_mod.BatchIterator.init(p) catch null else null;

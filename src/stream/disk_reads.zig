@@ -63,10 +63,11 @@ pub const Want = enum {
     blocked,
 };
 
-/// What a reader wants landed: its stream, from an index, at most `limit`
-/// of that stream's appends.
+/// What a reader wants landed: its stream (`router.nsNameKey` of its
+/// namespace id and name), from an index, at most `limit` of that stream's
+/// appends.
 pub const Window = struct {
-    name_hash: u64,
+    stream: [12]u8,
     from: u64,
     limit: u32,
 };
@@ -84,7 +85,7 @@ const Slot = struct {
 
     fn add(self: *Slot, w: Window) void {
         for (self.wants[0..self.n_wants]) |*have| {
-            if (have.name_hash == w.name_hash and have.from <= w.from) {
+            if (std.mem.eql(u8, &have.stream, &w.stream) and have.from <= w.from) {
                 have.limit = @max(have.limit, w.limit);
                 return;
             }
@@ -200,7 +201,7 @@ pub const DiskReads = struct {
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            for (self.asked[0..self.n_asked]) |have| if (have.name_hash == w.name_hash and have.from == w.from) return;
+            for (self.asked[0..self.n_asked]) |have| if (std.mem.eql(u8, &have.stream, &w.stream) and have.from == w.from) return;
             if (self.n_asked == MAX_WANTS) return;
             self.asked[self.n_asked] = w;
             self.n_asked += 1;
@@ -228,15 +229,15 @@ pub const DiskReads = struct {
             // drain, or not in the durable log at all.
             const wr = self.dl.writer;
             if (wr.entry_count == 0 or index < wr.first_index or index > wr.last_index) return .absent;
-            return self.inPlace(.{ .name_hash = w.name_hash, .from = index, .limit = w.limit });
+            return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         };
-        const bulk = self.bulk orelse return self.inPlace(.{ .name_hash = w.name_hash, .from = index, .limit = w.limit });
+        const bulk = self.bulk orelse return self.inPlace(.{ .stream = w.stream, .from = index, .limit = w.limit });
         const i = self.freeSlot() orelse return .pending;
         if (!self.ensureBuffers(i)) return self.blocked(now);
         const slot = &self.slots[i];
         const n: usize = @intCast(@min(src.limit, READ_ENTRIES));
         slot.n_wants = 0;
-        slot.add(.{ .name_hash = w.name_hash, .from = index, .limit = w.limit });
+        slot.add(.{ .stream = w.stream, .from = index, .limit = w.limit });
         slot.read = .{
             .path_len = src.path.len,
             .start = index,
@@ -334,10 +335,10 @@ pub const DiskReads = struct {
         for (entries) |*e| {
             if (e.header.entry_type != @backingInt(entry_mod.EntryType.stream_append)) continue;
             const cmd = entry_mod.CommandPayload.deserialize(e.payload) orelse continue;
-            const name_hash = router.nameHash(cmd.namespace_hash, cmd.key);
+            const stream = router.nsNameKey(cmd.namespace_id, cmd.key);
             var wanted = false;
             for (wants, 0..) |w, k| {
-                if (w.name_hash != name_hash or e.header.index < w.from or taken[k] >= w.limit) continue;
+                if (!std.mem.eql(u8, &w.stream, &stream) or e.header.index < w.from or taken[k] >= w.limit) continue;
                 taken[k] += 1;
                 wanted = true;
             }
@@ -428,15 +429,15 @@ const SegmentWriter = @import("../storage/ual/writer.zig").SegmentWriter;
 
 /// A stream append to `stream` in the default namespace.
 fn appendEntry(buf: []u8, index: u64, term: u64, stream: []const u8, value: []const u8) Entry {
-    const cmd: entry_mod.CommandPayload = .{ .namespace_hash = router.namespaceHash(""), .key_length = @intCast(stream.len), .value_length = @intCast(value.len), .key = stream, .value = value };
+    const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = @intCast(stream.len), .value_length = @intCast(value.len), .key = stream, .value = value };
     const n = cmd.serialize(buf).?;
     var e = entry_mod.buildEntry(.stream_append, 0, term, index, index * 1000, buf[0..n]);
     e.header.crc32c = e.computeCrc();
     return e;
 }
 
-fn hashOf(stream: []const u8) u64 {
-    return router.nameHash(router.namespaceHash(""), stream);
+fn keyOf(stream: []const u8) [12]u8 {
+    return router.nsNameKey(.default, stream);
 }
 
 /// Entries 1-6, alternating streams "a" and "b" (a at odd indices), sealed
@@ -514,7 +515,7 @@ test "stream disk reads: one read lands a reader's whole window, its stream's en
     d.bulk = &bulk;
     d.notify = .{ .ctx = &done, .done = Done.done };
 
-    const a: Window = .{ .name_hash = hashOf("a"), .from = 1, .limit = 10 };
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
     try testing.expectEqual(Want.pending, d.want(1, a));
     // Asked again inside the read in flight: no second read.
     try testing.expectEqual(Want.pending, d.want(3, a));
@@ -537,7 +538,7 @@ test "stream disk reads: entries still in the writer's buffer are read in place 
     defer f.deinit();
     var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
     defer d.deinit();
-    const a: Window = .{ .name_hash = hashOf("a"), .from = 1, .limit = 10 };
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
     try testing.expectEqual(Want.pending, d.want(1, a));
     try testing.expect(d.get(1) == null);
     try testing.expect(d.drain());
@@ -555,7 +556,7 @@ test "stream disk reads: an entry whose term isn't the log's is not cached, and 
     var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
     defer d.deinit();
     d.now_fn = Clock.get;
-    const a: Window = .{ .name_hash = hashOf("a"), .from = 1, .limit = 10 };
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
     try testing.expectEqual(Want.pending, d.want(1, a));
     _ = d.drain();
     try testing.expect(d.get(3) == null);
@@ -576,23 +577,23 @@ test "stream disk reads: a landed entry stays pinned for its reader until served
     d.now_fn = Clock.get;
     // Each entry is 16 bytes: a's three are past the budget, under its cap.
     d.cache_budget = 40;
-    try testing.expectEqual(Want.pending, d.want(1, .{ .name_hash = hashOf("a"), .from = 1, .limit = 10 }));
+    try testing.expectEqual(Want.pending, d.want(1, .{ .stream = keyOf("a"), .from = 1, .limit = 10 }));
     _ = d.drain();
     // Over its budget, but pinned: all three of a's kept.
     try testing.expect(d.cache.contains(1) and d.cache.contains(3) and d.cache.contains(5));
     // b's landing can't evict them while pinned.
-    try testing.expectEqual(Want.pending, d.want(2, .{ .name_hash = hashOf("b"), .from = 2, .limit = 10 }));
+    try testing.expectEqual(Want.pending, d.want(2, .{ .stream = keyOf("b"), .from = 2, .limit = 10 }));
     _ = d.drain();
     try testing.expect(d.cache.contains(1) and d.cache.contains(3));
     // Served, 1 is no longer pinned, and the next landing may evict it.
     _ = d.get(1);
     Clock.now += 1;
-    try testing.expectEqual(Want.pending, d.want(4, .{ .name_hash = hashOf("b"), .from = 4, .limit = 1 }));
+    try testing.expectEqual(Want.pending, d.want(4, .{ .stream = keyOf("b"), .from = 4, .limit = 1 }));
     _ = d.drain();
     try testing.expect(!d.cache.contains(1));
     // Unserved ones are released after PIN_MS.
     Clock.now += PIN_MS;
-    try testing.expectEqual(Want.pending, d.want(6, .{ .name_hash = hashOf("b"), .from = 6, .limit = 1 }));
+    try testing.expectEqual(Want.pending, d.want(6, .{ .stream = keyOf("b"), .from = 6, .limit = 1 }));
     _ = d.drain();
     try testing.expect(!d.cache.contains(3));
 }
