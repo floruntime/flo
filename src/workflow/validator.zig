@@ -620,23 +620,11 @@ fn validateSchedule(result: *ValidationResult, def: *const WorkflowDefinition) !
 
 /// Validate a 5-field cron expression by parsing each field.
 fn validateCronExpr(result: *ValidationResult, expr: []const u8) !void {
-    // Split into whitespace-separated fields
     var fields: [5][]const u8 = undefined;
     var field_count: usize = 0;
-    var start: usize = 0;
-
-    for (expr, 0..) |c, i| {
-        if (c == ' ' or c == '\t') {
-            if (i > start and field_count < 5) {
-                fields[field_count] = expr[start..i];
-                field_count += 1;
-            }
-            start = i + 1;
-        }
-    }
-    if (start < expr.len and field_count < 5) {
-        fields[field_count] = expr[start..];
-        field_count += 1;
+    var it = std.mem.tokenizeAny(u8, expr, " \t");
+    while (it.next()) |f| : (field_count += 1) {
+        if (field_count < 5) fields[field_count] = f;
     }
 
     if (field_count != 5) {
@@ -652,7 +640,14 @@ fn validateCronExpr(result: *ValidationResult, expr: []const u8) !void {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "Invalid cron {s} field: '{s}'", .{ field_names[i], fields[i] }) catch "Invalid cron field";
             try result.addError(.invalid_cron_expression, msg, "schedule.cron");
+            return;
         }
+    }
+    // Valid fields can still name a date that never comes (Feb 30). Four
+    // years back from a leap year's end reach every date that exists.
+    const c = cron.Cron.parse(expr) orelse return;
+    if (c.latest(cron.calendarToEpochMs(2028, 12, 31, 23, 59)) == null) {
+        try result.addError(.invalid_cron_expression, "Cron expression never fires", "schedule.cron");
     }
 }
 
@@ -1446,6 +1441,29 @@ test "validateWorkflow: invalid cron expression bad field value" {
         }
     }
     try testing.expect(found);
+}
+
+test "validateWorkflow: a cron with six fields or a date that never comes is invalid; Feb 29 is valid" {
+    const testing = std.testing;
+    for ([_]struct { []const u8, bool }{ .{ "* * * * * *", false }, .{ "0 0 30 2 *", false }, .{ "0 0 31 4 *", false }, .{ "0 0 29 2 *", true }, .{ "0 0 30 2 1", true } }) |case| {
+        var def = WorkflowDefinition{
+            .name = "test",
+            .description = "",
+            .version = "1.0.0",
+            .idempotency = .none,
+            .search_attributes = &.{},
+            .plans = &.{},
+            .start = .{ .run = .{ .target = "@actions/test", .input_mapping = null, .retry = null, .poll = null, .transitions = &.{.{ .outcome = "success", .target = "flo.Completed" }} } },
+            .steps = &.{},
+            .terminals = &.{},
+            .schedule = .{ .cron_expr = case[0] },
+        };
+        var result = try validateWorkflow(testing.allocator, &def);
+        defer result.deinit();
+        var invalid = false;
+        for (result.errors.items) |err| invalid = invalid or err.code == .invalid_cron_expression;
+        try testing.expectEqual(!case[1], invalid);
+    }
 }
 
 test "validateWorkflow: negative interval rejected" {

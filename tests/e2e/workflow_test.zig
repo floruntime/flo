@@ -4051,6 +4051,100 @@ test "e2e/workflow: a disabled workflow stays disabled across a restart: listed 
     try ctx.exec(&.{ "workflow", "start", "paused", "{}", "--run-id", "after" });
 }
 
+/// A schedule with one slot a minute, its runs never finishing.
+const EVERY_MINUTE =
+    \\kind: Workflow
+    \\name: slotted
+    \\version: 1.0.0
+    \\schedule:
+    \\  interval: 60000
+    \\  max_concurrent: 1000
+    \\start:
+    \\  wait_for_signal:
+    \\    type: never
+    \\  transitions:
+    \\    success: flo.Completed
+;
+
+/// The slotted workflow's runs in a list-runs table: a row each, after
+/// the title naming it.
+fn slottedRuns(out: []const u8) usize {
+    return std.mem.count(u8, out, "slotted") -| 1;
+}
+
+fn slottedRunsOn(c: *stdx.testing.ClusterContext, node: usize) !usize {
+    const out = try c.execCaptureOn(node, &.{ "workflow", "list-runs", "-w", "slotted", "--limit", "1000" });
+    defer c.allocator.free(out);
+    return slottedRuns(out);
+}
+
+test "e2e/workflow: a schedule's slot that fired before a restart doesn't fire again after it" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    try createYamlWorkflow(ctx, EVERY_MINUTE);
+    const list: []const []const u8 = &.{ "workflow", "list-runs", "-w", "slotted", "--limit", "1000" };
+    for (0..50) |_| {
+        if (slottedRuns(try ctx.execCapture(list)) > 0) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 1), slottedRuns(try ctx.execCapture(list)));
+    try ctx.restartServer();
+    // Well inside the first slot: the run it started is all there is.
+    stdx.time.sleep(1500 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), slottedRuns(try ctx.execCapture(list)));
+}
+
+test "e2e/workflow/cluster: a schedule's slot that fired doesn't fire again on the next leader" {
+    var cluster = try stdx.testing.ClusterContext.initDefault(testing.allocator);
+    defer cluster.deinit();
+    errdefer cluster.printLogs();
+    const first = try clusterLeader(&cluster, null);
+    const path = try writeTempYaml(testing.allocator, EVERY_MINUTE, "slotted.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try cluster.execOn(first, &.{ "workflow", "create", "-f", path });
+
+    // The first slot's run, on every node before the kill.
+    for (0..50) |_| {
+        var all = true;
+        for (0..cluster.node_count) |i| {
+            if (try slottedRunsOn(&cluster, i) != 1) all = false;
+        }
+        if (all) break;
+        stdx.time.sleep(100 * std.time.ns_per_ms);
+    }
+    for (0..cluster.node_count) |i| try testing.expectEqual(@as(usize, 1), try slottedRunsOn(&cluster, i));
+
+    cluster.killNode(first);
+    const next = try clusterLeader(&cluster, first);
+    // Its first ticks as leader are past; the slot is still the first.
+    stdx.time.sleep(2000 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), try slottedRunsOn(&cluster, next));
+}
+
+test "e2e/workflow: a cron schedule fires on the minute, from the first minute after it's created" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    // Created early in a minute, so the checks below land inside it.
+    if (@mod(stdx.time.milliTimestamp(), 60_000) > 40_000) {
+        stdx.time.sleep(@intCast((60_000 - @mod(stdx.time.milliTimestamp(), 60_000) + 1000) * std.time.ns_per_ms));
+    }
+    const def = EVERY_MINUTE;
+    const at = std.mem.indexOf(u8, def, "  interval: 60000").?;
+    const cron_def = try std.mem.concat(testing.allocator, u8, &.{ def[0..at], "  cron: \"* * * * *\"", def[at + "  interval: 60000".len ..] });
+    defer testing.allocator.free(cron_def);
+    try createYamlWorkflow(ctx, cron_def);
+    const list: []const []const u8 = &.{ "workflow", "list-runs", "-w", "slotted", "--limit", "1000" };
+
+    // The minute struck before it existed: nothing yet.
+    stdx.time.sleep(1000 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), slottedRuns(try ctx.execCapture(list)));
+
+    // Just past the next minute: one run.
+    const to_minute = 60_000 - @mod(stdx.time.milliTimestamp(), 60_000);
+    stdx.time.sleep(@intCast((to_minute + 2000) * std.time.ns_per_ms));
+    try testing.expectEqual(@as(usize, 1), slottedRuns(try ctx.execCapture(list)));
+}
+
 test "e2e/workflow: enabling or disabling a workflow that doesn't exist is not found" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();

@@ -3,6 +3,7 @@
 //! Full 5-field cron expression parser: minute hour day-of-month month day-of-week
 //! Supports: * (all), */N (step), N (value), N-M (range), N-M/S (range+step), N,M,O (list)
 //! Day-of-week: 0=Sunday..6=Saturday, 7=Sunday (alias)
+//! Times are UTC.
 //!
 //! Calendar helpers use Howard Hinnant's civil calendar algorithm for
 //! epoch ↔ calendar conversion.
@@ -26,115 +27,90 @@ pub const CalendarTime = struct {
 // Cron Parser
 // =============================================================================
 
-/// Compute the next fire time (epoch milliseconds) for a 5-field cron expression.
-/// Returns null if the expression is invalid or no match within 4 years.
-pub fn nextCronTime(now_ms: i64, expr: []const u8) ?i64 {
-    // 1. Split into 5 whitespace-separated fields
-    var fields: [5][]const u8 = undefined;
-    var field_count: usize = 0;
-    var start: usize = 0;
+/// A parsed 5-field cron expression, evaluated in UTC: a bitset per field.
+pub const Cron = struct {
+    minutes: u64,
+    hours: u64,
+    days: u64,
+    months: u64,
+    weekdays: u64,
+    /// A day field that is `*` (or `*/N`) leaves the day to the other one;
+    /// with both restricted, a day matching either fires, as in standard
+    /// cron.
+    days_any: bool,
+    weekdays_any: bool,
 
-    for (expr, 0..) |c, i| {
-        if (c == ' ' or c == '\t') {
-            if (i > start and field_count < 5) {
-                fields[field_count] = expr[start..i];
-                field_count += 1;
-            }
-            start = i + 1;
+    pub fn parse(expr: []const u8) ?Cron {
+        var fields: [5][]const u8 = undefined;
+        var n: usize = 0;
+        var it = mem.tokenizeAny(u8, expr, " \t");
+        while (it.next()) |f| {
+            if (n == 5) return null;
+            fields[n] = f;
+            n += 1;
         }
+        if (n != 5) return null;
+        var weekdays = parseCronField(fields[4], 0, 7) orelse return null;
+        // Sunday is 0 or 7.
+        if (weekdays & (@as(u64, 1) << 7) != 0) weekdays |= 1;
+        return .{
+            .minutes = parseCronField(fields[0], 0, 59) orelse return null,
+            .hours = parseCronField(fields[1], 0, 23) orelse return null,
+            .days = parseCronField(fields[2], 1, 31) orelse return null,
+            .months = parseCronField(fields[3], 1, 12) orelse return null,
+            .weekdays = weekdays,
+            .days_any = fields[2][0] == '*',
+            .weekdays_any = fields[4][0] == '*',
+        };
     }
-    if (start < expr.len and field_count < 5) {
-        fields[field_count] = expr[start..];
-        field_count += 1;
+
+    fn has(set: u64, v: u8) bool {
+        return set & (@as(u64, 1) << @as(u6, @intCast(v))) != 0;
     }
 
-    if (field_count != 5) return null;
+    pub fn firesOn(self: Cron, year: i32, month: u8, day: u8) bool {
+        if (!has(self.months, month)) return false;
+        const dom = has(self.days, day);
+        const dow = has(self.weekdays, dayOfWeek(year, month, day));
+        if (self.days_any and self.weekdays_any) return true;
+        if (self.days_any) return dow;
+        if (self.weekdays_any) return dom;
+        return dom or dow;
+    }
 
-    // 2. Parse each field into a bitset of allowed values
-    const min_set = parseCronField(fields[0], 0, 59) orelse return null;
-    const hour_set = parseCronField(fields[1], 0, 23) orelse return null;
-    const dom_set = parseCronField(fields[2], 1, 31) orelse return null;
-    const mon_set = parseCronField(fields[3], 1, 12) orelse return null;
-    var dow_set = parseCronField(fields[4], 0, 7) orelse return null;
-    // Normalize: Sunday=7 maps to bit 0 (Sunday=0)
-    if (dow_set & (@as(u64, 1) << 7) != 0) dow_set |= 1;
+    /// The highest value in `set` at most `limit`.
+    fn highest(set: u64, limit: u8) ?u8 {
+        const masked = set & ((@as(u64, 2) << @as(u6, @intCast(limit))) - 1);
+        if (masked == 0) return null;
+        return @intCast(63 - @clz(masked));
+    }
 
-    // 3. Decompose now_ms + 60s (next minute boundary) into calendar components
-    const now_secs = @divFloor(now_ms, 1000);
-    const next_min_secs = now_secs - @rem(now_secs, 60) + 60;
-    var dt = epochSecsToCalendar(next_min_secs);
-
-    // 4. Walk forward to find the next matching time (max 4 years)
-    const max_year = dt.year + 4;
-
-    while (dt.year <= max_year) {
-        // Month check
-        if (mon_set & (@as(u64, 1) << @as(u6, @intCast(dt.month))) == 0) {
-            dt.month += 1;
-            if (dt.month > 12) {
-                dt.month = 1;
-                dt.year += 1;
-            }
-            dt.day = 1;
-            dt.hour = 0;
-            dt.minute = 0;
-            continue;
-        }
-
-        // Day check (both day-of-month AND day-of-week must match)
-        const dim = daysInMonth(dt.year, dt.month);
-        if (dt.day > dim) {
-            dt.month += 1;
-            if (dt.month > 12) {
-                dt.month = 1;
-                dt.year += 1;
-            }
-            dt.day = 1;
-            dt.hour = 0;
-            dt.minute = 0;
-            continue;
-        }
-        const dow = dayOfWeek(dt.year, dt.month, dt.day);
-        const dom_ok = dom_set & (@as(u64, 1) << @as(u6, @intCast(dt.day))) != 0;
-        const dow_ok = dow_set & (@as(u64, 1) << @as(u6, @intCast(dow))) != 0;
-        if (!dom_ok or !dow_ok) {
-            dt.day += 1;
-            dt.hour = 0;
-            dt.minute = 0;
-            continue;
-        }
-
-        // Hour check
-        if (hour_set & (@as(u64, 1) << @as(u6, @intCast(dt.hour))) == 0) {
-            dt.hour += 1;
-            dt.minute = 0;
-            if (dt.hour >= 24) {
-                dt.day += 1;
-                dt.hour = 0;
-            }
-            continue;
-        }
-
-        // Minute check
-        if (min_set & (@as(u64, 1) << @as(u6, @intCast(dt.minute))) == 0) {
-            dt.minute += 1;
-            if (dt.minute >= 60) {
-                dt.hour += 1;
-                dt.minute = 0;
-                if (dt.hour >= 24) {
-                    dt.day += 1;
-                    dt.hour = 0;
+    /// The latest fire time at or before `now_ms`, within four years.
+    pub fn latest(self: Cron, now_ms: i64) ?i64 {
+        const now_secs = @divFloor(now_ms, 1000);
+        const now_dt = epochSecsToCalendar(now_secs);
+        var day_ms = calendarToEpochMs(now_dt.year, now_dt.month, now_dt.day, 0, 0);
+        var first = true;
+        var days: usize = 0;
+        while (days <= 4 * 366) : (days += 1) {
+            const dt = epochSecsToCalendar(@divFloor(day_ms, 1000));
+            if (self.firesOn(dt.year, dt.month, dt.day)) {
+                var hour_limit: u8 = if (first) now_dt.hour else 23;
+                while (highest(self.hours, hour_limit)) |h| {
+                    const minute_limit: u8 = if (first and h == now_dt.hour) now_dt.minute else 59;
+                    if (highest(self.minutes, minute_limit)) |m| {
+                        return day_ms + @as(i64, h) * 3_600_000 + @as(i64, m) * 60_000;
+                    }
+                    if (h == 0) break;
+                    hour_limit = h - 1;
                 }
             }
-            continue;
+            first = false;
+            day_ms -= 86_400_000;
         }
-
-        // All fields match — convert back to epoch ms
-        return calendarToEpochMs(dt.year, dt.month, dt.day, dt.hour, dt.minute);
+        return null;
     }
-
-    return null; // No match within 4 years — likely an invalid expression
-}
+};
 
 /// Parse a single cron field into a u64 bitset. Supports comma-separated tokens.
 pub fn parseCronField(field: []const u8, min: u8, max: u8) ?u64 {
@@ -187,7 +163,7 @@ pub fn parseCronToken(token: []const u8, min: u8, max: u8) ?u64 {
         else
             1;
         const right = std.fmt.parseInt(u8, range_end_str, 10) catch return null;
-        if (left > max or right > max or step == 0) return null;
+        if (left < min or right > max or left > right or step == 0) return null;
 
         var result: u64 = 0;
         var v: u16 = left;
@@ -267,65 +243,73 @@ pub fn daysInMonth(year: i32, month: u8) u8 {
 // Tests
 // =============================================================================
 
-test "nextCronTime: every 5 minutes" {
-    const testing = std.testing;
-    // Reference time: 2024-01-15 10:30:00 UTC
-    const now_ms: i64 = 1705312200000;
-    const result = nextCronTime(now_ms, "*/5 * * * *");
-    try testing.expect(result != null);
-    // Should be >= now + 60s (next minute boundary at minimum)
-    try testing.expect(result.? > now_ms);
-    // Should land on a 5-minute boundary
-    const dt = epochSecsToCalendar(@divFloor(result.?, 1000));
-    try testing.expect(dt.minute % 5 == 0);
+/// Epoch ms of a UTC time, for the tests.
+fn at(year: i32, month: u8, day: u8, hour: u8, minute: u8) i64 {
+    return calendarToEpochMs(year, month, day, hour, minute);
 }
 
-test "nextCronTime: every Monday at 9AM" {
-    const testing = std.testing;
-    // Reference time: 2024-01-15 10:30:00 UTC (Monday)
-    const now_ms: i64 = 1705312200000;
-    const result = nextCronTime(now_ms, "0 9 * * 1");
-    try testing.expect(result != null);
-    // Should be next Monday at 9:00 (Jan 22, 2024)
-    const dt = epochSecsToCalendar(@divFloor(result.?, 1000));
-    try testing.expectEqual(@as(u8, 0), dt.minute);
-    try testing.expectEqual(@as(u8, 9), dt.hour);
-    try testing.expectEqual(@as(u8, 1), dayOfWeek(dt.year, dt.month, dt.day)); // Monday
+fn latestOf(expr: []const u8, now_ms: i64) ?i64 {
+    return (Cron.parse(expr) orelse return null).latest(now_ms);
 }
 
-test "nextCronTime: 1st of month at 2:30" {
-    const testing = std.testing;
-    // Reference time: 2024-01-15 10:30:00 UTC
-    const now_ms: i64 = 1705312200000;
-    const result = nextCronTime(now_ms, "30 2 1 * *");
-    try testing.expect(result != null);
-    const dt = epochSecsToCalendar(@divFloor(result.?, 1000));
-    try testing.expectEqual(@as(u8, 30), dt.minute);
-    try testing.expectEqual(@as(u8, 2), dt.hour);
-    try testing.expectEqual(@as(u8, 1), dt.day);
-    // Should be Feb 1st since Jan 1st is past
-    try testing.expectEqual(@as(u8, 2), dt.month);
+test "cron: the latest fire is at or before now, on the minute" {
+    const t = std.testing;
+    // 2024-01-15 10:32:45 UTC, a Monday.
+    const now = at(2024, 1, 15, 10, 32) + 45_000;
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 10, 32)), latestOf("* * * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 10, 30)), latestOf("*/5 * * * *", now));
+    // Exactly on a fire time: that one.
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 10, 30)), latestOf("*/5 * * * *", at(2024, 1, 15, 10, 30)));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 9, 0)), latestOf("0 9 * * *", now));
+    // Later in today's hour and day than now: yesterday's.
+    try t.expectEqual(@as(?i64, at(2024, 1, 14, 11, 0)), latestOf("0 11 * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 9, 59)), latestOf("59 9 * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 10, 15)), latestOf("15,45 * * * *", now));
 }
 
-test "nextCronTime: invalid expression returns null" {
-    const testing = std.testing;
-    const now_ms: i64 = 1705312200000;
-    try testing.expect(nextCronTime(now_ms, "invalid") == null);
-    try testing.expect(nextCronTime(now_ms, "* *") == null);
-    try testing.expect(nextCronTime(now_ms, "60 * * * *") == null); // minute > 59
+test "cron: ranges and steps cover their bounds" {
+    const t = std.testing;
+    const now = at(2024, 1, 15, 23, 59);
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 23, 59)), latestOf("59 23 * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 23, 40)), latestOf("0-40/20 * * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 22, 0)), latestOf("0 */2 * * *", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 17, 30)), latestOf("30 9-17 * * *", now));
+    // Out of range, reversed, empty or malformed: not an expression.
+    for ([_][]const u8{ "60 * * * *", "* 24 * * *", "* * 0 * *", "* * 32 * *", "* * * 13 *", "* * * * 8", "5-1 * * * *", "* * 0-5 * *", "*/0 * * * *", "* * * *", "* * * * * *", "" }) |bad| {
+        try t.expect(Cron.parse(bad) == null);
+    }
 }
 
-test "nextCronTime: every day at midnight" {
-    const testing = std.testing;
-    // Reference time: 2024-01-15 10:30:00 UTC
-    const now_ms: i64 = 1705312200000;
-    const result = nextCronTime(now_ms, "0 0 * * *");
-    try testing.expect(result != null);
-    const dt = epochSecsToCalendar(@divFloor(result.?, 1000));
-    try testing.expectEqual(@as(u8, 0), dt.minute);
-    try testing.expectEqual(@as(u8, 0), dt.hour);
-    // Should be Jan 16 (next day)
-    try testing.expectEqual(@as(u8, 16), dt.day);
+test "cron: day of month and day of week, either when both are given" {
+    const t = std.testing;
+    // 2024-01-15 is a Monday; the 13th a Saturday, the 14th a Sunday.
+    const now = at(2024, 1, 15, 12, 0);
+    // Only day of week: the latest Sunday, as 0 and as 7.
+    try t.expectEqual(@as(?i64, at(2024, 1, 14, 0, 0)), latestOf("0 0 * * 0", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 14, 0, 0)), latestOf("0 0 * * 7", now));
+    // Only day of month.
+    try t.expectEqual(@as(?i64, at(2024, 1, 13, 0, 0)), latestOf("0 0 13 * *", now));
+    // Both: the 1st or a Saturday, whichever came last.
+    try t.expectEqual(@as(?i64, at(2024, 1, 13, 0, 0)), latestOf("0 0 1 * 6", now));
+    try t.expectEqual(@as(?i64, at(2024, 1, 15, 0, 0)), latestOf("0 0 15 * 6", now));
+    // `*/N` in a day field leaves the day to the other one.
+    try t.expectEqual(@as(?i64, at(2024, 1, 14, 0, 0)), latestOf("0 0 */1 * 0", now));
+}
+
+test "cron: month ends and leap years" {
+    const t = std.testing;
+    // The 31st skips months without one.
+    try t.expectEqual(@as(?i64, at(2024, 3, 31, 0, 0)), latestOf("0 0 31 * *", at(2024, 4, 30, 23, 59)));
+    // Feb 29 is in leap years only: 2024, then 2028.
+    try t.expectEqual(@as(?i64, at(2024, 2, 29, 0, 0)), latestOf("0 0 29 2 *", at(2027, 6, 1, 0, 0)));
+    try t.expectEqual(@as(?i64, at(2024, 2, 29, 0, 0)), latestOf("0 0 29 2 *", at(2024, 3, 1, 0, 0)));
+    // 2100 is not a leap year; 2000 is.
+    try t.expectEqual(@as(?i64, at(2096, 2, 29, 0, 0)), latestOf("0 0 29 2 *", at(2100, 3, 1, 0, 0)));
+    try t.expectEqual(@as(?i64, at(2000, 2, 29, 0, 0)), latestOf("0 0 29 2 *", at(2000, 3, 1, 0, 0)));
+    // Across a year end.
+    try t.expectEqual(@as(?i64, at(2023, 12, 31, 23, 0)), latestOf("0 23 * * *", at(2024, 1, 1, 22, 59)));
+    // A date that never comes: no fire.
+    try t.expectEqual(@as(?i64, null), latestOf("0 0 30 2 *", at(2024, 6, 1, 0, 0)));
 }
 
 test "parseCronField: basic patterns" {
