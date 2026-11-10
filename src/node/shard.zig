@@ -4444,6 +4444,14 @@ pub const Shard = struct {
             sm.setReadBlocked(self.read_blocked);
             sm.persist_failures.store(self.persist_failures, .monotonic);
             sm.flushes_failing_since_ms.store(self.flushes_failing_since_ms, .monotonic);
+            if (self.hard_state_store) |hs| {
+                sm.hardstate_failures.store(hs.hardstate_failures, .monotonic);
+                sm.hardstate_failing_since_ms.store(hs.hardstate_failing_since_ms, .monotonic);
+            }
+            if (self.durable_log) |dl| {
+                sm.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
+                sm.buffer_failing_since_ms.store(dl.writer.buffer_failing_since_ms, .monotonic);
+            }
         }
         const slot = self.health orelse return;
         slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
@@ -4490,6 +4498,14 @@ pub const Shard = struct {
         slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
         slot.persist_failures.store(self.persist_failures, .monotonic);
         slot.flushes_failing_since_ms.store(self.flushes_failing_since_ms, .monotonic);
+        if (self.hard_state_store) |hs| {
+            slot.hardstate_failures.store(hs.hardstate_failures, .monotonic);
+            slot.hardstate_failing_since_ms.store(hs.hardstate_failing_since_ms, .monotonic);
+        }
+        if (self.durable_log) |dl| {
+            slot.buffer_failures.store(dl.writer.buffer_failures, .monotonic);
+            slot.buffer_failing_since_ms.store(dl.writer.buffer_failing_since_ms, .monotonic);
+        }
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
 
@@ -6939,13 +6955,17 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
     if (writer.stop_at_gap and writer.first_unbuffered != null) return;
     writer.addEntry(entry) catch |err| {
         writer.buffer_failures += 1;
+        if (writer.buffer_failing_since_ms == 0) writer.buffer_failing_since_ms = Shard.nowMs();
         if (writer.stop_at_gap) {
             writer.first_unbuffered = entry.header.index;
             log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; buffering resumes from it at the next flush (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         } else {
             log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         }
+        return;
     };
+    // Buffered again: end any failing run. The cumulative count stays.
+    writer.buffer_failing_since_ms = 0;
 }
 
 /// A read the bulk I/O thread made for this shard is back.
@@ -6969,13 +6989,25 @@ const HardStateStore = struct {
     dir: []const u8,
     node_id: u32,
     shard_id: u16,
+    /// Cumulative count of HARDSTATE writes that could not be persisted, and
+    /// this node's uptime in ms when the current run of failures began (0 while
+    /// they persist). Surfaced (metric and /status) rather than left in the log:
+    /// while a run holds the node stops voting, since it must not forget a vote
+    /// it may already have given. The since-reading is published raw, computed
+    /// into a duration by the reader, like `flushes_failing_since_ms`.
+    hardstate_failures: u64 = 0,
+    hardstate_failing_since_ms: u64 = 0,
 
     fn persist(ctx: *anyopaque, term: u64, voted_for: u32, lost_log: bool) bool {
         const self: *HardStateStore = @ptrCast(@alignCast(ctx));
         hard_state_mod.save(self.dir, .{ .node_id = self.node_id, .term = term, .voted_for = voted_for, .lost_log = lost_log }) catch |err| {
-            log.err("shard {d}: cannot write {s}/{s}: {s}; this node will not vote until it can", .{ self.shard_id, self.dir, hard_state_mod.FILENAME, @errorName(err) });
+            self.hardstate_failures += 1;
+            if (self.hardstate_failing_since_ms == 0) self.hardstate_failing_since_ms = Shard.nowMs();
+            log.err("shard {d}: cannot write {s}/{s}: {s}; this node will not vote until it can (hardstate_failures={d})", .{ self.shard_id, self.dir, hard_state_mod.FILENAME, @errorName(err), self.hardstate_failures });
             return false;
         };
+        // Persisted: end any failing run. The cumulative count stays.
+        self.hardstate_failing_since_ms = 0;
         return true;
     }
 };
@@ -12130,6 +12162,104 @@ test "shard: a failed flush counts and starts the failing-since clock; a flush t
     try shard.flushSegmentToDisk();
     try std.testing.expectEqual(@as(u64, 0), shard.flushes_failing_since_ms);
     try std.testing.expectEqual(@as(u64, 2), shard.persist_failures);
+}
+
+test "shard: a real HARDSTATE persist failure shows in the field, the metric snapshot and text, and a write that reaches disk ends the run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var registry = @import("../metrics/registry.zig").MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.shard_metrics = registry.shardMetrics(0);
+
+    const store = shard.hard_state_store.?;
+    try std.testing.expectEqual(@as(u64, 0), store.hardstate_failures);
+    try std.testing.expectEqual(@as(u64, 0), store.hardstate_failing_since_ms);
+
+    // Make the shard directory unwritable so a real HARDSTATE save fails.
+    const shard_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000", .{data_dir});
+    defer std.testing.allocator.free(shard_dir);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{shard_dir}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+
+    try std.testing.expect(!HardStateStore.persist(store, 7, 1, false)); // the save fails for real
+    try std.testing.expect(store.hardstate_failures >= 1);
+    try std.testing.expect(store.hardstate_failing_since_ms != 0);
+
+    // Published as a count and a since-reading in the metric snapshot and text.
+    shard.publishHealth();
+    const snap = shard.shard_metrics.?.snapshot();
+    try std.testing.expect(snap.hardstate_failures >= 1);
+    try std.testing.expect(snap.hardstate_failing_since_ms != 0);
+    const text = try registry.exportPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "flo_shard_hardstate_failures_total{shard_id=\"0\"}") != null);
+
+    // Writable again: a persist that reaches disk ends the run; the total stays.
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(HardStateStore.persist(store, 8, 1, false));
+    try std.testing.expectEqual(@as(u64, 0), store.hardstate_failing_since_ms);
+    const total = store.hardstate_failures;
+    shard.publishHealth();
+    try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().hardstate_failing_since_ms);
+    try std.testing.expectEqual(total, shard.shard_metrics.?.snapshot().hardstate_failures);
+}
+
+test "shard: a real buffer failure shows in the field, the metric snapshot and text, and a later entry that buffers ends the run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var registry = @import("../metrics/registry.zig").MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], data_dir, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.shard_metrics = registry.shardMetrics(0);
+    try shard.flushSegmentToDisk();
+
+    // Force a real buffer (addEntry) failure via a failing allocator: the empty
+    // buffer has no room, so buffering the next entry allocates and that fails.
+    const writer = shard.durable_log.?.writer;
+    writer.data.clearAndFree(writer.allocator);
+    writer.sparse_index.clearAndFree(writer.allocator);
+    const real = writer.allocator;
+    var failing = std.testing.FailingAllocator.init(real, .{ .fail_index = 0 });
+    writer.allocator = failing.allocator();
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k1", "v");
+    writer.allocator = real;
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+    try std.testing.expect(writer.buffer_failing_since_ms != 0);
+
+    // Published as a count and a since-reading in the metric snapshot and text.
+    shard.publishHealth();
+    const snap = shard.shard_metrics.?.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.buffer_failures);
+    try std.testing.expect(snap.buffer_failing_since_ms != 0);
+    const text = try registry.exportPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "flo_shard_buffer_failures_total{shard_id=\"0\"}") != null);
+
+    // A later entry that buffers ends the run; the cumulative count stays.
+    _ = try kv_handler_mod.KVHandler.testProposePut(&shard, "k2", "v");
+    try std.testing.expectEqual(@as(u64, 0), writer.buffer_failing_since_ms);
+    try std.testing.expectEqual(@as(u64, 1), writer.buffer_failures);
+    shard.publishHealth();
+    try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().buffer_failing_since_ms);
 }
 
 test "Shard: a data directory that belonged to a group refuses to run alone, and rejoins as a member" {

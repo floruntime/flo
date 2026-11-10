@@ -46,6 +46,11 @@ pub const SegmentWriter = struct {
     /// one is an entry that would be missing from disk after a restart, so
     /// it is counted and logged rather than dropped silently.
     buffer_failures: u64,
+    /// This node's uptime in ms when the current run of buffer failures began,
+    /// or 0 while buffering succeeds. Set by the append hook on the first
+    /// failure of a run and cleared when an entry buffers again, so `/status`
+    /// and metrics can say how long writes have been failing to buffer.
+    buffer_failing_since_ms: u64 = 0,
     /// The first index that could not be buffered, when `stop_at_gap`.
     /// Nothing after it is buffered either, so a flush never writes past a
     /// gap; the owner re-buffers from here before flushing.

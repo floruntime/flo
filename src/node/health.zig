@@ -150,6 +150,18 @@ pub const ShardSlot = struct {
     /// or failing, which clients are told about but is otherwise only in the log.
     persist_failures: Atomic(u64) = .init(0),
     flushes_failing_since_ms: Atomic(u64) = .init(0),
+    /// HARDSTATE writes (term + vote) that could not be persisted (cumulative)
+    /// and this node's uptime in ms when the current run began (0 while they
+    /// persist): the node stops voting while a run holds. Published raw, like
+    /// `flushes_failing_since_ms`.
+    hardstate_failures: Atomic(u64) = .init(0),
+    hardstate_failing_since_ms: Atomic(u64) = .init(0),
+    /// Committed entries the append hook could not buffer for the next flush
+    /// (cumulative) and this node's uptime in ms when the current run began (0
+    /// while buffering succeeds): an unbuffered entry would be missing after a
+    /// restart.
+    buffer_failures: Atomic(u64) = .init(0),
+    buffer_failing_since_ms: Atomic(u64) = .init(0),
     /// Set with a `read_blocked` state on a lone shard, whose only copy this is:
     /// `readiness` keeps the node ready then, since a 503 would pull it and no
     /// other node could serve. In a cluster it is false and `read_blocked` is a
@@ -258,6 +270,10 @@ pub const NodeHealth = struct {
             // Shown once any flush has failed, so a healthy shard stays quiet.
             const persist_failures = s.persist_failures.load(.monotonic);
             if (persist_failures > 0) try w.print(",\"persist_failures\":{d},\"flushes_failing_since_ms\":{d}", .{ persist_failures, s.flushes_failing_since_ms.load(.monotonic) });
+            const hardstate_failures = s.hardstate_failures.load(.monotonic);
+            if (hardstate_failures > 0) try w.print(",\"hardstate_failures\":{d},\"hardstate_failing_since_ms\":{d}", .{ hardstate_failures, s.hardstate_failing_since_ms.load(.monotonic) });
+            const buffer_failures = s.buffer_failures.load(.monotonic);
+            if (buffer_failures > 0) try w.print(",\"buffer_failures\":{d},\"buffer_failing_since_ms\":{d}", .{ buffer_failures, s.buffer_failing_since_ms.load(.monotonic) });
             if (state == .replaying) {
                 try w.print(",\"replay\":{{\"index\":{d},\"last\":{d}}}", .{ s.replay_index.load(.monotonic), s.replay_last.load(.monotonic) });
             }
@@ -399,13 +415,17 @@ test "health: a halted shard keeps the node ready, and /status names where it ha
     try testing.expect(std.mem.indexOf(u8, out.written(), "out of memory") != null);
 }
 
-test "health: /status shows flush failures once any have happened, and stays quiet while flushes succeed" {
+test "health: /status shows flush, hard-state and buffer failures once any have happened, and stays quiet while they succeed" {
     var h = try NodeHealth.init(testing.allocator, 1, 2);
     defer h.deinit(testing.allocator);
     h.accepting.store(true, .release);
-    // Shard 0 has had flushes fail; shard 1 is healthy.
+    // Shard 0 has had each kind of persistence fail; shard 1 is healthy.
     h.shards[0].persist_failures.store(5, .monotonic);
     h.shards[0].flushes_failing_since_ms.store(123_456, .monotonic);
+    h.shards[0].hardstate_failures.store(3, .monotonic);
+    h.shards[0].hardstate_failing_since_ms.store(100_000, .monotonic);
+    h.shards[0].buffer_failures.store(2, .monotonic);
+    h.shards[0].buffer_failing_since_ms.store(110_000, .monotonic);
     h.shards[0].publish(.ok, .leader, 10, 10);
     h.shards[1].publish(.ok, .follower, 10, 10);
 
@@ -417,8 +437,15 @@ test "health: /status shows flush failures once any have happened, and stays qui
     const s0 = parsed.value.object.get("shards").?.array.items[0].object;
     try testing.expectEqual(@as(i64, 5), s0.get("persist_failures").?.integer);
     try testing.expectEqual(@as(i64, 123_456), s0.get("flushes_failing_since_ms").?.integer);
-    // A healthy shard stays quiet.
-    try testing.expect(parsed.value.object.get("shards").?.array.items[1].object.get("persist_failures") == null);
+    try testing.expectEqual(@as(i64, 3), s0.get("hardstate_failures").?.integer);
+    try testing.expectEqual(@as(i64, 100_000), s0.get("hardstate_failing_since_ms").?.integer);
+    try testing.expectEqual(@as(i64, 2), s0.get("buffer_failures").?.integer);
+    try testing.expectEqual(@as(i64, 110_000), s0.get("buffer_failing_since_ms").?.integer);
+    // A healthy shard stays quiet on all three.
+    const s1 = parsed.value.object.get("shards").?.array.items[1].object;
+    try testing.expect(s1.get("persist_failures") == null);
+    try testing.expect(s1.get("hardstate_failures") == null);
+    try testing.expect(s1.get("buffer_failures") == null);
 }
 
 test "health: /status names each shard's state, its reason when offline, and its losses" {
