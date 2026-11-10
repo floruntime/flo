@@ -73,7 +73,7 @@ test "e2e/bounds: a stream, series or group name over 4096 bytes is refused, and
 
     var out: [4096]u8 = undefined;
     for ([_]struct { op: proto.OpCode, key: []const u8, value: []const u8, why: []const u8 = "key or name too long" }{
-        .{ .op = .stream_group_create, .key = "s", .value = group, .why = "stream + group name too long" },
+        .{ .op = .stream_group_create, .key = "s", .value = group, .why = "group name too long" },
         .{ .op = .stream_append, .key = key, .value = "x", .why = "stream name too long" },
         .{ .op = .ts_write, .key = key, .value = &point },
     }) |c| {

@@ -30,6 +30,16 @@ pub const Streams = struct {
         return self.proj.streamRemovedThrough(key);
     }
 
+    /// The append that holds `record`, by its first record, and the
+    /// most its records take in an answer; null when the stream no longer
+    /// holds it.
+    pub fn appendOf(self: Streams, key: stream_mod.StreamKey, record: StreamID) ?Append {
+        const rec = self.proj.streamAppendOf(key, record) orelse return null;
+        return .{ .first = rec.id, .answer_bytes = stream_mod.answerBound(rec) };
+    }
+
+    pub const Append = struct { first: StreamID, answer_bytes: usize };
+
     /// The ids of the records after `cursor`, oldest first, one per
     /// record, at most `out.len`.
     pub fn idsAfter(self: Streams, key: stream_mod.StreamKey, cursor: StreamID, out: []StreamID) usize {
@@ -72,6 +82,21 @@ test "streams: ids after a cursor are one per record, a cursor inside an append 
     try testing.expectEqual(@as(usize, 0), s.idsAfter(stream_mod.streamKey(.default, "other"), StreamID.MIN, &out));
     try testing.expect(s.first(h).eql(id(100, 0)));
     try testing.expect(s.last(h).eql(id(100, 4)));
+}
+
+test "streams: each record names its append, until a trim cuts it" {
+    var proj = StreamProjection.init(testing.allocator);
+    defer proj.deinit();
+    const h = stream_mod.streamKey(.default, "s");
+    _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
+    _ = try proj.appendToStreamAt(h, 2, 0, 100, 2, 20);
+    const s: Streams = .{ .proj = &proj };
+    try testing.expect(s.appendOf(h, id(100, 1)).?.first.eql(id(100, 0)));
+    try testing.expect(s.appendOf(h, id(100, 3)).?.first.eql(id(100, 3)));
+    try testing.expect(s.appendOf(h, id(100, 5)) == null);
+    try testing.expectEqual(stream_mod.answerBound(.{ .id = id(100, 0), .ual_index = 1, .partition_index = 0, .record_count = 3, .byte_len = 30 }), s.appendOf(h, id(100, 2)).?.answer_bytes);
+    _ = proj.trimStream(h, id(100, 0));
+    try testing.expect(s.appendOf(h, id(100, 1)) == null);
 }
 
 test "streams: a trim's removed-through is its last cut append's last record, and never goes back" {

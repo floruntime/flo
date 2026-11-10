@@ -346,7 +346,7 @@ export function StreamDetail({ name, onBack }: { name: string; onBack: () => voi
                       className="grow"
                       style={{ gridTemplateColumns: 'minmax(150px,1.6fr) 90px 90px 90px 130px', cursor: 'pointer', background: openGroup === g.name ? 'var(--hover)' : undefined }}
                       onClick={() => setOpenGroup(openGroup === g.name ? null : g.name)}
-                      title={`ack timeout ${g.ack_timeout_ms} ms · max deliver ${g.max_deliver || '∞'} · created ${tfmt(g.created_at)}`}
+                      title={`ack timeout ${g.ack_timeout_ms} ms · max deliver ${g.max_deliver} · created ${tfmt(g.created_at)}`}
                     >
                       <span style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
                         <Dot color={g.color} style={{ flex: 'none' }} />

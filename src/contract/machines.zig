@@ -8,6 +8,7 @@ pub const list = [_]machine.Machine{
     @import("../kv/machine.zig").machine,
     @import("../actions/machine.zig").machine,
     @import("../queue/machine.zig").machine,
+    @import("../stream/group_machine.zig").machine,
 };
 
 comptime {

@@ -296,13 +296,13 @@ test "e2e/dashboard: stream messages from a cursor inside an append return the r
     try testing.expect(std.mem.indexOf(u8, rest.body, "\"m-149\"") != null);
 }
 
-test "e2e/dashboard: a stream whose groups can't be listed has a detail that still parses, its groups null" {
+test "e2e/dashboard: a stream with the longest name lists its groups" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
         .server = .{ .dashboard_enabled = true },
     });
     defer ctx.deinit();
-    // A name of the longest a stream takes: its info answers, but a group
-    // key ("name\x00group") can't be formed, so the group list is refused.
+    // A name of the longest a stream takes: a group's keys hash its
+    // stream's name, so its groups list like any stream's.
     const name = try testing.allocator.alloc(u8, 4096);
     defer testing.allocator.free(name);
     @memset(name, 'x');
@@ -320,6 +320,6 @@ test "e2e/dashboard: a stream whose groups can't be listed has a detail that sti
         return err;
     };
     defer parsed.deinit();
-    try testing.expect(parsed.value.object.get("consumer_groups").? == .null);
+    try testing.expectEqual(@as(usize, 0), parsed.value.object.get("consumer_groups").?.array.items.len);
     try testing.expectEqual(@as(i64, 1), parsed.value.object.get("total_count").?.integer);
 }

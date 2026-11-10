@@ -132,6 +132,7 @@ pub const OpCode = enum(u16) {
 
     // ── Stream Consumer Groups (0x150 – 0x16F) ──────────────────────────────
     stream_group_create = 0x150,
+    /// Removed: refused, naming what replaces it.
     stream_group_join = 0x151,
     stream_group_leave = 0x152,
     stream_group_read = 0x153,
@@ -313,8 +314,10 @@ pub const OptionTag = enum(u8) {
     force = 0x2C, // void: Force a destructive op (e.g. delete a non-empty stream)
 
     // Consumer Group Options (0x30 - 0x3F)
-    ack_timeout_ms = 0x30, // u32: Time before unacked message auto-redelivers (overrides default)
-    max_deliver = 0x31, // u8: Max delivery attempts before DLQ (default: 10, 0=unlimited)
+    ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h; default 30 s)
+    max_deliver = 0x31, // u8: A group's attempts: a record is dead once nacked or expired this many times (default 5, 1 to 255)
+    dead = 0x32, // void: A nack dead-letters its records now
+    error_text = 0x33, // string: Why a nack's records failed
 
     // Worker/Action Options (0x40 - 0x4F)
 
