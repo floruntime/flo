@@ -51,6 +51,8 @@ pub const DurableLog = struct {
     pending_cut: ?u64 = null,
     /// The sorted listing, valid until the next flush or truncation.
     listing: ?[]SegmentFile = null,
+    /// Directory listings made, for tests.
+    listings: u64 = 0,
     /// The segment whose header would not read, when listing failed on it.
     bad_header: [128]u8 = undefined,
     bad_header_len: usize = 0,
@@ -126,8 +128,35 @@ pub const DurableLog = struct {
         // directory sync failed), so drop the cached listing.
         errdefer self.invalidate();
         try self.writer.writeToFile(self.segs_path);
+        const sealed: SegmentFile = .{
+            .first_index = self.writer.first_index,
+            .last_index = self.writer.last_index,
+            .commit_index_at_seal = commit_index,
+            .holds_skip = self.writer.holds_skip,
+            .path = "",
+        };
         self.writer.reset();
-        self.invalidate();
+        self.listSealed(sealed);
+    }
+
+    /// The segment just sealed, added to the cached listing rather than the
+    /// listing dropped: a read below the ring would otherwise list the
+    /// whole directory, opening every header, after every flush. Dropped
+    /// instead when it wouldn't sort last, which a flush above the log's end
+    /// never is.
+    fn listSealed(self: *DurableLog, sealed: SegmentFile) void {
+        const old = self.listing orelse return;
+        if (old.len > 0 and sealed.first_index <= old[old.len - 1].last_index) return self.invalidate();
+        var name_buf: [32]u8 = undefined;
+        const name = segment.segmentFilename(&name_buf, sealed.first_index) orelse return self.invalidate();
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.segs_path, name }) catch return self.invalidate();
+        const grown = self.allocator.realloc(old, old.len + 1) catch {
+            self.allocator.free(path);
+            return self.invalidate();
+        };
+        grown[old.len] = sealed;
+        grown[old.len].path = path;
+        self.listing = grown;
     }
 
     /// The highest commit index any sealed segment was flushed under: what
@@ -381,6 +410,7 @@ pub const DurableLog = struct {
     /// name is still recorded for `badHeaderSegment`). Caller frees with
     /// `freeSegments`.
     pub fn listSegments(self: *DurableLog, strict: bool) ![]SegmentFile {
+        self.listings += 1;
         var files: std.ArrayListUnmanaged(SegmentFile) = .empty;
         errdefer {
             for (files.items) |f| self.allocator.free(f.path);
@@ -1317,6 +1347,48 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
         const r = dl.readRange(1, &buf, &arena);
         try testing.expect(!r.blocked and r.count == 0);
     }
+}
+
+test "durable log: a flush adds its segment to the cached listing, so a read after it lists nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(real);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/segs", .{real});
+    defer testing.allocator.free(path);
+    try stdx.fs.makePath(path);
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, path);
+    defer dl.deinit();
+
+    const SEGMENTS = 2_000;
+    for (1..SEGMENTS + 1) |i| {
+        try writer.addEntry(&testEntry(i, 1, "v"));
+        try dl.flush(i);
+    }
+    _ = try dl.segments();
+    try testing.expectEqual(@as(u64, 1), dl.listings);
+    // One more segment sealed, then a read below the ring's lookup: the
+    // listing it finds is the cached one, grown by that segment.
+    try writer.addEntry(&testEntry(SEGMENTS + 1, 1, "v"));
+    try dl.flush(SEGMENTS + 1);
+    var buf: [512]u8 = undefined;
+    const t0 = stdx.time.monotonicNs();
+    const src = (try dl.sealedSource(SEGMENTS + 1, &buf)).?;
+    const first = (try dl.sealedSource(1, &buf)).?;
+    const took_us = (stdx.time.monotonicNs() - t0) / std.time.ns_per_us;
+    try testing.expectEqual(@as(u64, 1), dl.listings);
+    try testing.expectEqual(@as(u64, 1), src.limit);
+    try testing.expect(std.mem.endsWith(u8, first.path, "0000000001.flseg"));
+    // It matches a fresh listing.
+    const t1 = stdx.time.monotonicNs();
+    const fresh = try dl.listSegments(true);
+    const list_us = (stdx.time.monotonicNs() - t1) / std.time.ns_per_us;
+    defer dl.freeSegments(fresh);
+    try testing.expectEqual(fresh.len, (try dl.segments()).len);
+    try testing.expectEqual(fresh[fresh.len - 1].last_index, (try dl.segments())[fresh.len - 1].last_index);
+    std.debug.print("{d} segments: two lookups after a flush in {d} us, no listing; a full listing takes {d} us\n", .{ SEGMENTS + 1, took_us, list_us });
 }
 
 test "durable log: readBlockClass sorts a read error into resource, disk, or fault" {

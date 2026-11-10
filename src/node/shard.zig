@@ -13115,7 +13115,11 @@ const ColdStream = struct {
             const records, const result = handler.readReadable(w, buf);
             if (result != .pending) return .{ records, result };
             if (handler.held == .blocked) return error.Blocked;
-            while (!self.shard.stream_disk.?.drain()) @import("stdx").time.sleep(std.time.ns_per_ms);
+            var waited: usize = 0;
+            while (!self.shard.stream_disk.?.drain()) : (waited += 1) {
+                if (waited == 2_000) return error.NeverLanded;
+                @import("stdx").time.sleep(std.time.ns_per_ms);
+            }
         }
         return error.NeverServed;
     }
@@ -13183,6 +13187,80 @@ test "Shard: a cold walk of a stream interleaved with another reads every record
     const reads = c.shard.stream_disk.?.reads_made;
     std.debug.print("cold walk: {d} records in {d} reads\n", .{ served, reads });
     try std.testing.expect(reads > 0 and reads * 10 <= served);
+}
+
+/// A group request on `c`, sent again while it is refused retryable, with
+/// the shard's disk reads landed between tries; the answer in `buf`. Up to
+/// 10 s: past the pins (5 s) that may hold a full cache.
+fn untilServed(c: *ColdStream, conn: *Connection, fd: std.posix.fd_t, buf: []u8, op: proto.OpCode, id: u64, value: []const u8, options: []const u8) !proto.Response {
+    for (0..2_000) |_| {
+        c.shard.runRequest(conn, try ParkTest.request(op, id, "", "s", value, options), .client);
+        // A group read's delivery is logged: answered once it applies.
+        _ = c.shard.applyCommitted();
+        var one: [1]proto.Response = undefined;
+        try ParkTest.responses(&c.shard, conn, fd, buf, &one);
+        if (one[0].header.status != @backingInt(proto.StatusCode.unavailable)) return one[0];
+        _ = c.shard.stream_disk.?.drain();
+        @import("stdx").time.sleep(5 * std.time.ns_per_ms);
+    }
+    return error.NeverServed;
+}
+
+test "Shard: a cold group read and claim deliver and claim only what their reply carries" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 60, 0, 10);
+    defer c.deinit();
+    const d = c.shard.stream_disk.?;
+    // Small, so a landing holds a few records: replies are true prefixes,
+    // and served ones are evicted.
+    d.cache_budget = 4096;
+    var all: [60]stream_mod.StreamRecord = undefined;
+    const name_hash = node_router.nameHash(node_router.namespaceHash(""), "s");
+    try std.testing.expectEqual(@as(usize, 60), c.shard.stream_handler.stream.readStreamAfter(name_hash, StreamID.MIN, null, &all));
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    // Room for a whole answer: flushing one into a full socket waits on a
+    // reader that only reads once the flush returns.
+    const room: c_int = 1 << 20;
+    _ = std.c.setsockopt(pair[0], std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&room), @sizeOf(c_int));
+    _ = std.c.setsockopt(pair[1], std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&room), @sizeOf(c_int));
+    const conn = try c.shard.addConnection(pair[0]);
+    var buf: [1 << 18]u8 = undefined;
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.count, 20);
+    const c1 = "\x01\x00" ++ "g" ++ "\x02\x00" ++ "c1";
+
+    // Each group read delivers what its reply carries, a prefix, and the
+    // next one starts right after it: nothing delivered past the reply.
+    var delivered: usize = 0;
+    var id: u64 = 1;
+    while (delivered < 30) : (id += 1) {
+        const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_read, id, c1, ob.getOptions());
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+        const n = std.mem.readInt(u32, r.data[0..4], .little);
+        try std.testing.expect(n > 0 and n < 20);
+        try std.testing.expectEqual(all[delivered].id.sequence, std.mem.readInt(u64, r.data[4..12], .little));
+        try std.testing.expectEqual(all[delivered].id.timestamp_ms, std.mem.readInt(u64, r.data[12..20], .little));
+        delivered += n;
+    }
+    try std.testing.expect(!d.cache.contains(all[0].ual_index));
+
+    // c2 claims c1's, cold: only the entries its reply carries are claimed.
+    var claim_buf: [2 + 1 + 2 + 2 + 4 + 8 + 8 + 4]u8 = undefined;
+    @memcpy(claim_buf[0..7], "\x01\x00" ++ "g" ++ "\x02\x00" ++ "c2");
+    @memset(claim_buf[7..27], 0);
+    std.mem.writeInt(u32, claim_buf[27..31], 30, .little);
+    const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_claim, id, &claim_buf, "");
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
+    const answered = std.mem.readInt(u32, r.data[0..4], .little);
+    try std.testing.expect(answered > 0 and answered < delivered);
+    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    const group = try @import("../namespace/handler.zig").qualifyGroupKey(&qbuf, "", "s", "g");
+    var pending: [64]stream_mod.PendingEntry = undefined;
+    try std.testing.expectEqual(@as(usize, answered), try c.shard.stream_handler.stream.groupPending(group, "c2", &pending));
 }
 
 test "Shard: a stream read whose disk read is blocked is refused at once, not held" {

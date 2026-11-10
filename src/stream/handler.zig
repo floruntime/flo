@@ -1907,6 +1907,16 @@ pub const StreamHandler = struct {
         /// The StreamID each payload came from, parallel to `payloads`.
         ids: []const StreamID,
         last_id: StreamID,
+        /// Payloads copied out of another shard's disk cache, which some of
+        /// `payloads` point into.
+        copies: []const []u8 = &.{},
+
+        pub fn deinit(self: PayloadRead, allocator: Allocator) void {
+            allocator.free(self.payloads);
+            allocator.free(self.ids);
+            for (self.copies) |c| allocator.free(c);
+            allocator.free(self.copies);
+        }
     };
 
     pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) PayloadRead {
@@ -1925,6 +1935,10 @@ pub const StreamHandler = struct {
         const n = stream_mod.wholeEntriesWithin(rec_buf[0..read_n], capped);
 
         var last_id = after_id;
+        // A job on another shard's thread reads this shard's hot ring and
+        // warm store, and copies from its disk cache; the disk reads it needs
+        // are asked of this shard, and it reads again on its next poll.
+        if (self.disk) |d| if (!d.isOwner()) return self.readPayloadsElsewhere(d, rec_buf[0..n], name_hash, after_id);
         self.beginRead();
         self.disk_window.name_hash = name_hash;
         // The payloads are good until the shard's next tick lands disk reads,
@@ -1961,6 +1975,72 @@ pub const StreamHandler = struct {
         @memcpy(out, results[0..count]);
         @memcpy(ids, result_ids[0..count]);
         return .{ .payloads = out, .ids = ids, .last_id = last_id };
+    }
+
+    /// `readPayloadsForStream` from a thread other than this shard's: it
+    /// touches no state of this handler, and takes from the disk cache only
+    /// copies.
+    fn readPayloadsElsewhere(self: *StreamHandler, d: *disk_reads.DiskReads, records: []const StreamRecord, name_hash: u64, after_id: StreamID) PayloadRead {
+        const nothing: PayloadRead = .{ .payloads = &.{}, .ids = &.{}, .last_id = after_id };
+        var results: [MAX_READ_BATCH][]const u8 = undefined;
+        var result_ids: [MAX_READ_BATCH]StreamID = undefined;
+        var copies: [MAX_READ_BATCH][]u8 = undefined;
+        var n_copies: usize = 0;
+        var count: usize = 0;
+        var last_id = after_id;
+        for (records, 0..) |rec, i| {
+            var payload = self.hotOrWarm(rec.ual_index);
+            if (payload == null) if (d.copyFor(rec.ual_index, self.allocator)) |copy| {
+                copies[n_copies] = copy;
+                n_copies += 1;
+                if (entry_mod.CommandPayload.deserialize(copy)) |cmd| payload = stream_mod.decodeAppendValue(cmd.value).payload;
+            } else if (!d.isGone(rec.ual_index)) {
+                // Not here yet: stop before it, and have it fetched.
+                d.askFor(.{ .name_hash = name_hash, .from = rec.ual_index, .limit = @intCast(records.len - i) });
+                break;
+            };
+            var it = if (payload) |p| stream_mod.BatchIterator.init(p) catch null else null;
+            if (it) |*batch| {
+                var j: u64 = 0;
+                while (batch.next()) |br| : (j += 1) {
+                    if (!recordId(rec, j).greaterThan(after_id)) continue;
+                    results[count] = br.payload;
+                    result_ids[count] = recordId(rec, j);
+                    count += 1;
+                }
+            }
+            last_id = stream_mod.lastRecordOf(rec);
+        }
+        const out = self.allocator.alloc([]const u8, count) catch {
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        const ids = self.allocator.alloc(StreamID, count) catch {
+            self.allocator.free(out);
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        const kept = self.allocator.alloc([]u8, n_copies) catch {
+            self.allocator.free(out);
+            self.allocator.free(ids);
+            for (copies[0..n_copies]) |c| self.allocator.free(c);
+            return nothing;
+        };
+        @memcpy(out, results[0..count]);
+        @memcpy(ids, result_ids[0..count]);
+        @memcpy(kept, copies[0..n_copies]);
+        return .{ .payloads = out, .ids = ids, .last_id = last_id, .copies = kept };
+    }
+
+    /// A record's payload from the hot ring or the warm store, or null.
+    fn hotOrWarm(self: *StreamHandler, ual_index: u64) ?[]const u8 {
+        if (self.partition.ual.read(ual_index)) |ual_entry| {
+            if (ual_entry.commandPayload()) |cmd| return stream_mod.decodeAppendValue(cmd.value).payload;
+        }
+        if (self.partition.readPayloadWarm(ual_index)) |raw| {
+            if (entry_mod.CommandPayload.deserialize(raw)) |cmd| return stream_mod.decodeAppendValue(cmd.value).payload;
+        }
+        return null;
     }
 
     /// A record's payload by its log index: from the hot ring (zero-copy),

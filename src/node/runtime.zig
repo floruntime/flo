@@ -1413,6 +1413,9 @@ const ShardBoot = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn shardThread(shard: *Shard) void {
+    // From here only this thread asks, lands and evicts in the shard's disk
+    // cache; other threads copy out of it.
+    if (shard.stream_disk) |d| d.owner = std.Thread.getCurrentId();
     shard.run() catch {};
 }
 

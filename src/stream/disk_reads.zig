@@ -16,6 +16,12 @@
 //! An entry landed for a reader is pinned until it has been served or
 //! `PIN_MS` passes, so later landings don't evict it before the reader that
 //! asked is made again. Each is checked against the log's terms first.
+//!
+//! Only the owning shard's thread asks, lands and evicts. Another shard's
+//! thread (a processing job, a stream trigger reading the stream it watches)
+//! may only copy a cached payload out (`copyFor`), under `mutex`, and ask
+//! the owner to fetch one (`askFor`); its read stops there and it reads
+//! again on its next poll.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -36,8 +42,8 @@ pub const READ_ENTRIES = 256;
 pub const READ_BYTES = 1024 * 1024;
 pub const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024;
 /// Pinned entries may take the cache past its budget up to this many times
-/// it; past that a landing caches no more, and its readers ask again once
-/// pins are released.
+/// it. Past that a landing caches no more, and reads that need what it
+/// dropped are refused retryable for `BACKOFF_MS` rather than read again.
 pub const PINNED_BUDGET_TIMES = 4;
 /// How long a landed entry is kept for the reader that asked, if unserved.
 pub const PIN_MS: u64 = 5_000;
@@ -109,6 +115,20 @@ pub const DiskReads = struct {
     cache_bytes: usize = 0,
     cache_budget: usize = DEFAULT_CACHE_BYTES,
 
+    /// Held by `drain` while it lands and evicts, and by any read of the
+    /// cache from a thread other than the owner's.
+    mutex: stdx.Mutex = .{},
+    /// The owning shard's thread, once it runs; null in tests, where every
+    /// caller is the owner.
+    owner: ?std.Thread.Id = null,
+    /// Windows other threads asked for, taken by the owner's next drain.
+    asked: [MAX_WANTS]Window = undefined,
+    n_asked: usize = 0,
+    /// Indices other threads asked for that the durable log doesn't hold
+    /// (below its first segment), so their next read skips them.
+    gone: [MAX_WANTS]u64 = @splat(0),
+    gone_next: usize = 0,
+
     blocked_until_ms: u64 = 0,
     /// Reads that came back blocked, results dropped for not matching the
     /// log, and entries a full cache couldn't take.
@@ -138,17 +158,60 @@ pub const DiskReads = struct {
         self.order.deinit(self.allocator);
     }
 
+    /// Whether the calling thread is the owning shard's.
+    pub fn isOwner(self: *const DiskReads) bool {
+        const o = self.owner orelse return true;
+        return o == std.Thread.getCurrentId();
+    }
+
     /// The raw entry payload at `index`, as the warm store keeps it, and
-    /// served: no longer pinned. Valid until the next `drain`.
+    /// served: no longer pinned. Valid until the next `drain`. The owner's
+    /// thread only.
     pub fn get(self: *DiskReads, index: u64) ?[]const u8 {
+        std.debug.assert(self.isOwner());
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const c = self.cache.getPtr(index) orelse return null;
         c.pinned_until_ms = 0;
         return c.payload;
     }
 
+    /// For another shard's thread: a copy of the cached payload at `index`,
+    /// the caller's to free, or null.
+    pub fn copyFor(self: *DiskReads, index: u64, allocator: std.mem.Allocator) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const c = self.cache.get(index) orelse return null;
+        return allocator.dupe(u8, c.payload) catch null;
+    }
+
+    /// For another shard's thread: whether the owner found `index` not in
+    /// the durable log when asked for it.
+    pub fn isGone(self: *DiskReads, index: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.gone) |g| if (g == index and g != 0) return true;
+        return false;
+    }
+
+    /// For another shard's thread: ask the owner to fetch window `w` on its
+    /// next tick.
+    pub fn askFor(self: *DiskReads, w: Window) void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.asked[0..self.n_asked]) |have| if (have.name_hash == w.name_hash and have.from == w.from) return;
+            if (self.n_asked == MAX_WANTS) return;
+            self.asked[self.n_asked] = w;
+            self.n_asked += 1;
+        }
+        if (self.notify) |n| n.done(n.ctx);
+    }
+
     /// Ask for the entry at `index`, for a reader of window `w`. Never lands
     /// or evicts anything: a payload `get` returned stays valid.
     pub fn want(self: *DiskReads, index: u64, w: Window) Want {
+        std.debug.assert(self.isOwner());
         const now = self.now_fn();
         if (now < self.blocked_until_ms) return .blocked;
         for (&self.slots) |*s| {
@@ -210,6 +273,25 @@ pub const DiskReads = struct {
     /// landed or came back, so held reads are made again. Called between
     /// requests: it may evict.
     pub fn drain(self: *DiskReads) bool {
+        std.debug.assert(self.isOwner());
+        // What other threads asked for is fetched as the owner's own want.
+        var asked: [MAX_WANTS]Window = undefined;
+        const n_asked = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const n = self.n_asked;
+            @memcpy(asked[0..n], self.asked[0..n]);
+            self.n_asked = 0;
+            break :blk n;
+        };
+        for (asked[0..n_asked]) |w| if (self.want(w.from, w) == .absent) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.gone[self.gone_next % MAX_WANTS] = w.from;
+            self.gone_next += 1;
+        };
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var any = false;
         for (&self.slots) |*s| {
             if (s.read.state.load(.acquire) != .done) continue;
@@ -288,6 +370,7 @@ pub const DiskReads = struct {
         self.evict(now, e.payload.len);
         if (self.cache_bytes + e.payload.len > self.cache_budget * PINNED_BUDGET_TIMES) {
             self.over_budget += 1;
+            _ = self.blocked(now);
             return;
         }
         const copy = self.allocator.dupe(u8, e.payload) catch return;
@@ -436,7 +519,10 @@ test "stream disk reads: one read lands a reader's whole window, its stream's en
     // Asked again inside the read in flight: no second read.
     try testing.expectEqual(Want.pending, d.want(3, a));
     try done.waitFor(1);
-    // Back, but not landed until drain: nothing changes mid-request.
+    // Back, but not landed until drain, whatever is asked meanwhile: a
+    // request's payloads are never evicted under it.
+    try testing.expectEqual(Want.pending, d.want(5, a));
+    try testing.expectEqual(@as(u32, 0), d.cache.count());
     try testing.expect(d.get(1) == null);
     try testing.expect(d.drain());
     try testing.expect(d.get(1) != null and d.get(3) != null and d.get(5) != null);
