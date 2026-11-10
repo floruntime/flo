@@ -7,8 +7,13 @@
 //!   deliver applies, with the messages and their delivery's token, which a
 //!   complete, fail or touch names back. Delivery is at least once: a
 //!   lease that runs out readies its messages again.
-//! - A message failed or expired `MAX_ATTEMPTS` times is dead, kept for
-//!   listing until its queue holds `MAX_DEAD` dead.
+//! - A message failed or expired `MAX_ATTEMPTS` times is dead, kept until
+//!   its queue is purged.
+//! - A queue holds at most its cap of messages and held bytes, ready,
+//!   leased and dead, and a shard's queues their cap of bytes: past one, an
+//!   enqueue is refused `overloaded`. The leader stamps its caps (`Caps`,
+//!   `[queues]` in flo.toml) into the entry and apply decides against them,
+//!   so every replica agrees whatever its own settings.
 //! - Messages go by priority (lowest first), then the time they became
 //!   ready, then seq.
 
@@ -170,8 +175,31 @@ fn countDue(shard: *Shard, ns: NamespaceId, hash: [8]u8, now: u64, enough: u32) 
     return n;
 }
 
+/// What a queue, and a shard's queues, may hold: this node's `[queues]`
+/// settings, stamped into each enqueue it proposes.
+pub const Caps = struct {
+    max_messages: u32 = qe.DEFAULT_MAX_MESSAGES,
+    max_bytes: u64 = qe.DEFAULT_MAX_BYTES,
+    shard_held_bytes: u64 = qe.DEFAULT_SHARD_HELD_BYTES,
+
+    pub fn eql(a: Caps, b: Caps) bool {
+        return a.max_messages == b.max_messages and a.max_bytes == b.max_bytes and a.shard_held_bytes == b.shard_held_bytes;
+    }
+};
+
+/// An enqueue under `caps`.
+pub fn enqueueValue(caps: Caps, ns: NamespaceId, name: []const u8, priority: u32, delay_ms: u64, payload: []const u8) qe.Enqueue.Value {
+    return .{ .ns = ns.int(), .queue = name, .priority = priority, .delay_ms = delay_ms, .payload = payload, .max_messages = caps.max_messages, .max_bytes = caps.max_bytes, .shard_held_bytes = caps.shard_held_bytes };
+}
+
 pub const QueueHandler = struct {
     allocator: Allocator,
+
+    /// This node's caps, set by the runtime from its settings.
+    caps: Caps = .{},
+    /// The leader's caps last seen to differ from `caps`, so the warning
+    /// is said once per difference, not per enqueue.
+    mismatch_seen: ?Caps = null,
 
     /// The owning shard, set by `Shard.wireHandlerShardPtrs`.
     shard_ptr: ?*anyopaque = null,
@@ -391,7 +419,7 @@ pub const QueueHandler = struct {
         return self.handleEnqueue(shard, req);
     }
 
-    fn handleEnqueue(_: *QueueHandler, shard: *Shard, req: Request) CommandResult {
+    fn handleEnqueue(self: *QueueHandler, shard: *Shard, req: Request) CommandResult {
         if (req.key.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "queue name is required" } };
         if (req.value.len > qe.MAX_MESSAGE) return .{ .err = .{ .code = .invalid_request, .message = "message too large: a queue message holds at most 64 KiB" } };
         if (req.key.len > qe.QueueName.max_size) return .{ .err = .{ .code = .invalid_request, .message = "queue name too long" } };
@@ -403,7 +431,7 @@ pub const QueueHandler = struct {
         // published, or on shard 0 proposed ahead of this write.
         const ns = shard.namespaceId(req.namespace);
         if (ns == .invalid) return .{ .err = persistence_mod.failureError(error.NamespaceUnknown, "enqueue not persisted") };
-        const proposed = propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = ns.int(), .queue = req.key, .priority = priority, .delay_ms = delay_ms, .payload = req.value }) catch |err| {
+        const proposed = propose(shard, .queue_enqueue, enqueueValue(self.caps, ns, req.key, priority, delay_ms, req.value)) catch |err| {
             return .{ .err = persistence_mod.failureError(err, "enqueue not persisted") };
         };
         return .{ .parked = proposed };
@@ -947,9 +975,10 @@ pub const QueueHandler = struct {
         switch (etype) {
             .queue_deliver => if (leads) self.deliverApplied(shard, e, result),
             .queue_settle => if (leads) self.ackApplied(shard, e, result),
-            .queue_enqueue => if (leads and result.refused() == null) {
+            .queue_enqueue => {
                 const p = qe.Enqueue.decodeAll(e.payload, &diag) catch return;
-                self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
+                self.checkCaps(shard, p);
+                if (leads and result.refused() == null) self.wakeQueue(shard, .of(p.ns), machine.hashOf(p.queue));
             },
             .queue_release => if (leads and result.refused() == null) {
                 const p = qe.Release.decodeAll(e.payload, &diag) catch return;
@@ -964,6 +993,18 @@ pub const QueueHandler = struct {
             },
             else => {},
         }
+    }
+
+    /// An enqueue applied under caps other than this node's: counted, and
+    /// said once per difference. The entry's caps govern, as they must for
+    /// every replica to agree.
+    fn checkCaps(self: *QueueHandler, shard: *Shard, p: qe.Enqueue.Value) void {
+        const theirs: Caps = .{ .max_messages = p.max_messages, .max_bytes = p.max_bytes, .shard_held_bytes = p.shard_held_bytes };
+        if (theirs.eql(self.caps)) return;
+        if (shard.metrics_registry) |mr| mr.server.recordQueueCapMismatch();
+        if (self.mismatch_seen) |seen| if (seen.eql(theirs)) return;
+        self.mismatch_seen = theirs;
+        log.warn("shard {d}: an enqueue applied under the leader's queue caps (max_messages {d}, max_bytes {d}, shard_held_bytes {d}), not this node's [queues] settings (max_messages {d}, max_bytes {d}, shard_held_bytes {d}); the leader's govern. Set the same caps on every node; a node restarted with changed caps also warns as it applies entries proposed under its old ones.", .{ shard.id, theirs.max_messages, theirs.max_bytes, theirs.shard_held_bytes, self.caps.max_messages, self.caps.max_bytes, self.caps.shard_held_bytes });
     }
 
     // ── The expire duty, and leadership ─────────────────────────────────
@@ -1089,14 +1130,14 @@ fn sendQueueResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_resu
 // For tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// An enqueue's payload, encoded into `buf`.
+/// An enqueue's payload at the default caps, encoded into `buf`.
 pub fn enqueuePayload(buf: []u8, ns: NamespaceId, name: []const u8, payload: []const u8) []const u8 {
-    return qe.Enqueue.encodeInto(buf, .{ .ns = ns.int(), .queue = name, .priority = 0, .delay_ms = 0, .payload = payload }) catch unreachable;
+    return qe.Enqueue.encodeInto(buf, enqueueValue(.{}, ns, name, 0, 0, payload)) catch unreachable;
 }
 
 /// Propose an enqueue to the default namespace's queue `name`.
 pub fn proposeEnqueue(shard: *Shard, name: []const u8, payload: []const u8) !persistence_mod.ProposeResult {
-    return propose(shard, .queue_enqueue, qe.Enqueue.Value{ .ns = NamespaceId.default.int(), .queue = name, .priority = 0, .delay_ms = 0, .payload = payload });
+    return propose(shard, .queue_enqueue, enqueueValue(shard.queue_handler.caps, .default, name, 0, 0, payload));
 }
 
 /// A message in the default namespace's queue `name`, put straight into

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const limits = @import("../protocol/limits.zig");
+const qe = @import("../protocol/queue_entries.zig");
 const log = @import("stdx").log;
 const Allocator = std.mem.Allocator;
 const toml = @import("toml.zig");
@@ -67,6 +68,17 @@ pub const KvConfig = struct {
     max_txn_bytes: u32 = limits.DEFAULT_MAX_BYTES_PER_TXN,
 };
 
+/// What queues may hold, on this node when it leads; the leader's govern.
+pub const QueuesConfig = struct {
+    /// Messages one queue may hold, ready, leased and dead.
+    max_messages: u32 = qe.DEFAULT_MAX_MESSAGES,
+    /// Bytes one queue may hold, likewise: each message's payload, error
+    /// text and 512 bytes besides.
+    max_bytes: u64 = qe.DEFAULT_MAX_BYTES,
+    /// Bytes all of a shard's queues may hold together, counted the same.
+    shard_held_bytes: u64 = qe.DEFAULT_SHARD_HELD_BYTES,
+};
+
 /// Server configuration loaded from flo.toml
 pub const ServerConfig = struct {
     // [server] section
@@ -102,6 +114,7 @@ pub const ServerConfig = struct {
 
     // [kv] section
     kv: KvConfig = .{},
+    queues: QueuesConfig = .{},
 
     // [admin] section: where the admin socket listens; null for admin.sock
     // in the data dir.
@@ -185,6 +198,7 @@ pub const ServerConfig = struct {
             .missing_action_wait_ms = self.workflows.missing_action_wait_ms,
             .max_txn_ops = self.kv.max_txn_ops,
             .max_txn_bytes = self.kv.max_txn_bytes,
+            .queue_caps = .{ .max_messages = self.queues.max_messages, .max_bytes = self.queues.max_bytes, .shard_held_bytes = self.queues.shard_held_bytes },
         };
     }
 
@@ -261,6 +275,11 @@ const sections = [_]Section{
     .{ .name = "kv", .keys = &.{
         .{ .name = "max_txn_ops", .kind = .integer, .min = 1, .max = limits.MAX_OPS_PER_TXN },
         .{ .name = "max_txn_bytes", .kind = .integer, .min = 1, .max = limits.MAX_PAYLOAD_PER_TXN },
+    } },
+    .{ .name = "queues", .keys = &.{
+        .{ .name = "max_messages", .kind = .integer, .min = 1, .max = qe.MAX_MAX_MESSAGES },
+        .{ .name = "max_bytes", .kind = .integer, .min = qe.MAX_MESSAGE, .max = qe.MAX_MAX_BYTES },
+        .{ .name = "shard_held_bytes", .kind = .integer, .min = qe.MAX_MESSAGE, .max = qe.MAX_SHARD_HELD_BYTES },
     } },
     .{ .name = "workers", .keys = &.{
         .{ .name = "heartbeat_timeout_ms", .kind = .integer, .min = 1000 },
@@ -481,6 +500,13 @@ pub fn load(allocator: Allocator, path: []const u8) !ServerConfig {
     if (table.getTable("kv")) |kv| {
         if (kv.getInt("max_txn_ops")) |n| config.kv.max_txn_ops = @intCast(n);
         if (kv.getInt("max_txn_bytes")) |n| config.kv.max_txn_bytes = @intCast(n);
+    }
+
+    // Parse [queues] section
+    if (table.getTable("queues")) |q| {
+        if (q.getInt("max_messages")) |n| config.queues.max_messages = @intCast(n);
+        if (q.getInt("max_bytes")) |n| config.queues.max_bytes = @intCast(n);
+        if (q.getInt("shard_held_bytes")) |n| config.queues.shard_held_bytes = @intCast(n);
     }
 
     // Parse [workers] section
@@ -760,6 +786,17 @@ pub fn generateDefaultConfig() []const u8 {
     \\# max_txn_ops = 64
     \\# max_txn_bytes = 262144
     \\
+    \\[queues]
+    \\# What one queue may hold, ready, leased and dead together: messages, up
+    \\# to 16777216, and held bytes, up to 1 GiB. And the held bytes all of a
+    \\# shard's queues may hold, up to 64 GiB. A message holds its payload, its
+    \\# error text and 512 bytes besides. Every replica holds every
+    \\# message in memory. Past a cap an enqueue is refused, overloaded; nothing
+    \\# held is dropped. Set the same values on every node: the leader's decide.
+    \\# max_messages = 100000
+    \\# max_bytes = 268435456
+    \\# shard_held_bytes = 1073741824
+    \\
     ;
 }
 
@@ -770,6 +807,15 @@ test "a transaction's limits default to 64 ops and 256 KiB, and reach the runtim
     const runtime = config.toRuntimeConfig();
     try std.testing.expectEqual(@as(u16, 64), runtime.max_txn_ops);
     try std.testing.expectEqual(@as(u32, 262144), runtime.max_txn_bytes);
+}
+
+test "queue caps default to 100,000 messages, 256 MiB a queue and 1 GiB a shard, and reach the runtime" {
+    var config = ServerConfig.init(std.testing.allocator);
+    defer config.deinit();
+    const runtime = config.toRuntimeConfig();
+    try std.testing.expectEqual(@as(u32, 100_000), runtime.queue_caps.max_messages);
+    try std.testing.expectEqual(@as(u64, 256 << 20), runtime.queue_caps.max_bytes);
+    try std.testing.expectEqual(@as(u64, 1 << 30), runtime.queue_caps.shard_held_bytes);
 }
 
 test "load default config" {
@@ -898,6 +944,10 @@ test "config: what flo.toml can't hold is refused, not ignored" {
         .{ .body = "[kv]\nmax_txn_ops = 257\n", .err = error.InvalidSetting },
         .{ .body = "[kv]\nmax_txn_bytes = 0\n", .err = error.InvalidSetting },
         .{ .body = "[kv]\nmax_txn_bytes = 1048577\n", .err = error.InvalidSetting },
+        .{ .body = "[queues]\nmax_messages = 0\n", .err = error.InvalidSetting },
+        .{ .body = "[queues]\nmax_messages = 16777217\n", .err = error.InvalidSetting },
+        .{ .body = "[queues]\nmax_bytes = 1073741825\n", .err = error.InvalidSetting },
+        .{ .body = "[queues]\nshard_held_bytes = 1024\n", .err = error.InvalidSetting },
         .{ .body = "[workers]\nheartbeat_timeout_ms = 10\n", .err = error.InvalidSetting },
         .{ .body = "[workers]\nheartbeat_timeout_ms = 5000\nremove_after_ms = 2000\n", .err = error.InvalidSetting },
     }) |c| {
@@ -952,6 +1002,26 @@ test "config: [workflows] missing_action_wait_ms reaches the runtime config, and
     var defaults = ServerConfig.init(allocator);
     defer defaults.deinit();
     try std.testing.expectEqual(@as(u64, 600_000), defaults.toRuntimeConfig().missing_action_wait_ms);
+}
+
+test "config: [queues] caps reach the runtime config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try @import("stdx").fs.dirRealpathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/flo.toml", .{dir});
+    defer allocator.free(path);
+
+    const f = try @import("stdx").fs.createFileAbsolute(path, .{ .truncate = true });
+    try @import("stdx").fs.writeAll(f, "[queues]\nmax_messages = 3\nmax_bytes = 70000\nshard_held_bytes = 80000\n");
+    @import("stdx").fs.closeFile(f);
+    var set = try load(allocator, path);
+    defer set.deinit();
+    const caps = set.toRuntimeConfig().queue_caps;
+    try std.testing.expectEqual(@as(u32, 3), caps.max_messages);
+    try std.testing.expectEqual(@as(u64, 70000), caps.max_bytes);
+    try std.testing.expectEqual(@as(u64, 80000), caps.shard_held_bytes);
 }
 
 test "config: [server] max_connections reaches the runtime config, and defaults to 0 (auto)" {

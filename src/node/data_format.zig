@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 12;
+pub const CURRENT: u32 = 13;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -44,6 +44,9 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A run's first step is logged: a log from before holds runs that took
     // theirs unlogged, which replay here would take again.
     .{ .format = 12, .segment_version = 8, .entries = 0xd744c48806095be5 },
+    // An enqueue carries its leader's queue caps; dead letters are no
+    // longer evicted.
+    .{ .format = 13, .segment_version = 9, .entries = 0x360066e8135ecf4c },
 };
 
 comptime {
