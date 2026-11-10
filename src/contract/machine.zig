@@ -9,6 +9,7 @@ const entry_mod = @import("../storage/ual/entry.zig");
 const persistence = @import("../storage/persistence.zig");
 const store_mod = @import("store.zig");
 const view_mod = @import("view.zig");
+const Streams = @import("streams.zig").Streams;
 
 const EntryType = entry_mod.EntryType;
 const Entry = entry_mod.Entry;
@@ -82,11 +83,17 @@ pub fn families(comptime machines: []const Machine) []const FamilyInfo {
 /// unless it was refused or failed. `scratch` holds the entry's staged
 /// bytes and is reset first.
 pub fn applyEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, e: *const Entry, out: *persistence.Result) ApplyError!void {
+    return applyEntryWith(m, store, scratch, null, e, out);
+}
+
+/// `applyEntry`, with the shard's streams readable through the view.
+pub fn applyEntryWith(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry, out: *persistence.Result) ApplyError!void {
     _ = scratch.reset(.retain_capacity);
     const arena = scratch.allocator();
     var keys = view_mod.KeySet.init(arena);
     try m.keys(e, &keys);
     var view = view_mod.View.init(store, arena, &keys);
+    view.streams_read = streams;
     try m.apply(&view, e, out);
     if (out.refused() != null) return;
     try view.commit();

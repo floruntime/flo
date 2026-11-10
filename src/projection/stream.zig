@@ -329,8 +329,10 @@ pub const StreamState = struct {
     first_id: StreamID,
     /// Last record ID (or MIN if empty).
     last_id: StreamID,
-    /// Trim threshold — records at or below this are considered trimmed.
-    trim_id: StreamID,
+    /// The last record a trim removed, never lowered: a trim cuts whole
+    /// appends, so this is the last record of the last append it cut, which
+    /// can lie past the trim's own bound. MIN until a trim removes one.
+    removed_through: StreamID,
     /// Stream name hash (for cross-referencing).
     name_hash: u64,
     /// Running sum of `record_count` over live entries — the logical record
@@ -345,7 +347,7 @@ pub const StreamState = struct {
             .records = .empty,
             .first_id = StreamID.MIN,
             .last_id = StreamID.MIN,
-            .trim_id = StreamID.MIN,
+            .removed_through = StreamID.MIN,
             .name_hash = name_hash,
             .total_records = 0,
             .total_bytes = 0,
@@ -419,6 +421,25 @@ pub const StreamState = struct {
         if (i > 0 and lastRecordOf(items[i - 1]).greaterThan(after_id)) i -= 1;
         while (i < items.len and !lastRecordOf(items[i]).greaterThan(after_id)) : (i += 1) {}
         return i;
+    }
+
+    /// The ids of the records after `after_id`, one per record, oldest
+    /// first: an append's records are its first id's sequence onwards.
+    pub fn idsAfter(self: *const StreamState, after_id: StreamID, out: []StreamID) usize {
+        const items = self.records.items;
+        var n: usize = 0;
+        var i = self.firstAfter(after_id);
+        while (i < items.len and n < out.len) : (i += 1) {
+            const rec = items[i];
+            var k: u32 = 0;
+            while (k < rec.record_count and n < out.len) : (k += 1) {
+                const id: StreamID = .{ .timestamp_ms = rec.id.timestamp_ms, .sequence = rec.id.sequence + k };
+                if (!id.greaterThan(after_id)) continue;
+                out[n] = id;
+                n += 1;
+            }
+        }
+        return n;
     }
 
     /// Read the entries holding records after `after_id` (exclusive).
@@ -502,10 +523,9 @@ pub const StreamState = struct {
         const extent = self.trimExtent(up_to_id);
         const cut = extent.entries;
 
-        if (cut == 0) {
-            self.trim_id = up_to_id;
-            return 0;
-        }
+        if (cut == 0) return 0;
+        const removed_last = lastRecordOf(items[cut - 1]);
+        if (removed_last.greaterThan(self.removed_through)) self.removed_through = removed_last;
 
         // Drop the trimmed entries from the running totals before shifting.
         for (items[0..cut]) |rec| {
@@ -520,7 +540,6 @@ pub const StreamState = struct {
         }
         self.records.items.len = remaining;
 
-        self.trim_id = up_to_id;
         if (remaining > 0) {
             self.first_id = self.records.items[0].id;
         } else {
@@ -1280,6 +1299,18 @@ pub const StreamProjection = struct {
     pub fn streamFirstId(self: *const StreamProjection, name_hash: u64) StreamID {
         const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
         return ss.first_id;
+    }
+
+    /// The last record a trim removed from a stream (`StreamState.removed_through`).
+    pub fn streamRemovedThrough(self: *const StreamProjection, name_hash: u64) StreamID {
+        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+        return ss.removed_through;
+    }
+
+    /// The ids of a stream's records after `after_id`, one per record.
+    pub fn streamIdsAfter(self: *const StreamProjection, name_hash: u64, after_id: StreamID, out: []StreamID) usize {
+        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        return ss.idsAfter(after_id, out);
     }
 
     /// Get the record count for a stream.
