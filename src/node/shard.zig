@@ -4669,7 +4669,7 @@ pub const Shard = struct {
 
     /// Apply one committed entry to this shard's state and wake whoever was
     /// waiting on it. A leader, a follower and boot replay all run the same
-    /// core (`applyEntryCoreWith`), so the three can never disagree about
+    /// core (`applyEntryCore`), so the three can never disagree about
     /// what an entry means; only the live paths notify. False when the
     /// partition refused the entry.
     /// Apply one committed entry and tell its waiters. False, counted and
@@ -7355,6 +7355,13 @@ fn routedToProjection(etype: entry_mod.EntryType) bool {
 /// actions', queues'), then the registry appliers for every other entry
 /// type.
 pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
+    return applyEntryCoreWith(&contract_machines.list, partition, registry, entry, out);
+}
+
+/// `applyEntryCore` over `machines`. A machine reads the partition's
+/// streams as this entry finds them: every entry below it applied, in
+/// index order, through this same function.
+fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, partition: *Partition, registry: *const ReplayRegistry, entry: *const entry_mod.Entry, out: *persistence_mod.Result) ApplyResult {
     if (comptime build_options.test_faults) {
         if (@import("test_faults.zig").of(entry)) |f| {
             if (f == .halt) return .{ .applier_failed = error.Halt };
@@ -7364,11 +7371,11 @@ pub fn applyEntryCore(partition: *Partition, registry: *const ReplayRegistry, en
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
-    if (contract_machine.ownerOf(&contract_machines.list, etype)) |m| {
+    if (contract_machine.ownerOf(machines, etype)) |m| {
         // The router has seen every index up to its own: one at or below it
         // was applied already, and must not be twice.
         if (applied.route == .skipped_already_applied) return .applied;
-        contract_machine.applyEntry(m, &partition.store, &partition.apply_scratch, entry, out) catch |err| return .{ .applier_failed = err };
+        contract_machine.applyEntryWith(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry, out) catch |err| return .{ .applier_failed = err };
         return .applied;
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
@@ -20257,6 +20264,51 @@ test "checkAppliers: a type a contract machine owns may have no other applier, a
     try std.testing.expectError(error.EntryTypeHasTwoAppliers, checkAppliersWith(&(listed_now ++ .{Toy.owning(.stream_append)}), 0, &shard.replay_registry));
     // KV's types are its machine's: without it, they have no applier.
     try std.testing.expectError(error.EntryTypeHasNoApplier, checkAppliersWith(&.{}, 0, &shard.replay_registry));
+}
+
+test "applyEntryCore: a machine reads the streams every entry below its own left" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+
+    const view_mod = @import("../contract/view.zig");
+    const Reader = struct {
+        var hash: u64 = 0;
+        var seen: [8]StreamID = undefined;
+        var n: usize = 0;
+        fn keys(_: *const entry_mod.Entry, _: *view_mod.KeySet) error{OutOfMemory}!void {}
+        fn apply(view: *view_mod.View, _: *const entry_mod.Entry, _: *persistence_mod.Result) persistence_mod.ApplyError!void {
+            n = (try view.streams()).idsAfter(hash, StreamID.MIN, &seen);
+        }
+        const machine: contract_machine.Machine = .{ .name = "reader", .entry_types = &.{.cg_create}, .families = &.{}, .keys = keys, .apply = apply };
+    };
+    Reader.hash = node_router.nameHash(.default, "s");
+
+    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
+    defer std.testing.allocator.free(v);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    try std.testing.expect(shard.applyCommitted());
+
+    // The next index, as the shard's own apply would reach it.
+    const raft = shard.raft_node;
+    const e = entry_mod.buildEntry(.cg_create, entry_mod.Flags.NONE, raft.current_term, raft.last_applied + 1, raft.applied_stamp + 1, "");
+    var out: persistence_mod.Result = .{};
+    out.reset(&e);
+    const machines = contract_machines.list ++ .{Reader.machine};
+    try std.testing.expect(applyEntryCoreWith(&machines, shard.defaultPartition(), &shard.replay_registry, &e, &out) == .applied);
+    try std.testing.expectEqual(@as(usize, 2), Reader.n);
+    try std.testing.expect(Reader.seen[0].eql(shard.stream_handler.stream.streamFirstId(Reader.hash)));
+    try std.testing.expect(Reader.seen[1].eql(shard.stream_handler.stream.streamLastId(Reader.hash)));
+
+    // Applied without the streams, the read halts the entry.
+    var bare: persistence_mod.Result = .{};
+    bare.reset(&e);
+    try std.testing.expectError(error.Halt, contract_machine.applyEntry(&Reader.machine, &shard.defaultPartition().store, &shard.defaultPartition().apply_scratch, &e, &bare));
 }
 
 test "applyEntryCore: a KV entry delivered twice applies once" {
