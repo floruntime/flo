@@ -399,8 +399,12 @@ pub const Shard = struct {
     /// once the node's bulk I/O thread is attached (null if ephemeral).
     catch_up: ?*CatchUp = null,
 
-    /// Count of segment flush failures. Surfaced instead of being silently
-    /// swallowed so disk-full / IO faults are observable.
+    /// Cumulative count of segment flush failures — failed attempts, not
+    /// distinct incidents: in sync mode a flush is attempted per request, so
+    /// while a disk is down this rises with request traffic. Surfaced (metric
+    /// and /status) instead of being silently swallowed, so a disk-full or IO
+    /// fault is observable. `flushes_failing_for_ms` is the better incident
+    /// signal: how long the current run has lasted.
     persist_failures: u64,
 
     /// Storage durability — controls segment flush timing.
@@ -523,6 +527,11 @@ pub const Shard = struct {
     forward_reply_warn_ms: u64 = 0,
     /// When a failed sync flush was last logged; it repeats on every request.
     flush_fail_warn_ms: u64,
+    /// The monotonic clock reading when the current run of flush failures began,
+    /// or 0 while flushes are succeeding. Kept internally; `/status` and metrics
+    /// publish the elapsed duration computed from it, not this raw reading, so a
+    /// reader and Prometheus see a plain "failing for N ms".
+    flushes_failing_since_ms: u64 = 0,
 
     /// Where the Raft node persists its term and vote (null if ephemeral).
     hard_state_store: ?*HardStateStore,
@@ -1221,7 +1230,7 @@ pub const Shard = struct {
     fn flushForConfig(ctx: *anyopaque) bool {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         self.flushSegmentToDisk() catch |err| {
-            self.persist_failures += 1;
+            self.noteFlushFailed();
             log.err("shard {d}: flushing a membership change failed: {s}; it does not take effect (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
             return false;
         };
@@ -1234,6 +1243,16 @@ pub const Shard = struct {
         const dl = self.durable_log orelse return;
         try self.rebufferGap(dl.writer);
         try dl.flush(self.raft_node.commit_index);
+        // Flushes are reaching disk again: end the failing run.
+        self.flushes_failing_since_ms = 0;
+    }
+
+    /// A flush to disk failed: count it (cumulative) and, if this is the first
+    /// of a run, record when it began. Every flush path funnels its failure
+    /// here; a success clears the run in `flushSegmentToDisk`.
+    fn noteFlushFailed(self: *Shard) void {
+        self.persist_failures += 1;
+        if (self.flushes_failing_since_ms == 0) self.flushes_failing_since_ms = nowMs();
     }
 
     /// Buffer again what the append hook could not, from the log, so the
@@ -1301,7 +1320,7 @@ pub const Shard = struct {
         const raft = self.raft_node;
         const through = raft.log.lastIndex();
         self.flushSegmentToDisk() catch |err| {
-            self.persist_failures += 1;
+            self.noteFlushFailed();
             const now = nowMs();
             if (now -| self.flush_fail_warn_ms >= WARN_INTERVAL_MS) {
                 self.flush_fail_warn_ms = now;
@@ -3967,7 +3986,7 @@ pub const Shard = struct {
     /// logged, when the flush failed: the batch is not acked.
     fn flushForAck(self: *Shard) bool {
         self.flushSegmentToDisk() catch |err| {
-            self.persist_failures += 1;
+            self.noteFlushFailed();
             log.err("shard {d}: sync flush failed: {s}; not acking the batch (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
             return false;
         };
@@ -4427,6 +4446,10 @@ pub const Shard = struct {
             sm.duty_oldest_held_ms.store(self.duties.oldestMs(nowMs()), .monotonic);
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
             sm.setReadBlocked(self.read_blocked);
+            sm.persist_failures.store(self.persist_failures, .monotonic);
+            // A duration, not the monotonic start: a raw clock reading means
+            // nothing to a reader and Prometheus can't subtract it.
+            sm.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
         }
         const slot = self.health orelse return;
         slot.publishVouch(self.replica.vouchedIndex(), self.replica.strangersWhileQuiet(nowMs()));
@@ -4461,7 +4484,7 @@ pub const Shard = struct {
                 break :blk std.fmt.bufPrint(&buf, "{s}; {s}", .{ note, h.reason() }) catch note;
             } else h.reason());
         } else if (self.read_blocked) {
-            slot.read_blocked_since_ms.store(self.read_blocked_since_ms, .monotonic);
+            slot.read_blocked_for_ms.store(nowMs() -| self.read_blocked_since_ms, .monotonic);
             var buf: [health_mod.REASON_MAX]u8 = undefined;
             slot.setReason(std.fmt.bufPrint(&buf, "a committed entry has not been readable to apply ({s}); applied {d} of {d}", .{
                 if (self.read_block_disk_failing) "the disk may be failing" else "a resource shortage",
@@ -4471,6 +4494,8 @@ pub const Shard = struct {
         }
         // A lone blocked shard keeps the node ready; a cluster one is a 503.
         slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
+        slot.persist_failures.store(self.persist_failures, .monotonic);
+        slot.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
         slot.publish(self.healthState(), raft.role, raft.last_applied, raft.commit_index);
     }
 
@@ -4891,7 +4916,10 @@ pub const Shard = struct {
         }
         if (self.seal_skip) {
             self.seal_skip = false;
-            self.flushSegmentToDisk() catch |err| log.warn("shard {d}: could not seal the segment holding a repair skip: {s}; it seals with the next flush", .{ self.id, @errorName(err) });
+            self.flushSegmentToDisk() catch |err| {
+                self.noteFlushFailed();
+                log.warn("shard {d}: could not seal the segment holding a repair skip: {s}; it seals with the next flush", .{ self.id, @errorName(err) });
+            };
         }
         if (self.wake_workers) {
             self.wake_workers = false;
@@ -5546,7 +5574,7 @@ pub const Shard = struct {
     fn segmentFlushTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
         self.flushSegmentToDisk() catch |err| {
-            self.persist_failures += 1;
+            self.noteFlushFailed();
             log.err("shard {d}: async segment flush failed: {s} (persist_failures={d})", .{ self.id, @errorName(err), self.persist_failures });
         };
         return 0;
@@ -12142,6 +12170,70 @@ test "Shard: a forward waits for its leader's answer, is answered when that lead
     resp = try proto.Response.parse(out[0..@intCast(n)]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
     try std.testing.expectEqual(@as(u64, 6), resp.header.request_id);
+}
+
+test "shard: a real flush failure shows in the field, the metric snapshot and text, and a write that reaches disk ends the run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir = try testDataDir(&tmp);
+    defer std.testing.allocator.free(data_dir);
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var registry = @import("../metrics/registry.zig").MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    var shard = try Shard.init(std.testing.allocator, 0, 4, 4096, pipe_fds[0], data_dir, 8 * 1024 * 1024, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    shard.shard_metrics = registry.shardMetrics(0);
+    try std.testing.expect(shard.applyCommitted());
+
+    // Buffer an entry, then make the segment directory unwritable so a real
+    // flush to disk fails.
+    const raft = shard.raft_node;
+    _ = try raft.propose(.raft_noop, entry_mod.Flags.NONE, "x");
+    const segs = try std.fmt.allocPrint(std.testing.allocator, "{s}/00000/segs", .{data_dir});
+    defer std.testing.allocator.free(segs);
+    var zbuf: [600:0]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{segs}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(z, 0o500));
+    defer _ = std.c.chmod(z, 0o700);
+
+    try std.testing.expect(!shard.flushForAck()); // the flush fails for real
+    try std.testing.expect(shard.persist_failures >= 1);
+    try std.testing.expect(shard.flushes_failing_since_ms != 0);
+
+    // The run is published as a duration in the metric snapshot and the text.
+    shard.flushes_failing_since_ms = Shard.nowMs() -| 1000; // one second in
+    shard.publishHealth();
+    const snap = shard.shard_metrics.?.snapshot();
+    try std.testing.expect(snap.persist_failures >= 1);
+    try std.testing.expect(snap.flushes_failing_for_ms >= 1000);
+    const text = try registry.exportPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "flo_shard_persist_failures_total{shard_id=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "flo_shard_flushes_failing_for_seconds{shard_id=\"0\"} 1.") != null);
+
+    // It also reaches /status through the health slot, not only the metric.
+    var nh = try health_mod.NodeHealth.init(std.testing.allocator, 1, 1);
+    defer nh.deinit(std.testing.allocator);
+    nh.accepting.store(true, .release);
+    shard.health = &nh.shards[0];
+    shard.publishHealth();
+    shard.health = null; // the slot outlives this test's use; don't dangle into deinit
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try nh.writeStatus(&out.writer, null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"persist_failures\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"flushes_failing_for_ms\"") != null);
+
+    // Writable again: a flush that reaches disk ends the run; the total stays.
+    _ = std.c.chmod(z, 0o700);
+    try std.testing.expect(shard.flushForAck());
+    try std.testing.expectEqual(@as(u64, 0), shard.flushes_failing_since_ms);
+    shard.publishHealth();
+    try std.testing.expectEqual(@as(u64, 0), shard.shard_metrics.?.snapshot().flushes_failing_for_ms);
 }
 
 test "Shard: a data directory that belonged to a group refuses to run alone, and rejoins as a member" {
