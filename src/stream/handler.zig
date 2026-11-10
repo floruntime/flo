@@ -808,7 +808,7 @@ pub const StreamHandler = struct {
     pub fn diskRefusal(self: *const StreamHandler) []const u8 {
         if (self.held != .blocked) return shard_mod.DISK_READ_PENDING;
         const d = self.disk orelse return shard_mod.DISK_READ_BLOCKED;
-        return switch (d.last_block) {
+        return switch (d.want_block) {
             .io => shard_mod.DISK_READ_BLOCKED,
             .full => shard_mod.DISK_READ_CACHE_FULL,
             .mismatch => shard_mod.DISK_READ_MISMATCH,

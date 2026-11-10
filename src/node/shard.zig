@@ -1065,6 +1065,8 @@ pub const Shard = struct {
         if (durable_log) |dl| {
             const d = try allocator.create(DiskReads);
             d.* = DiskReads.init(allocator, dl, &raft_node.log);
+            d.commit = &raft_node.commit_index;
+            dl.on_cut = .{ .ctx = d, .after = DiskReads.cutHook };
             stream_disk = d;
         }
         if (durable_log) |dl| {
@@ -1236,6 +1238,7 @@ pub const Shard = struct {
         self.raft_node.repaired = .{ .ctx = @ptrCast(self), .check = repairedOpaque };
         self.stream_handler.shard_ptr = @ptrCast(self);
         self.stream_handler.disk = self.stream_disk;
+        if (self.stream_disk) |d| d.on_damage = .{ .ctx = @ptrCast(self), .report = streamDiskDamage };
         self.queue_handler.shard_ptr = @ptrCast(self);
         self.ts_handler.shard_ptr = @ptrCast(self);
     }
@@ -7019,6 +7022,17 @@ fn segmentBufferCallback(ctx: *anyopaque, entry: *const entry_mod.Entry) void {
             log.err("shard {d}: failed to buffer entry index={d} for persistence: {s}; it will be missing from disk after a restart (buffer_failures={d})", .{ writer.partition_id, entry.header.index, @errorName(err), writer.buffer_failures });
         }
     };
+}
+
+/// The durable log couldn't give a committed stream entry back: damage, as
+/// boot and apply report it.
+fn streamDiskDamage(ctx: *anyopaque, index: u64, disk_failing: bool) void {
+    const shard: *Shard = @ptrCast(@alignCast(ctx));
+    if (disk_failing) {
+        shard.damaged(silent_loss.Damage.init(.segment_unreadable, "the segment holding committed entry {d} could not be read for {d} ms; the disk may be failing", .{ index, shard.stream_disk.?.disk_failing_ms }));
+    } else {
+        shard.damaged(silent_loss.Damage.init(.segment_unreadable, "the segment holding committed entry {d} is corrupt or doesn't hold it", .{index}));
+    }
 }
 
 /// A stream payload the bulk I/O thread read for this shard is back.
@@ -13997,6 +14011,31 @@ test "Shard: a job on another shard's thread waits out a blocked disk read rathe
         _ = d.drain();
     }
     return error.NeverServed;
+}
+
+test "Shard: a stream read of a corrupt sealed segment takes the shard offline, and /status says why" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // A byte flipped in the first sealed segment, past its header.
+    const seg = (try c.shard.durable_log.?.segments())[0].path;
+    const bytes = try DamageTest.readFile(seg);
+    defer std.testing.allocator.free(bytes);
+    bytes[bytes.len - 8] ^= 0xff;
+    try DamageTest.writeFile(seg, bytes);
+
+    var w = ColdStream.window(10);
+    var buf: [StreamHandler.MAX_READ_BATCH]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.readReadable(&w, &buf);
+    _ = c.shard.stream_disk.?.drain();
+    // Damage, as boot and apply report it: offline on a lone node, counted.
+    const damage = c.shard.offline orelse return error.ShardNotOffline;
+    try std.testing.expectEqual(silent_loss.Path.segment_unreadable, damage.path);
+    try std.testing.expectEqual(@as(u64, 1), c.shard.losses.total(.segment_unreadable));
+    var slot: health_mod.ShardSlot = .{};
+    c.shard.health = &slot;
+    c.shard.publishHealth();
+    try std.testing.expect(std.mem.indexOf(u8, slot.reason().?, "corrupt") != null);
 }
 
 test "Shard: a stream read whose disk read is blocked is refused at once, not held" {

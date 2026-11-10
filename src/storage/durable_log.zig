@@ -43,6 +43,9 @@ pub const DurableLog = struct {
     /// Truncations begun: a read made elsewhere under an older count may
     /// hold entries a cut has since dropped, and is not used.
     truncations: u64 = 0,
+    /// Told of each cut, as it is made: what reads of this log kept above it
+    /// may have been replaced.
+    on_cut: ?Cut = null,
     /// The cut the files do not yet reflect, held here because the intent
     /// file may itself be what failed to write. No flush happens while it
     /// is set: a new file above the cut would be indistinguishable, at the
@@ -249,7 +252,13 @@ pub const DurableLog = struct {
             => .resource,
             error.InputOutput,
             error.Unexpected,
+            // Permissions an operator may fix: retried, and damage only past
+            // the disk's grace, never taken as corruption at once.
+            error.AccessDenied,
+            error.PermissionDenied,
             => .disk,
+            // Missing, or not what the file should be: the log is damaged.
+            // Anything not named above is treated so too.
             else => .fault,
         };
     }
@@ -262,8 +271,14 @@ pub const DurableLog = struct {
     /// The intent is recorded on disk first: a cut interrupted by a crash
     /// or an error is finished by the next boot, because a segment still
     /// holding a truncated index would win at replay.
+    pub const Cut = struct {
+        ctx: *anyopaque,
+        after: *const fn (ctx: *anyopaque, after_index: u64) void,
+    };
+
     pub fn truncateAfter(self: *DurableLog, after_index: u64) !void {
         self.truncations += 1;
+        if (self.on_cut) |c| c.after(c.ctx, after_index);
         self.writer.truncateAfter(after_index);
         self.invalidate();
         // The log is already cut in memory; any failure from here leaves
@@ -1359,7 +1374,8 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
     defer testing.allocator.free(path2);
     const path3: []const u8 = try testing.allocator.dupe(u8, files[2].path);
     defer testing.allocator.free(path3);
-    // A permission error is a fault, not a block: the read gives up.
+    // A permission error is an operator's to fix: held as a disk-class
+    // block, retried, and damage only past the disk's grace.
     {
         var dpath: [600:0]u8 = undefined;
         const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path3}, 0);
@@ -1369,7 +1385,8 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
             break :blk null;
         };
         const r = dl.readRange(6, &buf, &arena);
-        try testing.expect(!r.blocked);
+        // Root reads through any mode: only check the block where it bites.
+        if (std.c.getuid() != 0) try testing.expect(r.blocked and r.disk_failing);
         _ = std.c.chmod(z, 0o644);
     }
     // A truncated segment is a fault, not a block.
@@ -1456,6 +1473,8 @@ test "durable log: readBlockClass sorts a read error into resource, disk, or fau
     try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.Unexpected));
     // Corruption and a missing or unreadable file are faults, read now as a hole.
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.InvalidVersion));
-    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.AccessDenied));
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.AccessDenied));
+    try testing.expectEqual(R.disk, DurableLog.readBlockClass(error.PermissionDenied));
+    try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.FileNotFound));
     try testing.expectEqual(R.fault, DurableLog.readBlockClass(error.EndOfStream));
 }

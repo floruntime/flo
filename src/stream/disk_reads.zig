@@ -62,8 +62,15 @@ pub const Want = enum {
     /// Not in the durable log (below its first segment): the reader skips it.
     absent,
     /// Can't be read right now: the read is answered retryable at once,
-    /// saying why (`DiskReads.last_block`).
+    /// saying why (`DiskReads.want_block`).
     blocked,
+};
+
+const no_commit_limit: u64 = std.math.maxInt(u64);
+
+pub const Damage = struct {
+    ctx: *anyopaque,
+    report: *const fn (ctx: *anyopaque, index: u64, disk_failing: bool) void,
 };
 
 /// Why a want was answered blocked.
@@ -154,7 +161,22 @@ pub const DiskReads = struct {
     local_arena: []u8 = &.{},
 
     blocked_until_ms: u64 = 0,
-    last_block: BlockReason = .io,
+    /// Why the shard-wide back-off was set.
+    backoff_reason: BlockReason = .io,
+    /// Why the last want answered blocked: read by the request that asked,
+    /// before another want can change it.
+    want_block: BlockReason = .io,
+    /// When a disk-class block began, while it lasts. Past `disk_failing_ms`
+    /// it is damage, as apply's is.
+    disk_failing_since_ms: ?u64 = null,
+    disk_failing_ms: u64 = 5 * 60 * 1000,
+    /// The shard's commit index: nothing above it is cached, since a cut may
+    /// still replace it.
+    commit: *const u64 = &no_commit_limit,
+    /// The shard's damage report, called on the owner's thread when its
+    /// durable log can't give a committed entry back: corrupt or missing,
+    /// or a disk failing past its grace.
+    on_damage: ?Damage = null,
     /// Reads that came back blocked, results dropped for not matching the
     /// log, entries a full cache couldn't take, and indices found damaged.
     blocked_reads: u64 = 0,
@@ -260,7 +282,10 @@ pub const DiskReads = struct {
         // Only the owner writes `gone`, so it reads it unlocked.
         if (self.gone.contains(index)) return .absent;
         const now = self.now_fn();
-        if (now < self.blocked_until_ms) return .blocked;
+        if (now < self.blocked_until_ms) {
+            self.want_block = self.backoff_reason;
+            return .blocked;
+        }
         for (&self.slots) |*s| {
             if (s.read.state.load(.acquire) == .idle) continue;
             if (index >= s.read.start and index < s.read.start + s.read.entries.len) {
@@ -280,7 +305,7 @@ pub const DiskReads = struct {
                 // stopped taking writes and said so): retryable, not skipped,
                 // and only this read is refused.
                 self.warn(now, "a stream entry at index {d} is in neither a sealed segment nor the segment writer's buffer; holding reads of it", .{index});
-                self.last_block = .unwritten;
+                self.want_block = .unwritten;
                 return .blocked;
             }
             if (wr.entry_count == 0 or index < wr.first_index) return .absent;
@@ -323,8 +348,39 @@ pub const DiskReads = struct {
     /// A blocked answer for the whole shard's cold reads, for `BACKOFF_MS`.
     fn blocked(self: *DiskReads, now: u64, why: BlockReason) Want {
         self.blocked_until_ms = now + BACKOFF_MS;
-        self.last_block = why;
+        self.backoff_reason = why;
+        self.want_block = why;
         return .blocked;
+    }
+
+    /// The log was cut after `after_index`: what was cached or found gone
+    /// above it may be replaced, so it goes. A read made before the cut is
+    /// dropped when it lands (`drain`).
+    pub fn cutHook(ctx: *anyopaque, after_index: u64) void {
+        const self: *DiskReads = @ptrCast(@alignCast(ctx));
+        self.onTruncate(after_index);
+    }
+
+    pub fn onTruncate(self: *DiskReads, after_index: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var drop: std.ArrayListUnmanaged(u64) = .empty;
+        defer drop.deinit(self.allocator);
+        var it = self.cache.iterator();
+        while (it.next()) |kv| if (kv.key_ptr.* > after_index) drop.append(self.allocator, kv.key_ptr.*) catch {};
+        for (drop.items) |index| if (self.cache.fetchRemove(index)) |kv| {
+            self.cache_bytes -= kv.value.payload.len;
+            self.allocator.free(kv.value.payload);
+        };
+        drop.clearRetainingCapacity();
+        var g = self.gone.keyIterator();
+        while (g.next()) |k| if (k.* > after_index) drop.append(self.allocator, k.*) catch {};
+        for (drop.items) |index| _ = self.gone.remove(index);
+    }
+
+    fn damage(self: *DiskReads, index: u64, disk_failing: bool) void {
+        self.markGone(index);
+        if (self.on_damage) |d| d.report(d.ctx, index, disk_failing);
     }
 
     /// Land every finished read, and make the in-place ones. True when any
@@ -347,6 +403,13 @@ pub const DiskReads = struct {
         var any = false;
         for (&self.slots) |*s| {
             if (s.read.state.load(.acquire) != .done) continue;
+            if (s.read.generation != self.dl.truncations) {
+                // Made before a cut: nothing in it is trusted.
+                s.n_wants = 0;
+                s.read.state.store(.idle, .release);
+                any = true;
+                continue;
+            }
             const r = s.read.result;
             self.land(s.read.start, s.read.entries[0..r.count], r.blocked, r.disk_failing, s.wants[0..s.n_wants]);
             s.n_wants = 0;
@@ -381,17 +444,27 @@ pub const DiskReads = struct {
         if (blocked_read) {
             self.blocked_reads += 1;
             _ = self.blocked(now, .io);
-            if (disk_failing) self.warn(now, "a stream read from the durable log failed; the disk may be failing", .{});
+            if (!disk_failing) {
+                self.disk_failing_since_ms = null;
+                return;
+            }
+            // A failing disk: retried, but past its grace it is damage, as
+            // a committed entry apply can't read is.
+            const since = self.disk_failing_since_ms orelse now;
+            self.disk_failing_since_ms = since;
+            if (now -| since >= self.disk_failing_ms) {
+                self.damaged += 1;
+                self.damage(start, true);
+            } else self.warn(now, "a stream read from the durable log failed; the disk may be failing", .{});
             return;
         }
+        self.disk_failing_since_ms = null;
         if (entries.len == 0) {
             // Not blocked, and not even its first entry: the segment holding
-            // it is corrupt or missing it. Skipped and counted, as an
-            // unreadable record was before reads went to disk, and never
-            // read again.
+            // a committed entry is corrupt or missing it. Damage to the log,
+            // reported as boot and apply report it; never read again.
             self.damaged += 1;
-            self.markGone(start);
-            self.warn(now, "the stream entry at index {d} could not be read from its segment (corrupt or missing); its records are skipped", .{start});
+            self.damage(start, false);
             return;
         }
         self.mutex.lock();
@@ -410,6 +483,8 @@ pub const DiskReads = struct {
                 wanted = true;
             }
             if (!wanted) continue;
+            // Above commit a cut may still replace it.
+            if (e.header.index > self.commit.*) continue;
             if (self.raft_log.entryTerm(e.header.index) != e.header.term) {
                 self.mismatches += 1;
                 _ = self.blocked(now, .mismatch);
@@ -665,7 +740,21 @@ test "stream disk reads: a landed entry stays pinned for its reader until served
     try testing.expect(!d.cache.contains(3));
 }
 
-test "stream disk reads: a corrupt segment marks its entry damaged once, skipped, never read again" {
+/// Records the damage a test's reads report.
+const Reported = struct {
+    index: ?u64 = null,
+    disk_failing: bool = false,
+    fn hook(self: *Reported) Damage {
+        return .{ .ctx = self, .report = report };
+    }
+    fn report(ctx: *anyopaque, index: u64, disk_failing: bool) void {
+        const self: *Reported = @ptrCast(@alignCast(ctx));
+        self.index = index;
+        self.disk_failing = disk_failing;
+    }
+};
+
+test "stream disk reads: a corrupt segment is damage, reported once, never read again" {
     var f: Fixture = undefined;
     try f.init(1, true);
     defer f.deinit();
@@ -681,12 +770,15 @@ test "stream disk reads: a corrupt segment marks its entry damaged once, skipped
     }
     var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
     defer d.deinit();
+    var reported: Reported = .{};
+    d.on_damage = reported.hook();
     const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
     try testing.expectEqual(Want.pending, d.want(1, a));
     _ = d.drain();
-    try testing.expectEqual(@as(u64, 1), d.damaged);
-    // Skipped and counted by the reader, as before reads went to disk; not
-    // read again, nor held.
+    // Damage to the log, reported to the shard, as boot and apply report it.
+    try testing.expectEqual(@as(?u64, 1), reported.index);
+    try testing.expect(!reported.disk_failing);
+    // Never read again, nor held.
     try testing.expectEqual(Want.absent, d.want(1, a));
     try testing.expect(!d.drain());
     try testing.expect(d.isGone(1));
@@ -726,4 +818,95 @@ test "stream disk reads: an entry as large as the log takes lands, not taken as 
     _ = d.drain();
     try testing.expectEqual(@as(u64, 0), d.damaged);
     try testing.expectEqual(e.payload.len, d.get(1).?.len);
+}
+
+test "stream disk reads: a disk failing past its grace is damage; before it, reads are retried" {
+    Clock.now = 1_000;
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    d.now_fn = Clock.get;
+    d.disk_failing_ms = 10_000;
+    var reported: Reported = .{};
+    d.on_damage = reported.hook();
+    f.dl.test_open_error = error.InputOutput;
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    try testing.expect(reported.index == null);
+    try testing.expectEqual(Want.blocked, d.want(1, a));
+    try testing.expectEqual(BlockReason.io, d.want_block);
+    // Still failing past the grace: damage.
+    Clock.now += 10_000;
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    try testing.expectEqual(@as(?u64, 1), reported.index);
+    try testing.expect(reported.disk_failing);
+}
+
+test "stream disk reads: nothing above the commit index is cached, and a cut drops what was above it" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    var commit: u64 = 3;
+    d.commit = &commit;
+    const a: Window = .{ .stream = keyOf("a"), .from = 1, .limit = 10 };
+    try testing.expectEqual(Want.pending, d.want(1, a));
+    _ = d.drain();
+    try testing.expect(d.get(1) != null and d.get(3) != null);
+    // 5 isn't committed: a cut may still replace it.
+    try testing.expect(d.get(5) == null);
+    // Committed, then cut after 2 (as a deposed node's log is): what was
+    // cached above it goes, so its replacement is never served stale.
+    commit = 6;
+    try testing.expectEqual(Want.pending, d.want(5, a));
+    _ = d.drain();
+    try testing.expect(d.get(5) != null);
+    f.dl.on_cut = .{ .ctx = &d, .after = DiskReads.cutHook };
+    try f.dl.truncateAfter(2);
+    try testing.expect(d.get(1) != null);
+    try testing.expect(d.get(3) == null and d.get(5) == null);
+}
+
+test "stream disk reads: with a bulk thread and no owner set, no thread owns it; without one, every caller does" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    try testing.expect(d.isOwner());
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    d.bulk = &bulk;
+    // A shard that hasn't started: another shard's job must take the copy path.
+    try testing.expect(!d.isOwner());
+    d.setOwner();
+    try testing.expect(d.isOwner());
+}
+
+test "stream disk reads: a window asked inside a read in flight widens it to reach that window's end" {
+    var f: Fixture = undefined;
+    try f.init(1, true);
+    defer f.deinit();
+    var d = DiskReads.init(testing.allocator, &f.dl, &f.raft_log);
+    defer d.deinit();
+    var bulk = try bulk_io.BulkIo.init(testing.allocator);
+    defer bulk.deinit();
+    var done: Done = .{};
+    d.bulk = &bulk;
+    d.notify = .{ .ctx = &done, .done = Done.done };
+    d.setOwner();
+    // Queued, not read yet: the thread isn't running.
+    try testing.expectEqual(Want.pending, d.want(1, .{ .stream = keyOf("a"), .from = 1, .limit = 1 }));
+    // A reader of a's next append asks inside it: the read lands both.
+    try testing.expectEqual(Want.pending, d.want(3, .{ .stream = keyOf("a"), .from = 3, .limit = 1 }));
+    try bulk.start();
+    try done.waitFor(1);
+    _ = d.drain();
+    try testing.expect(d.get(1) != null);
+    try testing.expect(d.get(3) != null);
 }
