@@ -9,7 +9,7 @@
 //!   lease that runs out readies its messages again.
 //! - A message failed or expired `MAX_ATTEMPTS` times is dead, kept until
 //!   its queue is purged.
-//! - A queue holds at most its cap of messages and payload bytes, ready,
+//! - A queue holds at most its cap of messages and held bytes, ready,
 //!   leased and dead, and a shard's queues their cap of bytes: past one, an
 //!   enqueue is refused `overloaded`. The leader stamps its caps (`Caps`,
 //!   `[queues]` in flo.toml) into the entry and apply decides against them,
@@ -1004,7 +1004,7 @@ pub const QueueHandler = struct {
         if (shard.metrics_registry) |mr| mr.server.recordQueueCapMismatch();
         if (self.mismatch_seen) |seen| if (seen.eql(theirs)) return;
         self.mismatch_seen = theirs;
-        log.warn("shard {d}: an enqueue applied under the leader's queue caps (max_messages {d}, max_bytes {d}, shard_held_bytes {d}), not this node's [queues] settings (max_messages {d}, max_bytes {d}, shard_held_bytes {d}); the leader's govern. Set the same caps on every node.", .{ shard.id, theirs.max_messages, theirs.max_bytes, theirs.shard_held_bytes, self.caps.max_messages, self.caps.max_bytes, self.caps.shard_held_bytes });
+        log.warn("shard {d}: an enqueue applied under the leader's queue caps (max_messages {d}, max_bytes {d}, shard_held_bytes {d}), not this node's [queues] settings (max_messages {d}, max_bytes {d}, shard_held_bytes {d}); the leader's govern. Set the same caps on every node; a node restarted with changed caps also warns as it applies entries proposed under its old ones.", .{ shard.id, theirs.max_messages, theirs.max_bytes, theirs.shard_held_bytes, self.caps.max_messages, self.caps.max_bytes, self.caps.shard_held_bytes });
     }
 
     // ── The expire duty, and leadership ─────────────────────────────────

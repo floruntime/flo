@@ -7,7 +7,7 @@
 //! - `queue.msg`: each message, keyed (ns id, name hash, seq).
 //! - `queue.dead`: each dead message, keyed (ns id, name hash, when it
 //!   died, seq), so a queue's dead letters page oldest first.
-//! - `queue.held`: one key, the payload bytes every queue on the shard
+//! - `queue.held`: one key, the bytes every queue on the shard
 //!   holds, ready, leased and dead.
 //! - `queue.ready`, `queue.deadline`, `queue.request`: the delivery model's
 //!   (`contract/delivery.zig`). A queue's ready keys order by priority, then
@@ -49,7 +49,8 @@ pub const Meta = Record(&.{
     .{ .name = "ready", .T = Int(u64) },
     .{ .name = "leased", .T = Int(u64) },
     .{ .name = "dead", .T = Int(u64) },
-    // The payload bytes of its messages, ready, leased and dead.
+    // What its messages hold, ready, leased and dead: each one's payload,
+    // its error text and `PER_MESSAGE` (`heldBy`).
     .{ .name = "held_bytes", .T = Int(u64) },
     // Since the queue was first written to.
     .{ .name = "enqueued", .T = Int(u64) },
@@ -245,6 +246,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
             const hash = hashOf(p.queue);
             try queueKeys(out, .of(p.ns), hash);
             try leaseKeys(out, .of(p.ns), hash, p.expiry_ns);
+            try out.add(Helds.ID, "", HELD_KEY[1..]);
         },
         .queue_extend => {
             const p = qe.Extend.decodeAll(e.payload, &diag) catch return;
@@ -255,6 +257,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
         },
         .queue_expire => {
             const p = qe.Expire.decodeAll(e.payload, &diag) catch return;
+            try out.add(Helds.ID, "", HELD_KEY[1..]);
             var it = p.items.iterator();
             while (it.next() catch return) |item| {
                 if (item.id.len != qe.ID_LEN) continue;
@@ -276,10 +279,15 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 
 pub const NO_QUEUE = "not found: no such queue";
 /// An enqueue past its queue's caps, or its shard's.
-pub const FULL = "overloaded: queue '{s}' is full: it holds {d} messages (at most {d}) and {d} payload bytes (at most {d}), ready, leased and dead; consume or purge it";
-pub const SHARD_FULL = "overloaded: this shard's queues hold {d} payload bytes, at most {d}; consume or purge some";
+pub const FULL = "overloaded: queue '{s}' is full: it holds {d} messages (at most {d}) and {d} held bytes (at most {d}), ready, leased and dead; consume or purge it";
+pub const SHARD_FULL = "overloaded: this shard's queues hold {d} held bytes, at most {d}; consume or purge some";
 
-/// The payload bytes every queue on the shard holds.
+/// What a message holds against the caps.
+pub fn heldBy(payload_len: usize, error_len: usize) u64 {
+    return payload_len + error_len + qe.PER_MESSAGE;
+}
+
+/// The bytes every queue on the shard holds (`heldBy`).
 pub fn heldOf(view: *View) ApplyError!u64 {
     return if (try view.get(Helds, HELD_KEY)) |h| h.v.bytes else 0;
 }
@@ -329,7 +337,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const mk = try M.inNs(view, ns, &hash);
             var meta: Meta.Value = if (try view.get(Metas, mk)) |m| m.v else emptyMeta(p.queue);
             if (!std.mem.eql(u8, meta.name, p.queue)) return out.refuse(.conflict, .unclassified, NAME_TAKEN);
-            const size: u64 = p.payload.len;
+            const size = heldBy(p.payload.len, 0);
             const held = meta.ready + meta.leased + meta.dead;
             if (held + 1 > p.max_messages or meta.held_bytes + size > p.max_bytes)
                 return out.refuseFmt(.overloaded, .unclassified, FULL, .{ p.queue, held, p.max_messages, meta.held_bytes, p.max_bytes });
@@ -522,7 +530,7 @@ fn report(view: *View, out: *Result, ns: NamespaceId, queue: []const u8, holder:
             .settle => {
                 try M.endLease(view, ns, &id, msg.v, holder, null, seen_expiry);
                 try view.delete(Msgs, key);
-                const size: u64 = msg.v.payload.len;
+                const size = heldBy(msg.v.payload.len, msg.v.@"error".len);
                 if (size > m.held_bytes) return error.Halt;
                 m.held_bytes -= size;
                 try unhold(view, size);
@@ -533,6 +541,7 @@ fn report(view: *View, out: *Result, ns: NamespaceId, queue: []const u8, holder:
                 try M.endLease(view, ns, &id, msg.v, holder, null, seen_expiry);
                 msg.v.ended = .released;
                 msg.v.failures +|= 1;
+                try reholdError(view, m, msg.v.@"error".len, r.@"error".len);
                 msg.v.@"error" = r.@"error";
                 m.leased -= 1;
                 m.released += 1;
@@ -579,6 +588,24 @@ fn die(view: *View, ns: NamespaceId, id: []const u8, msg: *Msg.Value, meta: *Met
     meta.dead_lettered += 1;
 }
 
+const EXPIRED = "lease expired";
+
+/// A message's error text replaced: what it holds moves by the difference,
+/// its queue's and its shard's. Never refused: an error is at most
+/// `qe.MAX_ERROR` bytes.
+fn reholdError(view: *View, meta: *Meta.Value, old_len: usize, new_len: usize) ApplyError!void {
+    if (new_len >= old_len) {
+        const more = new_len - old_len;
+        meta.held_bytes += more;
+        try view.put(Helds, HELD_KEY, .{ .v = .{ .bytes = (try heldOf(view)) + more } });
+    } else {
+        const less = old_len - new_len;
+        if (less > meta.held_bytes) return error.Halt;
+        meta.held_bytes -= less;
+        try unhold(view, less);
+    }
+}
+
 /// One expire item, past due by the log's clock: its key goes, and if it
 /// is the message's live deadline, the lease ends as a failure.
 fn expireOne(view: *View, item: qe.ExpireItem.Value, stamp: u64) ApplyError!bool {
@@ -593,7 +620,8 @@ fn expireOne(view: *View, item: qe.ExpireItem.Value, stamp: u64) ApplyError!bool
     var meta = (try view.get(Metas, mk)) orelse return error.Halt;
     msg.v.ended = .expired;
     msg.v.failures +|= 1;
-    msg.v.@"error" = "lease expired";
+    try reholdError(view, &meta.v, msg.v.@"error".len, EXPIRED.len);
+    msg.v.@"error" = EXPIRED;
     meta.v.leased -= 1;
     meta.v.expired += 1;
     if (msg.v.failures >= qe.MAX_ATTEMPTS) {
@@ -1013,12 +1041,15 @@ fn shardHeldOf(t: *TestQueues) u64 {
     return (Stored(Held).decode(bytes) catch unreachable).v.bytes;
 }
 
+/// What "abcd" holds, as a ready message with no error.
+const ABCD = heldBy(4, 0);
+
 test "queue machine: an enqueue past its queue's message or byte cap is refused, and dead letters count" {
     var t = TestQueues.init(testing.allocator);
     defer t.deinit();
     var v = enqueueValue(NS, "q", 0, "abcd");
     v.max_messages = 2;
-    v.max_bytes = 100;
+    v.max_bytes = 100_000;
     const first = try t.apply(.queue_enqueue, v, 10);
     var fr = first.reader();
     const a = fr.int(u64).?;
@@ -1029,39 +1060,92 @@ test "queue machine: an enqueue past its queue's message or byte cap is refused,
     try testing.expectEqual(proto_status.overloaded, full.refused().?.status);
     try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "queue 'q' is full: it holds 2 messages (at most 2)") != null);
     try testing.expectEqual(before, t.sums());
-    // A dead letter still counts; a settle frees its slot and bytes.
+    // A dead letter still counts, its error text too; a settle frees its
+    // slot and bytes.
     var got: [2]u64 = undefined;
     _ = try deliver(&t, 2, 100, &got);
     _ = try release(&t, &.{a}, true, 200);
+    try testing.expectEqual(2 * ABCD + "boom".len, t.meta(NS, "q").?.held_bytes);
     try testing.expect((try t.apply(.queue_enqueue, v, 210)).refused() != null);
-    const b = got[1];
-    _ = try settle(&t, &.{b}, 300);
+    _ = try settle(&t, &.{got[1]}, 300);
     try testing.expect((try t.apply(.queue_enqueue, v, 310)).refused() == null);
-    try testing.expectEqual(@as(u64, 8), t.meta(NS, "q").?.held_bytes);
-    // The byte cap: 8 held, 4 more pass 10.
+    const held = t.meta(NS, "q").?.held_bytes;
+    try testing.expectEqual(2 * ABCD + "boom".len, held);
+    // The byte cap, at its edge: one byte short refuses, exact takes it.
     v.max_messages = 100;
-    v.max_bytes = 10;
+    v.max_bytes = held + ABCD - 1;
     try testing.expect((try t.apply(.queue_enqueue, v, 320)).refused() != null);
-    v.max_bytes = 12;
+    v.max_bytes = held + ABCD;
     try testing.expect((try t.apply(.queue_enqueue, v, 330)).refused() == null);
+}
+
+test "queue machine: an empty message holds its overhead, so empty messages fill a shard too" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    var v = enqueueValue(NS, "q", 0, "");
+    v.shard_held_bytes = 3 * qe.PER_MESSAGE;
+    var stamp: u64 = 10;
+    for (0..3) |_| {
+        try testing.expect((try t.apply(.queue_enqueue, v, stamp)).refused() == null);
+        stamp += 1;
+    }
+    try testing.expectEqual(3 * qe.PER_MESSAGE, shardHeldOf(&t));
+    const full = try t.apply(.queue_enqueue, v, stamp);
+    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues hold 1536 held bytes, at most 1536") != null);
+}
+
+test "queue machine: a message's error text is held, replaced as it fails again, and given back with it" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    const a = try enqueue(&t, "q", 0, "abcd", 10);
+    var got: [1]u64 = undefined;
+    _ = try deliver(&t, 1, 100, &got);
+    _ = try release(&t, &.{a}, false, 200);
+    try testing.expectEqual(ABCD + "boom".len, t.meta(NS, "q").?.held_bytes);
+    // Its lease runs out: the error is "lease expired" now.
+    _ = try deliver(&t, 1, 300, &got);
+    _ = try t.duty(300 + LEASE);
+    try testing.expectEqual(ABCD + "lease expired".len, t.meta(NS, "q").?.held_bytes);
+    try testing.expectEqual(ABCD + "lease expired".len, shardHeldOf(&t));
+    _ = try deliver(&t, 1, 400 + LEASE, &got);
+    _ = try settle(&t, &got, 500 + LEASE);
+    try testing.expectEqual(@as(u64, 0), t.meta(NS, "q").?.held_bytes);
+    try testing.expectEqual(@as(u64, 0), shardHeldOf(&t));
+}
+
+test "queue machine: one expire ends every live lease it names past its deadline" {
+    var t = TestQueues.init(testing.allocator);
+    defer t.deinit();
+    _ = try enqueue(&t, "q", 0, "a", 10);
+    _ = try enqueue(&t, "q", 0, "b", 11);
+    _ = try enqueue(&t, "q", 0, "c", 12);
+    var got: [3]u64 = undefined;
+    try testing.expectEqual(@as(usize, 3), try deliver(&t, 3, 100, &got));
+    // One deadline for all three: one expire names them all, and all end.
+    const r = try t.duty(100 + LEASE);
+    var rd = r.reader();
+    try testing.expectEqual(@as(u32, 3), rd.int(u32).?);
+    for (got) |seq| try testing.expectEqual(Status.ready, t.msg(NS, "q", seq).?.status);
+    try testing.expectEqual(@as(u64, 3), t.meta(NS, "q").?.ready);
+    try testing.expectEqual(@as(usize, 0), t.count(Deadlines));
 }
 
 test "queue machine: the shard's held bytes count every queue, and a settle or purge gives them back" {
     var t = TestQueues.init(testing.allocator);
     defer t.deinit();
     var v = enqueueValue(NS, "q", 0, "abcd");
-    v.shard_held_bytes = 10;
+    v.shard_held_bytes = 2 * ABCD;
     _ = try t.apply(.queue_enqueue, v, 10);
     var other = enqueueValue(.of(7), "other", 0, "abcd");
-    other.shard_held_bytes = 10;
+    other.shard_held_bytes = 2 * ABCD;
     _ = try t.apply(.queue_enqueue, other, 11);
-    try testing.expectEqual(@as(u64, 8), shardHeldOf(&t));
+    try testing.expectEqual(2 * ABCD, shardHeldOf(&t));
     const full = try t.apply(.queue_enqueue, v, 12);
-    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues hold 8 payload bytes, at most 10") != null);
+    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues hold 1032 held bytes, at most 1032") != null);
     var got: [1]u64 = undefined;
     _ = try deliver(&t, 1, 100, &got);
     _ = try settle(&t, &got, 200);
-    try testing.expectEqual(@as(u64, 4), shardHeldOf(&t));
+    try testing.expectEqual(ABCD, shardHeldOf(&t));
     _ = try t.apply(.queue_purge, qe.Purge.Value{ .ns = 7, .queue = "other" }, 300);
     try testing.expectEqual(@as(u64, 0), shardHeldOf(&t));
     try testing.expect((try t.apply(.queue_enqueue, v, 310)).refused() == null);

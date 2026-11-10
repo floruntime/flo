@@ -125,7 +125,7 @@ pub const Queues = struct {
         return if (got) |m| m.v else null;
     }
 
-    /// The payload bytes every queue holds.
+    /// The bytes every queue holds (`qm.heldBy`).
     pub fn shardHeld(self: *Queues) u64 {
         const bytes = self.store.get(qm.Helds.ID, qm.HELD_KEY) orelse return 0;
         return (qm.Helds.Value.decode(bytes) catch return 0).v.bytes;
@@ -156,6 +156,8 @@ pub const Queues = struct {
         msgs: std.AutoArrayHashMapUnmanaged(u64, Msg) = .empty,
         /// Each message's payload length: a deliver's byte budget counts it.
         sizes: std.AutoArrayHashMapUnmanaged(u64, usize) = .empty,
+        /// Each message's error text length: what it holds counts it.
+        errors: std.AutoArrayHashMapUnmanaged(u64, usize) = .empty,
         dead_lettered: u64 = 0,
         held: u64 = 0,
         held_bytes: u64 = 0,
@@ -174,6 +176,7 @@ pub const Queues = struct {
         while (it.next() catch null) |item| {
             var v = item.value.v;
             try s.sizes.put(a, qm.seqOf(item.key[4..]), v.payload.len);
+            try s.errors.put(a, qm.seqOf(item.key[4..]), v.@"error".len);
             v.holder = try a.dupe(u8, v.holder);
             v.payload = "";
             v.queue = try a.dupe(u8, v.queue);
@@ -236,6 +239,7 @@ pub const Queues = struct {
             }
             return .{ .kind = kind, .refused = true, .broke = "the queue machine refused a workload entry" };
         }
+        if (r.mutant == .queue_settle_keeps_bytes and kind == .settle) try self.keepSettledBytes(snaps.items[0]);
         var effect: Effect = .{ .kind = kind, .refused = false };
         effect.broke = self.check(e, snaps.items, &effect) catch "the queue check ran out of memory";
         if (effect.broke == null) for (snaps.items) |s| if (self.ruleOfQueue(s.ns, s.hash)) |why| {
@@ -249,7 +253,8 @@ pub const Queues = struct {
     /// Whether `p` would take its queue or its shard past the caps it
     /// carries, from where they stood.
     fn over(p: qe.Enqueue.Value, s: Snapshot) bool {
-        return s.held + 1 > p.max_messages or s.held_bytes + p.payload.len > p.max_bytes or s.shard_held + p.payload.len > p.shard_held_bytes;
+        const size = qm.heldBy(p.payload.len, 0);
+        return s.held + 1 > p.max_messages or s.held_bytes + size > p.max_bytes or s.shard_held + size > p.shard_held_bytes;
     }
 
     fn holds(m: Msg, holder: []const u8, deliveries: u32, token: ae.Token.Value) bool {
@@ -511,7 +516,7 @@ pub const Queues = struct {
             const v = item.value.v;
             const id = item.key[4..];
             counts[@backingInt(v.status)] += 1;
-            bytes += v.payload.len;
+            bytes += qm.heldBy(v.payload.len, v.@"error".len);
             if (v.failures >= qe.MAX_ATTEMPTS and v.status != .dead) return "a message that spent its attempts isn't dead";
             var b: [64]u8 = undefined;
             var kb: [72]u8 = undefined;
@@ -526,7 +531,7 @@ pub const Queues = struct {
         }
         const m = self.meta(ns, hash) orelse return if (counts[0] + counts[1] + counts[2] == 0) null else "a queue holds messages but no meta";
         if (m.ready != counts[0] or m.leased != counts[1] or m.dead != counts[2]) return "a queue's counts aren't what it holds";
-        if (m.held_bytes != bytes) return "a queue's held bytes aren't its messages' payloads";
+        if (m.held_bytes != bytes) return "a queue's held bytes aren't what its messages hold";
         // And no ready or dead key is left over from a message that moved on.
         var rb: [9]u8 = undefined;
         var rk: [16]u8 = undefined;
@@ -605,6 +610,15 @@ pub const Queues = struct {
                     break;
                 }
             },
+            .queue_cap_tightened => if (kind == .enqueue) {
+                // Caps one short of the entry's: an enqueue at the edge is
+                // refused within them.
+                var p = qe.Enqueue.decodeAll(e.payload, &diag) catch return error.Halt;
+                p.max_messages -|= 1;
+                p.max_bytes -|= 1;
+                p.shard_held_bytes -|= 1;
+                out.payload = qe.Enqueue.encodeInto(self.rewrite, p) catch return error.Halt;
+            },
             .queue_cap_unchecked => if (kind == .enqueue) {
                 // Caps so high nothing is ever refused.
                 var p = qe.Enqueue.decodeAll(e.payload, &diag) catch return error.Halt;
@@ -660,6 +674,24 @@ pub const Queues = struct {
             else => {},
         }
         return out;
+    }
+
+    /// `queue_settle_keeps_bytes`: the messages a settle removed still
+    /// count in their queue's held bytes.
+    fn keepSettledBytes(self: *Queues, s: Snapshot) persistence.ApplyError!void {
+        var kept: u64 = 0;
+        var it = s.msgs.iterator();
+        while (it.next()) |kv| if (self.msg(s.ns, s.hash, kv.key_ptr.*) == null) {
+            kept += qm.heldBy(s.sizes.get(kv.key_ptr.*) orelse 0, s.errors.get(kv.key_ptr.*) orelse 0);
+        };
+        if (kept == 0) return;
+        var mb: [12]u8 = undefined;
+        const node = self.store.find(qm.Metas.ID, qm.storeKey(&mb, s.ns, &s.hash)) orelse return;
+        var m = (qm.Metas.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
+        m.held_bytes += kept;
+        const bytes = try self.store.allocator.alloc(u8, qm.Meta.encodedSize(m) catch return error.Halt);
+        _ = qm.Meta.encodeInto(bytes, m) catch return error.Halt;
+        self.store.replace(qm.Metas.ID, node, bytes);
     }
 
     /// Give a ready message the lowest priority, in place, key and record:

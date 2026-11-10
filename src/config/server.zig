@@ -72,9 +72,10 @@ pub const KvConfig = struct {
 pub const QueuesConfig = struct {
     /// Messages one queue may hold, ready, leased and dead.
     max_messages: u32 = qe.DEFAULT_MAX_MESSAGES,
-    /// Payload bytes one queue may hold, likewise.
+    /// Bytes one queue may hold, likewise: each message's payload, error
+    /// text and 512 bytes besides.
     max_bytes: u64 = qe.DEFAULT_MAX_BYTES,
-    /// Payload bytes all of a shard's queues may hold together.
+    /// Bytes all of a shard's queues may hold together, counted the same.
     shard_held_bytes: u64 = qe.DEFAULT_SHARD_HELD_BYTES,
 };
 
@@ -787,8 +788,9 @@ pub fn generateDefaultConfig() []const u8 {
     \\
     \\[queues]
     \\# What one queue may hold, ready, leased and dead together: messages, up
-    \\# to 16777216, and payload bytes, up to 1 GiB. And the payload bytes all
-    \\# of a shard's queues may hold, up to 64 GiB. Every replica holds every
+    \\# to 16777216, and held bytes, up to 1 GiB. And the held bytes all of a
+    \\# shard's queues may hold, up to 64 GiB. A message holds its payload, its
+    \\# error text and 512 bytes besides. Every replica holds every
     \\# message in memory. Past a cap an enqueue is refused, overloaded; nothing
     \\# held is dropped. Set the same values on every node: the leader's decide.
     \\# max_messages = 100000

@@ -1243,9 +1243,8 @@ pub const StreamProjection = struct {
         return gop.value_ptr;
     }
 
-    /// Append anchored to the originating UAL entry's timestamp (ms) so replay
-    /// reproduces identical StreamIDs — durable apply/replay paths must use this
-    /// instead of `appendToStream`, which reads the wall clock.
+    /// Append anchored to the originating UAL entry's timestamp (ms), so
+    /// replay reproduces identical StreamIDs.
     pub fn appendToStreamAt(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
         const ss = try self.getOrCreateStream(name_hash);
         const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms, record_count, byte_len);
@@ -1932,7 +1931,7 @@ test "stream: StreamState trim" {
     try testing.expect(!ss.first_id.eql(id2));
 }
 
-test "stream: appendToStream creates stream and returns StreamID" {
+test "stream: appendToStreamAt creates stream and returns StreamID" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 

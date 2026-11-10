@@ -54,6 +54,10 @@ test "e2e/queue-cap: a lowered max_messages refuses the next enqueue, and a purg
     try node.enqueue("q", "one", null);
     try node.enqueue("q", "two", null);
     try node.enqueue("q", "three", "queue 'q' is full: it holds 2 messages (at most 2)");
+    // One leased: a purge takes it too.
+    var taken = try node.cli.run(&.{ "queue", "dequeue", "q" });
+    defer taken.deinit();
+    try testing.expect(taken.stdoutContains("one"));
     // Another queue has its own count.
     try node.enqueue("other", "one", null);
     var purge = try node.cli.run(&.{ "queue", "purge", "q" });
@@ -71,8 +75,9 @@ test "e2e/queue-cap: a lowered max_bytes refuses the message that would pass it"
     defer testing.allocator.free(big);
     @memset(big, 'x');
     try node.enqueue("q", big, null);
-    try node.enqueue("q", big[0..10_000], "queue 'q' is full: it holds 1 messages (at most 100000) and 60000 payload bytes (at most 65536)");
-    try node.enqueue("q", big[0..5_536], null);
+    // A message holds its payload and 512 bytes besides.
+    try node.enqueue("q", big[0..10_000], "queue 'q' is full: it holds 1 messages (at most 100000) and 60512 held bytes (at most 65536)");
+    try node.enqueue("q", big[0..4_512], null);
 }
 
 test "e2e/queue-cap: a lowered shard_held_bytes counts every queue on the shard" {
@@ -83,7 +88,17 @@ test "e2e/queue-cap: a lowered shard_held_bytes counts every queue on the shard"
     defer testing.allocator.free(big);
     @memset(big, 'x');
     try node.enqueue("a", big, null);
-    try node.enqueue("b", big[0..10_000], "this shard's queues hold 60000 payload bytes, at most 65536");
+    try node.enqueue("b", big[0..10_000], "this shard's queues hold 60512 held bytes, at most 65536");
+}
+
+test "e2e/queue-cap: empty messages across many queues fill a shard, each holding its overhead" {
+    const node = try Node.start(.{ .shards = 1, .extra_config = "[queues]\nshard_held_bytes = 65536\n" });
+    defer node.deinit();
+    errdefer node.server.dumpLogTail();
+    // 65536 / 512: 128 empty messages fit, one to a queue.
+    var name_buf: [16]u8 = undefined;
+    for (0..128) |i| try node.enqueue(try std.fmt.bufPrint(&name_buf, "q{d}", .{i}), "", null);
+    try node.enqueue("q128", "", "this shard's queues hold 65536 held bytes, at most 65536");
 }
 
 fn expectRefused(config: ServerProcess.ServerConfig, says: []const u8) !void {
@@ -103,8 +118,37 @@ test "e2e/queue-cap: caps outside their range are refused at start, not clamped"
     try expectRefused(.{ .shards = 1, .extra_config = "[queues]\nshard_held_bytes = 1024\n" }, "[queues] shard_held_bytes = 1024: must be 65536 to 68719476736");
 }
 
+/// `flo_queue_cap_mismatch_total` on `node`'s /metrics; null if it doesn't
+/// answer or doesn't say.
+fn mismatches(cluster: *ClusterContext, node: usize) ?u64 {
+    const port = cluster.getServer(node).?.metrics_port;
+    const fd = stdx.net.tcpConnectIp4Timeout(.{ 127, 0, 0, 1 }, port, 200) catch return null;
+    defer _ = std.c.close(fd);
+    const req = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    if (std.c.write(fd, req, req.len) != req.len) return null;
+    const raw = testing.allocator.alloc(u8, 1 << 20) catch return null;
+    defer testing.allocator.free(raw);
+    var got: usize = 0;
+    // The socket does not block: read until the server closes it.
+    const deadline = stdx.time.milliTimestamp() + 2000;
+    while (got < raw.len and stdx.time.milliTimestamp() < deadline) {
+        const rc = std.c.read(fd, raw[got..].ptr, raw.len - got);
+        if (rc == 0) break;
+        if (rc < 0) {
+            stdx.time.sleep(std.time.ns_per_ms / 4);
+            continue;
+        }
+        got += @intCast(rc);
+    }
+    const name = "\nflo_queue_cap_mismatch_total ";
+    const at = std.mem.indexOf(u8, raw[0..got], name) orelse return null;
+    const rest = raw[at + name.len .. got];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, rest[0..end], " \r"), 10) catch null;
+}
+
 test "e2e/queue-cap: nodes with other caps than the leader's apply its enqueues, and say so" {
-    var cluster = try ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync, .node_config = .{
+    var cluster = try ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync, .metrics_enabled = true, .node_config = .{
         "[queues]\nmax_messages = 1000\n",
         "[queues]\nmax_messages = 2000\n",
         "[queues]\nmax_messages = 3000\n",
@@ -128,4 +172,10 @@ test "e2e/queue-cap: nodes with other caps than the leader's apply its enqueues,
         if (tries == 80) return error.MismatchNeverSaid;
         stdx.time.sleep(100 * std.time.ns_per_ms);
     }
+    // And counted, on the same two.
+    var counted: usize = 0;
+    for (0..3) |n| if ((mismatches(&cluster, n) orelse 0) >= 1) {
+        counted += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), counted);
 }

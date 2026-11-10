@@ -80,18 +80,19 @@ fn enqueue(q: *families.Queues, out: []u8, r: std.Random, queue: []const u8, tag
     @memcpy(payload_buf[0..tag.len], tag);
     @memset(payload_buf[tag.len..], '.');
     const payload = payload_buf[0 .. tag.len + r.uintLessThan(usize, 40)];
-    // Mostly the default caps; now and then one at the edge, by the
+    // Mostly the default caps; one enqueue in 20 at an edge, by the
     // leader's own state: exactly full, so the message is refused, or one
     // short, so it just fits. The leader's state can lag, so either may
-    // land on the other side; apply decides.
+    // land on the other side; apply decides. Rarely, so queues still grow
+    // enough for several leases to expire together.
     const n = held(q, queue);
     const bytes: u64 = if (q.meta(NS, qm.hashOf(queue))) |m| m.held_bytes else 0;
     const edge = r.boolean();
     var caps: struct { messages: u32, bytes: u64, shard: u64 } = .{ .messages = qe.DEFAULT_MAX_MESSAGES, .bytes = qe.DEFAULT_MAX_BYTES, .shard = qe.DEFAULT_SHARD_HELD_BYTES };
-    switch (r.uintLessThan(u8, 10)) {
+    switch (r.uintLessThan(u8, 60)) {
         0 => caps.messages = @intCast(n + @intFromBool(edge)),
-        1 => caps.bytes = bytes + payload.len - @intFromBool(!edge),
-        2 => caps.shard = q.shardHeld() + payload.len - @intFromBool(!edge),
+        1 => caps.bytes = bytes + qm.heldBy(payload.len, 0) - @intFromBool(!edge),
+        2 => caps.shard = q.shardHeld() + qm.heldBy(payload.len, 0) - @intFromBool(!edge),
         else => {},
     }
     const p = try qe.Enqueue.encodeInto(out, .{

@@ -44,6 +44,12 @@ pub const MAX_MAX_MESSAGES: u32 = 16 * 1024 * 1024;
 pub const MAX_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// The payload bytes all of a shard's queues may hold together.
 pub const DEFAULT_SHARD_HELD_BYTES: u64 = 1024 * 1024 * 1024;
+/// What a message holds besides its payload and its error text: its
+/// record and its keys, measured at 336 bytes in RAM (macOS, ReleaseSafe,
+/// 100,000 messages; see the queue machine's per-message test), and a dead
+/// one's dead key, rounded up. Charged against the caps with its payload, so
+/// empty messages fill a queue too.
+pub const PER_MESSAGE: u64 = 512;
 pub const MAX_SHARD_HELD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_ERROR: u32 = 1024;
 /// A delivery's holder: the consumer the dequeue named, or none.
