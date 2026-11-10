@@ -13719,6 +13719,40 @@ test "Shard: a cold group read and claim deliver and claim only what their reply
     try std.testing.expectEqual(@as(usize, answered), try c.shard.stream_handler.stream.groupPending(group, "c2", &pending));
 }
 
+test "Shard: a job on another shard's thread reads cold records by copy, once the owner has fetched them" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 100, 0, 10);
+    defer c.deinit();
+    // This thread owns the shard's disk cache; the job reads from another.
+    c.shard.stream_disk.?.owner = std.Thread.getCurrentId();
+    const Job = struct {
+        fn poll(handler: *StreamHandler, out: *StreamHandler.PayloadRead) void {
+            out.* = handler.readPayloadsForStream("s", "", StreamID.MIN, 10);
+        }
+    };
+    var first: StreamHandler.PayloadRead = undefined;
+    var t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &first });
+    t.join();
+    defer first.deinit(c.shard.stream_handler.allocator);
+    // Cold: nothing yet, the cursor where it was, and the fetch asked of the
+    // owner, which touched nothing of the cache from the job's thread.
+    try std.testing.expectEqual(@as(usize, 0), first.payloads.len);
+    try std.testing.expect(first.last_id.eql(StreamID.MIN));
+    try std.testing.expectEqual(@as(usize, 0), c.shard.stream_disk.?.cache.count());
+    // The owner's tick fetches it.
+    _ = c.shard.stream_disk.?.drain();
+    _ = c.shard.stream_disk.?.drain();
+    var second: StreamHandler.PayloadRead = undefined;
+    t = try std.Thread.spawn(.{}, Job.poll, .{ c.shard.stream_handler, &second });
+    t.join();
+    defer second.deinit(c.shard.stream_handler.allocator);
+    try std.testing.expect(second.payloads.len > 0);
+    try std.testing.expect(second.copies.len > 0);
+    var all: [1]stream_mod.StreamRecord = undefined;
+    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    try std.testing.expect(second.ids[0].eql(all[0].id));
+}
+
 test "Shard: a stream read whose disk read is blocked is refused at once, not held" {
     var c: ColdStream = undefined;
     try c.init(.async_flush, 100, 0, 10);
