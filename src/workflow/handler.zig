@@ -291,10 +291,15 @@ pub const WorkflowHandler = struct {
         /// Absolute deadline for wait_for_signal timeout (ms since epoch, 0 = none).
         wait_timeout_at_ms: i64 = 0,
 
-        /// The entry of a cancel proposed and not yet applied, and its term:
-        /// nothing else moves the run meanwhile (`cancelInFlight`).
-        cancel_index: u64 = 0,
-        cancel_term: u64 = 0,
+        /// The entry of a completion or cancel this leader proposed and that
+        /// hasn't applied, and its term: nothing else moves the run
+        /// meanwhile (`endingInFlight`). The run changes only when the
+        /// entry applies, so no node shows an ending the log may drop.
+        ending_index: u64 = 0,
+        ending_term: u64 = 0,
+        /// Whether that entry is a client's cancel: another cancel may
+        /// follow it, and the last one proposed is the one answered.
+        ending_cancel: bool = false,
 
         /// This run's key in `runs`, which owns it.
         ns_key: []const u8 = "",
@@ -594,7 +599,7 @@ pub const WorkflowHandler = struct {
     /// applying an earlier term's start: that start's own leader may have
     /// stepped it already, so it stays at its start (`dropStartedRuns`).
     pub fn startApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry, result: *const Result) void {
-        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.workflow_complete)) return self.cancelApplied(shard, entry);
+        if (entry.header.entry_type == @backingInt(entry_mod.EntryType.workflow_complete)) return self.endingApplied(shard, entry);
         const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
         if (etype != .workflow_start and etype != .workflow_step_started) return;
         if (shard.raft_node.role != .leader or entry.header.term != shard.raft_node.current_term) return;
@@ -614,18 +619,26 @@ pub const WorkflowHandler = struct {
         if (result.refused() == null) self.queueFirstStep(cmd.key, result.index);
     }
 
-    /// A completion applied: if it was the cancel this leader proposed last
-    /// for its run, the run was cancelled once, however many cancels and
-    /// answers there were.
-    fn cancelApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry) void {
+    /// A completion applied: if it was the one this leader proposed last
+    /// for its run, its outcome is counted, once however many cancels and
+    /// answers there were. A completion an earlier leader proposed counts
+    /// on none.
+    fn endingApplied(self: *WorkflowHandler, shard: *Shard, entry: *const entry_mod.Entry) void {
         if (shard.raft_node.role != .leader) return;
         const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         const run = self.runs.getPtr(cmd.key) orelse return;
-        if (run.cancel_index != entry.header.index) return;
-        run.cancel_index = 0;
-        if (shard.metrics_registry) |m| if (run.status == .cancelled) m.workflow.recordCancelled();
+        if (run.status.isTerminal()) self.dropCompletionRetry(cmd.key);
+        if (run.ending_index != entry.header.index) return;
+        run.ending_index = 0;
+        if (shard.metrics_registry) |m| switch (run.status) {
+            .completed => m.workflow.recordCompleted(),
+            .failed => m.workflow.recordFailed(),
+            .cancelled => m.workflow.recordCancelled(),
+            .timed_out => m.workflow.recordTimedOut(),
+            else => {},
+        };
     }
 
     // ── Core Command Logic ──────────────────────────────────────────────
@@ -965,7 +978,7 @@ pub const WorkflowHandler = struct {
         // this pass and is kept, its start not yet applied.
         while (i < self.started_to_advance.items.len) : (i += 1) {
             const s = self.started_to_advance.items[i];
-            const cancelling = if (self.runs.getPtr(s.ns_key)) |r| cancelInFlight(shard, r) else false;
+            const cancelling = if (self.runs.getPtr(s.ns_key)) |r| endingInFlight(shard, r) else false;
             if (shard.raft_node.last_applied < s.index or cancelling) {
                 self.started_to_advance.items[keep] = s;
                 keep += 1;
@@ -1012,7 +1025,7 @@ pub const WorkflowHandler = struct {
             visited += 1;
             const ns_key = entry.key_ptr.*;
             if (self.stepping.contains(ns_key)) continue;
-            if (self.runs.getPtr(ns_key)) |run| if (cancelInFlight(shard, run)) continue;
+            if (self.runs.getPtr(ns_key)) |run| if (endingInFlight(shard, run)) continue;
             const ns_end = std.mem.indexOfScalar(u8, ns_key, ':') orelse continue;
             _ = persistence_mod.proposeEntry(shard, .workflow_step_started, entry_mod.Flags.NONE, ns_key[0..ns_end], ns_key, "") catch |err| {
                 if (!shard.quietHalted(err)) log.warn("shard {d}: workflow run {s}: first step not logged: {s}; tried again next tick", .{ shard.id, ns_key, @errorName(err) });
@@ -1061,10 +1074,10 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
             return;
         }
-        if (cancelInFlight(shard, run)) {
+        if (endingInFlight(shard, run)) {
             // Retried, it's delivered if the cancel never applies, and told
             // the run finished if it does.
-            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is being cancelled — retry"));
+            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is ending — retry"));
             return;
         }
 
@@ -1173,6 +1186,12 @@ pub const WorkflowHandler = struct {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "run already finished");
             return null;
         }
+        if (endingInFlight(shard, run) and !run.ending_cancel) {
+            // Retried, it's cancelled if the completion never applies, and
+            // told the run finished if it does.
+            shard.sendRefusal(conn, req.header.request_id, .unavailable, proto.notRun("run is ending — retry"));
+            return null;
+        }
         if (req.value.len > MAX_CANCEL_REASON) {
             var msg: [96]u8 = undefined;
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.bufPrint(&msg, "a cancel reason is at most {d} bytes, not {d}", .{ MAX_CANCEL_REASON, req.value.len }) catch "cancel reason too long");
@@ -1196,21 +1215,22 @@ pub const WorkflowHandler = struct {
         // The run ends when the entry applies, and the client is answered
         // then. If it never does, the client is told the leader changed, and
         // the run carries on.
-        run.cancel_index = proposed.result.index;
-        run.cancel_term = proposed.result.term;
+        run.ending_index = proposed.result.index;
+        run.ending_term = proposed.result.term;
+        run.ending_cancel = true;
         if (held_action) |rid| shard.actions_handler.cancelHeld(shard, held_on, rid);
         return proposed.result;
     }
 
-    /// Whether a cancel of this run may still apply: its entry is in this
+    /// Whether a completion or cancel of this run may still apply: its entry is in this
     /// leader's log, as it was proposed, and hasn't applied. A node elected
     /// again keeps its entries, so a new term alone doesn't end it; an entry
     /// cut and replaced, or one that applied without ending the run, does.
-    pub fn cancelInFlight(shard: *const Shard, run: *const RunRecord) bool {
-        if (run.cancel_index == 0 or run.status.isTerminal()) return false;
+    pub fn endingInFlight(shard: *const Shard, run: *const RunRecord) bool {
+        if (run.ending_index == 0 or run.status.isTerminal()) return false;
         const raft = shard.raft_node;
-        if (raft.role != .leader or raft.last_applied >= run.cancel_index) return false;
-        return (raft.log.entryTerm(run.cancel_index) orelse return false) == run.cancel_term;
+        if (raft.role != .leader or raft.last_applied >= run.ending_index) return false;
+        return (raft.log.entryTerm(run.ending_index) orelse return false) == run.ending_term;
     }
 
     // ── STATUS ──────────────────────────────────────────────────────────
@@ -1651,7 +1671,7 @@ pub const WorkflowHandler = struct {
     /// `namespace` is used only for definition lookups.
     fn advanceWorkflow(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, namespace: []const u8) void {
         const run = self.runs.getPtr(run_ns_key) orelse return;
-        if (run.status.isTerminal()) return;
+        if (run.status.isTerminal() or endingInFlight(shard, run)) return;
 
         // Look up the definition
         const def_ns_key = self.makeNsKey(namespace, run.workflow_name_owned) orelse return;
@@ -2351,7 +2371,7 @@ pub const WorkflowHandler = struct {
                 self.parked.removeByPtr(key_ptr);
                 continue;
             }
-            if (cancelInFlight(shard, run)) continue;
+            if (endingInFlight(shard, run)) continue;
 
             // Check async action completion
             if (run.pending_action_run_id_owned) |action_rid| {
@@ -2394,9 +2414,9 @@ pub const WorkflowHandler = struct {
         // may have moved it on: each is asked again as it fires.
         for (due_keys[0..due_count]) |ns_key| {
             const r = self.runs.getPtr(ns_key) orelse continue;
-            if (cancelInFlight(shard, r)) {
+            if (endingInFlight(shard, r)) {
                 // Its timer stands if the cancel doesn't.
-                if (timerDue(r, now_ms) != .none) self.armTimer(r, now_ms +| CANCEL_RECHECK_MS);
+                if (timerDue(r, now_ms) != .none) self.armTimer(r, now_ms +| ENDING_RECHECK_MS);
                 continue;
             }
             switch (timerDue(r, now_ms)) {
@@ -2418,7 +2438,7 @@ pub const WorkflowHandler = struct {
         if (self.parked.count() == 0 and self.parked.capacity() > 64) self.parked.clearAndFree(self.allocator);
     }
 
-    const CANCEL_RECHECK_MS: i64 = 100;
+    const ENDING_RECHECK_MS: i64 = 100;
 
     /// Which of a run's timers has come due, if any.
     fn timerDue(run: *const RunRecord, now_ms: i64) enum { none, poll, wait } {
@@ -2844,9 +2864,8 @@ pub const WorkflowHandler = struct {
         return null;
     }
 
-    /// Ends a run. The completion record is built and logged first, then
-    /// applied to the run the way replay applies it, so the leader's run
-    /// and the log can't disagree. A record too large to log is trimmed to
+    /// Ends a run once its completion record, built from the run's state
+    /// now, applies. A record too large to log is trimmed to
     /// fit (see encodeTrimmed). A log too busy to take it is retried from
     /// the run's state on a later tick; on a node that isn't leading,
     /// nothing changes and the new leader owns the run.
@@ -2857,24 +2876,17 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    /// Proposes the run's completion. The run ends when it applies, and is
+    /// held meanwhile. The completion stays on the retry list until the run
+    /// ends: steps aren't logged, so if the entry is cut, only this node
+    /// can end the run, and it proposes it again once it leads.
     fn tryComplete(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) !void {
         const proposed = try self.proposeComplete(shard, run_ns_key, run, status, detail, now_ms);
-        defer self.allocator.free(proposed.value);
-        // The applier applies the same record again at commit, at the same
-        // stamp; it replaces the terminal state wholesale, so a second
-        // apply is a no-op.
-        self.applyComplete(run, proposed.value, @intCast(proposed.result.timestamp_ns / std.time.ns_per_ms)) catch {};
-
-        // Every terminal transition but a client's cancel passes through
-        // here, so this is where its outcome is counted; that cancel counts
-        // when it applies (`cancelApplied`).
-        if (shard.metrics_registry) |m| switch (run.status) {
-            .completed => m.workflow.recordCompleted(),
-            .failed => m.workflow.recordFailed(),
-            .cancelled => m.workflow.recordCancelled(),
-            .timed_out => m.workflow.recordTimedOut(),
-            else => {},
-        };
+        self.allocator.free(proposed.value);
+        run.ending_index = proposed.result.index;
+        run.ending_term = proposed.result.term;
+        run.ending_cancel = false;
+        self.keepCompletion(run_ns_key, status, detail, now_ms, 0);
     }
 
     /// Logs a run's completion record, without touching the run. The caller
@@ -2933,8 +2945,20 @@ pub const WorkflowHandler = struct {
     };
 
     fn retryCompletionLater(self: *WorkflowHandler, run_ns_key: []const u8, status: RunStatus, detail: []const u8, now_ms: i64, attempt: u32) void {
-        const due_ms = now_ms + completionBackoff(attempt);
+        self.keepCompletion(run_ns_key, status, detail, now_ms + completionBackoff(attempt), attempt);
+    }
+
+    /// Keeps a run's completion to propose once `due_ms` passes, unless
+    /// the run has ended or one is in flight by then.
+    fn keepCompletion(self: *WorkflowHandler, run_ns_key: []const u8, status: RunStatus, detail: []const u8, due_ms: i64, attempt: u32) void {
         for (self.completion_retries.items) |*p| if (std.mem.eql(u8, p.run_ns_key, run_ns_key)) {
+            // The latest completion is the one to propose again.
+            if (p.status != status or !std.mem.eql(u8, p.detail, detail)) {
+                const owned = self.allocator.dupe(u8, detail) catch return log.err("workflow run {s}: completion dropped: out of memory", .{run_ns_key});
+                self.allocator.free(p.detail);
+                p.detail = owned;
+                p.status = status;
+            }
             p.attempt = attempt;
             p.due_ms = due_ms;
             return;
@@ -2951,6 +2975,15 @@ pub const WorkflowHandler = struct {
         };
     }
 
+    fn dropCompletionRetry(self: *WorkflowHandler, run_ns_key: []const u8) void {
+        for (self.completion_retries.items, 0..) |p, i| if (std.mem.eql(u8, p.run_ns_key, run_ns_key)) {
+            _ = self.completion_retries.swapRemove(i);
+            self.allocator.free(p.run_ns_key);
+            self.allocator.free(p.detail);
+            return;
+        };
+    }
+
     /// 100 ms doubling to 5 s.
     fn completionBackoff(attempt: u32) i64 {
         return @min(@as(i64, 100) << @intCast(@min(attempt, 6)), 5000);
@@ -2961,8 +2994,14 @@ pub const WorkflowHandler = struct {
         var i: usize = 0;
         while (i < self.completion_retries.items.len) {
             const p = self.completion_retries.items[i];
-            const cancelling = if (self.runs.getPtr(p.run_ns_key)) |r| cancelInFlight(shard, r) else false;
-            if (p.due_ms > now_ms or cancelling) {
+            const run_now = self.runs.getPtr(p.run_ns_key);
+            if (run_now == null or run_now.?.status.isTerminal()) {
+                _ = self.completion_retries.swapRemove(i);
+                self.allocator.free(p.run_ns_key);
+                self.allocator.free(p.detail);
+                continue;
+            }
+            if (p.due_ms > now_ms or endingInFlight(shard, run_now.?)) {
                 i += 1;
                 continue;
             }
@@ -4774,6 +4813,8 @@ test "a step whose child run the log dropped fails once the child's start index 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-c", "run-c", "test-wf");
 
@@ -4784,6 +4825,7 @@ test "a step whose child run the log dropped fails once the child's start index 
     const run = handler.runs.getPtr("default:run-c").?;
     handler.parkForChild(run, "gone", "start", "child-wf", shard.id, 0, proposed.index);
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     const after = handler.runs.get("default:run-c").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, after.status);
     var lost = false;
@@ -4791,6 +4833,43 @@ test "a step whose child run the log dropped fails once the child's start index 
         if (std.mem.eql(u8, evt.event_type_owned, "child_lost")) lost = true;
     }
     try testing.expect(lost);
+}
+
+test "a parent waiting on a child resumes once the child's completion commits, not when it is proposed" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
+    createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
+    createTestRun(&handler, "default:par", "par", "test-wf");
+    createTestRun(&handler, "default:kid", "kid", "test-wf");
+    const parent = handler.runs.getPtr("default:par").?;
+    handler.parkForChild(parent, "kid", "start", "test-wf", shard.id, 0, 0);
+
+    const kid = handler.runs.getPtr("default:kid").?;
+    handler.completeRun(&shard, "default:kid", kid, .completed, "flo.Completed", 3);
+    // Proposed, not applied: the parent still waits on it.
+    handler.checkPendingActions(&shard);
+    try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:kid").?.status);
+    const waiting = handler.runs.get("default:par").?;
+    try testing.expectEqual(WorkflowHandler.RunStatus.waiting, waiting.status);
+    try testing.expectEqualStrings("kid", waiting.pending_child_run_id_owned.?);
+
+    _ = shard.applyCommitted();
+    try testing.expectEqual(WorkflowHandler.RunStatus.completed, handler.runs.get("default:kid").?.status);
+    handler.checkPendingActions(&shard);
+    const resumed = handler.runs.get("default:par").?;
+    try testing.expect(resumed.pending_child_run_id_owned == null);
+    var completed = false;
+    for (resumed.history.items) |evt| {
+        if (std.mem.eql(u8, evt.event_type_owned, "child_completed")) completed = true;
+    }
+    try testing.expect(completed);
 }
 
 test "a step whose action run the log dropped fails once the invoke's index has applied" {
@@ -4801,6 +4880,8 @@ test "a step whose action run the log dropped fails once the invoke's index has 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-l", "run-l", "test-wf");
@@ -4819,6 +4900,7 @@ test "a step whose action run the log dropped fails once the invoke's index has 
     run.pending_action_run_id_owned = try allocator.dupe(u8, "gone");
     _ = shard.applyCommitted();
     handler.checkPendingActions(&shard);
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.failed, handler.runs.get("default:run-l").?.status);
 }
 
@@ -4834,6 +4916,8 @@ test "step executor: linear workflow completes via action invocation" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
 
@@ -4885,6 +4969,8 @@ test "step executor: wait_for_signal parks run" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
@@ -4920,6 +5006,8 @@ test "step executor: signal resumes waiting workflow" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "init");
 
     createTestDef(&handler, "default:wait-wf", "wait-wf", test_wait_workflow_json);
@@ -4971,6 +5059,8 @@ test "step executor: missing definition does not crash" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     // No definition registered
     createTestRun(&handler, "default:run-4", "run-4", "nonexistent-wf");
@@ -4994,6 +5084,8 @@ test "step executor: missing action yields target_not_found" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-5", "run-5", "test-wf");
@@ -5017,6 +5109,8 @@ test "step executor: a step waits for its action, and starts when it registers" 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-w", "run-w", "test-wf");
@@ -5044,6 +5138,8 @@ test "step executor: past MAX_HELD waiting steps, a step fails at once" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     var id_buf: [32]u8 = undefined;
     for (0..ActionsHandler.MAX_HELD + 1) |i| {
@@ -5067,6 +5163,8 @@ test "step executor: a step whose hold a step-down dropped fails, rather than wa
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-d", "run-d", "test-wf");
@@ -5089,6 +5187,8 @@ test "step executor: a start let go of isn't lost before its invoke applies" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:run-r", "run-r", "test-wf");
@@ -5110,6 +5210,8 @@ test "step executor: an action deleted after its invoke was proposed fails the s
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
@@ -5187,6 +5289,8 @@ test "step executor: a plan's executor waits when the only other's breaker is op
         defer actions.deinit();
         var shard = try createTestShard(&actions);
         defer destroyTestShard(&shard);
+        handler.registerReplay(&shard.replay_registry);
+        shard.workflow_handler = &handler;
 
         createTestDef(&handler, "default:plan-wf", "plan-wf", test_plan_exhaust_workflow_json);
         createTestRun(&handler, "default:run-b", "run-b", "plan-wf");
@@ -5210,6 +5314,8 @@ test "workflow duty: looks only at runs parked on an action or a child" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
@@ -5235,6 +5341,8 @@ test "workflow duty: a timer fires when due, and one the run moved past is dropp
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
     createTestRun(&handler, "default:due", "due", "test-wf");
@@ -5266,6 +5374,8 @@ test "workflow duty: a run with two timers due fires once" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
     createTestRun(&handler, "default:r", "r", "two-waits");
     handler.advanceWorkflow(&shard, "default:r", "default");
@@ -5294,6 +5404,8 @@ test "workflow duty: a wait with a timeout arms its timer, which holds until due
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
     createTestRun(&handler, "default:r", "r", "two-waits");
     handler.advanceWorkflow(&shard, "default:r", "default");
@@ -5314,6 +5426,8 @@ test "workflow duty: an entry from before doesn't fire a run's later timer" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     const later = @import("stdx").time.milliTimestamp() + 3_600_000;
     createTestRun(&handler, "default:w", "w", "test-wf");
@@ -5342,6 +5456,8 @@ test "workflow duty: a signal already there ends a wait, and leaves no deadline 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
     createTestRun(&handler, "default:r", "r", "two-waits");
     const run = handler.runs.getPtr("default:r").?;
@@ -5364,6 +5480,8 @@ test "workflow duty: a failed insert is made good from the runs" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
     createTestRun(&handler, "default:r", "r", "two-waits");
     createTestRun(&handler, "default:p", "p", "two-waits");
@@ -5390,6 +5508,8 @@ test "workflow schedule: max_concurrent follows runs starting and finishing, eac
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     var out: Result = .{};
     var value: [64]u8 = undefined;
@@ -5466,6 +5586,8 @@ test "workflow first steps: a burst bigger than a pass is logged across passes, 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     // An entry carries its namespace's id: "a" is created first.
     try testing.expectEqual(.created, shard.namespace_handler.applyCreate("a"));
@@ -5547,6 +5669,8 @@ test "workflow schedule: a slot starts one run however many leaders propose it, 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     // Created ten intervals ago; slot 0 fired then, nothing since.
     const interval: i64 = 3_600_000;
@@ -5604,6 +5728,8 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:two-waits", "two-waits", test_two_waits_json);
     createTestRun(&handler, "default:r", "r", "two-waits");
     handler.advanceWorkflow(&shard, "default:r", "default");
@@ -5613,9 +5739,9 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
 
     const raft = shard.raft_node;
     const cancel = try unappliedEntry(&shard);
-    run.cancel_index = cancel.index;
-    run.cancel_term = cancel.term;
-    try testing.expect(WorkflowHandler.cancelInFlight(&shard, run));
+    run.ending_index = cancel.index;
+    run.ending_term = cancel.term;
+    try testing.expect(WorkflowHandler.endingInFlight(&shard, run));
     // A timer due while it's in flight neither fires nor is lost.
     handler.checkPendingActions(&shard);
     try testing.expect(run.current_step_name_owned == null);
@@ -5624,22 +5750,22 @@ test "workflow cancel: while one is in flight nothing moves the run, and once it
 
     // Elected again, its entry still in the log: it may yet apply.
     raft.current_term += 1;
-    try testing.expect(WorkflowHandler.cancelInFlight(&shard, run));
+    try testing.expect(WorkflowHandler.endingInFlight(&shard, run));
     raft.current_term -= 1;
     // Its entry cut and replaced by another term's.
-    run.cancel_term = cancel.term + 1;
-    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
-    run.cancel_term = cancel.term;
+    run.ending_term = cancel.term + 1;
+    try testing.expect(!WorkflowHandler.endingInFlight(&shard, run));
+    run.ending_term = cancel.term;
     // No longer leading.
     raft.role = .follower;
-    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    try testing.expect(!WorkflowHandler.endingInFlight(&shard, run));
     raft.role = .leader;
     // Its index applied without ending the run.
     _ = shard.applyCommitted();
-    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, run));
+    try testing.expect(!WorkflowHandler.endingInFlight(&shard, run));
 
     // The timer it kept fires now.
-    @import("stdx").time.sleep(@as(u64, WorkflowHandler.CANCEL_RECHECK_MS + 20) * std.time.ns_per_ms);
+    @import("stdx").time.sleep(@as(u64, WorkflowHandler.ENDING_RECHECK_MS + 20) * std.time.ns_per_ms);
     handler.checkPendingActions(&shard);
     try testing.expectEqualStrings("second", run.current_step_name_owned.?);
 }
@@ -5652,6 +5778,8 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     const raft = shard.raft_node;
@@ -5672,8 +5800,8 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     const cancel = try unappliedEntry(&shard);
     for ([_][]const u8{ "default:parked", "default:started", "default:retry" }) |key| {
         const run = handler.runs.getPtr(key).?;
-        run.cancel_index = cancel.index;
-        run.cancel_term = cancel.term;
+        run.ending_index = cancel.index;
+        run.ending_term = cancel.term;
     }
     handler.advanceStartedRuns(&shard);
     handler.checkPendingActions(&shard);
@@ -5686,8 +5814,8 @@ test "workflow cancel: in flight, a finished action, a first step and a completi
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:retry").?.status);
 
     // Its entry cut, each goes on.
-    parked.cancel_term = cancel.term + 1;
-    try testing.expect(!WorkflowHandler.cancelInFlight(&shard, parked));
+    parked.ending_term = cancel.term + 1;
+    try testing.expect(!WorkflowHandler.endingInFlight(&shard, parked));
 }
 
 test "a halted shard's expire duty holds back the starts it holds, and lets them go once it serves" {
@@ -5748,6 +5876,8 @@ test "step executor: failing action follows failure transition" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b"); // step-b will fail
 
@@ -5788,6 +5918,8 @@ test "step executor: an action completed naming no outcome takes the success tra
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
 
@@ -5815,6 +5947,8 @@ test "step executor: a step whose action run another shard says was lost resumes
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
@@ -5846,6 +5980,8 @@ test "step executor: retry on failure" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky"); // always fails
 
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
@@ -5902,6 +6038,8 @@ test "step executor: a plan whose executors all fail fails the step after one pa
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "stripe");
     registerTestAction(&shard, "paypal");
 
@@ -5943,6 +6081,8 @@ test "step executor: an action run that timed out takes the step's failure trans
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "flaky");
 
     createTestDef(&handler, "default:retry-wf", "retry-wf", test_retry_workflow_json);
@@ -5976,6 +6116,8 @@ test "step executor: poll re-arms on pending and times out after max_attempts" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     registerTestAction(&shard, "poller");
 
     createTestDef(&handler, "default:poll-wf", "poll-wf", test_poll_workflow_json);
@@ -6033,6 +6175,8 @@ test "step executor: checkPendingActions handles completed async action" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
 
@@ -6316,6 +6460,8 @@ test "a completion too large to log fails the run with a trimmed record that rep
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:big", "big", "test-wf");
@@ -6374,6 +6520,8 @@ test "a cancel whose completion record is too large stays a cancel, trimmed to f
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
 
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:big", "big", "test-wf");
@@ -6381,6 +6529,7 @@ test "a cancel whose completion record is too large stays a cancel, trimmed to f
     try overfillHistory(&handler, run);
 
     try handler.tryComplete(&shard, "default:big", run, .cancelled, "stop", 5);
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     const events = run.history.items;
     try testing.expectEqualStrings("history_trimmed", events[0].event_type_owned);
@@ -6427,6 +6576,8 @@ test "a signal that would leave the completion no headroom is refused, holding n
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
 
@@ -6474,6 +6625,8 @@ test "a completion the log is too busy for is retried from the run's state, and 
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:r", "r", "test-wf");
     const run = handler.runs.getPtr("default:r").?;
@@ -6488,6 +6641,8 @@ test "a completion the log is too busy for is retried from the run's state, and 
     handler.retryCompletions(&shard, 10); // not yet due
     try testing.expectEqual(status, run.status);
     handler.retryCompletions(&shard, 10 + 60_000);
+    try testing.expectEqual(status, run.status); // logged, not yet applied
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
 }
@@ -6500,6 +6655,8 @@ test "a completion on a node that isn't leading changes nothing and isn't retrie
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestRun(&handler, "default:r", "r", "test-wf");
     const run = handler.runs.getPtr("default:r").?;
     const status = run.status;
@@ -6550,6 +6707,8 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
     for ([_]usize{ 0, 1 }) |over| {
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
+        handler.registerReplay(&shard.replay_registry);
+        shard.workflow_handler = &handler;
         createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
         createTestRun(&handler, key, &run_id, "test-wf");
         const run = handler.runs.getPtr(key).?;
@@ -6561,6 +6720,7 @@ test "the completion limit counts the run's key: one byte over it is trimmed, ex
         handler.addHistoryEvent(run, "pad", detail, 0);
 
         handler.completeRun(&shard, key, run, .completed, "flo.Completed", 3);
+        _ = shard.applyCommitted();
         try testing.expectEqual(if (over == 0) WorkflowHandler.RunStatus.completed else .failed, run.status);
         // Completed at its entry's stamp, not at the leader's `now_ms`.
         const stamp_ms: i64 = @intCast(shard.raft_node.log.last_stamp / std.time.ns_per_ms);
@@ -6594,12 +6754,15 @@ test "cancelling a run that already finished is refused and keeps its result" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:r", "r", "test-wf");
     const run = handler.runs.getPtr("default:r").?;
     handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 3);
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     const events = run.history.items.len;
 
@@ -6619,6 +6782,8 @@ test "an engine-reached cancel with a detail past the cancel-reason cap is trimm
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:big", "big", "test-wf");
     const run = handler.runs.getPtr("default:big").?;
@@ -6626,6 +6791,7 @@ test "an engine-reached cancel with a detail past the cancel-reason cap is trimm
 
     const detail = @as([2000]u8, @splat('t'));
     handler.completeRun(&shard, "default:big", run, .cancelled, &detail, 5);
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
     const last = run.history.items[run.history.items.len - 1].detail_owned;
     try testing.expect(std.mem.startsWith(u8, last, detail[0..WorkflowHandler.MAX_CANCEL_REASON] ++ " (completion record too large: "));
@@ -6639,6 +6805,8 @@ test "a retry pending when the run is cancelled doesn't undo the cancel" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:r", "r", "test-wf");
     const run = handler.runs.getPtr("default:r").?;
@@ -6649,6 +6817,7 @@ test "a retry pending when the run is cancelled doesn't undo the cancel" {
     try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
 
     try handler.tryComplete(&shard, "default:r", run, .cancelled, "stop", 11);
+    _ = shard.applyCommitted();
     try testing.expectEqual(WorkflowHandler.RunStatus.cancelled, run.status);
 
     handler.retryCompletions(&shard, 10 + 60_000);
@@ -6666,6 +6835,8 @@ test "a wait that times out with no target ends the run through the log" {
     for ([_]bool{ false, true }) |leading| {
         var handler = WorkflowHandler.init(allocator);
         defer handler.deinit();
+        handler.registerReplay(&shard.replay_registry);
+        shard.workflow_handler = &handler;
         createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
         createTestRun(&handler, "default:w", "w", "test-wf");
         const run = handler.runs.getPtr("default:w").?;
@@ -6675,6 +6846,7 @@ test "a wait that times out with no target ends the run through the log" {
         if (!leading) handler.propose = notLeading;
 
         handler.handleWaitTimeout(&shard, "default:w", 2);
+        _ = shard.applyCommitted();
         if (leading) {
             try testing.expectEqual(WorkflowHandler.RunStatus.timed_out, run.status);
         } else {
@@ -6692,12 +6864,15 @@ test "a signal to a finished run is refused and leaves its history alone" {
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
+    handler.registerReplay(&shard.replay_registry);
+    shard.workflow_handler = &handler;
     var conn = try Connection.init(allocator, -1, 0, 0);
     defer conn.deinit();
     createTestDef(&handler, "default:test-wf", "test-wf", test_workflow_json);
     createTestRun(&handler, "default:r", "r", "test-wf");
     const run = handler.runs.getPtr("default:r").?;
     handler.completeRun(&shard, "default:r", run, .completed, "flo.Completed", 3);
+    _ = shard.applyCommitted();
     const events = run.history.items.len;
 
     const value = [_]u8{ 2, 0 } ++ "go".*;
