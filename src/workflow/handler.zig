@@ -630,7 +630,9 @@ pub const WorkflowHandler = struct {
         defer self.mu.unlock();
         const run = self.runs.getPtr(cmd.key) orelse return;
         if (run.status.isTerminal()) self.dropCompletionRetry(cmd.key);
-        if (run.ending_index != entry.header.index) return;
+        // Its index and term: a node elected again and still behind may
+        // apply another leader's entry at the index it once proposed at.
+        if (run.ending_index != entry.header.index or run.ending_term != entry.header.term) return;
         run.ending_index = 0;
         if (shard.metrics_registry) |m| switch (run.status) {
             .completed => m.workflow.recordCompleted(),
@@ -2866,13 +2868,22 @@ pub const WorkflowHandler = struct {
 
     /// Ends a run once its completion record, built from the run's state
     /// now, applies. A record too large to log is trimmed to
-    /// fit (see encodeTrimmed). A log too busy to take it is retried from
-    /// the run's state on a later tick; on a node that isn't leading,
-    /// nothing changes and the new leader owns the run.
+    /// fit (see encodeTrimmed). One the log refuses is kept and proposed
+    /// again from the run's state on a later tick, on a node that has
+    /// stopped leading once it leads again (`completionRetryable`).
     fn completeRun(self: *WorkflowHandler, shard: *Shard, run_ns_key: []const u8, run: *RunRecord, status: RunStatus, detail: []const u8, now_ms: i64) void {
-        self.tryComplete(shard, run_ns_key, run, status, detail, now_ms) catch |err| switch (err) {
-            error.Overloaded => self.retryCompletionLater(run_ns_key, status, detail, now_ms, 0),
-            else => {},
+        self.tryComplete(shard, run_ns_key, run, status, detail, now_ms) catch |err| {
+            if (completionRetryable(err)) self.retryCompletionLater(run_ns_key, status, detail, now_ms, 0);
+        };
+    }
+
+    /// Whether a completion the log refused may be proposed again: all but
+    /// one that can never fit. Steps aren't logged, so a node that stopped
+    /// leading keeps it for when it leads again; nothing else can end the run.
+    fn completionRetryable(err: anyerror) bool {
+        return switch (err) {
+            error.PayloadTooLarge, error.KeyTooLarge, error.BadKey => false,
+            else => true,
         };
     }
 
@@ -3010,9 +3021,8 @@ pub const WorkflowHandler = struct {
             defer self.allocator.free(p.detail);
             const run = self.runs.getPtr(p.run_ns_key) orelse continue;
             if (run.status.isTerminal()) continue;
-            self.tryComplete(shard, p.run_ns_key, run, p.status, p.detail, now_ms) catch |err| switch (err) {
-                error.Overloaded => self.retryCompletionLater(p.run_ns_key, p.status, p.detail, now_ms, p.attempt +| 1),
-                else => {},
+            self.tryComplete(shard, p.run_ns_key, run, p.status, p.detail, now_ms) catch |err| {
+                if (completionRetryable(err)) self.retryCompletionLater(p.run_ns_key, p.status, p.detail, now_ms, p.attempt +| 1);
             };
         }
     }
@@ -6647,7 +6657,7 @@ test "a completion the log is too busy for is retried from the run's state, and 
     try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
 }
 
-test "a completion on a node that isn't leading changes nothing and isn't retried" {
+test "a completion on a node that isn't leading changes nothing, and is kept for when it leads" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
     defer handler.deinit();
@@ -6666,7 +6676,39 @@ test "a completion on a node that isn't leading changes nothing and isn't retrie
     handler.completeRun(&shard, "default:r", run, .failed, "x", 10);
     try testing.expectEqual(status, run.status);
     try testing.expectEqual(@as(usize, 1), run.history.items.len);
+    try testing.expectEqual(@as(usize, 1), handler.completion_retries.items.len);
+
+    // Leading again, it's proposed and applies.
+    handler.propose = WorkflowHandler.proposeCompletion;
+    handler.retryCompletions(&shard, 10 + 60_000);
+    _ = shard.applyCommitted();
+    try testing.expectEqual(WorkflowHandler.RunStatus.failed, run.status);
     try testing.expectEqual(@as(usize, 0), handler.completion_retries.items.len);
+}
+
+test "an ending is counted only for the entry this leader proposed: its index and its term" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var actions = ActionsHandler.init(allocator);
+    defer actions.deinit();
+    var shard = try createTestShard(&actions);
+    defer destroyTestShard(&shard);
+    createTestRun(&handler, "default:r", "r", "test-wf");
+    const run = handler.runs.getPtr("default:r").?;
+    // Proposed at index 5 in term 1.
+    run.ending_index = 5;
+    run.ending_term = 1;
+    var pbuf: [128]u8 = undefined;
+    const value = [_]u8{ 5, 0, 0, 0, 0, 0, 0, 0 };
+    const result: Result = .{};
+    // Another leader's entry at that index, in term 2, isn't it.
+    const theirs = entry_mod.buildCommandEntry(.workflow_complete, 0, 2, 5, 0, .default, "default:r", &value, &pbuf).?;
+    handler.startApplied(&shard, &theirs, &result);
+    try testing.expectEqual(@as(u64, 5), run.ending_index);
+    const ours = entry_mod.buildCommandEntry(.workflow_complete, 0, 1, 5, 0, .default, "default:r", &value, &pbuf).?;
+    handler.startApplied(&shard, &ours, &result);
+    try testing.expectEqual(@as(u64, 0), run.ending_index);
 }
 
 test "a trimmed record leaves out the output, step outputs and tags" {
