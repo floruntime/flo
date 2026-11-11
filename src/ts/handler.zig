@@ -636,9 +636,6 @@ pub const TSHandler = struct {
             .too_long => return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("a tag filter is at most {d} bytes", .{ts_mod.MAX_TAG_STRING}) } },
         };
         const ns_id = req.ns_id;
-        if (filter.preds.len > 0 and !self.ts.hasSeries(ns_id, req.key, filter.preds)) {
-            return self.refuse(.not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ req.key, filter.canonical }, "no series has those tags; nothing deleted");
-        }
 
         // Through the log, so the delete survives a restart and every
         // replica applies it. Without a shard (unit tests), applied here.
@@ -648,7 +645,9 @@ pub const TSHandler = struct {
             };
             return .{ .parked = proposed };
         }
-        _ = self.ts.deleteSeries(ns_id, req.key, filter.preds);
+        if (self.ts.deleteSeries(ns_id, req.key, filter.preds) == 0 and filter.preds.len > 0) {
+            return self.refuse(.not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ req.key, filter.canonical }, "no series has those tags; nothing deleted");
+        }
         return .ok;
     }
 
