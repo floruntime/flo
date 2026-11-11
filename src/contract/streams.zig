@@ -15,25 +15,25 @@ pub const Streams = struct {
     proj: *const StreamProjection,
 
     /// The stream's first record, or MIN when it holds none.
-    pub fn first(self: Streams, name_hash: u64) StreamID {
-        return self.proj.streamFirstId(name_hash);
+    pub fn first(self: Streams, key: stream_mod.StreamKey) StreamID {
+        return self.proj.streamFirstId(key);
     }
 
     /// The stream's last record, or MIN when it holds none.
-    pub fn last(self: Streams, name_hash: u64) StreamID {
-        return self.proj.streamLastId(name_hash);
+    pub fn last(self: Streams, key: stream_mod.StreamKey) StreamID {
+        return self.proj.streamLastId(key);
     }
 
     /// The last record a trim removed, or MIN. Never lowered while the
     /// stream exists: every record at or before it is gone.
-    pub fn removedThrough(self: Streams, name_hash: u64) StreamID {
-        return self.proj.streamRemovedThrough(name_hash);
+    pub fn removedThrough(self: Streams, key: stream_mod.StreamKey) StreamID {
+        return self.proj.streamRemovedThrough(key);
     }
 
     /// The ids of the records after `cursor`, oldest first, one per
     /// record, at most `out.len`.
-    pub fn idsAfter(self: Streams, name_hash: u64, cursor: StreamID, out: []StreamID) usize {
-        return self.proj.streamIdsAfter(name_hash, cursor, out);
+    pub fn idsAfter(self: Streams, key: stream_mod.StreamKey, cursor: StreamID, out: []StreamID) usize {
+        return self.proj.streamIdsAfter(key, cursor, out);
     }
 };
 
@@ -51,7 +51,7 @@ fn id(ts: u64, seq: u64) StreamID {
 test "streams: ids after a cursor are one per record, a cursor inside an append resuming in it" {
     var proj = StreamProjection.init(testing.allocator);
     defer proj.deinit();
-    const h: u64 = 7;
+    const h = stream_mod.streamKey(.default, "s");
     // Two appends in one millisecond: three records, then two.
     _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
     _ = try proj.appendToStreamAt(h, 2, 0, 100, 2, 20);
@@ -69,7 +69,7 @@ test "streams: ids after a cursor are one per record, a cursor inside an append 
 
     try testing.expectEqual(@as(usize, 2), s.idsAfter(h, StreamID.MIN, out[0..2]));
     try testing.expectEqual(@as(usize, 0), s.idsAfter(h, id(100, 4), &out));
-    try testing.expectEqual(@as(usize, 0), s.idsAfter(99, StreamID.MIN, &out));
+    try testing.expectEqual(@as(usize, 0), s.idsAfter(stream_mod.streamKey(.default, "other"), StreamID.MIN, &out));
     try testing.expect(s.first(h).eql(id(100, 0)));
     try testing.expect(s.last(h).eql(id(100, 4)));
 }
@@ -77,7 +77,7 @@ test "streams: ids after a cursor are one per record, a cursor inside an append 
 test "streams: a trim's removed-through is its last cut append's last record, and never goes back" {
     var proj = StreamProjection.init(testing.allocator);
     defer proj.deinit();
-    const h: u64 = 7;
+    const h = stream_mod.streamKey(.default, "s");
     _ = try proj.appendToStreamAt(h, 1, 0, 100, 3, 30);
     _ = try proj.appendToStreamAt(h, 2, 0, 200, 1, 10);
     const s: Streams = .{ .proj = &proj };

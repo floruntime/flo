@@ -5,27 +5,10 @@
 //! envelope's namespace. A name with a leading `_` is the system's and is
 //! never created.
 //!
-//! ## Namespace Key Utilities (public API for all subsystems)
+//! ## Namespace key utilities
 //!
-//! All subsystems (KV, Stream, Queue, Actions, TS, Processing, Workflow) should
-//! use the public key utilities below for namespace isolation:
-//!
-//! ```zig
-//! const ns = @import("../namespace/handler.zig");
-//!
-//! // Validate key size early (returns error message or null if valid)
-//! if (ns.validateKeySize(req.namespace, req.key)) |msg| return error(msg);
-//!
-//! // Build namespace-qualified key: "myapp\x00mykey"
-//! var qbuf: [ns.MAX_QUALIFIED_KEY]u8 = undefined;
-//! const qkey = try ns.qualifyKey(&qbuf, req.namespace, req.key);
-//!
-//! // Strip prefix for display (scan results, error messages)
-//! const display_key = ns.stripPrefix(stored_key, req.namespace);
-//!
-//! // Build prefix for scanning all keys in a namespace
-//! const prefix = ns.namespacePrefix(&qbuf, req.namespace);
-//! ```
+//! `validateKeySize` checks a key early; `qualifyKey` builds the
+//! `"ns\x00key"` form for the subsystems still keyed by name.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -129,67 +112,6 @@ pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const 
     buf[ns.len] = NAMESPACE_SEPARATOR;
     @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
     return buf[0..total];
-}
-
-/// Qualify a consumer-group name so it is scoped to a single stream:
-/// `qualifyKey(ns, stream) ++ "\x00" ++ group`.
-///
-///   default ns:     `"<stream>\x00<group>"`
-///   non-default ns: `"<ns>\x00<stream>\x00<group>"`
-///
-/// This is what keys a consumer group in the projection and in the durable
-/// cg_commit/cg_delete entries, so folding the stream in here makes cursors and
-/// PEL strictly per-(stream, group) — a group never spans streams. The prefix a
-/// stream's groups share is exactly `qualifyKey(ns, stream) ++ "\x00"`, which
-/// `deleteStream` uses to cascade-remove a deleted stream's groups.
-pub fn qualifyGroupKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, stream: []const u8, group: []const u8) error{KeyTooLarge}![]const u8 {
-    const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
-    const ns_prefix_len: usize = if (has_ns) ns.len + 1 else 0;
-    const total = ns_prefix_len + stream.len + 1 + group.len;
-    if (total > MAX_QUALIFIED_KEY) return error.KeyTooLarge;
-    var off: usize = 0;
-    if (has_ns) {
-        @memcpy(buf[0..ns.len], ns);
-        buf[ns.len] = NAMESPACE_SEPARATOR;
-        off = ns.len + 1;
-    }
-    @memcpy(buf[off..][0..stream.len], stream);
-    off += stream.len;
-    buf[off] = NAMESPACE_SEPARATOR;
-    off += 1;
-    @memcpy(buf[off..][0..group.len], group);
-    off += group.len;
-    return buf[0..off];
-}
-
-/// Strip namespace prefix from a qualified key for display to the user.
-///
-/// Given a stored key like `"myapp\x00mykey"` and namespace `"myapp"`, returns
-/// `"mykey"`. If the key doesn't have the expected prefix (wrong namespace,
-/// default namespace, or malformed), returns the key unchanged.
-pub fn stripPrefix(qualified: []const u8, ns: []const u8) []const u8 {
-    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return qualified;
-    const prefix_len = ns.len + 1;
-    if (qualified.len > prefix_len and
-        qualified[ns.len] == NAMESPACE_SEPARATOR and
-        std.mem.eql(u8, qualified[0..ns.len], ns))
-    {
-        return qualified[prefix_len..];
-    }
-    return qualified;
-}
-
-/// Build the namespace prefix for scanning all keys belonging to a namespace.
-///
-/// Returns `"ns\x00"` for non-default namespaces (use as a `scanPrefix` argument),
-/// or an empty slice for the default namespace (full scan). A name too long
-/// to be one is refused, never cut.
-pub fn namespacePrefix(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8) error{NamespaceTooLong}![]const u8 {
-    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return &.{};
-    if (ns.len > MAX_NAME_LEN) return error.NamespaceTooLong;
-    @memcpy(buf[0..ns.len], ns);
-    buf[ns.len] = NAMESPACE_SEPARATOR;
-    return buf[0 .. ns.len + 1];
 }
 
 /// Validate a key for namespace ns: non-empty, no NUL, and fits once qualified.
@@ -1254,37 +1176,6 @@ test "qualifyKey: oversized key returns KeyTooLarge" {
     const big_key = &@as([(MAX_QUALIFIED_KEY)]u8, @splat('x')); // exactly fills buffer
     const result = qualifyKey(&buf, "ns", big_key);
     try testing.expectError(error.KeyTooLarge, result);
-}
-
-test "stripPrefix: removes namespace prefix" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const qualified = try qualifyKey(&buf, "myapp", "mykey");
-    try testing.expectEqualStrings("mykey", stripPrefix(qualified, "myapp"));
-}
-
-test "stripPrefix: default namespace is no-op" {
-    try testing.expectEqualStrings("mykey", stripPrefix("mykey", ""));
-    try testing.expectEqualStrings("mykey", stripPrefix("mykey", "default"));
-}
-
-test "stripPrefix: wrong namespace returns key unchanged" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const qualified = try qualifyKey(&buf, "myapp", "mykey");
-    try testing.expectEqualStrings(qualified, stripPrefix(qualified, "other"));
-}
-
-test "namespacePrefix: default returns empty" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), (try namespacePrefix(&buf, "")).len);
-    try testing.expectEqual(@as(usize, 0), (try namespacePrefix(&buf, "default")).len);
-}
-
-test "namespacePrefix: non-default returns ns plus separator" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const prefix = try namespacePrefix(&buf, "prod");
-    try testing.expectEqual(@as(usize, 5), prefix.len);
-    try testing.expectEqualStrings("prod", prefix[0..4]);
-    try testing.expectEqual(@as(u8, 0), prefix[4]);
 }
 
 test "validateKeySize: valid keys" {

@@ -49,6 +49,7 @@ const GroupMembersResponse = table_run.op("stream.group.members").response;
 const CommandResult = result_mod.CommandResult;
 const disk_reads = @import("disk_reads.zig");
 const StreamProjection = stream_mod.StreamProjection;
+const StreamKey = stream_mod.StreamKey;
 const StreamID = stream_mod.StreamID;
 const time_units = @import("../util/time_units.zig");
 
@@ -194,12 +195,12 @@ pub const StreamHandler = struct {
     }
 
     /// The stream's groups, a prefix scan of the partition's groups, keyed
-    /// `[ns\0]stream\0group`. A key whose rest holds another NUL is a
-    /// longer qualified stream's, never this one's.
+    /// `id ‖ stream ‖ \0 ‖ group` (`stream_mod.groupKey`). Group names hold
+    /// no NUL, so a key whose rest holds one is another stream's.
     fn runGroupList(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(GroupListResponse) {
         const self = shard.stream_handler;
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const prefix = ns_keys.qualifyGroupKey(&q_buf, req.namespace, req.key, "") catch return error.NameTooLong;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const prefix = stream_mod.groupKey(&q_buf, req.ns_id, req.key, "") orelse return error.NameTooLong;
         // By name, so a list that doesn't fit always shows the same first ones.
         const Named = struct { name: []const u8, g: *const stream_mod.ConsumerGroup };
         var found: std.ArrayList(Named) = .empty;
@@ -243,8 +244,8 @@ pub const StreamHandler = struct {
     /// A group's members. A group that isn't there is not found.
     fn runGroupMembers(shard: *Shard, _: *Connection, req: Request, group: []const u8) Error!table_run.Outcome(GroupMembersResponse) {
         const self = shard.stream_handler;
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = resolveGroupName(&q_buf, req.namespace, req.key, group) orelse return error.NameTooLong;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const key = resolveGroupName(&q_buf, req.ns_id, req.key, group) orelse return error.NameTooLong;
         const g = self.stream.getGroup(key) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
         // By id, so a list that doesn't fit always shows the same first ones.
@@ -281,7 +282,7 @@ pub const StreamHandler = struct {
     // ── Pre-Route Hooks ─────────────────────────────────────────────────
 
     /// Route by stream name — single-partition operations.
-    /// Uses namespace-qualified hash: hash(namespace \0 stream_name)
+    /// Routed by the namespace's id and the stream's name (`routeNsKey`).
     fn preRouteByStream(req: Request) ?u64 {
         if (req.key.len == 0) return 0;
         return router.routeNsKey(req.ns_id, req.key);
@@ -289,9 +290,8 @@ pub const StreamHandler = struct {
 
     // ── Shard Walker: Local Scan ────────────────────────────────────────
 
-    /// ShardWalker LocalScanFn for stream_list — scans unique stream
-    /// names from one shard's StreamProjection.
-    /// Filters by namespace prefix and strips prefix from results.
+    /// ShardWalker LocalScanFn for stream_list — the names of one
+    /// namespace's streams in one shard's StreamProjection.
     pub fn localScanStreams(
         ctx: *anyopaque,
         ns: dispatcher_mod.WalkNamespace,
@@ -299,35 +299,9 @@ pub const StreamHandler = struct {
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const namespace = ns.name;
         const stream: *StreamProjection = @ptrCast(@alignCast(ctx));
-        const S = struct {
-            threadlocal var ns_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        };
         const name_buf = dispatcher_mod.scanScratch(stream.stream_names.count());
-
-        // Build namespace prefix for filtering
-        const ns_prefix = ns_keys.namespacePrefix(&S.ns_buf, namespace) catch return .{ .items = &.{}, .next_cursor = null };
-
-        // Scan all qualified names
-        const raw_count = stream.scanStreamNames(name_buf);
-
-        // Filter by namespace and strip prefix
-        var count: usize = 0;
-        for (name_buf[0..raw_count]) |name| {
-            if (ns_prefix.len == 0) {
-                // Default namespace — only include bare names (no NUL separator)
-                if (std.mem.indexOfScalar(u8, name, ns_keys.NAMESPACE_SEPARATOR) == null) {
-                    name_buf[count] = name;
-                    count += 1;
-                }
-            } else if (std.mem.startsWith(u8, name, ns_prefix)) {
-                // Non-default namespace — strip prefix
-                name_buf[count] = name[ns_prefix.len..];
-                count += 1;
-            }
-        }
-
+        const count = stream.scanStreamNames(ns.id, name_buf);
         return .{ .items = name_buf[0..count], .next_cursor = null };
     }
 
@@ -525,13 +499,13 @@ pub const StreamHandler = struct {
             // entry ready (`wakeGroupReadWaiter`).
             // (A wildcard key is already rejected by handleCommand above, so the
             // key here is always a single concrete stream.)
-            const name_hash = router.nameHash(req.ns_id, req.key);
+            const key = stream_mod.streamKey(req.ns_id, req.key);
             const registered = shard.waiter_pool.register(.{
                 .kind = .stream_group_read,
                 .reply_to = conn.replyTo(),
                 .request_id = req.header.request_id,
                 .key = req.key,
-                .stream = .{ .name_hash = name_hash, .after = shard.stream_handler.stream.streamLastId(name_hash) },
+                .stream = .{ .stream = key, .after = shard.stream_handler.stream.streamLastId(key) },
                 .timeout_ms = bms,
             });
             if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
@@ -547,11 +521,11 @@ pub const StreamHandler = struct {
 
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    /// Why a request's stream or group name cannot be used, or null. Keys
-    /// join namespace, stream and group with NUL ("ns\x00stream\x00group";
-    /// no prefix in "default"), so a name holding a NUL could spell another
-    /// namespace's key. Names too long to qualify are refused too. Checked
-    /// here for every request but list, before any key is built.
+    /// Why a request's stream or group name cannot be used, or null. A
+    /// group's key joins stream and group with a NUL (`stream_mod.groupKey`),
+    /// so a name holding one could spell another stream's group. Names too
+    /// long for a key are refused too. Checked here for every request but
+    /// list, before any key is built.
     fn nameRefusal(op: OpCode, req: Request) ?[]const u8 {
         if (op == .stream_list) return null; // key is a filter, never a name
         if (std.mem.indexOfScalar(u8, req.key, 0) != null) return "stream name must not contain NUL";
@@ -559,8 +533,8 @@ pub const StreamHandler = struct {
         if (!isGroupOp(op)) return null;
         const group = (decodeGroupName(req.value) orelse return null).name;
         if (std.mem.indexOfScalar(u8, group, 0) != null) return "group name must not contain NUL";
-        var buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        _ = ns_keys.qualifyGroupKey(&buf, req.namespace, req.key, group) catch return "stream + group name too long";
+        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        _ = stream_mod.groupKey(&buf, req.ns_id, req.key, group) orelse return "stream + group name too long";
         return null;
     }
 
@@ -578,7 +552,7 @@ pub const StreamHandler = struct {
     /// handler around `run()`.
     pub fn appendForTest(self: *StreamHandler, namespace: []const u8, name: []const u8, batch: []const u8) CommandResult {
         if (!@import("builtin").is_test) @compileError("appendForTest is for tests");
-        return self.handleCommand(.{ .header = proto.RequestHeader.init(.stream_append, 0), .namespace = namespace, .key = name, .value = batch, .options = "" });
+        return self.handleCommand(.{ .header = proto.RequestHeader.init(.stream_append, 0), .namespace = namespace, .ns_id = self.namespaceId(namespace), .key = name, .value = batch, .options = "" });
     }
 
     /// Dispatch a stream command to the appropriate handler.
@@ -631,8 +605,8 @@ pub const StreamHandler = struct {
             // Hash the partition key and map to a partition index
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-                const pc = self.stream.getPartitionCount(metaKey(&qbuf, req) orelse return NAME_TOO_LONG);
+                var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                const pc = self.stream.getPartitionCount(nameKey(&qbuf, req) orelse return NAME_TOO_LONG);
                 partition_index = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -657,8 +631,8 @@ pub const StreamHandler = struct {
                 return .{ .err = .{ .code = .internal_error, .message = "stream encode failed" } };
             };
             defer self.allocator.free(stored_value);
-            // The applier registers the stream's name by resolving the
-            // namespace, so a namespace nobody created is created first.
+            // The entry is stamped with its namespace's id, so a namespace
+            // nobody created is created first.
             shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
             const proposed = persistence_mod.proposeEntry(shard, .stream_append, entry_mod.Flags.NONE, req.namespace, req.key, stored_value) catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "append not persisted") };
@@ -681,13 +655,10 @@ pub const StreamHandler = struct {
         } };
     }
 
-    /// Register the namespace-qualified name so the stream is listed and
-    /// found. A name that cannot be qualified is not listed rather than
-    /// listed bare, where it could pass for another namespace's.
+    /// Register the stream's name key so it is listed and found.
     fn registerStreamName(self: *StreamHandler, req: Request) error{OutOfMemory}!void {
-        var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const ns_stream_name = ns_keys.qualifyKey(&ns_reg_buf, req.namespace, req.key) catch return;
-        try self.stream.registerStream(ns_stream_name);
+        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        try self.stream.registerStream(nameKey(&buf, req) orelse return);
     }
 
     // ── READ ────────────────────────────────────────────────────────────
@@ -716,15 +687,13 @@ pub const StreamHandler = struct {
     /// What a read request covers. `stream_start` is exclusive: a reader
     /// passes back the last id it saw and gets what came after it.
     pub fn readWindow(self: *StreamHandler, req: Request) waiter_pool_mod.StreamWindow {
-        const name_hash = router.nameHash(req.ns_id, req.key);
         var window: waiter_pool_mod.StreamWindow = .{
-            .name_hash = name_hash,
-            .stream = router.nsNameKey(req.ns_id, req.key),
+            .stream = stream_mod.streamKey(req.ns_id, req.key),
             .limit = readLimit(req),
         };
 
         if (req.findOption(.stream_tail) != null) {
-            window.after = self.stream.streamLastId(name_hash);
+            window.after = self.stream.streamLastId(window.stream);
         } else if (req.findOption(.stream_start)) |opt| {
             if (opt.asStreamId()) |sid| {
                 if (sid.timestamp_ms > 0) {
@@ -749,9 +718,9 @@ pub const StreamHandler = struct {
         } else if (req.findOption(.partition_key)) |opt| {
             const pk_bytes = opt.data;
             if (pk_bytes.len > 0) {
-                var qbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-                // handleCommand refused a name too long to qualify.
-                const pc = if (metaKey(&qbuf, req)) |k| self.stream.getPartitionCount(k) else 1;
+                var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                // handleCommand refused a name too long for a key.
+                const pc = if (nameKey(&qbuf, req)) |k| self.stream.getPartitionCount(k) else 1;
                 window.partition = @intCast(std.hash.Wyhash.hash(0, pk_bytes) % pc);
             }
         }
@@ -772,9 +741,9 @@ pub const StreamHandler = struct {
         // the record budget; then keep the whole appends that fit it.
         const out = buf[0..window.limit];
         const count = if (window.end.eql(StreamID.MAX))
-            self.stream.readStreamAfter(window.name_hash, window.after, window.partition, out)
+            self.stream.readStreamAfter(window.stream, window.after, window.partition, out)
         else
-            self.stream.readStreamRange(window.name_hash, window.after, window.end, window.partition, out);
+            self.stream.readStreamRange(window.stream, window.after, window.end, window.partition, out);
         return out[0..stream_mod.wholeEntriesWithin(out[0..count], window.limit)];
     }
 
@@ -844,8 +813,7 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const ns_hash = req.ns_id;
-        const name_hash = router.nameHash(ns_hash, req.key);
+        const key = stream_mod.streamKey(req.ns_id, req.key);
 
         if (req.value.len > 0) {
             return .{ .err = .{ .code = .invalid_request, .message = "stream trim takes no value; give before, maxlen or maxage" } };
@@ -887,12 +855,12 @@ pub const StreamHandler = struct {
             if (keep == 0) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxlen must be > 0" } };
             // Logical records: counting entries would read a batched stream
             // as far shorter than it is.
-            const total = self.stream.streamLogicalCount(name_hash);
-            if (total <= keep) return trimmed(name_hash, 0, self.stream);
-            const nth = self.stream.resolveNthRecordId(name_hash, total - keep);
+            const total = self.stream.streamLogicalCount(key);
+            if (total <= keep) return trimmed(key, 0, self.stream);
+            const nth = self.stream.resolveNthRecordId(key, total - keep);
             // Trim cuts whole batches; when the cut falls inside the first
             // one, nothing can go without dropping records inside the window.
-            if (nth.eql(StreamID.MIN)) return trimmed(name_hash, 0, self.stream);
+            if (nth.eql(StreamID.MIN)) return trimmed(key, 0, self.stream);
             bound = .{ .id = nth };
         } else if (maxage) |opt| {
             // Remove records older than S seconds, by the trim entry's stamp.
@@ -901,33 +869,33 @@ pub const StreamHandler = struct {
             if (age_s > time_units.MAX_AGE_MS / std.time.ms_per_s) return .{ .err = .{ .code = .invalid_request, .message = "stream trim: maxage is over 100 years" } };
             bound = .{ .age_ms = age_s * std.time.ms_per_s };
             // Nothing that old by this node's time: no entry to propose.
-            if (bound.resolve(self.nowNs()) == null) return trimmed(name_hash, 0, self.stream);
+            if (bound.resolve(self.nowNs()) == null) return trimmed(key, 0, self.stream);
         } else unreachable;
 
         // A dry run answers from the projection on the owning shard: what the
         // trim would remove and the first record it would leave, with no
         // proposal and no log entry.
         if (dry_run) {
-            const trim_id = bound.resolve(self.nowNs()) orelse return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = firstSeq(self.stream, name_hash) } };
-            const first_id = self.stream.firstIdAfterTrim(name_hash, trim_id);
+            const trim_id = bound.resolve(self.nowNs()) orelse return .{ .stream_trimmed = .{ .deleted_count = 0, .first_seq = firstSeq(self.stream, key) } };
+            const first_id = self.stream.firstIdAfterTrim(key, trim_id);
             return .{ .stream_trimmed = .{
-                .deleted_count = self.stream.trimCount(name_hash, trim_id),
+                .deleted_count = self.stream.trimCount(key, trim_id),
                 .first_seq = if (first_id.eql(StreamID.MIN)) 0 else first_id.sequence,
             } };
         }
 
         if (self.shard_ptr) |sptr| {
-            const proposed = self.proposeTrim(shardFromPtr(sptr), req.namespace, name_hash, bound) catch |err| {
+            const proposed = self.proposeTrim(shardFromPtr(sptr), key, bound) catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "trim not persisted") };
             };
             return .{ .parked = proposed };
         }
-        const trim_id = bound.resolve(self.nowNs()) orelse return trimmed(name_hash, 0, self.stream);
-        return trimmed(name_hash, self.stream.trimStream(name_hash, trim_id), self.stream);
+        const trim_id = bound.resolve(self.nowNs()) orelse return trimmed(key, 0, self.stream);
+        return trimmed(key, self.stream.trimStream(key, trim_id), self.stream);
     }
 
-    fn trimmed(name_hash: u64, deleted: u64, stream: *StreamProjection) CommandResult {
-        const first_id = stream.streamFirstId(name_hash);
+    fn trimmed(key: StreamKey, deleted: u64, stream: *StreamProjection) CommandResult {
+        const first_id = stream.streamFirstId(key);
         const first_seq = if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0;
         return .{ .stream_trimmed = .{
             .deleted_count = deleted,
@@ -948,43 +916,40 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "stream name is required" } };
         }
 
-        const ns_hash = req.ns_id;
-        const name_hash = router.nameHash(ns_hash, req.key);
+        const key = stream_mod.streamKey(req.ns_id, req.key);
 
         // Whether the stream is empty is decided as the entry applies: here, an
         // append committed and not yet applied would read as nothing.
         const force = req.findOption(.force) != null;
         if (self.shard_ptr) |sptr| {
-            const proposed = self.proposeDelete(shardFromPtr(sptr), req.namespace, req.key, force) catch |err| {
+            const proposed = self.proposeDelete(shardFromPtr(sptr), req.ns_id, req.key, force) catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "delete not persisted") };
             };
             return .{ .parked = proposed };
         }
-        if (!force and self.stream.streamRecordCount(name_hash) > 0) {
+        if (!force and self.stream.streamRecordCount(key) > 0) {
             return .{ .err = .{ .code = .conflict, .message = NOT_EMPTY_MESSAGE } };
         }
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qualified = ns_keys.qualifyKey(&q_buf, req.namespace, req.key) catch return NAME_TOO_LONG;
-        _ = self.stream.deleteStream(name_hash, req.key, qualified);
+        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        _ = self.stream.deleteStream(key, nameKey(&buf, req) orelse return NAME_TOO_LONG);
         return .ok;
     }
 
     // ── INFO ────────────────────────────────────────────────────────────
 
     fn handleInfo(self: *StreamHandler, req: Request) CommandResult {
-        const ns_hash = req.ns_id;
-        const name_hash = router.nameHash(ns_hash, req.key);
-        var meta_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const meta_key = metaKey(&meta_buf, req) orelse return NAME_TOO_LONG;
+        const key = stream_mod.streamKey(req.ns_id, req.key);
+        var meta_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const meta_key = nameKey(&meta_buf, req) orelse return NAME_TOO_LONG;
         // An unknown stream is not an empty one.
         if (!self.stream.stream_names.contains(meta_key)) return .{ .err = .{ .code = .not_found, .message = "stream not found" } };
         const pc = self.stream.getPartitionCount(meta_key);
 
-        const first_id = self.stream.streamFirstId(name_hash);
-        const last_id = self.stream.streamLastId(name_hash);
+        const first_id = self.stream.streamFirstId(key);
+        const last_id = self.stream.streamLastId(key);
         // Logical records (batch contents), not append entries.
-        const count = self.stream.streamLogicalCount(name_hash);
-        const bytes = self.stream.streamByteSize(name_hash);
+        const count = self.stream.streamLogicalCount(key);
+        const bytes = self.stream.streamByteSize(key);
 
         const meta = self.stream.stream_metadata.get(meta_key);
 
@@ -1004,15 +969,12 @@ pub const StreamHandler = struct {
 
     // ── CREATE ──────────────────────────────────────────────────────────
 
-    /// Namespace-qualified stream name for metadata lookups.
-    ///
-    /// `stream_metadata` (partition count + retention) must be keyed the same
-    /// way `stream_names` is. Keyed by the bare name, a same-named stream in
-    /// another namespace shares the entry and silently overwrites the first
-    /// one's configuration — including its partition count, which drives
-    /// routing. Qualify at every read and write.
-    fn metaKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, req: Request) ?[]const u8 {
-        return ns_keys.qualifyKey(buf, req.namespace, req.key) catch null;
+    /// The request's stream's name key, which keys its listing and its
+    /// settings (partition count, which drives routing, and retention): by
+    /// the bare name, a same-named stream in another namespace would share
+    /// them.
+    fn nameKey(buf: *[stream_mod.MAX_NAME_KEY]u8, req: Request) ?[]const u8 {
+        return stream_mod.nameKey(buf, req.ns_id, req.key);
     }
 
     fn handleCreate(self: *StreamHandler, req: Request) CommandResult {
@@ -1048,15 +1010,15 @@ pub const StreamHandler = struct {
         // An alter of a stream this shard has no settings for would be
         // refused at apply: refused here, without the commit.
         if (config.op == .alter) {
-            var key_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-            const key = configKey(&key_buf, req.namespace, req.key) orelse return NAME_TOO_LONG;
+            var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+            const key = nameKey(&key_buf, req) orelse return NAME_TOO_LONG;
             if (!self.stream.stream_metadata.contains(key)) return .{ .err = .{ .code = .not_found, .message = NO_STREAM } };
         }
         var value: [StreamConfig.SIZE]u8 = undefined;
         config.encode(&value);
         const sptr = self.shard_ptr orelse {
             // Without a shard (unit tests), the applier runs here.
-            return switch (self.applyConfig(req.namespace, req.ns_id, req.key, config)) {
+            return switch (self.applyConfig(req.ns_id, req.key, config)) {
                 .ok => .ok,
                 .refused => |r| .{ .err = .{ .code = switch (r.status) {
                     .not_found => .not_found,
@@ -1104,22 +1066,16 @@ pub const StreamHandler = struct {
 
     const ConfigOutcome = union(enum) { ok, refused: struct { status: proto.StatusCode, message: []const u8 } };
 
-    /// A stream's settings key: its namespace-qualified name, as stream
-    /// listing and info read it.
-    fn configKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, name: []const u8) ?[]const u8 {
-        return ns_keys.qualifyKey(buf, namespace, name) catch null;
-    }
-
     /// What a stream_config applies, on every replica alike. A create of a
     /// stream that has settings is answered ok if it asks for the same ones,
     /// as a retry does, and refused if not: changing them is `alter`'s.
-    fn applyConfig(self: *StreamHandler, namespace: []const u8, ns_id: router.NamespaceId, name: []const u8, c: StreamConfig) ConfigOutcome {
-        var key_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = configKey(&key_buf, namespace, name) orelse return .{ .refused = .{ .status = .bad_request, .message = "stream name too long" } };
+    fn applyConfig(self: *StreamHandler, ns_id: router.NamespaceId, name: []const u8, c: StreamConfig) ConfigOutcome {
+        var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const key = stream_mod.nameKey(&key_buf, ns_id, name) orelse return .{ .refused = .{ .status = .bad_request, .message = "stream name too long" } };
         const existing = self.stream.stream_metadata.get(key);
         const meta: stream_mod.StreamMetadata = switch (c.op) {
             .create => blk: {
-                const wanted: stream_mod.StreamMetadata = .{ .partition_count = c.partition_count, .name_hash = router.nameHash(ns_id, name), .retention_age_s = c.retention_age_s, .retention_count = c.retention_count };
+                const wanted: stream_mod.StreamMetadata = .{ .partition_count = c.partition_count, .retention_age_s = c.retention_age_s, .retention_count = c.retention_count };
                 if (existing) |e| {
                     if (e.partition_count == wanted.partition_count and e.retention_age_s == wanted.retention_age_s and e.retention_count == wanted.retention_count) return .ok;
                     return .{ .refused = .{ .status = .conflict, .message = "conflict: the stream exists with other settings; change them with stream alter" } };
@@ -1130,7 +1086,6 @@ pub const StreamHandler = struct {
                 const e = existing orelse return .{ .refused = .{ .status = .not_found, .message = NO_STREAM } };
                 break :blk .{
                     .partition_count = e.partition_count,
-                    .name_hash = e.name_hash,
                     .retention_age_s = if (c.retention_age_s > 0) c.retention_age_s else e.retention_age_s,
                     .retention_count = if (c.retention_count > 0) c.retention_count else e.retention_count,
                 };
@@ -1139,7 +1094,9 @@ pub const StreamHandler = struct {
         // Validated: from here it changes state, or is out of memory.
         self.stream.registerStream(key) catch return .{ .refused = .{ .status = .internal_error, .message = "out of memory" } };
         self.stream.registerStreamMetadata(key, meta) catch return .{ .refused = .{ .status = .internal_error, .message = "out of memory" } };
-        if (c.op == .create) if (self.metrics_registry) |mr| {
+        // Metrics name the namespace; one the node's table doesn't have yet
+        // is registered by the stream's first read instead.
+        if (c.op == .create) if (self.metrics_registry) |mr| if (self.namespaceName(ns_id)) |namespace| {
             _ = mr.registerStream(namespace, name, 0) catch {};
         };
         return .ok;
@@ -1190,9 +1147,8 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         }).name;
 
-        // Namespace-qualify for isolation
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
 
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -1223,8 +1179,8 @@ pub const StreamHandler = struct {
         const decoded = decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
 
         const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
         const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
@@ -1251,14 +1207,14 @@ pub const StreamHandler = struct {
         const decoded = decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
 
         if (self.stream.getGroup(group_name) == null) {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
         }
         if (self.shard_ptr) |sptr| {
-            const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_delete, entry_mod.Flags.NONE, "", group_name, "") catch |err| {
+            const proposed = proposeGroupEntry(shardFromPtr(sptr), .cg_delete, group_name, "") catch |err| {
                 return .{ .err = persistence_mod.failureError(err, "group delete not persisted") };
             };
             return .{ .parked = proposed };
@@ -1274,8 +1230,8 @@ pub const StreamHandler = struct {
         const pair = decodeGroupConsumer(req) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
         const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
 
@@ -1308,8 +1264,8 @@ pub const StreamHandler = struct {
         const pair = decodeGroupConsumer(req) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
         const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         _ = self.stream.leaveGroup(group_name, member_id) catch |err| {
@@ -1335,8 +1291,15 @@ pub const StreamHandler = struct {
         const pair = decodeGroupConsumer(req) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, pair.group) orelse return NAME_TOO_LONG;
+        // A namespace never created holds no stream to read, and has no id
+        // to log a group under: an empty read, and no group.
+        if (req.ns_id == .invalid) {
+            const empty = self.serializeStreamRecordsWithPayloads(&.{}, StreamID.MIN, null) catch
+                return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
+            return .{ .group_messages = .{ .data = empty } };
+        }
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
         const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
 
         // The first read of a group creates it, and joins the consumer.
@@ -1359,8 +1322,7 @@ pub const StreamHandler = struct {
 
         const capped: usize = readLimit(req);
 
-        const ns_hash = req.ns_id;
-        const name_hash = router.nameHash(ns_hash, req.key);
+        const key = stream_mod.streamKey(req.ns_id, req.key);
 
         // Ready pending entries (nacked, or idle past the ack timeout) come
         // first, then new records past the cursor. The reply is built before
@@ -1373,7 +1335,7 @@ pub const StreamHandler = struct {
             };
         };
         var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const found = self.stream.readStreamByIds(name_hash, ready_ids[0..ready_n], buf[0..ready_n]);
+        const found = self.stream.readStreamByIds(key, ready_ids[0..ready_n], buf[0..ready_n]);
         // Found records keep the ids' order; the ids without one were trimmed.
         var gone: [MAX_READ_BATCH]StreamID = undefined;
         var gone_n: usize = 0;
@@ -1386,7 +1348,7 @@ pub const StreamHandler = struct {
                 gone_n += 1;
             }
         }
-        const fresh = self.stream.groupPeek(group_name, name_hash, capped - found, buf[found..capped]) catch |err| {
+        const fresh = self.stream.groupPeek(group_name, key, capped - found, buf[found..capped]) catch |err| {
             return switch (err) {
                 error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
             };
@@ -1395,7 +1357,7 @@ pub const StreamHandler = struct {
         // A group's cursor passes whole appends, so nothing is left out.
         var readable: [MAX_READ_BATCH]bool = undefined;
         self.beginRead();
-        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
+        self.disk_window.stream = key;
         const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
             return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
         };
@@ -1460,8 +1422,8 @@ pub const StreamHandler = struct {
         };
         _ = reader.readLengthPrefixed(u16); // consumer
 
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
 
         // Read StreamID array
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1507,8 +1469,8 @@ pub const StreamHandler = struct {
         };
         _ = reader.readLengthPrefixed(u16); // consumer
 
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
 
         // Read StreamIDs to NACK
         var ids: [MAX_READ_BATCH]StreamID = undefined;
@@ -1550,8 +1512,8 @@ pub const StreamHandler = struct {
         const decoded = decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
 
         const group = self.stream.getGroup(group_name) orelse {
             return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
@@ -1577,8 +1539,8 @@ pub const StreamHandler = struct {
         const decoded = decodeGroupName(req.value) orelse {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, decoded.name) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
 
         // Optional consumer filter.
         var consumer_filter: ?[]const u8 = null;
@@ -1639,8 +1601,8 @@ pub const StreamHandler = struct {
         const start_seq = reader.readU64() orelse 0;
         const count: u32 = reader.readU32() orelse DEFAULT_READ_BATCH;
 
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
         const consumer_id = if (consumer_raw.len > 0) consumer_raw else "default";
 
         const start_id = StreamID{ .timestamp_ms = start_ts, .sequence = start_seq };
@@ -1657,13 +1619,12 @@ pub const StreamHandler = struct {
         };
 
         // Resolve claimed IDs → full records (payload + headers) in one hop.
-        const ns_hash = req.ns_id;
-        const name_hash = router.nameHash(ns_hash, req.key);
+        const key = stream_mod.streamKey(req.ns_id, req.key);
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const rec_count = self.stream.readStreamByIds(name_hash, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
+        const rec_count = self.stream.readStreamByIds(key, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
 
         self.beginRead();
-        self.disk_window.stream = router.nsNameKey(req.ns_id, req.key);
+        self.disk_window.stream = key;
         const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN, null) catch {
             return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
         };
@@ -1707,8 +1668,8 @@ pub const StreamHandler = struct {
             return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
         };
 
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.namespace, req.key, raw_group) orelse return NAME_TOO_LONG;
+        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
         const consumer = reader.readLengthPrefixed(u16) orelse "";
 
         // Read StreamIDs to touch
@@ -1900,8 +1861,15 @@ pub const StreamHandler = struct {
         return shardFromPtr(sptr).namespace_handler.table.lookup(effective) orelse .invalid;
     }
 
+    /// The name of namespace `id`, as the node's table has it, or null
+    /// while the table doesn't have it yet.
+    fn namespaceName(self: *const StreamHandler, id: router.NamespaceId) ?[]const u8 {
+        if (id == .default) return "default";
+        const sptr = self.shard_ptr orelse return null;
+        return shardFromPtr(sptr).namespace_handler.table.nameOf(id);
+    }
+
     /// Append payload to a named stream (used by processing pipelines).
-    /// Computes the namespace-qualified name hash for proper stream isolation.
     /// Wraps the payload in batch format for consistency with all other appends.
     pub fn appendPayloadToStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, payload: []const u8) !void {
         // Wrap raw payload in batch format: [count:u32][payload_len:u32][payload][header_count:u16]
@@ -1953,10 +1921,10 @@ pub const StreamHandler = struct {
         var count: usize = 0;
         const capped = @min(limit, MAX_READ_BATCH);
 
-        const name_hash = router.nameHash(self.namespaceId(namespace), stream_name);
+        const stream_key = stream_mod.streamKey(self.namespaceId(namespace), stream_name);
 
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const read_n = self.stream.readStreamAfter(name_hash, after_id, null, rec_buf[0..capped]);
+        const read_n = self.stream.readStreamAfter(stream_key, after_id, null, rec_buf[0..capped]);
         // Whole appends only, so `last_id` never lands inside one: resuming
         // after it would skip the rest of that append.
         const n = stream_mod.wholeEntriesWithin(rec_buf[0..read_n], capped);
@@ -1965,7 +1933,6 @@ pub const StreamHandler = struct {
         // A job on another shard's thread reads this shard's hot ring and
         // warm store, and copies from its disk cache; the disk reads it needs
         // are asked of this shard, and it reads again on its next poll.
-        const stream_key = router.nsNameKey(self.namespaceId(namespace), stream_name);
         if (self.disk) |d| if (!d.isOwner()) return self.readPayloadsElsewhere(d, rec_buf[0..n], stream_key, after_id);
         self.beginRead();
         self.disk_window.stream = stream_key;
@@ -2134,7 +2101,6 @@ pub const StreamHandler = struct {
     /// UAL index is assigned from the partition's committed_index so it stays
     /// monotonic and lines up with lookups.
     fn applyLocalStreamAppend(self: *StreamHandler, req: Request, payload_value: []const u8, partition_index: u32) !StreamID {
-        const ns_hash = req.ns_id;
         const timestamp_ns: u64 = @intCast(@as(u64, @bitCast(@as(i64, @import("stdx").time.milliTimestamp()))) * 1_000_000);
         const next_index = self.partition.committed_index + 1;
 
@@ -2149,7 +2115,7 @@ pub const StreamHandler = struct {
             0, // term — unused without consensus
             next_index,
             timestamp_ns,
-            ns_hash,
+            req.ns_id,
             req.key,
             stored_value,
             &payload_buf,
@@ -2192,10 +2158,7 @@ pub const StreamHandler = struct {
 
         switch (etype) {
             .stream_append => {
-                const name_hash = router.nameHash(cmd.namespace_id, cmd.key);
-                // Before anything changes: a namespace this shard never bound
-                // halts here on every replica, never lands in "default".
-                const ns = self.stream.resolveNamespace(cmd.namespace_id) orelse return error.Halt;
+                const key = stream_mod.streamKey(cmd.namespace_id, cmd.key);
                 // Recover the user partition from the value prefix so it survives
                 // restart — without it every record rebuilds as partition 0 and
                 // partition-filtered reads break.
@@ -2205,54 +2168,40 @@ pub const StreamHandler = struct {
                 // Anchor to the entry timestamp so replay reproduces the same
                 // StreamIDs as the original live apply.
                 const ts_ms = entry.header.timestamp_ns / 1_000_000;
-                const id = self.stream.appendToStreamAt(name_hash, entry.header.index, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
+                const id = self.stream.appendToStreamAt(key, entry.header.index, av.partition_index, ts_ms, record_count, byte_len) catch |err| {
                     log.err("stream '{s}': append at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
                     return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
                 };
-                // Register the NAMESPACE-QUALIFIED name: a client's append,
-                // and a pipeline sink's on this shard, proposed any implicit
-                // create first, so the hash resolves. A bare key is invisible
-                // to `stream list`,
-                // which filters on the namespace prefix, while `stream info`
-                // still resolves it by hash — so the two disagree. Only the
-                // default namespace, whose qualified form is the bare name,
-                // is unaffected.
-                var ns_reg_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-                // A name that cannot be qualified is not listed rather than
-                // listed bare, where it could pass for another namespace's.
-                if (ns_keys.qualifyKey(&ns_reg_buf, ns, cmd.key)) |ns_name| {
-                    self.stream.registerStream(ns_name) catch |err| {
+                // Listed under its namespace's id: `stream list` and `stream
+                // info` find it by the same key, on every replica and after
+                // a restart. A name too long for a key was refused before it
+                // was proposed.
+                var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                if (stream_mod.nameKey(&name_buf, cmd.namespace_id, cmd.key)) |name_key| {
+                    self.stream.registerStream(name_key) catch |err| {
                         log.err("stream '{s}': name not registered, so lists miss it: {s}", .{ cmd.key, @errorName(err) });
                         return error.OutOfMemory;
                     };
-                } else |_| {}
+                }
                 out.putInt(u64, id.sequence);
                 out.putInt(u64, id.timestamp_ms);
             },
             .stream_trim => {
                 if (cmd.value.len < 8) return error.Halt;
-                const nh = std.mem.readInt(u64, cmd.value[0..8], .little);
+                var key: StreamKey = undefined;
+                key[0..4].* = cmd.namespace_id.bytes();
+                key[4..12].* = cmd.value[0..8].*;
                 const bound = TrimBound.decode(cmd.key) orelse return error.Halt;
                 // An age resolves against this entry's stamp, so every replica
                 // cuts at the same place.
-                const deleted = if (bound.resolve(entry.header.timestamp_ns)) |trim_id| self.stream.trimStream(nh, trim_id) else 0;
-                const first_id = self.stream.streamFirstId(nh);
+                const deleted = if (bound.resolve(entry.header.timestamp_ns)) |trim_id| self.stream.trimStream(key, trim_id) else 0;
+                const first_id = self.stream.streamFirstId(key);
                 out.putInt(u64, deleted);
                 out.putInt(u64, if (!first_id.eql(StreamID.MIN)) first_id.sequence else 0);
             },
             .stream_config => {
                 const config = StreamConfig.decode(cmd.value) orelse return error.Halt;
-                const ns = self.stream.resolveNamespace(cmd.namespace_id) orelse {
-                    // A create's namespace is bound before it is proposed
-                    // (the edge's `prepareWrite`), so a create reaching here
-                    // unbound is a Flo bug, and halts. An alter isn't: in a
-                    // namespace this shard never bound, its stream can't
-                    // exist. Every replica binds from the same log, so every
-                    // one refuses it.
-                    if (config.op == .create) return error.Halt;
-                    return out.refuse(.not_found, .not_found, NO_STREAM);
-                };
-                switch (self.applyConfig(ns, cmd.namespace_id, cmd.key, config)) {
+                switch (self.applyConfig(cmd.namespace_id, cmd.key, config)) {
                     .ok => {},
                     .refused => |r| {
                         if (r.status == .internal_error) return error.OutOfMemory;
@@ -2260,35 +2209,42 @@ pub const StreamHandler = struct {
                     },
                 }
             },
-            // Stream delete: key = raw stream name, value = qualified name.
-            // Applied from the committed log everywhere, like stream_trim.
+            // Stream delete: key = the stream's name, in the entry's
+            // namespace. Applied from the committed log everywhere, like
+            // stream_trim.
             .stream_delete => {
                 if (cmd.key.len == 0) return error.Halt;
-                const name_hash = router.nameHash(cmd.namespace_id, cmd.key);
+                const key = stream_mod.streamKey(cmd.namespace_id, cmd.key);
+                var name_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                const name_key = stream_mod.nameKey(&name_buf, cmd.namespace_id, cmd.key) orelse return error.Halt;
                 // In log order, so an append committed before the delete counts
                 // on every replica, whatever its proposer had applied.
-                if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(name_hash) > 0) {
+                if (entry.header.flags & entry_mod.Flags.FORCE == 0 and self.stream.streamRecordCount(key) > 0) {
                     out.refuse(.conflict, .unclassified, NOT_EMPTY_MESSAGE);
                     return;
                 }
-                _ = self.stream.deleteStream(name_hash, cmd.key, cmd.value);
+                _ = self.stream.deleteStream(key, name_key);
             },
             // Consumer-group durability: cg_commit carries a group's
             // ack-floor cursor + sweeper config; cg_delete removes the group. The
-            // CommandPayload key is the namespace-qualified group name. Cursor
-            // advance is monotonic (see StreamProjection.applyCommit), so this is
-            // safe to run on the originating leader as well as on followers/replay.
+            // CommandPayload key is `stream\x00group`, in the entry's
+            // namespace (`proposeGroupEntry`). Cursor advance is monotonic (see
+            // StreamProjection.applyCommit), so this is safe to run on the
+            // originating leader as well as on followers/replay.
             .cg_commit => {
                 if (cmd.key.len == 0) return error.Halt;
                 const commit = stream_mod.GroupCommit.decode(cmd.value) orelse return error.Halt;
-                self.stream.applyCommit(cmd.key, commit, entry.header.timestamp_ns) catch |err| {
+                var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                const group = stream_mod.nameKey(&key_buf, cmd.namespace_id, cmd.key) orelse return error.Halt;
+                self.stream.applyCommit(group, commit, entry.header.timestamp_ns) catch |err| {
                     log.err("consumer group '{s}': commit at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
                     return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
                 };
             },
             .cg_delete => {
                 if (cmd.key.len == 0) return error.Halt;
-                _ = self.stream.deleteGroup(cmd.key);
+                var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+                _ = self.stream.deleteGroup(stream_mod.nameKey(&key_buf, cmd.namespace_id, cmd.key) orelse return error.Halt);
             },
             else => return error.Halt,
         }
@@ -2296,35 +2252,30 @@ pub const StreamHandler = struct {
 
     // ── Trim Persistence ────────────────────────────────────────────────
 
-    /// A trim entry: key = the bound (`TrimBound.encode`), value = the
-    /// stream hash.
-    fn proposeTrim(self: *StreamHandler, shard: *Shard, namespace: []const u8, name_hash: u64, bound: TrimBound) !persistence_mod.ProposeResult {
+    /// A trim entry, in the stream's namespace: key = the bound
+    /// (`TrimBound.encode`), value = the stream key past the id, its name's
+    /// hash.
+    fn proposeTrim(self: *StreamHandler, shard: *Shard, key: StreamKey, bound: TrimBound) !persistence_mod.ProposeResult {
         _ = self;
         var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
-        var val_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, val_buf[0..8], name_hash, .little);
-        return persistence_mod.proposeEntry(shard, .stream_trim, entry_mod.Flags.NONE, namespace, bound.encode(&key_buf), &val_buf);
+        return persistence_mod.proposeEntryIn(shard, .stream_trim, entry_mod.Flags.NONE, stream_mod.keyNamespace(&key), bound.encode(&key_buf), key[4..12]);
     }
 
-    /// A delete entry: key = raw stream name, value = namespace-qualified
-    /// name, so followers and replay clear the name registry without the
-    /// namespace string (they only carry `namespace_id`).
-    fn proposeDelete(self: *StreamHandler, shard: *Shard, namespace: []const u8, raw_name: []const u8, force: bool) !persistence_mod.ProposeResult {
+    /// A delete entry: key = the stream's name, in its namespace.
+    fn proposeDelete(self: *StreamHandler, shard: *Shard, ns: router.NamespaceId, name: []const u8, force: bool) !persistence_mod.ProposeResult {
         _ = self;
-        var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const qualified = try ns_keys.qualifyKey(&q_buf, namespace, raw_name);
-        return persistence_mod.proposeEntry(shard, .stream_delete, if (force) entry_mod.Flags.FORCE else entry_mod.Flags.NONE, namespace, raw_name, qualified);
+        return persistence_mod.proposeEntryIn(shard, .stream_delete, if (force) entry_mod.Flags.FORCE else entry_mod.Flags.NONE, ns, name, "");
     }
 
     /// Retention's trims: proposed; the trim applies when it commits.
     /// Whether it was proposed (without a shard, applied here).
-    pub fn persistTrim(self: *StreamHandler, name_hash: u64, bound: TrimBound) bool {
+    pub fn persistTrim(self: *StreamHandler, key: StreamKey, bound: TrimBound) bool {
         const sptr = self.shard_ptr orelse {
             const trim_id = bound.resolve(self.nowNs()) orelse return false;
-            return self.stream.trimStream(name_hash, trim_id) > 0;
+            return self.stream.trimStream(key, trim_id) > 0;
         };
-        _ = self.proposeTrim(shardFromPtr(sptr), "", name_hash, bound) catch |err| {
-            if (!shardFromPtr(sptr).quietHalted(err)) log.err("stream retention: trim of stream hash {x} not persisted: {s}", .{ name_hash, @errorName(err) });
+        _ = self.proposeTrim(shardFromPtr(sptr), key, bound) catch |err| {
+            if (!shardFromPtr(sptr).quietHalted(err)) log.err("stream retention: trim of stream {x} not persisted: {s}", .{ &key, @errorName(err) });
             return false;
         };
         return true;
@@ -2339,8 +2290,8 @@ pub const StreamHandler = struct {
         return @intCast(@max(0, @import("stdx").time.nanoTimestamp()));
     }
 
-    fn firstSeq(stream: *StreamProjection, name_hash: u64) u64 {
-        const first_id = stream.streamFirstId(name_hash);
+    fn firstSeq(stream: *StreamProjection, key: StreamKey) u64 {
+        const first_id = stream.streamFirstId(key);
         return if (first_id.eql(StreamID.MIN)) 0 else first_id.sequence;
     }
 
@@ -2372,9 +2323,7 @@ pub const StreamHandler = struct {
         var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
         commit.encode(&val);
 
-        // group_name is already namespace-qualified; it travels in the
-        // CommandPayload key, so the namespace arg is unused on replay.
-        const proposed = persistence_mod.proposeEntry(shardFromPtr(sptr), .cg_commit, entry_mod.Flags.NONE, "", group_name, &val) catch |err| {
+        const proposed = proposeGroupEntry(shardFromPtr(sptr), .cg_commit, group_name, &val) catch |err| {
             return .{ .err = persistence_mod.failureError(err, "group state not persisted") };
         };
         return .{ .parked = proposed };
@@ -2424,12 +2373,17 @@ fn applyGroupConfig(self: *StreamHandler, group_name: []const u8, req: Request) 
     self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch {};
 }
 
-/// Resolve a group name to its durable, per-(stream, group) key in the
-/// request's namespace: `qualifyKey(ns, stream) ++ "\x00" ++ group`. A
-/// consumer group is scoped to a single stream, so the cursor/PEL never span
-/// streams.
-fn resolveGroupName(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, stream: []const u8, raw_name: []const u8) ?[]const u8 {
-    return ns_keys.qualifyGroupKey(buf, namespace, stream, raw_name) catch null;
+/// Resolve a group name to its per-(stream, group) key in the request's
+/// namespace (`stream_mod.groupKey`). A consumer group is scoped to a single
+/// stream, so the cursor/PEL never span streams.
+fn resolveGroupName(buf: *[stream_mod.MAX_NAME_KEY]u8, ns: router.NamespaceId, stream: []const u8, raw_name: []const u8) ?[]const u8 {
+    return stream_mod.groupKey(buf, ns, stream, raw_name);
+}
+
+/// A cg_commit or cg_delete for the group `group_key` names: stamped with
+/// the group's namespace, keyed by the rest of its key.
+fn proposeGroupEntry(shard: *Shard, entry_type: EntryType, group_key: []const u8, value: []const u8) !persistence_mod.ProposeResult {
+    return persistence_mod.proposeEntryIn(shard, entry_type, entry_mod.Flags.NONE, stream_mod.keyNamespace(group_key), group_key[4..], value);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2682,6 +2636,11 @@ fn applyLogged(h: *StreamHandler, e: *const entry_mod.Entry) persistence_mod.App
     return out;
 }
 
+/// A stream's name key in the default namespace (id 1).
+fn defaultKey(comptime name: []const u8) []const u8 {
+    return "\x00\x00\x00\x01" ++ name;
+}
+
 test "stream handler: a create of an existing stream is ok when it asks for the same settings, refused when not; an alter needs the stream" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
@@ -2711,7 +2670,7 @@ test "stream handler: a create of an existing stream is ok when it asks for the 
     var b2 = OptionsBuilder.init(&ob2);
     try b2.addU64(.retention_count, 9);
     try testing.expectEqual(CommandResult.ok, handler.handleCommand(makeRequest(.stream_alter, "c", "", b2.getOptions())));
-    const meta = handler.stream.stream_metadata.get("c").?;
+    const meta = handler.stream.stream_metadata.get(defaultKey("c")).?;
     try testing.expectEqual(@as(u32, 4), meta.partition_count);
     try testing.expectEqual(@as(u64, 9), meta.retention_count);
 }
@@ -2731,10 +2690,9 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const create = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 1, 0, ns, "r", &value, &pbuf).?;
     var out = try applyLogged(&handler, &create);
     try testing.expect(out.refused() == null);
-    const meta = handler.stream.stream_metadata.get("r").?;
+    const meta = handler.stream.stream_metadata.get(defaultKey("r")).?;
     try testing.expectEqual(@as(u32, 3), meta.partition_count);
     try testing.expectEqual(@as(u64, 60), meta.retention_age_s);
-    try testing.expectEqual(router.nameHash(ns, "r"), meta.name_hash);
 
     // A second create asking for other settings is refused the same way
     // everywhere, and changes nothing.
@@ -2743,7 +2701,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const again = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 2, 0, ns, "r", &value, &pbuf2).?;
     out = try applyLogged(&handler, &again);
     try testing.expectEqual(proto.StatusCode.conflict, out.refused().?.status);
-    try testing.expectEqual(@as(u32, 3), handler.stream.stream_metadata.get("r").?.partition_count);
+    try testing.expectEqual(@as(u32, 3), handler.stream.stream_metadata.get(defaultKey("r")).?.partition_count);
 
     // An alter merges: what it names changes, the rest stays.
     (StreamHandler.StreamConfig{ .op = .alter, .partition_count = 0, .retention_age_s = 0, .retention_count = 7 }).encode(&value);
@@ -2751,7 +2709,7 @@ test "stream handler: stream_config entries give every replica a stream's settin
     const alter = entry_mod.buildCommandEntry(.stream_config, entry_mod.Flags.NONE, 1, 3, 0, ns, "r", &value, &pbuf3).?;
     out = try applyLogged(&handler, &alter);
     try testing.expect(out.refused() == null);
-    const merged = handler.stream.stream_metadata.get("r").?;
+    const merged = handler.stream.stream_metadata.get(defaultKey("r")).?;
     try testing.expectEqual(@as(u32, 3), merged.partition_count);
     try testing.expectEqual(@as(u64, 60), merged.retention_age_s);
     try testing.expectEqual(@as(u64, 7), merged.retention_count);
@@ -2906,7 +2864,7 @@ test "stream handler: append refuses a batch over the limit or malformed, by nam
         .err => |e| try testing.expectEqualStrings("stream append: malformed batch", e.message),
         else => return error.TestUnexpectedResult,
     };
-    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(router.nameHash(.default, "s1")));
+    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(stream_mod.streamKey(.default, "s1")));
 }
 
 test "stream handler: a read returns whole appends and its cursor passes them" {
@@ -2995,7 +2953,7 @@ test "stream handler: one maximal append's answer is within its bound" {
         else => return error.TestUnexpectedResult,
     }
 
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     var recs: [1]StreamRecord = undefined;
     try testing.expectEqual(@as(usize, 1), handler.stream.readStreamAfter(h, StreamID.MIN, null, &recs));
     const data = try handler.serializeStreamRecordsWithPayloads(&recs, StreamID.MIN, null);
@@ -3013,7 +2971,7 @@ test "stream handler: a read steps past an append it can't read" {
     defer handler.deinit();
 
     // An append the projection knows but whose payload is in no tier.
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
@@ -3053,7 +3011,7 @@ test "stream handler: a group read skips and counts an append in no tier, and it
     // last, so only the cursor moving past it shows it was passed.
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     _ = try handler.stream.appendToStreamAt(h, 999_999, 0, 4_000_000_000_000, 1, 10);
 
     for ([_]u32{ 1, 0 }) |want| {
@@ -3078,7 +3036,7 @@ test "stream handler: a processing read skips and counts an append in no tier, a
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
 
     const read = handler.readPayloadsForStream("s1", "default", StreamID.MIN, 10);
@@ -3133,15 +3091,15 @@ test "stream handler: a ready entry that can't be read is dropped, not left to l
 
     // An append the projection knows but whose payload is in no tier, then
     // one that reads.
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
     _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
 
     // The lost append is pending and ready, as if delivered before it was lost.
-    var q_buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group = resolveGroupName(&q_buf, "default", "s1", "cg1").?;
+    var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+    const group = resolveGroupName(&q_buf, .default, "s1", "cg1").?;
     var rec: [1]StreamRecord = undefined;
     try testing.expectEqual(@as(usize, 1), handler.stream.readStreamByIds(h, &.{lost}, &rec));
     try handler.stream.groupDeliverRecords(group, "c1", &rec, lost, 1);
@@ -3260,7 +3218,7 @@ test "stream handler: an append that runs out of memory fails, rather than apply
         handler.stream.reset();
         fa.fail_index = fa.alloc_index + fail_at;
         const outcome = applyLogged(&handler, &entry);
-        if (outcome) |_| try testing.expect(handler.stream.stream_names.contains("s1")) else |err| try testing.expectEqual(error.OutOfMemory, err);
+        if (outcome) |_| try testing.expect(handler.stream.stream_names.contains(defaultKey("s1"))) else |err| try testing.expectEqual(error.OutOfMemory, err);
         if (!fa.has_induced_failure) {
             _ = try outcome;
             break;
@@ -3283,8 +3241,8 @@ test "stream handler: delete removes one stream, leaves siblings + --force gatin
     _ = handler.handleCommand(makeRequest(.stream_append, "shipments", makeBatchValue(&vb2, "s1"), ""));
 
     const ns_hash: router.NamespaceId = .default;
-    const orders_hash = router.nameHash(ns_hash, "orders");
-    const ship_hash = router.nameHash(ns_hash, "shipments");
+    const orders_hash = stream_mod.streamKey(ns_hash, "orders");
+    const ship_hash = stream_mod.streamKey(ns_hash, "shipments");
     try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
 
     // Non-empty without --force → conflict, stream untouched.
@@ -3316,9 +3274,9 @@ test "stream handler: a stream_delete entry without force is refused for a strea
 
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
-    const orders_hash = router.nameHash(.default, "orders");
+    const orders_hash = stream_mod.streamKey(.default, "orders");
     var pbuf: [128]u8 = undefined;
-    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, .default, "orders", "orders", &pbuf).?;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 1, 1, .default, "orders", "", &pbuf).?;
     const out = try applyLogged(&handler, &del);
     const refused = out.refused().?;
     try testing.expectEqual(proto.StatusCode.conflict, refused.status);
@@ -3327,7 +3285,7 @@ test "stream handler: a stream_delete entry without force is refused for a strea
 
     // An empty stream, or none, is deleted all the same.
     var ebuf: [128]u8 = undefined;
-    const none = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 2, 1, .default, "never", "never", &ebuf).?;
+    const none = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.NONE, 0, partition.committed_index + 2, 1, .default, "never", "", &ebuf).?;
     try testing.expect((try applyLogged(&handler, &none)).refused() == null);
 }
 
@@ -3343,13 +3301,13 @@ test "stream handler: stream_delete replay/follower path wipes the stream" {
     var vb: [64]u8 = undefined;
     _ = handler.handleCommand(makeRequest(.stream_append, "orders", makeBatchValue(&vb, "o1"), ""));
     const ns_hash: router.NamespaceId = .default;
-    const orders_hash = router.nameHash(ns_hash, "orders");
+    const orders_hash = stream_mod.streamKey(ns_hash, "orders");
     try testing.expectEqual(@as(usize, 1), handler.stream.streamRecordCount(orders_hash));
 
-    // A replicated/replayed stream_delete entry (key = raw name, value = qualified)
+    // A replicated/replayed stream_delete entry (key = the stream's name)
     // must remove the stream — this is the exact path followers and restart use.
     var pbuf: [128]u8 = undefined;
-    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, .default, "orders", "orders", &pbuf).?;
+    const del = entry_mod.buildCommandEntry(.stream_delete, entry_mod.Flags.FORCE, 0, partition.committed_index + 1, 1, .default, "orders", "", &pbuf).?;
     _ = try applyLogged(&handler, &del);
     try testing.expectEqual(@as(usize, 0), handler.stream.streamRecordCount(orders_hash));
 }
@@ -3375,7 +3333,7 @@ test "stream handler: trim" {
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbd, "d"), ""));
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vbe, "e"), ""));
 
-    const s1_hash = router.nameHash(.default, "s1");
+    const s1_hash = stream_mod.streamKey(.default, "s1");
 
     // Keep the newest 2: a dry run counts the 3 it would remove and removes none.
     var dry_buf: [32]u8 = undefined;
@@ -3472,7 +3430,7 @@ test "stream handler: trim refuses what it would otherwise ignore" {
     try expectTrimRefused(&handler, "", big.getOptions(), "stream trim: maxage is over 100 years");
 
     // Nothing was trimmed by any of them.
-    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(router.nameHash(.default, "s1")));
+    try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(stream_mod.streamKey(.default, "s1")));
 }
 
 test "stream handler: a trim by age cuts at its entry's stamp, not the host's clock" {
@@ -3487,24 +3445,24 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
         var handler = StreamHandler.init(allocator, &partition);
         defer handler.deinit();
 
-        const h = router.nameHash(.default, "aged");
+        const h = stream_mod.streamKey(.default, "aged");
         // 3 s old exactly is not older than 3 s: it stays.
         for ([_]u64{ 10_000, 5_000, 3_000, 1_000 }, 1..) |age, i| {
             _ = try handler.stream.appendToStreamAt(h, i, 0, stamp_ms - age, 1, 10);
         }
         var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
-        var val: [8]u8 = undefined;
-        std.mem.writeInt(u64, &val, h, .little);
+        // The entry carries the namespace; its value, the rest of the key.
+        const val = h[4..12];
         var pbuf: [128]u8 = undefined;
         // Older than 3 s at the stamp: the 10 s and 5 s old records.
-        const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), &val, &pbuf).?;
+        const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 10, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = 3_000 }).encode(&key_buf), val, &pbuf).?;
         var trimmed_out = try applyLogged(&handler, &trim);
         var tr = trimmed_out.reader();
         try testing.expectEqual(@as(?u64, 2), tr.int(u64));
         try testing.expectEqual(@as(u64, 2), handler.stream.streamLogicalCount(h));
 
         // An age past the stamp trims nothing, never everything.
-        const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), &val, &pbuf).?;
+        const past = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 11, stamp_ms * std.time.ns_per_ms, .default, (TrimBound{ .age_ms = stamp_ms + 1 }).encode(&key_buf), val, &pbuf).?;
         trimmed_out = try applyLogged(&handler, &past);
         tr = trimmed_out.reader();
         try testing.expectEqual(@as(?u64, 0), tr.int(u64));
@@ -3520,7 +3478,7 @@ test "stream handler: --maxage counts in seconds" {
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
     _ = try handler.stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
     _ = try handler.stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
@@ -3578,7 +3536,7 @@ test "stream handler: --maxlen cutting inside the first batch trims nothing" {
     // One 3-record batch: keeping 1 would cut inside it.
     const batch = [_]u8{ 3, 0, 0, 0, 1, 0, 0, 0, 'a', 0, 0, 1, 0, 0, 0, 'b', 0, 0, 1, 0, 0, 0, 'c', 0, 0 };
     _ = handler.handleCommand(makeRequest(.stream_append, "s1", &batch, ""));
-    const h = router.nameHash(.default, "s1");
+    const h = stream_mod.streamKey(.default, "s1");
     try testing.expectEqual(@as(u64, 3), handler.stream.streamLogicalCount(h));
 
     for ([_]bool{ true, false }) |dry| {
@@ -3651,7 +3609,7 @@ test "stream handler: byte retention is refused, and a refused create registers 
         .err => |e| try testing.expectEqualStrings("stream retention by bytes is not supported; use retention_age or retention_count", e.message),
         else => return error.TestUnexpectedResult,
     }
-    try testing.expect(handler.stream.stream_metadata.get("sized") == null);
+    try testing.expect(handler.stream.stream_metadata.get(defaultKey("sized")) == null);
 
     _ = handler.handleCommand(makeRequest(.stream_create, "sized", "", ""));
     switch (handler.handleCommand(makeRequest(.stream_alter, "sized", "", b.getOptions()))) {
@@ -4000,7 +3958,7 @@ test "stream handler: a group name must come in the wire format, and is always i
     try std.testing.expect(handler.handleCommand(other) != .err);
 }
 
-test "stream handler: a stream or group name too long to qualify, or holding a NUL, is refused, never used unqualified" {
+test "stream handler: a stream or group name too long for a key, or holding a NUL, is refused" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
     defer partition.deinit();
@@ -4008,19 +3966,19 @@ test "stream handler: a stream or group name too long to qualify, or holding a N
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const long = stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 1)); // "b\x00" + this is one byte over
+    const long = stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 1)); // over the limit in namespace "b"
     for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
         var req = makeRequest(op, long, groupWire("g"), "");
         req.namespace = "b";
         req.ns_id = .of(16);
         try testing.expect(handler.handleCommand(req) == .err);
     }
-    // The stream fits qualified ("b\x00" + 4090), but not with its group.
+    // The stream fits, but not with its group.
     var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
     near.namespace = "b";
     near.ns_id = .of(16);
     try testing.expect(handler.handleCommand(near) == .err);
-    // A NUL in either name could spell another namespace's key.
+    // A NUL in either name could spell another stream's group.
     try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b\x00orders", groupWire("g"), "")) == .err);
     try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b", groupWire("orders\x00g"), "")) == .err);
     try testing.expectEqual(@as(usize, 0), partition.stream.groups.count());
