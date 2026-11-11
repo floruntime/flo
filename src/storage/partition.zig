@@ -60,6 +60,12 @@ pub const Partition = struct {
     /// this keeps its tombstones bounded.
     warm_sweep: tombstones.Sweep = .{},
 
+    /// The warm store's indices, lowest first, for eviction without a scan
+    /// of the map. Every index in the store is here. An index put again
+    /// (which the ring's increasing indices rule out outside tests) leaves
+    /// a stale entry, skipped when it reaches the top.
+    warm_order: std.PriorityQueue(u64, void, lowerIndexFirst) = .empty,
+
     /// Warm store memory tracking (bounded by warm_budget).
     warm_bytes_used: usize,
     warm_budget: usize,
@@ -126,6 +132,7 @@ pub const Partition = struct {
             self.allocator.free(@constCast(kv.value_ptr.*));
         }
         self.warm_store.deinit(self.allocator);
+        self.warm_order.deinit(self.allocator);
 
         self.kv.deinit(self.allocator);
         self.apply_scratch.deinit();
@@ -197,6 +204,11 @@ pub const Partition = struct {
         // Uses the entry's own index as key.
         if (e.payload.len > 0 and !is_kv) {
             const copy = self.allocator.dupe(u8, e.payload) catch return .{ .index = index, .route = route, .failed = failed };
+            // Room in the order first, so every index stored is in it.
+            self.warm_order.ensureUnusedCapacity(self.allocator, 1) catch {
+                self.allocator.free(copy);
+                return .{ .index = index, .route = route, .failed = failed };
+            };
 
             // Free old copy if this index was already in warm store (idempotent apply)
             if (self.warm_store.fetchRemove(e.header.index)) |old| {
@@ -210,6 +222,7 @@ pub const Partition = struct {
                 return .{ .index = index, .route = route, .failed = failed };
             };
             self.warm_bytes_used += copy.len;
+            self.noteWarmIndex(e.header.index);
 
             // Evict oldest warm entries if over budget
             self.evictWarmIfNeeded();
@@ -218,27 +231,39 @@ pub const Partition = struct {
         return .{ .index = index, .route = route, .failed = failed };
     }
 
-    /// Evict oldest entries from the warm store when over budget.
-    /// Removes entries with the lowest UAL index first.
+    fn lowerIndexFirst(_: void, a: u64, b: u64) std.math.Order {
+        return std.math.order(a, b);
+    }
+
+    /// An index just put in the warm store, in eviction order. The caller
+    /// made room for it.
+    fn noteWarmIndex(self: *Partition, index: u64) void {
+        self.warm_order.push(self.allocator, index) catch unreachable;
+        // Replaced indices leave stale entries; once they outnumber the live
+        // ones, start again from the map.
+        if (self.warm_order.count() > 2 * self.warm_store.count() + 1024) self.rebuildWarmOrder();
+    }
+
+    /// Drops the stale entries: the order holds more than the store, so
+    /// its capacity fits the store and nothing is allocated.
+    fn rebuildWarmOrder(self: *Partition) void {
+        self.warm_order.clearRetainingCapacity();
+        var it = self.warm_store.keyIterator();
+        while (it.next()) |k| self.warm_order.push(self.allocator, k.*) catch unreachable;
+    }
+
+    /// Evict oldest entries from the warm store when over budget: the lowest
+    /// UAL index first, from `warm_order`, never a scan of the map.
     fn evictWarmIfNeeded(self: *Partition) void {
         if (self.warm_budget == 0) return; // 0 = unlimited
         while (self.warm_bytes_used > self.warm_budget and self.warm_store.count() > 0) {
-            // Find the entry with the lowest index
-            var min_index: u64 = std.math.maxInt(u64);
-            var wit = self.warm_store.iterator();
-            while (wit.next()) |kv| {
-                if (kv.key_ptr.* < min_index) {
-                    min_index = kv.key_ptr.*;
-                }
-            }
-            if (min_index == std.math.maxInt(u64)) break;
-
-            // Remove it
-            if (self.warm_store.fetchRemove(min_index)) |removed| {
-                self.warm_sweep.noteRemoved([]const u8, &self.warm_store);
-                self.warm_bytes_used -= removed.value.len;
-                self.allocator.free(@constCast(removed.value));
-            }
+            // Every stored index is in the order, so it isn't empty here.
+            const lowest = self.warm_order.pop() orelse unreachable;
+            // Stale: replaced since, or gone already.
+            const removed = self.warm_store.fetchRemove(lowest) orelse continue;
+            self.warm_sweep.noteRemoved([]const u8, &self.warm_store);
+            self.warm_bytes_used -= removed.value.len;
+            self.allocator.free(@constCast(removed.value));
         }
     }
 
@@ -442,6 +467,67 @@ test "partition: warm store eviction under budget" {
     // Oldest entries should have been evicted
     try testing.expectEqual(@as(usize, 10), part.warmCount());
     try testing.expect(part.warm_store.get(20) != null and part.warm_store.get(10) == null);
+}
+
+test "partition: warm eviction takes the lowest index first, whatever order the indices came in, replaced ones included" {
+    var part = try Partition.init(testing.allocator, 0, 8192, 0);
+    defer part.deinit();
+    // Put by hand in any order, with 5 put twice (a replaced copy), so the
+    // order holds a stale entry for it.
+    for ([_]u64{ 5, 3, 9, 1, 5, 7 }) |i| {
+        if (part.warm_store.fetchRemove(i)) |old| {
+            part.warm_bytes_used -= old.value.len;
+            part.allocator.free(@constCast(old.value));
+        }
+        try part.warm_store.put(part.allocator, i, try part.allocator.dupe(u8, "0123456789"));
+        part.warm_bytes_used += 10;
+        try part.warm_order.ensureUnusedCapacity(part.allocator, 1);
+        part.noteWarmIndex(i);
+    }
+    // Room for two: 1, 3 and 5 go, lowest first, never 7 or 9.
+    part.setWarmBudget(25);
+    part.evictWarmIfNeeded();
+    try testing.expectEqual(@as(usize, 2), part.warmCount());
+    try testing.expect(part.warm_store.contains(7) and part.warm_store.contains(9));
+    // The stale 5 is passed over, and 7 is next.
+    part.setWarmBudget(15);
+    part.evictWarmIfNeeded();
+    try testing.expectEqual(@as(usize, 1), part.warmCount());
+    try testing.expect(part.warm_store.contains(9));
+}
+
+test "partition: every index the warm store holds is in its eviction order" {
+    var part = try Partition.init(testing.allocator, 0, 8192, 0);
+    defer part.deinit();
+    part.wireProjections();
+    part.setWarmBudget(100);
+    var i: u64 = 1;
+    while (i <= 40) : (i += 1) {
+        var e = makeEntry(.stream_append, i, 1, "0123456789");
+        e.header.crc32c = e.computeCrc();
+        _ = try part.apply(&e);
+        try testing.expectEqual(part.warm_store.count(), part.warm_order.count());
+    }
+    try testing.expectEqual(@as(usize, 10), part.warmCount());
+}
+
+test "partition: indices put again leave stale entries in the eviction order, bounded" {
+    var part = try Partition.init(testing.allocator, 0, 8192, 0);
+    defer part.deinit();
+    // Ten indices put over and over: each put again leaves a stale entry.
+    for (0..5000) |n| {
+        const idx: u64 = n % 10;
+        if (part.warm_store.fetchRemove(idx)) |old| {
+            part.warm_bytes_used -= old.value.len;
+            part.allocator.free(@constCast(old.value));
+        }
+        try part.warm_order.ensureUnusedCapacity(part.allocator, 1);
+        try part.warm_store.put(part.allocator, idx, try part.allocator.dupe(u8, "0123456789"));
+        part.warm_bytes_used += 10;
+        part.noteWarmIndex(idx);
+        try testing.expect(part.warm_order.count() <= 2 * part.warm_store.count() + 1024);
+    }
+    try testing.expectEqual(@as(usize, 10), part.warmCount());
 }
 
 test "partition: a warm store held at its budget keeps its tombstones bounded" {

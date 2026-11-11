@@ -42,6 +42,18 @@ compare directly.
 | SPSC | 14.9M | 67 | 1M ring, burst mode |
 | Send-only | 15.4M | 64 | 1M ring, no drain |
 
+### Warm store eviction (`bench-warm`)
+
+A non-KV apply once the partition's warm store is full, so every apply also evicts. ReleaseSafe in every
+module, on the shared Mac, 2026-11-10; three runs each.
+
+| Build | ns/apply | Notes |
+|-------|---------:|-------|
+| dev 5213836 | 178,569–181,265 | each eviction scans the whole warm map (41,943 entries of 100 B, 4 MiB budget) |
+| lowest index from a heap | 287–310 | the same, evicting from a min-heap of indices |
+
+A full 32 MiB warm store holds about 330,000 entries of that size, eight times the map this scans.
+
 ## Comparison with Old Architecture
 
 The New column is older than the tables above: its figures come from Zig 0.15.2, with their build also
