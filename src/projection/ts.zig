@@ -1044,19 +1044,8 @@ pub const TSProjection = struct {
     pub fn deleteSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) usize {
         var removed: usize = 0;
 
-        // Blocks first, counting a series held only in blocks; one that
-        // also has a buffer is counted there.
-        var blit = self.blocks.iterator();
-        while (blit.next()) |kv| {
-            const key = kv.key_ptr.*;
-            if (self.seriesMatches(key, ns_id, measurement, preds)) {
-                if (!self.buffers.contains(key)) removed += 1;
-                kv.value_ptr.deinit(self.allocator);
-                self.allocator.free(@constCast(key));
-                self.blocks.removeByPtr(kv.key_ptr);
-            }
-        }
-
+        // Delete matching write buffers (this namespace + measurement only).
+        // Every series has one: a flush empties it but keeps it.
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
@@ -1065,6 +1054,17 @@ pub const TSProjection = struct {
                 self.allocator.free(@constCast(key));
                 self.buffers.removeByPtr(kv.key_ptr);
                 removed += 1;
+            }
+        }
+
+        // Delete matching blocks
+        var blit = self.blocks.iterator();
+        while (blit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (self.seriesMatches(key, ns_id, measurement, preds)) {
+                kv.value_ptr.deinit(self.allocator);
+                self.allocator.free(@constCast(key));
+                self.blocks.removeByPtr(kv.key_ptr);
             }
         }
 

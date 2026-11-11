@@ -4158,11 +4158,13 @@ pub const WorkflowHandler = struct {
 
         // A disable or a redefinition that commits ahead of a start decides
         // it, as the handler's checks would have. Only client and schedule
-        // starts: a child's start was never held to either, and a trigger's
-        // isn't, since its leader has moved the trigger's cursor past the
-        // record already, so a trigger start proposed before a disable
-        // commits still runs. A refused schedule start leaves its slot
-        // unfired; enabling re-anchors past it.
+        // starts. Not a child's: a parent reads a child on another shard
+        // that its start never created as not finished yet, so refusing it
+        // here would leave the parent waiting for good. Not a trigger's:
+        // its leader has moved the trigger's cursor past the record
+        // already, so a trigger start proposed before a disable commits
+        // still runs. A refused schedule start leaves its slot unfired;
+        // enabling re-anchors past it.
         const client_start = std.mem.eql(u8, event_type, "workflow_started");
         if (client_start or std.mem.eql(u8, event_type, "schedule_started")) {
             const def_key = self.makeNsKey(namespace, wf_name) orelse return error.OutOfMemory;
