@@ -13409,6 +13409,12 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try std.testing.expectEqual(@as(u64, 24), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
     wf.checkPendingActions(&shard);
+    // Its completion is logged; the run ends when that commits, and is
+    // held until then.
+    const ending = Run.byId(wf, a_id);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.running, ending.status);
+    try std.testing.expect(WorkflowHandler.endingInFlight(&shard, ending));
+    try ParkTest.ack(&shard);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, Run.byId(wf, a_id).status);
 }
 
@@ -19073,7 +19079,7 @@ test "a workflow cancel is answered when its entry applies, and the run ends the
     t.send(.workflow_cancel, 42, id, "");
     try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
-    try std.testing.expect(WorkflowHandler.cancelInFlight(&t.shard, run));
+    try std.testing.expect(WorkflowHandler.endingInFlight(&t.shard, run));
 
     // A signal meanwhile is refused as retryable, and doesn't move it.
     var sig: [4]u8 = undefined;
@@ -19161,7 +19167,97 @@ test "a workflow cancel whose entry a later leader replaces is told the leader c
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
     try std.testing.expect(std.mem.indexOf(u8, (try one[0].refused()).message, "leader changed") != null);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
-    try std.testing.expect(!WorkflowHandler.cancelInFlight(&t.shard, run));
+    try std.testing.expect(!WorkflowHandler.endingInFlight(&t.shard, run));
+}
+
+/// A waiting run signalled to its completion: the completion is logged,
+/// not yet committed. Returns the run.
+fn raceTestEndingRun(t: *RaceTest, buf: []u8, one: []proto.Response, id_buf: *[32]u8) ![]const u8 {
+    const data = try raceTestWaitingRun(t, buf, one);
+    const id = id_buf[0..data.len];
+    @memcpy(id, data);
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 50, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], buf, one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    return id;
+}
+
+test "a workflow completion a later leader's log drops leaves the run unfinished, and the node ends it once it leads again" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    t.shard.setMetricsRegistry(&registry);
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const r = t.shard.raft_node;
+    const id = try raceTestEndingRun(&t, &buf, &one, &id_buf);
+    const run = raceTestRun(&t, id);
+    const before = r.log.lastIndex() - 1;
+    const term = r.current_term;
+
+    // Logged, not committed: the run hasn't ended, here or to a reader.
+    try std.testing.expect(!run.status.isTerminal());
+    try std.testing.expect(WorkflowHandler.endingInFlight(&t.shard, run));
+    try std.testing.expectEqual(@as(u64, 0), registry.workflow.completed_total.load(.monotonic));
+
+    // Node 2 leads term + 1, replaces the completion with its no-op and
+    // commits it.
+    var noop = entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, term + 1, before + 1, r.log.last_stamp + 1, "");
+    noop.header.crc32c = noop.computeCrc();
+    _ = try r.handleAppendEntries(.{ .term = term + 1, .leader_id = 2, .prev_log_index = before, .prev_log_term = term, .entries = (&noop)[0..1], .leader_commit = before + 1 });
+    _ = t.shard.applyCommitted();
+    try std.testing.expect(!run.status.isTerminal());
+    try std.testing.expect(!WorkflowHandler.endingInFlight(&t.shard, run));
+    try std.testing.expectEqual(@as(u64, 0), registry.workflow.completed_total.load(.monotonic));
+
+    // Elected again, it proposes the completion again; once that commits
+    // the run has ended, counted once.
+    r.current_term = term + 2;
+    r.role = .leader;
+    r.ready_index = r.log.lastIndex();
+    t.shard.workflow_handler.checkPendingActions(&t.shard);
+    try std.testing.expect(WorkflowHandler.endingInFlight(&t.shard, run));
+    try ParkTest.ack(&t.shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    try std.testing.expectEqual(@as(u64, 1), registry.workflow.completed_total.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), t.shard.workflow_handler.completion_retries.items.len);
+}
+
+test "a cancel or signal while a workflow's completion is in flight is told to retry, and after it commits, that the run finished" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    var id_buf: [32]u8 = undefined;
+    const id = try raceTestEndingRun(&t, &buf, &one, &id_buf);
+    const run = raceTestRun(&t, id);
+
+    t.send(.workflow_cancel, 51, id, "");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqualStrings("run is ending — retry", (try one[0].refused()).message);
+    var sig: [4]u8 = undefined;
+    std.mem.writeInt(u16, sig[0..2], 2, .little);
+    @memcpy(sig[2..4], "go");
+    t.send(.workflow_signal, 52, id, &sig);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), one[0].header.status);
+    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+
+    try ParkTest.ack(&t.shard);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+    t.send(.workflow_cancel, 53, id, "");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.bad_request), one[0].header.status);
+    try std.testing.expectEqualStrings("run already finished", (try one[0].refused()).message);
 }
 
 test "a halted shard's duties stop, and one with work counts as held until the shard serves again" {
