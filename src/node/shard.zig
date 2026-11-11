@@ -1962,6 +1962,14 @@ pub const Shard = struct {
         return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@fromBackingInt(@intCast(req.header.op_code)));
     }
 
+    /// Whether a request can't run without its namespace's id, so one in
+    /// a namespace never created is refused: a wait names what it waits for
+    /// by the id, and nothing could wake it without one; a group read makes
+    /// its group under the id, waiting or not, and creates no namespace.
+    fn needsNamespaceId(req: proto.Request) bool {
+        return blockingWait(req) != null or req.header.op_code == @backingInt(proto.OpCode.stream_group_read);
+    }
+
     /// How long a read may wait on purpose for its data, or null for any
     /// other request. Such a read holds a slot of its own class, and is not
     /// a slow answer while it waits.
@@ -2172,9 +2180,7 @@ pub const Shard = struct {
             }
             if (req.ns_id == .invalid) req.ns_id = self.namespaceIdOf(req);
         }
-        // A wait names what it waits for by its namespace's id; one in a
-        // namespace never created has none, and nothing could wake it.
-        if (req.ns_id == .invalid and namespaced(req.header.op_code) and blockingWait(req) != null)
+        if (req.ns_id == .invalid and namespaced(req.header.op_code) and needsNamespaceId(req))
             return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
         if (internal_from_client) return answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code);
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
@@ -7370,6 +7376,78 @@ pub fn raiseNamespaceIdFloor(shards: []Shard) void {
     if (shards.len == 0) return;
     for (shards[1..]) |*s| {
         if (s.namespace_handler.highestId()) |id| shards[0].namespace_handler.raiseIdFloor(id);
+        // Some writes stamp a published namespace's id without binding it
+        // here first (a group read makes its group), so what was applied
+        // counts too.
+        const named = s.defaultPartition().highest_namespace;
+        if (named != 0) shards[0].namespace_handler.raiseIdFloor(named);
+    }
+}
+
+/// Raise `partition.highest_namespace` by the entry's namespace ids.
+/// The fixed ids sit below every allocated one, and an id past the table
+/// was never allocated, so neither can collide with a later create.
+fn noteNamespace(partition: *Partition, entry: *const entry_mod.Entry) void {
+    const id = entryNamespaceId(entry) orelse return;
+    if (id < ns_table.FIRST_ALLOCATED.int() or id >= ns_table.CAPACITY) return;
+    partition.highest_namespace = @max(partition.highest_namespace, id);
+}
+
+/// The highest namespace id an entry names, or null for none. Read by
+/// payload layout, not by entry type, so a new entry is covered by its
+/// layout: a command payload leads with the id; a table entry leads with
+/// an `ns` id, a KV key (the id is its prefix), or a list of items that
+/// each lead with an `ns` id. A table entry holding an `ns` id anywhere
+/// else fails the build (`nsLead`).
+pub fn entryNamespaceId(entry: *const entry_mod.Entry) ?u32 {
+    const code: u8 = entry.header.entry_type;
+    inline for (table.entry_table) |e| {
+        if (e.type_code == code) return payloadNamespaceId(e.payload, entry.payload);
+    }
+    const etype = std.enums.fromInt(entry_mod.EntryType, code) orelse return null;
+    if (!etype.hasKeyValue() or entry.payload.len < 4) return null;
+    return std.mem.readInt(u32, entry.payload[0..4], .little);
+}
+
+const NsLead = enum { none, id, kv_key, items };
+
+fn isNsId(comptime f: schema.Field) bool {
+    return std.mem.eql(u8, f.name, "ns") and f.T == kv_entries.NamespaceId;
+}
+
+fn holdsNsId(comptime T: type) bool {
+    if (T.kind == .list) return holdsNsId(T.Element);
+    if (T.kind != .record) return false;
+    for (T.field_list) |f| if (isNsId(f) or holdsNsId(f.T)) return true;
+    return false;
+}
+
+fn nsLead(comptime P: type) NsLead {
+    const first = P.field_list[0];
+    if (isNsId(first)) return .id;
+    if (std.mem.eql(u8, first.name, "key") and first.T == kv_entries.Key) return .kv_key;
+    if (first.T.kind == .list and first.T.Element.kind == .record and isNsId(first.T.Element.field_list[0])) return .items;
+    if (holdsNsId(P)) @compileError("an entry names a namespace id other than up front; entryNamespaceId can't find it");
+    return .none;
+}
+
+fn payloadNamespaceId(comptime P: type, payload: []const u8) ?u32 {
+    var diag: schema.Diagnostic = .{};
+    var r: schema.Reader = .{ .bytes = payload, .diag = &diag };
+    switch (comptime nsLead(P)) {
+        .none => return null,
+        .id => return kv_entries.NamespaceId.decode(&r, "") catch null,
+        .kv_key => {
+            const key = kv_entries.Key.decode(&r, "") catch return null;
+            return if (key.len < 4) null else std.mem.readInt(u32, key[0..4], .big);
+        },
+        .items => {
+            const items = P.field_list[0].T.decode(&r, "") catch return null;
+            var it = items.iterator();
+            var top: ?u32 = null;
+            while (it.next() catch null) |item| top = @max(top orelse 0, item.ns);
+            return top;
+        },
     }
 }
 
@@ -7500,6 +7578,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         }
     }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+    noteNamespace(partition, entry);
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
     if (contract_machine.ownerOf(machines, etype)) |m| {
@@ -11759,6 +11838,27 @@ test "Shard: at boot, shard 0 proposes no id another shard has bound, though its
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
     two.settle();
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), two.namespaces.lookup("fresh"));
+    try std.testing.expect(a.halted == null);
+}
+
+test "Shard: at boot, shard 0 proposes no id a group entry on another shard names, though nothing bound it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const lost: u32 = a.namespace_handler.next_id + 7;
+    var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
+    (stream_mod.GroupCommit{ .floor = .{ .timestamp_ms = 0, .sequence = 0 }, .ack_timeout_ms = 30_000, .max_deliver = 5 }).encode(&val);
+    var pbuf: [256]u8 = undefined;
+    var e = entry_mod.buildCommandEntry(.cg_commit, entry_mod.Flags.NONE, 1, 1, 1, .of(lost), "s\x00g", &val, &pbuf).?;
+    e.header.crc32c = e.computeCrc();
+    var out = persistence_mod.Result{ .index = 1 };
+    try std.testing.expect(applyEntryCore(b.defaultPartition(), &b.replay_registry, &e, &out) == .applied);
+    try std.testing.expect(b.namespace_handler.highestId() == null);
+    raiseNamespaceIdFloor(&two.shards);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
     try std.testing.expect(a.halted == null);
 }
 
@@ -21208,6 +21308,34 @@ test "Shard: a lone node's read of a namespace never created is answered missing
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, &shard, &out)).header.status);
     shard.runRequest(c.conn, edgeGet(&body, 3, "nope", "other"), .client);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, &shard, &out)).header.status);
+}
+
+test "Shard: a group read in a namespace never created is refused no_namespace, not run, waiting or not, and makes no group" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.block_ms, 5000);
+    const last = shard.raft_node.log.lastIndex();
+    for ([_][]const u8{ "", ob.getOptions() }, 1..) |options, id| {
+        shard.runRequest(c.conn, testReq(.stream_group_read, id, "nope", "s", group_consumer, options), .client);
+        const refused = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), refused.header.status);
+        try std.testing.expectEqual(proto.Ran.no, (try refused.refused()).ran);
+    }
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(usize, 0), shard.defaultPartition().stream.groups.count());
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+    try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }
 
 test "Shard: a follower's reads of a namespace it doesn't know share one ask of the leader, wait for its table, and run once it gets there" {

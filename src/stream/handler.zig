@@ -529,7 +529,8 @@ pub const StreamHandler = struct {
     fn nameRefusal(op: OpCode, req: Request) ?[]const u8 {
         if (op == .stream_list) return null; // key is a filter, never a name
         if (std.mem.indexOfScalar(u8, req.key, 0) != null) return "stream name must not contain NUL";
-        if (ns_keys.validateKeySize(req.namespace, req.key) != null) return "stream name too long for its namespace";
+        if (req.key.len == 0) return "stream name is required";
+        if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return "stream name too long";
         if (!isGroupOp(op)) return null;
         const group = (decodeGroupName(req.value) orelse return null).name;
         if (std.mem.indexOfScalar(u8, group, 0) != null) return "group name must not contain NUL";
@@ -2258,7 +2259,14 @@ pub const StreamHandler = struct {
     fn proposeTrim(self: *StreamHandler, shard: *Shard, key: StreamKey, bound: TrimBound) !persistence_mod.ProposeResult {
         _ = self;
         var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
-        return persistence_mod.proposeEntryIn(shard, .stream_trim, entry_mod.Flags.NONE, stream_mod.keyNamespace(&key), bound.encode(&key_buf), key[4..12]);
+        const t = trimCommand(&key, bound, &key_buf);
+        return persistence_mod.proposeEntryIn(shard, .stream_trim, entry_mod.Flags.NONE, t.ns, t.key, t.value);
+    }
+
+    const TrimCommand = struct { ns: router.NamespaceId, key: []const u8, value: []const u8 };
+
+    fn trimCommand(key: *const StreamKey, bound: TrimBound, key_buf: *[TrimBound.MAX_SIZE]u8) TrimCommand {
+        return .{ .ns = stream_mod.keyNamespace(key), .key = bound.encode(key_buf), .value = key[4..12] };
     }
 
     /// A delete entry: key = the stream's name, in its namespace.
@@ -3470,6 +3478,31 @@ test "stream handler: a trim by age cuts at its entry's stamp, not the host's cl
     }
 }
 
+test "stream handler: a trim applies in its entry's namespace alone, though the same name is a stream in another" {
+    const allocator = testing.allocator;
+    var partition = try Partition.init(allocator, 0, 4096, 0);
+    defer partition.deinit();
+    partition.wireProjections();
+    var handler = StreamHandler.init(allocator, &partition);
+    defer handler.deinit();
+
+    const ours = stream_mod.streamKey(.of(16), "same");
+    const theirs = stream_mod.streamKey(.of(17), "same");
+    for (1..4) |i| {
+        _ = try handler.stream.appendToStreamAt(ours, 2 * i - 1, 0, 1_000 + i, 1, 10);
+        _ = try handler.stream.appendToStreamAt(theirs, 2 * i, 0, 1_000 + i, 1, 10);
+    }
+    var key_buf: [TrimBound.MAX_SIZE]u8 = undefined;
+    const t = StreamHandler.trimCommand(&ours, .{ .id = StreamID.MAX }, &key_buf);
+    var pbuf: [128]u8 = undefined;
+    const trim = entry_mod.buildCommandEntry(.stream_trim, entry_mod.Flags.NONE, 0, 7, 2_000 * std.time.ns_per_ms, t.ns, t.key, t.value, &pbuf).?;
+    var out = try applyLogged(&handler, &trim);
+    var r = out.reader();
+    try testing.expectEqual(@as(?u64, 3), r.int(u64));
+    try testing.expectEqual(@as(u64, 0), handler.stream.streamLogicalCount(ours));
+    try testing.expectEqual(@as(u64, 3), handler.stream.streamLogicalCount(theirs));
+}
+
 test "stream handler: --maxage counts in seconds" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 4096, 0);
@@ -3966,12 +3999,19 @@ test "stream handler: a stream or group name too long for a key, or holding a NU
     var handler = StreamHandler.init(allocator, &partition);
     defer handler.deinit();
 
-    const long = stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 1)); // over the limit in namespace "b"
+    // The namespace's name doesn't count: the key holds its id.
+    const long = stdx.repeat("s", ns_keys.MAX_QUALIFIED_KEY + 1);
+    const longest = stdx.repeat("s", ns_keys.MAX_QUALIFIED_KEY);
     for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
         var req = makeRequest(op, long, groupWire("g"), "");
         req.namespace = "b";
         req.ns_id = .of(16);
-        try testing.expect(handler.handleCommand(req) == .err);
+        const refused = handler.handleCommand(req);
+        try testing.expectEqualStrings("stream name too long", refused.err.message);
+        var fits = makeRequest(op, longest, groupWire("g"), "");
+        fits.namespace = "b";
+        fits.ns_id = .of(16);
+        if (!StreamHandler.isGroupOp(op)) try testing.expect(StreamHandler.nameRefusal(op, fits) == null);
     }
     // The stream fits, but not with its group.
     var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
