@@ -46,6 +46,7 @@ const Request = proto.Request;
 const OpCode = proto.OpCode;
 const ReadView = view_mod.ReadView;
 const Run = machine.Run.Value;
+const NamespaceId = @import("../namespace/table.zig").Id;
 
 /// An action's lease when its register names none.
 pub const DEFAULT_LEASE_MS: u64 = 5 * 60 * 1000;
@@ -97,9 +98,11 @@ fn readOf(shard: *Shard) ReadView {
     return .{ .store = storeOf(shard) };
 }
 
-/// A bare namespace is "default", as the entries carry it.
-fn homeOf(namespace: []const u8) []const u8 {
-    return if (namespace.len == 0) "default" else namespace;
+/// The name of namespace `ns`, as the node's table has it or, on shard 0
+/// before it publishes a create, as this shard does: for what a client
+/// reads, never for a key.
+fn namespaceName(shard: *Shard, ns: NamespaceId) ?[]const u8 {
+    return shard.namespace_handler.table.nameOf(ns) orelse shard.namespace_handler.nameOf(ns);
 }
 
 fn nsToMs(ns: u64) i64 {
@@ -107,21 +110,20 @@ fn nsToMs(ns: u64) i64 {
 }
 
 /// `k` in `ns`, as a family stores it, in `buf`.
-fn storeKey(buf: []u8, ns: []const u8, k: []const u8) ?[]const u8 {
-    if (ns.len > view_mod.MAX_NAMESPACE) return null;
-    return view_mod.key(buf, ns, k) catch null;
+fn storeKey(buf: []u8, ns: NamespaceId, k: []const u8) ?[]const u8 {
+    return view_mod.idKey(buf, ns, k) catch null;
 }
 
-const KEY_BUF = 1 + view_mod.MAX_NAMESPACE + machine.MAX_KEY_LEN;
+const KEY_BUF = @sizeOf(u32) + machine.MAX_KEY_LEN;
 
-fn getRun(shard: *Shard, ns: []const u8, run_id: []const u8) ?Run {
+fn getRun(shard: *Shard, ns: NamespaceId, run_id: []const u8) ?Run {
     var b: [KEY_BUF]u8 = undefined;
     const k = storeKey(&b, ns, run_id) orelse return null;
     const r = readOf(shard).get(machine.Runs, k) catch return null;
     return if (r) |x| x.v else null;
 }
 
-fn getDef(shard: *Shard, ns: []const u8, name: []const u8) ?machine.Def.Value {
+fn getDef(shard: *Shard, ns: NamespaceId, name: []const u8) ?machine.Def.Value {
     var b: [KEY_BUF]u8 = undefined;
     const k = storeKey(&b, ns, name) orelse return null;
     const d = readOf(shard).get(machine.Defs, k) catch return null;
@@ -130,8 +132,8 @@ fn getDef(shard: *Shard, ns: []const u8, name: []const u8) ?machine.Def.Value {
 
 /// The shard that owns action `name` in `ns`: invokes are routed there, so
 /// its runs are there.
-fn ownerOf(shard: *Shard, ns: []const u8, name: []const u8) u16 {
-    return switch (shard.router.route(router.routeNsKey(shard.namespaceId(ns), name))) {
+fn ownerOf(shard: *Shard, ns: NamespaceId, name: []const u8) u16 {
+    return switch (shard.router.route(router.routeNsKey(ns, name))) {
         .local => @intCast(shard.id),
         .shard => |t| t.shard_id,
     };
@@ -140,6 +142,9 @@ fn ownerOf(shard: *Shard, ns: []const u8, name: []const u8) u16 {
 /// Propose a schema'd action entry, encoded in the shard's entry buffer
 /// when it fits (a run's input can make an invoke larger).
 fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence.ProposeResult {
+    // An entry naming no namespace halts every replica that applies it, so
+    // it is refused here rather than trusted to dispatch never sending one.
+    if (@hasField(@TypeOf(body), "ns")) if (body.ns == 0) return error.NamespaceUnknown;
     const P = ae.Payload(@backingInt(etype));
     const size = try P.encodedSize(body);
     if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, Flags.NONE, try P.encodeInto(shard.entry_buf[0..size], body));
@@ -389,7 +394,7 @@ pub const ActionsHandler = struct {
         const name = req.key;
         if (name.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
         if (name.len > action_ops.MAX_ACTION_NAME) return .{ .err = .{ .code = .invalid_request, .message = "action name too long" } };
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         if (getDef(shard, ns, name) == null and storeOf(shard).family(machine.Defs.ID).count >= MAX_ACTIONS)
             return .{ .err = .{ .code = .internal_error, .message = "action limit reached" } };
         const v = req.value;
@@ -406,7 +411,7 @@ pub const ActionsHandler = struct {
         const lease_ms = if (timeout_ms == 0) DEFAULT_LEASE_MS else timeout_ms;
         if (lease_ms < ae.MIN_LEASE_MS or lease_ms > ae.MAX_LEASE_MS)
             return .{ .err = .{ .code = .invalid_request, .message = std.fmt.comptimePrint("bad request: an action's timeout is its lease: at least {d} ms and at most {d} ms, or 0 for {d} ms", .{ ae.MIN_LEASE_MS, ae.MAX_LEASE_MS, DEFAULT_LEASE_MS }) } };
-        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns, .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else std.math.clamp(max_attempts, 1, 1000) }) catch |err|
+        const proposed = propose(shard, .action_register, ae.Register.Value{ .ns = ns.int(), .name = name, .owner = owner, .lease_ms = lease_ms, .max_attempts = if (max_attempts == 0) DEFAULT_MAX_ATTEMPTS else std.math.clamp(max_attempts, 1, 1000) }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
@@ -415,7 +420,7 @@ pub const ActionsHandler = struct {
     fn handleInvoke(shard: *Shard, req: Request) CommandResult {
         const name = req.key;
         if (name.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         if (getDef(shard, ns, name) == null) return .{ .err = .{ .code = .not_found, .message = "action not found" } };
         const parsed = parseInvokeValue(shard.allocator, req.value) catch |err| return .{ .err = switch (err) {
             error.OutOfMemory => .{ .code = .internal_error, .message = "out of memory" },
@@ -427,8 +432,8 @@ pub const ActionsHandler = struct {
         if (parsed.input.len > ae.MAX_INPUT) return .{ .err = .{ .code = .invalid_request, .message = "action input too large" } };
         if (parsed.labels) |l| if (l.len > ae.MAX_LABELS) return .{ .err = .{ .code = .invalid_request, .message = "invoke labels too large" } };
         var id_buf: [32]u8 = undefined;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(req.ns_id, name), &id_buf);
-        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns, .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(ns, name), &id_buf);
+        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = name, .run = run_id, .input = parsed.input, .labels = parsed.labels, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
@@ -436,10 +441,10 @@ pub const ActionsHandler = struct {
     fn handleDelete(shard: *Shard, req: Request) CommandResult {
         const name = req.key;
         if (name.len == 0) return .{ .err = .{ .code = .invalid_request, .message = "action name is required" } };
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         // Deleting one that isn't there is ok.
         if (getDef(shard, ns, name) == null) return .{ .action_deleted = {} };
-        const proposed = propose(shard, .action_delete, ae.Delete.Value{ .ns = ns, .name = name }) catch |err|
+        const proposed = propose(shard, .action_delete, ae.Delete.Value{ .ns = ns.int(), .name = name }) catch |err|
             return .{ .err = persistence.failureError(err, "action not persisted") };
         return .{ .parked = proposed };
     }
@@ -450,13 +455,13 @@ pub const ActionsHandler = struct {
     fn handleList(shard: *Shard, req: Request) CommandResult {
         var w: std.Io.Writer.Allocating = .init(shard.allocator);
         defer w.deinit();
-        writeActionList(shard, homeOf(req.namespace), req.key, &w.writer) catch
+        writeActionList(shard, req.ns_id, req.key, &w.writer) catch
             return .{ .err = .{ .code = .internal_error, .message = "action list serialization failed" } };
         const data = w.toOwnedSlice() catch return .{ .err = .{ .code = .internal_error, .message = "out of memory" } };
         return .{ .action_list_result = .{ .data = data, .cursor = null } };
     }
 
-    fn writeActionList(shard: *Shard, ns: []const u8, prefix: []const u8, w: *std.Io.Writer) !void {
+    fn writeActionList(shard: *Shard, ns: NamespaceId, prefix: []const u8, w: *std.Io.Writer) !void {
         var pb: [KEY_BUF]u8 = undefined;
         const p = storeKey(&pb, ns, prefix) orelse return error.WriteFailed;
         var count: u32 = 0;
@@ -464,7 +469,7 @@ pub const ActionsHandler = struct {
         while (try it.next()) |_| count += 1;
         try w.writeInt(u32, count, .little);
         it = readOf(shard).range(machine.Defs, p);
-        while (try it.next()) |item| try writeEntry(item.key[1 + ns.len ..], item.value.v, w);
+        while (try it.next()) |item| try writeEntry(item.key[@sizeOf(u32)..], item.value.v, w);
         try w.writeByte(0);
         try w.writeInt(u16, 0, .little);
     }
@@ -472,8 +477,8 @@ pub const ActionsHandler = struct {
     /// One action as its list answers it: `[name_len:u16][name][value_len:u32]`
     /// then `[version:u32][owner_len:u16][owner][timeout_ms:u64][max_attempts:u32][created_at_ms:i64]`.
     /// Nothing for an action this shard doesn't hold.
-    pub fn writeListEntry(shard: *Shard, namespace: []const u8, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const def = getDef(shard, homeOf(namespace), name) orelse return;
+    pub fn writeListEntry(shard: *Shard, ns: NamespaceId, name: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const def = getDef(shard, ns, name) orelse return;
         try writeEntry(name, def, w);
     }
 
@@ -492,9 +497,8 @@ pub const ActionsHandler = struct {
     /// The action walk's names: one shard's actions in the namespace that
     /// start with `prefix`, the request's key.
     fn localScanActions(ctx: *anyopaque, walk_ns: dispatcher_mod.WalkNamespace, prefix: []const u8, _: ?[]const u8, _: u32) dispatcher_mod.NameWalker.ScanResult {
-        const namespace = walk_ns.name;
         const shard: *Shard = @ptrCast(@alignCast(ctx));
-        const ns = homeOf(namespace);
+        const ns = walk_ns.id;
         const name_buf = dispatcher_mod.scanScratch(@intCast(storeOf(shard).family(machine.Defs.ID).count));
         var pb: [KEY_BUF]u8 = undefined;
         const p = storeKey(&pb, ns, prefix) orelse return .{ .items = name_buf[0..0], .next_cursor = null };
@@ -502,7 +506,7 @@ pub const ActionsHandler = struct {
         var it = readOf(shard).range(machine.Defs, p);
         while (it.next() catch null) |item| {
             if (count >= name_buf.len) break;
-            name_buf[count] = item.key[1 + ns.len ..];
+            name_buf[count] = item.key[@sizeOf(u32)..];
             count += 1;
         }
         return .{ .items = name_buf[0..count], .next_cursor = null };
@@ -513,7 +517,7 @@ pub const ActionsHandler = struct {
     ///                [status:u8][created_at:i64][has_started:u8][started_at?:i64]
     ///                [has_completed:u8][completed_at?:i64])*
     fn handleListRuns(shard: *Shard, req: Request) CommandResult {
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         const limit: u32 = if (req.value.len >= 4) std.mem.readInt(u32, req.value[0..4], .little) else 100;
         var w: std.Io.Writer.Allocating = .init(shard.allocator);
         defer w.deinit();
@@ -523,7 +527,7 @@ pub const ActionsHandler = struct {
         return .{ .action_list_result = .{ .data = data, .cursor = null } };
     }
 
-    fn writeRuns(shard: *Shard, ns: []const u8, action: []const u8, limit: u32, w: *std.Io.Writer) !void {
+    fn writeRuns(shard: *Shard, ns: NamespaceId, action: []const u8, limit: u32, w: *std.Io.Writer) !void {
         var pb: [KEY_BUF]u8 = undefined;
         const p = storeKey(&pb, ns, "") orelse return error.WriteFailed;
         var count: u32 = 0;
@@ -541,7 +545,7 @@ pub const ActionsHandler = struct {
             const run = item.value.v;
             if (action.len > 0 and !std.mem.eql(u8, run.action, action)) continue;
             emitted += 1;
-            const id = item.key[1 + ns.len ..];
+            const id = item.key[@sizeOf(u32)..];
             try w.writeInt(u16, @intCast(id.len), .little);
             try w.writeAll(id);
             try w.writeInt(u16, @intCast(run.action.len), .little);
@@ -580,7 +584,7 @@ pub const ActionsHandler = struct {
 
     fn runStatus(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(StatusResponse) {
         const self = shard.actions_handler;
-        const run = getRun(shard, homeOf(req.namespace), req.key) orelse return error.NotFound;
+        const run = getRun(shard, req.ns_id, req.key) orelse return error.NotFound;
         const buf = self.status_buf orelse blk: {
             const b = try self.allocator.alloc(u8, action_ops.MAX_OUTPUT + action_ops.MAX_ERROR + action_ops.MAX_WORKER_ID + action_ops.MAX_OUTCOME);
             self.status_buf = b;
@@ -615,7 +619,7 @@ pub const ActionsHandler = struct {
     /// in the namespace, so they are none past RUNS_SCANNED: runs are kept,
     /// and a namespace's grow without bound.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         const def = getDef(shard, ns, req.key) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = .{ .reason = .not_found, .ran = .no, .message = machine.NO_ACTION } } };
         const owner_buf = &shard.actions_handler.info_owner_buf;
@@ -675,7 +679,7 @@ pub const ActionsHandler = struct {
 
     /// `action`'s runs by status among the first `durations.len` of the
     /// namespace's, and the completed ones' durations in ms.
-    fn countRuns(shard: *Shard, ns: []const u8, action: []const u8, durations: []u64) RunCounts {
+    fn countRuns(shard: *Shard, ns: NamespaceId, action: []const u8, durations: []u64) RunCounts {
         var c: RunCounts = .{};
         var pb: [KEY_BUF]u8 = undefined;
         const p = storeKey(&pb, ns, "") orelse return c;
@@ -742,7 +746,7 @@ pub const ActionsHandler = struct {
     /// it names (the request's, then the others its worker registered),
     /// and its wait.
     const Want = struct {
-        ns: []const u8,
+        ns: NamespaceId,
         worker: []const u8,
         labels: ?[]const u8,
         request_key: ?[]const u8,
@@ -759,7 +763,7 @@ pub const ActionsHandler = struct {
     /// shard owns is asked of that shard, one at a time. With nothing
     /// anywhere the await waits, and runs again when woken.
     fn runAwait(shard: *Shard, conn: *Connection, req: Request, actions: action_ops.ActionNames.Value, block_ms: u64, request_key: ?[]const u8) Error!table_run.Outcome(AwaitResponse) {
-        const ns = homeOf(req.namespace);
+        const ns = req.ns_id;
         const worker_id = req.key;
         if (worker_id.len > 0) if (shard.worker_handler.refusesWork(ns, worker_id)) |no| return .{ .refused = .{ .status = .bad_request, .refusal = no } };
         var want: Want = .{ .ns = ns, .worker = worker_id, .labels = null, .request_key = request_key, .block_ms = block_ms, .names = .{} };
@@ -837,18 +841,18 @@ pub const ActionsHandler = struct {
         return .wait;
     }
 
-    /// A waiting await's key: `[ns][worker][request_key][names]`, the
-    /// names as an await's list encodes them, the lengths and the names'
-    /// count packed in the waiter's min_version.
+    /// A waiting await's key: `[ns id:u32 BE][worker][request_key][names]`,
+    /// the names as an await's list encodes them, the lengths and the
+    /// names' count packed in the waiter's min_version.
     const AwaitKey = struct {
         bytes: []const u8,
         lengths: u64,
 
         fn build(buf: []u8, want: Want) ?AwaitKey {
             const rk = want.request_key orelse "";
-            if (want.ns.len > 0xFFFF or want.worker.len > 0xFFFF or rk.len > 0xFFFF) return null;
+            if (want.worker.len > 0xFFFF or rk.len > 0xFFFF) return null;
             var w: schema.Writer = .{ .buf = buf };
-            w.put(want.ns) catch return null;
+            w.put(&want.ns.bytes()) catch return null;
             w.put(want.worker) catch return null;
             w.put(rk) catch return null;
             // The request's names must fit; the worker's registered ones go
@@ -863,21 +867,20 @@ pub const ActionsHandler = struct {
                 };
                 n += 1;
             }
-            return .{ .bytes = buf[0..w.pos], .lengths = (@as(u64, want.ns.len) << 48) | (@as(u64, want.worker.len) << 32) | (@as(u64, rk.len) << 16) | n };
+            return .{ .bytes = buf[0..w.pos], .lengths = (@as(u64, want.worker.len) << 32) | (@as(u64, rk.len) << 16) | n };
         }
 
-        const Parts = struct { ns: []const u8, worker: []const u8, request_key: []const u8, names: action_ops.ActionNames.Value };
+        const Parts = struct { ns: NamespaceId, worker: []const u8, request_key: []const u8, names: action_ops.ActionNames.Value };
 
         fn parse(key: []const u8, lengths: u64) ?Parts {
-            const ns_len: usize = @intCast(lengths >> 48);
             const worker_len: usize = @intCast((lengths >> 32) & 0xFFFF);
             const rk_len: usize = @intCast((lengths >> 16) & 0xFFFF);
             const count: u32 = @intCast(lengths & 0xFFFF);
-            if (ns_len + worker_len + rk_len > key.len) return null;
-            const a = ns_len;
+            const a = @sizeOf(u32);
+            if (a + worker_len + rk_len > key.len) return null;
             const b = a + worker_len;
             const c = b + rk_len;
-            return .{ .ns = key[0..a], .worker = key[a..b], .request_key = key[b..c], .names = .{ .bytes = key[c..], .count = count } };
+            return .{ .ns = .of(std.mem.readInt(u32, key[0..a], .big)), .worker = key[a..b], .request_key = key[b..c], .names = .{ .bytes = key[c..], .count = count } };
         }
     };
 
@@ -886,7 +889,7 @@ pub const ActionsHandler = struct {
     /// What an await asking other owners keeps between asks.
     const Ask = struct {
         req_bytes: []u8,
-        ns: []u8,
+        ns: NamespaceId,
         worker: []u8,
         labels: ?[]u8,
         request_key: ?[]u8,
@@ -912,7 +915,7 @@ pub const ActionsHandler = struct {
             errdefer allocator.destroy(a);
             a.* = .{
                 .req_bytes = try Shard.serializeRequest(allocator, req),
-                .ns = try allocator.dupe(u8, want.ns),
+                .ns = want.ns,
                 .worker = try allocator.dupe(u8, want.worker),
                 .labels = if (want.labels) |l| try allocator.dupe(u8, l) else null,
                 .request_key = if (want.request_key) |k| try allocator.dupe(u8, k) else null,
@@ -959,7 +962,6 @@ pub const ActionsHandler = struct {
         fn free(state: *anyopaque, allocator: Allocator) void {
             const a: *Ask = @ptrCast(@alignCast(state));
             allocator.free(a.req_bytes);
-            allocator.free(a.ns);
             allocator.free(a.worker);
             if (a.labels) |l| allocator.free(l);
             if (a.request_key) |k| allocator.free(k);
@@ -1023,7 +1025,7 @@ pub const ActionsHandler = struct {
             errdefer allocator.destroy(c);
             c.* = .{
                 .req_bytes = try allocator.dupe(u8, a.req_bytes),
-                .ns = try allocator.dupe(u8, a.ns),
+                .ns = a.ns,
                 .worker = try allocator.dupe(u8, a.worker),
                 .labels = if (a.labels) |l| try allocator.dupe(u8, l) else null,
                 .request_key = if (a.request_key) |k| try allocator.dupe(u8, k) else null,
@@ -1067,7 +1069,7 @@ pub const ActionsHandler = struct {
     /// leader whose term's entries haven't applied refuses it, and the
     /// worker retries.
     fn runDeliver(shard: *Shard, conn: *Connection, req: Request, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!table_run.Outcome(DeliverResponse) {
-        return switch (try shard.actions_handler.deliverHere(shard, conn.replyTo(), req.header.request_id, homeOf(req.namespace), req.key, holder, labels, request_key, again_only)) {
+        return switch (try shard.actions_handler.deliverHere(shard, conn.replyTo(), req.header.request_id, req.ns_id, req.key, holder, labels, request_key, again_only)) {
             .proposed => .wait,
             .again => |task| .{ .answer = .{ .task = task } },
             .none => .{ .answer = .{ .task = null } },
@@ -1090,7 +1092,7 @@ pub const ActionsHandler = struct {
     /// whose labels the worker lacks. Only a leader whose term's entries
     /// have applied chooses: before that, a run delivered in the last term
     /// may still read as ready here.
-    fn deliverHere(self: *ActionsHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, ns: []const u8, action: []const u8, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!Delivered {
+    fn deliverHere(self: *ActionsHandler, shard: *Shard, reply_to: ReplyTo, request_id: u64, ns: NamespaceId, action: []const u8, holder: []const u8, labels: ?[]const u8, request_key: ?[]const u8, again_only: bool) Error!Delivered {
         if (!shard.raft_node.leaderReady()) return .not_ready;
         if (request_key) |rk| if (again(shard, ns, action, holder, rk)) |task| return .{ .again = task };
         if (again_only) return .none;
@@ -1124,7 +1126,7 @@ pub const ActionsHandler = struct {
             try self.pending.ensureUnusedCapacity(self.allocator, 1);
             try self.reserved.ensureUnusedCapacity(self.allocator, 1);
             const owned_key = try self.allocator.dupe(u8, run_key);
-            const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns, .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
+            const proposed = propose(shard, .action_deliver, ae.Deliver.Value{ .ns = ns.int(), .action = action, .run = run_id, .due_ns = due, .holder = holder, .request_key = request_key, .lease_ms = def.lease_ms }) catch |err| {
                 self.allocator.free(owned_key);
                 if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not delivered: {s}", .{ shard.id, run_id, @errorName(err) });
                 return .none;
@@ -1138,7 +1140,7 @@ pub const ActionsHandler = struct {
 
     /// The delivery `holder`'s request key got, if the holder holds it
     /// still: from the log's own record, so any leader finds it.
-    fn again(shard: *Shard, ns: []const u8, action: []const u8, holder: []const u8, request_key: []const u8) ?Task {
+    fn again(shard: *Shard, ns: NamespaceId, action: []const u8, holder: []const u8, request_key: []const u8) ?Task {
         var kb: [KEY_BUF + action_ops.MAX_WORKER_ID + action_ops.MAX_REQUEST_KEY]u8 = undefined;
         var rb: [action_ops.MAX_WORKER_ID + 1 + action_ops.MAX_REQUEST_KEY]u8 = undefined;
         if (holder.len + 1 + request_key.len > rb.len) return null;
@@ -1147,14 +1149,15 @@ pub const ActionsHandler = struct {
         const run = getRun(shard, ns, rec.v.run) orelse return null;
         if (!std.mem.eql(u8, run.action, action) or run.status != .leased or !std.mem.eql(u8, run.holder, holder)) return null;
         if (run.token.term != rec.v.term or run.token.index != rec.v.index) return null;
-        return taskOf(ns, rec.v.run, run);
+        return taskOf(shard, ns, rec.v.run, run);
     }
 
-    /// The task a delivered run is.
-    fn taskOf(ns: []const u8, run_id: []const u8, run: Run) Task {
+    /// The task a delivered run is. It names its namespace as the client
+    /// does; one this node can't name yet goes as "".
+    fn taskOf(shard: *Shard, ns: NamespaceId, run_id: []const u8, run: Run) Task {
         return .{
             .run = run_id,
-            .namespace = ns,
+            .namespace = namespaceName(shard, ns) orelse "",
             .deliveries = run.deliveries,
             .term = run.token.term,
             .index = run.token.index,
@@ -1175,13 +1178,14 @@ pub const ActionsHandler = struct {
         var diag: schema.Diagnostic = .{};
         const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
         var kb: [KEY_BUF]u8 = undefined;
-        if (storeKey(&kb, p.ns, p.run)) |k| if (self.reserved.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+        const ns: NamespaceId = .of(p.ns);
+        if (storeKey(&kb, ns, p.run)) |k| if (self.reserved.fetchRemove(k)) |kv| self.allocator.free(kv.key);
         const at = for (self.pending.items, 0..) |pd, i| {
             if (pd.index == e.header.index and pd.term == e.header.term) break i;
         } else return;
         const pd = self.pending.swapRemove(at);
-        const task: ?Task = if (result.refused() != null) null else if (getRun(shard, p.ns, p.run)) |run| taskOf(p.ns, p.run, run) else null;
-        if (task) |t| if (gone(shard, pd.reply_to)) return self.abandon(shard, p.ns, p.holder, t);
+        const task: ?Task = if (result.refused() != null) null else if (getRun(shard, ns, p.run)) |run| taskOf(shard, ns, p.run, run) else null;
+        if (task) |t| if (gone(shard, pd.reply_to)) return self.abandon(shard, ns, p.holder, t);
         deliverAnswer(shard, pd.reply_to, pd.request_id, task);
     }
 
@@ -1197,21 +1201,22 @@ pub const ActionsHandler = struct {
 
     /// Hand a task back that no await took: released as abandoned, which
     /// counts no failure.
-    fn abandon(self: *ActionsHandler, shard: *Shard, ns: []const u8, holder: []const u8, t: Task) void {
+    fn abandon(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
         _ = self;
         const run = getRun(shard, ns, t.run) orelse return;
-        _ = propose(shard, .action_release, ae.Release.Value{ .ns = ns, .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" }) catch |err| {
+        _ = propose(shard, .action_release, ae.Release.Value{ .ns = ns.int(), .action = t.action, .run = t.run, .holder = holder, .request_key = run.request_key, .deliveries = t.deliveries, .token = .{ .term = t.term, .index = t.index }, .expiry_ns = run.expiry_ns, .abandoned = true, .retry = true, .delay_ms = 0, .@"error" = "" }) catch |err| {
             if (!shard.quietHalted(err)) log.warn("shard {d}: run {s} not handed back: {s}; its lease runs out", .{ shard.id, t.run, @errorName(err) });
         };
     }
 
-    /// `[ns_len:u16][ns][holder_len:u16][holder][action_len:u16][action][run_len:u16][run][deliveries:u32][term:u64][index:u64]`.
-    fn sendAbandon(self: *ActionsHandler, shard: *Shard, ns: []const u8, holder: []const u8, t: Task) void {
-        const parts = [_][]const u8{ ns, holder, t.action, t.run };
-        var size: usize = 4 + 8 + 8;
+    /// `[ns:u32][holder_len:u16][holder][action_len:u16][action][run_len:u16][run][deliveries:u32][term:u64][index:u64]`.
+    fn sendAbandon(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, holder: []const u8, t: Task) void {
+        const parts = [_][]const u8{ holder, t.action, t.run };
+        var size: usize = 4 + 4 + 8 + 8;
         for (parts) |p| size += 2 + p.len;
         const bytes = self.allocator.alloc(u8, size) catch return;
-        var off: usize = 0;
+        std.mem.writeInt(u32, bytes[0..4], ns.int(), .little);
+        var off: usize = 4;
         for (parts) |p| {
             std.mem.writeInt(u16, bytes[off..][0..2], @intCast(p.len), .little);
             @memcpy(bytes[off + 2 ..][0..p.len], p);
@@ -1229,14 +1234,15 @@ pub const ActionsHandler = struct {
     }
 
     pub fn abandonFromInbox(self: *ActionsHandler, shard: *Shard, bytes: []const u8) void {
-        var r: Fields = .{ .bytes = bytes };
-        const ns = r.next() orelse return;
+        if (bytes.len < 4) return;
+        const ns: NamespaceId = .of(std.mem.readInt(u32, bytes[0..4], .little));
+        var r: Fields = .{ .bytes = bytes, .off = 4 };
         const holder = r.next() orelse return;
         const action = r.next() orelse return;
         const run_id = r.next() orelse return;
         if (r.off + 20 != bytes.len) return;
         const run = getRun(shard, ns, run_id) orelse return;
-        var t = taskOf(ns, run_id, run);
+        var t = taskOf(shard, ns, run_id, run);
         t.action = action;
         t.deliveries = std.mem.readInt(u32, bytes[r.off..][0..4], .little);
         t.term = std.mem.readInt(u64, bytes[r.off + 4 ..][0..8], .little);
@@ -1256,7 +1262,11 @@ pub const ActionsHandler = struct {
         var diag: schema.Diagnostic = .{};
         const got = AwaitResponse.decodeAll(resp.data, &diag) catch return;
         const task = got.task orelse return;
-        shard.actions_handler.sendAbandon(shard, task.namespace, "", task);
+        // The task names its namespace as the client does. One sent with
+        // no name had none the node could name: it isn't "default", so it
+        // is held until its lease runs out instead.
+        if (task.namespace.len == 0) return;
+        shard.actions_handler.sendAbandon(shard, shard.namespaceId(task.namespace), "", task);
     }
 
     /// An await or ask answered with its task, or none.
@@ -1330,7 +1340,10 @@ pub const ActionsHandler = struct {
         if (!mayFind(shard, parts, from == .remote)) return false;
         const left = waitLeft(waiter, @import("stdx").time.monotonicMs());
         if (left == 0) return false;
-        const bytes = rerunBytes(shard.allocator, waiter.request_id, parts, left) catch return false;
+        // The await runs again as a client's request, which names its
+        // namespace; its id came from that name, so this node has it.
+        const namespace = namespaceName(shard, parts.ns) orelse return false;
+        const bytes = rerunBytes(shard.allocator, waiter.request_id, namespace, parts, left) catch return false;
         self.reruns.append(self.allocator, .{ .reply_to = waiter.reply_to, .request_id = waiter.request_id, .bytes = bytes }) catch {
             shard.allocator.free(bytes);
             return false;
@@ -1350,7 +1363,7 @@ pub const ActionsHandler = struct {
         return false;
     }
 
-    fn mayFindOf(shard: *Shard, ns: []const u8, action: []const u8, remote: bool) bool {
+    fn mayFindOf(shard: *Shard, ns: NamespaceId, action: []const u8, remote: bool) bool {
         if (ownerOf(shard, ns, action) != shard.id) return remote;
         var pb: [KEY_BUF]u8 = undefined;
         var rb: [machine.MAX_KEY_LEN]u8 = undefined;
@@ -1367,12 +1380,12 @@ pub const ActionsHandler = struct {
     }
 
     /// The await a waiter was, as a request, waiting `left_ms` at most.
-    fn rerunBytes(allocator: Allocator, request_id: u64, parts: AwaitKey.Parts, left_ms: u64) ![]u8 {
+    fn rerunBytes(allocator: Allocator, request_id: u64, namespace: []const u8, parts: AwaitKey.Parts, left_ms: u64) ![]u8 {
         const body: AwaitRequest.Value = .{ .actions = parts.names, .block_ms = @min(left_ms, action_ops.MAX_AWAIT_MS), .request_key = if (parts.request_key.len == 0) null else parts.request_key };
         const value = try allocator.alloc(u8, try AwaitRequest.encodedSize(body));
         defer allocator.free(value);
         _ = try AwaitRequest.encodeInto(value, body);
-        const req: Request = .{ .header = proto.RequestHeader.init(.action_await, request_id), .namespace = parts.ns, .key = parts.worker, .value = value, .options = "" };
+        const req: Request = .{ .header = proto.RequestHeader.init(.action_await, request_id), .namespace = namespace, .key = parts.worker, .value = value, .options = "" };
         return Shard.serializeRequest(allocator, req);
     }
 
@@ -1383,24 +1396,24 @@ pub const ActionsHandler = struct {
     /// on, and one from another worker are told apart by the machine.
     fn reported(shard: *Shard, req: Request, action: []const u8) Error!Run {
         if (!shard.raft_node.leaderReady()) return error.NotLeading;
-        const run = getRun(shard, homeOf(req.namespace), req.key) orelse return error.NotFound;
+        const run = getRun(shard, req.ns_id, req.key) orelse return error.NotFound;
         if (!std.mem.eql(u8, run.action, action)) return error.NotFound;
         return run;
     }
 
     fn runComplete(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, outcome: []const u8, result: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
-        const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
+        const proposed = propose(shard, .action_settle, ae.Settle.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = result }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "complete not persisted") } };
-        recordReport(shard, req.namespace, worker, action, false);
+        recordReport(shard, req.ns_id, worker, action, false);
         return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
     }
 
     fn runFail(shard: *Shard, _: *Connection, req: Request, action: []const u8, worker: []const u8, deliveries: u32, term: u64, index: u64, retry: bool, abandoned: bool, delay_ms: u64, err_text: []const u8) Error!table_run.Outcome(EmptyResponse) {
         const run = try reported(shard, req, action);
-        const proposed = propose(shard, .action_release, ae.Release.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .abandoned = abandoned, .retry = retry, .delay_ms = delay_ms, .@"error" = err_text }) catch |err|
+        const proposed = propose(shard, .action_release, ae.Release.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .request_key = run.request_key, .deliveries = deliveries, .token = .{ .term = term, .index = index }, .expiry_ns = run.expiry_ns, .abandoned = abandoned, .retry = retry, .delay_ms = delay_ms, .@"error" = err_text }) catch |err|
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "fail not persisted") } };
-        if (!abandoned) recordReport(shard, req.namespace, worker, action, true);
+        if (!abandoned) recordReport(shard, req.ns_id, worker, action, true);
         return .{ .park = .{ .proposed = proposed, .answer = answerEmpty } };
     }
 
@@ -1414,12 +1427,12 @@ pub const ActionsHandler = struct {
         if (run.status != .leased or run.deliveries != deliveries or run.token.term != term or run.token.index != index or !std.mem.eql(u8, run.holder, worker))
             return .{ .refused = .{ .status = .conflict, .refusal = .{ .reason = .stale_report, .ran = .no, .message = machine.staleWhy(run, worker, deliveries, token) } } };
         var kb: [KEY_BUF]u8 = undefined;
-        const run_key = storeKey(&kb, homeOf(req.namespace), req.key) orelse return error.NotFound;
+        const run_key = storeKey(&kb, req.ns_id, req.key) orelse return error.NotFound;
         const half = (run.lease_ms *| std.time.ns_per_ms) / 2;
         if (run.expiry_ns -| shard.raft_node.now() > half or self.extending.contains(run_key)) return .{ .answer = .{ .expires_at_ms = nsToMs(run.expiry_ns) } };
         try self.extending.ensureUnusedCapacity(self.allocator, 1);
         const owned = try self.allocator.dupe(u8, run_key);
-        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = homeOf(req.namespace), .action = action, .run = req.key, .holder = worker, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
+        const proposed = propose(shard, .action_extend, ae.Extend.Value{ .ns = req.ns_id.int(), .action = action, .run = req.key, .holder = worker, .token = token, .expiry_ns = run.expiry_ns, .held_since_ns = run.delivered_ns, .lease_ms = run.lease_ms }) catch |err| {
             self.allocator.free(owned);
             return .{ .refused = .{ .status = persistence.failureStatus(err), .refusal = persistence.failureRefusal(err, "touch not persisted") } };
         };
@@ -1438,16 +1451,16 @@ pub const ActionsHandler = struct {
 
     /// A worker's report counts toward its stats where it is registered:
     /// here, or on its own shard, told through the inbox.
-    fn recordReport(shard: *Shard, namespace: []const u8, worker: []const u8, action: []const u8, failed: bool) void {
+    fn recordReport(shard: *Shard, ns: NamespaceId, worker: []const u8, action: []const u8, failed: bool) void {
         if (worker.len == 0) return;
-        const ns = homeOf(namespace);
         const target = ownerOf(shard, ns, worker);
         if (target == shard.id) return countReport(shard, ns, worker, action, failed);
-        const parts = [_][]const u8{ ns, worker, action };
-        var size: usize = 1;
+        const parts = [_][]const u8{ worker, action };
+        var size: usize = 4 + 1;
         for (parts) |p| size += 2 + p.len;
         const bytes = shard.allocator.alloc(u8, size) catch return;
-        var off: usize = 0;
+        std.mem.writeInt(u32, bytes[0..4], ns.int(), .little);
+        var off: usize = 4;
         for (parts) |p| {
             std.mem.writeInt(u16, bytes[off..][0..2], @intCast(p.len), .little);
             @memcpy(bytes[off + 2 ..][0..p.len], p);
@@ -1457,14 +1470,15 @@ pub const ActionsHandler = struct {
         shard.actions_handler.send(shard, target, .worker_report, bytes);
     }
 
-    fn countReport(shard: *Shard, ns: []const u8, worker: []const u8, action: []const u8, failed: bool) void {
+    fn countReport(shard: *Shard, ns: NamespaceId, worker: []const u8, action: []const u8, failed: bool) void {
         if (failed) shard.worker_handler.recordFailure(ns, worker, action) else shard.worker_handler.recordCompletion(ns, worker, action);
     }
 
-    /// `[ns_len:u16][ns][worker_len:u16][worker][action_len:u16][action][failed:u8]`.
+    /// `[ns:u32][worker_len:u16][worker][action_len:u16][action][failed:u8]`.
     pub fn reportFromInbox(shard: *Shard, bytes: []const u8) void {
-        var r: Fields = .{ .bytes = bytes };
-        const ns = r.next() orelse return;
+        if (bytes.len < 4) return;
+        const ns: NamespaceId = .of(std.mem.readInt(u32, bytes[0..4], .little));
+        var r: Fields = .{ .bytes = bytes, .off = 4 };
         const worker = r.next() orelse return;
         const action = r.next() orelse return;
         if (r.off + 1 != bytes.len) return;
@@ -1491,12 +1505,12 @@ pub const ActionsHandler = struct {
                 if (leads and result.refused() == null) shard.wake_workers = true;
                 // The action was deleted after the invoke was proposed.
                 const no_action = if (result.refused()) |r| r.refusal.reason == .not_found else false;
-                if (leads and no_action) if (p.caller_shard) |from| self.failHeld(shard, from, p.run, p.ns, p.action, "");
+                if (leads and no_action) if (p.caller_shard) |from| self.failHeld(shard, from, p.run, .of(p.ns), p.action, "");
             },
             .action_extend => {
                 const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
                 var kb: [KEY_BUF]u8 = undefined;
-                if (storeKey(&kb, p.ns, p.run)) |k| if (self.extending.fetchRemove(k)) |kv| self.allocator.free(kv.key);
+                if (storeKey(&kb, .of(p.ns), p.run)) |k| if (self.extending.fetchRemove(k)) |kv| self.allocator.free(kv.key);
             },
             .action_expire => {
                 if (self.expiring) |i| if (i == e.header.index) {
@@ -1508,12 +1522,12 @@ pub const ActionsHandler = struct {
             },
             .action_settle => if (leads and result.refused() == null) {
                 const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
-                self.tellWorkflow(shard, p.ns, p.run);
+                self.tellWorkflow(shard, .of(p.ns), p.run);
             },
             .action_release => if (leads and result.refused() == null) {
                 const p = ae.Release.decodeAll(e.payload, &diag) catch return;
                 if (p.delay_ms == 0) shard.wake_workers = true else self.noteDue(e.header.timestamp_ns +| p.delay_ms *| std.time.ns_per_ms);
-                self.tellWorkflow(shard, p.ns, p.run);
+                self.tellWorkflow(shard, .of(p.ns), p.run);
             },
             else => {},
         }
@@ -1582,7 +1596,9 @@ pub const ActionsHandler = struct {
         defer if (passed) ActionsHandler.wakeWorkers(shard);
         while (it.next() catch null) |item| {
             const k = item.key;
-            const rest = k[1 + @as(usize, k[0]) ..];
+            if (k.len < @sizeOf(u32)) continue;
+            // Past the namespace's id: `[action][0][due][run]`.
+            const rest = k[@sizeOf(u32)..];
             if (std.mem.indexOfScalar(u8, rest, 0)) |sep| if (rest.len >= sep + 9) {
                 const due = std.mem.readInt(u64, rest[sep + 1 ..][0..8], .big);
                 if (due >= self.rebuild_from) {
@@ -1607,13 +1623,13 @@ pub const ActionsHandler = struct {
         var diag: schema.Diagnostic = .{};
         const p = ae.Expire.decodeAll(e.payload, &diag) catch return;
         var it = p.items.iterator();
-        while (it.next() catch return) |item| self.tellWorkflow(shard, item.ns, item.run);
+        while (it.next() catch return) |item| self.tellWorkflow(shard, .of(item.ns), item.run);
     }
 
     /// A run a workflow waits on finished: its result goes to the
     /// workflow's shard, unless that is this one, where the workflow reads
     /// the store.
-    fn tellWorkflow(self: *ActionsHandler, shard: *Shard, ns: []const u8, run_id: []const u8) void {
+    fn tellWorkflow(self: *ActionsHandler, shard: *Shard, ns: NamespaceId, run_id: []const u8) void {
         const run = getRun(shard, ns, run_id) orelse return;
         if (!finishedStatus(run.status)) return;
         const caller = run.caller_run orelse return;
@@ -1691,7 +1707,7 @@ pub const ActionsHandler = struct {
 
     /// A workflow here that has heard nothing of a run asks its shard, at
     /// most once per `ASK_EVERY_MS`; the answer comes as `action_finished`.
-    pub fn askResult(self: *ActionsHandler, shard: *Shard, target: u16, ns: []const u8, run_id: []const u8) void {
+    pub fn askResult(self: *ActionsHandler, shard: *Shard, target: u16, ns: NamespaceId, run_id: []const u8) void {
         const now = @import("stdx").time.monotonicMs();
         if (self.asked.getPtr(run_id)) |last| {
             if (now -| last.* < ASK_EVERY_MS) return;
@@ -1700,22 +1716,18 @@ pub const ActionsHandler = struct {
             const k = self.allocator.dupe(u8, run_id) catch return;
             self.asked.put(self.allocator, k, now) catch return self.allocator.free(k);
         }
-        const bytes = self.allocator.alloc(u8, 2 + ns.len + run_id.len) catch return;
-        std.mem.writeInt(u16, bytes[0..2], @intCast(ns.len), .little);
-        @memcpy(bytes[2..][0..ns.len], ns);
-        @memcpy(bytes[2 + ns.len ..], run_id);
+        const bytes = self.allocator.alloc(u8, 4 + run_id.len) catch return;
+        std.mem.writeInt(u32, bytes[0..4], ns.int(), .little);
+        @memcpy(bytes[4..], run_id);
         self.send(shard, target, .action_result_ask, bytes);
     }
 
-    /// `[ns_len:u16][ns][run]`: answered if the run finished, or if this
-    /// shard has no such run and isn't starting it, which means its invoke
-    /// was lost.
+    /// `[ns:u32][run]`: answered if the run finished, or if this shard has
+    /// no such run and isn't starting it, which means its invoke was lost.
     pub fn resultAskFromInbox(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8) void {
-        if (bytes.len < 2) return;
-        const ns_len: usize = std.mem.readInt(u16, bytes[0..2], .little);
-        if (2 + ns_len > bytes.len) return;
-        const ns = bytes[2..][0..ns_len];
-        const run_id = bytes[2 + ns_len ..];
+        if (bytes.len < 4) return;
+        const ns: NamespaceId = .of(std.mem.readInt(u32, bytes[0..4], .little));
+        const run_id = bytes[4..];
         // A leader whose term's entries haven't applied may yet apply the
         // invoke: it says nothing, and the workflow asks again.
         if (!shard.raft_node.leaderReady()) return;
@@ -1738,8 +1750,8 @@ pub const ActionsHandler = struct {
     };
 
     /// A run on this shard, read from the store.
-    pub fn getRunResult(shard: *Shard, ns: []const u8, run_id: []const u8) ?InternalRunResult {
-        const run = getRun(shard, homeOf(ns), run_id) orelse return null;
+    pub fn getRunResult(shard: *Shard, ns: NamespaceId, run_id: []const u8) ?InternalRunResult {
+        const run = getRun(shard, ns, run_id) orelse return null;
         return .{
             .status = statusOf(run),
             .output = if (run.status == .completed) run.result else null,
@@ -1762,8 +1774,8 @@ pub const ActionsHandler = struct {
     }
 
     /// Whether action `name` exists in `ns` here.
-    pub fn actionExists(shard: *Shard, ns: []const u8, name: []const u8) bool {
-        return getDef(shard, homeOf(ns), name) != null;
+    pub fn actionExists(shard: *Shard, ns: NamespaceId, name: []const u8) bool {
+        return getDef(shard, ns, name) != null;
     }
 
     /// An invoke a workflow proposed: the run's id and the entry's index.
@@ -1772,17 +1784,16 @@ pub const ActionsHandler = struct {
     /// Invoke an action for a workflow run on this shard: the run exists
     /// once the invoke applies. Null if the action doesn't exist or the
     /// invoke could not be proposed.
-    pub fn invokeByName(shard: *Shard, namespace: []const u8, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) ?Invoked {
+    pub fn invokeByName(shard: *Shard, ns: NamespaceId, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) ?Invoked {
         const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
-        const ns = homeOf(namespace);
         if (!actionExists(shard, ns, action_name)) return null;
-        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name), id_buf);
+        const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(ns, action_name), id_buf);
         const index = proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard) orelse return null;
         return .{ .id = run_id, .index = index };
     }
 
-    fn proposeInvoke(shard: *Shard, ns: []const u8, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8, caller_shard: ?u16) ?u64 {
-        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns, .action = action, .run = run_id, .input = input, .labels = null, .source = if (caller_run != null) .workflow else .direct, .caller_run = caller_run, .caller_workflow = caller_workflow, .caller_shard = caller_shard }) catch |err| {
+    fn proposeInvoke(shard: *Shard, ns: NamespaceId, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8, caller_shard: ?u16) ?u64 {
+        const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = action, .run = run_id, .input = input, .labels = null, .source = if (caller_run != null) .workflow else .direct, .caller_run = caller_run, .caller_workflow = caller_workflow, .caller_shard = caller_shard }) catch |err| {
             if (!shard.quietHalted(err)) log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
             return null;
         };
@@ -1790,7 +1801,7 @@ pub const ActionsHandler = struct {
     }
 
     /// A workflow on another shard asking this one to start a run it will
-    /// wait on: `[run_len:u16][run][ns_len:u16][ns][action_len:u16][action]`
+    /// wait on: `[ns:u32][run_len:u16][run][action_len:u16][action]`
     /// `[caller_len:u16][caller][workflow_len:u16][workflow]`
     /// `[wait_len:u16][wait][input]` (a non-empty `wait` if its step may wait
     /// for the action), from
@@ -1816,7 +1827,7 @@ pub const ActionsHandler = struct {
 
     const StartMessage = struct {
         run: []const u8,
-        ns: []const u8,
+        ns: NamespaceId,
         action: []const u8,
         caller: []const u8,
         workflow: []const u8,
@@ -1824,9 +1835,10 @@ pub const ActionsHandler = struct {
         input: []const u8,
 
         fn parse(bytes: []const u8) ?StartMessage {
-            var r: Fields = .{ .bytes = bytes };
+            if (bytes.len < 4) return null;
+            const ns: NamespaceId = .of(std.mem.readInt(u32, bytes[0..4], .little));
+            var r: Fields = .{ .bytes = bytes, .off = 4 };
             const run = r.next() orelse return null;
-            const ns = r.next() orelse return null;
             const action = r.next() orelse return null;
             const caller = r.next() orelse return null;
             const workflow = r.next() orelse return null;
@@ -1836,7 +1848,7 @@ pub const ActionsHandler = struct {
 
         fn invoke(m: StartMessage, from: u16) ae.Invoke.Value {
             const caller: ?[]const u8 = if (m.caller.len == 0) null else m.caller;
-            return .{ .ns = m.ns, .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow, .caller_shard = if (caller != null) from else null };
+            return .{ .ns = m.ns.int(), .action = m.action, .run = m.run, .input = m.input, .labels = null, .source = if (caller != null) .workflow else .direct, .caller_run = caller, .caller_workflow = if (m.workflow.len == 0) null else m.workflow, .caller_shard = if (caller != null) from else null };
         }
 
         fn fits(m: StartMessage, from: u16) bool {
@@ -1860,7 +1872,7 @@ pub const ActionsHandler = struct {
 
     /// Hold a start until its action is registered, and tell its workflow
     /// why it waits. With no wait set, or no room, its step fails now.
-    fn hold(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8, run_id: []const u8, ns: []const u8, action: []const u8) void {
+    fn hold(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8, run_id: []const u8, ns: NamespaceId, action: []const u8) void {
         if (self.missing_action_wait_ms == 0) return self.failHeld(shard, from, run_id, ns, action, "");
         if (self.held.count() >= MAX_HELD) return self.failHeld(shard, from, run_id, ns, action, "; too many steps are already waiting for an action on this shard");
         const owned = self.allocator.dupe(u8, bytes) catch return self.failHeld(shard, from, run_id, ns, action, "; out of memory");
@@ -1870,13 +1882,13 @@ pub const ActionsHandler = struct {
         var it = self.held.valueIterator();
         while (it.next()) |h| {
             const other = StartMessage.parse(h.bytes).?;
-            if (std.mem.eql(u8, other.action, m.action) and std.mem.eql(u8, other.ns, m.ns)) first = false;
+            if (std.mem.eql(u8, other.action, m.action) and other.ns == m.ns) first = false;
         }
         self.held.put(self.allocator, m.run, .{ .from = from, .bytes = owned, .until_ms = until_ms }) catch {
             self.allocator.free(owned);
             return self.failHeld(shard, from, run_id, ns, action, "; out of memory");
         };
-        if (first) log.warn("shard {d}: a workflow step waits for action {s} in namespace {s}, which isn't registered; it fails in {d} ms if it still isn't ([workflows] missing_action_wait_ms)", .{ shard.id, m.action, m.ns, self.missing_action_wait_ms });
+        if (first) log.warn("shard {d}: a workflow step waits for action {s} in namespace {s}, which isn't registered; it fails in {d} ms if it still isn't ([workflows] missing_action_wait_ms)", .{ shard.id, m.action, namespaceName(shard, m.ns) orelse "(unnamed)", self.missing_action_wait_ms });
         const note = self.allocator.alloc(u8, 2 + m.run.len + m.action.len) catch return;
         std.mem.writeInt(u16, note[0..2], @intCast(m.run.len), .little);
         @memcpy(note[2..][0..m.run.len], m.run);
@@ -1885,9 +1897,12 @@ pub const ActionsHandler = struct {
     }
 
     /// A step's start this shard won't hold, or held too long.
-    fn failHeld(self: *ActionsHandler, shard: *Shard, from: u16, run_id: []const u8, ns: []const u8, action: []const u8, why: []const u8) void {
+    fn failHeld(self: *ActionsHandler, shard: *Shard, from: u16, run_id: []const u8, ns: NamespaceId, action: []const u8, why: []const u8) void {
         var buf: [1024]u8 = undefined;
-        const detail = std.fmt.bufPrint(&buf, "action {s} is not registered in namespace {s}{s}", .{ action, ns, why }) catch "the action is not registered";
+        const detail = if (namespaceName(shard, ns)) |name|
+            std.fmt.bufPrint(&buf, "action {s} is not registered in namespace {s}{s}", .{ action, name, why }) catch "the action is not registered"
+        else
+            std.fmt.bufPrint(&buf, "action {s} is not registered{s}", .{ action, why }) catch "the action is not registered";
         self.sendFinished(shard, from, run_id, .cancelled, NOT_REGISTERED, detail);
     }
 
@@ -1984,15 +1999,16 @@ pub const ActionsHandler = struct {
 
     /// The inbox payload `startRunFromInbox` reads, allocated with
     /// `allocator`; the receiving shard frees it.
-    pub fn encodeStartRunMessage(allocator: Allocator, namespace: []const u8, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, can_wait: bool) ?[]u8 {
-        const parts = [_][]const u8{ run_id, homeOf(namespace), action_name, caller_run_id orelse "", caller_workflow_name orelse "", if (can_wait) "w" else "" };
-        var size: usize = input.len;
+    pub fn encodeStartRunMessage(allocator: Allocator, ns: NamespaceId, run_id: []const u8, action_name: []const u8, input: []const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, can_wait: bool) ?[]u8 {
+        const parts = [_][]const u8{ run_id, action_name, caller_run_id orelse "", caller_workflow_name orelse "", if (can_wait) "w" else "" };
+        var size: usize = 4 + input.len;
         for (parts) |p| {
             if (p.len > std.math.maxInt(u16)) return null;
             size += 2 + p.len;
         }
         const out = allocator.alloc(u8, size) catch return null;
-        var off: usize = 0;
+        std.mem.writeInt(u32, out[0..4], ns.int(), .little);
+        var off: usize = 4;
         for (parts) |p| {
             std.mem.writeInt(u16, out[off..][0..2], @intCast(p.len), .little);
             @memcpy(out[off + 2 ..][0..p.len], p);
@@ -2061,7 +2077,7 @@ pub const ActionsHandler = struct {
                 request_key = run.request_key;
             };
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
+            const bytes = ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns.int(), .action = due.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key }) catch continue;
             if (items.items.len + bytes.len > ae.MAX_EXPIRE_BYTES) break;
             items.appendSlice(self.allocator, bytes) catch break;
             n += 1;
@@ -2298,12 +2314,12 @@ const test_support = struct {
     }
 
     /// The run `id` in `ns`, from the shard's store.
-    pub fn run(shard: *Shard, ns: []const u8, id: []const u8) ?Run {
+    pub fn run(shard: *Shard, ns: NamespaceId, id: []const u8) ?Run {
         return getRun(shard, ns, id);
     }
 
     /// Action `name`'s version in `ns`.
-    pub fn version(shard: *Shard, ns: []const u8, name: []const u8) ?u32 {
+    pub fn version(shard: *Shard, ns: NamespaceId, name: []const u8) ?u32 {
         return if (getDef(shard, ns, name)) |d| d.version else null;
     }
 
@@ -2315,7 +2331,7 @@ const test_support = struct {
     /// named and the rest the worker registered; null when the request's
     /// own don't fit.
     pub fn awaitKeyNames(worker: []const u8, names: []const []const u8, asked: usize) ?u64 {
-        var want: ActionsHandler.Want = .{ .ns = "default", .worker = worker, .labels = null, .request_key = null, .block_ms = 1000, .names = .{}, .asked = asked };
+        var want: ActionsHandler.Want = .{ .ns = .default, .worker = worker, .labels = null, .request_key = null, .block_ms = 1000, .names = .{}, .asked = asked };
         for (names) |n| want.names.add(n);
         var buf: [waiter_pool_mod.MAX_WAITER_KEY]u8 = undefined;
         const key = ActionsHandler.AwaitKey.build(&buf, want) orelse return null;
@@ -2346,4 +2362,12 @@ test "action info's latency: percentiles of the completed runs, none without one
     try std.testing.expectEqual(@as(u64, 50), l.p50_ms);
     try std.testing.expectEqual(@as(u64, 95), l.p95_ms);
     try std.testing.expectEqual(@as(u64, 100), l.max_ms);
+}
+
+test "an action entry naming no namespace is refused before it is proposed" {
+    // The guard answers before the shard is touched: a committed entry with
+    // namespace 0 would halt every replica that applied it.
+    const shard: *Shard = undefined;
+    try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_register, ae.Register.Value{ .ns = 0, .name = "a", .owner = "", .lease_ms = 1000, .max_attempts = 1 }));
+    try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_delete, ae.Delete.Value{ .ns = 0, .name = "a" }));
 }

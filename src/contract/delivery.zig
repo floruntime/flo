@@ -1,7 +1,10 @@
 //! The delivery model: items a scope's holders take one at a time, each
-//! under a lease until it is reported or the lease runs out. Actions use
-//! it (an action's runs); so will queues. A family of items is the user's;
-//! this keeps the three it leans on, and the rules every lease follows.
+//! under a lease until it is reported or the lease runs out: an action's
+//! runs, a queue's messages, a consumer group's records. A family of items
+//! is the user's; this keeps the three it leans on, and the rules every
+//! lease follows.
+//!
+//! Every key names its item's namespace by id.
 //!
 //! - ready: each ready item, keyed (ns, scope, order, due, id), so a
 //!   leader picks the next of a scope without a scan. The order is a
@@ -78,10 +81,6 @@ pub const Request = Record(&.{
     .{ .name = "index", .T = Int(u64) },
 });
 
-/// How a family names an item's namespace in its keys: by name,
-/// length-framed (`[len][name]`), or by id (`[id]`, as KV keys are).
-pub const NsKind = enum { name, id };
-
 pub const Config = struct {
     ready_id: u16,
     ready_name: []const u8,
@@ -94,8 +93,6 @@ pub const Config = struct {
     /// The longest scope name and item id.
     max_scope: usize,
     max_id: usize,
-    max_namespace: usize,
-    ns: NsKind = .name,
     /// The item field (a u32) that orders a scope's ready items before
     /// their due time, lowest first; none orders by due time alone.
     order: ?[]const u8 = null,
@@ -109,18 +106,12 @@ pub fn Model(comptime cfg: Config) type {
         pub const Deadlines = view_mod.Family(cfg.deadline_id, cfg.deadline_name, Stored(Deadline));
         pub const Requests = view_mod.Family(cfg.request_id, cfg.request_name, Stored(Request));
 
-        pub const Ns = switch (cfg.ns) {
-            .name => []const u8,
-            .id => NamespaceId,
-        };
+        pub const Ns = NamespaceId;
         /// A ready key's ordering prefix: an item's order field, or nothing.
         pub const Order = if (cfg.order != null) u32 else void;
         const ORDER_LEN = if (cfg.order != null) 4 else 0;
-        /// A namespace as a deadline key holds it.
-        const NS_IN_DEADLINE = switch (cfg.ns) {
-            .name => 1 + cfg.max_namespace,
-            .id => @sizeOf(u32),
-        };
+        /// A namespace as a deadline key holds it: its id.
+        const NS_IN_DEADLINE = @sizeOf(u32);
 
         /// The longest key these families hold, before a namespace prefix.
         pub const MAX_KEY: usize = @max(cfg.max_scope + 1 + ORDER_LEN + 8 + cfg.max_id, 8 + NS_IN_DEADLINE + cfg.max_id);
@@ -176,45 +167,24 @@ pub fn Model(comptime cfg: Config) type {
             return buf[0 .. scope.len + 1];
         }
 
-        /// `[expiry:u64 BE][ns][id]`, in no namespace: every lease, earliest
-        /// first. The namespace is in it, as `[len][name]` or its id, so the
-        /// same id in two namespaces is two keys.
+        /// `[expiry:u64 BE][ns id:u32 BE][id]`, in no namespace: every
+        /// lease, earliest first. The namespace's id is in it, so the same id
+        /// in two namespaces is two keys.
         pub fn deadlineKey(buf: []u8, expiry_ns: u64, ns: Ns, id: []const u8) []const u8 {
             std.mem.writeInt(u64, buf[0..8], expiry_ns, .big);
-            const n = switch (cfg.ns) {
-                .name => blk: {
-                    buf[8] = @intCast(ns.len);
-                    @memcpy(buf[9..][0..ns.len], ns);
-                    break :blk 1 + ns.len;
-                },
-                .id => blk: {
-                    buf[8..12].* = ns.bytes();
-                    break :blk 4;
-                },
-            };
-            @memcpy(buf[8 + n ..][0..id.len], id);
-            return buf[0 .. 8 + n + id.len];
+            buf[8..12].* = ns.bytes();
+            @memcpy(buf[12..][0..id.len], id);
+            return buf[0 .. 12 + id.len];
         }
 
         pub const DeadlineKey = struct { expiry_ns: u64, ns: Ns, id: []const u8 };
 
         /// A deadline key read back, without its family's namespace prefix.
         pub fn parseDeadlineKey(k: []const u8) ?DeadlineKey {
-            if (k.len < 9) return null;
-            const expiry_ns = std.mem.readInt(u64, k[0..8], .big);
-            switch (cfg.ns) {
-                .name => {
-                    const ns_len = k[8];
-                    if (k.len < 9 + @as(usize, ns_len)) return null;
-                    return .{ .expiry_ns = expiry_ns, .ns = k[9..][0..ns_len], .id = k[9 + ns_len ..] };
-                },
-                .id => {
-                    if (k.len < 12) return null;
-                    const ns: NamespaceId = .of(std.mem.readInt(u32, k[8..12], .big));
-                    if (ns == .invalid) return null;
-                    return .{ .expiry_ns = expiry_ns, .ns = ns, .id = k[12..] };
-                },
-            }
+            if (k.len < 12) return null;
+            const ns: NamespaceId = .of(std.mem.readInt(u32, k[8..12], .big));
+            if (ns == .invalid) return null;
+            return .{ .expiry_ns = std.mem.readInt(u64, k[0..8], .big), .ns = ns, .id = k[12..] };
         }
 
         /// A lease past its deadline, as the expire duty reads it.
@@ -311,7 +281,7 @@ pub fn Model(comptime cfg: Config) type {
             const ours = if (found) |r| std.mem.eql(u8, @field(r, cfg.scope), scope) else true;
             if (!ours and live) return false;
             var b: KeyBuf = undefined;
-            try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, expiry_ns, ns, id)));
+            try view.delete(Deadlines, try inNoNs(view, deadlineKey(&b, expiry_ns, ns, id)));
             return live;
         }
 
@@ -319,7 +289,7 @@ pub fn Model(comptime cfg: Config) type {
             // An extend or a redeliver landing on the same instant rewrites
             // the same key: still one deadline for the one live lease.
             var b: KeyBuf = undefined;
-            try view.put(Deadlines, try nsKey(view, "", deadlineKey(&b, item.expiry_ns, ns, id)), .{ .v = .{ .scope = @field(item, cfg.scope) } });
+            try view.put(Deadlines, try inNoNs(view, deadlineKey(&b, item.expiry_ns, ns, id)), .{ .v = .{ .scope = @field(item, cfg.scope) } });
         }
 
         /// Delete the key at `seen`, the expiry the leader saw, if it is
@@ -328,7 +298,7 @@ pub fn Model(comptime cfg: Config) type {
         pub fn dropDeadline(view: *View, ns: Ns, id: []const u8, item: anytype, seen: u64) ApplyError!void {
             if (seen != item.expiry_ns) return;
             var b: KeyBuf = undefined;
-            try view.delete(Deadlines, try nsKey(view, "", deadlineKey(&b, seen, ns, id)));
+            try view.delete(Deadlines, try inNoNs(view, deadlineKey(&b, seen, ns, id)));
         }
 
         /// A delivery's request record goes with it, if it still names the
@@ -343,15 +313,10 @@ pub fn Model(comptime cfg: Config) type {
         /// `k` in `ns`, as this model's families store it, in the entry's
         /// scratch.
         pub fn inNs(view: *View, ns: Ns, k: []const u8) ApplyError![]const u8 {
-            return switch (cfg.ns) {
-                .name => nsKey(view, ns, k),
-                .id => blk: {
-                    // An entry naming no namespace was never proposed.
-                    if (ns == .invalid) return error.Halt;
-                    const buf = try view.arena.alloc(u8, @sizeOf(u32) + k.len);
-                    break :blk view_mod.idKey(buf, ns, k) catch unreachable;
-                },
-            };
+            // An entry naming no namespace was never proposed.
+            if (ns == .invalid) return error.Halt;
+            const buf = try view.arena.alloc(u8, @sizeOf(u32) + k.len);
+            return view_mod.idKey(buf, ns, k) catch unreachable;
         }
 
         /// A report for a delivery that has moved on, or from a holder that
@@ -394,11 +359,11 @@ pub fn sameDelivery(item: anytype, holder: []const u8, deliveries: u32, token: a
     return item.deliveries == deliveries and item.token.term == token.term and item.token.index == token.index and std.mem.eql(u8, item.holder, holder);
 }
 
-/// `k` in `ns`, as a family stores it, in the entry's scratch.
-pub fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
-    if (ns.len > view_mod.MAX_NAMESPACE) return error.Halt;
-    const buf = try view.arena.alloc(u8, 1 + ns.len + k.len);
-    return view_mod.key(buf, ns, k) catch unreachable;
+/// `k` as a family in no namespace stores it (a deadline, which names its
+/// namespace inside), in the entry's scratch.
+fn inNoNs(view: *View, k: []const u8) ApplyError![]const u8 {
+    const buf = try view.arena.alloc(u8, 1 + k.len);
+    return view_mod.key(buf, "", k) catch unreachable;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -406,57 +371,52 @@ pub fn nsKey(view: *View, ns: []const u8, k: []const u8) ApplyError![]const u8 {
 const testing = std.testing;
 
 /// A model of each kind, in test families.
-const ByName = Model(.{ .ready_id = 2, .ready_name = "t.ready", .deadline_id = 3, .deadline_name = "t.deadline", .request_id = 4, .request_name = "t.request", .scope = "scope", .max_scope = 16, .max_id = 16, .max_namespace = 16, .noun = "run" });
-const ById = Model(.{ .ready_id = 5, .ready_name = "u.ready", .deadline_id = 6, .deadline_name = "u.deadline", .request_id = 7, .request_name = "u.request", .scope = "scope", .max_scope = 8, .max_id = 16, .max_namespace = 16, .ns = .id, .order = "priority", .noun = "message" });
+/// A model with an order and one without, in test families.
+const Unordered = Model(.{ .ready_id = 2, .ready_name = "t.ready", .deadline_id = 3, .deadline_name = "t.deadline", .request_id = 4, .request_name = "t.request", .scope = "scope", .max_scope = 16, .max_id = 16, .noun = "run" });
+const Ordered = Model(.{ .ready_id = 5, .ready_name = "u.ready", .deadline_id = 6, .deadline_name = "u.deadline", .request_id = 7, .request_name = "u.request", .scope = "scope", .max_scope = 8, .max_id = 16, .order = "priority", .noun = "message" });
 
 test "delivery model: ready keys sort by order, then due time, then id, and read back" {
-    var a: ById.KeyBuf = undefined;
-    var b: ById.KeyBuf = undefined;
+    var a: Ordered.KeyBuf = undefined;
+    var b: Ordered.KeyBuf = undefined;
     // A lower order goes first, however late it is due.
-    const late_first = ById.readyKey(&a, "q0000000", 0, 900, "x");
-    const early_second = ById.readyKey(&b, "q0000000", 1, 100, "a");
+    const late_first = Ordered.readyKey(&a, "q0000000", 0, 900, "x");
+    const early_second = Ordered.readyKey(&b, "q0000000", 1, 100, "a");
     try testing.expect(std.mem.order(u8, late_first, early_second) == .lt);
-    var c: ById.KeyBuf = undefined;
-    try testing.expect(std.mem.order(u8, ById.readyKey(&c, "q0000000", 1, 99, "z"), early_second) == .lt);
+    var c: Ordered.KeyBuf = undefined;
+    try testing.expect(std.mem.order(u8, Ordered.readyKey(&c, "q0000000", 1, 99, "z"), early_second) == .lt);
     // The order is big-endian: 255 sorts before 256.
-    var e: ById.KeyBuf = undefined;
-    var f: ById.KeyBuf = undefined;
-    try testing.expect(std.mem.order(u8, ById.readyKey(&e, "q0000000", 255, 0, "a"), ById.readyKey(&f, "q0000000", 256, 0, "a")) == .lt);
-    try testing.expect(std.mem.startsWith(u8, early_second, ById.orderPrefix(&c, "q0000000", 1)));
-    const back = ById.parseReadyKey(early_second, 8).?;
+    var e: Ordered.KeyBuf = undefined;
+    var f: Ordered.KeyBuf = undefined;
+    try testing.expect(std.mem.order(u8, Ordered.readyKey(&e, "q0000000", 255, 0, "a"), Ordered.readyKey(&f, "q0000000", 256, 0, "a")) == .lt);
+    try testing.expect(std.mem.startsWith(u8, early_second, Ordered.orderPrefix(&c, "q0000000", 1)));
+    const back = Ordered.parseReadyKey(early_second, 8).?;
     try testing.expectEqual(@as(u64, 100), back.due_ns);
     try testing.expectEqualStrings("a", back.id);
     // With no order, a key is the scope, a NUL, the due time and the id.
-    var d: ByName.KeyBuf = undefined;
-    try testing.expectEqualSlices(u8, "send\x00\x00\x00\x00\x00\x00\x00\x00\x07r1", ByName.readyKey(&d, "send", {}, 7, "r1"));
+    var d: Unordered.KeyBuf = undefined;
+    try testing.expectEqualSlices(u8, "send\x00\x00\x00\x00\x00\x00\x00\x00\x07r1", Unordered.readyKey(&d, "send", {}, 7, "r1"));
 }
 
-test "delivery model: a deadline key names its namespace by name or by id, and reads back" {
-    var a: ByName.KeyBuf = undefined;
-    const k = ByName.deadlineKey(&a, 42, "ns", "r1");
-    const back = ByName.parseDeadlineKey(k).?;
-    try testing.expectEqual(@as(u64, 42), back.expiry_ns);
-    try testing.expectEqualStrings("ns", back.ns);
-    try testing.expectEqualStrings("r1", back.id);
-    var b: ById.KeyBuf = undefined;
-    const kid = ById.deadlineKey(&b, 42, .of(7), "m1");
+test "delivery model: a deadline key names its namespace by id, and reads back" {
+    var b: Ordered.KeyBuf = undefined;
+    const kid = Ordered.deadlineKey(&b, 42, .of(7), "m1");
     try testing.expectEqual(@as(usize, 8 + 4 + 2), kid.len);
-    const bid = ById.parseDeadlineKey(kid).?;
+    const bid = Ordered.parseDeadlineKey(kid).?;
     try testing.expectEqual(NamespaceId.of(7), bid.ns);
     try testing.expectEqualStrings("m1", bid.id);
     // The id that names no namespace is no deadline's.
-    try testing.expect(ById.parseDeadlineKey(ById.deadlineKey(&b, 42, .invalid, "m1")) == null);
-    try testing.expect(ByName.parseDeadlineKey("short") == null);
+    try testing.expect(Ordered.parseDeadlineKey(Ordered.deadlineKey(&b, 42, .invalid, "m1")) == null);
+    try testing.expect(Ordered.parseDeadlineKey("short") == null);
 }
 
 test "delivery model: a stale report says what became of the item, in the family's own word" {
     const Item = struct { deliveries: u32, token: ae.Token.Value, holder: []const u8, ended: Ended };
     const tok: ae.Token.Value = .{ .term = 2, .index = 9 };
     const item: Item = .{ .deliveries = 3, .token = tok, .holder = "w1", .ended = .expired };
-    try testing.expectEqualStrings("stale report: the message was delivered again since", ById.staleWhy(item, "w1", 2, tok));
-    try testing.expectEqualStrings("stale report: the run was delivered again since", ByName.staleWhy(item, "w1", 2, tok));
-    try testing.expectEqualStrings("stale report: another worker holds this delivery", ById.staleWhy(item, "w2", 3, tok));
-    try testing.expectEqualStrings("stale report: the lease expired and the message moved on", ById.staleWhy(item, "w1", 3, tok));
+    try testing.expectEqualStrings("stale report: the message was delivered again since", Ordered.staleWhy(item, "w1", 2, tok));
+    try testing.expectEqualStrings("stale report: the run was delivered again since", Unordered.staleWhy(item, "w1", 2, tok));
+    try testing.expectEqualStrings("stale report: another worker holds this delivery", Ordered.staleWhy(item, "w2", 3, tok));
+    try testing.expectEqualStrings("stale report: the lease expired and the message moved on", Ordered.staleWhy(item, "w1", 3, tok));
     const ends = [_]struct { Ended, []const u8 }{
         .{ .settled, "stale report: the message was completed" },
         .{ .released, "stale report: the message was released" },
@@ -466,38 +426,36 @@ test "delivery model: a stale report says what became of the item, in the family
     for (ends) |e| {
         var it = item;
         it.ended = e[0];
-        try testing.expectEqualStrings(e[1], ById.staleWhy(it, "w1", 3, tok));
+        try testing.expectEqualStrings(e[1], Ordered.staleWhy(it, "w1", 3, tok));
     }
 }
 
-test "delivery model: an item in no namespace halts, by id as by name" {
+test "delivery model: an item in no namespace halts" {
     var store = store_mod.Store.init(testing.allocator);
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var keys = view_mod.KeySet.init(arena.allocator());
     var view = View.init(&store, arena.allocator(), &keys);
-    try testing.expectError(error.Halt, ById.inNs(&view, .invalid, "m1"));
-    const long: [view_mod.MAX_NAMESPACE + 1]u8 = @splat('n');
-    try testing.expectError(error.Halt, ByName.inNs(&view, &long, "r1"));
-    try testing.expectEqualSlices(u8, "\x00\x00\x00\x07m1", try ById.inNs(&view, .of(7), "m1"));
+    try testing.expectError(error.Halt, Ordered.inNs(&view, .invalid, "m1"));
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x07m1", try Ordered.inNs(&view, .of(7), "m1"));
 }
 
 test "delivery model: the duty's walk reads deadlines earliest first and stops at the first not yet due" {
     var store = store_mod.Store.init(testing.allocator);
     defer store.deinit();
     for ([_]u64{ 30, 10, 20, 50 }, 0..) |expiry, i| {
-        var b: ById.KeyBuf = undefined;
-        var kb: [1 + ById.MAX_KEY]u8 = undefined;
+        var b: Ordered.KeyBuf = undefined;
+        var kb: [1 + Ordered.MAX_KEY]u8 = undefined;
         const id = [_]u8{ 'm', @intCast('0' + i) };
-        const k = try view_mod.key(&kb, "", ById.deadlineKey(&b, expiry, .of(3), &id));
+        const k = try view_mod.key(&kb, "", Ordered.deadlineKey(&b, expiry, .of(3), &id));
         var w: std.Io.Writer.Allocating = .init(testing.allocator);
         defer w.deinit();
         try (Stored(Deadline){ .v = .{ .scope = "q" } }).encode(&w.writer);
         const rec = try store.allocRecord(k);
-        store.link(ById.Deadlines.ID, rec, try testing.allocator.dupe(u8, w.written()));
+        store.link(Ordered.Deadlines.ID, rec, try testing.allocator.dupe(u8, w.written()));
     }
-    var it = ById.pastDue(.{ .store = &store }, 30);
+    var it = Ordered.pastDue(.{ .store = &store }, 30);
     var seen: [4]u64 = undefined;
     var n: usize = 0;
     while (it.next()) |d| : (n += 1) {

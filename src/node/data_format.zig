@@ -11,7 +11,7 @@ const log = stdx.log;
 const Allocator = std.mem.Allocator;
 
 /// The format this binary reads and writes.
-pub const CURRENT: u32 = 18;
+pub const CURRENT: u32 = 19;
 
 /// What each format stores: the log's segment version and a hash of the
 /// entry layouts in it. A new segment version or layout is a new format, so
@@ -63,6 +63,8 @@ const formats = [_]struct { format: u32, segment_version: u16, entries: u64 }{
     // A KV request no longer carries a routing key, so a value takes the
     // room it held: a stored value may be longer.
     .{ .format = 18, .segment_version = 11, .entries = 0xd84de9970c60f47e },
+    // Action entries name their namespace by id.
+    .{ .format = 19, .segment_version = 12, .entries = 0x6a7954352202e5d7 },
 };
 
 comptime {

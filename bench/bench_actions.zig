@@ -19,6 +19,8 @@ const machine = src.actions.machine;
 /// Runs on the store when timing starts: a shard with a backlog.
 const RUNS = 100_000;
 const LEASE_MS = 30_000;
+/// The default namespace's id, as an entry carries it.
+const DEFAULT_NS = src.node.router.NamespaceId.default.int();
 
 const Bench = struct {
     store: contract.store.Store,
@@ -57,25 +59,25 @@ pub fn main() !void {
     defer b.scratch.deinit();
     std.debug.print("\n=== Actions apply ({d} runs on the store) ===\n\n", .{RUNS});
 
-    try b.apply(.action_register, ae.Register, .{ .ns = "default", .name = "act", .owner = "", .lease_ms = LEASE_MS, .max_attempts = 3 }, 1);
+    try b.apply(.action_register, ae.Register, .{ .ns = DEFAULT_NS, .name = "act", .owner = "", .lease_ms = LEASE_MS, .max_attempts = 3 }, 1);
     var rb: [32]u8 = undefined;
     // Stamps a second apart, so every run is due by the next phase.
     const s = std.time.ns_per_s;
     const due0: u64 = 10 * s;
     var start = stdx.time.nanoTimestamp();
-    for (0..RUNS) |i| try b.apply(.action_invoke, ae.Invoke, .{ .ns = "default", .action = "act", .run = runId(&rb, i), .input = "{\"order\":42}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, due0 + i);
+    for (0..RUNS) |i| try b.apply(.action_invoke, ae.Invoke, .{ .ns = DEFAULT_NS, .action = "act", .run = runId(&rb, i), .input = "{\"order\":42}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, due0 + i);
     report("invoke", RUNS, start);
 
     const deliver_at = due0 + RUNS + s;
     const first_deliver = b.index + 1;
     start = stdx.time.nanoTimestamp();
-    for (0..RUNS) |i| try b.apply(.action_deliver, ae.Deliver, .{ .ns = "default", .action = "act", .run = runId(&rb, i), .due_ns = due0 + i, .holder = "worker-1", .request_key = null, .lease_ms = LEASE_MS }, deliver_at + i);
+    for (0..RUNS) |i| try b.apply(.action_deliver, ae.Deliver, .{ .ns = DEFAULT_NS, .action = "act", .run = runId(&rb, i), .due_ns = due0 + i, .holder = "worker-1", .request_key = null, .lease_ms = LEASE_MS }, deliver_at + i);
     report("deliver", RUNS, start);
 
     // Half settled; the rest left to expire.
     const settled = RUNS / 2;
     start = stdx.time.nanoTimestamp();
-    for (0..settled) |i| try b.apply(.action_settle, ae.Settle, .{ .ns = "default", .action = "act", .run = runId(&rb, i), .holder = "worker-1", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = first_deliver + i }, .expiry_ns = deliver_at + i + LEASE_MS * std.time.ns_per_ms, .outcome = "", .result = "{\"ok\":true}" }, deliver_at + RUNS + i);
+    for (0..settled) |i| try b.apply(.action_settle, ae.Settle, .{ .ns = DEFAULT_NS, .action = "act", .run = runId(&rb, i), .holder = "worker-1", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = first_deliver + i }, .expiry_ns = deliver_at + i + LEASE_MS * std.time.ns_per_ms, .outcome = "", .result = "{\"ok\":true}" }, deliver_at + RUNS + i);
     report("settle", settled, start);
 
     const expire_at = deliver_at + RUNS + LEASE_MS * std.time.ns_per_ms + s;
@@ -85,7 +87,7 @@ pub fn main() !void {
     const singles = (RUNS - settled) / 2;
     start = stdx.time.nanoTimestamp();
     for (settled..settled + singles) |i| {
-        const item = try ae.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = "act", .run = runId(&rb, i), .expiry_ns = deliver_at + i + LEASE_MS * std.time.ns_per_ms, .holder = "worker-1", .request_key = null });
+        const item = try ae.ExpireItem.encodeInto(&ib, .{ .ns = DEFAULT_NS, .action = "act", .run = runId(&rb, i), .expiry_ns = deliver_at + i + LEASE_MS * std.time.ns_per_ms, .holder = "worker-1", .request_key = null });
         try b.apply(.action_expire, ae.Expire, .{ .items = .{ .bytes = item, .count = 1 } }, expire_at + i);
     }
     report("expire, 1 lease", singles, start);
@@ -100,7 +102,7 @@ pub fn main() !void {
         start = stdx.time.nanoTimestamp();
         while (i + per <= end) : (i += per) {
             items.clearRetainingCapacity();
-            for (i..i + per) |j| try items.appendSlice(allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = "act", .run = runId(&rb, j), .expiry_ns = deliver_at + j + LEASE_MS * std.time.ns_per_ms, .holder = "worker-1", .request_key = null }));
+            for (i..i + per) |j| try items.appendSlice(allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = DEFAULT_NS, .action = "act", .run = runId(&rb, j), .expiry_ns = deliver_at + j + LEASE_MS * std.time.ns_per_ms, .holder = "worker-1", .request_key = null }));
             try b.apply(.action_expire, ae.Expire, .{ .items = .{ .bytes = items.items, .count = per } }, expire_at + RUNS + i);
             entries += 1;
         }
