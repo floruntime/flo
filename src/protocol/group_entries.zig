@@ -118,15 +118,25 @@ const report = [_]schema.Field{
 /// Records done with by their holder: acked.
 pub const Settle = Record(&report);
 
-/// Records handed back by their holder: ready again after `delay_ms`, or
-/// dead at once (`dead`) or once their attempts are spent. `free` hands
-/// them back with no failure counted: the leader's own, for records a read
-/// leased but couldn't carry.
+/// How records were handed back.
+pub const HandBack = enum(u8) {
+    /// They failed: a nack. Ready again after `delay_ms`, or dead at once
+    /// (`dead`) or once their attempts are spent.
+    failed = 0,
+    /// Their holder never started them (a worker stopping): ready again at
+    /// once, the delivery counted, no failure.
+    abandoned = 1,
+    /// The leader's own, for records a read leased but its answer couldn't
+    /// carry: ready again at once, neither delivery nor failure counted.
+    unread = 2,
+};
+
+/// Records handed back, by their holder or, `unread`, by the leader.
 pub const Release = Record(&(report ++ [_]schema.Field{
     .{ .name = "delay_ms", .T = schema.DurationMs(MAX_DELAY_MS) },
     .{ .name = "dead", .T = schema.Bool },
     .{ .name = "error", .T = Bytes(MAX_ERROR) },
-    .{ .name = "free", .T = schema.Bool },
+    .{ .name = "ended", .T = schema.Enum(HandBack) },
 }));
 
 /// A delivery's lease moved out. It names the delivery's own lease and when

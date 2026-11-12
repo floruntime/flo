@@ -321,6 +321,7 @@ pub const OptionTag = enum(u8) {
     ack_timeout_ms = 0x30, // u32: A group's lease: a record not acked this long is redelivered (5 s to 12 h; default 30 s)
     max_deliver = 0x31, // u8: A group's attempts: a record is dead once nacked or expired this many times (default 5, 1 to 255)
     dead = 0x32, // void: A nack dead-letters its records now
+    abandon = 0x34, // void: A nack hands its records back unstarted: ready at once, no attempt spent
 
     // Worker/Action Options (0x40 - 0x4F)
 
