@@ -76,6 +76,9 @@ const projection_router = @import("../projection/router.zig");
 const silent_loss = @import("silent_loss.zig");
 const apply_marker = @import("apply_marker.zig");
 const offline_mod = @import("offline.zig");
+const qe_caps = @import("../protocol/queue_entries.zig");
+const ge_mod = @import("../protocol/group_entries.zig");
+const group_handler = @import("../stream/group_handler.zig");
 const contract_machine = @import("../contract/machine.zig");
 const contract_machines = @import("../contract/machines.zig");
 const repair = @import("repair.zig");
@@ -1940,7 +1943,6 @@ pub const Shard = struct {
         return switch (op) {
             @backingInt(proto.OpCode.queue_dequeue),
             @backingInt(proto.OpCode.stream_group_read),
-            @backingInt(proto.OpCode.stream_group_claim),
             @backingInt(proto.OpCode.action_await),
             => true,
             else => false,
@@ -4650,6 +4652,7 @@ pub const Shard = struct {
         self.namespace_handler.forgetImplicitCreates(self);
         self.actions_handler.stoppedLeading(self);
         self.queue_handler.stoppedLeading(self);
+        group_handler.stoppedLeading(self);
         self.resolvePending(message);
         // Blocking reads that hand out work belong to the leader: a parked
         // dequeue woken here would take a message from this node's copy
@@ -4922,6 +4925,7 @@ pub const Shard = struct {
                             // as the repair wants it.
                             self.answerPending(next_idx, e.header.term, false, &self.last_result);
                             self.queue_handler.skipped(self, &e);
+                            group_handler.skipped(self, &e);
                             continue;
                         }
                         // The leader stamps each entry after the one before it,
@@ -5035,6 +5039,7 @@ pub const Shard = struct {
         self.actions_handler.afterApply(self, entry, result);
         // A dequeue its deliver answers, dequeues woken for messages ready.
         self.queue_handler.afterApply(self, entry, result);
+        group_handler.afterApply(self, entry, result);
         if (comptime build_options.test_faults) {
             const leads = self.raft_node.role == .leader and entry.header.term == self.raft_node.current_term;
             if (leads and @import("test_faults.zig").of(entry) == .panic_leader_step) @panic("test fault: panic in the leader's step after apply");
@@ -5135,7 +5140,7 @@ pub const Shard = struct {
                 const cmd = entry_mod.CommandPayload.deserialize(entry.payload) orelse return;
                 if (cmd.key.len == 0) return;
                 self.waiter_pool.notify(.stream_read, cmd.key, resolveStreamWaiter, @ptrCast(self));
-                self.waiter_pool.notify(.stream_group_read, cmd.key, resolveGroupReadWaiter, @ptrCast(self));
+                group_handler.appended(self, stream_mod.streamKey(cmd.namespace_id, cmd.key));
             },
             else => {},
         }
@@ -5587,14 +5592,11 @@ pub const Shard = struct {
             @ptrCast(self),
         ) catch {};
 
-        // Consumer-group PEL sweeper — runs every 1 second. Makes ready
-        // pending entries idle past their group's ack_timeout_ms and drops
-        // poison entries past max_deliver. Local in-memory PEL mutation only
-        // (PEL is not persisted), so no Raft round-trip.
+        // Consumer-group leases past their deadline, likewise.
         self.task_scheduler.register(
-            "stream_group_sweep",
-            1_000, // check every 1 second
-            streamGroupSweepTask,
+            "group_expire",
+            @import("../queue/handler.zig").DUTY_INTERVAL_MS,
+            groupExpireTask,
             @ptrCast(self),
         ) catch {};
 
@@ -5738,16 +5740,11 @@ pub const Shard = struct {
         return self.queue_handler.expireDue(self);
     }
 
-    /// TaskScheduler callback: sweep every consumer group's PEL.
-    /// Makes entries idle past ack_timeout_ms ready for their group's next
-    /// read and drops ones past max_deliver. Returns how many it changed.
-    fn streamGroupSweepTask(ctx: *anyopaque) u64 {
+    /// TaskScheduler callback: on the leader, end consumer-group leases past
+    /// their deadline. Returns how many deadline keys it named.
+    fn groupExpireTask(ctx: *anyopaque) u64 {
         const self: *Shard = @ptrCast(@alignCast(ctx));
-        const proj = self.stream_handler.stream;
-        const now_ms: u64 = @intCast(@max(0, @import("stdx").time.milliTimestamp()));
-        const r = proj.sweepAllGroups(now_ms);
-        if (r.made_ready > 0) self.waiter_pool.notifyAny(.stream_group_read, wakeGroupReadWaiter, @ptrCast(self));
-        return @as(u64, r.made_ready) + @as(u64, r.dropped);
+        return group_handler.expireDue(self);
     }
 
     // ─── Event processing ────────────────────────────────────────────────
@@ -6910,10 +6907,9 @@ fn handleWaiterTimeout(waiter: *const Waiter, ctx: *anyopaque) void {
             }
         },
         .queue_dequeue => QueueHandler.answerEmpty(shard, waiter.reply_to, waiter.request_id),
-        // stream_read / action_await / stream_group_read → empty OK response
-        .stream_read, .stream_group_read => {
-            shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
-        },
+        .stream_read => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, ""),
+        // A group read that took nothing in its wait.
+        .stream_group_read => shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, &group_handler.EMPTY),
         // Its payloads weren't back from disk in time: retryable, never a
         // short answer that looks complete.
         .stream_disk_read => shard.deliverDeferredRefusal(waiter.reply_to, waiter.request_id, .unavailable, proto.notRun(DISK_READ_LATE)),
@@ -7011,30 +7007,6 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         .stream_messages => |m| shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, m.data),
         else => shard.deliverDeferredError(waiter.reply_to, waiter.request_id, .internal_error, ""),
     }
-    return true;
-}
-
-/// Group read waiter resolver: wake the client so it retries its group read.
-///
-/// Group reads require PEL state management (consumer tracking, ack
-/// deadlines) that only `handleGroupRead` handles correctly, so instead of
-/// duplicating it we send an empty OK response to break the client's
-/// blocking poll; the client retries and gets data through `handleGroupRead`.
-pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
-    const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const last = shard.stream_handler.stream.streamLastId(waiter.stream.stream);
-    if (!last.greaterThan(waiter.stream.after)) return false;
-
-    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
-    return true;
-}
-
-/// A parked group read woken because a pending entry became ready (a nack,
-/// or the sweeper): an empty answer, and the client's next read gets it.
-/// Reads of other groups on the stream wake too, and read again.
-pub fn wakeGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
-    const shard: *Shard = @ptrCast(@alignCast(ctx));
-    shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
     return true;
 }
 
@@ -7629,6 +7601,11 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
     }
     const had = registry.dispatch(entry, out) catch |err| return .{ .applier_failed = err };
     if (!had) return if (listed(&APPLIES_NOTHING, etype)) .applied else .no_applier;
+    // A machine that follows this entry (a group, a trim of its stream),
+    // after its owner, unless the owner refused it.
+    if (out.refused() == null) if (contract_machine.observerOf(machines, etype)) |m| {
+        contract_machine.observeEntry(m, &partition.store, &partition.apply_scratch, .{ .proj = &partition.stream }, entry) catch |err| return .{ .applier_failed = err };
+    };
     return .applied;
 }
 
@@ -10012,14 +9989,21 @@ test "Shard: stream.group.members answers the named group's members by id, and a
     var f: MgetGatherFixture = undefined;
     try f.init(8);
     defer f.deinit();
-    // Each shard holds the group: the request is answered by whichever owns the stream.
+    // Each shard holds the group: the request is answered by whichever owns
+    // the stream. Its members are the consumers holding its records.
     for (&f.two.shards) |*s| {
-        // Keyed by the default namespace's id (1), the stream, then the group.
-        try s.stream_handler.stream.createGroup("\x00\x00\x00\x01s\x00g", 1_000_000);
-        const g = s.stream_handler.stream.getGroup("\x00\x00\x00\x01s\x00g").?;
-        // Joined out of order; listed by id.
-        for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }) |id| _ = try g.join(id, 2_000_000);
-        try s.stream_handler.stream.createGroup("\x00\x00\x00\x01s\x00other", 1_000_000);
+        const p = s.defaultPartition();
+        for (0..4) |i| _ = try p.stream.appendToStreamAt(stream_mod.streamKey(.default, "s"), i + 1, 0, 1, 1, 10);
+        // Delivered out of order; listed by id.
+        for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }, 0..) |id, i| {
+            var pb: [ge_mod.Deliver.max_size]u8 = undefined;
+            const body = try ge_mod.Deliver.encodeInto(&pb, .{ .ns = 1, .stream = "s", .group = "g", .count = 1, .max_bytes = 1 << 20, .holder = id, .lease_ms = 30_000, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES });
+            const e = entry_mod.buildEntry(.group_deliver, entry_mod.Flags.NONE, 1, 100 + i, 2_000_000, body);
+            var out: persistence_mod.Result = .{};
+            out.reset(&e);
+            try contract_machine.applyEntryWith(&@import("../stream/group_machine.zig").machine, &p.store, &p.apply_scratch, .{ .proj = &p.stream }, &e, &out);
+            try std.testing.expect(out.refused() == null);
+        }
     }
     const a = &f.two.shards[0];
     const Members = table_run.op("stream.group.members");
@@ -10333,7 +10317,7 @@ test "Shard: an answer the other shard could not send, a request no slot is left
         try std.testing.expectEqual(s.due_ms, s.answer_due_ms);
         try std.testing.expect(s.writes);
     }
-    for ([_]proto.OpCode{ .queue_dequeue, .stream_group_read, .stream_group_claim, .action_await }) |op| try std.testing.expect(Shard.takesItems(@backingInt(op)));
+    for ([_]proto.OpCode{ .queue_dequeue, .stream_group_read, .action_await }) |op| try std.testing.expect(Shard.takesItems(@backingInt(op)));
     for ([_]proto.OpCode{ .kv_get, .stream_read, .kv_put, .queue_complete }) |op| try std.testing.expect(!Shard.takesItems(@backingInt(op)));
     while (b.drainInbox() > 0) {}
     _ = a.drainInbox();
@@ -11887,10 +11871,10 @@ test "Shard: at boot, shard 0 proposes no id a group entry on another shard name
     const a = &two.shards[0];
     const b = &two.shards[1];
     const lost: u32 = a.namespace_handler.next_id + 7;
-    var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
-    (stream_mod.GroupCommit{ .floor = .{ .timestamp_ms = 0, .sequence = 0 }, .ack_timeout_ms = 30_000, .max_deliver = 5 }).encode(&val);
-    var pbuf: [256]u8 = undefined;
-    var e = entry_mod.buildCommandEntry(.cg_commit, entry_mod.Flags.NONE, 1, 1, 1, .of(lost), "s\x00g", &val, &pbuf).?;
+    // A group read's deliver, made under a published id nothing bound here.
+    var pbuf: [ge_mod.Deliver.max_size]u8 = undefined;
+    const body = try ge_mod.Deliver.encodeInto(&pbuf, .{ .ns = lost, .stream = "s", .group = "g", .count = 1, .max_bytes = 1 << 20, .holder = "c", .lease_ms = 30_000, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = qe_caps.DEFAULT_MAX_MESSAGES, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES });
+    var e = entry_mod.buildEntry(.group_deliver, entry_mod.Flags.NONE, 1, 1, 1, body);
     e.header.crc32c = e.computeCrc();
     var out = persistence_mod.Result{ .index = 1 };
     try std.testing.expect(applyEntryCore(b.defaultPartition(), &b.replay_registry, &e, &out) == .applied);
@@ -14140,7 +14124,26 @@ fn untilServed(c: *ColdStream, conn: *Connection, fd: std.posix.fd_t, buf: []u8,
     return error.NeverServed;
 }
 
-test "Shard: a cold group read and claim deliver and claim only what their reply carries" {
+test "Shard: a group answer tells a record on its way back from disk from one it can't read" {
+    var c: ColdStream = undefined;
+    try c.init(.async_flush, 60, 0, 10);
+    defer c.deinit();
+    var all: [60]stream_mod.StreamRecord = undefined;
+    const name_hash = stream_mod.streamKey(.default, "s");
+    try std.testing.expectEqual(@as(usize, 60), c.shard.stream_handler.stream.readStreamAfter(name_hash, StreamID.MIN, null, &all));
+    // The first is past the hot ring and the warm store; the last is hot;
+    // the third id is no append of the stream.
+    const ids = [_]StreamID{ all[0].id, all[59].id, .{ .timestamp_ms = 1, .sequence = 0 } };
+    var unread: [3]StreamHandler.Unread = undefined;
+    const body = try c.shard.stream_handler.serializeGroupRecords(name_hash, 1, 1, 1, &ids, &.{ 1, 1, 1 }, &unread);
+    defer c.shard.stream_handler.allocator.free(body);
+    try std.testing.expectEqual(StreamHandler.Unread.fetching, unread[0]);
+    try std.testing.expectEqual(StreamHandler.Unread.read, unread[1]);
+    try std.testing.expectEqual(StreamHandler.Unread.lost, unread[2]);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[24..28], .little));
+}
+
+test "Shard: a cold group read delivers only what its reply carries" {
     var c: ColdStream = undefined;
     try c.init(.async_flush, 60, 0, 10);
     defer c.deinit();
@@ -14174,27 +14177,20 @@ test "Shard: a cold group read and claim deliver and claim only what their reply
     while (delivered < 30) : (id += 1) {
         const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_read, id, c1, ob.getOptions());
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
-        const n = std.mem.readInt(u32, r.data[0..4], .little);
+        // [term][index][expires_at_ms][count] then the records.
+        const n = std.mem.readInt(u32, r.data[24..28], .little);
         try std.testing.expect(n > 0 and n < 20);
-        try std.testing.expectEqual(all[delivered].id.sequence, std.mem.readInt(u64, r.data[4..12], .little));
-        try std.testing.expectEqual(all[delivered].id.timestamp_ms, std.mem.readInt(u64, r.data[12..20], .little));
+        try std.testing.expectEqual(all[delivered].id.sequence, std.mem.readInt(u64, r.data[28..36], .little));
+        try std.testing.expectEqual(all[delivered].id.timestamp_ms, std.mem.readInt(u64, r.data[36..44], .little));
         delivered += n;
     }
     try std.testing.expect(!d.cache.contains(all[0].ual_index));
-
-    // c2 claims c1's, cold: only the entries its reply carries are claimed.
-    var claim_buf: [2 + 1 + 2 + 2 + 4 + 8 + 8 + 4]u8 = undefined;
-    @memcpy(claim_buf[0..7], "\x01\x00" ++ "g" ++ "\x02\x00" ++ "c2");
-    @memset(claim_buf[7..27], 0);
-    std.mem.writeInt(u32, claim_buf[27..31], 30, .little);
-    const r = try untilServed(&c, conn, pair[1], &buf, .stream_group_claim, id, &claim_buf, "");
-    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
-    const answered = std.mem.readInt(u32, r.data[0..4], .little);
-    try std.testing.expect(answered > 0 and answered < delivered);
-    var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    const group = stream_mod.groupKey(&qbuf, .default, "s", "g").?;
-    var pending: [64]stream_mod.PendingEntry = undefined;
-    try std.testing.expectEqual(@as(usize, answered), try c.shard.stream_handler.stream.groupPending(group, "c2", &pending));
+    // What was delivered is exactly what replies carried: leased, no more.
+    var mk: [4 + 16]u8 = undefined;
+    const scope = @import("../stream/group_machine.zig").scopeOf(.default, "s", "g");
+    const read: @import("../contract/view.zig").ReadView = .{ .store = &c.shard.defaultPartition().store };
+    const meta = (try read.get(@import("../stream/group_machine.zig").Metas, @import("../stream/group_machine.zig").storeKey(&mk, .default, &scope))).?.v;
+    try std.testing.expectEqual(@as(u64, delivered), meta.leased);
 }
 
 test "Shard: a job on another shard's thread reads cold records by copy, once the owner has fetched them" {
@@ -14609,10 +14605,94 @@ test "Shard: a blocking group read wakes on its own namespace's append, not a sa
 
     shard.runRequest(conn, try ParkTest.request(.stream_append, 3, "app", "s", rec, ""), .client);
     try ParkTest.ack(&shard);
+    // The woken read proposed its deliver; answered when it commits.
+    try ParkTest.ack(&shard);
     var two: [2]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
     try std.testing.expect(two[0].header.request_id == 1 or two[1].header.request_id == 1);
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+}
+
+test "Shard: a group follows its stream's real trim and delete: a deliver after the trim takes only what's left, and after the delete its group is gone" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var rn = try RaftNetwork.init(std.testing.allocator, 1, 0, 9000, .{ 127, 0, 0, 1 }, "s");
+    defer rn.deinit();
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .bootstrap, .{}, .{});
+    defer shard.deinit();
+    shard.raft_network = &rn;
+    shard.wireHandlerShardPtrs();
+    try ParkTest.joinPeer(&shard);
+    // Not the default namespace: a trim names its stream under the entry's id.
+    _ = shard.namespace_handler.applyCreate("app");
+
+    var pair: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[1]);
+    const conn = try shard.addConnection(pair[0]);
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    var id: u64 = 1;
+    inline for (.{ "a", "b", "c" }) |p| {
+        const rec = "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ p ++ "\x00\x00";
+        shard.runRequest(conn, try ParkTest.request(.stream_append, id, "app", "s", rec, ""), .client);
+        id += 1;
+        try ParkTest.ack(&shard);
+        try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    }
+    // c holds "a".
+    var count_buf: [16]u8 = undefined;
+    var count = proto.OptionsBuilder.init(&count_buf);
+    try count.addU32(.count, 10);
+    var first_buf: [16]u8 = undefined;
+    var first = proto.OptionsBuilder.init(&first_buf);
+    try first.addU32(.count, 1);
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, id, "app", "s", group_consumer, first.getOptions()), .client);
+    id += 1;
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, one[0].data[24..28], .little));
+
+    // The stream handler's own trim, keeping one: "a" and "b" go.
+    var trim_buf: [16]u8 = undefined;
+    var trim = proto.OptionsBuilder.init(&trim_buf);
+    try trim.addU64(.limit, 1);
+    shard.runRequest(conn, try ParkTest.request(.stream_trim, id, "app", "s", "", trim.getOptions()), .client);
+    id += 1;
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    const gm = @import("../stream/group_machine.zig");
+    const ns = shard.namespace_handler.idOf("app").?;
+    const sk = gm.streamOf(ns, "s");
+    try std.testing.expect(gm.floorOf(group_handler.streamRecOf(&shard, sk)).eql(shard.stream_handler.stream.streamRemovedThrough(sk)));
+    try std.testing.expect(!gm.floorOf(group_handler.streamRecOf(&shard, sk)).eql(StreamID.MIN));
+
+    // A deliver now takes "c" alone: not "b", which the trim cut.
+    shard.runRequest(conn, try ParkTest.request(.stream_group_read, id, "app", "s", group_consumer, count.getOptions()), .client);
+    id += 1;
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, one[0].data[24..28], .little));
+    // [term][index][expires][count], then [seq:u64][ts:i64][tier:u8]
+    // [partition:u32][key_present:u8][payload_len:u32][payload].
+    const at = 28 + 8 + 8 + 1 + 4 + 1;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, one[0].data[at..][0..4], .little));
+    try std.testing.expectEqualStrings("c", one[0].data[at + 4 ..][0..1]);
+
+    // The handler's own delete, forced: the group's stream moves on a
+    // generation, so the group is gone.
+    var del_buf: [16]u8 = undefined;
+    var del = proto.OptionsBuilder.init(&del_buf);
+    try del.addFlag(.force);
+    shard.runRequest(conn, try ParkTest.request(.stream_delete, id, "app", "s", "", del.getOptions()), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(u64, 1), group_handler.streamRecOf(&shard, sk).gen);
+    try std.testing.expect(group_handler.metaOf(&shard, ns, "s", "g") == null);
 }
 
 test "Shard: a nack wakes a parked group read, and the next read serves the nacked record" {
@@ -14639,9 +14719,17 @@ test "Shard: a nack wakes a parked group read, and the next read serves the nack
     shard.runRequest(conn, try ParkTest.request(.stream_append, 1, "app", "s", rec, ""), .client);
     try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
+    // A read is answered once its deliver commits.
     shard.runRequest(conn, try ParkTest.request(.stream_group_read, 2, "app", "s", group_consumer, ""), .client);
+    try ParkTest.ack(&shard);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "r") != null);
+    const got = one[0].data;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, got[24..28], .little));
+    try std.testing.expect(std.mem.indexOf(u8, got, "r") != null);
+    const term = std.mem.readInt(u64, got[0..8], .little);
+    const index = std.mem.readInt(u64, got[8..16], .little);
+    const seq = std.mem.readInt(u64, got[28..36], .little);
+    const ms = std.mem.readInt(u64, got[36..44], .little);
 
     // Nothing new: the next read parks.
     var ob_buf: [16]u8 = undefined;
@@ -14650,34 +14738,34 @@ test "Shard: a nack wakes a parked group read, and the next read serves the nack
     shard.runRequest(conn, try ParkTest.request(.stream_group_read, 3, "app", "s", group_consumer, ob.getOptions()), .client);
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
 
-    // The consumer nacks what it got: the parked read is woken, empty.
-    var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    const group_key = stream_mod.groupKey(&qbuf, shard.namespaceId("app"), "s", "g").?;
-    var pel: [4]stream_mod.PendingEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try shard.stream_handler.stream.groupPending(group_key, null, &pel));
-    var nack: [64]u8 = undefined;
+    // The consumer nacks what it got, by its delivery: the parked read is
+    // woken, and takes it again.
+    var nack: [128]u8 = undefined;
     @memcpy(nack[0..group_consumer.len], group_consumer);
     var off: usize = group_consumer.len;
-    std.mem.writeInt(u32, nack[off..][0..4], 1, .little);
-    std.mem.writeInt(u64, nack[off + 4 ..][0..8], pel[0].id.timestamp_ms, .little);
-    std.mem.writeInt(u64, nack[off + 12 ..][0..8], pel[0].id.sequence, .little);
-    off += 20;
+    std.mem.writeInt(u64, nack[off..][0..8], term, .little);
+    std.mem.writeInt(u64, nack[off + 8 ..][0..8], index, .little);
+    std.mem.writeInt(u32, nack[off + 16 ..][0..4], 1, .little);
+    std.mem.writeInt(u64, nack[off + 20 ..][0..8], ms, .little);
+    std.mem.writeInt(u64, nack[off + 28 ..][0..8], seq, .little);
+    std.mem.writeInt(u32, nack[off + 36 ..][0..4], 1, .little);
+    off += 40;
     shard.runRequest(conn, try ParkTest.request(.stream_group_nack, 4, "app", "s", nack[0..off], ""), .client);
+    try ParkTest.ack(&shard);
+    try ParkTest.ack(&shard);
     var two: [2]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &two);
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
     for (two) |r| {
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
-        if (r.header.request_id == 3) try std.testing.expectEqual(@as(usize, 0), r.data.len);
+        if (r.header.request_id == 4) try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r.data[0..4], .little));
+        if (r.header.request_id == 3) {
+            // The nacked record, delivered a second time.
+            try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r.data[24..28], .little));
+            try std.testing.expect(std.mem.indexOf(u8, r.data, "r") != null);
+            try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, r.data[r.data.len - 4 ..][0..4], .little));
+        }
     }
-
-    // Read again: the nacked record, delivered a second time.
-    shard.runRequest(conn, try ParkTest.request(.stream_group_read, 5, "app", "s", group_consumer, ""), .client);
-    try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
-    try std.testing.expectEqual(@as(u64, 5), one[0].header.request_id);
-    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "r") != null);
-    try std.testing.expectEqual(@as(usize, 1), try shard.stream_handler.stream.groupPending(group_key, null, &pel));
-    try std.testing.expectEqual(@as(u32, 2), pel[0].delivery_count);
 }
 
 test "Shard: a deferred answer too large to frame reaches its client as an error" {
@@ -21409,6 +21497,52 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
     try std.testing.expectError(error.Halt, contract_machine.applyEntry(&Reader.machine, &shard.defaultPartition().store, &shard.defaultPartition().apply_scratch, &e, &bare));
 }
 
+test "applyEntryCore: a stream's delete reaches its groups after it applies, and not when it is refused" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
+    defer std.testing.allocator.free(v);
+    _ = try persistence_mod.proposeEntry(&shard, .stream_append, entry_mod.Flags.NONE, "", "s", v);
+    try std.testing.expect(shard.applyCommitted());
+
+    const gm = @import("../stream/group_machine.zig");
+    const p = shard.defaultPartition();
+    var index = shard.raft_node.last_applied;
+    var cb: [ge_mod.Create.max_size]u8 = undefined;
+    const create = entry_mod.buildEntry(.group_create, entry_mod.Flags.NONE, shard.raft_node.current_term, index + 1, 1, try ge_mod.Create.encodeInto(&cb, .{ .ns = 1, .stream = "s", .group = "g", .lease_ms = 30_000, .max_attempts = 3 }));
+    index += 1;
+    var out: persistence_mod.Result = .{};
+    out.reset(&create);
+    try std.testing.expect(applyEntryCore(p, &shard.replay_registry, &create, &out) == .applied);
+
+    const hash = stream_mod.streamKey(.default, "s");
+    const genOf = struct {
+        fn f(part: *Partition, h: stream_mod.StreamKey) u64 {
+            var b: [13]u8 = undefined;
+            const got = (@import("../contract/view.zig").ReadView{ .store = &part.store }).get(gm.Streams_, gm.recKey(&b, h)) catch unreachable;
+            return got.?.v.gen;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(u64, 0), genOf(p, hash));
+    // Not empty, not forced: refused, and the group never hears of it.
+    // Forced: applied, and the group's stream moves on a generation.
+    for ([_]u16{ entry_mod.Flags.NONE, entry_mod.Flags.FORCE }, [_]u64{ 0, 1 }) |flags, gen| {
+        var buf: [64]u8 = undefined;
+        const cmd: entry_mod.CommandPayload = .{ .namespace_id = .default, .key_length = 1, .value_length = 0, .key = "s", .value = "" };
+        index += 1;
+        const del = entry_mod.buildEntry(.stream_delete, flags, shard.raft_node.current_term, index, 2, buf[0..cmd.serialize(&buf).?]);
+        out.reset(&del);
+        try std.testing.expect(applyEntryCore(p, &shard.replay_registry, &del, &out) == .applied);
+        try std.testing.expectEqual(flags == entry_mod.Flags.NONE, out.refused() != null);
+        try std.testing.expectEqual(gen, genOf(p, hash));
+    }
+}
+
 test "applyEntryCore: a KV entry delivered twice applies once" {
     var part = try Partition.init(std.testing.allocator, 0, 8192, 0);
     defer part.deinit();
@@ -21535,7 +21669,10 @@ test "Shard: a group read in a namespace never created is refused no_namespace, 
         try std.testing.expectEqual(proto.Ran.no, (try refused.refused()).ran);
     }
     try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
-    try std.testing.expectEqual(@as(usize, 0), shard.defaultPartition().stream.groups.count());
+    {
+        var it = shard.defaultPartition().store.range(@import("../stream/group_machine.zig").Metas.ID, "");
+        try std.testing.expect(it.next() == null);
+    }
     try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
     try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }

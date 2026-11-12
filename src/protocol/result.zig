@@ -103,12 +103,6 @@ pub const CommandResult = union(enum) {
     // Layer 1: Consumer Group Responses
     // =========================================================================
 
-    /// Group join response with assigned partitions
-    group_joined: struct {
-        generation_id: u64,
-        assigned_partitions: []const u32,
-    },
-
     /// Group read response with messages (pre-serialized)
     group_messages: struct {
         /// Pre-serialized wire data

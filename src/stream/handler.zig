@@ -13,18 +13,19 @@
 //!
 //! Stream data entries live in the UAL and are read directly — no materialization
 //! step. The UAL entry IS the stream record. The StreamProjection maintains
-//! per-stream StreamState (StreamID → ual_index) and PEL-based consumer groups.
+//! per-stream StreamState (StreamID → ual_index).
 //!
 //! ## Opcode Ranges
 //!
-//!   Streams:        0x10–0x1F (append, read, trim, info, subscribe, list, create, alter)
-//!   Consumer Groups: 0x20–0x2C (create, join, leave, read, ack, nack, claim, pending, touch, info, delete)
+//!   Streams:         0x130–0x140 (append, read, trim, info, subscribe, list, create, alter, delete)
+//!   Consumer groups: 0x150–0x15E, served by `group_handler.zig`
 //!
 //! ## Data Model
 //!
 //! The StreamProjection tracks per-stream StreamRecord (StreamID → ual_index).
 //! Actual message payloads live in the UAL at the recorded ual_index.
-//! Consumer groups use a Pending Entry List (PEL) for per-message ack tracking.
+//! A consumer group leases each record it delivers until acked; its state
+//! is the group machine's, read from the stream at apply.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -43,6 +44,9 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 const table_run = @import("../node/table_run.zig");
 const stream_ops = @import("../protocol/stream_ops.zig");
+const group_handler = @import("group_handler.zig");
+const group_machine = @import("group_machine.zig");
+const group_entries = @import("../protocol/group_entries.zig");
 const GroupListResponse = table_run.op("stream.group.list").response;
 const GroupMembersResponse = table_run.op("stream.group.members").response;
 
@@ -55,7 +59,6 @@ const time_units = @import("../util/time_units.zig");
 
 pub const TrimBound = stream_mod.TrimBound;
 const StreamRecord = stream_mod.StreamRecord;
-const PendingEntry = stream_mod.PendingEntry;
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
 const OpCode = proto.OpCode;
@@ -121,6 +124,8 @@ pub const StreamHandler = struct {
     err_buf: [128]u8 = undefined,
     /// A group list or members answer, encoded after the handler returns.
     list_buf: ?[]u8 = null,
+    /// Consumer groups' reads in flight and expire duty (`group_handler.zig`).
+    groups: group_handler.Groups,
 
     /// Maximum number of messages in a single read response.
     pub const MAX_READ_BATCH: usize = proto.MAX_STREAM_READ_RECORDS;
@@ -138,11 +143,13 @@ pub const StreamHandler = struct {
             .allocator = allocator,
             .shard_ptr = null,
             .metrics_registry = null,
+            .groups = group_handler.Groups.init(allocator),
         };
     }
 
     pub fn deinit(self: *StreamHandler) void {
         if (self.list_buf) |b| self.allocator.free(b);
+        self.groups.deinit();
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -159,19 +166,17 @@ pub const StreamHandler = struct {
         dispatcher.registerWithRoute(.stream_alter, dispatchStream, preRouteByStream);
         dispatcher.registerWithRoute(.stream_delete, dispatchStream, preRouteByStream);
 
-        // Consumer group operations (0x20–0x2C)
-        dispatcher.registerWithRoute(.stream_group_create, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_join, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_leave, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_read, dispatchGroupRead, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_ack, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_nack, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_delete, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_info, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_pending, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_touch, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_claim, dispatchStream, preRouteByStream);
-        dispatcher.registerWithRoute(.stream_group_configure_sweeper, dispatchStream, preRouteByStream);
+        // Consumer groups, on the group machine (`group_handler.zig`).
+        dispatcher.registerWithRoute(.stream_group_create, group_handler.dispatchCreate, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_delete, group_handler.dispatchDelete, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_read, group_handler.dispatchRead, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_ack, group_handler.dispatchAck, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_nack, group_handler.dispatchNack, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_touch, group_handler.dispatchTouch, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_info, group_handler.dispatchInfo, preRouteByStream);
+        dispatcher.registerWithRoute(.stream_group_pending, group_handler.dispatchPending, preRouteByStream);
+        inline for (.{ OpCode.stream_group_join, OpCode.stream_group_leave, OpCode.stream_group_claim, OpCode.stream_group_configure_sweeper }) |op|
+            dispatcher.registerWithRoute(op, group_handler.dispatchRemoved, preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_list, table_run.handler("stream.group.list", StreamHandler, runGroupList), preRouteByStream);
         dispatcher.registerWithRoute(.stream_group_members, table_run.handler("stream.group.members", StreamHandler, runGroupMembers), preRouteByStream);
     }
@@ -194,24 +199,26 @@ pub const StreamHandler = struct {
         return b;
     }
 
-    /// The stream's groups, a prefix scan of the partition's groups, keyed
-    /// `id ‖ stream ‖ \0 ‖ group` (`stream_mod.groupKey`). Group names hold
-    /// no NUL, so a key whose rest holds one is another stream's.
+    /// The stream's groups, from the group machine's metas: a stream's
+    /// groups' scopes lead with its name hash. A meta of another stream whose
+    /// name hashes the same is passed over.
     fn runGroupList(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(GroupListResponse) {
         const self = shard.stream_handler;
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const prefix = stream_mod.groupKey(&q_buf, req.ns_id, req.key, "") orelse return error.NameTooLong;
+        if (req.key.len > group_entries.StreamName.max_size) return error.NameTooLong;
+        const sk = group_machine.streamOf(req.ns_id, req.key);
+        const hb = sk[4..12];
+        var kb: [12]u8 = undefined;
         // By name, so a list that doesn't fit always shows the same first ones.
-        const Named = struct { name: []const u8, g: *const stream_mod.ConsumerGroup };
+        const Named = struct { name: []const u8, m: group_machine.Meta.Value, scope: group_machine.Scope };
         var found: std.ArrayList(Named) = .empty;
         defer found.deinit(self.allocator);
-        var it = self.stream.groups.iterator();
-        while (it.next()) |e| {
-            const key = e.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            const name = key[prefix.len..];
-            if (std.mem.indexOfScalar(u8, name, 0) != null) continue;
-            try found.append(self.allocator, .{ .name = name, .g = e.value_ptr });
+        const read: @import("../contract/view.zig").ReadView = .{ .store = &self.partition.store };
+        var it = read.range(group_machine.Metas, group_machine.storeKey(&kb, req.ns_id, hb));
+        while (it.next() catch null) |item| {
+            if (!std.mem.eql(u8, item.value.v.stream, req.key)) continue;
+            // A gone group's records are still being cleaned: it isn't listed.
+            if (!group_machine.live(item.value.v, group_handler.streamRecOf(shard, sk))) continue;
+            try found.append(self.allocator, .{ .name = item.value.v.group, .m = item.value.v, .scope = item.key[4..][0..group_machine.SCOPE_LEN].* });
         }
         std.mem.sort(Named, found.items, {}, struct {
             fn lessThan(_: void, a: Named, b: Named) bool {
@@ -221,17 +228,17 @@ pub const StreamHandler = struct {
         var out = stream_ops.Groups.Builder.init(try self.answerBuf());
         var more = false;
         for (found.items) |f| {
-            const name = f.name;
-            const g = f.g;
+            var members: [stream_ops.MAX_MEMBERS]Holder = undefined;
+            const n = holdersOf(read, req.ns_id, f.scope, &members);
             const added = out.add(.{
-                .name = name,
-                .members = @intCast(g.members.count()),
-                .pending = g.pel.count(),
-                .created_at_ms = @intCast(g.created_at_ns / std.time.ns_per_ms),
-                .ack_timeout_ms = g.ack_timeout_ms,
-                .max_deliver = g.max_deliver,
-                .last_delivered_ms = g.last_delivered_id.timestamp_ms,
-                .last_delivered_seq = g.last_delivered_id.sequence,
+                .name = f.name,
+                .members = @intCast(n),
+                .pending = f.m.ready + f.m.leased,
+                .created_at_ms = @intCast(f.m.created_ns / std.time.ns_per_ms),
+                .ack_timeout_ms = @intCast(f.m.lease_ms),
+                .max_deliver = @intCast(@min(f.m.max_attempts, 255)),
+                .last_delivered_ms = f.m.cursor_ms,
+                .last_delivered_seq = f.m.cursor_seq,
             }) catch false;
             if (!added) {
                 more = true;
@@ -241,35 +248,57 @@ pub const StreamHandler = struct {
         return .{ .answer = .{ .groups = out.value(), .more = more } };
     }
 
-    /// A group's members. A group that isn't there is not found.
+    /// A holder of a group's records out now: how many it holds, since
+    /// when, and when it last took one.
+    const Holder = struct { id: []const u8, held: u32, since_ns: u64, last_ns: u64 };
+
+    fn holdersOf(read: @import("../contract/view.zig").ReadView, ns: router.NamespaceId, scope: group_machine.Scope, out: []Holder) usize {
+        var n: usize = 0;
+        var kb: [4 + group_machine.SCOPE_LEN]u8 = undefined;
+        var it = read.range(group_machine.Items, group_machine.storeKey(&kb, ns, &scope));
+        while (it.next() catch null) |item| {
+            const v = item.value.v;
+            if (v.status != .leased) continue;
+            for (out[0..n]) |*h| {
+                if (!std.mem.eql(u8, h.id, v.holder)) continue;
+                h.held += 1;
+                h.since_ns = @min(h.since_ns, v.delivered_ns);
+                h.last_ns = @max(h.last_ns, v.delivered_ns);
+                break;
+            } else {
+                if (n == out.len) continue;
+                out[n] = .{ .id = v.holder, .held = 1, .since_ns = v.delivered_ns, .last_ns = v.delivered_ns };
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// A group's members: the consumers holding its records now. Membership
+    /// isn't logged; a consumer with nothing out isn't one.
     fn runGroupMembers(shard: *Shard, _: *Connection, req: Request, group: []const u8) Error!table_run.Outcome(GroupMembersResponse) {
         const self = shard.stream_handler;
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const key = resolveGroupName(&q_buf, req.ns_id, req.key, group) orelse return error.NameTooLong;
-        const g = self.stream.getGroup(key) orelse
+        if (req.key.len > group_entries.StreamName.max_size or group.len > group_entries.MAX_GROUP_NAME) return error.NameTooLong;
+        _ = group_handler.metaOf(shard, req.ns_id, req.key, group) orelse
             return .{ .refused = .{ .status = .not_found, .refusal = proto.notRun("not found: no such consumer group") } };
+        const read: @import("../contract/view.zig").ReadView = .{ .store = &self.partition.store };
+        var holders: [stream_ops.MAX_MEMBERS]Holder = undefined;
+        const n = holdersOf(read, req.ns_id, group_machine.scopeOf(req.ns_id, req.key, group), &holders);
         // By id, so a list that doesn't fit always shows the same first ones.
-        var sorted: std.ArrayList(*const stream_mod.Member) = .empty;
-        defer sorted.deinit(self.allocator);
-        var it = g.members.valueIterator();
-        while (it.next()) |m| try sorted.append(self.allocator, m);
-        std.mem.sort(*const stream_mod.Member, sorted.items, {}, struct {
-            fn lessThan(_: void, a: *const stream_mod.Member, b: *const stream_mod.Member) bool {
+        std.mem.sort(Holder, holders[0..n], {}, struct {
+            fn lessThan(_: void, a: Holder, b: Holder) bool {
                 return std.mem.order(u8, a.id, b.id) == .lt;
             }
         }.lessThan);
         var out = stream_ops.Members.Builder.init(try self.answerBuf());
         var more = false;
-        for (sorted.items) |m| {
+        for (holders[0..n]) |h| {
             const added = out.add(.{
-                .id = m.id,
-                .state = switch (m.state) {
-                    .active => .active,
-                    .leaving => .leaving,
-                },
-                .pending = m.pending_count,
-                .joined_at_ms = @intCast(m.joined_at_ns / std.time.ns_per_ms),
-                .last_active_ms = if (m.last_active_ms == 0) null else @intCast(m.last_active_ms),
+                .id = h.id,
+                .state = .active,
+                .pending = h.held,
+                .joined_at_ms = @intCast(h.since_ns / std.time.ns_per_ms),
+                .last_active_ms = @intCast(h.last_ns / std.time.ns_per_ms),
             }) catch false;
             if (!added) {
                 more = true;
@@ -313,11 +342,6 @@ pub const StreamHandler = struct {
         const cmd_result = shard.stream_handler.handleCommand(req);
         defer shard.stream_handler.freeResult(cmd_result);
         if (cmd_result == .parked) return parkStream(shard, conn, req, cmd_result.parked);
-
-        // Track namespace data for stream create operations
-        const op: proto.OpCode = @fromBackingInt(@intCast(req.header.op_code));
-        // A nacked entry is ready for the stream's parked group reads.
-        if (op == .stream_group_nack and cmd_result == .ok) shard.waiter_pool.notify(.stream_group_read, req.key, shard_mod.wakeGroupReadWaiter, @ptrCast(shard));
 
         sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
     }
@@ -457,93 +481,17 @@ pub const StreamHandler = struct {
         conn.response_deferred = true;
     }
 
-    /// Dedicated dispatch for stream_group_read — supports blocking via block_ms.
-    ///
-    /// Mirrors `dispatchRead` but for consumer group reads.  When no messages
-    /// are available and `block_ms` is set, registers a waiter that gets woken
-    /// when new data is appended to the stream (see `Shard.resolveGroupReadWaiter`).
-    fn dispatchGroupRead(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: Request) void {
-        const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
-        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-
-        const block_ms = req.getBlockMs();
-
-        if (block_ms) |bms| {
-            // Try reading first — if data exists, return immediately
-            const cmd_result = shard.stream_handler.handleCommand(req);
-
-            switch (cmd_result) {
-                .group_messages => |m| {
-                    // Check if we got any actual messages (count > 0)
-                    if (m.data.len > 4) {
-                        const count = std.mem.readInt(u32, m.data[0..4], .little);
-                        if (count > 0) {
-                            defer shard.stream_handler.freeResult(cmd_result);
-                            sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
-                            return;
-                        }
-                    }
-                    // No data — register a blocking waiter
-                    shard.stream_handler.freeResult(cmd_result);
-                },
-                else => {
-                    // Error or other result — send immediately
-                    defer shard.stream_handler.freeResult(cmd_result);
-                    sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
-                    return;
-                },
-            }
-
-            // Nothing deliverable now: wake when the stream's last id moves
-            // past this one, or when a nack or the sweeper makes a pending
-            // entry ready (`wakeGroupReadWaiter`).
-            // (A wildcard key is already rejected by handleCommand above, so the
-            // key here is always a single concrete stream.)
-            const key = stream_mod.streamKey(req.ns_id, req.key);
-            const registered = shard.waiter_pool.register(.{
-                .kind = .stream_group_read,
-                .reply_to = conn.replyTo(),
-                .request_id = req.header.request_id,
-                .key = req.key,
-                .stream = .{ .stream = key, .after = shard.stream_handler.stream.streamLastId(key) },
-                .timeout_ms = bms,
-            });
-            if (!registered) return shard.refuseWaitersFull(conn, req.header.request_id);
-            conn.response_deferred = true;
-            return;
-        }
-
-        // Non-blocking group read — standard path
-        const cmd_result = shard.stream_handler.handleCommand(req);
-        defer shard.stream_handler.freeResult(cmd_result);
-        sendStreamResponse(shard, conn, req.header.request_id, cmd_result);
-    }
-
     // ── Core Command Logic ──────────────────────────────────────────────
 
-    /// Why a request's stream or group name cannot be used, or null. A
-    /// group's key joins stream and group with a NUL (`stream_mod.groupKey`),
-    /// so a name holding one could spell another stream's group. Names too
-    /// long for a key are refused too. Checked here for every request but
-    /// list, before any key is built.
+    /// Why a request's stream name cannot be used, or null: none, one
+    /// holding a NUL, or one too long for a key. Checked here for every
+    /// request but list, before any key is built.
     fn nameRefusal(op: OpCode, req: Request) ?[]const u8 {
         if (op == .stream_list) return null; // key is a filter, never a name
         if (std.mem.indexOfScalar(u8, req.key, 0) != null) return "stream name must not contain NUL";
         if (req.key.len == 0) return "stream name is required";
         if (req.key.len > ns_keys.MAX_QUALIFIED_KEY) return "stream name too long";
-        if (!isGroupOp(op)) return null;
-        const group = (decodeGroupName(req.value) orelse return null).name;
-        if (std.mem.indexOfScalar(u8, group, 0) != null) return "group name must not contain NUL";
-        var buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        _ = stream_mod.groupKey(&buf, req.ns_id, req.key, group) orelse return "stream + group name too long";
         return null;
-    }
-
-    fn isGroupOp(op: OpCode) bool {
-        return switch (op) {
-            .stream_group_create, .stream_group_join, .stream_group_leave, .stream_group_read, .stream_group_ack, .stream_group_nack, .stream_group_delete, .stream_group_info, .stream_group_pending, .stream_group_touch, .stream_group_claim, .stream_group_configure_sweeper => true,
-            else => false,
-        };
     }
 
     const NAME_TOO_LONG: CommandResult = .{ .err = .{ .code = .invalid_request, .message = "stream name too long" } };
@@ -570,20 +518,6 @@ pub const StreamHandler = struct {
             .stream_create => self.handleCreate(req),
             .stream_alter => self.handleAlter(req),
             .stream_delete => self.handleDelete(req),
-
-            // Consumer group operations
-            .stream_group_create => self.handleGroupCreate(req),
-            .stream_group_join => self.handleGroupJoin(req),
-            .stream_group_leave => self.handleGroupLeave(req),
-            .stream_group_read => self.handleGroupRead(req),
-            .stream_group_ack => self.handleGroupAck(req),
-            .stream_group_nack => self.handleGroupNack(req),
-            .stream_group_delete => self.handleGroupDelete(req),
-            .stream_group_info => self.handleGroupInfo(req),
-            .stream_group_pending => self.handleGroupPending(req),
-            .stream_group_touch => self.handleGroupTouch(req),
-            .stream_group_claim => self.handleGroupClaim(req),
-            .stream_group_configure_sweeper => self.handleGroupConfigureSweeper(req),
 
             else => .{ .err = .{ .code = .invalid_request, .message = "unknown stream opcode" } },
         };
@@ -790,6 +724,23 @@ pub const StreamHandler = struct {
     pub fn beginRead(self: *StreamHandler) void {
         self.held = .no;
         self.served_records = 0;
+    }
+
+    /// How many of a stream's records `ids`, in order, have their payloads
+    /// in hand: held hot, warm or in the disk cache. At the first that isn't,
+    /// its disk read is asked for and the prefix stops; `held` says whether
+    /// it is coming (`pending`) or can't be read now (`blocked`).
+    pub fn prefetch(self: *StreamHandler, ns: router.NamespaceId, stream_name: []const u8, ids: []const StreamID) usize {
+        self.beginRead();
+        const key = stream_mod.streamKey(ns, stream_name);
+        self.disk_window.stream = key;
+        for (ids, 0..) |id, i| {
+            const rec = self.stream.streamAppendOf(key, id) orelse continue;
+            self.disk_window.from = rec.ual_index;
+            self.disk_window.limit = @intCast(ids.len - i);
+            if (self.getPayloadAndTier(rec.ual_index) == null and self.held != .no) return i;
+        }
+        return ids.len;
     }
 
     /// A read response carrying `records`. The caller frees it.
@@ -1140,576 +1091,6 @@ pub const StreamHandler = struct {
         return .{ .age_s = age_s, .count = count, .bytes = bytes };
     }
 
-    // ── GROUP CREATE ────────────────────────────────────────────────────
-
-    fn handleGroupCreate(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group] (binary length-prefixed)
-        const raw_group = (decodeGroupName(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        }).name;
-
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
-
-        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-
-        self.stream.createGroup(group_name, now_ns) catch |err| {
-            return switch (err) {
-                error.AlreadyExists => .{ .err = .{ .code = .already_exists, .message = "consumer group already exists" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "group creation failed" } },
-            };
-        };
-
-        // Apply sweeper config from TLV options the CLI/SDK already sends.
-        applyGroupConfig(self, group_name, req);
-        // The group and its config survive a restart through the log. One
-        // the log never took would vanish on restart and never reach a
-        // follower: not created, then.
-        const result = self.groupCommitResult(group_name, true);
-        if (result == .err) _ = self.stream.deleteGroup(group_name);
-        return result;
-    }
-
-    // ── GROUP CONFIGURE SWEEPER ─────────────────────────────────────────
-
-    /// Update a group's ack_timeout_ms / max_deliver at runtime.
-    /// Wire value: [group_len:u16][group]; config carried as TLV options
-    /// (ack_timeout_ms = 0x30, max_deliver = 0x31). A missing option leaves
-    /// that field unchanged.
-    fn handleGroupConfigureSweeper(self: *StreamHandler, req: Request) CommandResult {
-        const decoded = decodeGroupName(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
-
-        const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
-        const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
-
-        const before = self.stream.getGroup(group_name) orelse return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-        const was_timeout = before.ack_timeout_ms;
-        const was_max = before.max_deliver;
-        self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        // A config the log never took is a config the group does not have.
-        const result = self.groupCommitResult(group_name, true);
-        if (result == .err) self.stream.configureGroup(group_name, was_timeout, was_max) catch {};
-        return result;
-    }
-
-    // ── GROUP DELETE ────────────────────────────────────────────────────
-
-    fn handleGroupDelete(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group]
-        const decoded = decodeGroupName(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
-
-        if (self.stream.getGroup(group_name) == null) {
-            return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-        }
-        if (self.shard_ptr) |sptr| {
-            const proposed = proposeGroupEntry(shardFromPtr(sptr), .cg_delete, group_name, "") catch |err| {
-                return .{ .err = persistence_mod.failureError(err, "group delete not persisted") };
-            };
-            return .{ .parked = proposed };
-        }
-        _ = self.stream.deleteGroup(group_name);
-        return .ok;
-    }
-
-    // ── GROUP JOIN ──────────────────────────────────────────────────────
-
-    fn handleGroupJoin(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
-        const pair = decodeGroupConsumer(req) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
-        const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
-        const now_ns = @as(u64, @intCast(@import("stdx").time.milliTimestamp())) * 1_000_000;
-
-        // Auto-create group if it doesn't exist
-        self.stream.createGroup(group_name, now_ns) catch |err| {
-            if (err != error.AlreadyExists) {
-                return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
-            }
-        };
-
-        _ = self.stream.joinGroup(group_name, member_id, now_ns) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "group join failed" } },
-            };
-        };
-
-        return .{
-            .group_joined = .{
-                .generation_id = 1, // Placeholder — real gen ID from rebalance
-                .assigned_partitions = &[_]u32{0}, // Single partition for now
-            },
-        };
-    }
-
-    // ── GROUP LEAVE ─────────────────────────────────────────────────────
-
-    fn handleGroupLeave(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
-        const pair = decodeGroupConsumer(req) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
-        const member_id = if (pair.consumer.len > 0) pair.consumer else "default";
-
-        _ = self.stream.leaveGroup(group_name, member_id) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        return .ok;
-    }
-
-    // ── GROUP READ ──────────────────────────────────────────────────────
-
-    fn handleGroupRead(self: *StreamHandler, req: Request) CommandResult {
-        // Consumer groups are per-stream: a wildcard/fan-in key is rejected.
-        // Use one stream (e.g. an `all-events` stream + a JSON type discriminator
-        // and processing-based routing) instead of `events.*`.
-        if (req.key.len > 0 and req.key[req.key.len - 1] == '*') {
-            return .{ .err = .{ .code = .invalid_request, .message = "wildcard group reads are no longer supported; target a single stream" } };
-        }
-
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
-        const pair = decodeGroupConsumer(req) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        // A namespace never created holds no stream to read, and has no id
-        // to log a group under: an empty read, and no group.
-        if (req.ns_id == .invalid) {
-            const empty = self.serializeStreamRecordsWithPayloads(&.{}, StreamID.MIN, null) catch
-                return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
-            return .{ .group_messages = .{ .data = empty } };
-        }
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, pair.group) orelse return NAME_TOO_LONG;
-        const consumer_id = if (pair.consumer.len > 0) pair.consumer else "default";
-
-        // The first read of a group creates it, and joins the consumer.
-        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-        const now_ns = now_ms * 1_000_000;
-        if (self.stream.createGroup(group_name, now_ns)) {
-            // The group survives a restart through the log, as a created
-            // one does. The read doesn't wait for the entry: a crash before
-            // it commits loses a group that has acked nothing, and its
-            // records are delivered again.
-            const logged = self.groupCommitResult(group_name, true);
-            if (logged == .err) {
-                _ = self.stream.deleteGroup(group_name);
-                return logged;
-            }
-        } else |err| if (err != error.AlreadyExists) {
-            return .{ .err = .{ .code = .internal_error, .message = "group creation failed" } };
-        }
-        _ = self.stream.joinGroup(group_name, consumer_id, now_ns) catch {};
-
-        const capped: usize = readLimit(req);
-
-        const key = stream_mod.streamKey(req.ns_id, req.key);
-
-        // Ready pending entries (nacked, or idle past the ack timeout) come
-        // first, then new records past the cursor. The reply is built before
-        // the pending list changes, so a reply that can't be built leaves
-        // everything for the next read.
-        var ready_ids: [MAX_READ_BATCH]StreamID = undefined;
-        const ready_n = self.stream.groupPeekReady(group_name, ready_ids[0..capped]) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-        var buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const found = self.stream.readStreamByIds(key, ready_ids[0..ready_n], buf[0..ready_n]);
-        // Found records keep the ids' order; the ids without one were trimmed.
-        var gone: [MAX_READ_BATCH]StreamID = undefined;
-        var gone_n: usize = 0;
-        var j: usize = 0;
-        for (ready_ids[0..ready_n]) |id| {
-            if (j < found and buf[j].id.eql(id)) {
-                j += 1;
-            } else {
-                gone[gone_n] = id;
-                gone_n += 1;
-            }
-        }
-        const fresh = self.stream.groupPeek(group_name, key, capped - found, buf[found..capped]) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-        const count = found + fresh;
-        // A group's cursor passes whole appends, so nothing is left out.
-        var readable: [MAX_READ_BATCH]bool = undefined;
-        self.beginRead();
-        self.disk_window.stream = key;
-        const data = self.serializeStreamRecordsWithPayloads(buf[0..count], StreamID.MIN, readable[0..count]) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "group read serialization failed" } };
-        };
-        // The reply stops before a record being read back from disk: only
-        // what it carries is delivered, and the rest waits. With none of it
-        // held, the reader retries: a group read's state can't be held as a
-        // plain read is, and the retry finds the payloads landed.
-        const answered = self.served_records;
-        if (answered == 0 and self.held != .no) {
-            self.allocator.free(data);
-            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
-        }
-        // Only appends the reply carries are delivered; the cursor passes the
-        // rest too, or the next read would meet them again.
-        // A ready entry whose payload can't be read can never be sent:
-        // dropped with the trimmed ones, or it would lead every read.
-        var served: [MAX_READ_BATCH]StreamID = undefined;
-        var served_n: usize = 0;
-        const ready_end = @min(found, answered);
-        for (buf[0..ready_end], readable[0..ready_end]) |rec, ok| {
-            if (ok) {
-                served[served_n] = rec.id;
-                served_n += 1;
-            } else {
-                gone[gone_n] = rec.id;
-                gone_n += 1;
-            }
-        }
-        var sent: [MAX_READ_BATCH]StreamRecord = undefined;
-        var sent_n: usize = 0;
-        const fresh_end = @max(found, answered);
-        for (buf[found..fresh_end], readable[found..fresh_end]) |rec, ok| if (ok) {
-            sent[sent_n] = rec;
-            sent_n += 1;
-        };
-        self.stream.groupServeReady(group_name, consumer_id, served[0..served_n], gone[0..gone_n], now_ms) catch |err| {
-            self.allocator.free(data);
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-        // The cursor passes what the reply covered, not what waits on disk.
-        const through = if (fresh_end > found) stream_mod.lastRecordOf(buf[fresh_end - 1]) else StreamID.MIN;
-        self.stream.groupDeliverRecords(group_name, consumer_id, sent[0..sent_n], through, now_ms) catch |err| {
-            self.allocator.free(data);
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-                else => .{ .err = .{ .code = .internal_error, .message = "group deliver failed" } },
-            };
-        };
-
-        return .{ .group_messages = .{ .data = data } };
-    }
-
-    // ── GROUP ACK ───────────────────────────────────────────────────────
-
-    fn handleGroupAck(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-        var reader = WireReader.init(req.value);
-        const raw_group = reader.readLengthPrefixed(u16) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        _ = reader.readLengthPrefixed(u16); // consumer
-
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
-
-        // Read StreamID array
-        var ids: [MAX_READ_BATCH]StreamID = undefined;
-        var id_count: usize = 0;
-        if (reader.readU32()) |count| {
-            for (0..count) |_| {
-                const ts = reader.readU64() orelse break;
-                const seq = reader.readU64() orelse break;
-                if (id_count < MAX_READ_BATCH) {
-                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
-                    id_count += 1;
-                }
-            }
-        }
-
-        if (id_count == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "stream IDs required for ack" } };
-        }
-
-        if (group_name.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        }
-
-        _ = self.stream.groupAck(group_name, ids[0..id_count]) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        // The advanced ack floor survives a restart through the log,
-        // debounced to floor advances so out-of-order acks do not each
-        // write an entry.
-        return self.groupCommitResult(group_name, false);
-    }
-
-    // ── GROUP NACK ──────────────────────────────────────────────────────
-
-    fn handleGroupNack(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-        var reader = WireReader.init(req.value);
-        const raw_group = reader.readLengthPrefixed(u16) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        _ = reader.readLengthPrefixed(u16); // consumer
-
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
-
-        // Read StreamIDs to NACK
-        var ids: [MAX_READ_BATCH]StreamID = undefined;
-        var id_count: usize = 0;
-        if (reader.readU32()) |count| {
-            for (0..count) |_| {
-                const ts = reader.readU64() orelse break;
-                const seq = reader.readU64() orelse break;
-                if (id_count < MAX_READ_BATCH) {
-                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
-                    id_count += 1;
-                }
-            }
-        }
-
-        if (group_name.len == 0) {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        }
-
-        if (id_count > 0) {
-            _ = self.stream.groupNack(group_name, ids[0..id_count]) catch |err| {
-                return switch (err) {
-                    error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-                };
-            };
-        } else {
-            if (self.stream.getGroup(group_name) == null) {
-                return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-            }
-        }
-
-        return .ok;
-    }
-
-    // ── GROUP INFO ──────────────────────────────────────────────────────
-
-    fn handleGroupInfo(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group] (same as pending/delete)
-        const decoded = decodeGroupName(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
-
-        const group = self.stream.getGroup(group_name) orelse {
-            return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-        };
-
-        // Serialize group info with PEL count
-        const data = serializeGroupInfo(self.allocator, group) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "group info serialization failed" } };
-        };
-
-        return .{ .group_pending = .{ .data = data } };
-    }
-
-    // ── GROUP PENDING ───────────────────────────────────────────────────
-
-    fn handleGroupPending(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group]  (consumer filter optional)
-        //   [group_len:u16][group][consumer_len:u16][consumer]
-        // The second length-prefixed field is optional; when present, the PEL
-        // is filtered to entries owned by that consumer. Old clients sending
-        // just [group_len][group] keep the previous unfiltered behavior.
-        var reader = WireReader.init(req.value);
-        const decoded = decodeGroupName(req.value) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, decoded.name) orelse return NAME_TOO_LONG;
-
-        // Optional consumer filter.
-        var consumer_filter: ?[]const u8 = null;
-        _ = reader.readLengthPrefixed(u16); // skip group (already decoded)
-        if (reader.readLengthPrefixed(u16)) |c| {
-            if (c.len > 0) consumer_filter = c;
-        }
-
-        // Get actual PEL entries
-        var pel_buf: [MAX_READ_BATCH]PendingEntry = undefined;
-        const count = self.stream.groupPending(group_name, consumer_filter, &pel_buf) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        // Serialize PEL entries
-        // Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])*
-        const data = serializePendingEntries(self.allocator, pel_buf[0..count]) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "pending serialization failed" } };
-        };
-
-        return .{ .group_pending = .{ .data = data } };
-    }
-
-    // ── GROUP CLAIM ─────────────────────────────────────────────────────
-
-    /// Cursor-based PEL claim. Scans the group's pending entry list
-    /// from `start_id` in StreamID order, claims up to `count` entries whose
-    /// idle time ≥ `min_idle_ms` for `consumer`, and returns the full records
-    /// (payload + headers) plus a trailing 16-byte next-cursor.
-    ///
-    /// Wire (value):
-    ///   [group_len:u16][group]
-    ///   [consumer_len:u16][consumer]
-    ///   [min_idle_ms:u32]
-    ///   [start_id_ts:u64][start_id_seq:u64]
-    ///   [count:u32]
-    ///
-    /// Response (group_messages.data):
-    ///   <serializeStreamRecordsWithPayloads blob>
-    ///   [next_cursor_ts:u64][next_cursor_seq:u64]   ← 16-byte trailer
-    ///
-    /// `next_cursor == StreamID.MAX (max,max)` means the PEL has been fully
-    /// scanned. The SDK loops, feeding next_cursor back as start_id, until the
-    /// response carries zero records or the MAX sentinel.
-    ///
-    /// Drain-own-pending (reconnect) is `consumer = me`, `min_idle_ms = 0`,
-    /// `start_id = MIN`. Steal-from-idle (rebalance) is `min_idle_ms > 0`.
-    fn handleGroupClaim(self: *StreamHandler, req: Request) CommandResult {
-        var reader = WireReader.init(req.value);
-        const raw_group = reader.readLengthPrefixed(u16) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-        const consumer_raw = reader.readLengthPrefixed(u16) orelse "";
-        const min_idle_ms: u64 = reader.readU32() orelse 0;
-        const start_ts = reader.readU64() orelse 0;
-        const start_seq = reader.readU64() orelse 0;
-        const count: u32 = reader.readU32() orelse DEFAULT_READ_BATCH;
-
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
-        const consumer_id = if (consumer_raw.len > 0) consumer_raw else "default";
-
-        const start_id = StreamID{ .timestamp_ms = start_ts, .sequence = start_seq };
-        const capped = @min(@as(usize, count), MAX_READ_BATCH);
-        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-
-        // A page of PEL entries → IDs + next cursor, claimed below only as
-        // far as the reply carries them.
-        var id_buf: [MAX_READ_BATCH]StreamID = undefined;
-        const claim_res = self.stream.groupPeekClaim(group_name, consumer_id, min_idle_ms, now_ms, start_id, capped, id_buf[0..capped]) catch |err| {
-            return switch (err) {
-                error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-            };
-        };
-
-        // Resolve claimed IDs → full records (payload + headers) in one hop.
-        const key = stream_mod.streamKey(req.ns_id, req.key);
-        var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
-        const rec_count = self.stream.readStreamByIds(key, id_buf[0..claim_res.count], rec_buf[0..claim_res.count]);
-
-        self.beginRead();
-        self.disk_window.stream = key;
-        const records_blob = self.serializeStreamRecordsWithPayloads(rec_buf[0..rec_count], StreamID.MIN, null) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "claim serialization failed" } };
-        };
-        // Stopped before a record being read back from disk: the entries from
-        // it on are not claimed, and the cursor resumes there. With none of
-        // the page held, the claimer retries.
-        const answered = self.served_records;
-        if (answered == 0 and self.held != .no) {
-            self.allocator.free(records_blob);
-            return .{ .err = .{ .code = .unavailable, .message = self.diskRefusal(), .ran = .no } };
-        }
-        var claimed: usize = claim_res.count;
-        var next_cursor = claim_res.next_cursor;
-        if (answered < rec_count) {
-            const cut = rec_buf[answered].id.order();
-            claimed = 0;
-            while (claimed < claim_res.count and id_buf[claimed].order() < cut) claimed += 1;
-            next_cursor = rec_buf[answered].id;
-        }
-        self.stream.groupClaimIds(group_name, id_buf[0..claimed], consumer_id, now_ms) catch {};
-
-        // Append the 16-byte next-cursor to the records blob.
-        const data = self.allocator.alloc(u8, records_blob.len + 16) catch {
-            self.allocator.free(records_blob);
-            return .{ .err = .{ .code = .internal_error, .message = "claim alloc failed" } };
-        };
-        @memcpy(data[0..records_blob.len], records_blob);
-        self.allocator.free(records_blob);
-        std.mem.writeInt(u64, data[records_blob.len..][0..8], next_cursor.timestamp_ms, .little);
-        std.mem.writeInt(u64, data[records_blob.len + 8 ..][0..8], next_cursor.sequence, .little);
-
-        return .{ .group_messages = .{ .data = data } };
-    }
-
-    // ── GROUP TOUCH ─────────────────────────────────────────────────────
-
-    fn handleGroupTouch(self: *StreamHandler, req: Request) CommandResult {
-        // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-        var reader = WireReader.init(req.value);
-        const raw_group = reader.readLengthPrefixed(u16) orelse {
-            return .{ .err = .{ .code = .invalid_request, .message = "group name is required" } };
-        };
-
-        var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-        const group_name = resolveGroupName(&q_buf, req.ns_id, req.key, raw_group) orelse return NAME_TOO_LONG;
-        const consumer = reader.readLengthPrefixed(u16) orelse "";
-
-        // Read StreamIDs to touch
-        var ids: [MAX_READ_BATCH]StreamID = undefined;
-        var id_count: usize = 0;
-        if (reader.readU32()) |count| {
-            for (0..count) |_| {
-                const ts = reader.readU64() orelse break;
-                const seq = reader.readU64() orelse break;
-                if (id_count < MAX_READ_BATCH) {
-                    ids[id_count] = .{ .timestamp_ms = ts, .sequence = seq };
-                    id_count += 1;
-                }
-            }
-        }
-
-        const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
-        var touched_count: u32 = 0;
-        if (id_count > 0) {
-            touched_count = self.stream.groupTouch(group_name, ids[0..id_count], consumer, now_ms) catch |err| {
-                return switch (err) {
-                    error.GroupNotFound => .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } },
-                };
-            };
-        } else {
-            if (self.stream.getGroup(group_name) == null) {
-                return .{ .err = .{ .code = .group_not_found, .message = "consumer group not found" } };
-            }
-        }
-
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, touched_count, .little);
-        const data = self.allocator.alloc(u8, 4) catch {
-            return .{ .err = .{ .code = .internal_error, .message = "alloc failed" } };
-        };
-        @memcpy(data, &buf);
-        return .{ .group_pending = .{ .data = data } };
-    }
-
     // ── Helpers ─────────────────────────────────────────────────────────
 
     /// An append a read can't return: counted and logged once.
@@ -1848,6 +1229,88 @@ pub const StreamHandler = struct {
         }
         std.debug.assert(pos == total);
 
+        return buf;
+    }
+
+    /// A group read's answer: `[term:u64][index:u64][expires_at_ms:i64]`
+    /// Why a group read's answer left a record out.
+    pub const Unread = enum(u8) {
+        read,
+        /// Its payload is on its way back from disk: no fault of the record.
+        fetching,
+        /// Its payload is gone or malformed: it can't be read again.
+        lost,
+    };
+
+    /// `[count:u32]`, then each record in the order its deliver took them, as
+    /// a stream read gives it, followed by its `[deliveries:u32]`. A record
+    /// whose payload can't be read now is left out, and `unread` says why.
+    pub fn serializeGroupRecords(self: *StreamHandler, key: StreamKey, term: u64, index: u64, expires_at_ms: i64, records: []const StreamID, deliveries: []const u32, unread: []Unread) ![]u8 {
+        const key_size: usize = 1;
+        const Found = struct { rec: StreamRecord, br: stream_mod.BatchRecord, tier: proto.StorageTier };
+        const found = try self.allocator.alloc(?Found, records.len);
+        defer self.allocator.free(found);
+        var total: usize = group_handler.READ_FIXED;
+        var count: u32 = 0;
+        for (records, found, 0..) |id, *f, i| {
+            f.* = null;
+            unread[i] = .lost;
+            const rec = self.stream.streamAppendOf(key, id) orelse continue;
+            // Asked of the disk now, or waiting on it: on its way back.
+            const before = self.held;
+            self.held = .no;
+            const got = self.getPayloadAndTier(rec.ual_index);
+            const fetching = self.held != .no;
+            if (before == .pending or (before == .blocked and self.held == .no)) self.held = before;
+            const r = got orelse {
+                if (fetching) unread[i] = .fetching else self.noteUnreadable(rec);
+                continue;
+            };
+            var it = stream_mod.BatchIterator.init(r.payload) catch {
+                self.noteUnreadable(rec);
+                continue;
+            };
+            var j: u64 = 0;
+            const want = id.sequence - rec.id.sequence;
+            while (it.next()) |br| : (j += 1) if (j == want) {
+                f.* = .{ .rec = rec, .br = br, .tier = r.tier };
+                break;
+            };
+            const g = f.* orelse continue;
+            unread[i] = .read;
+            total += 8 + 8 + 1 + 4 + key_size + 4 + g.br.payload.len + 4 + responseHeaderSize(g.br.header_count, g.br.headers_raw.len) + 4;
+            count += 1;
+        }
+        const buf = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(buf);
+        std.mem.writeInt(u64, buf[0..8], term, .little);
+        std.mem.writeInt(u64, buf[8..16], index, .little);
+        std.mem.writeInt(i64, buf[16..24], if (count == 0) 0 else expires_at_ms, .little);
+        std.mem.writeInt(u32, buf[24..28], count, .little);
+        var pos: usize = group_handler.READ_FIXED;
+        for (records, found, deliveries) |id, f, d| {
+            const g = f orelse continue;
+            std.mem.writeInt(u64, buf[pos..][0..8], id.sequence, .little);
+            pos += 8;
+            std.mem.writeInt(i64, buf[pos..][0..8], @as(i64, @intCast(id.timestamp_ms)), .little);
+            pos += 8;
+            buf[pos] = @backingInt(g.tier);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], g.rec.partition_index, .little);
+            pos += 4;
+            buf[pos] = 0; // key_present
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(g.br.payload.len), .little);
+            pos += 4;
+            @memcpy(buf[pos .. pos + g.br.payload.len], g.br.payload);
+            pos += g.br.payload.len;
+            std.mem.writeInt(u32, buf[pos..][0..4], g.br.header_count, .little);
+            pos += 4;
+            if (g.br.header_count > 0) pos = writeResponseHeaders(g.br.headers_raw, g.br.header_count, buf, pos);
+            std.mem.writeInt(u32, buf[pos..][0..4], d, .little);
+            pos += 4;
+        }
+        std.debug.assert(pos == total);
         return buf;
     }
 
@@ -2144,8 +1607,6 @@ pub const StreamHandler = struct {
         registry.register(.stream_trim, @ptrCast(self), replayEntry);
         registry.register(.stream_delete, @ptrCast(self), replayEntry);
         registry.register(.stream_config, @ptrCast(self), replayEntry);
-        registry.register(.cg_commit, @ptrCast(self), replayEntry);
-        registry.register(.cg_delete, @ptrCast(self), replayEntry);
     }
 
     /// The stream applier: offset tracking, name registration, trims, deletes
@@ -2193,7 +1654,7 @@ pub const StreamHandler = struct {
                 out.putInt(u64, id.timestamp_ms);
             },
             .stream_trim => {
-                if (cmd.value.len < 8) return error.Halt;
+                if (cmd.value.len != 8) return error.Halt;
                 var key: StreamKey = undefined;
                 key[0..4].* = cmd.namespace_id.bytes();
                 key[4..12].* = cmd.value[0..8].*;
@@ -2230,27 +1691,6 @@ pub const StreamHandler = struct {
                     return;
                 }
                 _ = self.stream.deleteStream(key, name_key);
-            },
-            // Consumer-group durability: cg_commit carries a group's
-            // ack-floor cursor + sweeper config; cg_delete removes the group. The
-            // CommandPayload key is `stream\x00group`, in the entry's
-            // namespace (`proposeGroupEntry`). Cursor advance is monotonic (see
-            // StreamProjection.applyCommit), so this is safe to run on the
-            // originating leader as well as on followers/replay.
-            .cg_commit => {
-                if (cmd.key.len == 0) return error.Halt;
-                const commit = stream_mod.GroupCommit.decode(cmd.value) orelse return error.Halt;
-                var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                const group = stream_mod.nameKey(&key_buf, cmd.namespace_id, cmd.key) orelse return error.Halt;
-                self.stream.applyCommit(group, commit, entry.header.timestamp_ns) catch |err| {
-                    log.err("consumer group '{s}': commit at index {d} not applied: {s}", .{ cmd.key, entry.header.index, @errorName(err) });
-                    return if (err == error.OutOfMemory) error.OutOfMemory else error.Halt;
-                };
-            },
-            .cg_delete => {
-                if (cmd.key.len == 0) return error.Halt;
-                var key_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-                _ = self.stream.deleteGroup(stream_mod.nameKey(&key_buf, cmd.namespace_id, cmd.key) orelse return error.Halt);
             },
             else => return error.Halt,
         }
@@ -2313,91 +1753,7 @@ pub const StreamHandler = struct {
     fn shardFromPtr(ptr: *anyopaque) *Shard {
         return @ptrCast(@alignCast(ptr));
     }
-
-    /// A group's durable state — ack-floor cursor and sweeper config — as
-    /// a `cg_commit` entry the client is parked on. `force` = false
-    /// debounces to floor advances (the ack hot path): acking entries
-    /// above a still-pending low entry moves no floor, so no entry is
-    /// written and the answer is immediate. `force` = true always writes,
-    /// for create and configure, where the config is what changed. The
-    /// floor counts as committed once the entry applies; until then an ack
-    /// writes the same floor again.
-    fn groupCommitResult(self: *StreamHandler, group_name: []const u8, force: bool) CommandResult {
-        const sptr = self.shard_ptr orelse return .ok;
-        const group = self.stream.getGroup(group_name) orelse return .ok;
-        const floor = group.ackFloor();
-        if (!force and !floor.greaterThan(group.last_committed_floor)) return .ok;
-
-        const commit = stream_mod.GroupCommit{
-            .floor = floor,
-            .ack_timeout_ms = group.ack_timeout_ms,
-            .max_deliver = group.max_deliver,
-        };
-        var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
-        commit.encode(&val);
-
-        const proposed = proposeGroupEntry(shardFromPtr(sptr), .cg_commit, group_name, &val) catch |err| {
-            return .{ .err = persistence_mod.failureError(err, "group state not persisted") };
-        };
-        return .{ .parked = proposed };
-    }
 };
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Wire Decode Helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// A group name decoded from its wire format.
-const GroupDecode = struct {
-    name: []const u8,
-};
-
-/// Result from group+consumer pair decoding.
-const GroupConsumerDecode = struct {
-    group: []const u8,
-    consumer: []const u8,
-};
-
-/// Decode a group name from wire format: [group_len:u16][group]
-fn decodeGroupName(value: []const u8) ?GroupDecode {
-    var reader = WireReader.init(value);
-    const name = reader.readLengthPrefixed(u16) orelse return null;
-    return if (name.len > 0) .{ .name = name } else null;
-}
-
-/// Decode group + consumer pair from wire format.
-/// Wire: [group_len:u16][group][consumer_len:u16][consumer], or the group alone.
-fn decodeGroupConsumer(req: Request) ?GroupConsumerDecode {
-    var reader = WireReader.init(req.value);
-    if (reader.readPair(u16, u16)) |pair| {
-        if (pair.key.len > 0) return .{ .group = pair.key, .consumer = pair.value };
-    }
-    const name = (decodeGroupName(req.value) orelse return null).name;
-    return .{ .group = name, .consumer = "" };
-}
-
-/// Apply ack_timeout_ms / max_deliver TLV options (if present) to a group's
-/// in-memory sweeper config. Silently ignores a missing group (the caller
-/// just created it) and absent options.
-fn applyGroupConfig(self: *StreamHandler, group_name: []const u8, req: Request) void {
-    const ack_timeout: ?u32 = if (req.findOption(.ack_timeout_ms)) |o| o.asU32() else null;
-    const max_deliver: ?u8 = if (req.findOption(.max_deliver)) |o| o.asU8() else null;
-    if (ack_timeout == null and max_deliver == null) return;
-    self.stream.configureGroup(group_name, ack_timeout, max_deliver) catch {};
-}
-
-/// Resolve a group name to its per-(stream, group) key in the request's
-/// namespace (`stream_mod.groupKey`). A consumer group is scoped to a single
-/// stream, so the cursor/PEL never span streams.
-fn resolveGroupName(buf: *[stream_mod.MAX_NAME_KEY]u8, ns: router.NamespaceId, stream: []const u8, raw_name: []const u8) ?[]const u8 {
-    return stream_mod.groupKey(buf, ns, stream, raw_name);
-}
-
-/// A cg_commit or cg_delete for the group `group_key` names: stamped with
-/// the group's namespace, keyed by the rest of its key.
-fn proposeGroupEntry(shard: *Shard, entry_type: EntryType, group_key: []const u8, value: []const u8) !persistence_mod.ProposeResult {
-    return persistence_mod.proposeEntryIn(shard, entry_type, entry_mod.Flags.NONE, stream_mod.keyNamespace(group_key), group_key[4..], value);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Response Serialization — CommandResult → Wire Response
@@ -2457,20 +1813,6 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
             std.mem.writeInt(u64, buf[8..16], t.first_seq, .little);
             shard.sendOkResponse(conn, request_id, &buf);
         },
-        .group_joined => |j| {
-            // Serialize: [generation_id:u64][partition_count:u32][partition:u32]*
-            const part_count: u32 = @intCast(j.assigned_partitions.len);
-            var buf: [256]u8 = undefined;
-            std.mem.writeInt(u64, buf[0..8], j.generation_id, .little);
-            std.mem.writeInt(u32, buf[8..12], part_count, .little);
-            var off: usize = 12;
-            for (j.assigned_partitions) |p| {
-                if (off + 4 > buf.len) break;
-                std.mem.writeInt(u32, buf[off..][0..4], p, .little);
-                off += 4;
-            }
-            shard.sendOkResponse(conn, request_id, buf[0..off]);
-        },
         .group_messages => |m| {
             shard.sendOkResponse(conn, request_id, m.data);
         },
@@ -2487,74 +1829,11 @@ fn sendStreamResponse(shard: *Shard, conn: *Connection, request_id: u64, cmd_res
 // Serialization
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Serialize consumer group info.
-/// Wire format: [pel_count:u64][member_count:u32][created_at_ns:u64]
-fn serializeGroupInfo(allocator: Allocator, group: *stream_mod.ConsumerGroup) ![]u8 {
-    const total: usize = 8 + 4 + 8; // pel_count + member_count + created_at_ns
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    var offset: usize = 0;
-
-    std.mem.writeInt(u64, buf[offset..][0..8], @intCast(group.pelCount()), .little);
-    offset += 8;
-
-    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(group.memberCount()), .little);
-    offset += 4;
-
-    std.mem.writeInt(u64, buf[offset..][0..8], group.created_at_ns, .little);
-
-    return buf;
-}
-
-/// Serialize PEL entries from groupPending().
-/// Wire format: [count:u32]([timestamp_ms:u64][sequence:u64][delivery_count:u32][consumer_len:u16][consumer])*
-fn serializePendingEntries(allocator: Allocator, entries: []const PendingEntry) ![]u8 {
-    var total: usize = 4; // count header
-    for (entries) |e| {
-        total += 8 + 8 + 4 + 2 + e.consumer.len; // ts + seq + delivery_count + consumer_len + consumer
-    }
-
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    var pos: usize = 0;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entries.len), .little);
-    pos += 4;
-
-    for (entries) |e| {
-        std.mem.writeInt(u64, buf[pos..][0..8], e.id.timestamp_ms, .little);
-        pos += 8;
-        std.mem.writeInt(u64, buf[pos..][0..8], e.id.sequence, .little);
-        pos += 8;
-        std.mem.writeInt(u32, buf[pos..][0..4], e.delivery_count, .little);
-        pos += 4;
-        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(e.consumer.len), .little);
-        pos += 2;
-        if (e.consumer.len > 0) {
-            @memcpy(buf[pos .. pos + e.consumer.len], e.consumer);
-            pos += e.consumer.len;
-        }
-    }
-
-    return buf;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
-
-/// A group name as the wire carries it: [len:u16][name].
-fn groupWire(comptime name: []const u8) []const u8 {
-    return comptime &([2]u8{ name.len, 0 } ++ name[0..name.len].*);
-}
-
-/// A group and a member as the wire carries them.
-fn groupMemberWire(comptime group: []const u8, comptime member: []const u8) []const u8 {
-    return comptime &([2]u8{ group.len, 0 } ++ group[0..group.len].* ++ [2]u8{ member.len, 0 } ++ member[0..member.len].*);
-}
 
 /// Helper to build a test request.
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const u8) Request {
@@ -2566,30 +1845,6 @@ fn makeRequest(op: OpCode, key: []const u8, value: []const u8, options: []const 
         .value = value,
         .options = options,
     };
-}
-
-/// Build a stream_group_claim wire value:
-/// [group_len:u16][group][consumer_len:u16][consumer]
-/// [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32].
-fn makeClaimValue(buf: []u8, group: []const u8, consumer: []const u8, min_idle_ms: u32, start_id: StreamID, count: u32) []const u8 {
-    var pos: usize = 0;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(group.len), .little);
-    pos += 2;
-    @memcpy(buf[pos .. pos + group.len], group);
-    pos += group.len;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(consumer.len), .little);
-    pos += 2;
-    @memcpy(buf[pos .. pos + consumer.len], consumer);
-    pos += consumer.len;
-    std.mem.writeInt(u32, buf[pos..][0..4], min_idle_ms, .little);
-    pos += 4;
-    std.mem.writeInt(u64, buf[pos..][0..8], start_id.timestamp_ms, .little);
-    pos += 8;
-    std.mem.writeInt(u64, buf[pos..][0..8], start_id.sequence, .little);
-    pos += 8;
-    std.mem.writeInt(u32, buf[pos..][0..4], count, .little);
-    pos += 4;
-    return buf[0..pos];
 }
 
 /// Build a batch-format value for a single payload with no headers.
@@ -2742,8 +1997,6 @@ test "stream handler: dispatcher registration" {
 
     // Consumer group opcodes
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_create));
-    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_join));
-    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_leave));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_read));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_ack));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_nack));
@@ -2751,8 +2004,6 @@ test "stream handler: dispatcher registration" {
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_info));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_pending));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_group_touch));
-    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_claim));
-    try testing.expect(dispatcher.hasHandler(OpCode.stream_group_configure_sweeper));
     try testing.expect(dispatcher.hasHandler(OpCode.stream_alter));
 
     try testing.expect(dispatcher.hasHandler(OpCode.stream_delete));
@@ -3012,35 +2263,6 @@ test "stream handler: a read steps past an append it can't read" {
     try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
 }
 
-test "stream handler: a group read skips and counts an append in no tier, and its cursor passes it" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // A readable append, then one the projection knows but no tier holds,
-    // last, so only the cursor moving past it shows it was passed.
-    var vb: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
-    const h = stream_mod.streamKey(.default, "s1");
-    _ = try handler.stream.appendToStreamAt(h, 999_999, 0, 4_000_000_000_000, 1, 10);
-
-    for ([_]u32{ 1, 0 }) |want| {
-        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-        switch (r) {
-            .group_messages => |m| {
-                defer handler.freeResult(r);
-                try testing.expectEqual(want, std.mem.readInt(u32, m.data[0..4], .little));
-                if (want == 1) try testing.expect(std.mem.endsWith(u8, m.data, "ok\x00\x00\x00\x00"));
-            },
-            else => return error.TestUnexpectedResult,
-        }
-    }
-    try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
-}
-
 test "stream handler: a processing read skips and counts an append in no tier, and its cursor passes it" {
     const allocator = testing.allocator;
     var partition = try Partition.init(allocator, 0, 1 << 20, 0);
@@ -3059,77 +2281,6 @@ test "stream handler: a processing read skips and counts an append in no tier, a
     // Passed, or a source would read it again forever.
     try testing.expect(read.last_id.eql(lost));
     try testing.expectEqual(@as(u64, 1), handler.skipped_appends);
-}
-
-test "stream handler: a group read that can't build its answer leaves nothing pending" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    var vb: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "m"), ""));
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // The answer's allocation fails.
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    handler.allocator = failing.allocator();
-    const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    handler.allocator = allocator;
-    switch (r) {
-        .err => {},
-        else => return error.TestUnexpectedResult,
-    }
-    // The next read still delivers it: it reached neither the pending list
-    // nor the group's cursor.
-    const ok = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    switch (ok) {
-        .group_messages => |m| {
-            defer handler.freeResult(ok);
-            try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, m.data[0..4], .little));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: a ready entry that can't be read is dropped, not left to lead every read" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 1 << 20, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // An append the projection knows but whose payload is in no tier, then
-    // one that reads.
-    const h = stream_mod.streamKey(.default, "s1");
-    const lost = try handler.stream.appendToStreamAt(h, 999_999, 0, 1_700_000_000_000, 1, 10);
-    var vb: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vb, "ok"), ""));
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // The lost append is pending and ready, as if delivered before it was lost.
-    var q_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
-    const group = resolveGroupName(&q_buf, .default, "s1", "cg1").?;
-    var rec: [1]StreamRecord = undefined;
-    try testing.expectEqual(@as(usize, 1), handler.stream.readStreamByIds(h, &.{lost}, &rec));
-    try handler.stream.groupDeliverRecords(group, "c1", &rec, lost, 1);
-    _ = try handler.stream.groupNack(group, &.{lost});
-
-    var ob: [32]u8 = undefined;
-    var b = OptionsBuilder.init(&ob);
-    try b.addU32(.count, 1);
-    for (0..2) |_| {
-        const r = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), b.getOptions()));
-        handler.freeResult(r);
-    }
-    // The first read dropped it; the second served the readable one.
-    var pel: [4]PendingEntry = undefined;
-    const n = try handler.stream.groupPending(group, null, &pel);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expect(!pel[0].id.eql(lost));
 }
 
 test "stream handler: read honors count" {
@@ -3656,305 +2807,6 @@ test "stream handler: byte retention is refused, and a refused create registers 
     }
 }
 
-test "stream handler: group lifecycle" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // Create group (stream=key, group_name=value)
-    const create_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("my-group"), ""));
-    switch (create_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Create duplicate → error
-    const dup_result = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("my-group"), ""));
-    switch (dup_result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.already_exists, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Join group as member-1
-    const join_req = makeRequest(.stream_group_join, "s1", groupMemberWire("my-group", "member-1"), "");
-    const join_result = handler.handleCommand(join_req);
-    switch (join_result) {
-        .group_joined => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Leave group
-    const leave_req = makeRequest(.stream_group_leave, "s1", groupMemberWire("my-group", "member-1"), "");
-    const leave_result = handler.handleCommand(leave_req);
-    switch (leave_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Delete group
-    const del_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", groupWire("my-group"), ""));
-    switch (del_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Delete again → not found
-    const del2_result = handler.handleCommand(makeRequest(.stream_group_delete, "s1", groupWire("my-group"), ""));
-    switch (del2_result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: group read and ack" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // Append messages
-    var vm1: [64]u8 = undefined;
-    var vm2: [64]u8 = undefined;
-    var vm3: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm1, "msg1"), ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm2, "msg2"), ""));
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm3, "msg3"), ""));
-
-    // Create group
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // First read — PEL delivers all 3 records, adds to PEL
-    var first_id_ts: u64 = 0;
-    var first_id_seq: u64 = 0;
-    const read_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    switch (read_result) {
-        .group_messages => |m| {
-            defer handler.freeResult(read_result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 3), count);
-            // Extract first record's StreamID: [count:u32][sequence:u64][timestamp_ms:i64]...
-            first_id_seq = std.mem.readInt(u64, m.data[4..12], .little);
-            first_id_ts = std.mem.readInt(u64, m.data[12..20], .little);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Second read with no new appends — no NEW records after last_delivered_id
-    const read2_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    switch (read2_result) {
-        .group_messages => |m| {
-            defer handler.freeResult(read2_result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 0), count); // no new records
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Append a new message
-    var vm4: [64]u8 = undefined;
-    _ = handler.handleCommand(makeRequest(.stream_append, "s1", makeBatchValue(&vm4, "msg4"), ""));
-
-    // Third read — delivers only the new msg4
-    const read3_result = handler.handleCommand(makeRequest(.stream_group_read, "s1", groupWire("cg1"), ""));
-    switch (read3_result) {
-        .group_messages => |m| {
-            defer handler.freeResult(read3_result);
-            const count = std.mem.readInt(u32, m.data[0..4], .little);
-            try testing.expectEqual(@as(u32, 1), count); // only msg4
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Ack via proper wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]
-    var ack_wire: [2 + 3 + 2 + 7 + 4 + 16]u8 = undefined;
-    std.mem.writeInt(u16, ack_wire[0..2], 3, .little); // "cg1"
-    @memcpy(ack_wire[2..5], "cg1");
-    std.mem.writeInt(u16, ack_wire[5..7], 7, .little); // "default"
-    @memcpy(ack_wire[7..14], "default");
-    std.mem.writeInt(u32, ack_wire[14..18], 1, .little); // count=1
-    std.mem.writeInt(u64, ack_wire[18..26], first_id_ts, .little);
-    std.mem.writeInt(u64, ack_wire[26..34], first_id_seq, .little);
-    const ack_req = makeRequest(.stream_group_ack, "s1", &ack_wire, "");
-    const ack_result = handler.handleCommand(ack_req);
-    switch (ack_result) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-// NOTE: handler-level tests that need *delivered* records (append → group_read
-// → PEL) can't run in this minimal Partition harness — the append→Raft-apply
-// pipeline that materializes stream records is not wired here (the pre-existing
-// "group read and ack" test has the same limitation and returns 0 records).
-// The claim/pending *logic* over a populated PEL is covered by the projection
-// tests in projection/stream.zig; the full append→read→claim→ack round-trip is
-// covered by the Go SDK e2e test. The handler tests below exercise the wire
-// parse + response shape on an empty PEL, which needs no append pipeline.
-
-test "stream handler: group claim wire parse + empty response" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // Create the group (no deliveries → empty PEL).
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // Claim against an empty PEL: 0 records, trailing cursor == StreamID.MAX.
-    var cbuf: [128]u8 = undefined;
-    const claim_result = handler.handleCommand(makeRequest(.stream_group_claim, "s1", makeClaimValue(&cbuf, "cg1", "worker", 0, StreamID.MIN, 10), ""));
-    switch (claim_result) {
-        .group_messages => |m| {
-            defer handler.freeResult(claim_result);
-            try testing.expect(m.data.len >= 4 + 16);
-            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, m.data[0..4], .little));
-            const cur_ts = std.mem.readInt(u64, m.data[m.data.len - 16 ..][0..8], .little);
-            const cur_seq = std.mem.readInt(u64, m.data[m.data.len - 8 ..][0..8], .little);
-            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cur_ts);
-            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), cur_seq);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Claim on a non-existent group → group_not_found.
-    var cbuf2: [128]u8 = undefined;
-    const missing = handler.handleCommand(makeRequest(.stream_group_claim, "s1", makeClaimValue(&cbuf2, "nope", "worker", 0, StreamID.MIN, 10), ""));
-    switch (missing) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: group configure sweeper" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // Build TLV options: ack_timeout_ms=500, max_deliver=4.
-    var opt_buf: [32]u8 = undefined;
-    var builder = proto.OptionsBuilder.init(&opt_buf);
-    builder.addU32(.ack_timeout_ms, 500) catch unreachable;
-    builder.addU8(.max_deliver, 4) catch unreachable;
-    const cfg = handler.handleCommand(makeRequest(.stream_group_configure_sweeper, "s1", groupWire("cg1"), builder.getOptions()));
-    switch (cfg) {
-        .ok => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Configuring a missing group → group_not_found.
-    const miss = handler.handleCommand(makeRequest(.stream_group_configure_sweeper, "s1", groupWire("nope"), builder.getOptions()));
-    switch (miss) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: group pending consumer filter wire parse" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-
-    // Empty PEL: both filtered and unfiltered pending parse and return 0.
-    const all = handler.handleCommand(makeRequest(.stream_group_pending, "s1", groupWire("cg1"), ""));
-    switch (all) {
-        .group_pending => |p| {
-            defer handler.freeResult(all);
-            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, p.data[0..4], .little));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    const filtered = handler.handleCommand(makeRequest(.stream_group_pending, "s1", groupMemberWire("cg1", "ca"), ""));
-    switch (filtered) {
-        .group_pending => |p| {
-            defer handler.freeResult(filtered);
-            try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, p.data[0..4], .little));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: group info" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // Create group and join
-    _ = handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("cg1"), ""));
-    const join_req = makeRequest(.stream_group_join, "s1", groupMemberWire("cg1", "m1"), "");
-    _ = handler.handleCommand(join_req);
-
-    const result = handler.handleCommand(makeRequest(.stream_group_info, "s1", groupWire("cg1"), ""));
-    switch (result) {
-        .group_pending => |p| {
-            defer handler.freeResult(result);
-            // Parse member_count from serialized data (at offset 8)
-            const member_count = std.mem.readInt(u32, p.data[8..12], .little);
-            try testing.expectEqual(@as(u32, 1), member_count);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "stream handler: group not found errors" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // Join non-existent group — auto-creates the group
-    const join_result = handler.handleCommand(makeRequest(.stream_group_join, "s1", groupWire("nope"), ""));
-    switch (join_result) {
-        .group_joined => {},
-        else => return error.TestUnexpectedResult,
-    }
-
-    // Ack non-existent group — wire format with fake StreamID
-    var ack_wire: [2 + 14 + 2 + 1 + 4 + 16]u8 = undefined;
-    std.mem.writeInt(u16, ack_wire[0..2], 14, .little);
-    @memcpy(ack_wire[2..16], "no_such_group_");
-    std.mem.writeInt(u16, ack_wire[16..18], 1, .little);
-    @memcpy(ack_wire[18..19], "x");
-    std.mem.writeInt(u32, ack_wire[19..23], 1, .little); // count=1
-    std.mem.writeInt(u64, ack_wire[23..31], 1000, .little); // ts
-    std.mem.writeInt(u64, ack_wire[31..39], 0, .little); // seq
-    const ack_req = makeRequest(.stream_group_ack, "s1", &ack_wire, "");
-    const ack_result = handler.handleCommand(ack_req);
-    switch (ack_result) {
-        .err => |e| try testing.expectEqual(CommandResult.ErrorCode.group_not_found, e.code),
-        else => return error.TestUnexpectedResult,
-    }
-}
-
 test "stream handler: pre-route by stream" {
     const req1 = makeRequest(.stream_append, "stream-a", "", "");
     const req2 = makeRequest(.stream_append, "stream-a", "", "");
@@ -3977,54 +2829,11 @@ test "stream handler: pre-route by stream" {
     try testing.expect(StreamHandler.preRouteByStream(req1) != StreamHandler.preRouteByStream(req_ns));
 }
 
-test "stream handler: a group name must come in the wire format, and is always in the request's namespace" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // A name without its length prefix is refused.
-    const raw = handler.handleCommand(makeRequest(.stream_group_create, "s1", "my-group", ""));
-    try std.testing.expect(raw == .err);
-    // The same group name in two namespaces is two groups.
-    try std.testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "s1", groupWire("g"), "")) != .err);
-    var other = makeRequest(.stream_group_create, "s1", groupWire("g"), "");
-    other.namespace = "other";
-    other.ns_id = .of(16);
-    try std.testing.expect(handler.handleCommand(other) != .err);
-}
-
-test "stream handler: a stream or group name too long for a key, or holding a NUL, is refused" {
-    const allocator = testing.allocator;
-    var partition = try Partition.init(allocator, 0, 4096, 0);
-    defer partition.deinit();
-    partition.wireProjections();
-    var handler = StreamHandler.init(allocator, &partition);
-    defer handler.deinit();
-
-    // The namespace's name doesn't count: the key holds its id.
-    const long = stdx.repeat("s", ns_keys.MAX_QUALIFIED_KEY + 1);
-    const longest = stdx.repeat("s", ns_keys.MAX_QUALIFIED_KEY);
-    for ([_]OpCode{ .stream_append, .stream_group_create, .stream_group_delete, .stream_info }) |op| {
-        var req = makeRequest(op, long, groupWire("g"), "");
-        req.namespace = "b";
-        req.ns_id = .of(16);
-        const refused = handler.handleCommand(req);
-        try testing.expectEqualStrings("stream name too long", refused.err.message);
-        var fits = makeRequest(op, longest, groupWire("g"), "");
-        fits.namespace = "b";
-        fits.ns_id = .of(16);
-        if (!StreamHandler.isGroupOp(op)) try testing.expect(StreamHandler.nameRefusal(op, fits) == null);
-    }
-    // The stream fits, but not with its group.
-    var near = makeRequest(.stream_group_create, stdx.repeat("s", (ns_keys.MAX_QUALIFIED_KEY - 6)), groupWire(stdx.repeat("g", 8)), "");
-    near.namespace = "b";
-    near.ns_id = .of(16);
-    try testing.expect(handler.handleCommand(near) == .err);
-    // A NUL in either name could spell another stream's group.
-    try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b\x00orders", groupWire("g"), "")) == .err);
-    try testing.expect(handler.handleCommand(makeRequest(.stream_group_create, "b", groupWire("orders\x00g"), "")) == .err);
-    try testing.expectEqual(@as(usize, 0), partition.stream.groups.count());
+test "stream handler: a stream name is refused when empty, holding a NUL, or too long for a key; a list's key is a filter" {
+    const long: [ns_keys.MAX_QUALIFIED_KEY + 1]u8 = @splat('s');
+    try testing.expectEqualStrings("stream name is required", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, "", "", "")).?);
+    try testing.expectEqualStrings("stream name must not contain NUL", StreamHandler.nameRefusal(.stream_read, makeRequest(.stream_read, "a\x00b", "", "")).?);
+    try testing.expectEqualStrings("stream name too long", StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, &long, "", "")).?);
+    try testing.expect(StreamHandler.nameRefusal(.stream_append, makeRequest(.stream_append, long[0..ns_keys.MAX_QUALIFIED_KEY], "", "")) == null);
+    try testing.expect(StreamHandler.nameRefusal(.stream_list, makeRequest(.stream_list, "a\x00b", "", "")) == null);
 }

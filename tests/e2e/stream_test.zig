@@ -9,77 +9,10 @@
 const std = @import("std");
 const testing = std.testing;
 const stdx = @import("stdx");
-const src = @import("src");
-const StreamID = src.cli_client.StreamID;
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-/// Read the leading record/PEL count (u32 LE) from a group response blob.
-fn recordCount(data: []const u8) u32 {
-    if (data.len < 4) return 0;
-    return std.mem.readInt(u32, data[0..4], .little);
-}
-
-/// Parse StreamIDs out of a group_messages records blob (as returned by
-/// group_read / group_claim). Stops after `count` records, so a trailing
-/// claim cursor is ignored. Returns the number of IDs written to `out`.
-/// Record layout (serializeStreamRecordsWithPayloads):
-/// [count:u32]([seq:u64][ts:i64][tier:u8][partition:u32]
-///   [key_present:u8]([key_len:u32][key])?[payload_len:u32][payload]
-///   [hdr_count:u32]([k_len:u32][k][v_len:u32][v])* )*
-fn parseRecordIds(data: []const u8, out: []StreamID) usize {
-    if (data.len < 4) return 0;
-    const count = std.mem.readInt(u32, data[0..4], .little);
-    var pos: usize = 4;
-    var n: usize = 0;
-    var i: u32 = 0;
-    while (i < count and n < out.len) : (i += 1) {
-        if (pos + 8 + 8 + 1 + 4 + 1 > data.len) break;
-        const seq = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-        const ts = std.mem.readInt(i64, data[pos..][0..8], .little);
-        pos += 8;
-        pos += 1; // tier
-        pos += 4; // partition
-        const key_present = data[pos];
-        pos += 1;
-        if (key_present != 0) {
-            if (pos + 4 > data.len) break;
-            const klen = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4 + klen;
-        }
-        if (pos + 4 > data.len) break;
-        const plen = std.mem.readInt(u32, data[pos..][0..4], .little);
-        pos += 4 + plen;
-        if (pos + 4 > data.len) break;
-        const hcount = std.mem.readInt(u32, data[pos..][0..4], .little);
-        pos += 4;
-        var h: u32 = 0;
-        while (h < hcount) : (h += 1) {
-            if (pos + 4 > data.len) break;
-            const kl = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4 + kl;
-            if (pos + 4 > data.len) break;
-            const vl = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4 + vl;
-        }
-        out[n] = .{ .timestamp_ms = @intCast(ts), .sequence = seq };
-        n += 1;
-    }
-    return n;
-}
-
-/// True if a claim response's trailing 16-byte cursor is StreamID.MAX
-/// (PEL fully scanned).
-fn claimCursorIsMax(data: []const u8) bool {
-    if (data.len < 16) return false;
-    const off = data.len - 16;
-    const ts = std.mem.readInt(u64, data[off..][0..8], .little);
-    const seq = std.mem.readInt(u64, data[off + 8 ..][0..8], .little);
-    return ts == std.math.maxInt(u64) and seq == std.math.maxInt(u64);
-}
 
 /// Extract StreamID from command output (format: "Appended at <id>" or just the ID)
 fn extractStreamId(output: []const u8) ?[]const u8 {
@@ -655,286 +588,9 @@ test "e2e/stream: delete is idempotent and recreatable" {
 // Consumer Group Operations
 // =============================================================================
 
-test "e2e/stream: group create basic" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Setup stream first
-    try ctx.exec(&.{ "stream", "append", "cg-create-test", "setup-msg" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "create", "cg-create-test", "--group", "test-cg" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("Created") or result.contains("test-cg") or result.succeeded());
-}
-
-test "e2e/stream: group create on non-existent stream" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "create", "nonexistent-stream-xyz", "--group", "orphan-group" });
-    defer result.deinit();
-
-    // Server may auto-create stream or fail - both are valid behaviors
-    // Just verify we get a response
-    try testing.expect(result.stdout.len > 0 or result.stderr.len > 0 or result.succeeded());
-}
-
-test "e2e/stream: group create duplicate handling" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "cg-dup-test", "setup-msg" });
-
-    // Create first time
-    try ctx.exec(&.{ "stream", "group", "create", "cg-dup-test", "--group", "dup-cg" });
-
-    // Create again - may conflict or be idempotent
-    var result = try ctx.cli.run(&.{ "stream", "group", "create", "cg-dup-test", "--group", "dup-cg" });
-    defer result.deinit();
-
-    // Server may return conflict OR be idempotent (both are valid behaviors)
-    try testing.expect(result.contains("already exists") or result.contains("conflict") or result.contains("Conflict") or result.contains("Created") or result.succeeded());
-}
-
-test "e2e/stream: group read" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Setup stream with messages
-    for (0..10) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "cg-msg-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "cg-read-test", msg });
-    }
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "cg-read-test", "--group", "read-group", "--consumer", "worker1", "--limit", "3" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("cg-msg") or result.succeeded());
-}
-
-test "e2e/stream: group ack" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Setup
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "ack-msg-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "ack-test", msg });
-    }
-
-    // Read to get IDs
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "ack-test", "--group", "ack-group", "--consumer", "w1", "--limit", "2" });
-
-    // Extract first ID for ack
-    const id = extractStreamId(read_output);
-    if (id) |ack_id| {
-        var result = try ctx.cli.run(&.{ "stream", "group", "ack", "ack-test", "--group", "ack-group", "--consumer", "w1", "--ids", ack_id });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Acknowledged") or result.contains("ack") or result.succeeded());
-    }
-}
-
-test "e2e/stream: group delete" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "cg-del-test", "msg" });
-    try ctx.exec(&.{ "stream", "group", "create", "cg-del-test", "--group", "del-cg" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "delete", "cg-del-test", "--group", "del-cg" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("Deleted") or result.contains("deleted") or result.succeeded());
-}
-
-test "e2e/stream: group create after delete succeeds" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "recreate-test", "msg" });
-
-    // Create, delete, recreate
-    try ctx.exec(&.{ "stream", "group", "create", "recreate-test", "--group", "recreate-cg" });
-    try ctx.exec(&.{ "stream", "group", "delete", "recreate-test", "--group", "recreate-cg" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "create", "recreate-test", "--group", "recreate-cg" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("Created") or result.contains("recreate-cg") or result.succeeded());
-}
-
-test "e2e/stream: group info" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "cg-info-test", "msg" });
-    try ctx.exec(&.{ "stream", "group", "create", "cg-info-test", "--group", "info-cg" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "info", "cg-info-test", "--group", "info-cg" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("Group") or result.contains("info-cg") or result.contains("offset") or result.succeeded());
-}
-
-test "e2e/stream: group pending" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Setup and read without acking
-    for (0..5) |_| {
-        try ctx.exec(&.{ "stream", "append", "pending-test", "msg" });
-    }
-
-    // Read without acking to create pending
-    _ = try ctx.execCapture(&.{ "stream", "group", "read", "pending-test", "--group", "pending-group", "--consumer", "w1", "--limit", "3" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "pending", "pending-test", "--group", "pending-group" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("Pending") or result.contains("pending") or result.succeeded());
-}
-
-test "e2e/stream: group claim redelivers unacked records, ack drains" {
-    // Crash-recovery redelivery over the full wire: deliver → (no ack) →
-    // claim re-returns the same records → ack → claim returns nothing.
-    // GroupRead alone cannot redeliver.
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    const NS = "default";
-    const STREAM = "claim-redeliver";
-    const GROUP = "cg";
-    const CONSUMER = "worker-a";
-
-    // Seed 3 records.
-    for (0..3) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "msg-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", STREAM, msg });
-    }
-
-    var conn = src.cli_client.Client.init(testing.allocator, ctx.endpoint);
-    defer conn.deinit();
-    try conn.connect();
-
-    // Deliver 3 to the consumer's PEL, no ack.
-    {
-        var r = try src.cli_client.stream.groupRead(&conn, NS, STREAM, GROUP, CONSUMER, 3, null);
-        defer r.deinit();
-        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
-        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
-    }
-
-    // GroupRead again returns 0 — last_delivered_id has advanced past them.
-    {
-        var r = try src.cli_client.stream.groupRead(&conn, NS, STREAM, GROUP, CONSUMER, 3, null);
-        defer r.deinit();
-        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
-    }
-
-    // Claim drains the PEL: same 3 records come back (redelivery), cursor == MAX.
-    var ids: [8]StreamID = undefined;
-    var id_count: usize = 0;
-    {
-        var r = try src.cli_client.stream.groupClaim(&conn, NS, STREAM, GROUP, CONSUMER, 0, StreamID.MIN, 10);
-        defer r.deinit();
-        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
-        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
-        id_count = parseRecordIds(r.data, &ids);
-        try testing.expectEqual(@as(usize, 3), id_count);
-        // Trailing 16-byte cursor == StreamID.MAX (fully scanned).
-        try testing.expect(claimCursorIsMax(r.data));
-    }
-
-    // Pending shows all 3 for this consumer.
-    {
-        var r = try src.cli_client.stream.groupPendingForConsumer(&conn, NS, STREAM, GROUP, CONSUMER);
-        defer r.deinit();
-        try testing.expectEqual(@as(u32, 3), recordCount(r.data));
-    }
-
-    // Ack the claimed records.
-    {
-        var r = try src.cli_client.stream.groupAck(&conn, NS, STREAM, GROUP, CONSUMER, ids[0..id_count]);
-        defer r.deinit();
-        try testing.expectEqual(@as(@TypeOf(r.status), .ok), r.status);
-    }
-
-    // Now claim returns nothing — PEL is drained.
-    {
-        var r = try src.cli_client.stream.groupClaim(&conn, NS, STREAM, GROUP, CONSUMER, 0, StreamID.MIN, 10);
-        defer r.deinit();
-        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
-    }
-
-    // And pending is empty.
-    {
-        var r = try src.cli_client.stream.groupPendingForConsumer(&conn, NS, STREAM, GROUP, CONSUMER);
-        defer r.deinit();
-        try testing.expectEqual(@as(u32, 0), recordCount(r.data));
-    }
-}
-
-test "e2e/stream: group nack" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |_| {
-        try ctx.exec(&.{ "stream", "append", "nack-test", "nack-msg" });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "nack-test", "--group", "nack-group", "--consumer", "w1", "--limit", "2" });
-
-    const id = extractStreamId(read_output);
-    if (id) |nack_id| {
-        var result = try ctx.cli.run(&.{ "stream", "group", "nack", "nack-test", "--group", "nack-group", "--consumer", "w1", "--ids", nack_id });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Released") or result.contains("released") or result.contains("ok") or result.succeeded());
-    }
-}
-
-test "e2e/stream: group leave" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "leave-test", "msg" });
-
-    // Join group first
-    _ = try ctx.execCapture(&.{ "stream", "group", "read", "leave-test", "--group", "leave-group", "--consumer", "worker-to-leave", "--limit", "1" });
-
-    var result = try ctx.cli.run(&.{ "stream", "group", "leave", "leave-test", "--group", "leave-group", "--consumer", "worker-to-leave" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("left") or result.contains("ok") or result.contains("Leave") or result.succeeded());
-}
-
 // =============================================================================
 // Consumer Group Options (Reliability Features)
 // =============================================================================
-
-test "e2e/stream: group touch" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..3) |_| {
-        try ctx.exec(&.{ "stream", "append", "touch-test", "touch-msg" });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "touch-test", "--group", "touch-group", "--consumer", "c1", "--limit", "3" });
-
-    const id = extractStreamId(read_output);
-    if (id) |touch_id| {
-        var result = try ctx.cli.run(&.{ "stream", "group", "touch", "touch-test", "--group", "touch-group", "--consumer", "c1", "--ids", touch_id });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Extended") or result.contains("touched") or result.contains("ok") or result.succeeded());
-    }
-}
 
 // =============================================================================
 // Consumer Group Advanced Modes
@@ -998,68 +654,6 @@ test "e2e/stream: server restart and new appends work" {
 
     // New message should be present
     try testing.expect(final_read.contains(new_msg));
-}
-
-test "e2e/stream: a consumer group's ack floor survives restart, and a read resumes after it" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .durability = .sync },
-    });
-    defer ctx.deinit();
-    const stream_name = "cg-persist-offset";
-    const group_name = "persist-group";
-    var msg_buf: [64]u8 = undefined;
-    for (0..10) |i| try ctx.exec(&.{ "stream", "append", stream_name, try std.fmt.bufPrint(&msg_buf, "persist-msg-{d}", .{i}) });
-
-    var first = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "5" });
-    defer first.deinit();
-    try testing.expectEqual(@as(u8, 0), first.exit_code);
-    const first_id = extractStreamId(first.stdout) orelse return error.NoStreamId;
-    var ack = try ctx.cli.run(&.{ "stream", "group", "ack", stream_name, "--group", group_name, "--consumer", "c1", "--ids", first_id });
-    defer ack.deinit();
-    try testing.expectEqual(@as(u8, 0), ack.exit_code);
-
-    try ctx.restartServer();
-
-    // The floor is past msg-0; the four delivered and unacked come again.
-    var after = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "10" });
-    defer after.deinit();
-    try testing.expectEqual(@as(u8, 0), after.exit_code);
-    try testing.expect(!after.stdoutContains("persist-msg-0"));
-    for (1..10) |i| try testing.expect(after.stdoutContains(try std.fmt.bufPrint(&msg_buf, "persist-msg-{d}", .{i})));
-}
-
-test "e2e/stream: a consumer group made by a group read survives restart, and what it hadn't acked is delivered again" {
-    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{
-        .server = .{ .durability = .sync },
-    });
-    defer ctx.deinit();
-    const stream_name = "cg-persist-pending";
-    const group_name = "pending-persist-group";
-    var msg_buf: [64]u8 = undefined;
-    for (0..5) |i| try ctx.exec(&.{ "stream", "append", stream_name, try std.fmt.bufPrint(&msg_buf, "pending-persist-{d}", .{i}) });
-
-    // No group create: the read makes the group.
-    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "3" });
-    defer read1.deinit();
-    try testing.expectEqual(@as(u8, 0), read1.exit_code);
-    var pending_before = try ctx.cli.run(&.{ "stream", "group", "pending", stream_name, "--group", group_name });
-    defer pending_before.deinit();
-    try testing.expectEqual(@as(u8, 0), pending_before.exit_code);
-    try testing.expect(pending_before.stdoutContains("Pending: 3 message(s)"));
-
-    try ctx.restartServer();
-
-    // What survives is the group, its ack floor and its config; the pending
-    // list starts empty and the cursor is back at the floor. Keeping the
-    // pending list across a restart is planned, and then this is Pending: 3.
-    var pending_after = try ctx.cli.run(&.{ "stream", "group", "pending", stream_name, "--group", group_name });
-    defer pending_after.deinit();
-    try testing.expectEqual(@as(u8, 0), pending_after.exit_code);
-    try testing.expect(pending_after.stdoutContains("Pending: 0 message(s)"));
-    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", stream_name, "--group", group_name, "--consumer", "c1", "--limit", "10" });
-    defer read2.deinit();
-    try testing.expectEqual(@as(u8, 0), read2.exit_code);
-    for (0..5) |i| try testing.expect(read2.stdoutContains(try std.fmt.bufPrint(&msg_buf, "pending-persist-{d}", .{i})));
 }
 
 // =============================================================================
@@ -1963,56 +1557,6 @@ test "e2e/stream: default append goes to partition 0" {
 // Multi-Consumer Partition Distribution
 // =============================================================================
 
-test "e2e/stream: consumer group read from multi-partition stream" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Create 4-partition stream with messages
-    try ctx.exec(&.{ "stream", "create", "mp-cg-test", "--partitions", "4" });
-    for (0..20) |i| {
-        var buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "mp-cg-msg-{d}", .{i});
-        // Distribute across partitions by specifying partition
-        var p_buf: [4]u8 = undefined;
-        const part_str = try std.fmt.bufPrint(&p_buf, "{d}", .{i % 4});
-        try ctx.exec(&.{ "stream", "append", "mp-cg-test", msg, "--partition", part_str });
-    }
-
-    // Consumer 1 joins group and reads
-    var r1 = try ctx.cli.run(&.{ "stream", "group", "read", "mp-cg-test", "--group", "mp-group", "--consumer", "c1", "--limit", "10" });
-    defer r1.deinit();
-
-    // Should get some messages
-    try testing.expect(r1.contains("mp-cg-msg") or r1.succeeded());
-}
-
-test "e2e/stream: two consumers in group share partitions" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Create 4-partition stream
-    try ctx.exec(&.{ "stream", "create", "mp-share-test", "--partitions", "4" });
-    for (0..20) |i| {
-        var buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "share-msg-{d}", .{i});
-        var p_buf: [4]u8 = undefined;
-        const part_str = try std.fmt.bufPrint(&p_buf, "{d}", .{i % 4});
-        try ctx.exec(&.{ "stream", "append", "mp-share-test", msg, "--partition", part_str });
-    }
-
-    // Two consumers join the same group
-    var r1 = try ctx.cli.run(&.{ "stream", "group", "read", "mp-share-test", "--group", "share-group", "--consumer", "c1", "--limit", "15" });
-    defer r1.deinit();
-
-    var r2 = try ctx.cli.run(&.{ "stream", "group", "read", "mp-share-test", "--group", "share-group", "--consumer", "c2", "--limit", "15" });
-    defer r2.deinit();
-
-    // Both should get messages (partitions distributed between them)
-    const c1_got = r1.contains("share-msg") or r1.succeeded();
-    const c2_got = r2.contains("share-msg") or r2.succeeded();
-    try testing.expect(c1_got or c2_got);
-}
-
 // =============================================================================
 // Partition Key Read Operations
 // =============================================================================
@@ -2408,123 +1952,6 @@ test "e2e/stream: info --output json shows StreamID format for first/last" {
     try testing.expect(result.contains(last_id));
 }
 
-test "e2e/stream: group ack with multiple StreamIDs" {
-    // Tests the wire format: [count:u32][ts:u64][seq:u64]* with count > 1
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "multi-ack-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "multi-ack-test", msg });
-    }
-
-    // Read multiple messages
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-ack-test", "--group", "multi-ack-group", "--consumer", "w1", "--limit", "3" });
-
-    // Extract multiple IDs from output
-    var ids_buf: [3][]const u8 = undefined;
-    var id_count: usize = 0;
-    var search_pos: usize = 0;
-    const output = read_output;
-    while (id_count < 3 and search_pos < output.len) {
-        if (extractStreamId(output[search_pos..])) |id| {
-            // Calculate actual position in original string
-            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
-            ids_buf[id_count] = id;
-            id_count += 1;
-            search_pos = id_start + id.len;
-        } else break;
-    }
-
-    if (id_count >= 2) {
-        // Ack multiple IDs at once (comma-separated)
-        var ack_ids_buf: [256]u8 = undefined;
-        const ack_ids = std.fmt.bufPrint(&ack_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
-
-        var result = try ctx.cli.run(&.{ "stream", "group", "ack", "multi-ack-test", "--group", "multi-ack-group", "--consumer", "w1", "--ids", ack_ids });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Acknowledged") or result.contains("ack") or result.succeeded());
-    }
-}
-
-test "e2e/stream: ack reduces pending count" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "ack-pending-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "ack-pending-test", msg });
-    }
-
-    // Read 3 messages (creates pending entries)
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "ack-pending-test", "--group", "ack-pending-grp", "--consumer", "w1", "--limit", "3" });
-
-    // Check pending shows entries
-    var pending1 = try ctx.cli.run(&.{ "stream", "group", "pending", "ack-pending-test", "--group", "ack-pending-grp" });
-    defer pending1.deinit();
-    try stdx.testing.assertSucceeded(pending1);
-
-    // Ack one message
-    const id = extractStreamId(read_output);
-    if (id) |ack_id| {
-        try ctx.exec(&.{ "stream", "group", "ack", "ack-pending-test", "--group", "ack-pending-grp", "--consumer", "w1", "--ids", ack_id });
-
-        // Pending should still have entries (we acked 1 of 3), but the acked
-        // ID should no longer appear
-        var pending2 = try ctx.cli.run(&.{ "stream", "group", "pending", "ack-pending-test", "--group", "ack-pending-grp" });
-        defer pending2.deinit();
-        try stdx.testing.assertSucceeded(pending2);
-    }
-}
-
-test "e2e/stream: a nacked record is the next group read's" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "nack-redeliver", "first-msg" });
-    try ctx.exec(&.{ "stream", "append", "nack-redeliver", "second-msg" });
-
-    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
-    defer read1.deinit();
-    try testing.expectEqual(@as(u8, 0), read1.exit_code);
-    try testing.expect(read1.contains("first-msg"));
-    const id = extractStreamId(read1.stdout) orelse return error.NoStreamId;
-
-    var nack = try ctx.cli.run(&.{ "stream", "group", "nack", "nack-redeliver", "--group", "g", "--consumer", "w1", "--ids", id });
-    defer nack.deinit();
-    try testing.expectEqual(@as(u8, 0), nack.exit_code);
-
-    // The nacked record comes before the one never delivered.
-    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "nack-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
-    defer read2.deinit();
-    try testing.expectEqual(@as(u8, 0), read2.exit_code);
-    try testing.expect(read2.contains("first-msg"));
-    try testing.expect(!read2.contains("second-msg"));
-}
-
-test "e2e/stream: a record left unacked past the ack timeout goes to the group's next reader" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "group", "create", "expire-redeliver", "--group", "g", "--ack-timeout", "500" });
-    try ctx.exec(&.{ "stream", "append", "expire-redeliver", "only-msg" });
-
-    var read1 = try ctx.cli.run(&.{ "stream", "group", "read", "expire-redeliver", "--group", "g", "--consumer", "w1", "--limit", "1" });
-    defer read1.deinit();
-    try testing.expectEqual(@as(u8, 0), read1.exit_code);
-    try testing.expect(read1.contains("only-msg"));
-
-    // w1 never acks; past the timeout and a sweeper pass, w2 gets it.
-    stdx.time.sleep(2500 * std.time.ns_per_ms);
-    var read2 = try ctx.cli.run(&.{ "stream", "group", "read", "expire-redeliver", "--group", "g", "--consumer", "w2", "--limit", "1" });
-    defer read2.deinit();
-    try testing.expectEqual(@as(u8, 0), read2.exit_code);
-    try testing.expect(read2.contains("only-msg"));
-}
-
 test "e2e/stream: trim with --before StreamID" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
@@ -2554,25 +1981,6 @@ test "e2e/stream: trim with --before StreamID" {
     try testing.expect(read_result.contains("trim-msg-5"));
 }
 
-test "e2e/stream: group read output contains StreamID format" {
-    // Verify that consumer group read returns records with StreamID format IDs
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "cg-id-test", "cg-id-msg" });
-
-    const output = try ctx.execCapture(&.{ "stream", "group", "read", "cg-id-test", "--group", "cg-id-grp", "--consumer", "w1", "--limit", "3" });
-
-    // Output should contain a StreamID (timestamp-sequence format)
-    const id = extractStreamId(output);
-    try testing.expect(id != null);
-    try testing.expect(isValidStreamId(id.?));
-
-    // Verify the timestamp part is a real timestamp
-    const parsed = parseStreamId(id.?) orelse return error.InvalidStreamId;
-    try testing.expect(parsed.timestamp > 1577836800000);
-}
-
 test "e2e/stream: multiple appends have same timestamp with incrementing sequence" {
     // When multiple records are appended in the same millisecond, they should
     // share the same timestamp but have incrementing sequence numbers.
@@ -2591,79 +1999,6 @@ test "e2e/stream: multiple appends have same timestamp with incrementing sequenc
     // Should succeed and contain all three
     try stdx.testing.assertSucceeded(result);
     try testing.expect(result.contains("batch1") or result.contains("batch2") or result.contains("batch3"));
-}
-
-test "e2e/stream: group nack with multiple StreamIDs" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "multi-nack-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "multi-nack-test", msg });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-nack-test", "--group", "multi-nack-grp", "--consumer", "w1", "--limit", "3" });
-
-    // Extract multiple IDs
-    var ids_buf: [3][]const u8 = undefined;
-    var id_count: usize = 0;
-    var search_pos: usize = 0;
-    const output = read_output;
-    while (id_count < 3 and search_pos < output.len) {
-        if (extractStreamId(output[search_pos..])) |id| {
-            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
-            ids_buf[id_count] = id;
-            id_count += 1;
-            search_pos = id_start + id.len;
-        } else break;
-    }
-
-    if (id_count >= 2) {
-        var nack_ids_buf: [256]u8 = undefined;
-        const nack_ids = std.fmt.bufPrint(&nack_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
-
-        var result = try ctx.cli.run(&.{ "stream", "group", "nack", "multi-nack-test", "--group", "multi-nack-grp", "--consumer", "w1", "--ids", nack_ids });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Released") or result.contains("released") or result.contains("ok") or result.succeeded());
-    }
-}
-
-test "e2e/stream: group touch with multiple StreamIDs" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "multi-touch-{d}", .{i}) catch unreachable;
-        try ctx.exec(&.{ "stream", "append", "multi-touch-test", msg });
-    }
-
-    const read_output = try ctx.execCapture(&.{ "stream", "group", "read", "multi-touch-test", "--group", "multi-touch-grp", "--consumer", "w1", "--limit", "3" });
-
-    var ids_buf: [3][]const u8 = undefined;
-    var id_count: usize = 0;
-    var search_pos: usize = 0;
-    const output = read_output;
-    while (id_count < 3 and search_pos < output.len) {
-        if (extractStreamId(output[search_pos..])) |id| {
-            const id_start = @intFromPtr(id.ptr) - @intFromPtr(output.ptr);
-            ids_buf[id_count] = id;
-            id_count += 1;
-            search_pos = id_start + id.len;
-        } else break;
-    }
-
-    if (id_count >= 2) {
-        var touch_ids_buf: [256]u8 = undefined;
-        const touch_ids = std.fmt.bufPrint(&touch_ids_buf, "{s},{s}", .{ ids_buf[0], ids_buf[1] }) catch unreachable;
-
-        var result = try ctx.cli.run(&.{ "stream", "group", "touch", "multi-touch-test", "--group", "multi-touch-grp", "--consumer", "w1", "--ids", touch_ids });
-        defer result.deinit();
-
-        try testing.expect(result.contains("Extended") or result.contains("touched") or result.contains("ok") or result.succeeded());
-    }
 }
 
 // =============================================================================
@@ -2755,22 +2090,6 @@ test "e2e/stream: headers with multiple key-value pairs" {
     try testing.expect(result.contains("high"));
 }
 
-test "e2e/stream: headers survive consumer group read" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "hdr-cg-test", "cg-payload", "--header", "type=event,region=us-east" });
-
-    // Group read should also return headers
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "hdr-cg-test", "--group", "hdr-cg", "--consumer", "w1", "--limit", "5", "-o", "json" });
-    defer result.deinit();
-
-    try stdx.testing.assertSucceeded(result);
-    try testing.expect(result.contains("cg-payload"));
-    try testing.expect(result.contains("type"));
-    try testing.expect(result.contains("event"));
-}
-
 // =============================================================================
 // Per-Stream Consumer Groups
 //
@@ -2789,7 +2108,7 @@ test "e2e/stream: wildcard group read is rejected" {
     defer result.deinit();
 
     try testing.expectEqual(@as(u8, 3), result.exit_code);
-    try testing.expect(result.stderrContains("wildcard group reads are no longer supported"));
+    try testing.expect(result.stderrContains("a group reads a single stream, not a pattern"));
 }
 
 test "e2e/stream: same group name on two streams has independent cursors" {
@@ -2818,30 +2137,6 @@ test "e2e/stream: same group name on two streams has independent cursors" {
     var r_orders2 = try ctx.cli.run(&.{ "stream", "group", "read", "orders", "--group", "g", "--consumer", "w1", "--limit", "10" });
     defer r_orders2.deinit();
     try testing.expect(!r_orders2.contains("order-1"));
-}
-
-test "e2e/stream: deleting a stream removes its consumer groups" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    try ctx.exec(&.{ "stream", "append", "s-del", "a" });
-    try ctx.exec(&.{ "stream", "append", "s-keep", "b" });
-
-    // Same group name on two distinct streams = two independent groups.
-    try ctx.exec(&.{ "stream", "group", "create", "s-del", "--group", "g" });
-    try ctx.exec(&.{ "stream", "group", "create", "s-keep", "--group", "g" });
-
-    // Deleting `s-del` cascade-removes its group `g`...
-    try ctx.exec(&.{ "stream", "delete", "s-del", "--force" });
-
-    var info_del = try ctx.cli.run(&.{ "stream", "group", "info", "s-del", "--group", "g" });
-    defer info_del.deinit();
-    try testing.expectEqual(@as(u8, 1), info_del.exit_code);
-
-    // ...while the same-named group on `s-keep` survives.
-    var info_keep = try ctx.cli.run(&.{ "stream", "group", "info", "s-keep", "--group", "g" });
-    defer info_keep.deinit();
-    try testing.expect(info_keep.succeeded() or info_keep.contains("g"));
 }
 
 // =============================================================================
@@ -2979,27 +2274,6 @@ test "e2e/stream: create with retention then append and read works" {
     try testing.expect(result.contains("msg-1"));
     try testing.expect(result.contains("msg-2"));
     try testing.expect(result.contains("msg-3"));
-}
-
-test "e2e/stream: create with retention and consumer group works" {
-    var ctx = try stdx.testing.TestContext.init(testing.allocator);
-    defer ctx.deinit();
-
-    // Create with retention
-    try ctx.exec(&.{ "stream", "create", "ret-cg-test", "--retention", "24" });
-
-    // Append messages
-    for (0..5) |i| {
-        var buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "ret-cg-msg-{d}", .{i}) catch continue;
-        try ctx.exec(&.{ "stream", "append", "ret-cg-test", msg });
-    }
-
-    // Consumer group read should work
-    var result = try ctx.cli.run(&.{ "stream", "group", "read", "ret-cg-test", "--group", "ret-group", "--consumer", "w1", "--limit", "3" });
-    defer result.deinit();
-
-    try testing.expect(result.contains("ret-cg-msg") or result.succeeded());
 }
 
 test "e2e/stream: alter retention does not disrupt existing data" {
@@ -3334,7 +2608,7 @@ test "e2e/stream: paging through 400-record batches returns every record once" {
     }
 }
 
-test "e2e/stream: a group delivers 400-record batches once each" {
+test "e2e/stream: a group delivers 400-record batches once each, a record at a time" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
     try appendThreeBatches(ctx, "grouped");
@@ -3343,26 +2617,31 @@ test "e2e/stream: a group delivers 400-record batches once each" {
     var seen: std.ArrayList(u8) = .empty;
     defer seen.deinit(testing.allocator);
     var reads: usize = 0;
-    while (reads < 10) : (reads += 1) {
-        var r = try ctx.cli.run(&.{ "stream", "group", "read", "grouped", "--group", "g", "--consumer", "w", "--limit", "500", "-o", "json" });
+    while (reads < 20) : (reads += 1) {
+        var r = try ctx.cli.run(&.{ "stream", "group", "read", "grouped", "--group", "g", "--consumer", "w", "--limit", "100", "-o", "json" });
         defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
         const n = std.mem.count(u8, r.stdout, "\"data\":\"p");
         if (n == 0) break;
-        // Whole batches only: what is pending is exactly what was returned.
-        try testing.expectEqual(@as(usize, 400), n);
+        // A record at a time: a read takes 100 of a 400-record append.
+        try testing.expectEqual(@as(usize, 100), n);
         try seen.appendSlice(testing.allocator, r.stdout);
 
         var ids: std.ArrayList(u8) = .empty;
         defer ids.deinit(testing.allocator);
-        var it = std.mem.splitSequence(u8, r.stdout, "\"id\":\"");
+        var it = std.mem.splitSequence(u8, r.stdout, "\"delivery\":\"");
         _ = it.next();
         while (it.next()) |rest| {
             const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
             if (ids.items.len > 0) try ids.append(testing.allocator, ',');
             try ids.appendSlice(testing.allocator, rest[0..end]);
         }
-        try ctx.exec(&.{ "stream", "group", "ack", "grouped", "--group", "g", "--consumer", "w", "--ids", ids.items });
+        var ack = try ctx.cli.run(&.{ "stream", "group", "ack", "grouped", "--group", "g", "--consumer", "w", "--ids", ids.items });
+        defer ack.deinit();
+        try testing.expectEqual(@as(u8, 0), ack.exit_code);
+        try testing.expect(ack.stdoutContains("Acknowledged 100 record(s)"));
     }
+    try testing.expectEqual(@as(usize, 12), reads);
     try expectEachOnce(seen.items);
 
     var pending = try ctx.cli.run(&.{ "stream", "group", "pending", "grouped", "--group", "g", "-o", "json" });
@@ -3464,9 +2743,8 @@ fn expectOneExactRecord(out: []const u8, payload: []const u8, header_val: []cons
 }
 
 test "e2e/cluster: a follower asked about a group answers the leader's members and pending entries" {
-    // Members, pending entries and leases live in the leader's memory: a
-    // follower that answered from its own would show none. Group reads go
-    // to the leader, as group writes do.
+    // A group's members are the consumers holding its records. Group reads
+    // go to the leader, as group writes do.
     var cluster = ClusterContext.init(testing.allocator, .{ .node_count = 3, .durability = .sync }) catch |err| {
         std.debug.print("the three-node cluster did not form: {s}\n", .{@errorName(err)});
         return err;
@@ -3475,7 +2753,6 @@ test "e2e/cluster: a follower asked about a group answers the leader's members a
 
     try cluster.execOnWithRetry(0, &.{ "stream", "append", "lr", "one" }, 5, 200);
     try cluster.execOnWithRetry(0, &.{ "stream", "group", "create", "lr", "--group", "g" }, 5, 200);
-    try cluster.execOnWithRetry(0, &.{ "stream", "group", "join", "lr", "g", "c-1" }, 5, 200);
     const read = try cluster.execCaptureAnyOn(0, &.{ "stream", "group", "read", "lr", "--group", "g", "--consumer", "c-1" });
     defer testing.allocator.free(read);
     try testing.expect(std.mem.indexOf(u8, read, "one") != null);

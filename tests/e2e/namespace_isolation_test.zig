@@ -84,7 +84,7 @@ fn verifyStreams(ctx: *stdx.testing.TestContext, _: bool) !void {
 
 // ── Consumer groups and stream settings ─────────────────────────────────────
 
-const GroupRecord = struct { id: []const u8, data: []const u8 };
+const GroupRecord = struct { delivery: []const u8, data: []const u8 };
 
 /// Each namespace's group reads its first two records and acks the first,
 /// leaving one pending; and creates "cfg" with its own retention, then
@@ -104,21 +104,21 @@ fn writeGroups(ctx: *stdx.testing.TestContext) !void {
             defer records.deinit();
             try testing.expectEqual(1, records.value.len);
             try testing.expectEqualStrings(try payload(&buf, ns, k), records.value[0].data);
-            id.* = try testing.allocator.dupe(u8, records.value[0].id);
+            id.* = try testing.allocator.dupe(u8, records.value[0].delivery);
         }
         defer for (ids) |id| testing.allocator.free(id);
         const acked = try run(ctx, &.{ "stream", "group", "ack", "same", "--group", "g", "--consumer", "c", "--ids", ids[0], "-n", ns }, 0);
         defer testing.allocator.free(acked);
-        try testing.expectEqualStrings("Acknowledged 1 message(s)", acked);
+        try testing.expectEqualStrings("Acknowledged 1 record(s)", acked);
 
         try ctx.exec(&.{ "stream", "create", "cfg", "--retention", try std.fmt.bufPrint(&hours, "{d}", .{24 + i}), "-n", ns });
         try ctx.exec(&.{ "stream", "alter", "cfg", "--retention-count", try std.fmt.bufPrint(&keep, "{d}", .{10 + i}), "-n", ns });
     }
 }
 
-/// Before the restart each group has its member and the one pending
-/// record; after it, the group and its cursor (past the acked record) are
-/// what the log rebuilt, and its next read is its own namespace's rest.
+/// Each group has its member and the one record it still leases, before
+/// the restart and after it, as the log rebuilt them; and its next read is
+/// its own namespace's rest.
 /// The settings are each namespace's own either way.
 fn verifyGroups(ctx: *stdx.testing.TestContext, restarted: bool) !void {
     var buf: [64]u8 = undefined;
@@ -138,7 +138,7 @@ fn verifyGroups(ctx: *stdx.testing.TestContext, restarted: bool) !void {
         try testing.expectEqual((24 + i) * 3600, settings.value.retention.age_s);
         try testing.expectEqual(10 + i, settings.value.retention.count);
 
-        if (!restarted) {
+        {
             try testing.expectEqual(1, groups.value.groups[0].members);
             try testing.expectEqual(1, groups.value.groups[0].pending);
             const pending = try run(ctx, &.{ "stream", "group", "pending", "same", "--group", "g", "-o", "json", "-n", ns }, 0);
@@ -154,14 +154,15 @@ fn verifyGroups(ctx: *stdx.testing.TestContext, restarted: bool) !void {
             try testing.expectEqual(1, m.value.members.len);
             try testing.expectEqualStrings("c", m.value.members[0].id);
             try testing.expectEqual(1, m.value.members[0].pending);
-            continue;
         }
+        if (!restarted) continue;
         const rest = try run(ctx, &.{ "stream", "group", "read", "same", "--group", "g", "--consumer", "c", "--limit", "16", "-o", "json", "-n", ns }, 0);
         defer testing.allocator.free(rest);
         const records = try parse([]const GroupRecord, rest);
         defer records.deinit();
-        try testing.expectEqual(count(i) - 1, records.value.len);
-        for (records.value, 2..) |r, k| try testing.expectEqualStrings(try payload(&buf, ns, k), r.data);
+        // The second is still leased: the rest are the third on.
+        try testing.expectEqual(count(i) - 2, records.value.len);
+        for (records.value, 3..) |r, k| try testing.expectEqualStrings(try payload(&buf, ns, k), r.data);
     }
 }
 

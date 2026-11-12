@@ -271,21 +271,6 @@ pub fn list(
     return client.sendRequest(.stream_list, namespace, "", try base.walkValue(&value_buf, limit, cursor));
 }
 
-/// Join a consumer group
-pub fn groupJoin(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
-    var writer = FixedWireWriter(512).init();
-    try writer.writePair(u16, u16, group, consumer);
-
-    return client.sendRequest(.stream_group_join, namespace, stream, writer.bytes());
-}
-
 /// Read from a consumer group
 pub fn groupRead(
     client: *Client,
@@ -310,67 +295,61 @@ pub fn groupRead(
     return client.sendRequestWithOptions(.stream_group_read, namespace, stream, writer.bytes(), builder.getOptions());
 }
 
-/// Room for one read's worth of ids (a read carries at most
-/// MAX_STREAM_BATCH_RECORDS records, as whole appends) plus group and consumer.
-const ID_LIST_BYTES = 2 + 1024 + 2 + 1024 + 4 + 16 * @as(usize, @import("../../protocol/proto.zig").MAX_STREAM_BATCH_RECORDS);
+/// Room for one read's worth of records (at most a read's count) plus
+/// group, consumer and delivery.
+const ITEM_LIST_BYTES = 2 + 1024 + 2 + 1024 + 8 + 8 + 4 + 20 * @as(usize, @import("../../protocol/proto.zig").MAX_STREAM_READ_RECORDS);
 
-/// Acknowledge messages in a consumer group
-pub fn groupAck(
+/// A record a report names: its id, and the deliveries it came with.
+pub const GroupItem = struct { id: StreamID, deliveries: u32 };
+
+/// What a report is: an ack, a nack or a touch.
+pub const GroupReport = enum { ack, nack, touch };
+
+/// Options a nack takes.
+pub const NackOptions = struct { delay_ms: u64 = 0, dead: bool = false, error_text: []const u8 = "" };
+
+/// Report on one delivery's records: `[group][consumer][term:u64][index:u64]`
+/// `[count:u32]([ms:u64][seq:u64][deliveries:u32])*`. The answer is
+/// `[applied:u32][refused:u32]([ms:u64][seq:u64][why:u8])*`, a touch's after
+/// `[expires_at_ms:i64]`.
+pub fn groupReport(
     client: *Client,
     namespace: []const u8,
     stream: []const u8,
     group: []const u8,
     consumer: []const u8,
-    ids: []const StreamID,
+    kind: GroupReport,
+    term: u64,
+    index: u64,
+    items: []const GroupItem,
+    nack: NackOptions,
 ) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(ID_LIST_BYTES).init();
+    var writer = FixedWireWriter(ITEM_LIST_BYTES).init();
     try writer.writeLengthPrefixed(u16, group);
     try writer.writeLengthPrefixed(u16, consumer);
-    try writer.writeU32(@intCast(ids.len));
-    for (ids) |id| {
-        try writer.writeU64(id.timestamp_ms);
-        try writer.writeU64(id.sequence);
+    try writer.writeU64(term);
+    try writer.writeU64(index);
+    try writer.writeU32(@intCast(items.len));
+    for (items) |it| {
+        try writer.writeU64(it.id.timestamp_ms);
+        try writer.writeU64(it.id.sequence);
+        try writer.writeU32(it.deliveries);
     }
-
-    return client.sendRequest(.stream_group_ack, namespace, stream, writer.bytes());
-}
-
-/// Leave a consumer group
-pub fn groupLeave(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer]
-    var writer = FixedWireWriter(512).init();
-    try writer.writePair(u16, u16, group, consumer);
-
-    return client.sendRequest(.stream_group_leave, namespace, stream, writer.bytes());
-}
-
-/// Nack messages (release back for redelivery)
-pub fn groupNack(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-    ids: []const StreamID,
-) !Response {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(ID_LIST_BYTES).init();
-    try writer.writeLengthPrefixed(u16, group);
-    try writer.writeLengthPrefixed(u16, consumer);
-    try writer.writeU32(@intCast(ids.len));
-    for (ids) |id| {
-        try writer.writeU64(id.timestamp_ms);
-        try writer.writeU64(id.sequence);
+    var options_buf: [64 + 1024]u8 = undefined;
+    var builder = proto.OptionsBuilder.init(&options_buf);
+    if (kind == .nack) {
+        if (nack.delay_ms > 0) try builder.addU64(.delay_ms, nack.delay_ms);
+        if (nack.dead) try builder.addFlag(.dead);
+        if (nack.error_text.len > 0) try builder.addString(.error_text, nack.error_text);
     }
-    return client.sendRequest(.stream_group_nack, namespace, stream, writer.bytes());
+    const op: proto.OpCode = switch (kind) {
+        .ack => .stream_group_ack,
+        .nack => .stream_group_nack,
+        .touch => .stream_group_touch,
+    };
+    return client.sendRequestWithOptions(op, namespace, stream, writer.bytes(), builder.getOptions());
 }
+
 /// Get pending messages for a consumer group
 pub fn groupPending(
     client: *Client,
@@ -395,8 +374,8 @@ pub fn groupInfo(
     return client.sendRequest(.stream_group_info, namespace, stream, writer.bytes());
 }
 
-/// Get pending messages for a consumer group, optionally filtered to a
-/// single consumer's PEL. `consumer == null` returns the whole group's PEL.
+/// The records a consumer group has leased out, optionally only those one
+/// consumer holds. `consumer == null` returns every holder's.
 pub fn groupPendingForConsumer(
     client: *Client,
     namespace: []const u8,
@@ -414,44 +393,15 @@ pub fn groupPendingForConsumer(
     return client.sendRequest(.stream_group_pending, namespace, stream, writer.bytes());
 }
 
-/// Claim pending entries — cursor-based PEL scan.
-///
-/// Scans the group's PEL from `start_id` in StreamID order and claims up to
-/// `count` entries whose idle time ≥ `min_idle_ms` for `consumer`, returning
-/// the records (payload + headers) plus a trailing 16-byte next-cursor.
-///
-/// Drain own pending (reconnect): `min_idle_ms = 0`, `start_id = StreamID.MIN`.
-/// Steal from idle consumers (rebalance): `min_idle_ms > 0`.
-pub fn groupClaim(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-    min_idle_ms: u32,
-    start_id: StreamID,
-    count: u32,
-) !Response {
-    // Wire: [group_len:u16][group][consumer_len:u16][consumer]
-    //       [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32]
-    var writer = FixedWireWriter(512).init();
-    try writer.writeLengthPrefixed(u16, group);
-    try writer.writeLengthPrefixed(u16, consumer);
-    try writer.writeU32(min_idle_ms);
-    try writer.writeU64(start_id.timestamp_ms);
-    try writer.writeU64(start_id.sequence);
-    try writer.writeU32(count);
-
-    return client.sendRequest(.stream_group_claim, namespace, stream, writer.bytes());
-}
-
 /// Options for creating a consumer group
 pub const GroupCreateOptions = struct {
     namespace: []const u8,
     stream: []const u8,
     group: []const u8,
+    /// The lease: a record not acked this long is redelivered (5 s to 12 h).
     ack_timeout_ms: u32 = 30_000,
-    max_deliver: u8 = 10,
+    /// The attempts: a record is dead once nacked or expired this many times.
+    max_deliver: u8 = 5,
 };
 
 /// Create a consumer group with configuration
@@ -498,42 +448,6 @@ pub fn groupDelete(
 pub const TouchResult = struct {
     touched_count: u32,
 };
-
-/// Touch messages to extend their ack deadline
-/// This resets the delivered_at timestamp, giving the consumer more time to ack.
-pub fn groupTouch(
-    client: *Client,
-    namespace: []const u8,
-    stream: []const u8,
-    group: []const u8,
-    consumer: []const u8,
-    ids: []const StreamID,
-) !TouchResult {
-    // Wire format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][timestamp_ms:u64][sequence:u64]*
-    var writer = FixedWireWriter(ID_LIST_BYTES).init();
-    try writer.writePair(u16, u16, group, consumer);
-    try writer.writeU32(@intCast(ids.len));
-    for (ids) |id| {
-        try writer.writeU64(id.timestamp_ms);
-        try writer.writeU64(id.sequence);
-    }
-
-    var response = try client.sendRequest(.stream_group_touch, namespace, stream, writer.bytes());
-    defer response.deinit();
-
-    if (response.isError()) {
-        client.keepError(response);
-        return error.ServerError;
-    }
-
-    // Response is [touched_count:u32]
-    var result = TouchResult{ .touched_count = 0 };
-    if (response.data.len >= 4) {
-        result.touched_count = std.mem.readInt(u32, response.data[0..4], .little);
-    }
-
-    return result;
-}
 
 /// Create a stream with specified partition count
 pub fn create(

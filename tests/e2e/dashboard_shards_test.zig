@@ -91,12 +91,13 @@ test "e2e/dashboard: on many shards, lists hold every item of every namespace on
     // A stream's groups are its own: st-07's in each namespace, a group by
     // the namespace's name and one both have, with a member in it. A
     // default-namespace stream named like a namespace ("na") holds none of
-    // that namespace's groups, though their keys start with its name.
+    // that namespace's groups, though their keys start with its name. A
+    // member is a consumer holding a record.
     try ctx.exec(&.{ "stream", "append", "na", "x" });
     for (SPACES) |ns| {
         try ctx.exec(&.{ "stream", "group", "create", "st-07", "--group", ns, "-n", ns });
         try ctx.exec(&.{ "stream", "group", "create", "st-07", "--group", "both", "-n", ns });
-        try ctx.exec(&.{ "stream", "group", "join", "st-07", "both", "c-1", "-n", ns });
+        try ctx.exec(&.{ "stream", "group", "read", "st-07", "--group", "both", "--consumer", "c-1", "--limit", "1", "-n", ns });
     }
     for (SPACES, [_][]const u8{ "nb", "na" }) |ns, other| {
         var path_buf: [96]u8 = undefined;
@@ -114,7 +115,7 @@ test "e2e/dashboard: on many shards, lists hold every item of every namespace on
         var members = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/streams/st-07/groups/both/members?namespace={s}", .{ns}));
         defer members.deinit();
         try testing.expectEqual(@as(u16, 200), members.status);
-        try testing.expect(std.mem.indexOf(u8, members.body, "{\"members\":[{\"id\":\"c-1\",\"state\":\"active\",\"pending\":0,") != null);
+        try testing.expect(std.mem.indexOf(u8, members.body, "{\"members\":[{\"id\":\"c-1\",\"state\":\"active\",\"pending\":1,") != null);
         var none = try http.get(try std.fmt.bufPrint(&path_buf, "/api/v1/streams/st-07/groups/{s}/members?namespace={s}", .{ other, ns }));
         defer none.deinit();
         try testing.expectEqual(@as(u16, 404), none.status);

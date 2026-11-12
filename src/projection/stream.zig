@@ -1,18 +1,12 @@
-//! Stream Projection — per-stream record tracking + consumer groups with PEL.
+//! Stream Projection — per-stream record tracking.
 //!
 //! Each stream has its own StreamID space (timestamp-sequence, like Redis).
-//! Consumer groups use a Pending Entry List (PEL) for per-message ack/nack/claim.
+//! Consumer groups are the group machine's (`stream/group_machine.zig`),
+//! which reads a stream's records through `contract/streams.zig`.
 //!
 //! Data flow:
 //!   stream_append → per-stream ID gen → record StreamID → UAL index mapping
-//!   group_read    → deliver from last_delivered_id → add to PEL
-//!   group_ack     → remove from PEL by StreamID
-//!   group_nack    → mark for redelivery in PEL
-//!   group_claim   → transfer PEL entry to new consumer
 //!   stream_trim   → remove records with IDs below threshold
-//!
-//! Consumer group lifecycle:
-//!   create → join member → read (adds to PEL) → ack/nack → claim → leave → delete
 
 const std = @import("std");
 const NamespaceId = @import("../namespace/table.zig").Id;
@@ -37,7 +31,7 @@ pub fn streamKey(ns: NamespaceId, name: []const u8) StreamKey {
     return node_router.nsNameKey(ns, name);
 }
 
-/// The longest name key: an id, then a stream's name or `stream\x00group`.
+/// The longest name key: an id, then a stream's name.
 pub const MAX_NAME_KEY = 4 + MAX_QUALIFIED_KEY;
 
 /// A stream's name and settings key: its namespace's id, then its name.
@@ -51,21 +45,7 @@ pub fn nameKey(buf: *[MAX_NAME_KEY]u8, ns: NamespaceId, name: []const u8) ?[]con
     return buf[0 .. 4 + name.len];
 }
 
-/// A consumer group's key: the id, the stream's name, a NUL, the group's
-/// name. A group belongs to one stream, and neither name may hold a NUL,
-/// so the first NUL ends the stream's part. A cg_commit or cg_delete
-/// entry carries the key past the id; the entry carries the id itself.
-/// Null for names too long to be one.
-pub fn groupKey(buf: *[MAX_NAME_KEY]u8, ns: NamespaceId, stream: []const u8, group: []const u8) ?[]const u8 {
-    if (stream.len + 1 + group.len > MAX_QUALIFIED_KEY) return null;
-    buf[0..4].* = ns.bytes();
-    @memcpy(buf[4..][0..stream.len], stream);
-    buf[4 + stream.len] = 0;
-    @memcpy(buf[5 + stream.len ..][0..group.len], group);
-    return buf[0 .. 5 + stream.len + group.len];
-}
-
-/// The namespace a name or group key is in.
+/// The namespace a name key is in.
 pub fn keyNamespace(key: []const u8) NamespaceId {
     return .of(std.mem.readInt(u32, key[0..4], .big));
 }
@@ -122,56 +102,6 @@ pub const TrimBound = union(enum) {
     }
 };
 pub const StreamIdGenerator = stream_id_mod.StreamIdGenerator;
-
-/// Default consumer-group ack timeout: a delivered-but-unacked entry idle this
-/// long is made ready by the background sweeper: the group's next read serves it.
-pub const DEFAULT_ACK_TIMEOUT_MS: u32 = 30_000;
-/// Default max delivery attempts before the sweeper drops a poison entry.
-pub const DEFAULT_MAX_DELIVER: u8 = 10;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Group Member
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const MemberState = enum(u8) {
-    active,
-    leaving,
-};
-
-pub const Member = struct {
-    /// Member identifier (e.g., consumer instance ID).
-    id: []const u8,
-    /// Timestamp when joined.
-    joined_at_ns: u64,
-    /// Current state.
-    state: MemberState,
-    /// Number of PEL entries assigned to this consumer.
-    pending_count: u32 = 0,
-    /// Last time this consumer was active (ms since epoch).
-    last_active_ms: u64 = 0,
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PEL (Pending Entry List) — tracks delivered-but-unacked messages
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const PendingEntry = struct {
-    /// The StreamID of this pending message.
-    id: StreamID,
-    /// Consumer currently owning this entry.
-    consumer: []const u8,
-    /// When first delivered (ms since epoch).
-    delivered_at_ms: u64,
-    /// Most recent delivery/claim time (ms since epoch).
-    last_delivery_ms: u64,
-    /// How many times delivered.
-    delivery_count: u32,
-    /// Nacked, or idle past the group's ack timeout: the group's next read
-    /// serves it, to whichever consumer reads, before any new record.
-    ready: Ready = .no,
-
-    pub const Ready = enum(u8) { no, nacked, expired };
-};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Per-Stream Record — maps StreamID → UAL index
@@ -481,6 +411,16 @@ pub const StreamState = struct {
         return n;
     }
 
+    /// The append holding record `id`, if the stream still does.
+    pub fn appendOf(self: *const StreamState, id: StreamID) ?StreamRecord {
+        const items = self.records.items;
+        var i = self.lowerBound(id);
+        if (i < items.len and items[i].id.eql(id)) return items[i];
+        if (i == 0) return null;
+        i -= 1;
+        return if (lastRecordOf(items[i]).lessThan(id)) null else items[i];
+    }
+
     /// Read the entries holding records after `after_id` (exclusive).
     pub fn readAfter(self: *const StreamState, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
         const items = self.records.items;
@@ -503,11 +443,6 @@ pub const StreamState = struct {
     /// order; any ID not currently in the stream (trimmed, never appended, or
     /// belonging to a different stream) is silently skipped. Returns the
     /// number of records written to `buf`.
-    ///
-    /// Used by `stream_group_claim`: the projection's `ConsumerGroup.autoclaim`
-    /// returns just the IDs it claimed, and the wire handler resolves them to
-    /// full records (payload + headers) in one round-trip before sending the
-    /// response. Avoids a sparse `readRange` that would pull in unrelated IDs.
     pub fn readByIds(self: *const StreamState, ids: []const StreamID, buf: []StreamRecord) usize {
         const items = self.records.items;
         if (items.len == 0) return 0;
@@ -607,518 +542,6 @@ pub const StreamState = struct {
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Consumer Group
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const ConsumerGroup = struct {
-    /// Group name (owned).
-    name: []const u8,
-    /// Members by ID.
-    members: std.StringHashMap(Member),
-    /// When the group was created.
-    created_at_ns: u64,
-    /// Allocator for member management.
-    allocator: Allocator,
-    /// PEL — StreamID.order() → PendingEntry. Tracks delivered-but-unacked
-    /// messages. Array-backed so iteration order is stable for cursor-based
-    /// scans (`autoclaim` paginates with a `start_id` cursor). Inserts happen
-    /// at delivery time in monotonic StreamID order (`groupDeliver` reads
-    /// past `last_delivered_id`); removals use `fetchOrderedRemove` so the
-    /// order invariant is preserved.
-    pel: std.AutoArrayHashMapUnmanaged(u128, PendingEntry),
-    /// Highest StreamID delivered to any consumer in this group.
-    last_delivered_id: StreamID,
-    /// Highest ack-floor already persisted via a `cg_commit` UAL entry. Used to
-    /// debounce commits: a `cg_commit` is only emitted when the floor advances
-    /// past this. In-memory only (not serialized / not recovered) — on restart
-    /// it resets to MIN, so the first post-restart ack re-persists the floor.
-    last_committed_floor: StreamID = StreamID.MIN,
-    /// Idle time (ms) after which the background sweeper makes a pending
-    /// entry ready for the group's next read. 0 = sweeper disabled for this group.
-    /// Durable via cg_commit; set at group create or by
-    /// stream_group_configure_sweeper.
-    ack_timeout_ms: u32 = DEFAULT_ACK_TIMEOUT_MS,
-    /// Max delivery attempts before the sweeper drops an entry from the PEL
-    /// (poison-message guard). 0 = unlimited.
-    max_deliver: u8 = DEFAULT_MAX_DELIVER,
-
-    pub fn init(allocator: Allocator, name: []const u8, created_at_ns: u64) !ConsumerGroup {
-        const owned_name = try allocator.dupe(u8, name);
-        return .{
-            .name = owned_name,
-            .members = std.StringHashMap(Member).init(allocator),
-            .created_at_ns = created_at_ns,
-            .allocator = allocator,
-            .pel = .empty,
-            .last_delivered_id = StreamID.MIN,
-        };
-    }
-
-    /// The durable recovery cursor for this group: the highest StreamID such
-    /// that every record at or before it is acked. On restart we set
-    /// `last_delivered_id` to this so `groupDeliver` redelivers exactly the
-    /// genuinely-unacked tail (and never-delivered records), and skips acked
-    /// records — at-least-once across restart.
-    ///
-    /// The PEL holds delivered-but-unacked entries in ascending StreamID order
-    /// (delivery is monotonic; `orderedRemove` preserves order), so the lowest
-    /// PEL key is the first unacked record and its predecessor is the floor.
-    /// With an empty PEL everything delivered is acked, so the floor is
-    /// `last_delivered_id`.
-    pub fn ackFloor(self: *const ConsumerGroup) StreamID {
-        if (self.pel.count() == 0) return self.last_delivered_id;
-        const lowest_pending = self.pel.keys()[0];
-        if (lowest_pending == 0) return StreamID.MIN;
-        return StreamID.fromOrder(lowest_pending - 1);
-    }
-
-    pub fn deinit(self: *ConsumerGroup) void {
-        var it = self.members.iterator();
-        while (it.next()) |kv| {
-            self.allocator.free(@constCast(kv.value_ptr.id));
-        }
-        self.members.deinit();
-        self.pel.deinit(self.allocator);
-        self.allocator.free(@constCast(self.name));
-    }
-
-    /// Add a member to the group. Returns true if new, false if already exists.
-    pub fn join(self: *ConsumerGroup, member_id: []const u8, now_ns: u64) !bool {
-        const gop = try self.members.getOrPut(member_id);
-        if (gop.found_existing) return false;
-        const owned_id = try self.allocator.dupe(u8, member_id);
-        gop.key_ptr.* = owned_id;
-        gop.value_ptr.* = .{
-            .id = owned_id,
-            .joined_at_ns = now_ns,
-            .state = .active,
-        };
-        return true;
-    }
-
-    /// Remove a member from the group. Returns true if removed.
-    ///
-    /// If the member still owns PEL entries, we keep the member record (and its
-    /// owned `id` string) alive and just mark it `.leaving` — PEL entries point
-    /// their `consumer` slice at this owned string (see `internConsumer`), so
-    /// freeing it now would dangle. The record is reclaimed once the last
-    /// pending entry is acked/dropped (via `reapLeftMember`).
-    pub fn leave(self: *ConsumerGroup, member_id: []const u8) bool {
-        if (self.members.getPtr(member_id)) |m| {
-            if (m.pending_count > 0) {
-                m.state = .leaving;
-                return true;
-            }
-        }
-        if (self.members.fetchRemove(member_id)) |kv| {
-            self.allocator.free(@constCast(kv.value.id));
-            return true;
-        }
-        return false;
-    }
-
-    /// Ensure `consumer_id` is a member and return the group-owned copy of its
-    /// id. PEL entries store this owned slice as their `consumer` so it stays
-    /// valid after the request buffer that carried `consumer_id` is freed.
-    /// Best-effort: on OOM falls back to the caller's slice (dangle only under
-    /// allocation failure, which is already fatal elsewhere).
-    fn internConsumer(self: *ConsumerGroup, consumer_id: []const u8) []const u8 {
-        if (self.members.getPtr(consumer_id)) |m| return m.id;
-        _ = self.join(consumer_id, 0) catch return consumer_id;
-        if (self.members.getPtr(consumer_id)) |m| return m.id;
-        return consumer_id;
-    }
-
-    /// Drop a `.leaving` member once it has no pending entries left.
-    fn reapLeftMember(self: *ConsumerGroup, member_id: []const u8) void {
-        if (self.members.getPtr(member_id)) |m| {
-            if (m.state == .leaving and m.pending_count == 0) {
-                if (self.members.fetchRemove(member_id)) |kv| {
-                    self.allocator.free(@constCast(kv.value.id));
-                }
-            }
-        }
-    }
-
-    pub fn memberCount(self: *const ConsumerGroup) usize {
-        return self.members.count();
-    }
-
-    // ── PEL Operations ──────────────────────────────────────────────────
-
-    /// Deliver records to a consumer — adds them to the PEL.
-    /// `records` are the StreamRecords being delivered. Returns count added to PEL.
-    pub fn deliver(self: *ConsumerGroup, consumer_id: []const u8, records: []const StreamRecord, now_ms: u64) !u32 {
-        var added: u32 = 0;
-        const owned_consumer = self.internConsumer(consumer_id);
-        for (records) |rec| {
-            const key = rec.id.order();
-            const gop = try self.pel.getOrPut(self.allocator, key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .{
-                    .id = rec.id,
-                    .consumer = owned_consumer,
-                    .delivered_at_ms = now_ms,
-                    .last_delivery_ms = now_ms,
-                    .delivery_count = 1,
-                };
-                added += 1;
-                if (self.members.getPtr(consumer_id)) |m| {
-                    m.pending_count += 1;
-                    m.last_active_ms = now_ms;
-                }
-            }
-        }
-        // Advance last_delivered_id past the whole last append, so the next
-        // read starts after it.
-        if (records.len > 0) {
-            const last = lastRecordOf(records[records.len - 1]);
-            if (last.greaterThan(self.last_delivered_id)) {
-                self.last_delivered_id = last;
-            }
-        }
-        return added;
-    }
-
-    /// Acknowledge messages — remove from PEL. Returns count acked.
-    ///
-    /// Uses `fetchOrderedRemove` (not `fetchSwapRemove`) so the PEL stays
-    /// in insertion order, which equals StreamID order since deliveries
-    /// happen monotonically. `autoclaim`'s cursor-based scan depends on it.
-    pub fn ack(self: *ConsumerGroup, ids: []const StreamID) u32 {
-        var acked: u32 = 0;
-        for (ids) |id| {
-            const key = id.order();
-            if (self.pel.fetchOrderedRemove(key)) |kv| {
-                if (self.members.getPtr(kv.value.consumer)) |m| {
-                    if (m.pending_count > 0) m.pending_count -= 1;
-                }
-                // Reclaim a member that left while it still had pending entries.
-                self.reapLeftMember(kv.value.consumer);
-                acked += 1;
-            }
-        }
-        return acked;
-    }
-
-    /// Negative-acknowledge messages: each is served again by the group's
-    /// next read, or dropped if it has been delivered `max_deliver` times.
-    /// The count goes up when an entry is delivered, not here.
-    pub fn nack(self: *ConsumerGroup, ids: []const StreamID) u32 {
-        var nacked: u32 = 0;
-        for (ids) |id| {
-            const key = id.order();
-            const pe = self.pel.getPtr(key) orelse continue;
-            if (self.exhausted(pe)) {
-                self.dropEntry(key);
-            } else {
-                pe.ready = .nacked;
-            }
-            nacked += 1;
-        }
-        return nacked;
-    }
-
-    /// Delivered as many times as the group allows.
-    fn exhausted(self: *const ConsumerGroup, pe: *const PendingEntry) bool {
-        return self.max_deliver > 0 and pe.delivery_count >= self.max_deliver;
-    }
-
-    /// Remove one pending entry, as an ack does.
-    fn dropEntry(self: *ConsumerGroup, key: u128) void {
-        const kv = self.pel.fetchOrderedRemove(key) orelse return;
-        if (self.members.getPtr(kv.value.consumer)) |m| {
-            if (m.pending_count > 0) m.pending_count -= 1;
-        }
-        self.reapLeftMember(kv.value.consumer);
-    }
-
-    /// The ready entries a read would serve, oldest first, without changing
-    /// them: the read builds its reply before anything moves.
-    pub fn peekReady(self: *const ConsumerGroup, out: []StreamID) usize {
-        var n: usize = 0;
-        var it = self.pel.iterator();
-        while (it.next()) |kv| {
-            if (n >= out.len) break;
-            if (kv.value_ptr.ready != .no) {
-                out[n] = kv.value_ptr.id;
-                n += 1;
-            }
-        }
-        return n;
-    }
-
-    /// Deliver ready entries (from `peekReady`) to `consumer`.
-    pub fn serveReady(self: *ConsumerGroup, consumer: []const u8, ids: []const StreamID, now_ms: u64) void {
-        for (ids) |id| {
-            const pe = self.pel.getPtr(id.order()) orelse continue;
-            if (pe.ready == .no) continue;
-            if (!std.mem.eql(u8, pe.consumer, consumer)) {
-                if (self.members.getPtr(pe.consumer)) |m| {
-                    if (m.pending_count > 0) m.pending_count -= 1;
-                }
-                pe.consumer = self.internConsumer(consumer);
-                if (self.members.getPtr(consumer)) |m| m.pending_count += 1;
-            }
-            pe.ready = .no;
-            pe.delivery_count += 1;
-            pe.last_delivery_ms = now_ms;
-        }
-    }
-
-    /// Drop pending entries whose records are gone (trimmed): they can never
-    /// be delivered again.
-    pub fn dropPending(self: *ConsumerGroup, ids: []const StreamID) void {
-        for (ids) |id| self.dropEntry(id.order());
-    }
-
-    /// Claim specific PEL entries for a new consumer. Returns count claimed.
-    pub fn claim(self: *ConsumerGroup, ids: []const StreamID, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64) u32 {
-        var claimed: u32 = 0;
-        for (ids) |id| {
-            const key = id.order();
-            if (self.pel.getPtr(key)) |pe| {
-                const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
-                if (idle >= min_idle_ms) {
-                    // Decrement old consumer count
-                    if (self.members.getPtr(pe.consumer)) |m| {
-                        if (m.pending_count > 0) m.pending_count -= 1;
-                    }
-                    pe.consumer = self.internConsumer(new_consumer);
-                    pe.last_delivery_ms = now_ms;
-                    pe.delivery_count += 1;
-                    pe.ready = .no;
-                    // Increment new consumer count
-                    if (self.members.getPtr(new_consumer)) |m| {
-                        m.pending_count += 1;
-                    }
-                    claimed += 1;
-                }
-            }
-        }
-        return claimed;
-    }
-
-    /// Result of an `autoclaim` cursor scan.
-    pub const ClaimResult = struct {
-        /// Number of entries claimed (written to `out`).
-        count: u32,
-        /// Cursor to pass as `start_id` on the next call. `StreamID.MAX` means
-        /// the PEL has been fully scanned (no more entries past this batch).
-        next_cursor: StreamID,
-    };
-
-    /// Auto-claim PEL entries for a consumer, scanning in StreamID order from
-    /// `start_id`. Writes claimed IDs to `out`; returns the count plus a cursor
-    /// for the next page.
-    ///
-    /// Single cursor-based scan covers two use cases:
-    ///   * **Drain own pending** (reconnect): `new_consumer = me`, `min_idle_ms = 0`.
-    ///     Re-delivers entries this consumer already owns (bumps `delivery_count`,
-    ///     touches `last_delivery_ms`). Same-owner is **not** skipped — that's
-    ///     the whole point of the reconnect drain.
-    ///   * **Steal from idle consumers** (rebalance): `min_idle_ms > 0`.
-    ///     Transfers ownership to `new_consumer` for entries idle ≥ `min_idle_ms`.
-    ///     Entries that don't meet the idle threshold are passed over and the
-    ///     cursor advances past them (a scan covers each entry once).
-    ///
-    /// Relies on the array-backed PEL iterating in insertion order (== StreamID
-    /// order, since deliveries are monotonic and acks use `fetchOrderedRemove`).
-    pub fn autoclaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) ClaimResult {
-        return self.scanClaim(new_consumer, min_idle_ms, now_ms, start_id, max_count, out, true);
-    }
-
-    fn scanClaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID, do_claim: bool) ClaimResult {
-        var result_count: u32 = 0;
-        const start_order = start_id.order();
-        var next_cursor = StreamID.MAX;
-        var it = self.pel.iterator();
-        while (it.next()) |kv| {
-            if (kv.key_ptr.* < start_order) continue;
-            // Stop once the batch is full; the next unprocessed key becomes the
-            // cursor so the caller resumes exactly where we left off.
-            if (result_count >= max_count or result_count >= out.len) {
-                next_cursor = StreamID.fromOrder(kv.key_ptr.*);
-                break;
-            }
-            const pe = kv.value_ptr;
-            const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
-            if (idle >= min_idle_ms) {
-                if (do_claim) self.claimOne(pe, new_consumer, now_ms);
-                out[result_count] = pe.id;
-                result_count += 1;
-            }
-        }
-        return .{ .count = result_count, .next_cursor = next_cursor };
-    }
-
-    /// `autoclaim`'s page, claiming nothing: the caller claims what it can
-    /// answer with (`claimIds`).
-    pub fn peekClaim(self: *ConsumerGroup, new_consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) ClaimResult {
-        return self.scanClaim(new_consumer, min_idle_ms, now_ms, start_id, max_count, out, false);
-    }
-
-    /// Claim these pending entries for `new_consumer`.
-    pub fn claimIds(self: *ConsumerGroup, ids: []const StreamID, new_consumer: []const u8, now_ms: u64) void {
-        for (ids) |id| if (self.pel.getPtr(id.order())) |pe| self.claimOne(pe, new_consumer, now_ms);
-    }
-
-    fn claimOne(self: *ConsumerGroup, pe: *PendingEntry, new_consumer: []const u8, now_ms: u64) void {
-        const same_owner = std.mem.eql(u8, pe.consumer, new_consumer);
-        if (!same_owner) {
-            if (self.members.getPtr(pe.consumer)) |m| {
-                if (m.pending_count > 0) m.pending_count -= 1;
-            }
-            pe.consumer = self.internConsumer(new_consumer);
-            if (self.members.getPtr(new_consumer)) |m| {
-                m.pending_count += 1;
-            }
-        }
-        pe.last_delivery_ms = now_ms;
-        pe.delivery_count += 1;
-        pe.ready = .no;
-    }
-
-    /// Touch pending entries — reset their idle timer.
-    /// Touch pending entries — reset their idle timer. An entry that went
-    /// ready by expiring goes back to the consumer touching it, if it is
-    /// that consumer's: it is still being worked on.
-    pub fn touch(self: *ConsumerGroup, ids: []const StreamID, consumer: []const u8, now_ms: u64) u32 {
-        var touched: u32 = 0;
-        for (ids) |id| {
-            const key = id.order();
-            if (self.pel.getPtr(key)) |pe| {
-                pe.last_delivery_ms = now_ms;
-                if (pe.ready == .expired and std.mem.eql(u8, pe.consumer, consumer)) pe.ready = .no;
-                touched += 1;
-            }
-        }
-        return touched;
-    }
-
-    /// Get pending entries, optionally for a specific consumer.
-    pub fn getPending(self: *const ConsumerGroup, consumer_id: ?[]const u8, buf: []PendingEntry) usize {
-        var n: usize = 0;
-        var it = self.pel.iterator();
-        while (it.next()) |kv| {
-            if (n >= buf.len) break;
-            const pe = kv.value_ptr;
-            if (consumer_id) |cid| {
-                if (!std.mem.eql(u8, pe.consumer, cid)) continue;
-            }
-            buf[n] = pe.*;
-            n += 1;
-        }
-        return n;
-    }
-
-    /// Number of entries in the PEL.
-    pub fn pelCount(self: *const ConsumerGroup) usize {
-        return self.pel.count();
-    }
-
-    /// Update sweeper config. A value of `null` leaves that field unchanged.
-    pub fn configure(self: *ConsumerGroup, ack_timeout_ms: ?u32, max_deliver: ?u8) void {
-        if (ack_timeout_ms) |v| self.ack_timeout_ms = v;
-        if (max_deliver) |v| self.max_deliver = v;
-        // A ready entry already delivered as often as a lowered limit allows
-        // is dropped now, not served once more.
-        var i: usize = 0;
-        while (i < self.pel.count()) {
-            const pe = &self.pel.values()[i];
-            if (pe.ready != .no and self.exhausted(pe)) {
-                self.dropEntry(self.pel.keys()[i]);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    /// Result of a sweeper pass over one group's PEL.
-    pub const SweepResult = struct {
-        /// Entries idle ≥ ack_timeout_ms made ready for the group's next read.
-        made_ready: u32 = 0,
-        /// Entries dropped from the PEL for exceeding max_deliver (poison).
-        dropped: u32 = 0,
-    };
-
-    /// Background-sweeper pass: for each PEL entry idle ≥ `ack_timeout_ms`,
-    /// either drop it (delivered max_deliver times, poison guard) or make it
-    /// ready for the group's next read. No-op when ack_timeout_ms == 0.
-    ///
-    /// Dropped entries are removed with `fetchOrderedRemove` to preserve PEL
-    /// ordering (autoclaim's cursor invariant). Returns counts.
-    pub fn sweep(self: *ConsumerGroup, now_ms: u64) SweepResult {
-        if (self.ack_timeout_ms == 0) return .{};
-        var res: SweepResult = .{};
-
-        // Collect drop targets first; mutating the array map during iteration
-        // would invalidate the iterator.
-        var drop_buf: [256]u128 = undefined;
-        var drop_n: usize = 0;
-
-        var it = self.pel.iterator();
-        while (it.next()) |kv| {
-            const pe = kv.value_ptr;
-            const idle = if (now_ms > pe.last_delivery_ms) now_ms - pe.last_delivery_ms else 0;
-            if (idle < self.ack_timeout_ms) continue;
-
-            if (self.exhausted(pe)) {
-                if (drop_n < drop_buf.len) {
-                    drop_buf[drop_n] = kv.key_ptr.*;
-                    drop_n += 1;
-                }
-            } else if (pe.ready == .no) {
-                // Expired: the group's next read serves it.
-                pe.ready = .expired;
-                res.made_ready += 1;
-            }
-        }
-
-        for (drop_buf[0..drop_n]) |key| {
-            if (self.pel.contains(key)) res.dropped += 1;
-            self.dropEntry(key);
-        }
-        return res;
-    }
-};
-
-/// Durable consumer-group state carried by a `cg_commit` UAL entry: the
-/// recovery cursor (ack-floor) plus sweeper config. The group name travels in
-/// the CommandPayload key, so it is not part of this value.
-///
-/// Wire value layout (little-endian): version(1) + floor_ts(8) + floor_seq(8)
-/// + ack_timeout_ms(4) + max_deliver(1) = 22 bytes.
-pub const GroupCommit = struct {
-    pub const WIRE_LEN = 22;
-    const VERSION: u8 = 1;
-
-    floor: StreamID,
-    ack_timeout_ms: u32,
-    max_deliver: u8,
-
-    pub fn encode(self: GroupCommit, buf: *[WIRE_LEN]u8) void {
-        buf[0] = VERSION;
-        std.mem.writeInt(u64, buf[1..9], self.floor.timestamp_ms, .little);
-        std.mem.writeInt(u64, buf[9..17], self.floor.sequence, .little);
-        std.mem.writeInt(u32, buf[17..21], self.ack_timeout_ms, .little);
-        buf[21] = self.max_deliver;
-    }
-
-    pub fn decode(data: []const u8) ?GroupCommit {
-        if (data.len < WIRE_LEN or data[0] != VERSION) return null;
-        return .{
-            .floor = .{
-                .timestamp_ms = std.mem.readInt(u64, data[1..9], .little),
-                .sequence = std.mem.readInt(u64, data[9..17], .little),
-            },
-            .ack_timeout_ms = std.mem.readInt(u32, data[17..21], .little),
-            .max_deliver = data[21],
-        };
-    }
-};
-
 /// Stream metadata — partition count, retention policy, and other per-stream config.
 pub const StreamMetadata = struct {
     partition_count: u32 = 1,
@@ -1142,9 +565,6 @@ pub const StreamMetadata = struct {
 pub const StreamProjection = struct {
     allocator: Allocator,
 
-    /// Consumer groups by `groupKey`.
-    groups: std.StringHashMap(ConsumerGroup),
-
     /// Registered streams, by `nameKey` (for listing).
     stream_names: std.StringHashMap(void),
 
@@ -1160,16 +580,12 @@ pub const StreamProjection = struct {
     pub const Stats = struct {
         appended: u64 = 0,
         reads: u64 = 0,
-        commits: u64 = 0,
-        groups_created: u64 = 0,
-        groups_deleted: u64 = 0,
         trimmed: u64 = 0,
     };
 
     pub fn init(allocator: Allocator) StreamProjection {
         return .{
             .allocator = allocator,
-            .groups = std.StringHashMap(ConsumerGroup).init(allocator),
             .stream_names = std.StringHashMap(void).init(allocator),
             .stream_metadata = std.StringHashMap(StreamMetadata).init(allocator),
             .streams = std.AutoHashMap(StreamKey, StreamState).init(allocator),
@@ -1178,12 +594,6 @@ pub const StreamProjection = struct {
     }
 
     pub fn deinit(self: *StreamProjection) void {
-        // Free consumer groups
-        var git = self.groups.iterator();
-        while (git.next()) |kv| {
-            kv.value_ptr.deinit();
-        }
-        self.groups.deinit();
         // Free per-stream state
         var sit = self.streams.iterator();
         while (sit.next()) |kv| {
@@ -1207,12 +617,6 @@ pub const StreamProjection = struct {
     /// Reset the stream projection to empty state.
     /// Clears every stream on this shard, as a restart would.
     pub fn reset(self: *StreamProjection) void {
-        // Free consumer groups
-        var git = self.groups.iterator();
-        while (git.next()) |kv| {
-            kv.value_ptr.deinit();
-        }
-        self.groups.clearAndFree();
         // Free per-stream state
         var sit = self.streams.iterator();
         while (sit.next()) |kv| {
@@ -1234,58 +638,7 @@ pub const StreamProjection = struct {
         self.stats = .{};
     }
 
-    // ─── Consumer Group operations ─────────────────────────────────────────
-
-    /// Create a consumer group. Returns error.AlreadyExists if name taken.
-    pub fn createGroup(self: *StreamProjection, name: []const u8, now_ns: u64) !void {
-        const gop = try self.groups.getOrPut(name);
-        if (gop.found_existing) return error.AlreadyExists;
-
-        var group = try ConsumerGroup.init(self.allocator, name, now_ns);
-        gop.key_ptr.* = group.name;
-        gop.value_ptr.* = group;
-        _ = &group;
-        self.stats.groups_created += 1;
-    }
-
-    /// Delete a consumer group.
-    pub fn deleteGroup(self: *StreamProjection, name: []const u8) bool {
-        if (self.groups.fetchRemove(name)) |kv| {
-            var group = kv.value;
-            group.deinit();
-            self.stats.groups_deleted += 1;
-            return true;
-        }
-        return false;
-    }
-
-    /// Get a consumer group by name.
-    pub fn getGroup(self: *StreamProjection, name: []const u8) ?*ConsumerGroup {
-        return self.groups.getPtr(name);
-    }
-
-    /// Join a member to a consumer group.
-    pub fn joinGroup(self: *StreamProjection, group_name: []const u8, member_id: []const u8, now_ns: u64) !bool {
-        if (self.groups.getPtr(group_name)) |group| {
-            return try group.join(member_id, now_ns);
-        }
-        return error.GroupNotFound;
-    }
-
-    /// Remove a member from a consumer group.
-    pub fn leaveGroup(self: *StreamProjection, group_name: []const u8, member_id: []const u8) !bool {
-        if (self.groups.getPtr(group_name)) |group| {
-            return group.leave(member_id);
-        }
-        return error.GroupNotFound;
-    }
-
-    /// Count of consumer groups.
-    pub fn groupCount(self: *const StreamProjection) usize {
-        return self.groups.count();
-    }
-
-    // ─── PEL-aware Stream Operations ───────────────────────────────────────
+    // ─── Per-stream state ──────────────────────────────────────────────────
 
     /// Get or create per-stream state for a given name hash.
     pub fn getOrCreateStream(self: *StreamProjection, key: StreamKey) !*StreamState {
@@ -1322,8 +675,7 @@ pub const StreamProjection = struct {
     }
 
     /// Resolve specific StreamIDs back to records (preserves input order, skips
-    /// missing IDs). Used by `stream_group_claim` to turn claimed PEL IDs into
-    /// full records (payload + headers) for the wire response.
+    /// missing IDs).
     pub fn readStreamByIds(self: *StreamProjection, key: StreamKey, ids: []const StreamID, buf: []StreamRecord) usize {
         const ss = self.streams.getPtr(key) orelse return 0;
         const n = ss.readByIds(ids, buf);
@@ -1347,6 +699,12 @@ pub const StreamProjection = struct {
     pub fn streamRemovedThrough(self: *const StreamProjection, key: StreamKey) StreamID {
         const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         return ss.removed_through;
+    }
+
+    /// The append holding a stream's record `id`, if it still does.
+    pub fn streamAppendOf(self: *const StreamProjection, key: StreamKey, id: StreamID) ?StreamRecord {
+        const ss = self.streams.getPtr(key) orelse return null;
+        return ss.appendOf(id);
     }
 
     /// The ids of a stream's records after `after_id`, one per record.
@@ -1426,17 +784,8 @@ pub const StreamProjection = struct {
     }
 
     /// Delete a stream entirely: drop its records (by `key`) plus its name
-    /// registry and metadata entries (by `name_key`, its `nameKey`), and
-    /// cascade-delete its consumer groups. Mirror of `registerStream` /
-    /// `trimStream`.
-    ///
-    /// Consumer groups are per-(stream, group): a group's key is the
-    /// stream's name key, a NUL, then the group (`groupKey`), so every group
-    /// whose key has `name_key ++ "\x00"` as a prefix belongs to this stream
-    /// and is removed with it. Because `deleteStream` runs on all four
-    /// rebuild paths (leader live, follower replication, restart replay,
-    /// projection apply), this cleanup is durable and replicated without a
-    /// separate cg_delete entry. Returns true if the stream existed.
+    /// registry and metadata entries (by `name_key`, its `nameKey`). Mirror
+    /// of `registerStream` / `trimStream`. Returns true if the stream existed.
     pub fn deleteStream(self: *StreamProjection, key: StreamKey, name_key: []const u8) bool {
         var existed = false;
         if (self.streams.fetchRemove(key)) |kv| {
@@ -1453,170 +802,7 @@ pub const StreamProjection = struct {
             existed = true;
         }
 
-        // Cascade-delete this stream's consumer groups. Scan-and-remove one at a
-        // time: removing while iterating would invalidate the iterator, and group
-        // counts per stream are small, so the rescan cost is negligible on this
-        // rare path. Each matching key's backing memory is owned by its group and
-        // freed by `group.deinit()`, so it must not be touched after removal.
-        while (true) {
-            var match: ?[]const u8 = null;
-            var it = self.groups.keyIterator();
-            while (it.next()) |k| {
-                const gk = k.*;
-                if (gk.len > name_key.len and
-                    gk[name_key.len] == 0 and
-                    std.mem.startsWith(u8, gk, name_key))
-                {
-                    match = gk;
-                    break;
-                }
-            }
-            const gk = match orelse break;
-            if (self.groups.fetchRemove(gk)) |kv| {
-                var group = kv.value;
-                group.deinit();
-                self.stats.groups_deleted += 1;
-            }
-        }
         return existed;
-    }
-
-    /// Deliver records from a named stream to a consumer group.
-    /// Reads `count` records after the group's last_delivered_id, adds to PEL.
-    /// Returns the StreamRecords delivered (fills buf, returns count).
-    /// The whole appends a group read of `count` records would deliver,
-    /// delivering none: the reply is built from these before the pending
-    /// list takes them.
-    pub fn groupPeek(self: *StreamProjection, group_name: []const u8, key: StreamKey, count: usize, buf: []StreamRecord) !usize {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        const ss = self.streams.getPtr(key) orelse return 0;
-        const read_n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
-        return wholeEntriesWithin(buf[0..read_n], count);
-    }
-
-    /// Put `records` (from `groupPeek`) on the group's pending list, and
-    /// move its cursor to `through` (the last record peeked), which may pass
-    /// appends left off the list.
-    pub fn groupDeliverRecords(self: *StreamProjection, group_name: []const u8, consumer_id: []const u8, records: []const StreamRecord, through: StreamID, now_ms: u64) !void {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        if (records.len > 0) _ = try group.deliver(consumer_id, records, now_ms);
-        if (through.greaterThan(group.last_delivered_id)) group.last_delivered_id = through;
-    }
-
-    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, key: StreamKey, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
-        const n = try self.groupPeek(group_name, key, count, buf);
-        const through = if (n > 0) lastRecordOf(buf[n - 1]) else StreamID.MIN;
-        try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], through, now_ms);
-        return n;
-    }
-
-    /// Acknowledge messages in a consumer group by StreamID.
-    pub fn groupAck(self: *StreamProjection, group_name: []const u8, ids: []const StreamID) !u32 {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.ack(ids);
-    }
-
-    /// Negative-acknowledge messages in a consumer group (mark for redelivery).
-    pub fn groupNack(self: *StreamProjection, group_name: []const u8, ids: []const StreamID) !u32 {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.nack(ids);
-    }
-
-    /// The group's ready entries, oldest first, unchanged (see `ConsumerGroup.peekReady`).
-    pub fn groupPeekReady(self: *StreamProjection, group_name: []const u8, out: []StreamID) !usize {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.peekReady(out);
-    }
-
-    /// Deliver ready entries to `consumer`, and drop the ones whose records
-    /// are gone.
-    pub fn groupServeReady(self: *StreamProjection, group_name: []const u8, consumer: []const u8, served: []const StreamID, gone: []const StreamID, now_ms: u64) !void {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        group.serveReady(consumer, served, now_ms);
-        group.dropPending(gone);
-    }
-
-    /// Claim specific PEL entries for a new consumer.
-    pub fn groupClaim(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, min_idle_ms: u64, now_ms: u64) !u32 {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.claim(ids, consumer, min_idle_ms, now_ms);
-    }
-
-    /// Auto-claim PEL entries in a consumer group (cursor-based scan).
-    pub fn groupAutoclaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !ConsumerGroup.ClaimResult {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.autoclaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
-    }
-
-    /// `groupAutoclaim`'s page, claiming nothing.
-    pub fn groupPeekClaim(self: *StreamProjection, group_name: []const u8, consumer: []const u8, min_idle_ms: u64, now_ms: u64, start_id: StreamID, max_count: usize, out: []StreamID) !ConsumerGroup.ClaimResult {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.peekClaim(consumer, min_idle_ms, now_ms, start_id, max_count, out);
-    }
-
-    /// Claim these pending entries of `group_name` for `consumer`.
-    pub fn groupClaimIds(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, now_ms: u64) !void {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        group.claimIds(ids, consumer, now_ms);
-    }
-
-    /// Touch (reset idle timer) for PEL entries.
-    pub fn groupTouch(self: *StreamProjection, group_name: []const u8, ids: []const StreamID, consumer: []const u8, now_ms: u64) !u32 {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.touch(ids, consumer, now_ms);
-    }
-
-    /// Get pending entries for a consumer group (optionally filtered by consumer).
-    pub fn groupPending(self: *StreamProjection, group_name: []const u8, consumer_id: ?[]const u8, buf: []PendingEntry) !usize {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.getPending(consumer_id, buf);
-    }
-
-    /// Get the PEL count for a consumer group.
-    pub fn groupPelCount(self: *StreamProjection, group_name: []const u8) !usize {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        return group.pelCount();
-    }
-
-    /// Update a group's sweeper config (ack_timeout_ms / max_deliver).
-    /// `null` leaves a field unchanged.
-    pub fn configureGroup(self: *StreamProjection, group_name: []const u8, ack_timeout_ms: ?u32, max_deliver: ?u8) !void {
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        group.configure(ack_timeout_ms, max_deliver);
-    }
-
-    /// Apply a durable `cg_commit` (auto-creating the group if needed). Called
-    /// from replay/follower-apply, never on the originating leader (whose live
-    /// in-memory state is already ahead). The cursor advance is **monotonic**:
-    /// we only move `last_delivered_id` forward, so re-applying an older commit
-    /// (or applying on a node that already advanced past it) never regresses
-    /// the group and causes spurious redelivery. Config is last-writer-wins.
-    pub fn applyCommit(self: *StreamProjection, group_name: []const u8, commit: GroupCommit, now_ns: u64) !void {
-        self.createGroup(group_name, now_ns) catch |err| {
-            if (err != error.AlreadyExists) return err;
-        };
-        const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        if (commit.floor.greaterThan(group.last_delivered_id)) {
-            group.last_delivered_id = commit.floor;
-        }
-        if (commit.floor.greaterThan(group.last_committed_floor)) {
-            group.last_committed_floor = commit.floor;
-        }
-        group.ack_timeout_ms = commit.ack_timeout_ms;
-        group.max_deliver = commit.max_deliver;
-    }
-
-    /// Run the sweeper pass over every consumer group in this projection.
-    /// Returns the aggregate counts. Called from the shard's periodic task.
-    pub fn sweepAllGroups(self: *StreamProjection, now_ms: u64) ConsumerGroup.SweepResult {
-        var total: ConsumerGroup.SweepResult = .{};
-        var it = self.groups.iterator();
-        while (it.next()) |kv| {
-            const r = kv.value_ptr.sweep(now_ms);
-            total.made_ready += r.made_ready;
-            total.dropped += r.dropped;
-        }
-        return total;
     }
 
     // ─── Stream Name Registry ──────────────────────────────────────────────
@@ -1679,13 +865,6 @@ pub const StreamProjection = struct {
     pub fn memoryUsage(self: *const StreamProjection) usize {
         var mem: usize = @sizeOf(StreamProjection);
 
-        var git = self.groups.iterator();
-        while (git.next()) |kv| {
-            mem += kv.value_ptr.name.len;
-            mem += kv.value_ptr.members.count() * @sizeOf(Member);
-            mem += kv.value_ptr.pel.count() * (@sizeOf(u128) + @sizeOf(PendingEntry));
-        }
-
         // Per-stream state
         var sit = self.streams.iterator();
         while (sit.next()) |kv| {
@@ -1732,18 +911,11 @@ test "stream: same-named streams in two namespaces share no state, even when the
     try testing.expectEqual(@as(u64, 3), s.streamLogicalCount(a));
     try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
 
-    // The same stream and group names in both: two names, two groups.
+    // The same stream name in both: two names.
     var na: [MAX_NAME_KEY]u8 = undefined;
     var nb: [MAX_NAME_KEY]u8 = undefined;
     try s.registerStream(nameKey(&na, one, "orders").?);
     try s.registerStream(nameKey(&nb, two, "orders").?);
-    var ga: [MAX_NAME_KEY]u8 = undefined;
-    var gb: [MAX_NAME_KEY]u8 = undefined;
-    try s.createGroup(groupKey(&ga, one, "orders", "g").?, 1000);
-    try s.createGroup(groupKey(&gb, two, "orders", "g").?, 1000);
-    var buf: [4]StreamRecord = undefined;
-    try testing.expectEqual(@as(usize, 1), try s.groupDeliver(groupKey(&ga, one, "orders", "g").?, a, "c", 4, 1000, &buf));
-    try testing.expectEqual(@as(usize, 0), try s.groupPelCount(groupKey(&gb, two, "orders", "g").?));
 
     // Each namespace lists its own name, past the id.
     var names: [4][]const u8 = undefined;
@@ -1751,45 +923,10 @@ test "stream: same-named streams in two namespaces share no state, even when the
     try testing.expectEqualStrings("orders", names[0]);
     try testing.expectEqual(@as(usize, 0), s.scanStreamNames(.default, &names));
 
-    // Deleting one namespace's stream leaves the other's records, name and group.
+    // Deleting one namespace's stream leaves the other's records and name.
     try testing.expect(s.deleteStream(a, nameKey(&na, one, "orders").?));
     try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
     try testing.expect(s.stream_names.contains(nameKey(&nb, two, "orders").?));
-    try testing.expect(s.getGroup(groupKey(&gb, two, "orders", "g").?) != null);
-    try testing.expect(s.getGroup(groupKey(&ga, one, "orders", "g").?) == null);
-}
-
-test "stream: consumer group lifecycle" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    // Create group
-    try s.createGroup("my-group", 1000);
-    try testing.expectEqual(@as(usize, 1), s.groupCount());
-
-    // Duplicate create returns AlreadyExists (handled gracefully)
-    try testing.expectError(error.AlreadyExists, s.createGroup("my-group", 2000));
-
-    // Join member
-    const joined = try s.joinGroup("my-group", "consumer-1", 3000);
-    try testing.expect(joined);
-
-    // Duplicate join returns false
-    const joined2 = try s.joinGroup("my-group", "consumer-1", 4000);
-    try testing.expect(!joined2);
-
-    // Get group
-    const group = s.getGroup("my-group").?;
-    try testing.expectEqual(@as(usize, 1), group.memberCount());
-
-    // Leave
-    const left = try s.leaveGroup("my-group", "consumer-1");
-    try testing.expect(left);
-    try testing.expectEqual(@as(usize, 0), group.memberCount());
-
-    // Delete group
-    try testing.expect(s.deleteGroup("my-group"));
-    try testing.expectEqual(@as(usize, 0), s.groupCount());
 }
 
 test "stream: stats tracking" {
@@ -1799,10 +936,7 @@ test "stream: stats tracking" {
     const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
-
     try testing.expectEqual(@as(u64, 2), s.stats.appended);
-    try testing.expectEqual(@as(u64, 1), s.stats.groups_created);
 }
 
 test "stream: memory usage estimate" {
@@ -1810,134 +944,12 @@ test "stream: memory usage estimate" {
     defer s.deinit();
 
     _ = try s.appendToStreamAt(testKey(42), 100, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);
 }
 
-test "stream: ackFloor reflects lowest unacked" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(7);
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-
-    // Append 3 records and deliver them into the PEL.
-    const id1 = try s.appendToStreamAt(hash, 10, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 11, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 12, 0, TEST_MS, 1, 0);
-    var buf: [8]StreamRecord = undefined;
-    const n = try s.groupDeliver("g", hash, "c1", 8, 2000, buf[0..]);
-    try testing.expectEqual(@as(usize, 3), n);
-
-    const g = s.getGroup("g").?;
-    // All 3 pending → floor is the predecessor of the lowest pending (id1).
-    try testing.expect(g.ackFloor().lessThan(id1));
-
-    // Ack id1: floor advances to predecessor of id2 (now lowest pending), so
-    // id1 <= floor < id2 — id1 is no longer redelivered, id2 still is.
-    _ = try s.groupAck("g", &[_]StreamID{id1});
-    try testing.expect(!g.ackFloor().lessThan(id1));
-    try testing.expect(g.ackFloor().lessThan(id2));
-
-    // Ack the rest: PEL empty → floor == last_delivered_id (everything acked).
-    _ = try s.groupAck("g", &[_]StreamID{ id2, buf[2].id });
-    try testing.expectEqual(@as(usize, 0), g.pelCount());
-    try testing.expectEqual(g.last_delivered_id.order(), g.ackFloor().order());
-}
-
-test "stream: applyCommit seeds cursor monotonically + restores config" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    // Fresh group from a replayed commit: cursor advances MIN → floor.
-    const commit = GroupCommit{ .floor = .{ .timestamp_ms = 500, .sequence = 3 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
-    try s.applyCommit("g", commit, 1000);
-    const g = s.getGroup("g").?;
-    try testing.expectEqual(@as(u64, 500), g.last_delivered_id.timestamp_ms);
-    try testing.expectEqual(@as(u32, 12345), g.ack_timeout_ms);
-    try testing.expectEqual(@as(u8, 9), g.max_deliver);
-
-    // A stale (lower) commit must NOT regress the cursor.
-    const stale = GroupCommit{ .floor = .{ .timestamp_ms = 100, .sequence = 0 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
-    try s.applyCommit("g", stale, 1000);
-    try testing.expectEqual(@as(u64, 500), g.last_delivered_id.timestamp_ms);
-
-    // A higher commit advances it.
-    const newer = GroupCommit{ .floor = .{ .timestamp_ms = 900, .sequence = 1 }, .ack_timeout_ms = 12345, .max_deliver = 9 };
-    try s.applyCommit("g", newer, 1000);
-    try testing.expectEqual(@as(u64, 900), g.last_delivered_id.timestamp_ms);
-}
-
-test "stream: restart redelivers only the unacked tail" {
-    // Simulates consumer-group crash recovery at the projection layer:
-    // append → deliver → ack some → restart → only the unacked remainder is
-    // redelivered. "Restart" = a fresh projection that replays the same UAL
-    // entries (same name_hash / ual_index / entry-timestamp) so StreamIDs are
-    // reproduced identically, then applies the persisted cg_commit cursor.
-    const hash = testKey(99);
-    const ts: u64 = 100; // single entry-timestamp ms → ids {100,0..3}
-
-    // ── before restart ──
-    var s1 = StreamProjection.init(testing.allocator);
-    defer s1.deinit();
-    const aid1 = try s1.appendToStreamAt(hash, 10, 0, ts, 1, 0);
-    const aid2 = try s1.appendToStreamAt(hash, 11, 0, ts, 1, 0);
-    const aid3 = try s1.appendToStreamAt(hash, 12, 0, ts, 1, 0);
-    const aid4 = try s1.appendToStreamAt(hash, 13, 0, ts, 1, 0);
-    try s1.createGroup("g", 1);
-    _ = try s1.joinGroup("g", "c1", 1);
-
-    var buf: [8]StreamRecord = undefined;
-    try testing.expectEqual(@as(usize, 4), try s1.groupDeliver("g", hash, "c1", 8, 1000, buf[0..]));
-    _ = try s1.groupAck("g", &[_]StreamID{ aid1, aid2 }); // ack first two
-
-    const g1 = s1.getGroup("g").?;
-    const commit = GroupCommit{ .floor = g1.ackFloor(), .ack_timeout_ms = g1.ack_timeout_ms, .max_deliver = g1.max_deliver };
-
-    // ── after restart: fresh projection, replay same entries + cursor ──
-    var s2 = StreamProjection.init(testing.allocator);
-    defer s2.deinit();
-    const bid1 = try s2.appendToStreamAt(hash, 10, 0, ts, 1, 0);
-    const bid2 = try s2.appendToStreamAt(hash, 11, 0, ts, 1, 0);
-    const bid3 = try s2.appendToStreamAt(hash, 12, 0, ts, 1, 0);
-    const bid4 = try s2.appendToStreamAt(hash, 13, 0, ts, 1, 0);
-    // Replay reproduced identical StreamIDs.
-    try testing.expectEqual(aid1.order(), bid1.order());
-    try testing.expectEqual(aid2.order(), bid2.order());
-    try testing.expectEqual(aid3.order(), bid3.order());
-    try testing.expectEqual(aid4.order(), bid4.order());
-
-    try s2.applyCommit("g", commit, 1); // recover cursor (auto-creates group)
-    _ = try s2.joinGroup("g", "c1", 1);
-
-    var buf2: [8]StreamRecord = undefined;
-    const n = try s2.groupDeliver("g", hash, "c1", 8, 2000, buf2[0..]);
-    // Only the two genuinely-unacked records come back — not the acked pair.
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(aid3.order(), buf2[0].id.order());
-    try testing.expectEqual(aid4.order(), buf2[1].id.order());
-}
-
-test "stream: GroupCommit encode/decode round-trip" {
-    const c = GroupCommit{ .floor = .{ .timestamp_ms = 0xDEAD, .sequence = 0xBEEF }, .ack_timeout_ms = 777, .max_deliver = 5 };
-    var buf: [GroupCommit.WIRE_LEN]u8 = undefined;
-    c.encode(&buf);
-    const d = GroupCommit.decode(&buf).?;
-    try testing.expectEqual(c.floor.order(), d.floor.order());
-    try testing.expectEqual(c.ack_timeout_ms, d.ack_timeout_ms);
-    try testing.expectEqual(c.max_deliver, d.max_deliver);
-
-    // Wrong version / short buffer → null.
-    try testing.expectEqual(@as(?GroupCommit, null), GroupCommit.decode(buf[0 .. GroupCommit.WIRE_LEN - 1]));
-    var bad = buf;
-    bad[0] = 0xFF;
-    try testing.expectEqual(@as(?GroupCommit, null), GroupCommit.decode(&bad));
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// PEL + StreamState Tests
+// StreamState Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "stream: StreamState append and read" {
@@ -2092,355 +1104,6 @@ test "stream: trimStream" {
     const trimmed = s.trimStream(hash, id2);
     try testing.expectEqual(@as(u64, 2), trimmed);
     try testing.expectEqual(@as(usize, 1), s.streamRecordCount(hash));
-}
-
-test "stream: groupDeliver adds to PEL" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "consumer-1", 1000);
-
-    var buf: [10]StreamRecord = undefined;
-    const delivered = try s.groupDeliver("mygroup", hash, "consumer-1", 2, 5000, &buf);
-    try testing.expectEqual(@as(usize, 2), delivered);
-
-    // PEL should have 2 entries
-    const pel_count = try s.groupPelCount("mygroup");
-    try testing.expectEqual(@as(usize, 2), pel_count);
-
-    // Deliver more — should get the remaining 1
-    const delivered2 = try s.groupDeliver("mygroup", hash, "consumer-1", 10, 5001, &buf);
-    try testing.expectEqual(@as(usize, 1), delivered2);
-}
-
-test "stream: groupAck removes from PEL" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "c1", 1000);
-
-    var buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("mygroup", hash, "c1", 3, 5000, &buf);
-    try testing.expectEqual(@as(usize, 3), try s.groupPelCount("mygroup"));
-
-    // Ack 2 messages
-    const ids = [_]StreamID{ id1, id2 };
-    const acked = try s.groupAck("mygroup", &ids);
-    try testing.expectEqual(@as(u32, 2), acked);
-    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("mygroup"));
-}
-
-/// A group read's ready half, as `handleGroupRead` runs it: serve what is
-/// ready to `consumer`. Returns how many were served.
-fn testServeReady(s: *StreamProjection, group: []const u8, consumer: []const u8, now_ms: u64) !usize {
-    var ids: [16]StreamID = undefined;
-    const n = try s.groupPeekReady(group, &ids);
-    try s.groupServeReady(group, consumer, ids[0..n], &.{}, now_ms);
-    return n;
-}
-
-fn testDeliveryCount(s: *StreamProjection, group: []const u8) !u32 {
-    var pel_buf: [10]PendingEntry = undefined;
-    const n = try s.groupPending(group, null, &pel_buf);
-    try testing.expectEqual(@as(usize, 1), n);
-    return pel_buf[0].delivery_count;
-}
-
-test "stream: a nacked entry is served again by the group's next read, to any consumer" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "c1", 1000);
-    _ = try s.joinGroup("mygroup", "c2", 1000);
-
-    var buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 5000, &buf);
-    try testing.expectEqual(@as(usize, 0), try testServeReady(&s, "mygroup", "c2", 5500));
-
-    const ids = [_]StreamID{id1};
-    try testing.expectEqual(@as(u32, 1), try s.groupNack("mygroup", &ids));
-    // A nack is not a delivery: the count goes up when it is served.
-    try testing.expectEqual(@as(u32, 1), try testDeliveryCount(&s, "mygroup"));
-
-    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "mygroup", "c2", 6000));
-    var pel_buf: [10]PendingEntry = undefined;
-    try testing.expectEqual(@as(usize, 1), try s.groupPending("mygroup", "c2", &pel_buf));
-    try testing.expectEqual(@as(u32, 2), pel_buf[0].delivery_count);
-    // Served once: not again until nacked or expired.
-    try testing.expectEqual(@as(usize, 0), try testServeReady(&s, "mygroup", "c2", 6100));
-}
-
-test "stream: a nacked and an expired entry are dropped after the same number of deliveries" {
-    for ([_]bool{ true, false }) |by_nack| {
-        var s = StreamProjection.init(testing.allocator);
-        defer s.deinit();
-        const hash = testKey(42);
-        const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-        try s.createGroup("g", 1000);
-        _ = try s.joinGroup("g", "c1", 1000);
-        try s.configureGroup("g", 200, 3);
-
-        var rec_buf: [10]StreamRecord = undefined;
-        _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
-        var now: u64 = 1000;
-        var deliveries: u32 = 1;
-        while (try s.groupPelCount("g") > 0) {
-            now += 300;
-            if (by_nack) {
-                _ = try s.groupNack("g", &[_]StreamID{id1});
-            } else {
-                _ = s.sweepAllGroups(now);
-            }
-            if (try s.groupPelCount("g") == 0) break;
-            deliveries += @intCast(try testServeReady(&s, "g", "c1", now));
-            try testing.expect(deliveries <= 3);
-        }
-        try testing.expectEqual(@as(u32, 3), deliveries);
-    }
-}
-
-test "stream: groupClaim transfers ownership" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "c1", 1000);
-    _ = try s.joinGroup("mygroup", "c2", 1000);
-
-    var buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 5000, &buf);
-
-    // Claim with 0 min_idle so it always matches
-    const ids = [_]StreamID{id1};
-    const claimed = try s.groupClaim("mygroup", &ids, "c2", 0, 6000);
-    try testing.expectEqual(@as(u32, 1), claimed);
-
-    // Verify consumer changed via getPending
-    var pel_buf: [10]PendingEntry = undefined;
-    const n = try s.groupPending("mygroup", "c2", &pel_buf);
-    try testing.expectEqual(@as(usize, 1), n);
-}
-
-test "stream: the sweeper makes an idle entry ready without counting a delivery, then drops it at max_deliver" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-    _ = try s.joinGroup("g", "c2", 1000);
-    // Ready after 200ms idle, dropped after 3 deliveries.
-    try s.configureGroup("g", 200, 3);
-
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf); // delivery 1
-
-    // Not yet idle enough → no-op.
-    var r = s.sweepAllGroups(1100);
-    try testing.expectEqual(@as(u32, 0), r.made_ready);
-    try testing.expectEqual(@as(u32, 0), r.dropped);
-
-    // Idle ≥ 200ms → ready, not counted; a second pass changes nothing.
-    r = s.sweepAllGroups(1400);
-    try testing.expectEqual(@as(u32, 1), r.made_ready);
-    try testing.expectEqual(@as(u32, 1), try testDeliveryCount(&s, "g"));
-    r = s.sweepAllGroups(1500);
-    try testing.expectEqual(@as(u32, 0), r.made_ready);
-
-    // Served to another consumer (delivery 2), expires, served (3).
-    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "g", "c2", 1500));
-    _ = s.sweepAllGroups(1800);
-    try testing.expectEqual(@as(usize, 1), try testServeReady(&s, "g", "c2", 1800));
-    try testing.expectEqual(@as(u32, 3), try testDeliveryCount(&s, "g"));
-
-    // Delivered max_deliver times and idle again → dropped.
-    r = s.sweepAllGroups(2100);
-    try testing.expectEqual(@as(u32, 1), r.dropped);
-    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
-}
-
-test "stream: a consumer touching an entry that expired keeps it, but not one it nacked or another's" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-    try s.configureGroup("g", 200, 5);
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
-    const ids = [_]StreamID{id1};
-    var ready: [4]StreamID = undefined;
-
-    _ = s.sweepAllGroups(1300);
-    _ = try s.groupTouch("g", &ids, "c2", 1350);
-    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ready));
-    _ = try s.groupTouch("g", &ids, "c1", 1400);
-    try testing.expectEqual(@as(usize, 0), try s.groupPeekReady("g", &ready));
-
-    _ = try s.groupNack("g", &ids);
-    _ = try s.groupTouch("g", &ids, "c1", 1500);
-    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ready));
-}
-
-test "stream: lowering max_deliver drops a ready entry already delivered that often" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-    try s.configureGroup("g", 200, 5);
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
-    _ = try s.groupNack("g", &[_]StreamID{id1});
-    try s.configureGroup("g", null, 1);
-    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
-}
-
-test "stream: a ready entry whose record was trimmed is dropped by the read that finds it gone" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
-    _ = try s.groupNack("g", &[_]StreamID{id1});
-
-    var ids: [4]StreamID = undefined;
-    try testing.expectEqual(@as(usize, 1), try s.groupPeekReady("g", &ids));
-    try s.groupServeReady("g", "c1", &.{}, ids[0..1], 2000);
-    try testing.expectEqual(@as(usize, 0), try s.groupPelCount("g"));
-}
-
-test "stream: sweeper disabled when ack_timeout_ms is 0" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(7);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "c1", 1000);
-    try s.configureGroup("g", 0, 10); // ack_timeout_ms = 0 → sweeper off
-
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "c1", 1, 1000, &rec_buf);
-
-    const r = s.sweepAllGroups(1_000_000);
-    try testing.expectEqual(@as(u32, 0), r.made_ready);
-    try testing.expectEqual(@as(u32, 0), r.dropped);
-    try testing.expectEqual(@as(usize, 1), try s.groupPelCount("g"));
-}
-
-test "stream: groupAutoclaim auto-transfers idle entries" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "c1", 1000);
-    _ = try s.joinGroup("mygroup", "c2", 1000);
-
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("mygroup", hash, "c1", 2, 1000, &rec_buf);
-
-    // Autoclaim after enough idle time (entries delivered at t=1000, now=5000, idle=4000ms)
-    var out: [10]StreamID = undefined;
-    const res = try s.groupAutoclaim("mygroup", "c2", 3000, 5000, StreamID.MIN, 10, &out);
-    try testing.expectEqual(@as(u32, 2), res.count);
-    // Fully scanned → cursor is MAX
-    try testing.expect(res.next_cursor.eql(StreamID.MAX));
-
-    // Verify ownership transferred to c2
-    var pel_buf: [10]PendingEntry = undefined;
-    try testing.expectEqual(@as(usize, 2), try s.groupPending("mygroup", "c2", &pel_buf));
-}
-
-test "stream: groupAutoclaim drains own pending (reconnect) and paginates" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(77);
-    _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
-    _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("g", 1000);
-    _ = try s.joinGroup("g", "me", 1000);
-
-    var rec_buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("g", hash, "me", 3, 1000, &rec_buf);
-
-    // Reconnect drain: min_idle_ms=0, same consumer — must return own entries
-    // (the old impl skipped same-owner and would return 0).
-    var out: [10]StreamID = undefined;
-    const page1 = try s.groupAutoclaim("g", "me", 0, 2000, StreamID.MIN, 2, &out);
-    try testing.expectEqual(@as(u32, 2), page1.count);
-    // Batch full at 2 < 3 entries → cursor points at the 3rd entry, not MAX
-    try testing.expect(!page1.next_cursor.eql(StreamID.MAX));
-
-    // Second page from the returned cursor picks up the remaining entry.
-    const page2 = try s.groupAutoclaim("g", "me", 0, 2000, page1.next_cursor, 10, &out);
-    try testing.expectEqual(@as(u32, 1), page2.count);
-    try testing.expect(page2.next_cursor.eql(StreamID.MAX));
-}
-
-test "stream: groupTouch resets idle timer" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    const hash = testKey(42);
-    const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
-
-    try s.createGroup("mygroup", 1000);
-    _ = try s.joinGroup("mygroup", "c1", 1000);
-
-    var buf: [10]StreamRecord = undefined;
-    _ = try s.groupDeliver("mygroup", hash, "c1", 1, 1000, &buf);
-
-    // Touch at t=5000
-    const ids = [_]StreamID{id1};
-    const touched = try s.groupTouch("mygroup", &ids, "c1", 5000);
-    try testing.expectEqual(@as(u32, 1), touched);
-
-    // Verify last_delivery_ms updated via getPending
-    var pel_buf: [10]PendingEntry = undefined;
-    _ = try s.groupPending("mygroup", null, &pel_buf);
-    try testing.expectEqual(@as(u64, 5000), pel_buf[0].last_delivery_ms);
-}
-
-test "stream: groupDeliver to non-existent group" {
-    var s = StreamProjection.init(testing.allocator);
-    defer s.deinit();
-
-    var buf: [10]StreamRecord = undefined;
-    try testing.expectError(error.GroupNotFound, s.groupDeliver("nope", testKey(42), "c1", 1, 1000, &buf));
 }
 
 test "stream: multiple streams are independent" {

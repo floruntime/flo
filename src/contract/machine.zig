@@ -33,11 +33,20 @@ pub const Machine = struct {
     /// writes and the same result on every replica. "Now" is the entry's
     /// stamp. A refusal is said on `out` and drops the staged writes.
     apply: *const fn (view: *view_mod.View, e: *const Entry, out: *persistence.Result) ApplyError!void,
+    /// Entry types another applier owns that this machine follows: after one
+    /// applies and isn't refused, `observe` runs over this machine's own
+    /// families, in the same index order on every replica. It never refuses,
+    /// and its work in one apply is bounded by what it keeps, never by an
+    /// unbounded walk: larger work goes to entries of its own.
+    observes: []const EntryType = &.{},
+    observe_keys: ?*const fn (e: *const Entry, out: *view_mod.KeySet) error{OutOfMemory}!void = null,
+    observe: ?*const fn (view: *view_mod.View, e: *const Entry) ApplyError!void = null,
 };
 
 /// What's wrong with a list of machines, or null: one owner per entry type,
 /// one family per id and per name.
 pub fn listRule(comptime machines: []const Machine) ?[]const u8 {
+    @setEvalBranchQuota(100_000);
     for (machines, 0..) |m, i| {
         for (machines[0..i]) |earlier| {
             for (m.entry_types) |t| for (earlier.entry_types) |u| if (t == u)
@@ -45,6 +54,12 @@ pub fn listRule(comptime machines: []const Machine) ?[]const u8 {
         }
         for (m.entry_types, 0..) |t, j| for (m.entry_types[0..j]) |u| if (t == u)
             return std.fmt.comptimePrint("{s} lists entry type {s} twice", .{ m.name, @tagName(t) });
+        if (m.observes.len > 0 and (m.observe == null or m.observe_keys == null))
+            return std.fmt.comptimePrint("{s} observes entries but has no observe", .{m.name});
+        for (m.observes) |t| for (machines) |o| for (o.entry_types) |u| if (t == u)
+            return std.fmt.comptimePrint("{s} observes {s}, which a machine owns: it applies it", .{ m.name, @tagName(t) });
+        for (m.observes) |t| for (machines[0..i]) |earlier| for (earlier.observes) |u| if (t == u)
+            return std.fmt.comptimePrint("entry type {s} is observed by both {s} and {s}", .{ @tagName(t), earlier.name, m.name });
     }
     var seen: []const FamilyInfo = &.{};
     for (machines) |m| for (m.families) |f| {
@@ -60,6 +75,27 @@ pub fn listRule(comptime machines: []const Machine) ?[]const u8 {
 
 pub fn check(comptime machines: []const Machine) void {
     if (comptime listRule(machines)) |message| @compileError(message);
+}
+
+/// The machine that follows `etype` another applier owns, if one does.
+pub fn observerOf(comptime machines: []const Machine, etype: EntryType) ?*const Machine {
+    inline for (machines) |*m| {
+        for (m.observes) |t| if (t == etype) return m;
+    }
+    return null;
+}
+
+/// `m`'s observe of `e`, an entry another applier applied: its writes become
+/// state with it.
+pub fn observeEntry(m: *const Machine, store: *store_mod.Store, scratch: *std.heap.ArenaAllocator, streams: ?Streams, e: *const Entry) ApplyError!void {
+    _ = scratch.reset(.retain_capacity);
+    const arena = scratch.allocator();
+    var keys = view_mod.KeySet.init(arena);
+    try m.observe_keys.?(e, &keys);
+    var view = view_mod.View.init(store, arena, &keys);
+    view.streams_read = streams;
+    try m.observe.?(&view, e);
+    try view.commit();
 }
 
 /// The machine that owns `etype`, if one does.
@@ -97,4 +133,21 @@ pub fn applyEntryWith(m: *const Machine, store: *store_mod.Store, scratch: *std.
     try m.apply(&view, e, out);
     if (out.refused() != null) return;
     try view.commit();
+}
+
+test "listRule: an observer needs its observe, follows only entries no machine owns, and is the only one for its type" {
+    const T = struct {
+        fn keys(_: *const Entry, _: *view_mod.KeySet) error{OutOfMemory}!void {}
+        fn apply(_: *view_mod.View, _: *const Entry, _: *persistence.Result) ApplyError!void {}
+        fn observe(_: *view_mod.View, _: *const Entry) ApplyError!void {}
+        fn of(name: []const u8, owns: []const EntryType, follows: []const EntryType, with_observe: bool) Machine {
+            return .{ .name = name, .entry_types = owns, .families = &.{}, .keys = keys, .apply = apply, .observes = follows, .observe_keys = if (with_observe) keys else null, .observe = if (with_observe) observe else null };
+        }
+    };
+    comptime {
+        std.debug.assert(listRule(&.{T.of("a", &.{.cg_create}, &.{.stream_trim}, true)}) == null);
+        std.debug.assert(std.mem.eql(u8, listRule(&.{T.of("a", &.{}, &.{.stream_trim}, false)}).?, "a observes entries but has no observe"));
+        std.debug.assert(std.mem.eql(u8, listRule(&.{ T.of("a", &.{.cg_create}, &.{}, true), T.of("b", &.{}, &.{.cg_create}, true) }).?, "b observes cg_create, which a machine owns: it applies it"));
+        std.debug.assert(std.mem.eql(u8, listRule(&.{ T.of("a", &.{}, &.{.stream_trim}, true), T.of("b", &.{}, &.{.stream_trim}, true) }).?, "entry type stream_trim is observed by both a and b"));
+    }
 }

@@ -91,9 +91,17 @@ pub const EntryType = enum(u8) {
     ts_retention = 0x33,
 
     // ── Consumer Groups ──
-    cg_commit = 0x40,
+    // 0x40 and 0x42 were a group's cursor and delete, before groups'
+    // deliveries were logged; retired. 0x41 is never written.
     cg_create = 0x41,
-    cg_delete = 0x42,
+    group_create = 0x43,
+    group_delete = 0x44,
+    group_deliver = 0x45,
+    group_settle = 0x46,
+    group_release = 0x47,
+    group_extend = 0x48,
+    group_expire = 0x49,
+    group_clean = 0x4A,
 
     // ── Raft Control ──
     raft_config = 0xF0,
@@ -145,8 +153,9 @@ pub const EntryType = enum(u8) {
             .action_register, .action_delete, .action_invoke, .action_deliver, .action_settle, .action_release, .action_extend, .action_expire => false,
             .stream_append, .stream_trim, .stream_delete, .stream_config => true,
             .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => false,
+            .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean => false,
             .ts_write, .ts_write_batch, .ts_delete, .ts_retention => true,
-            .cg_commit, .cg_create, .cg_delete => true,
+            .cg_create => true,
             .workflow_create, .workflow_start, .workflow_complete, .workflow_enabled, .workflow_step_started => true,
             .processing_submit, .processing_stop, .processing_cancel, .processing_checkpoint, .processing_remove => true,
             .raft_config, .raft_noop, .raft_snapshot, .repair_skip => false,
