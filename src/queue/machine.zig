@@ -277,7 +277,7 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
 pub const NO_QUEUE = "not found: no such queue";
 /// An enqueue past its queue's caps, or its shard's.
 pub const FULL = "overloaded: queue '{s}' is full: it holds {d} messages (at most {d}) and {d} held bytes (at most {d}), ready, leased and dead; consume or purge it";
-pub const SHARD_FULL = "overloaded: this shard's queues hold {d} held bytes, at most {d}; consume or purge some";
+pub const SHARD_FULL = "overloaded: this shard's queues and groups hold {d} held bytes, at most {d}; consume or purge some";
 
 /// What a message holds against the caps.
 pub fn heldBy(payload_len: usize, error_len: usize) u64 {
@@ -337,10 +337,10 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
             const size = heldBy(p.payload.len, 0);
             const held = meta.ready + meta.leased + meta.dead;
             if (held + 1 > p.max_messages or meta.held_bytes + size > p.max_bytes)
-                return out.refuseFmt(.overloaded, .unclassified, FULL, .{ p.queue, held, p.max_messages, meta.held_bytes, p.max_bytes });
+                return out.refuseFmt(.overloaded, .queue_full, FULL, .{ p.queue, held, p.max_messages, meta.held_bytes, p.max_bytes });
             var shard_held = try heldOf(view);
             if (shard_held + size > p.shard_held_bytes)
-                return out.refuseFmt(.overloaded, .unclassified, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
+                return out.refuseFmt(.overloaded, .queue_full, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
             shard_held += size;
             try view.put(Helds, HELD_KEY, .{ .v = .{ .bytes = shard_held } });
             const seq = meta.next_seq;
@@ -1038,6 +1038,8 @@ fn shardHeldOf(t: *TestQueues) u64 {
     return (Stored(Held).decode(bytes) catch unreachable).v.bytes;
 }
 
+const proto_reason = @import("../protocol/reason.zig");
+
 /// What "abcd" holds, as a ready message with no error.
 const ABCD = heldBy(4, 0);
 
@@ -1055,7 +1057,20 @@ test "queue machine: an enqueue past its queue's message or byte cap is refused,
     const before = t.sums();
     const full = try t.apply(.queue_enqueue, v, 12);
     try testing.expectEqual(proto_status.overloaded, full.refused().?.status);
+    try testing.expectEqual(proto_reason.Reason.queue_full, full.refused().?.refusal.reason);
+    try testing.expectEqual(proto_reason.Ran.no, full.refused().?.refusal.ran);
     try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "queue 'q' is full: it holds 2 messages (at most 2)") != null);
+    try testing.expectEqual(before, t.sums());
+    // The shard's total, with this queue's own caps still clear: the same
+    // reason, and nothing changes.
+    var w = enqueueValue(NS, "other", 0, "abcd");
+    // Two held already: a total of one more byte than they hold refuses.
+    w.shard_held_bytes = 2 * ABCD + ABCD - 1;
+    const shard_full = try t.apply(.queue_enqueue, w, 13);
+    try testing.expectEqual(proto_status.overloaded, shard_full.refused().?.status);
+    try testing.expectEqual(proto_reason.Reason.queue_full, shard_full.refused().?.refusal.reason);
+    try testing.expectEqual(proto_reason.Ran.no, shard_full.refused().?.refusal.ran);
+    try testing.expect(std.mem.indexOf(u8, shard_full.refused().?.refusal.message, "this shard's queues and groups hold") != null);
     try testing.expectEqual(before, t.sums());
     // A dead letter still counts, its error text too; a settle frees its
     // slot and bytes.
@@ -1088,7 +1103,7 @@ test "queue machine: an empty message holds its overhead, so empty messages fill
     }
     try testing.expectEqual(3 * qe.PER_MESSAGE, shardHeldOf(&t));
     const full = try t.apply(.queue_enqueue, v, stamp);
-    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues hold 1536 held bytes, at most 1536") != null);
+    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues and groups hold 1536 held bytes, at most 1536") != null);
 }
 
 test "queue machine: a message's error text is held, replaced as it fails again, and given back with it" {
@@ -1138,7 +1153,7 @@ test "queue machine: the shard's held bytes count every queue, and a settle or p
     _ = try t.apply(.queue_enqueue, other, 11);
     try testing.expectEqual(2 * ABCD, shardHeldOf(&t));
     const full = try t.apply(.queue_enqueue, v, 12);
-    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues hold 1032 held bytes, at most 1032") != null);
+    try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "this shard's queues and groups hold 1032 held bytes, at most 1032") != null);
     var got: [1]u64 = undefined;
     _ = try deliver(&t, 1, 100, &got);
     _ = try settle(&t, &got, 200);

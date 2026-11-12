@@ -450,7 +450,7 @@ pub const QueueHandler = struct {
 
     /// A page of a queue's dead letters, oldest first:
     ///   [count:u32] ([seq:u64][size:u32][len:u32][payload][enqueued_at_ms:i64]
-    ///                [attempts:u32][priority:u8][moved_at_ms:i64])*
+    ///                [deliveries:u32][priority:u8][moved_at_ms:i64])*
     ///   [total:u64][has_more:u8][last_seq:u64]
     /// `[limit:u32][after:u64]?` picks the page: up to 100, after the dead
     /// letter whose seq ends the page before, or from the oldest if that one
@@ -598,7 +598,7 @@ pub const QueueHandler = struct {
                 const added = out.add(.{
                     .seq = seq,
                     .priority = m.priority,
-                    .attempts = m.deliveries,
+                    .deliveries = m.deliveries,
                     .enqueued_at_ms = nsToMs(m.enqueued_ns),
                     .size = @intCast(m.payload.len),
                     .payload = shown,

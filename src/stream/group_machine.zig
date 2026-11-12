@@ -667,8 +667,8 @@ fn deliverApply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     if (n == 0 and capped) {
         const held = meta.ready + meta.leased + meta.dead;
         if (held + 1 > p.max_held or meta.held_bytes + each > p.max_held_bytes)
-            return out.refuseFmt(.overloaded, .unclassified, FULL, .{ p.group, p.stream, held, p.max_held, meta.held_bytes, p.max_held_bytes });
-        return out.refuseFmt(.overloaded, .unclassified, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
+            return out.refuseFmt(.overloaded, .group_held_full, FULL, .{ p.group, p.stream, held, p.max_held, meta.held_bytes, p.max_held_bytes });
+        return out.refuseFmt(.overloaded, .group_held_full, SHARD_FULL, .{ shard_held, p.shard_held_bytes });
     }
     if (took_fresh > 0) try hold(view, &meta, each * took_fresh);
 
@@ -1452,14 +1452,26 @@ test "group machine: a group takes new records only within its caps, and a settl
     _ = try t.append("s", 100, 3);
     var v: ge.Deliver.Value = .{ .ns = NS.int(), .stream = "s", .group = "g", .count = 3, .max_bytes = 1 << 20, .holder = "c1", .lease_ms = LEASE_MS, .create = true, .ready = .{ .bytes = "", .count = 0 }, .through_ms = std.math.maxInt(u64), .through_seq = std.math.maxInt(u64), .max_held = 2, .max_held_bytes = qe_caps.DEFAULT_MAX_BYTES, .shard_held_bytes = qe_caps.DEFAULT_SHARD_HELD_BYTES };
     const first = try t.apply(.group_deliver, v, 10 * ms);
+    const first_index = t.index;
     try testing.expectEqual(@as(u32, 2), answerInt(u32, first));
     try testing.expectEqual(2 * heldBy(0), t.meta("s", "g").?.held_bytes);
     // Full, nothing ready: refused, and the reader is told why.
     v.count = 1;
     const full = try t.apply(.group_deliver, v, 11 * ms);
     try testing.expect(std.mem.indexOf(u8, full.refused().?.refusal.message, "group 'g' on stream 's' is full: it holds 2 records (at most 2)") != null);
+    const reason = @import("../protocol/reason.zig");
+    try testing.expectEqual(reason.Reason.group_held_full, full.refused().?.refusal.reason);
+    try testing.expectEqual(reason.Ran.no, full.refused().?.refusal.ran);
+    // The shard's total, with the group's own caps clear: the same reason.
+    var w = v;
+    w.max_held = 100;
+    w.shard_held_bytes = 2 * heldBy(0) + heldBy(0) - 1;
+    const shard_full = try t.apply(.group_deliver, w, 11 * ms);
+    try testing.expect(std.mem.indexOf(u8, shard_full.refused().?.refusal.message, "this shard's queues and groups hold") != null);
+    try testing.expectEqual(reason.Reason.group_held_full, shard_full.refused().?.refusal.reason);
+    try testing.expectEqual(reason.Ran.no, shard_full.refused().?.refusal.ran);
     // An ack makes room, and gives its bytes back.
-    var d: Delivered = .{ .token = .{ .term = t.term, .index = t.index - 1 }, .n = 1 };
+    var d: Delivered = .{ .token = .{ .term = t.term, .index = first_index }, .n = 1 };
     d.records[0] = sid(100, 0);
     d.deliveries[0] = 1;
     _ = try settle(&t, d, &.{sid(100, 0)}, "c1", 12 * ms);

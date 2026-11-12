@@ -384,7 +384,7 @@ fn runDlqList(ctx: *commander.Context) commander.Error!void {
     ctx.print("Dead-letter queue for: {s} ({d} messages)\n", .{ queue, page.total });
     if (page.count == 0 and page.total == 0) ctx.print("(empty)\n", .{});
     var it = page.iterator();
-    while (it.next()) |d| ctx.print("{d}  attempts={d}  {s}{s}\n", .{ d.seq, d.attempts, d.payload, if (d.size > d.payload.len) "…" else "" });
+    while (it.next()) |d| ctx.print("{d}  deliveries={d}  {s}{s}\n", .{ d.seq, d.deliveries, d.payload, if (d.size > d.payload.len) "…" else "" });
     if (page.more) ctx.print("(more: --after {d})\n", .{page.last_seq});
 }
 

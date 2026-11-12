@@ -171,7 +171,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
                   <div className="list">
                     <div className="li head" style={{ gridTemplateColumns: '96px 70px 1fr 96px 96px' }}>
                       <div className="c">Seq</div>
-                      <div className="c r">Attempts</div>
+                      <div className="c r">Deliveries</div>
                       <div className="c">Payload</div>
                       <div className="c r">Moved</div>
                       <div className="c r">Action</div>
@@ -179,7 +179,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
                     {dlq.map((m) => (
                       <div className="li" key={m.seq} style={{ gridTemplateColumns: '96px 70px 1fr 96px 96px', background: selSeq === m.seq ? 'var(--hover)' : undefined }} onClick={() => setSel({ kind: 'dlq', m })}>
                         <span className="mono nw" style={{ fontSize: 12.5, color: 'var(--tx-2)' }}>#{m.seq}</span>
-                        <span className="c r mono" style={{ color: 'var(--crit)' }}>{m.attempts}×</span>
+                        <span className="c r mono" style={{ color: 'var(--crit)' }}>{m.deliveries}×</span>
                         <span className="nw" style={{ fontSize: 12, color: 'var(--tx-3)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{shown(m)}</span>
                         <span className="c r mono" style={{ fontSize: 11.5, color: 'var(--tx-3)' }}>{ago(m.moved_at)}</span>
                         <span className="c r" onClick={(e) => e.stopPropagation()}><DlqActions compact /></span>
@@ -207,7 +207,7 @@ export function QueueDetail({ name, ns, onBack }: { name: string; ns: string; on
               </div>
               <div className="kvrow2"><span>Priority</span><span style={{ display: 'flex', gap: 8, alignItems: 'center' }}><PrioTag p={sel.m.priority} /><span className="mono" style={{ fontSize: 11.5, color: 'var(--tx-faint)' }}>{prioMeta(sel.m.priority)[1]}</span></span></div>
               <div className="kvrow2"><span>State</span><span className="mono" style={{ color: 'var(--tx)' }}>{sel.kind === 'dlq' ? 'dead-lettered' : 'ready'}</span></div>
-              <div className="kvrow2"><span>Attempts</span><span className="mono" style={{ color: sel.m.attempts > 1 ? 'var(--warn)' : 'var(--tx)' }}>{sel.m.attempts}</span></div>
+              <div className="kvrow2"><span>Deliveries</span><span className="mono" style={{ color: sel.m.deliveries > 1 ? 'var(--warn)' : 'var(--tx)' }}>{sel.m.deliveries}</span></div>
               <div className="kvrow2"><span>Enqueued</span><span className="mono" style={{ color: 'var(--tx)' }} title={tfmt(sel.m.enqueued_at)}>{ago(sel.m.enqueued_at)}</span></div>
               {sel.kind === 'dlq' && <div className="kvrow2"><span>Dead-lettered</span><span className="mono" style={{ color: 'var(--tx)' }} title={tfmt(sel.m.moved_at)}>{ago(sel.m.moved_at)}</span></div>}
               <div className="kvrow2"><span>Size</span><span className="mono" style={{ color: 'var(--tx)' }}>{bfmt(sel.m.size)}</span></div>
