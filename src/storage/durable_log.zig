@@ -81,14 +81,30 @@ pub const DurableLog = struct {
         const w = self.writer;
         if (w.entry_count > 0 and start >= w.first_index and start <= w.last_index) return null;
         if (self.pending_cut) |cut| if (start > cut) return null;
-        for (try self.segments()) |f| {
-            if (start < f.first_index or start > f.last_index or f.unreadable) continue;
-            if (f.path.len > path_buf.len) return error.PathTooLong;
-            @memcpy(path_buf[0..f.path.len], f.path);
-            const end = if (self.pending_cut) |cut| @min(cut, f.last_index) else f.last_index;
-            return .{ .path = path_buf[0..f.path.len], .limit = end - start + 1 };
+        const f = covering(try self.segments(), start) orelse return null;
+        if (f.unreadable) return null;
+        if (f.path.len > path_buf.len) return error.PathTooLong;
+        @memcpy(path_buf[0..f.path.len], f.path);
+        const end = if (self.pending_cut) |cut| @min(cut, f.last_index) else f.last_index;
+        return .{ .path = path_buf[0..f.path.len], .limit = end - start + 1 };
+    }
+
+    /// The segment holding `index`, by binary search: a listing is in index
+    /// order with no two segments overlapping (`listSegments` refuses an
+    /// overlap), so only the last one starting at or below `index` can hold
+    /// it. A walk below the ring looks one up per segment, and a sync log
+    /// seals one segment per flush, so a scan here would cost the listing's
+    /// length on every read.
+    fn covering(files: []const SegmentFile, index: u64) ?*const SegmentFile {
+        var lo: usize = 0;
+        var hi: usize = files.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (files[mid].first_index <= index) lo = mid + 1 else hi = mid;
         }
-        return null;
+        if (lo == 0) return null;
+        const f = &files[lo - 1];
+        return if (index <= f.last_index) f else null;
     }
 
     /// What a read below the ring came to. `blocked` means it could not be
@@ -168,14 +184,11 @@ pub const DurableLog = struct {
         self.listing = grown;
     }
 
-    /// The last index any sealed segment holds; zero with none.
+    /// The last index any sealed segment holds; zero with none. The listing
+    /// is in index order with no overlap, so it's the last segment's.
     pub fn lastSealedIndex(self: *DurableLog) !u64 {
         const files = try self.segments();
-        var last: u64 = 0;
-        for (files) |f| if (!f.unreadable) {
-            last = @max(last, f.last_index);
-        };
-        return last;
+        return if (files.len == 0) 0 else files[files.len - 1].last_index;
     }
 
     /// The highest commit index any sealed segment was flushed under: what
@@ -587,15 +600,11 @@ pub const DurableLog = struct {
         // A cached segment above needs no open and is served even under the
         // injected error; one that must be opened hits it.
         if (self.test_open_error) |e| return e;
-        const files = try self.segments();
-        for (files) |f| {
-            if (index < f.first_index or index > f.last_index) continue;
-            const opened = try SegmentReader.initFromFile(self.allocator, f.path);
-            if (self.open) |o| self.allocator.free(o.buf);
-            self.open = .{ .first_index = f.first_index, .last_index = f.last_index, .buf = opened.buf, .reader = opened.reader };
-            return &self.open.?;
-        }
-        return null;
+        const f = covering(try self.segments(), index) orelse return null;
+        const opened = try SegmentReader.initFromFile(self.allocator, f.path);
+        if (self.open) |o| self.allocator.free(o.buf);
+        self.open = .{ .first_index = f.first_index, .last_index = f.last_index, .buf = opened.buf, .reader = opened.reader };
+        return &self.open.?;
     }
 
     fn intentPath(self: *DurableLog, buf: []u8) ![]const u8 {
@@ -847,6 +856,48 @@ test "durable log: readRange serves the writer buffer, then each sealed segment"
     // A one-slot buffer gets exactly one.
     try testing.expectEqual(@as(usize, 1), dl.readRange(1, buf[0..1], &arena).count);
     try testing.expectEqualStrings("one", buf[0].payload);
+}
+
+test "durable log: every index is found in its own segment among many, and none outside them" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &writer, td.path);
+    defer dl.deinit();
+
+    // 40 segments of uneven size: segment k holds k % 3 + 1 entries, from index 5.
+    var index: u64 = 5;
+    var firsts: [40]u64 = undefined;
+    for (0..40) |k| {
+        firsts[k] = index;
+        for (0..k % 3 + 1) |_| {
+            try writer.addEntry(&testEntry(index, 1, "x"));
+            index += 1;
+        }
+        try dl.flush(index - 1);
+    }
+    const last = index - 1;
+    try testing.expectEqual(@as(usize, 40), (try dl.segments()).len);
+    try testing.expectEqual(last, try dl.lastSealedIndex());
+
+    var buf: [1]Entry = undefined;
+    var arena: [64]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    for (5..last + 1) |i| {
+        try testing.expectEqual(@as(usize, 1), dl.readRange(i, &buf, &arena).count);
+        try testing.expectEqual(@as(u64, i), buf[0].header.index);
+        const src = (try dl.sealedSource(i, &path_buf)).?;
+        // The segment it names starts at the last first index at or below i.
+        var k: usize = 0;
+        while (k + 1 < firsts.len and firsts[k + 1] <= i) k += 1;
+        var name_buf: [32]u8 = undefined;
+        try testing.expect(std.mem.endsWith(u8, src.path, segment.segmentFilename(&name_buf, firsts[k]).?));
+    }
+    for ([_]u64{ 0, 1, 4, last + 1, last + 100 }) |i| {
+        try testing.expectEqual(@as(usize, 0), dl.readRange(i, &buf, &arena).count);
+        try testing.expect((try dl.sealedSource(i, &path_buf)) == null);
+    }
 }
 
 test "durable log: truncateAfter rewrites the sealed tail under its own name and deletes emptied files" {

@@ -54,6 +54,20 @@ module, on the shared Mac, 2026-11-10; three runs each.
 
 A full 32 MiB warm store holds about 330,000 entries of that size, eight times the map this scans.
 
+### Segment lookup below the ring (`bench-segment-walk`)
+
+A walk of 10,000 one-entry segments, as a sync log seals one per flush. `lookup` is `sealedSource`, the
+lookup a stream disk read makes; `read` also opens and reads each segment. ReleaseSafe, shared Mac under
+load (33–54), 2026-11-12; three runs each.
+
+| Build | lookup ns/index | read ns/index |
+|---|---:|---:|
+| dev 8672c21 (linear scan of the listing) | 2,482–2,549 | 18,792–19,222 |
+| binary search | 67–75 | 14,956–16,441 |
+
+The scan grows with the listing, which grows with every flush; the read's remainder is the file open
+and whole-file read per segment.
+
 ## Comparison with Old Architecture
 
 The New column is older than the tables above: its figures come from Zig 0.15.2, with their build also
