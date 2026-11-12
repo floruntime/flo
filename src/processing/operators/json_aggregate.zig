@@ -97,7 +97,8 @@ pub const JsonAggregateOperator = struct {
     pub const WindowConfig = union(enum) {
         /// Running aggregate — emit on every input record
         none,
-        /// Count-based window — emit after N records per key
+        /// Count-based window — emit after N records per key; a key holds
+        /// state only while its window is open
         tumbling_count: u64,
     };
 
@@ -106,10 +107,6 @@ pub const JsonAggregateOperator = struct {
         count: u64 = 0,
         min: f64 = std.math.floatMax(f64),
         max: f64 = -std.math.floatMax(f64),
-
-        fn reset(self: *Group) void {
-            self.* = .{};
-        }
 
         fn addValue(self: *Group, val: f64) void {
             self.sum += val;
@@ -223,7 +220,10 @@ pub const JsonAggregateOperator = struct {
             .tumbling_count => |threshold| {
                 if (group.count >= threshold) {
                     try self.emitResult(rec.key, group, rec.event_time_ms, ctx);
-                    group.reset();
+                    // A window that emitted leaves nothing to keep: the key's
+                    // next record starts a fresh one, so only keys with a
+                    // window open hold memory.
+                    if (self.groups.fetchSwapRemove(rec.key)) |kv| self.allocator.free(kv.key);
                 }
             },
         }
@@ -511,11 +511,21 @@ test "JsonAggregateOperator — count-based tumbling window" {
     try op.processElement(ProcessingRecord.init("k1", "{\"v\":3}", 300), &ctx);
     try std.testing.expectEqual(@as(usize, 1), collector.count());
 
-    // Group should be reset after emission
-    const group = agg.getGroup("k1").?;
-    try std.testing.expectEqual(@as(u64, 0), group.count);
-    try std.testing.expectEqual(@as(f64, 0), group.sum);
+    // The window emitted: its key is gone from the map.
+    try std.testing.expect(agg.getGroup("k1") == null);
+    try std.testing.expectEqual(@as(usize, 0), agg.groups.count());
+    collector.clear();
 
+    // A later record for it starts a fresh window: it counts from one, and
+    // the next window sums only its own records.
+    try op.processElement(ProcessingRecord.init("k1", "{\"v\":10}", 400), &ctx);
+    try std.testing.expectEqual(@as(u64, 1), agg.getGroup("k1").?.count);
+    try std.testing.expectEqual(@as(f64, 10), agg.getGroup("k1").?.sum);
+    try op.processElement(ProcessingRecord.init("k1", "{\"v\":20}", 500), &ctx);
+    try op.processElement(ProcessingRecord.init("k1", "{\"v\":30}", 600), &ctx);
+    try std.testing.expectEqual(@as(usize, 1), collector.count());
+    try std.testing.expect(std.mem.indexOf(u8, collector.drain()[0].value, "\"value\":60") != null);
+    try std.testing.expect(agg.getGroup("k1") == null);
     collector.clear();
 }
 
