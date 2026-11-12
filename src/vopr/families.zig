@@ -33,6 +33,7 @@ const schema = @import("../protocol/schema.zig");
 const action_machine = @import("../actions/machine.zig");
 const ae = @import("../protocol/action_entries.zig");
 const ns_handler = @import("../namespace/handler.zig");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const namespace_entries = @import("../protocol/namespace_entries.zig");
 
 const Allocator = std.mem.Allocator;
@@ -615,9 +616,9 @@ pub const Actions = struct {
     }
 
     /// A run's record, if it has one.
-    pub fn run(self: *Actions, ns: []const u8, id: []const u8) ?action_machine.Run.Value {
-        var b: [1 + 255 + ae.MAX_RUN_ID]u8 = undefined;
-        const k = view_mod.key(&b, ns, id) catch return null;
+    pub fn run(self: *Actions, ns: NamespaceId, id: []const u8) ?action_machine.Run.Value {
+        var b: [@sizeOf(u32) + ae.MAX_RUN_ID]u8 = undefined;
+        const k = view_mod.idKey(&b, ns, id) catch return null;
         const got = self.read().get(action_machine.Runs, k) catch return null;
         return if (got) |r| r.v else null;
     }
@@ -638,7 +639,7 @@ pub const Actions = struct {
     /// The runs an entry names: at most one, or an expire's items.
     const MAX_TOUCHED = ae.MAX_EXPIRE_ITEMS;
     const Touched = struct {
-        ns: []const u8,
+        ns: NamespaceId,
         id: []const u8,
         before: ?action_machine.Run.Value,
     };
@@ -661,7 +662,7 @@ pub const Actions = struct {
             .expire => {
                 const p = ae.Expire.decodeAll(e.payload, &diag) catch return error.Halt;
                 var it = p.items.iterator();
-                while (it.next() catch return error.Halt) |item| try self.note(ba, &touched, item.ns, item.run);
+                while (it.next() catch return error.Halt) |item| try self.note(ba, &touched, .of(item.ns), item.run);
             },
             inline else => |k| {
                 const P = switch (k) {
@@ -673,15 +674,21 @@ pub const Actions = struct {
                     else => unreachable,
                 };
                 const p = P.decodeAll(e.payload, &diag) catch return error.Halt;
-                try self.note(ba, &touched, p.ns, p.run);
+                try self.note(ba, &touched, .of(p.ns), p.run);
             },
         }
 
         // The action an invoke or deliver names, as it stood: whether it
         // should have been refused.
         const def_before: ?action_machine.Def.Value = switch (kind) {
-            .invoke => self.def("default", (ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt).action),
-            .deliver => self.def("default", (ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt).action),
+            .invoke => blk: {
+                const p = ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt;
+                break :blk self.def(.of(p.ns), p.action);
+            },
+            .deliver => blk: {
+                const p = ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
+                break :blk self.def(.of(p.ns), p.action);
+            },
             else => null,
         };
 
@@ -700,9 +707,9 @@ pub const Actions = struct {
     }
 
     /// An action's definition, if it has one.
-    fn def(self: *Actions, ns: []const u8, name: []const u8) ?action_machine.Def.Value {
-        var b: [1 + 255 + ae.MAX_ACTION_NAME]u8 = undefined;
-        const k = view_mod.key(&b, ns, name) catch return null;
+    fn def(self: *Actions, ns: NamespaceId, name: []const u8) ?action_machine.Def.Value {
+        var b: [@sizeOf(u32) + ae.MAX_ACTION_NAME]u8 = undefined;
+        const k = view_mod.idKey(&b, ns, name) catch return null;
         const got = self.read().get(action_machine.Defs, k) catch return null;
         return if (got) |d| d.v else null;
     }
@@ -737,10 +744,10 @@ pub const Actions = struct {
         return null;
     }
 
-    fn note(self: *Actions, ba: Allocator, touched: *std.ArrayListUnmanaged(Touched), ns: []const u8, id: []const u8) Allocator.Error!void {
-        for (touched.items) |t| if (std.mem.eql(u8, t.ns, ns) and std.mem.eql(u8, t.id, id)) return;
+    fn note(self: *Actions, ba: Allocator, touched: *std.ArrayListUnmanaged(Touched), ns: NamespaceId, id: []const u8) Allocator.Error!void {
+        for (touched.items) |t| if (t.ns == ns and std.mem.eql(u8, t.id, id)) return;
         const got = self.run(ns, id);
-        try touched.append(ba, .{ .ns = try ba.dupe(u8, ns), .id = try ba.dupe(u8, id), .before = if (got) |v| try copyRun(ba, v) else null });
+        try touched.append(ba, .{ .ns = ns, .id = try ba.dupe(u8, id), .before = if (got) |v| try copyRun(ba, v) else null });
     }
 
     fn copyRun(a: Allocator, v: action_machine.Run.Value) Allocator.Error!action_machine.Run.Value {
@@ -821,7 +828,7 @@ pub const Actions = struct {
                     var named = false;
                     var it = p.items.iterator();
                     while (it.next() catch null) |item| {
-                        if (std.mem.eql(u8, item.ns, t.ns) and std.mem.eql(u8, item.run, t.id) and item.expiry_ns == pre.expiry_ns) named = true;
+                        if (item.ns == t.ns.int() and std.mem.eql(u8, item.run, t.id) and item.expiry_ns == pre.expiry_ns) named = true;
                     }
                     if (!named) return "an expire ended a lease none of its items named the deadline of";
                     if (pre.expiry_ns > stamp) return "an expire ended a lease before its deadline";
@@ -837,13 +844,13 @@ pub const Actions = struct {
     }
 
     /// What every run must be, whatever entry left it so.
-    fn ruleOfRun(self: *Actions, ns: []const u8, id: []const u8, v: action_machine.Run.Value) ?[]const u8 {
+    fn ruleOfRun(self: *Actions, ns: NamespaceId, id: []const u8, v: action_machine.Run.Value) ?[]const u8 {
         if (v.failures >= v.max_attempts and v.status != .failed and v.status != .timed_out) return "a run that spent its attempts didn't end";
         var b: [512]u8 = undefined;
         var kb: [512]u8 = undefined;
         switch (v.status) {
             .ready => {
-                const k = view_mod.key(&kb, ns, action_machine.readyKey(&b, v.action, {}, v.due_ns, id)) catch return null;
+                const k = view_mod.idKey(&kb, ns, action_machine.readyKey(&b, v.action, {}, v.due_ns, id)) catch return null;
                 if (self.store.get(action_machine.Ready.ID, k) == null) return "a ready run has no ready key at its due time";
             },
             .leased => {
@@ -862,7 +869,8 @@ pub const Actions = struct {
         var it = self.store.range(action_machine.Requests.ID, "");
         while (it.next()) |rec| {
             const k = rec.key();
-            const ns = k[1..][0..k[0]];
+            if (k.len < 4) return "a request record's key names no namespace";
+            const ns: NamespaceId = .of(std.mem.readInt(u32, k[0..4], .big));
             const req = (action_machine.Requests.Value.decode(rec.value) catch return "a request record doesn't decode").v;
             const v = self.run(ns, req.run) orelse return "a request record names no run";
             if (v.status != .leased or v.token.term != req.term or v.token.index != req.index) return "a request record names a delivery that isn't live";
@@ -892,7 +900,7 @@ pub const Actions = struct {
                 var latest = stamp;
                 while (it.next() catch return error.Halt) |item| {
                     var moved = item;
-                    if (item.expiry_ns <= stamp) if (self.run(item.ns, item.run)) |v| if (v.status == .leased) {
+                    if (item.expiry_ns <= stamp) if (self.run(.of(item.ns), item.run)) |v| if (v.status == .leased) {
                         moved.expiry_ns = v.expiry_ns;
                         latest = @max(latest, v.expiry_ns);
                     };
@@ -903,7 +911,7 @@ pub const Actions = struct {
             },
             .settle_ignores_token => if (kindOf(e.header.entry_type) == .settle) {
                 var p = ae.Settle.decodeAll(e.payload, &diag) catch return error.Halt;
-                if (self.run(p.ns, p.run)) |v| if (v.status == .leased) {
+                if (self.run(.of(p.ns), p.run)) |v| if (v.status == .leased) {
                     p.holder = try self.scratch.allocator().dupe(u8, v.holder);
                     p.deliveries = v.deliveries;
                     p.token = v.token;
@@ -926,10 +934,10 @@ pub const Actions = struct {
                 // Held from now: the run's start moves, so the extend is
                 // still its lease's, and the ceiling with it.
                 const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
-                if (self.run(p.ns, p.run)) |v| if (v.status == .leased and v.delivered_ns == p.held_since_ns) {
+                if (self.run(.of(p.ns), p.run)) |v| if (v.status == .leased and v.delivered_ns == p.held_since_ns) {
                     var moved = p;
                     moved.held_since_ns = stamp;
-                    try self.moveStart(p.ns, p.run, stamp);
+                    try self.moveStart(.of(p.ns), p.run, stamp);
                     out.payload = ae.Extend.encodeInto(self.rewrite, moved) catch return error.Halt;
                 };
             },
@@ -940,9 +948,9 @@ pub const Actions = struct {
 
     /// Set a run's `delivered_ns` in place: `extend_ignores_held_since`'s
     /// state half. Its value is copied, so the store owns what it holds.
-    fn moveStart(self: *Actions, ns: []const u8, id: []const u8, to: u64) persistence.ApplyError!void {
-        var b: [1 + 255 + ae.MAX_RUN_ID]u8 = undefined;
-        const k = view_mod.key(&b, ns, id) catch return error.Halt;
+    fn moveStart(self: *Actions, ns: NamespaceId, id: []const u8, to: u64) persistence.ApplyError!void {
+        var b: [@sizeOf(u32) + ae.MAX_RUN_ID]u8 = undefined;
+        const k = view_mod.idKey(&b, ns, id) catch return error.Halt;
         const node = self.store.find(action_machine.Runs.ID, k) orelse return;
         var v = (action_machine.Runs.Value.decode(store_mod.Record.of(node).value) catch return error.Halt).v;
         v.delivered_ns = to;
@@ -1139,16 +1147,16 @@ const ActionsTest = struct {
 
     /// Registered, invoked and delivered to `w`; the deliver's token.
     fn delivered(t: *ActionsTest, lease_ms: u64, max_attempts: u32, request_key: ?[]const u8) !ae.Token.Value {
-        _ = try t.next(ae.Register, .action_register, .{ .ns = "default", .name = "act", .owner = "", .lease_ms = lease_ms, .max_attempts = max_attempts });
-        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = "default", .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
+        _ = try t.next(ae.Register, .action_register, .{ .ns = NamespaceId.default.int(), .name = "act", .owner = "", .lease_ms = lease_ms, .max_attempts = max_attempts });
+        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
         const due = t.stamp;
-        const d = try t.next(ae.Deliver, .action_deliver, .{ .ns = "default", .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = request_key, .lease_ms = lease_ms });
+        const d = try t.next(ae.Deliver, .action_deliver, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = request_key, .lease_ms = lease_ms });
         try testing.expect(!d.refused);
         return .{ .term = 1, .index = t.index };
     }
 
     fn live(t: *ActionsTest) action_machine.Run.Value {
-        return t.a.run("default", "r").?;
+        return t.a.run(.default, "r").?;
     }
 
     fn expire(t: *ActionsTest, expiry_ns: u64, stamp: u64) !?[]const u8 {
@@ -1162,9 +1170,9 @@ test "families: an action run's entries keep their rules, and each refused one c
     const token = try t.delivered(5_000, 2, "k");
     try testing.expectEqual(@as(?[]const u8, null), t.a.danglingRequest());
     // A stale token is refused; the live one fails the run, retried.
-    const stale = try t.next(ae.Release, .action_release, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = .{ .term = 1, .index = 99 }, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" });
+    const stale = try t.next(ae.Release, .action_release, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = .{ .term = 1, .index = 99 }, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" });
     try testing.expect(stale.refused);
-    const rel = try t.next(ae.Release, .action_release, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" });
+    const rel = try t.next(ae.Release, .action_release, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" });
     try testing.expectEqual(@as(?[]const u8, null), rel.broke);
     try testing.expectEqual(@as(u32, 1), t.live().failures);
     try testing.expectEqual(@as(?[]const u8, null), t.a.danglingRequest());
@@ -1180,11 +1188,11 @@ fn brokenUnder(mutant: Mutant, comptime steps: fn (*ActionsTest) anyerror!?[]con
 
 const mutant_steps = struct {
     fn earlyDeliver(t: *ActionsTest) !?[]const u8 {
-        _ = try t.next(ae.Register, .action_register, .{ .ns = "default", .name = "act", .owner = "", .lease_ms = 5_000, .max_attempts = 2 });
-        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = "default", .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
+        _ = try t.next(ae.Register, .action_register, .{ .ns = NamespaceId.default.int(), .name = "act", .owner = "", .lease_ms = 5_000, .max_attempts = 2 });
+        _ = try t.next(ae.Invoke, .action_invoke, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null });
         const due = t.stamp;
         // Due at `due`, delivered a second before it.
-        return (try t.at(ae.Deliver, .action_deliver, .{ .ns = "default", .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = null, .lease_ms = 5_000 }, due - std.time.ns_per_s)).broke;
+        return (try t.at(ae.Deliver, .action_deliver, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .due_ns = due, .holder = "w", .request_key = null, .lease_ms = 5_000 }, due - std.time.ns_per_s)).broke;
     }
 
     fn earlyExpire(t: *ActionsTest) !?[]const u8 {
@@ -1196,23 +1204,23 @@ const mutant_steps = struct {
         const token = try t.delivered(10_000, 2, null);
         const old = t.live().expiry_ns;
         // Extended past half its lease: the old key stays, now past due.
-        _ = try t.at(ae.Extend, .action_extend, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = old, .held_since_ns = t.live().delivered_ns, .lease_ms = 10_000 }, t.stamp + 6 * std.time.ns_per_s);
+        _ = try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = old, .held_since_ns = t.live().delivered_ns, .lease_ms = 10_000 }, t.stamp + 6 * std.time.ns_per_s);
         return t.expire(old, old + std.time.ns_per_s);
     }
 
     fn staleSettle(t: *ActionsTest) !?[]const u8 {
         _ = try t.delivered(5_000, 2, null);
-        return (try t.next(ae.Settle, .action_settle, .{ .ns = "default", .action = "act", .run = "r", .holder = "other", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = 99 }, .expiry_ns = t.live().expiry_ns, .outcome = "", .result = "" })).broke;
+        return (try t.next(ae.Settle, .action_settle, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "other", .request_key = null, .deliveries = 1, .token = .{ .term = 1, .index = 99 }, .expiry_ns = t.live().expiry_ns, .outcome = "", .result = "" })).broke;
     }
 
     fn failedRelease(t: *ActionsTest) !?[]const u8 {
         const token = try t.delivered(5_000, 3, null);
-        return (try t.next(ae.Release, .action_release, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" })).broke;
+        return (try t.next(ae.Release, .action_release, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" })).broke;
     }
 
     fn settleWithKey(t: *ActionsTest) !?[]const u8 {
         const token = try t.delivered(5_000, 2, "k");
-        const s = try t.next(ae.Settle, .action_settle, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .outcome = "", .result = "" });
+        const s = try t.next(ae.Settle, .action_settle, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .request_key = "k", .deliveries = 1, .token = token, .expiry_ns = t.live().expiry_ns, .outcome = "", .result = "" });
         return s.broke orelse t.a.danglingRequest();
     }
 
@@ -1221,13 +1229,13 @@ const mutant_steps = struct {
         const token = try t.delivered(lease, 2, null);
         const since = t.live().delivered_ns;
         // Past half the lease: the extend moves it, to the ceiling at most.
-        return (try t.at(ae.Extend, .action_extend, .{ .ns = "default", .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = t.live().expiry_ns, .held_since_ns = since, .lease_ms = lease }, since + 7 * 60 * 60 * std.time.ns_per_s)).broke;
+        return (try t.at(ae.Extend, .action_extend, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .holder = "w", .token = token, .expiry_ns = t.live().expiry_ns, .held_since_ns = since, .lease_ms = lease }, since + 7 * 60 * 60 * std.time.ns_per_s)).broke;
     }
 };
 
 fn expireAt(t: *ActionsTest, expiry_ns: u64, stamp: u64) !?[]const u8 {
     var ib: [512]u8 = undefined;
-    const item = try ae.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = "act", .run = "r", .expiry_ns = expiry_ns, .holder = "w", .request_key = null });
+    const item = try ae.ExpireItem.encodeInto(&ib, .{ .ns = NamespaceId.default.int(), .action = "act", .run = "r", .expiry_ns = expiry_ns, .holder = "w", .request_key = null });
     return (try t.at(ae.Expire, .action_expire, .{ .items = .{ .bytes = item, .count = 1 } }, stamp)).broke;
 }
 

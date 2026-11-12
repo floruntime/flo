@@ -1,10 +1,10 @@
 //! Two namespaces holding a stream, a consumer group, a queue, a
-//! measurement, a workflow or a processing job of the same name keep them
-//! apart: each is keyed by the namespace's id and its name, from a request
-//! and from the log alike, so a read in one never sees the other's records,
-//! messages, points, runs or jobs, on one shard or many, and after a
-//! restart replays the log. The two namespaces are a pair whose names once
-//! hashed to the same 32 bits.
+//! measurement, a workflow, a processing job or an action of the same name
+//! keep them apart: each is keyed by the namespace's id and its name, from a
+//! request and from the log alike, so a read in one never sees the other's
+//! records, messages, points, runs, jobs or tasks, on one shard or many, and
+//! after a restart replays the log. The two namespaces are a pair whose
+//! names once hashed to the same 32 bits.
 
 const std = @import("std");
 const testing = std.testing;
@@ -515,6 +515,130 @@ fn verifyJobs(ctx: *stdx.testing.TestContext, restarted: bool) !void {
     }
 }
 
+// ── Actions ──────────────────────────────────────────────────────────────────
+
+/// The runs each namespace invoked of "same", by its index.
+var action_runs: [NAMESPACES.len][4][32]u8 = undefined;
+var action_run_lens: [NAMESPACES.len][4]usize = undefined;
+
+fn actionRun(i: usize, k: usize) []const u8 {
+    return action_runs[i][k][0..action_run_lens[i][k]];
+}
+
+/// In each namespace: "same", allowing i + 1 attempts, with count(i) runs;
+/// "gone", deleted from the first namespace only; and "only", whose one
+/// run is the second namespace's.
+fn writeActions(ctx: *stdx.testing.TestContext) !void {
+    var buf: [64]u8 = undefined;
+    var want: [64]u8 = undefined;
+    for (NAMESPACES, 0..) |ns, i| {
+        const attempts = try std.fmt.bufPrint(&want, "{d}", .{i + 1});
+        for ([_][]const u8{ "same", "gone", "only" }) |name| {
+            const registered = try run(ctx, &.{ "action", "register", name, "--max-attempts", attempts, "-n", ns }, 0);
+            defer testing.allocator.free(registered);
+            var line_buf: [64]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&line_buf, "Registered action: {s}", .{name}), registered);
+        }
+        for (0..count(i)) |k| {
+            const invoked = try run(ctx, &.{ "action", "invoke", "same", try payload(&buf, ns, k), "-n", ns }, 0);
+            defer testing.allocator.free(invoked);
+            const prefix = "Result: ";
+            if (!std.mem.startsWith(u8, invoked, prefix)) return error.NoRunId;
+            const id = invoked[prefix.len..];
+            @memcpy(action_runs[i][k][0..id.len], id);
+            action_run_lens[i][k] = id.len;
+        }
+    }
+    const deleted = try run(ctx, &.{ "action", "delete", "gone", "-n", NAMESPACES[0] }, 0);
+    defer testing.allocator.free(deleted);
+    try testing.expectEqualStrings("Deleted action: gone", deleted);
+    const only = try run(ctx, &.{ "action", "invoke", "only", "{}", "-n", NAMESPACES[1] }, 0);
+    defer testing.allocator.free(only);
+    try testing.expect(std.mem.startsWith(u8, only, "Result: "));
+}
+
+/// `action status <run_id> -n <ns>` answers not found, and nothing else.
+fn expectRunNotFound(ctx: *stdx.testing.TestContext, run_id: []const u8, ns: []const u8) !void {
+    var r = try ctx.cli.run(&.{ "action", "status", run_id, "-n", ns });
+    defer r.deinit();
+    var want: [96]u8 = undefined;
+    try testing.expectEqual(@as(u8, 1), r.exit_code);
+    try testing.expectEqualStrings("", r.stdout);
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Error: Run not found: {s}\n", .{run_id}), r.stderr);
+}
+
+/// Before the restart each namespace's worker takes and completes its first
+/// run of "same"; after it, its second. Either way it is given only its own
+/// namespace's, and lists, info and status see only their own.
+fn verifyActions(ctx: *stdx.testing.TestContext, restarted: bool) !void {
+    var buf: [64]u8 = undefined;
+    for (NAMESPACES, 0..) |ns, i| {
+        const other = 1 - i;
+        // The runs of "same" completed before this check.
+        const prior: usize = @intFromBool(restarted);
+
+        // The first namespace deleted "gone"; the second still has it.
+        const listed = try run(ctx, &.{ "action", "list", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(listed);
+        const names = try parse([]const struct { name: []const u8 }, listed);
+        defer names.deinit();
+        var got: [3][]const u8 = undefined;
+        if (names.value.len > got.len) return error.TooManyActions;
+        for (names.value, 0..) |n, k| got[k] = n.name;
+        std.mem.sort([]const u8, got[0..names.value.len], {}, lessThanStr);
+        const want_names: []const []const u8 = if (i == 0) &.{ "only", "same" } else &.{ "gone", "only", "same" };
+        try testing.expectEqual(want_names.len, names.value.len);
+        for (want_names, got[0..want_names.len]) |w, g| try testing.expectEqualStrings(w, g);
+
+        // Its own definition and runs.
+        const info = try run(ctx, &.{ "action", "info", "same", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(info);
+        const def = try parse(struct { max_attempts: u64, ready: u64, completed: ?u64 }, info);
+        defer def.deinit();
+        try testing.expectEqual(@as(u64, i + 1), def.value.max_attempts);
+        try testing.expectEqual(@as(u64, count(i) - prior), def.value.ready);
+        try testing.expectEqual(@as(?u64, prior), def.value.completed);
+
+        const runs_out = try run(ctx, &.{ "action", "runs", "same", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(runs_out);
+        const runs = try parse([]const struct { run_id: []const u8, action: []const u8 }, runs_out);
+        defer runs.deinit();
+        try testing.expectEqual(count(i), runs.value.len);
+        for (runs.value) |r| {
+            try testing.expectEqualStrings("same", r.action);
+            for (0..count(i)) |k| {
+                if (std.mem.eql(u8, actionRun(i, k), r.run_id)) break;
+            } else return error.NotOwnRun;
+        }
+
+        // The other namespace's runs are not found from here.
+        try expectRunNotFound(ctx, actionRun(other, 0), ns);
+        const own = try run(ctx, &.{ "action", "status", actionRun(i, 0), "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(own);
+        const status = try parse(struct { status: []const u8 }, own);
+        defer status.deinit();
+        try testing.expectEqualStrings(if (restarted) "completed" else "pending", status.value.status);
+
+        // A worker here takes this namespace's next run, never the other's.
+        const taken = try run(ctx, &.{ "worker", "await", "same", "--worker-id", "w", "--block", "5000", "-n", ns }, 0);
+        defer testing.allocator.free(taken);
+        const task_line = line(taken, "Task: ") orelse return error.NoTask;
+        const task = task_line["Task: ".len..];
+        try testing.expect(std.mem.startsWith(u8, task, actionRun(i, prior)));
+        var want: [80]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Payload: {s}", .{try payload(&buf, ns, prior)}), line(taken, "Payload: ") orelse return error.NoPayload);
+        const completed = try run(ctx, &.{ "worker", "complete", task, "--worker-id", "w", "-n", ns }, 0);
+        testing.allocator.free(completed);
+
+        // "only" has a run in the second namespace alone.
+        if (i == 0) {
+            const none = try run(ctx, &.{ "worker", "await", "only", "--worker-id", "w", "--block", "300", "-n", ns }, 0);
+            defer testing.allocator.free(none);
+            try testing.expectEqualStrings("(no tasks)", none);
+        }
+    }
+}
+
 fn lessThanStr(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }
@@ -583,4 +707,12 @@ test "e2e/processing/isolation: jobs named in two namespaces list, stop and repo
 
 test "e2e/processing/isolation: jobs named in two namespaces list, stop and report only their own, on 4 shards and after a restart" {
     try isolated(4, writeJobs, verifyJobs);
+}
+
+test "e2e/action/isolation: an action named in two namespaces invokes, lists, reports and hands out only its own runs, on 1 shard and after a restart" {
+    try isolated(1, writeActions, verifyActions);
+}
+
+test "e2e/action/isolation: an action named in two namespaces invokes, lists, reports and hands out only its own runs, on 4 shards and after a restart" {
+    try isolated(4, writeActions, verifyActions);
 }

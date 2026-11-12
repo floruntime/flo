@@ -7462,6 +7462,19 @@ fn payloadNamespaceId(comptime P: type, payload: []const u8) ?u32 {
     }
 }
 
+test "entryNamespaceId: an action entry, and an expire's items, name their namespace's id" {
+    var buf: [512]u8 = undefined;
+    const reg = try action_entries.Register.encodeInto(&buf, .{ .ns = 21, .name = "a", .owner = "", .lease_ms = 5000, .max_attempts = 1 });
+    const e = entry_mod.buildEntry(.action_register, entry_mod.Flags.NONE, 1, 1, 1, reg);
+    try std.testing.expectEqual(@as(?u32, 21), entryNamespaceId(&e));
+    var items: [2 * action_entries.ExpireItem.max_size]u8 = undefined;
+    var n: usize = 0;
+    for ([_]u32{ 17, 30 }) |ns| n += (try action_entries.ExpireItem.encodeInto(items[n..], .{ .ns = ns, .action = "a", .run = "r", .expiry_ns = 1, .holder = "", .request_key = null })).len;
+    const exp = try action_entries.Expire.encodeInto(&buf, .{ .items = .{ .bytes = items[0..n], .count = 2 } });
+    const x = entry_mod.buildEntry(.action_expire, entry_mod.Flags.NONE, 1, 2, 1, exp);
+    try std.testing.expectEqual(@as(?u32, 30), entryNamespaceId(&x));
+}
+
 pub fn raftRingCapacity(hot_buffer_capacity: usize) usize {
     return @max(RAFT_RING_MIN, @min(hot_buffer_capacity / 4, RAFT_RING_MAX));
 }
@@ -7966,11 +7979,11 @@ fn proposeAction(shard: *Shard, comptime etype: entry_mod.EntryType, body: anyty
 }
 
 fn testRegister(name: []const u8) action_entries.Register.Value {
-    return .{ .ns = "default", .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 3 };
+    return .{ .ns = ns_table.DEFAULT.int(), .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 3 };
 }
 
 fn testInvoke(name: []const u8, run_id: []const u8) action_entries.Invoke.Value {
-    return .{ .ns = "default", .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null };
+    return .{ .ns = ns_table.DEFAULT.int(), .action = name, .run = run_id, .input = "{}", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null };
 }
 
 test "Shard: init and deinit" {
@@ -12187,10 +12200,10 @@ test "Shard: a node that doesn't lead ends no lease, however far past its deadli
     const s = &t.shard;
     _ = try applyActionEntry(s, .action_register, testRegister("echo"), 1, 1);
     _ = try applyActionEntry(s, .action_invoke, testInvoke("echo", "act-1"), 2, 1);
-    _ = try applyActionEntry(s, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "echo", .run = "act-1", .due_ns = 1, .holder = "w-1", .request_key = null, .lease_ms = 5000 }, 3, 1);
+    _ = try applyActionEntry(s, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "echo", .run = "act-1", .due_ns = 1, .holder = "w-1", .request_key = null, .lease_ms = 5000 }, 3, 1);
     try std.testing.expectEqual(@as(u64, 0), s.actions_handler.expireDue(s));
     try std.testing.expect(s.actions_handler.expiring == null);
-    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(s, "default", "act-1").?.status);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(s, .default, "act-1").?.status);
 }
 
 test "Shard: a connection's blocking reads held for the leader count toward its cap" {
@@ -13626,7 +13639,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     const a = Run.byId(wf, a_id);
     try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, a.status);
     const action_run = a.pending_action_run_id_owned.?;
-    try std.testing.expect(ActionsHandler.for_tests.run(&shard, "default", action_run) == null);
+    try std.testing.expect(ActionsHandler.for_tests.run(&shard, .default, action_run) == null);
     try std.testing.expectEqual(@as(u32, 1), shard.pending_count);
 
     // One ack commits both: the second start is answered (its applier
@@ -13636,7 +13649,7 @@ test "Shard: on a cluster leader a workflow's first step invokes its action with
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@as(u64, 22), one[0].header.request_id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&shard, "default", action_run).?.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&shard, .default, action_run).?.status);
     wf.advanceStartedRuns(&shard);
     try ParkTest.ack(&shard);
     wf.advanceStartedRuns(&shard);
@@ -13913,7 +13926,7 @@ test "Shard: concurrent conditional writes are decided in log order: one run per
     try std.testing.expectEqual(@backingInt(proto.StatusCode.conflict), rs[3].header.status);
     // Two registers are two versions.
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), rs[5].header.status);
-    try std.testing.expectEqual(@as(?u32, 2), ActionsHandler.for_tests.version(&shard, "default", "act"));
+    try std.testing.expectEqual(@as(?u32, 2), ActionsHandler.for_tests.version(&shard, .default, "act"));
 }
 
 test "Shard: park answers from its own entry when a later one has already committed" {
@@ -16441,7 +16454,7 @@ const ActionsTest = struct {
     }
 
     fn run(t: *ActionsTest, id: []const u8) action_machine.Run.Value {
-        return ActionsHandler.for_tests.run(&t.shard, "default", id).?;
+        return ActionsHandler.for_tests.run(&t.shard, .default, id).?;
     }
 };
 
@@ -17126,7 +17139,7 @@ const ClusterActionsTest = struct {
     fn setUp(t: *ClusterActionsTest, runs: []const []const u8, delivered_ns: u64) !void {
         _ = try applyActionEntry(&t.shard, .action_register, testRegister("act"), 1, 1);
         for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_invoke, testInvoke("act", r), 2 + i, 1);
-        if (delivered_ns != 0) _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = runs[0], .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 9, delivered_ns);
+        if (delivered_ns != 0) _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = runs[0], .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 9, delivered_ns);
     }
 };
 
@@ -17149,7 +17162,7 @@ test "actions: one expire is in flight at a time, and a new leader ends no lease
     try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
     try ParkTest.ack(&t.shard);
     try std.testing.expect(actions.expiring == null);
-    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, "default", "r1").?.status);
+    try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
 }
 
 test "actions: an expire ends at most a full entry of leases, and the next is proposed as it applies, not at the next tick" {
@@ -17162,7 +17175,7 @@ test "actions: an expire ends at most a full entry of leases, and the next is pr
     var runs: [n][]const u8 = undefined;
     for (&runs, &names, 0..) |*r, *b, i| r.* = try std.fmt.bufPrint(b, "r{d}", .{i});
     try t.setUp(&runs, 0);
-    for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 100 + i, 2);
+    for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 100 + i, 2);
     const actions = t.shard.actions_handler;
     // Past this term's grace.
     _ = actions.expireDue(&t.shard);
@@ -17178,7 +17191,7 @@ test "actions: an expire ends at most a full entry of leases, and the next is pr
     // A partial one leaves none past due: nothing follows it.
     try ParkTest.ack(&t.shard);
     try std.testing.expect(actions.expiring == null);
-    for (runs) |r| try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, "default", r).?.status);
+    for (runs) |r| try std.testing.expectEqual(action_machine.Status.ready, ActionsHandler.for_tests.run(&t.shard, .default, r).?.status);
 }
 
 test "actions: with the leader's clock ahead of its voters', leases past due only by its own clock aren't expired, so none chain" {
@@ -17192,7 +17205,7 @@ test "actions: with the leader's clock ahead of its voters', leases past due onl
     try t.setUp(&runs, 0);
     const wall: u64 = @intCast(@import("stdx").time.nanoTimestamp());
     // A full entry of leases that ended a moment ago by the leader's clock.
-    for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 100 + i, wall - 5001 * std.time.ns_per_ms + i);
+    for (runs, 0..) |r, i| _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = r, .due_ns = 1, .holder = "w1", .request_key = null, .lease_ms = 5000 }, 100 + i, wall - 5001 * std.time.ns_per_ms + i);
     // The other voter's clock is 10 s behind, which holds the stamps back.
     const rn = t.shard.raft_node;
     rn.peers[0].clock_ns = wall - 10 * std.time.ns_per_s;
@@ -17204,7 +17217,7 @@ test "actions: with the leader's clock ahead of its voters', leases past due onl
     // so nothing applies as a no-op and chains into another.
     try std.testing.expectEqual(@as(u64, 0), actions.expireDue(&t.shard));
     try std.testing.expect(actions.expiring == null);
-    for (runs) |r| try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, "default", r).?.status);
+    for (runs) |r| try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, r).?.status);
 }
 
 test "actions: a touch while its extend is in flight answers the lease as it stands, proposing nothing" {
@@ -17214,7 +17227,7 @@ test "actions: a touch while its extend is in flight answers the lease as it sta
     // A second of a 5 s lease left: a touch extends.
     const now: u64 = @intCast(@import("stdx").time.nanoTimestamp());
     try t.setUp(&.{"r1"}, now - 4 * std.time.ns_per_s);
-    const run = ActionsHandler.for_tests.run(&t.shard, "default", "r1").?;
+    const run = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
     var body: [1024]u8 = undefined;
     const touch = try table_run.op("action.touch").request.encodeInto(&body, .{ .action = "act", .worker = "w1", .deliveries = run.deliveries, .term = run.token.term, .index = run.token.index });
     try ParkTest.send(&t.shard, t.c.conn, .action_touch, 1, "r1", touch);
@@ -17269,9 +17282,9 @@ test "actions: a task whose await closed before its deliver applied is handed ba
     t.shard.removeConnection(t.c.conn.fd);
     try ParkTest.ack(&t.shard);
     // Its deliver applied, and handing it back was proposed.
-    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, "default", "r1").?.status);
+    try std.testing.expectEqual(action_machine.Status.leased, ActionsHandler.for_tests.run(&t.shard, .default, "r1").?.status);
     try ParkTest.ack(&t.shard);
-    const run = ActionsHandler.for_tests.run(&t.shard, "default", "r1").?;
+    const run = ActionsHandler.for_tests.run(&t.shard, .default, "r1").?;
     try std.testing.expectEqual(action_machine.Status.ready, run.status);
     try std.testing.expectEqual(action_machine.Ended.abandoned, run.ended);
     try std.testing.expectEqual(@as(u32, 0), run.failures);
@@ -17502,7 +17515,7 @@ test "actions: a report counts toward its worker's stats on the worker's own sha
     defer std.testing.allocator.free(done);
     _ = feedClient(t.cb.pair[1], &t.two.shards[1], t.cb.conn.fd, done);
     t.two.settle();
-    try std.testing.expectEqual(@as(u64, 1), here.worker_handler.find("default", t.worker).?.tasks_completed);
+    try std.testing.expectEqual(@as(u64, 1), here.worker_handler.find(.default, t.worker).?.tasks_completed);
 }
 
 test "actions: a run its shard has no record of is answered as lost, and a workflow asks about a run at most once a while" {
@@ -17511,8 +17524,8 @@ test "actions: a run its shard has no record of is answered as lost, and a workf
     defer t.deinit();
     const here = &t.two.shards[0];
     const actions = here.actions_handler;
-    actions.askResult(here, 1, "default", "act-nothing");
-    actions.askResult(here, 1, "default", "act-nothing");
+    actions.askResult(here, 1, .default, "act-nothing");
+    actions.askResult(here, 1, .default, "act-nothing");
     try std.testing.expectEqual(@as(usize, 1), t.two.shards[1].mailbox.inbox.pending());
     t.two.settle();
     try std.testing.expectEqual(result_mod.CommandResult.ActionRunStatus.cancelled, actions.finished.get("act-nothing").?.status);
@@ -17560,10 +17573,9 @@ test "actions: a shard asked about a run says nothing until its leader is ready,
     const there = &t.two.shards[1];
     const actions = there.actions_handler;
     var ask: [64]u8 = undefined;
-    std.mem.writeInt(u16, ask[0..2], 7, .little);
-    @memcpy(ask[2..9], "default");
-    @memcpy(ask[9..15], "run-xy");
-    const bytes = ask[0..15];
+    std.mem.writeInt(u32, ask[0..4], ns_table.DEFAULT.int(), .little);
+    @memcpy(ask[4..10], "run-xy");
+    const bytes = ask[0..10];
     const raft = there.raft_node;
     const ready = raft.ready_index;
     raft.ready_index = raft.last_applied + 1000;
@@ -17573,7 +17585,7 @@ test "actions: a shard asked about a run says nothing until its leader is ready,
     // Asked to start it, its action not registered: held, not lost. The
     // workflow's shard is told why it waits, and asking gets no answer.
     var start_buf: [256]u8 = undefined;
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-xy", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, .default, "run-xy", "nope", "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
     _ = &start_buf;
     actions.startRunFromInbox(there, 0, start);
@@ -17583,9 +17595,9 @@ test "actions: a shard asked about a run says nothing until its leader is ready,
     try std.testing.expectEqual(@as(usize, 0), t.two.shards[0].mailbox.inbox.pending());
     // Never started, and not starting: lost.
     var other: [64]u8 = undefined;
-    @memcpy(other[0..15], bytes);
-    @memcpy(other[9..15], "run-zz");
-    actions.resultAskFromInbox(there, 0, other[0..15]);
+    @memcpy(other[0..10], bytes);
+    @memcpy(other[4..10], "run-zz");
+    actions.resultAskFromInbox(there, 0, other[0..10]);
     try std.testing.expectEqual(@as(usize, 1), t.two.shards[0].mailbox.inbox.pending());
     t.two.settle();
 }
@@ -17920,10 +17932,10 @@ test "actions: however awaits, invokes, refusals, step-downs and commits interle
                     if (key) |k| {
                         var rb: [64]u8 = undefined;
                         var sk: [128]u8 = undefined;
-                        const rec_key = try view.key(&sk, "default", action_machine.requestKey(&rb, worker, k));
+                        const rec_key = try view.idKey(&sk, .default, action_machine.requestKey(&rb, worker, k));
                         if (t.shard.defaultPartition().store.get(action_machine.Requests.ID, rec_key)) |bytes| {
                             const rec = (try action_machine.Requests.Value.decode(bytes)).v;
-                            if (ActionsHandler.for_tests.run(&t.shard, "default", rec.run)) |run| held = run.status == .leased and run.token.term == rec.term and run.token.index == rec.index;
+                            if (ActionsHandler.for_tests.run(&t.shard, .default, rec.run)) |run| held = run.status == .leased and run.token.term == rec.term and run.token.index == rec.index;
                         }
                     }
                     const before = actions.pending.items.len;
@@ -17943,7 +17955,7 @@ test "actions: however awaits, invokes, refusals, step-downs and commits interle
                     const d = try action_entries.Deliver.decodeAll(e.payload, &diag);
                     var rb: [16]u8 = undefined;
                     @memcpy(rb[0..d.run.len], d.run);
-                    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = "default", .action = "act", .run = rb[0..d.run.len], .due_ns = d.due_ns, .holder = "rival", .request_key = null, .lease_ms = 5000 }, store_index, now);
+                    _ = try applyActionEntry(&t.shard, .action_deliver, action_entries.Deliver.Value{ .ns = ns_table.DEFAULT.int(), .action = "act", .run = rb[0..d.run.len], .due_ns = d.due_ns, .holder = "rival", .request_key = null, .lease_ms = 5000 }, store_index, now);
                     refused += 1;
                 },
                 // This node steps down, and leads again.
@@ -17981,9 +17993,9 @@ test "actions: what a shard keeps of runs asked about, and runs it was asked to 
     defer t.deinit();
     const here = &t.two.shards[0];
     const actions = here.actions_handler;
-    actions.askResult(here, 1, "default", "act-old");
+    actions.askResult(here, 1, .default, "act-old");
     const there = &t.two.shards[1];
-    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, "default", "run-old", t.name, "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
+    const start = ActionsHandler.encodeStartRunMessage(std.testing.allocator, .default, "run-old", t.name, "{}", "wf-run", "wf", true) orelse return error.OutOfMemory;
     defer std.testing.allocator.free(start);
     there.actions_handler.startRunFromInbox(there, 0, start);
     try std.testing.expect(there.actions_handler.starting.get("run-old") != null);
@@ -18266,7 +18278,7 @@ test "Shard: a worker's await runs where the worker is registered, so a labelled
     try std.testing.expect(std.mem.endsWith(u8, resp.data, "job"));
     // Handing it a task doesn't count toward its load: that is what the
     // worker reports.
-    try std.testing.expectEqual(@as(u32, 0), other.worker_handler.find("default", worker).?.current_load);
+    try std.testing.expectEqual(@as(u32, 0), other.worker_handler.find(.default, worker).?.current_load);
 }
 
 test "Shard: an await parked before its worker was drained is refused as it drains, and a run that arrives later waits" {
@@ -18352,7 +18364,7 @@ fn expectParkedAwaitRefused(how: enum { drained, silent }) !void {
             // The sweep's clock moves past the timeout; moving the worker's
             // last sight back instead would stop at 0 on a machine up for
             // less than the timeout.
-            const seen = other.worker_handler.find("default", worker).?.last_seen_ms;
+            const seen = other.worker_handler.find(.default, worker).?.last_seen_ms;
             try std.testing.expectEqual(@as(usize, 1), other.worker_handler.checkHealth(seen + other.worker_handler.heartbeat_timeout_ms + 1));
         },
     }
@@ -18463,8 +18475,8 @@ test "Shard: on a leader, an invoke and a retry wake workers; a settle, and anyt
     const role = shard.raft_node.role;
     defer shard.raft_node.role = role;
     const token: action_entries.Token.Value = .{ .term = 1, .index = 1 };
-    const release: action_entries.Release.Value = .{ .ns = "default", .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" };
-    const settle: action_entries.Settle.Value = .{ .ns = "default", .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .outcome = "", .result = "" };
+    const release: action_entries.Release.Value = .{ .ns = ns_table.DEFAULT.int(), .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .abandoned = false, .retry = true, .delay_ms = 0, .@"error" = "" };
+    const settle: action_entries.Settle.Value = .{ .ns = ns_table.DEFAULT.int(), .action = "a", .run = "r", .holder = "w", .request_key = null, .deliveries = 1, .token = token, .expiry_ns = 0, .outcome = "", .result = "" };
     var buf: [1024]u8 = undefined;
     for ([_]struct { leads: bool, e: entry_mod.Entry, wakes: bool }{
         .{ .leads = true, .e = try ActionsHandler.for_tests.entry(.action_invoke, testInvoke("a", "r"), 1, 1, 0, buf[0..512]), .wakes = true },

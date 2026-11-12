@@ -24,7 +24,6 @@ const persistence = @import("../storage/persistence.zig");
 const schema = @import("../protocol/schema.zig");
 const ae = @import("../protocol/action_entries.zig");
 const qe = @import("../protocol/queue_entries.zig");
-const limits = @import("../protocol/limits.zig");
 const view_mod = @import("../contract/view.zig");
 const machine_mod = @import("../contract/machine.zig");
 const delivery = @import("../contract/delivery.zig");
@@ -103,8 +102,6 @@ const M = delivery.Model(.{
     .scope = "queue",
     .max_scope = 8,
     .max_id = qe.ID_LEN,
-    .max_namespace = limits.MAX_NAMESPACE_NAME,
-    .ns = .id,
     .order = "priority",
     .noun = "message",
 });

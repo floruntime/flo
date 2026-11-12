@@ -17,8 +17,10 @@ const action_machine = @import("../actions/machine.zig");
 const families = @import("families.zig");
 
 const EntryType = entry_mod.EntryType;
+const NamespaceId = @import("../namespace/table.zig").Id;
 
-const NS = "default";
+/// Every entry's namespace: the default one, by id.
+const NS: NamespaceId = .default;
 const ACTIONS = [_][]const u8{ "a0", "a1" };
 /// Holders whose name starts so are workers that die holding the run:
 /// nothing reports for them, and their leases expire.
@@ -83,7 +85,7 @@ pub fn make(a: *families.Actions, l: Leader, r: std.Random, op_id: u64, buf: []u
 /// attempt, so a failure or an expiry ends the run.
 fn register(out: []u8, r: std.Random) !?Made {
     const p = try ae.Register.encodeInto(out, .{
-        .ns = NS,
+        .ns = NS.int(),
         .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
         .owner = "",
         .lease_ms = r.intRangeAtMost(u64, 5_000, 8_000),
@@ -95,7 +97,7 @@ fn register(out: []u8, r: std.Random) !?Made {
 /// An action deleted: its runs stay, but none is delivered until it is
 /// registered again.
 fn delete(out: []u8, r: std.Random) !?Made {
-    const p = try ae.Delete.encodeInto(out, .{ .ns = NS, .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)] });
+    const p = try ae.Delete.encodeInto(out, .{ .ns = NS.int(), .name = ACTIONS[r.uintLessThan(usize, ACTIONS.len)] });
     return .{ .entry_type = .action_delete, .payload = p };
 }
 
@@ -105,7 +107,7 @@ fn invoke(a: *families.Actions, out: []u8, r: std.Random, spoil: bool, tag: []co
     var ib: [ae.MAX_RUN_ID]u8 = undefined;
     const taken = if (spoil) pick(a, r, any, &ib) else null;
     const p = try ae.Invoke.encodeInto(out, .{
-        .ns = NS,
+        .ns = NS.int(),
         .action = ACTIONS[r.uintLessThan(usize, ACTIONS.len)],
         .run = if (taken) |t| t.id else try std.fmt.bufPrint(&rb, "r{s}", .{tag}),
         .input = tag,
@@ -130,7 +132,7 @@ fn pick(a: *families.Actions, r: std.Random, want: *const fn (action_machine.Run
         n += 1;
         // Reservoir: each match equally likely.
         if (r.uintLessThan(u32, n) != 0) continue;
-        const id = item.key[1 + @as(usize, item.key[0]) ..];
+        const id = item.key[@sizeOf(u32)..];
         @memcpy(id_buf[0..id.len], id);
         chosen = .{ .id = id_buf[0..id.len], .run = item.value.v };
     }
@@ -168,7 +170,7 @@ fn deliver(a: *families.Actions, out: []u8, l: Leader, r: std.Random, spoil: boo
     var hb: [24]u8 = undefined;
     var kb: [8]u8 = undefined;
     const payload = try ae.Deliver.encodeInto(out, .{
-        .ns = NS,
+        .ns = NS.int(),
         .action = p.run.action,
         .run = p.id,
         .due_ns = if (spoil and p.run.status == .ready and r.boolean()) p.run.due_ns + 1 else p.run.due_ns,
@@ -217,7 +219,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
     var rb: [24]u8 = undefined;
     const payload = switch (kind) {
         .settle => try ae.Settle.encodeInto(out, .{
-            .ns = NS,
+            .ns = NS.int(),
             .action = v.action,
             .run = p.id,
             .holder = holder,
@@ -229,7 +231,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             .result = if (resend) v.result else try std.fmt.bufPrint(&rb, "o{s}", .{tag}),
         }),
         .release => try ae.Release.encodeInto(out, .{
-            .ns = NS,
+            .ns = NS.int(),
             .action = v.action,
             .run = p.id,
             .holder = holder,
@@ -243,7 +245,7 @@ fn report(a: *families.Actions, out: []u8, kind: Kind, l: Leader, r: std.Random,
             .@"error" = try std.fmt.bufPrint(&rb, "e{s}", .{tag}),
         }),
         else => try ae.Extend.encodeInto(out, .{
-            .ns = NS,
+            .ns = NS.int(),
             .action = v.action,
             .run = p.id,
             .holder = holder,
@@ -289,7 +291,7 @@ fn expire(a: *families.Actions, out: []u8, l: Leader, spoil: bool) !?Made {
             holder = run.?.holder;
             request_key = run.?.request_key;
         }
-        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns, .action = item.value.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
+        const bytes = try ae.ExpireItem.encodeInto(items[w..], .{ .ns = k.ns.int(), .action = item.value.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = holder, .request_key = request_key });
         if (w + bytes.len > room) break;
         w += bytes.len;
         n += 1;
@@ -301,8 +303,8 @@ fn expire(a: *families.Actions, out: []u8, l: Leader, spoil: bool) !?Made {
 }
 
 fn def(a: *families.Actions, name: []const u8) ?action_machine.Def.Value {
-    var b: [1 + NS.len + ae.MAX_ACTION_NAME]u8 = undefined;
-    const k = @import("../contract/view.zig").key(&b, NS, name) catch return null;
+    var b: [@sizeOf(u32) + ae.MAX_ACTION_NAME]u8 = undefined;
+    const k = @import("../contract/view.zig").idKey(&b, NS, name) catch return null;
     const got = a.read().get(action_machine.Defs, k) catch return null;
     return if (got) |d| d.v else null;
 }

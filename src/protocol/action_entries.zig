@@ -6,13 +6,15 @@
 //! entry that made it, which no other delivery can share: a report or a
 //! touch naming another token applies nothing. Times are the entry's
 //! stamp plus a duration, so every replica computes the same deadline.
-//! The namespace is a field, never empty: the default one is "default".
+//! The namespace is its id, leading each entry (or each expire item), so
+//! the same action or run id in two namespaces is two keys.
 
 const std = @import("std");
 const schema = @import("schema.zig");
 const entries = @import("entries.zig");
 const limits = @import("limits.zig");
 const action_ops = @import("action_ops.zig");
+const kv_entries = @import("kv_entries.zig");
 
 const Int = schema.Int;
 const Bytes = schema.Bytes;
@@ -20,7 +22,8 @@ const Optional = schema.Optional;
 const Record = schema.Record;
 const BoundedList = schema.BoundedList;
 
-pub const Ns = Bytes(limits.MAX_NAMESPACE_NAME);
+/// A namespace's id (`namespace/table.zig`); 0 names none.
+pub const NamespaceId = kv_entries.NamespaceId;
 pub const MAX_ACTION_NAME: u32 = 256;
 pub const ActionName = Bytes(MAX_ACTION_NAME);
 /// Run ids are made by the server, 32 bytes.
@@ -60,7 +63,7 @@ pub const Token = Record(&.{
 });
 
 pub const Register = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "name", .T = ActionName },
     .{ .name = "owner", .T = Bytes(MAX_OWNER) },
     .{ .name = "lease_ms", .T = LeaseMs },
@@ -68,12 +71,12 @@ pub const Register = Record(&.{
 });
 
 pub const Delete = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "name", .T = ActionName },
 });
 
 pub const Invoke = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "input", .T = Bytes(MAX_INPUT) },
@@ -90,7 +93,7 @@ pub const Invoke = Record(&.{
 /// by, so the entry names that key; a run that has moved since isn't
 /// delivered.
 pub const Deliver = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "due_ns", .T = Int(u64) },
@@ -107,7 +110,7 @@ pub const Deliver = Record(&.{
 pub const RequestKey = Optional(Bytes(MAX_REQUEST_KEY));
 
 pub const Settle = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "holder", .T = Holder },
@@ -124,7 +127,7 @@ pub const Settle = Record(&.{
 /// attempts are spent), or abandoned, which counts the delivery but not a
 /// failure.
 pub const Release = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "holder", .T = Holder },
@@ -142,7 +145,7 @@ pub const Release = Record(&.{
 /// the delivery began (`held_since_ns`, so the hold ceiling follows from
 /// the entry) and the expiry the leader saw, whose key it replaces.
 pub const Extend = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "holder", .T = Holder },
@@ -157,7 +160,7 @@ pub const Extend = Record(&.{
 /// that lease has expired, whichever delivery or extend set it; otherwise
 /// the lease moved on and only the key goes.
 pub const ExpireItem = Record(&.{
-    .{ .name = "ns", .T = Ns },
+    .{ .name = "ns", .T = NamespaceId },
     .{ .name = "action", .T = ActionName },
     .{ .name = "run", .T = RunId },
     .{ .name = "expiry_ns", .T = Int(u64) },

@@ -150,7 +150,7 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
             try w.writeInt(i64, def.created_at_ms, .little);
             try w.writeByte(@intFromBool(!handler.disabled.contains(key)));
         },
-        .action_list => try ActionsHandler.writeListEntry(@ptrCast(@alignCast(ctx)), namespace, name, w),
+        .action_list => try ActionsHandler.writeListEntry(@ptrCast(@alignCast(ctx)), ns.id, name, w),
         // [name_len:u16][name]
         else => {
             try w.writeInt(u16, @intCast(name.len), .little);
