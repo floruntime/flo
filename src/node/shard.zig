@@ -18726,6 +18726,33 @@ test "Shard: a client's membership change to a follower is refused admin-only, n
     try std.testing.expect(raft.latest_config.names(3));
 }
 
+test "Shard: a replica carries an admin-socket membership change to the leader, but redirects a client write" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true);
+    raft.setMembership(&cfg, 1);
+    raft.lost_log = .none;
+    raft.leader_id = 1;
+
+    // A client's write to this replica is redirected to the leader, answered
+    // here and now (the replica cannot carry a client's write).
+    var buf: [512]u8 = undefined;
+    try expectAnswer(try t.ask(.kv_put, "v", &buf), .unavailable, "this node is a replica; send writes to the leader, node 1");
+
+    // But an admin-socket membership change is carried to the leader, the way
+    // a repair is: forwarded (not redirected), and the answer deferred until
+    // the leader commits it. This is what the .client follower test cannot
+    // show, since a .client change never reaches the carry path.
+    const before = t.shard.forward_count;
+    var pv: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pv, 2, .little);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 9, "", "", &pv, ""), .admin);
+    try std.testing.expectEqual(before + 1, t.shard.forward_count);
+    try std.testing.expect(t.conn.response_deferred);
+}
+
 test "Shard: a list page whose scan couldn't hold its names is refused, not cut short" {
     const pipe_fds = try @import("stdx").io.pipe();
     defer _ = std.c.close(pipe_fds[0]);

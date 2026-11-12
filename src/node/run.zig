@@ -280,8 +280,13 @@ test "run: across the whole cluster page, only the reads are open to a client" {
             inline for (.{ Origin.admin, Origin.peer, Origin.held }) |o|
                 try std.testing.expect(authorize(.anonymous, o, req) == .ok);
         } else {
-            // An unused code in the page: the gate passes it, and dispatch
-            // answers it as unknown. Reads are the only open defined ops.
+            // Not a read and not admin-only — so it must be an *unused* code,
+            // or it would fall open to an anonymous client. A defined op added
+            // here (e.g. a probe at 0x035) is caught by this: classify it as a
+            // read or admin-only. OpCode is non-exhaustive, so `tagName` (not
+            // `fromInt`) tells a declared op from a bare value. The gate passes
+            // an unused code; dispatch answers it as unknown.
+            try std.testing.expect(std.enums.tagName(proto.OpCode, @fromBackingInt(op)) == null);
             try std.testing.expect(authorize(.anonymous, .client, req) == .ok);
         }
     }

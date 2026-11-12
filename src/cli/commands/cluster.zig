@@ -78,7 +78,8 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\replica here. Odd numbers of voters tolerate more failures.
                     \\
                     \\Run it on any member: it goes to the node's admin socket, then to
-                    \\the leader.
+                    \\the leader. If it reports losing leadership before the change
+                    \\committed, retrying is safe.
                 )
                 .variadicArg("ids", "Ids of the replicas to promote")
                 .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
@@ -99,7 +100,8 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\removal that leaves an even number of voters, or two, needs --yes.
                     \\
                     \\Run it on any member: it goes to the node's admin socket, then to
-                    \\the leader.
+                    \\the leader. If it reports losing leadership before the change
+                    \\committed, retrying is safe.
                 )
                 .arg("id", "Id of the member to remove")
                 .boolFlag("yes", 0, "Remove even when it leaves an even number of voters, or two")
@@ -303,6 +305,7 @@ fn runMembers(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runPromote(ctx: *commander.Context) commander.Error!void {
+    try refuseClientEndpoint(ctx);
     if (ctx.args.len == 0) {
         return outcome.usage(ctx, "give the id of a replica to promote: flo cluster promote <id>...", .{});
     }
@@ -316,6 +319,7 @@ fn runPromote(ctx: *commander.Context) commander.Error!void {
 }
 
 fn runRemove(ctx: *commander.Context) commander.Error!void {
+    try refuseClientEndpoint(ctx);
     if (ctx.args.len != 1) {
         return outcome.usage(ctx, "give one node id: flo cluster remove <id> [--yes]", .{});
     }
@@ -323,6 +327,15 @@ fn runRemove(ctx: *commander.Context) commander.Error!void {
     var value: [wire.Remove.SIZE]u8 = undefined;
     try sendChange(ctx, .cluster_remove, (wire.Remove{ .id = id, .yes = ctx.getBool("yes") }).encode(&value));
     ctx.print("node {d} removed; it cannot rejoin under that id\n", .{id});
+}
+
+/// promote, remove and repair administer the node over its admin socket, so a
+/// client endpoint names the wrong thing. `-e/--endpoint` (and its `-p/--port`
+/// shorthand) is a persistent root flag the admin path doesn't read, so refuse
+/// it rather than silently sending the change to the local node's socket.
+fn refuseClientEndpoint(ctx: *commander.Context) commander.Error!void {
+    if (ctx.flagChanged("endpoint") or ctx.flagChanged("port"))
+        return outcome.usage(ctx, "-e/--endpoint and -p/--port name a server to talk to, but this command goes to a node's admin socket; name the node with --config/--data-dir and run it on a member", .{});
 }
 
 /// Send a membership change to the node's admin socket; it carries it to the
@@ -359,6 +372,7 @@ fn sendAdmin(ctx: *commander.Context, path: []const u8, op: proto.OpCode, value:
 }
 
 fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
+    try refuseClientEndpoint(ctx);
     const index = ctx.getUint("index") orelse 0;
     if (index == 0) return outcome.usage(ctx, "--index is required: the entry the cluster halted at (flo cluster members shows it, as HALTED AT)", .{});
     const reason = ctx.getString("reason") orelse "";

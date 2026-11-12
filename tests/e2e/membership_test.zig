@@ -107,9 +107,12 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     var id_buf: [16]u8 = undefined;
     const fourth_s = try std.fmt.bufPrint(&id_buf, "{d}", .{fourth});
 
-    // Promoted from any node: a membership change goes to that node's admin
-    // socket, which carries it to the leader.
-    const via: usize = if (replica == 1) 2 else 1;
+    // Promoted from a non-leader, so the carry is exercised: the change goes
+    // to that node's admin socket, which forwards it to the leader over the
+    // peer link.
+    const leader_before = try leaderIndex(&cluster);
+    var via: usize = 0;
+    while (via == leader_before) via += 1;
     try cluster.execAdminOn(via, &.{ "cluster", "promote", fourth_s });
     var view = try members(&cluster, 0);
     try testing.expectEqual(@as(usize, 4), countRole(view.value, "voter"));
