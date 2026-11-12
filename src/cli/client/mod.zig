@@ -13,6 +13,8 @@
 // Re-export base types
 pub const Client = @import("base.zig").Client;
 pub const Response = @import("base.zig").Response;
+pub const STALE_WARNING = @import("base.zig").STALE_WARNING;
+pub const rearmStaleWarning = @import("base.zig").rearmStaleWarning;
 /// StreamID used across the stream client API (groupAck/groupClaim ids, cursors).
 pub const StreamID = @import("../../stream/stream_id.zig").StreamID;
 

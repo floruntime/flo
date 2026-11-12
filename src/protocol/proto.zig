@@ -595,8 +595,9 @@ pub const RequestHeader = extern struct {
 };
 
 /// Response header (32 bytes, matches request header structure)
-/// Response flag: the answer reads state a halted shard holds, from just
-/// before the entry it halted at, and nothing written since.
+/// Response flag: the answer reads state its shard can't bring up to date,
+/// because the shard is halted, diverged or blocked reading its log, so
+/// writes since may be missing from it.
 pub const RESPONSE_STALE: u8 = 0x01;
 
 /// Set while a halted shard answers a read on this thread: every answer

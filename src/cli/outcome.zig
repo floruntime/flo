@@ -222,6 +222,8 @@ pub const FakeServer = struct {
     /// An offset into its answer frame whose byte is flipped after the
     /// checksum is computed, for a damaged answer.
     corrupt_at: ?usize = null,
+    /// The flags its ok answers carry.
+    flags: u8 = 0,
     thread: std.Thread = undefined,
 
     pub fn start(status: proto.StatusCode, body: []const u8) !*FakeServer {
@@ -231,15 +233,20 @@ pub const FakeServer = struct {
     /// A server whose answer has the byte at `offset` of its frame flipped
     /// under the checksum it was sent with.
     pub fn startCorrupt(status: proto.StatusCode, body: []const u8, offset: usize) !*FakeServer {
-        return spawn(status, body, proto.TABLE_HASH, offset);
+        return spawn(status, body, proto.TABLE_HASH, offset, 0);
+    }
+
+    /// A server whose ok answer is marked as read from stale state.
+    pub fn startStale(body: []const u8) !*FakeServer {
+        return spawn(.ok, body, proto.TABLE_HASH, null, proto.RESPONSE_STALE);
     }
 
     /// A server built from another table: its answers carry `table_hash`.
     pub fn startWithTable(status: proto.StatusCode, body: []const u8, table_hash: u64) !*FakeServer {
-        return spawn(status, body, table_hash, null);
+        return spawn(status, body, table_hash, null, 0);
     }
 
-    fn spawn(status: proto.StatusCode, body: []const u8, table_hash: u64, corrupt_at: ?usize) !*FakeServer {
+    fn spawn(status: proto.StatusCode, body: []const u8, table_hash: u64, corrupt_at: ?usize, flags: u8) !*FakeServer {
         const net = @import("stdx").net;
         const fd = try net.sysSocket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer net.sysClose(fd);
@@ -248,7 +255,7 @@ pub const FakeServer = struct {
         try net.sysListen(fd, 1);
         const local = try net.sysLocalIp4(fd);
         const self = try std.heap.page_allocator.create(FakeServer);
-        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body, .table_hash = table_hash, .corrupt_at = corrupt_at };
+        self.* = .{ .listen_fd = fd, .port = local.port, .status = status, .body = body, .table_hash = table_hash, .corrupt_at = corrupt_at, .flags = flags };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
     }
@@ -275,14 +282,12 @@ pub const FakeServer = struct {
                 if (n == 0) return;
                 left -= n;
             }
-            const frame = if (self.table_hash != proto.TABLE_HASH) foreign: {
+            const frame = if (self.status == .ok or self.table_hash != proto.TABLE_HASH) ok: {
                 var answer = proto.Response.ok(header.request_id, self.body);
                 answer.header.table_hash = self.table_hash;
-                break :foreign answer.serialize(&out) catch return;
-            } else if (self.status == .ok)
-                proto.Response.serializeOk(header.request_id, self.body, &out) catch return
-            else
-                proto.Response.serializeRefusal(self.status, header.request_id, proto.unclassified(self.status, self.body), &out);
+                answer.header.flags = self.flags;
+                break :ok answer.serialize(&out) catch return;
+            } else proto.Response.serializeRefusal(self.status, header.request_id, proto.unclassified(self.status, self.body), &out);
             if (self.corrupt_at) |at| out[at] ^= 0x01;
             _ = net.sysWrite(c, frame) catch return;
             // One answer, then the connection closes: a command that retried

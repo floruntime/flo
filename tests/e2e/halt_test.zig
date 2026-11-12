@@ -34,6 +34,13 @@ test "e2e/halt: a lone node's shard halts at the entry, refuses writes saying wh
     });
     defer ctx.deinit();
     try ctx.exec(&.{ "kv", "set", "before", "kept" });
+    // A healthy shard's read carries no warning.
+    {
+        var r = try ctx.execResult(&.{ "kv", "get", "before" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        try testing.expectEqualStrings("", r.stderr);
+    }
 
     // The halting write committed: it is pending, not refused, and must
     // not be resent.
@@ -54,8 +61,15 @@ test "e2e/halt: a lone node's shard halts at the entry, refuses writes saying wh
         try testing.expect(std.mem.indexOf(u8, r.stderr, "Restarting won't help") != null);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "[unavailable/shard_halted]") != null);
     }
-    // Reads are served from the state before the halt.
-    try testing.expectEqualStrings("kept", try ctx.execCapture(&.{ "kv", "get", "before" }));
+    // Reads are served from the state before the halt, and say they may be
+    // out of date on stderr, leaving stdout the value alone.
+    {
+        var r = try ctx.execResult(&.{ "kv", "get", "before" });
+        defer r.deinit();
+        try testing.expectEqual(@as(u8, 0), r.exit_code);
+        try testing.expectEqualStrings("kept", std.mem.trimEnd(u8, r.stdout, "\n"));
+        try testing.expectEqualStrings(src.cli_client.STALE_WARNING, r.stderr);
+    }
 
     var metrics = try ctx.createMetricsHttp();
     const before = try nodeStatus(metrics);

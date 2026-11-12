@@ -110,6 +110,7 @@ fn runRepl(ctx: *commander.Context) commander.Error!void {
         // Trim whitespace
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
+        client_mod.rearmStaleWarning();
 
         // Parse and execute command
         const upper_cmd = toUpper(trimmed);

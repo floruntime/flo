@@ -42,6 +42,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const root = try buildRoot(allocator);
     defer root.deinit();
 
+    @import("client/base.zig").stale_warning_fd = std.posix.STDERR_FILENO;
     // Pass through the args slice provided by main (Juicy Main).
     const result = root.executeSlice(args);
     result catch |err| switch (err) {
