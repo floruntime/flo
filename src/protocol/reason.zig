@@ -83,6 +83,17 @@ pub const Reason = enum(u16) {
     admin_only = 30,
     /// The processing job is running: stop or cancel it first.
     job_running = 31,
+    /// The node's memory budget is spent: delete something, give the node
+    /// more memory, or raise its budget. The message names the node.
+    memory_budget = 32,
+    /// The node holds as many actions as it registers: delete one first.
+    too_many_actions = 33,
+    /// The node holds as many workflow definitions as it keeps: delete one
+    /// first. Defined ahead of the check that returns it, so clients know it.
+    too_many_workflow_definitions = 34,
+    /// The node holds as many workflow runs as it keeps: let some finish or
+    /// delete them first. Defined ahead of the check that returns it.
+    too_many_workflow_runs = 35,
 };
 
 /// Whether a refused request took effect.

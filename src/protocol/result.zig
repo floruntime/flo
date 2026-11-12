@@ -365,7 +365,11 @@ pub const CommandResult = union(enum) {
         pub fn refusal(e: Error) flo_proto.Refusal {
             const status = e.code.toStatus();
             return .{
-                .reason = if (e.code == .committed_not_applied) .committed_not_applied else .unclassified,
+                .reason = switch (e.code) {
+                    .committed_not_applied => .committed_not_applied,
+                    .too_many_actions => .too_many_actions,
+                    else => .unclassified,
+                },
                 .ran = if (e.code == .committed_not_applied) .yes else e.ran orelse flo_proto.ranOf(status),
                 .message = e.message,
             };
@@ -385,6 +389,8 @@ pub const CommandResult = union(enum) {
         internal_error = 0x0006,
         unavailable = 0x0007,
         overloaded = 0x0008,
+        /// The node holds as many actions as it registers.
+        too_many_actions = 0x0009,
 
         // KV errors (0x0100-0x01FF)
         kv_key_too_large = 0x0100,
@@ -463,6 +469,7 @@ pub const CommandResult = union(enum) {
                 .partition_moved,
                 => .unavailable,
                 .overloaded => .overloaded,
+                .too_many_actions => .limit,
                 .unknown,
                 .timeout,
                 .internal_error,
@@ -542,4 +549,13 @@ test "result: an error's refusal says whether it ran: committed is yes, the site
     try std.testing.expectEqual(flo_proto.Ran.unknown, (E{ .code = .internal_error, .message = "m" }).refusal().ran);
     try std.testing.expectEqual(flo_proto.Ran.no, (E{ .code = .invalid_request, .message = "m" }).refusal().ran);
     try std.testing.expectEqual(flo_proto.Reason.unclassified, (E{ .code = .not_found, .message = "m" }).refusal().reason);
+}
+
+test "a node at its action limit refuses with the limit status, saying which, and never ran" {
+    const E = CommandResult.Error;
+    const e: E = .{ .code = .too_many_actions, .ran = .no, .message = "limit: full" };
+    try std.testing.expectEqual(flo_proto.StatusCode.limit, e.code.toStatus());
+    const r = e.refusal();
+    try std.testing.expectEqual(flo_proto.Reason.too_many_actions, r.reason);
+    try std.testing.expectEqual(flo_proto.Ran.no, r.ran);
 }
