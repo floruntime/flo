@@ -610,6 +610,16 @@ pub const Shard = struct {
     /// (cumulative): followers at the same bar take theirs, and this leader's
     /// next is at the next bar.
     snapshot_skips_leader_not_ready: u64 = 0,
+    /// Processing KV sink writes other shards sent here that the log was
+    /// too full to take, in arrival order, retried each tick: encoded
+    /// `SinkPut`s, owned. While any wait, newer ones queue behind them, so a
+    /// key's writes still land in the order they were sent.
+    kv_sink_retries: std.ArrayListUnmanaged([]u8) = .empty,
+    /// The bytes `kv_sink_retries` holds.
+    kv_sink_retry_bytes: usize = 0,
+    /// Such writes dropped because the list was full (cumulative): what is
+    /// still lost until channels give sinks durable delivery.
+    kv_sink_retry_overflow: u64 = 0,
     /// A committed entry could not be read to apply it — a resource or IO
     /// failure reading below the ring, not a hole. The shard holds it unapplied
     /// and retries, but not on every call: `read_retry_at_ms` paces the retry,
@@ -1412,6 +1422,8 @@ pub const Shard = struct {
 
     pub fn deinit(self: *Shard) void {
         self.marker.close();
+        for (self.kv_sink_retries.items) |b| self.allocator.free(b);
+        self.kv_sink_retries.deinit(self.allocator);
         self.skips.deinit(self.allocator);
         self.closing_fds.deinit(self.allocator);
         self.resume_fds.deinit(self.allocator);
@@ -2769,12 +2781,62 @@ pub const Shard = struct {
     /// A processing KV sink on another shard wrote a key this shard owns.
     fn runKvSinkPut(self: *Shard, msg: InboxMessage) void {
         const bytes = inboxPayload(msg);
-        defer if (bytes.len > 0) self.allocator.free(bytes);
-        const put = KVHandler.SinkPut.decode(bytes) orelse
-            return self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
-        if (KVHandler.sinkPropose(self, put.namespace, put.key, put.value, put.ttl_ms)) |why| {
-            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.key, why);
+        // Behind writes already waiting, so a key's writes keep their order.
+        if (self.kv_sink_retries.items.len > 0) return self.holdKvSinkPut(bytes);
+        if (!self.proposeKvSinkPut(bytes)) return self.holdKvSinkPut(bytes);
+        if (bytes.len > 0) self.allocator.free(bytes);
+    }
+
+    /// Proposes one encoded sink write; false when the log is too full to
+    /// take it now. A write refused for good, or that doesn't decode, is
+    /// counted as dropped.
+    fn proposeKvSinkPut(self: *Shard, bytes: []const u8) bool {
+        const put = KVHandler.SinkPut.decode(bytes) orelse {
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "the sink's message didn't decode");
+            return true;
+        };
+        switch (KVHandler.sinkPropose(self, put.namespace, put.key, put.value, put.ttl_ms)) {
+            .proposed => {},
+            .held => return false,
+            .dropped => |why| self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", put.key, why),
         }
+        return true;
+    }
+
+    /// Most sink writes waiting for room on one shard, and most bytes: a
+    /// write can be 64 KiB, so the count alone would let 256 MiB wait.
+    pub const KV_SINK_RETRY_MAX = 4096;
+    pub const KV_SINK_RETRY_MAX_BYTES = 16 * 1024 * 1024;
+
+    fn holdKvSinkPut(self: *Shard, bytes: []u8) void {
+        if (self.kv_sink_retries.items.len >= KV_SINK_RETRY_MAX or self.kv_sink_retry_bytes + bytes.len > KV_SINK_RETRY_MAX_BYTES) {
+            self.kv_sink_retry_overflow += 1;
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "too many sink writes wait for room on the owning shard");
+            if (bytes.len > 0) self.allocator.free(bytes);
+            return;
+        }
+        self.kv_sink_retries.append(self.allocator, bytes) catch {
+            self.kv_sink_retry_overflow += 1;
+            self.processing_handler.noteSinkDrop(self.metrics_registry, "kv", "?", "out of memory holding a sink write for room");
+            if (bytes.len > 0) self.allocator.free(bytes);
+            return;
+        };
+        self.kv_sink_retry_bytes += bytes.len;
+    }
+
+    /// Proposes the sink writes waiting for room, oldest first, until the
+    /// log is full again.
+    fn retryKvSinkPuts(self: *Shard) void {
+        const items = self.kv_sink_retries.items;
+        var done: usize = 0;
+        while (done < items.len) : (done += 1) {
+            if (!self.proposeKvSinkPut(items[done])) break;
+            self.kv_sink_retry_bytes -= items[done].len;
+            if (items[done].len > 0) self.allocator.free(items[done]);
+        }
+        if (done == 0) return;
+        std.mem.copyForwards([]u8, items[0 .. items.len - done], items[done..]);
+        self.kv_sink_retries.shrinkRetainingCapacity(items.len - done);
     }
 
     /// How a run a workflow here waits on ended, or a workflow's shard
@@ -4504,6 +4566,8 @@ pub const Shard = struct {
             sm.setReadBlocked(self.read_blocked);
             sm.persist_failures.store(self.persist_failures, .monotonic);
             sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
+            sm.kv_sink_retry_pending.store(self.kv_sink_retries.items.len, .monotonic);
+            sm.kv_sink_retry_overflow.store(self.kv_sink_retry_overflow, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
             // nothing to a reader and Prometheus can't subtract it.
             sm.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
@@ -4857,7 +4921,7 @@ pub const Shard = struct {
             return false;
         }
         const now = nowMs();
-        self.snapshot_window = .{ .s = s, .opened_ms = now, .slices_left = TEST_BAR_SLICES, .hold_until_ms = if (hold_ms > 0) now + hold_ms else 0, .as_leader = self.raft_node.role == .leader };
+        self.snapshot_window = .{ .s = s, .opened_ms = now, .slices_left = TEST_BAR_SLICES, .hold_until_ms = if (hold_ms > 0) now + hold_ms else 0 };
         return true;
     }
 
@@ -4879,9 +4943,10 @@ pub const Shard = struct {
             self.snapshot_window = null;
             return;
         }
-        // Won an election while suspended: a leader not yet ready passes the
-        // bar, as one that reached it so would have, and applies on.
-        if (self.raft_node.role == .leader and !w.as_leader) {
+        // Elected while suspended, whether it led before or not: a leader not
+        // yet ready passes the bar, as one that reached it so would have, and
+        // applies on, or it would refuse writes for the rest of the window.
+        if (self.leaderApplying()) {
             self.snapshot_skips_leader_not_ready += 1;
             log.warn("shard {d}: dropped the snapshot at bar {d}: this node was elected leader while suspended; its next snapshot is at the next bar", .{ self.id, w.s });
             self.snapshot_window = null;
@@ -5312,6 +5377,7 @@ pub const Shard = struct {
         // on a single node) applies here, outside any module's work.
         _ = self.applyCommitted();
         self.stepSnapshotWindow();
+        if (self.kv_sink_retries.items.len > 0) self.retryKvSinkPuts();
         _ = self.coldCaughtUp();
 
         // Shard 0: namespaces created this tick go to disk, then into the
@@ -7249,10 +7315,6 @@ pub const SnapshotWindow = struct {
     /// A window opened by a test fault holds until this monotonic time, so
     /// an e2e test can write through it.
     hold_until_ms: u64 = 0,
-    /// The node led when the window opened. A follower that wins an
-    /// election meanwhile drops the window: until it has applied its term's
-    /// start it isn't ready, and would refuse writes for the rest of it.
-    as_leader: bool = false,
 };
 
 /// Stub slices a test bar's window queues before it closes.
@@ -9990,6 +10052,163 @@ test "Shard: a processing sink in a namespace not yet published writes nothing u
     const job = jobs.next().?;
     try std.testing.expect(job.held);
     try std.testing.expect(std.mem.indexOf(u8, job.held_owned, "is on another") != null);
+}
+
+test "Shard: a pipeline's KV sinks send another shard no more than its inbox has room for, so a tick isn't held at the same record every time" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        s.processing_handler.setPeerStreamHandlers(&streams);
+    }
+    // Two sinks, each writing one hot key owned by shard 1: two sends a record.
+    var pbuf: [2][16]u8 = undefined;
+    var prefixes: [2][]const u8 = undefined;
+    var found: usize = 0;
+    var i: usize = 0;
+    while (found < 2) : (i += 1) {
+        const p = try std.fmt.bufPrint(&pbuf[found], "hot{d}", .{i});
+        var full: [32]u8 = undefined;
+        if (a.processing_handler.kvOwner(a, "default", try std.fmt.bufPrint(&full, "{s}:", .{p})) == 1) {
+            prefixes[found] = p;
+            found += 1;
+        }
+    }
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    const records = 600;
+    for (0..records) |_| try a.stream_handler.appendPayloadToStream(source, "default", "v");
+    two.settle();
+
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: hot
+        \\batch_size: 2000
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\sinks:
+        \\  - name: one
+        \\    kv: {{ key_prefix: {s} }}
+        \\  - name: two
+        \\    kv: {{ key_prefix: {s} }}
+    , .{ source, prefixes[0], prefixes[1] });
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "default", "", yaml, ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobs.count());
+
+    // Shard 1's inbox already part full, from senders it hasn't drained.
+    const filler = 600;
+    for (0..filler) |_| {
+        const m = (KVHandler.SinkPut{ .namespace = "default", .key = "cold", .value = "x", .ttl_ms = 0 }).encode(a.allocator).?;
+        try std.testing.expect(b.mailbox.inbox.send(.{ .tag = .kv_sink_put, .src_shard = 0, .payload_len = @intCast(m.len), .payload_ptr = m.ptr }));
+    }
+    const from_b = b.raft_node.log.lastIndex() + 1;
+    var it = a.processing_handler.pipelines.valueIterator();
+    const pipe = it.next().?;
+    pipe.last_poll_ms = 0;
+    _ = a.processing_handler.tickPipelines(a);
+    // What fit was read and sent, and nothing held.
+    const room = b.mailbox.inbox.capacity - filler;
+    try std.testing.expectEqual(@as(u64, room / 2), pipe.records_in);
+    try std.testing.expectEqual(@as(i64, 0), pipe.held_since_ms);
+    two.settle();
+    var rounds: u32 = 0;
+    while (pipe.records_in < records and rounds < 20) : (rounds += 1) {
+        pipe.last_poll_ms = 0;
+        _ = a.processing_handler.tickPipelines(a);
+        try std.testing.expectEqual(@as(i64, 0), pipe.held_since_ms);
+        two.settle();
+    }
+    // Each write sent once.
+    try std.testing.expectEqual(@as(u64, records), pipe.records_in);
+    try std.testing.expectEqual(@as(usize, filler + 2 * records), entriesOf(b, .kv_put, from_b));
+    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops);
+}
+
+test "Shard: a pipeline tick held partway through a batch resumes at the record it stopped in, sending none before it again" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const streams = [_]*StreamHandler{ a.stream_handler, b.stream_handler };
+    for (&two.shards) |*s| {
+        s.wireHandlerShardPtrs();
+        s.processing_handler.setPeerStreamHandlers(&streams);
+    }
+    // One hot key, owned by shard 1.
+    var kbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    const sku = while (true) : (i += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "s{d}", .{i});
+        var full: [32]u8 = undefined;
+        if (a.processing_handler.kvOwner(a, "default", try std.fmt.bufPrint(&full, "hot:{s}", .{k})) == 1) break k;
+    };
+    var sbuf: [16]u8 = undefined;
+    const source = try keyOn(a, .default, 0, &sbuf);
+    // Each record explodes into ten writes: a batch sends more than the
+    // owner's inbox holds, so a tick is held partway through it.
+    const records = 300;
+    const fanout = 10;
+    var rbuf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&rbuf);
+    try w.writeAll("{\"order\":{\"items\":[");
+    for (0..fanout) |j| try w.print("{s}{{\"sku\":\"{s}\"}}", .{ if (j == 0) "" else ",", sku });
+    try w.writeAll("]}}");
+    for (0..records) |_| try a.stream_handler.appendPayloadToStream(source, "default", w.buffered());
+    two.settle();
+
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    var ybuf: [512]u8 = undefined;
+    const yaml = try std.fmt.bufPrint(&ybuf,
+        \\kind: Processing
+        \\name: hot
+        \\batch_size: 2000
+        \\sources:
+        \\  - name: src
+        \\    stream: {{ name: {s} }}
+        \\operators:
+        \\  - type: flatmap
+        \\    name: o
+        \\    array_field: "$.order.items"
+        \\    element_key: "$.sku"
+        \\sinks:
+        \\  - name: out
+        \\    kv: {{ key_prefix: hot }}
+    , .{source});
+    a.runRequest(c.conn, try ParkTest.request(.processing_submit, 5, "default", "", yaml, ""), .client);
+    two.settle();
+    try std.testing.expectEqual(@as(u32, 1), a.processing_handler.jobs.count());
+
+    const from_b = b.raft_node.log.lastIndex() + 1;
+    var it = a.processing_handler.pipelines.valueIterator();
+    const pipe = it.next().?;
+    var held: usize = 0;
+    var rounds: u32 = 0;
+    while (rounds < 50) : (rounds += 1) {
+        pipe.last_poll_ms = 0;
+        _ = a.processing_handler.tickPipelines(a);
+        const was_held = pipe.held_since_ms != 0;
+        two.settle();
+        if (!was_held) break;
+        held += 1;
+    }
+    try std.testing.expect(held > 0);
+    try std.testing.expect(rounds < 50);
+    // Every write landed; again only those of a record a held tick stopped in.
+    const puts = entriesOf(b, .kv_put, from_b);
+    try std.testing.expect(puts >= records * fanout);
+    try std.testing.expect(puts <= records * fanout + held * fanout);
+    try std.testing.expectEqual(@as(u64, 0), a.processing_handler.sink_drops);
 }
 
 test "Shard: a start's retry choosing its run id, sent before its namespace is published, is decided on its workflow's shard by the namespace's id" {
@@ -23164,14 +23383,33 @@ test "Shard: a window is dropped when its shard halts, goes offline, has its app
 
     // Opened as a follower, then elected: dropped, counted, and apply goes on.
     _ = try suspendAtTestBarAsFollower(sh);
-    // Elected, with an entry of its own committed behind the window.
+    // Elected in a new term, with its no-op committed behind the window:
+    // not ready until that applies.
     r.role = .leader;
+    r.current_term += 1;
     _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    r.ready_index = r.log.lastIndex();
     r.commit_index = r.log.lastIndex();
     const skips = sh.snapshot_skips_leader_not_ready;
     sh.stepSnapshotWindow();
     try std.testing.expect(sh.snapshot_window == null);
     try std.testing.expectEqual(skips + 1, sh.snapshot_skips_leader_not_ready);
+    try std.testing.expectEqual(r.commit_index, r.last_applied);
+
+    // Led when the window opened, then elected again in a later term: not
+    // ready under the new term, so dropped too.
+    _ = try suspendAtTestBar(sh);
+    try std.testing.expect(r.leaderReady());
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window != null);
+    r.current_term += 1;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    r.ready_index = r.log.lastIndex();
+    r.commit_index = r.log.lastIndex();
+    try std.testing.expect(!r.leaderReady());
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window == null);
+    try std.testing.expectEqual(skips + 2, sh.snapshot_skips_leader_not_ready);
     try std.testing.expectEqual(r.commit_index, r.last_applied);
 }
 
@@ -23184,7 +23422,6 @@ fn suspendAtTestBarAsFollower(sh: *Shard) !u64 {
     _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
     r.role = .follower;
     _ = sh.applyCommitted();
-    try std.testing.expect(!sh.snapshot_window.?.as_leader);
     return sh.snapshot_window.?.s;
 }
 
@@ -23291,4 +23528,352 @@ test "Shard: a stream trigger whose shard is capped while apply is suspended kee
         if (sh.workflow_handler.runs.count() >= events) break;
     }
     try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
+}
+
+/// A KV sink write as another shard sends it to the key's owner.
+fn kvSinkMessage(sh: *Shard, key: []const u8, value: []const u8) InboxMessage {
+    const bytes = (KVHandler.SinkPut{ .namespace = "default", .key = key, .value = value, .ttl_ms = null }).encode(sh.allocator).?;
+    return .{ .tag = .kv_sink_put, .src_shard = 1, .payload_len = @intCast(bytes.len), .payload_ptr = bytes.ptr };
+}
+
+test "Shard: KV sink writes another shard sends while this one is full wait in order, are proposed once there's room, and past the list's bound are counted dropped" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    // Suspended, with its cap filled by parked writes.
+    _ = try suspendAtTestBar(sh);
+    var id: u64 = 1;
+    while (r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING) : (id += 1) {
+        try ParkTest.send(sh, t.conn, .kv_put, id, "filler", "v");
+    }
+    const last = r.log.lastIndex();
+
+    // Two writes to one key, then another: held, nothing proposed.
+    sh.runKvSinkPut(kvSinkMessage(sh, "sink-key", "first"));
+    sh.runKvSinkPut(kvSinkMessage(sh, "sink-key", "second"));
+    sh.runKvSinkPut(kvSinkMessage(sh, "other", "x"));
+    try std.testing.expectEqual(@as(usize, 3), sh.kv_sink_retries.items.len);
+    try std.testing.expectEqual(last, r.log.lastIndex());
+    try std.testing.expectEqual(@as(u64, 0), sh.processing_handler.sink_drops);
+
+    // Full list: the next is dropped and counted.
+    while (sh.kv_sink_retries.items.len < Shard.KV_SINK_RETRY_MAX) sh.runKvSinkPut(kvSinkMessage(sh, "more", "y"));
+    sh.runKvSinkPut(kvSinkMessage(sh, "past", "z"));
+    try std.testing.expectEqual(@as(u64, 1), sh.kv_sink_retry_overflow);
+    try std.testing.expectEqual(@as(u64, 1), sh.processing_handler.sink_drops);
+
+    // Room again: proposed oldest first, a key's last write winning.
+    try stepWindowClosed(sh);
+    var rounds: u32 = 0;
+    while (sh.kv_sink_retries.items.len > 0 and rounds < 100) : (rounds += 1) {
+        _ = try sh.tick(0);
+        var passes: u32 = 0;
+        while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    }
+    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retries.items.len);
+    var buf: [4096]u8 = undefined;
+    var rbuf: [1 << 20]u8 = undefined;
+    // Drain the parked fillers' answers, then read the key back.
+    sh.flushToClient(t.conn.fd);
+    while (std.c.recv(t.pair[1], &rbuf, rbuf.len, std.c.MSG.DONTWAIT) > 0) sh.flushToClient(t.conn.fd);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.send(sh, t.conn, .kv_get, 99_999, "sink-key", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "second") != null);
+    try std.testing.expectEqual(@as(u64, 1), sh.processing_handler.sink_drops);
+}
+
+test "Shard: a KV sink write arriving while earlier ones wait goes behind them, though the log has room for it" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    try fillCapSuspended(&t);
+    sh.runKvSinkPut(kvSinkMessage(sh, "k", "first"));
+    try std.testing.expectEqual(@as(usize, 1), sh.kv_sink_retries.items.len);
+
+    // Room again, before the list is retried: the next write still waits.
+    try resumeAndApply(sh);
+    try std.testing.expect(r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING);
+    const last = r.log.lastIndex();
+    sh.runKvSinkPut(kvSinkMessage(sh, "k", "second"));
+    try std.testing.expectEqual(@as(usize, 2), sh.kv_sink_retries.items.len);
+    try std.testing.expectEqual(last, r.log.lastIndex());
+
+    // Retried in order: the key ends with the later write.
+    _ = try sh.tick(0);
+    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sh.kv_sink_retry_bytes);
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    var buf: [4096]u8 = undefined;
+    var rbuf: [1 << 20]u8 = undefined;
+    sh.flushToClient(t.conn.fd);
+    while (std.c.recv(t.pair[1], &rbuf, rbuf.len, std.c.MSG.DONTWAIT) > 0) sh.flushToClient(t.conn.fd);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.send(sh, t.conn, .kv_get, 99_999, "k", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expect(std.mem.indexOf(u8, one[0].data, "second") != null);
+}
+
+test "Shard: KV sink writes waiting for room are bounded by bytes as well as by count" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    try fillCapSuspended(&t);
+    const big: [60 * 1024]u8 = @splat('v');
+    while (sh.kv_sink_retry_bytes + big.len + 64 <= Shard.KV_SINK_RETRY_MAX_BYTES) sh.runKvSinkPut(kvSinkMessage(sh, "big", &big));
+    const held = sh.kv_sink_retries.items.len;
+    try std.testing.expect(held < Shard.KV_SINK_RETRY_MAX);
+    try std.testing.expectEqual(@as(u64, 0), sh.kv_sink_retry_overflow);
+    sh.runKvSinkPut(kvSinkMessage(sh, "big", &big));
+    try std.testing.expectEqual(held, sh.kv_sink_retries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), sh.kv_sink_retry_overflow);
+    try std.testing.expect(sh.kv_sink_retry_bytes <= Shard.KV_SINK_RETRY_MAX_BYTES);
+}
+
+test "Shard: a workflow step whose action invoke the log is too full to take waits, says so once, and invokes once there's room" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(sh, .action_register, testRegister("act"));
+    _ = sh.applyCommitted();
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"run":"@actions/act","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "flow", def);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try ParkTest.send(sh, t.conn, .workflow_start, 2, "flow", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    // Its first step logged and applied: queued to take.
+    sh.workflow_handler.advanceStartedRuns(sh);
+    _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(usize, 1), sh.workflow_handler.started_to_advance.items.len);
+
+    // The log fills while apply is suspended.
+    _ = try suspendAtTestBar(sh);
+    var id: u64 = 10;
+    while (r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING) : (id += 1) {
+        try ParkTest.send(sh, t.conn, .kv_put, id, "filler", "v");
+    }
+    sh.workflow_handler.advanceStartedRuns(sh);
+    var runs = sh.workflow_handler.runs.valueIterator();
+    const run = runs.next().?;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(run.pending_action_run_id_owned == null);
+    try std.testing.expect(run.poll_next_at_ms > 0);
+    var waits: usize = 0;
+    for (run.history.items) |e| {
+        if (std.mem.eql(u8, e.event_type_owned, "step_waiting_for_room")) waits += 1;
+        try std.testing.expect(!std.mem.eql(u8, e.event_type_owned, "workflow_failed"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), waits);
+
+    // Room again: the poll timer runs the step, which now invokes.
+    try stepWindowClosed(sh);
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    // Past the retry delay, as the run's armed timer reckons it.
+    @import("stdx").time.sleep(@as(u64, @intCast(WorkflowHandler.STEP_ROOM_RETRY_MS + 50)) * std.time.ns_per_ms);
+    sh.workflow_handler.checkPendingActions(sh);
+    try std.testing.expect(run.pending_action_run_id_owned != null);
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+}
+
+test "Shard: a plan step whose start is refused for room records its start and its wait once, however often it's retried" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    _ = try proposeAction(sh, .action_register, testRegister("act"));
+    _ = sh.applyCommitted();
+    const def =
+        \\{"kind":"Workflow","name":"planned","version":"1.0.0",
+        \\"plans":{"p":{"executors":[{"name":"only","run":"@actions/act"}]}},
+        \\"start":{"run":"@plan/p","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "planned", def);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try ParkTest.send(sh, t.conn, .workflow_start, 2, "planned", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    sh.workflow_handler.advanceStartedRuns(sh);
+    _ = sh.applyCommitted();
+
+    try fillCapSuspended(&t);
+    sh.workflow_handler.advanceStartedRuns(sh);
+    var runs = sh.workflow_handler.runs.valueIterator();
+    const run = runs.next().?;
+    // Still full: retried on the poll timer, refused each time.
+    var tries: u32 = 0;
+    while (tries < 3) : (tries += 1) {
+        @import("stdx").time.sleep(@as(u64, @intCast(WorkflowHandler.STEP_ROOM_RETRY_MS + 20)) * std.time.ns_per_ms);
+        sh.workflow_handler.checkPendingActions(sh);
+    }
+    try std.testing.expect(run.pending_action_run_id_owned == null);
+    try std.testing.expectEqual(@as(usize, 1), historyCount(run, "plan_executor_start"));
+    try std.testing.expectEqual(@as(usize, 1), historyCount(run, "step_waiting_for_room"));
+
+    try resumeAndApply(sh);
+    @import("stdx").time.sleep(@as(u64, @intCast(WorkflowHandler.STEP_ROOM_RETRY_MS + 50)) * std.time.ns_per_ms);
+    sh.workflow_handler.checkPendingActions(sh);
+    try std.testing.expect(run.pending_action_run_id_owned != null);
+    try std.testing.expect(!run.waiting_for_room);
+    try std.testing.expectEqual(@as(usize, 1), historyCount(run, "plan_executor_start"));
+}
+
+fn historyCount(run: *const WorkflowHandler.RunRecord, event: []const u8) usize {
+    var n: usize = 0;
+    for (run.history.items) |e| {
+        if (std.mem.eql(u8, e.event_type_owned, event)) n += 1;
+    }
+    return n;
+}
+
+/// Fills the log to its cap with parked client writes, apply suspended.
+fn fillCapSuspended(t: *AsyncAlone) !void {
+    const r = t.shard.raft_node;
+    _ = try suspendAtTestBar(&t.shard);
+    var id: u64 = 1_000_000;
+    while (r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING) : (id += 1) {
+        try ParkTest.send(&t.shard, t.conn, .kv_put, id, "filler", "v");
+    }
+}
+
+/// Resumes and applies everything committed.
+fn resumeAndApply(sh: *Shard) !void {
+    try stepWindowClosed(sh);
+    const r = sh.raft_node;
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+}
+
+test "Shard: a workflow step whose child run's start the log is too full to take waits, and starts the child once there's room" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const child =
+        \\{"kind":"Workflow","name":"child","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    const parent =
+        \\{"kind":"Workflow","name":"parent","version":"1.0.0",
+        \\"start":{"run":"@workflow/child","transitions":{"success":"flo.Completed","failure":"flo.Failed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "child", child);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try ParkTest.send(sh, t.conn, .workflow_create, 2, "parent", parent);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try ParkTest.send(sh, t.conn, .workflow_start, 3, "parent", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    sh.workflow_handler.advanceStartedRuns(sh);
+    _ = sh.applyCommitted();
+
+    try fillCapSuspended(&t);
+    sh.workflow_handler.advanceStartedRuns(sh);
+    try std.testing.expectEqual(@as(usize, 1), sh.workflow_handler.runs.count());
+    var runs = sh.workflow_handler.runs.valueIterator();
+    const run = runs.next().?;
+    try std.testing.expectEqual(WorkflowHandler.RunStatus.waiting, run.status);
+    try std.testing.expect(run.pending_child_run_id_owned == null);
+
+    try resumeAndApply(sh);
+    @import("stdx").time.sleep(@as(u64, @intCast(WorkflowHandler.STEP_ROOM_RETRY_MS + 50)) * std.time.ns_per_ms);
+    sh.workflow_handler.checkPendingActions(sh);
+    try std.testing.expect(run.pending_child_run_id_owned != null);
+    _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(usize, 2), sh.workflow_handler.runs.count());
+}
+
+test "Shard: an action start another shard asks for while this one is full is held, and proposed once there's room" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    _ = try proposeAction(sh, .action_register, testRegister("act"));
+    _ = sh.applyCommitted();
+    try fillCapSuspended(&t);
+    const message = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "act-run-1", "act", "{}", "wf-run-1", "flow", false).?;
+    defer sh.allocator.free(message);
+    sh.actions_handler.startRunFromInbox(sh, 1, message);
+    try std.testing.expect(sh.actions_handler.startPending("act-run-1"));
+    const last = sh.raft_node.log.lastIndex();
+
+    try resumeAndApply(sh);
+    _ = sh.actions_handler.expireDue(sh);
+    try std.testing.expect(sh.raft_node.log.lastIndex() > last);
+    _ = sh.applyCommitted();
+    try std.testing.expect(ActionsHandler.for_tests.run(sh, .default, "act-run-1") != null);
+}
+
+test "Shard: an action start held for room whose action is deleted meanwhile fails saying so, not that it waited for its action" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const ah = sh.actions_handler;
+    _ = try proposeAction(sh, .action_register, testRegister("act"));
+    _ = sh.applyCommitted();
+    try fillCapSuspended(&t);
+    const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "act-run-1", "act", "{}", "wf-run-1", "flow", false).?;
+    defer sh.allocator.free(m);
+    ah.startRunFromInbox(sh, @intCast(sh.id), m);
+    try std.testing.expect(ah.held.get("act-run-1").?.for_room);
+
+    try resumeAndApply(sh);
+    _ = try proposeAction(sh, .action_delete, action_entries.Delete.Value{ .ns = ns_table.DEFAULT.int(), .name = "act" });
+    var passes: u32 = 0;
+    while (sh.raft_node.last_applied < sh.raft_node.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    try std.testing.expect(!ActionsHandler.actionExists(sh, .default, "act"));
+    ah.held.getPtr("act-run-1").?.until_ms = 0;
+    _ = ah.expireDue(sh);
+    try std.testing.expect(!ah.startPending("act-run-1"));
+    try std.testing.expectEqual(@as(usize, 0), ah.held_for_room);
+    const f = ah.takeFinished("act-run-1").?;
+    defer ah.freeFinished(f);
+    try std.testing.expect(std.mem.indexOf(u8, f.output, "removed while its start waited for room") != null);
+}
+
+test "Shard: action starts held for room have a bound of their own, which leaves starts waiting for their action room to wait" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const ah = sh.actions_handler;
+    _ = try proposeAction(sh, .action_register, testRegister("act"));
+    _ = sh.applyCommitted();
+    try fillCapSuspended(&t);
+    var rbuf: [32]u8 = undefined;
+    for (0..ActionsHandler.MAX_HELD + 1) |i| {
+        const run = try std.fmt.bufPrint(&rbuf, "room-{d}", .{i});
+        const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, run, "act", "{}", "wf", "flow", false).?;
+        defer sh.allocator.free(m);
+        ah.startRunFromInbox(sh, 1, m);
+    }
+    try std.testing.expectEqual(ActionsHandler.MAX_HELD, ah.held_for_room);
+    try std.testing.expect(!ah.startPending("room-1024"));
+    // One waiting for an action not yet registered is still held.
+    const m = ActionsHandler.encodeStartRunMessage(sh.allocator, .default, "missing-1", "nope", "{}", "wf", "flow", true).?;
+    defer sh.allocator.free(m);
+    ah.startRunFromInbox(sh, 1, m);
+    try std.testing.expect(ah.startPending("missing-1"));
+    try std.testing.expectEqual(ActionsHandler.MAX_HELD + 1, ah.held.count());
 }
