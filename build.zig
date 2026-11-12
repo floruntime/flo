@@ -280,6 +280,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bench-workflow-idle", .source = "bench/bench_workflow_idle.zig" },
         .{ .name = "bench-workflow-child", .source = "bench/bench_workflow_child.zig" },
         .{ .name = "bench-segment-walk", .source = "bench/bench_segment_walk.zig" },
+        .{ .name = "bench-segment-read", .source = "bench/bench_segment_read.zig" },
         .{ .name = "bench-kv-client", .source = "bench/bench_kv_client.zig" },
         .{ .name = "bench-txn-latency", .source = "bench/bench_txn_latency.zig" },
         .{ .name = "bench-warm", .source = "bench/bench_warm.zig" },

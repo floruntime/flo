@@ -930,6 +930,7 @@ test "durable log: a positioned read finds every start in a large segment, throu
     var seg = try PositionedSegment.open(testing.allocator, path);
     defer seg.close(testing.allocator);
     try testing.expect(seg.sparse.len > 1);
+    try testing.expect(seg.whole == null);
 
     var buf: [5]Entry = undefined;
     var arena: [4096]u8 = undefined;
@@ -963,45 +964,53 @@ test "durable log: a positioned read finds every start in a large segment, throu
 test "durable log: a positioned read refuses an entry whose bytes don't match its CRC" {
     var td = try TestDir.init();
     defer td.deinit();
-    var writer = SegmentWriter.init(testing.allocator, 0);
-    defer writer.deinit();
-    try writer.addEntry(&testEntry(1, 1, "one"));
-    try writer.addEntry(&testEntry(2, 1, "two"));
-    try writer.addEntry(&testEntry(3, 1, "three"));
-    try writer.writeToFile(td.path);
+    // Two segments: a large one, read by position, and a small one, read whole.
     var name_buf: [32]u8 = undefined;
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ td.path, segment.segmentFilename(&name_buf, 1).? });
-    defer testing.allocator.free(path);
-
-    // Flip a byte of entry 2's payload ("two") in place.
-    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 1 << 20);
-    defer testing.allocator.free(bytes);
-    const at = std.mem.indexOf(u8, bytes, "two").?;
-    bytes[at] ^= 0xff;
-    {
-        const f = try stdx.fs.createFile(path, .{});
+    var paths: [2][]const u8 = undefined;
+    for ([_]u64{ 300, 3 }, [_]u64{ 1, 1001 }, 0..) |n, first, k| {
+        var writer = SegmentWriter.init(testing.allocator, 0);
+        defer writer.deinit();
+        var pbuf: [300]u8 = undefined;
+        for (first..first + n) |i| {
+            @memset(&pbuf, 'p');
+            if (i == first + 1) @memcpy(pbuf[0..6], "second");
+            try writer.addEntry(&testEntry(i, 1, &pbuf));
+        }
+        try writer.writeToFile(td.path);
+        paths[k] = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ td.path, segment.segmentFilename(&name_buf, first).? });
+        // Flip a byte of the second entry's payload in place.
+        const bytes = try stdx.fs.readFileAlloc(testing.allocator, paths[k], 1 << 20);
+        defer testing.allocator.free(bytes);
+        bytes[std.mem.indexOf(u8, bytes, "second").?] ^= 0xff;
+        const f = try stdx.fs.createFile(paths[k], .{});
         defer stdx.fs.closeFile(f);
         try stdx.fs.writeAll(f, bytes);
     }
+    defer for (paths) |p| testing.allocator.free(p);
 
-    var seg = try PositionedSegment.open(testing.allocator, path);
+    var seg = try PositionedSegment.open(testing.allocator, paths[0]);
     defer seg.close(testing.allocator);
+    try testing.expect(seg.whole == null);
     var buf: [3]Entry = undefined;
-    var arena: [64]u8 = undefined;
+    var arena: [1024]u8 = undefined;
     var scratch: [4096]u8 = undefined;
     // Entry 1 is good on its own; a read that reaches entry 2 fails.
     try testing.expectEqual(@as(usize, 1), (try seg.read(1, buf[0..1], &arena, &scratch)).count);
     try testing.expectError(error.InvalidCrc, seg.read(1, &buf, &arena, &scratch));
     try testing.expectError(error.InvalidCrc, seg.read(2, &buf, &arena, &scratch));
-    try testing.expectEqual(@as(usize, 1), (try seg.read(3, &buf, &arena, &scratch)).count);
-    // The durable log reads it as a fault: nothing, and no crash.
+    try testing.expectEqual(@as(usize, 3), (try seg.read(3, &buf, &arena, &scratch)).count);
+    // The small one is read whole, and its whole-file CRC refuses it.
+    try testing.expectError(error.InvalidCrc, PositionedSegment.open(testing.allocator, paths[1]));
+    // The durable log reads either as a fault: nothing, and not blocked.
     var dl_writer = SegmentWriter.init(testing.allocator, 0);
     defer dl_writer.deinit();
     var dl = try DurableLog.init(testing.allocator, &dl_writer, td.path);
     defer dl.deinit();
-    const r = dl.readRange(2, &buf, &arena);
-    try testing.expectEqual(@as(usize, 0), r.count);
-    try testing.expect(!r.blocked);
+    for ([_]u64{ 2, 1002 }) |i| {
+        const r = dl.readRange(i, &buf, &arena);
+        try testing.expectEqual(@as(usize, 0), r.count);
+        try testing.expect(!r.blocked);
+    }
 }
 
 test "durable log: truncateAfter rewrites the sealed tail under its own name and deletes emptied files" {
