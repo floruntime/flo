@@ -2294,9 +2294,9 @@ test "e2e/workflow: E2E-16c GET /api/workflows/:run_id/history returns events" {
 // =============================================================================
 // E2E-17: Definition Overwrite Safety
 // =============================================================================
-// Version pinning (14.11) is implemented — definition_yaml is captured in
-// RunSnapshot at start time. Overwriting the cached definition does not affect
-// already-running instances.
+// Overwriting a definition leaves the runs it already started readable. A
+// run isn't pinned to the definition it started under: its next step reads
+// the definition stored then.
 
 test "e2e/workflow: E2E-17 definition overwrite safety" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
@@ -2352,16 +2352,12 @@ test "e2e/workflow: E2E-17 definition overwrite safety" {
 
     var overwrite = try ctx.cli.run(&.{ "workflow", "create", "-f", v2_path });
     defer overwrite.deinit();
-    // Overwrite succeeds — it updates the cached definition for future runs,
-    // but the already-running v1 instance keeps its pinned definition_yaml.
+    // Overwrite succeeds: it replaces the stored definition.
 
     // Verify the v1 run is still accessible and not corrupted
     var v1_check = try ctx.cli.run(&.{ "workflow", "status", "e2e17-v1-run" });
     defer v1_check.deinit();
     try stdx.testing.assertSucceeded(v1_check);
-
-    // The v1 run's RunSnapshot contains the original v1 definition_yaml,
-    // so it continues using its wait-step even after the cache was overwritten.
 }
 
 // =============================================================================
@@ -2688,6 +2684,36 @@ test "e2e/workflow: same workflow name in different namespaces are independent" 
     defer res_b.deinit();
     try stdx.testing.assertSucceeded(res_b);
     try stdx.testing.assertContains(res_b, "2.0.0");
+}
+
+test "e2e/workflow: a chosen run id of 596 bytes starts a run, and one of 597 is refused as a bad request" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+    const path = try writeTempYaml(testing.allocator,
+        \\kind: Workflow
+        \\name: long-ids
+        \\version: 1.0.0
+        \\start:
+        \\  wait_for_signal:
+        \\    type: go
+        \\  transitions:
+        \\    success: flo.Completed
+    , "long-ids-wf.yaml");
+    defer cleanupTempFile(testing.allocator, path);
+    try ctx.exec(&.{ "workflow", "create", "-f", path });
+
+    const longest = @as([596]u8, @splat('r'));
+    var ok = try ctx.cli.run(&.{ "workflow", "start", "long-ids", "{}", "--run-id", &longest, "-o", "json" });
+    defer ok.deinit();
+    try testing.expectEqual(@as(u8, 0), ok.exit_code);
+    try testing.expectEqualStrings("{\"run_id\":\"" ++ longest ++ "\"}\n", ok.stdout);
+
+    const too_long = longest ++ [_]u8{'r'};
+    var refused = try ctx.cli.run(&.{ "workflow", "start", "long-ids", "{}", "--run-id", &too_long });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 3), refused.exit_code);
+    try testing.expectEqualStrings("", refused.stdout);
+    try testing.expectEqualStrings("Error: bad request: a run id is at most 596 bytes [bad_request]\n", refused.stderr);
 }
 
 test "e2e/workflow: start and status are namespace-scoped" {

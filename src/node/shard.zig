@@ -816,6 +816,7 @@ pub const Shard = struct {
         const workflow_handler = try allocator.create(WorkflowHandler);
         errdefer allocator.destroy(workflow_handler);
         workflow_handler.* = WorkflowHandler.init(allocator);
+        workflow_handler.namespaces = namespace_handler;
 
         // Create Processing handler
         const processing_handler = try allocator.create(ProcessingHandler);

@@ -679,8 +679,9 @@ pub const ProcessingHandler = struct {
         // pipelines from the entry — the same applier a restart uses.
         // Admitted at dispatch; the definition has now passed, so reserve.
         shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
-        // A namespace this submit creates had no id at dispatch; shard 0,
-        // where every submit runs, knows the one it just proposed.
+        // A submit's key is empty, so dispatch neither creates its namespace
+        // nor gives it an id when this submit is the one creating it; shard
+        // 0, where every submit runs, knows the id it just proposed.
         const ns_id = if (req.ns_id != .invalid) req.ns_id else shard.namespaceId(req.namespace);
         const proposed = self.proposeSubmit(shard, ns_id, job_id, .running, def.batch_size, home, yaml) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "job not persisted"));

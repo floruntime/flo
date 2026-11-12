@@ -58,6 +58,7 @@ const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const router = @import("../node/router.zig");
 const run_id_mod = @import("../node/run_id.zig");
 const NamespaceId = @import("../namespace/table.zig").Id;
+const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
 
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = proto.Request;
@@ -191,6 +192,9 @@ pub const WorkflowHandler = struct {
     /// Cleared by the shard while it applies entries replicated from a peer:
     /// those producers run on the node that owns the definition.
     install_producers: bool = true,
+    /// This shard's namespaces, as its applied entries bind them: what an
+    /// applier reads a namespace's name from, the same on every replica.
+    namespaces: ?*const NamespaceHandler = null,
 
     /// Active interval/cron schedules, by their definitions' keys.
     /// Registered when a workflow with a `schedule:` block is created.
@@ -204,6 +208,9 @@ pub const WorkflowHandler = struct {
     const MAX_WORKFLOW_NAME_LEN: usize = 256;
     /// The longest key a create or start entry carries.
     pub const MAX_START_KEY: usize = 600;
+    /// The longest run id a start may choose: its key is the namespace's id
+    /// and the run id.
+    pub const MAX_RUN_ID: usize = MAX_START_KEY - KEY_PREFIX;
     const MAX_DEFINITIONS: usize = 10_000;
     const MAX_RUNS: usize = 100_000;
 
@@ -873,6 +880,10 @@ pub const WorkflowHandler = struct {
                     offset += rid_len;
                     if (run_id_mod.looksGenerated(.workflow, explicit_run_id.?)) {
                         shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "bad request: run ids of the form wfr-<hex>-<hex> are the server's; choose another");
+                        return null;
+                    }
+                    if (explicit_run_id.?.len > MAX_RUN_ID) {
+                        shard.sendErrorResponse(conn, req.header.request_id, .bad_request, std.fmt.comptimePrint("bad request: a run id is at most {d} bytes", .{MAX_RUN_ID}));
                         return null;
                     }
                 }
@@ -3189,7 +3200,7 @@ pub const WorkflowHandler = struct {
         // to another stream starts that stream from its beginning.
         var cursor_ts: u64 = 0;
         var cursor_seq: u64 = 0;
-        const stream_ns: ?[]const u8 = if (trigger.namespace) |n| (if (n.len > 0) n else null) else null;
+        const stream_ns = self.otherStreamNamespace(ns, trigger.namespace);
         if (self.stream_triggers.fetchRemove(trigger_key)) |old| {
             self.allocator.free(old.key);
             var state = old.value;
@@ -3236,6 +3247,17 @@ pub const WorkflowHandler = struct {
             return;
         };
         _ = global_stream_trigger_count.fetchAdd(1, .monotonic);
+    }
+
+    /// The namespace a trigger names for its stream, or null when that is
+    /// the workflow's own: named, empty or left out, all three read the same
+    /// stream, so a redefinition moving between them keeps its cursor.
+    fn otherStreamNamespace(self: *const WorkflowHandler, ns: NamespaceId, named: ?[]const u8) ?[]const u8 {
+        const name = named orelse return null;
+        if (name.len == 0) return null;
+        const own = if (self.namespaces) |h| h.nameOf(ns) orelse h.table.nameOf(ns) else null;
+        if (own) |o| if (std.mem.eql(u8, o, name)) return null;
+        return name;
     }
 
     /// Remove the stream trigger for a workflow definition.
@@ -3692,8 +3714,8 @@ pub const WorkflowHandler = struct {
 
     /// Whether this shard holds run `run_id` in namespace `ns`.
     pub fn holdsRun(self: *const WorkflowHandler, ns: NamespaceId, run_id: []const u8) bool {
-        // A run's start entry holds keys under `MAX_START_KEY` bytes, so a
-        // longer id is no run's.
+        // A run's start entry holds a key of at most `MAX_START_KEY` bytes,
+        // so a longer id is no run's.
         var buf: [MAX_START_KEY]u8 = undefined;
         if (KEY_PREFIX + run_id.len > buf.len) return false;
         return self.runs.contains(writeKey(&buf, ns, run_id));
@@ -3741,7 +3763,7 @@ pub const WorkflowHandler = struct {
     fn proposeCreate(self: *WorkflowHandler, shard: *Shard, ns: NamespaceId, name: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         var key_buf: [MAX_START_KEY]u8 = undefined;
-        if (KEY_PREFIX + name.len > key_buf.len) return error.NoSpaceLeft;
+        if (KEY_PREFIX + name.len > key_buf.len) return error.KeyTooLarge;
         return persistence_mod.proposeEntryIn(shard, .workflow_create, entry_mod.Flags.NONE, ns, writeKey(&key_buf, ns, name), yaml);
     }
 
@@ -3784,7 +3806,7 @@ pub const WorkflowHandler = struct {
     ) !persistence_mod.ProposeResult {
         _ = self;
         var ns_key_buf: [MAX_START_KEY]u8 = undefined;
-        if (KEY_PREFIX + run_id.len > ns_key_buf.len) return error.NoSpaceLeft;
+        if (KEY_PREFIX + run_id.len > ns_key_buf.len) return error.KeyTooLarge;
         const ns_key = writeKey(&ns_key_buf, ns, run_id);
         const idem = idempotency_key orelse "";
         const value_len = 2 + wf_name.len + 2 + version.len + 1 + 2 + event_type.len + 2 + idem.len + input.len;
@@ -4534,6 +4556,31 @@ test "workflow handler: a re-created trigger keeps its cursor on the same stream
     try testing.expectEqual(@as(u64, 0), moved.stream_cursor_seq);
 }
 
+test "workflow handler: a re-created trigger naming its own namespace, or none, keeps its cursor; another namespace resets it" {
+    const allocator = testing.allocator;
+    var namespaces = try NamespaceHandler.init(allocator);
+    defer namespaces.deinit();
+    try testing.expectEqual(.created, namespaces.applyCreate("team-a"));
+    try testing.expectEqual(.created, namespaces.applyCreate("team-b"));
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    handler.namespaces = &namespaces;
+    const ns = namespaces.idOf("team-a").?;
+
+    handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .batch_size = 4 });
+    const key = handler.nsKey(ns, "wf").?;
+    defer allocator.free(key);
+    for ([_]?[]const u8{ "team-a", null, "", "team-a" }) |named| {
+        handler.stream_triggers.getPtr(key).?.stream_cursor_ts = 1700;
+        handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = named, .batch_size = 4 });
+        try testing.expectEqual(@as(u64, 1700), handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+    }
+
+    handler.registerStreamTrigger(ns, "wf", .{ .stream = "events", .namespace = "team-b", .batch_size = 4 });
+    try testing.expectEqual(@as(u64, 0), handler.stream_triggers.getPtr(key).?.stream_cursor_ts);
+    try testing.expectEqualStrings("team-b", handler.stream_triggers.getPtr(key).?.stream_namespace_owned.?);
+}
+
 // ── Step Executor Tests ─────────────────────────────────────────────────
 
 /// Minimal 2-step workflow: start → step_b → flo.Completed
@@ -4682,7 +4729,6 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.replies_held = 0;
     shard.forward_count = 0;
     // A write's entry carries its namespace's id, from the node's table.
-    const NamespaceHandler = @import("../namespace/handler.zig").NamespaceHandler;
     const namespaces = try std.testing.allocator.create(NamespaceHandler);
     namespaces.* = try NamespaceHandler.init(std.testing.allocator);
     shard.namespace_handler = namespaces;
