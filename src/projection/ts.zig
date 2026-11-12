@@ -1044,7 +1044,8 @@ pub const TSProjection = struct {
     pub fn deleteSeries(self: *TSProjection, ns_id: NamespaceId, measurement: []const u8, preds: []const TagPredicate) usize {
         var removed: usize = 0;
 
-        // Delete matching write buffers (this namespace + measurement only)
+        // Delete matching write buffers (this namespace + measurement only).
+        // Every series has one: a flush empties it but keeps it.
         var bit = self.buffers.iterator();
         while (bit.next()) |kv| {
             const key = kv.key_ptr.*;
@@ -1142,14 +1143,20 @@ pub const TSProjection = struct {
                 out.putInt(u64, rec.timestamp_ns);
             },
             // The value is the canonical tag filter; empty deletes the
-            // whole measurement.
+            // whole measurement. A filter that matches no series is refused
+            // here, not when proposed: a write committed ahead of it may
+            // add the series it names.
             .ts_delete => {
                 const cmd = entry_mod.CommandPayload.deserialize(ual_entry.payload) orelse return error.Halt;
                 var canon_buf: [MAX_TAG_STRING]u8 = undefined;
                 var preds_buf: [MAX_TAGS]TagPredicate = undefined;
-                switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
-                    .ok => |f| _ = self.deleteSeries(cmd.namespace_id, cmd.key, f.preds),
+                const f = switch (parseTagFilter(cmd.value, &canon_buf, &preds_buf)) {
+                    .ok => |f| f,
                     else => return error.Halt,
+                };
+                const removed = self.deleteSeries(cmd.namespace_id, cmd.key, f.preds);
+                if (removed == 0 and f.preds.len > 0) {
+                    out.refuseFmt(.not_found, .not_found, "no series of '{s}' has tags {s}; nothing deleted", .{ cmd.key, f.canonical });
                 }
             },
             // The entry carries the duration; the cutoff is its stamp less
@@ -1743,7 +1750,7 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
         var preds: [MAX_TAGS]TagPredicate = undefined;
         const a1 = parseTagFilter("sensor=A1", &canon, &preds).ok.preds;
         try testing.expect(ts.hasSeries(.of(17), "temp", a1));
-        _ = ts.deleteSeries(.of(17), "temp", a1);
+        try testing.expectEqual(@as(usize, 1), ts.deleteSeries(.of(17), "temp", a1));
         try testing.expect(!ts.hasSeries(.of(17), "temp", a1));
         // The other series, the untagged one, and the same series in
         // another namespace remain.
@@ -1755,6 +1762,28 @@ test "ts: a delete with a tag filter removes only the series whose tags include 
         const untagged = try ts.queryRange(.of(17), "temp", "value", 0, 0, 10000, &buf);
         try testing.expectEqual(@as(usize, 1), untagged.points_in_buffer + untagged.blocks_matched);
     }
+}
+
+test "ts: a tag-filtered delete is refused at apply when no series matches, and runs once one is written ahead of it" {
+    var vals: [1][256]u8 = undefined;
+    var payloads: [3][512]u8 = undefined;
+    const del = entry_mod.buildCommandEntry(.ts_delete, 0, 1, 1, 100, .of(17), "temp", "sensor=A1", &payloads[0]).?;
+    const write = entry_mod.buildCommandEntry(.ts_write, 0, 1, 2, 200, .of(17), "temp", TsWriteValue.encode(&vals[0], .{ .value = 1.0, .timestamp_ns = 1000, .field_name = "value", .tags = "sensor=A1" }).?, &payloads[1]).?;
+    const del_again = entry_mod.buildCommandEntry(.ts_delete, 0, 1, 3, 300, .of(17), "temp", "sensor=A1", &payloads[2]).?;
+
+    var ts = TSProjection.init(testing.allocator, .{ .buffer_capacity = 100 });
+    defer ts.deinit();
+    var out = Result.start(&del);
+    try ts.applyEntry(&del, &out);
+    const refused = out.refused().?;
+    try testing.expect(refused.status == .not_found);
+    try testing.expectEqualStrings("no series of 'temp' has tags sensor=A1; nothing deleted", refused.refusal.message);
+
+    try applyTest(&ts, &write);
+    out = Result.start(&del_again);
+    try ts.applyEntry(&del_again, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expectEqual(@as(usize, 0), ts.seriesCount());
 }
 
 test "ts: the same tags and measurement in two namespaces stay apart, live and replayed" {

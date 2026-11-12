@@ -1202,10 +1202,16 @@ pub const ProcessingHandler = struct {
         out.refuseRan(.bad_request, .unclassified, .yes, message);
     }
 
-    /// Replay a status change (stop/cancel).
+    /// Replay a status change (stop/cancel). Only a running job changes:
+    /// asking again for the status it has is a no-op that succeeds, and any
+    /// other is refused, so a failed job keeps its status, its reason and
+    /// its count. Checked here, not when proposed, since a stop and a
+    /// cancel may both be in flight.
     fn replayStatusChange(self: *ProcessingHandler, key: []const u8, status: JobStatus, out: *Result) persistence_mod.ApplyError!void {
         // A stop or cancel taken before a remove applied lands after it.
         const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        if (job.status == status) return;
+        if (job.status != .running) return out.refuseFmt(.conflict, .unclassified, "job isn't running (it is {s})", .{@tagName(job.status)});
         self.setStatus(job, status);
     }
 
@@ -2540,10 +2546,35 @@ test "ProcessingHandler: a stored definition that no longer parses is kept as fa
     // The same submit again is still one failed job.
     _ = try applySubmit(&handler, "job-r", testSubmitValue(&buf, .running, yaml), 1);
     try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
-    // Cancelling it leaves none failed.
+    // Cancelling it is refused: it stays failed, and counted.
     var out: Result = .{};
     try handler.replayStatusChange("job-r", .cancelled, &out);
-    try std.testing.expectEqual(@as(u64, 0), handler.failed_jobs);
+    try std.testing.expectEqualStrings("job isn't running (it is failed)", out.refused().?.refusal.message);
+    try std.testing.expectEqual(ProcessingHandler.JobStatus.failed, job.status);
+    try std.testing.expectEqual(@as(u64, 1), handler.failed_jobs);
+}
+
+test "ProcessingHandler: stopping a stopped job succeeds and changes nothing; cancelling it is refused" {
+    var handler = ProcessingHandler.init(std.testing.allocator);
+    defer handler.deinit();
+    var buf: [512]u8 = undefined;
+    _ = try applySubmit(&handler, "job-s", testSubmitValue(&buf, .running, "kind: Processing\nname: s\nsources: [{stream: {name: in}}]\nsinks: [{stream: {name: out}}]\n"), 1);
+    var out: Result = .{};
+    try handler.replayStatusChange("job-s", .stopped, &out);
+    try std.testing.expect(out.refused() == null);
+
+    // A second stop, raced with the first, is a no-op.
+    out = .{};
+    try handler.replayStatusChange("job-s", .stopped, &out);
+    try std.testing.expect(out.refused() == null);
+    try std.testing.expectEqual(ProcessingHandler.JobStatus.stopped, handler.jobs.get("job-s").?.status);
+
+    out = .{};
+    try handler.replayStatusChange("job-s", .cancelled, &out);
+    const refused = out.refused().?;
+    try std.testing.expect(refused.status == .conflict);
+    try std.testing.expectEqualStrings("job isn't running (it is stopped)", refused.refusal.message);
+    try std.testing.expectEqual(ProcessingHandler.JobStatus.stopped, handler.jobs.get("job-s").?.status);
 }
 
 test "ProcessingHandler: a job without a pipeline keeps its cursor, forward only, and a pipeline built later starts from it" {

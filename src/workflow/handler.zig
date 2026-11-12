@@ -3969,8 +3969,8 @@ pub const WorkflowHandler = struct {
 
         if (!run.status.isTerminal()) self.noteRunFinished(run);
         _ = self.to_step.remove(run.ns_key);
-        // The entry carries the whole terminal state; whatever the run held
-        // (the live producer's copy, or an earlier apply) is replaced.
+        // The entry carries the whole terminal state: the run's steps,
+        // outputs and history are replaced with what was logged.
         run.status = entry.status;
         run.completed_at_ms = completed_at_ms;
         if (run.output_owned) |o| self.allocator.free(o);
@@ -4022,7 +4022,7 @@ pub const WorkflowHandler = struct {
             .workflow_start => self.replayStart(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_enabled => self.replayEnabled(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             .workflow_step_started => self.replayStepStarted(cmd.key, cmd.value, out),
-            .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms)),
+            .workflow_complete => self.replayComplete(cmd.key, cmd.value, @intCast(entry.header.timestamp_ns / std.time.ns_per_ms), out),
             else => error.Halt,
         };
     }
@@ -4156,6 +4156,27 @@ pub const WorkflowHandler = struct {
         // was uncommitted. The log's order decides; the later is refused.
         if (self.runs.contains(ns_key_raw)) return out.refuse(.conflict, .unclassified, "conflict: a run with this id already exists");
 
+        // A disable or a redefinition that commits ahead of a start decides
+        // it, as the handler's checks would have. Only client and schedule
+        // starts. Not a child's: a parent reads a child on another shard
+        // that its start never created as not finished yet, so refusing it
+        // here would leave the parent waiting for good. Not a trigger's:
+        // its leader has moved the trigger's cursor past the record
+        // already, so a trigger start proposed before a disable commits
+        // still runs. A refused schedule start leaves its slot unfired;
+        // enabling re-anchors past it.
+        const client_start = std.mem.eql(u8, event_type, "workflow_started");
+        if (client_start or std.mem.eql(u8, event_type, "schedule_started")) {
+            const def_key = self.makeNsKey(namespace, wf_name) orelse return error.OutOfMemory;
+            defer self.allocator.free(def_key);
+            if (self.disabled.contains(def_key)) return out.refuse(.bad_request, .unclassified, "workflow is disabled");
+            if (client_start and idem == null) {
+                if (self.definitions.get(def_key)) |def| {
+                    if (def.idempotency == .required) return out.refuse(.bad_request, .unclassified, "idempotency key is required for this workflow");
+                }
+            }
+        }
+
         const ns_key = self.allocator.dupe(u8, ns_key_raw) catch return error.OutOfMemory;
         var run = RunRecord{
             .run_id_owned = self.allocator.dupe(u8, raw_run_id) catch {
@@ -4259,10 +4280,19 @@ pub const WorkflowHandler = struct {
     ///   [has_output:u8][output_len:u32][output]?
     ///   [step_count:u16]([name_len:u16][name][outcome_len:u16][outcome][output_len:u32][output])*
     ///   [history_count:u16]([type_len:u16][type][detail_len:u16][detail][timestamp:i64])*
-    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64) persistence_mod.ApplyError!void {
+    fn replayComplete(self: *WorkflowHandler, ns_key_raw: []const u8, value: []const u8, completed_at_ms: i64, out: *Result) persistence_mod.ApplyError!void {
         // Runs are never removed: a completion names one that started.
         const run = self.runs.getPtr(ns_key_raw) orelse return error.Halt;
-        return self.applyComplete(run, value, completed_at_ms);
+        // The first completion in the log ends the run; a cancel and a
+        // completion in flight together leave it as the first left it. A
+        // second with the same outcome (two cancels) succeeds, changing
+        // nothing.
+        if (run.status.isTerminal()) {
+            const entry = CompleteEntry.parse(value) orelse return error.Halt;
+            if (entry.status == run.status) return;
+            return out.refuse(.bad_request, .unclassified, "run already finished");
+        }
+        try self.applyComplete(run, value, completed_at_ms);
     }
 
     /// A workflow_complete value, checked against its length:
@@ -4416,6 +4446,8 @@ fn containsLower(haystack: []const u8, needle_lower: []const u8) bool {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+/// A result for the tests that apply a completion directly and don't read it.
+var replay_out_for_tests: Result = .{};
 
 fn makeRequest(op: OpCode, key: []const u8, value: []const u8) Request {
     return .{
@@ -5671,6 +5703,85 @@ test "workflow schedule: enabled again, slots count from the enable, and those m
     try testing.expectEqual(@as(?i64, 12_500), WorkflowHandler.dueSlot(s, 12_600));
 }
 
+test "workflow start: a disable committed ahead refuses a client or schedule start at apply, leaving the slot unfired; trigger and child starts still run" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var out: Result = .{};
+    try handler.replayCreate("a:wf",
+        \\kind: Workflow
+        \\name: wf
+        \\version: 1.0.0
+        \\schedule:
+        \\  interval: 1000
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , 1000, &out);
+    const sched = handler.schedules.getPtr("a:wf").?;
+    const fired_before = sched.fired_ms;
+
+    // The leader proposed slot 4000's start; a disable commits first.
+    try handler.replayEnabled("a:wf", &.{0}, 4500, &out);
+    var buf: [256]u8 = undefined;
+    out = .{};
+    try handler.replayStart("a:r-sched", startValue(&buf, "wf", "schedule_started", "schedule:a:wf:4000"), 4600, &out);
+    try testing.expectEqualStrings("workflow is disabled", out.refused().?.refusal.message);
+    try testing.expect(!handler.runs.contains("a:r-sched"));
+    try testing.expectEqual(fired_before, sched.fired_ms);
+    try testing.expectEqual(@as(u32, 0), handler.active_runs.get("a:wf") orelse 0);
+
+    out = .{};
+    try handler.replayStart("a:r-client", startValue(&buf, "wf", "workflow_started", ""), 4600, &out);
+    try testing.expectEqualStrings("workflow is disabled", out.refused().?.refusal.message);
+    try testing.expect(!handler.runs.contains("a:r-client"));
+
+    // A trigger's start is not held to it: its leader moved the cursor.
+    out = .{};
+    try handler.replayStart("a:r-trig", startValue(&buf, "wf", "trigger_started", ""), 4600, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expect(handler.runs.contains("a:r-trig"));
+    out = .{};
+    try handler.replayStart("a:r-child", startValue(&buf, "wf", "child_started", ""), 4600, &out);
+    try testing.expect(out.refused() == null);
+
+    // Enabled again, the refused slot doesn't fire: slots count from the enable.
+    try handler.replayEnabled("a:wf", &.{1}, 7250, &out);
+    try testing.expectEqual(@as(?i64, 7250), WorkflowHandler.dueSlot(sched, 7300));
+}
+
+test "workflow start: a redefinition that requires a key, committed ahead, refuses a client start without one at apply" {
+    const allocator = testing.allocator;
+    var handler = WorkflowHandler.init(allocator);
+    defer handler.deinit();
+    var out: Result = .{};
+    try handler.replayCreate("a:wf",
+        \\kind: Workflow
+        \\name: wf
+        \\version: 1.0.0
+        \\idempotency: required
+        \\start:
+        \\  wait_for_signal:
+        \\    type: never
+        \\  transitions:
+        \\    success: flo.Completed
+    , 1000, &out);
+    var buf: [256]u8 = undefined;
+    out = .{};
+    try handler.replayStart("a:r1", startValue(&buf, "wf", "workflow_started", ""), 2000, &out);
+    try testing.expectEqualStrings("idempotency key is required for this workflow", out.refused().?.refusal.message);
+    try testing.expect(!handler.runs.contains("a:r1"));
+    out = .{};
+    try handler.replayStart("a:r2", startValue(&buf, "wf", "workflow_started", "k1"), 2000, &out);
+    try testing.expect(out.refused() == null);
+    // A child's start carries no key and was never held to one.
+    out = .{};
+    try handler.replayStart("a:r3", startValue(&buf, "wf", "child_started", ""), 2000, &out);
+    try testing.expect(out.refused() == null);
+}
+
 test "workflow schedule: a slot starts one run however many leaders propose it, and a missed one fires once" {
     const allocator = testing.allocator;
     var handler = WorkflowHandler.init(allocator);
@@ -6367,8 +6478,8 @@ test "workflow replay: an unknown status, or a complete entry without its output
     try testing.expectEqual(@as(usize, 1), handler.runCount());
 
     // Missing has_output byte; then an unknown status. Neither may change the run.
-    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{3}, 2));
-    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2));
+    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{3}, 2, &replay_out_for_tests));
+    try testing.expectError(error.Halt, handler.replayComplete("default:r1", &[_]u8{ 0xee, 0 }, 2, &replay_out_for_tests));
     try testing.expectEqual(WorkflowHandler.RunStatus.running, handler.runs.get("default:r1").?.status);
 }
 
@@ -6441,19 +6552,58 @@ test "workflow replay: a complete entry cut short leaves the run as it was, and 
     const history_before = handler.runs.get("default:r1").?.history.items.len;
     try testing.expectEqual(@as(usize, 1), history_before);
     for (1..whole.len - 3) |n| {
-        try testing.expectError(error.Halt, handler.replayComplete("default:r1", whole[0..n], 2));
+        try testing.expectError(error.Halt, handler.replayComplete("default:r1", whole[0..n], 2, &replay_out_for_tests));
         const run = handler.runs.get("default:r1").?;
         try testing.expectEqual(WorkflowHandler.RunStatus.running, run.status);
         try testing.expect(run.output_owned == null);
         try testing.expectEqual(history_before, run.history.items.len);
     }
 
-    try handler.replayComplete("default:r1", &whole, 2);
+    try handler.replayComplete("default:r1", &whole, 2, &replay_out_for_tests);
     const run = handler.runs.get("default:r1").?;
     try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
     try testing.expectEqualStrings("ok", run.output_owned.?);
     try testing.expectEqual(@as(usize, 1), run.history.items.len);
     try testing.expectEqualStrings("t", run.search_tags_owned.?);
+}
+
+test "workflow replay: a cancel logged after a completion is refused and changes nothing, on every replica; a second cancel after a cancel succeeds" {
+    // A completion a deposed leader logged commits ahead of a cancel the
+    // next leader took while that completion hadn't applied there.
+    const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
+    const completed = [_]u8{3} ++ [_]u8{ 1, 2, 0, 0, 0, 'o', 'k' } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 };
+    const cancelled = [_]u8{5} ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 } ++ [_]u8{ 0, 0 };
+
+    // Two replicas apply the same log.
+    for (0..2) |_| {
+        var handler = WorkflowHandler.init(testing.allocator);
+        defer handler.deinit();
+        var out: Result = .{};
+        try handler.replayStart("default:r1", &start, 1, &out);
+        out = .{};
+        try handler.replayComplete("default:r1", &completed, 2, &out);
+        try testing.expect(out.refused() == null);
+        out = .{};
+        try handler.replayComplete("default:r1", &cancelled, 3, &out);
+        const refused = out.refused().?;
+        try testing.expectEqualStrings("run already finished", refused.refusal.message);
+        try testing.expectEqual(proto.Ran.no, refused.refusal.ran);
+        const run = handler.runs.get("default:r1").?;
+        try testing.expectEqual(WorkflowHandler.RunStatus.completed, run.status);
+        try testing.expectEqualStrings("ok", run.output_owned.?);
+        try testing.expectEqual(@as(i64, 2), run.completed_at_ms);
+    }
+
+    // Two cancels: the first ends the run, the second is told it did.
+    var handler = WorkflowHandler.init(testing.allocator);
+    defer handler.deinit();
+    var out: Result = .{};
+    try handler.replayStart("default:r1", &start, 1, &out);
+    try handler.replayComplete("default:r1", &cancelled, 2, &out);
+    out = .{};
+    try handler.replayComplete("default:r1", &cancelled, 3, &out);
+    try testing.expect(out.refused() == null);
+    try testing.expectEqual(@as(i64, 2), handler.runs.get("default:r1").?.completed_at_ms);
 }
 
 /// Fills a run's history past what a completion record holds.
@@ -6512,7 +6662,7 @@ test "a completion too large to log fails the run with a trimmed record that rep
     var follower = WorkflowHandler.init(allocator);
     defer follower.deinit();
     createTestRun(&follower, "default:big", "big", "test-wf");
-    try follower.replayComplete("default:big", record, 2);
+    try follower.replayComplete("default:big", record, 2, &replay_out_for_tests);
     const f = follower.runs.get("default:big").?;
     try testing.expectEqual(done.status, f.status);
     try testing.expectEqual(done.history.items.len, f.history.items.len);
