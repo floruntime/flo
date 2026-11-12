@@ -1068,6 +1068,8 @@ pub const QueueHandler = struct {
     /// and an acked dequeue whose complete was skipped gets its messages as
     /// leased.
     pub fn skipped(self: *QueueHandler, shard: *Shard, e: *const Entry) void {
+        // The duty's own entry skipped: free to propose the next.
+        if (self.expiring == e.header.index) self.expiring = null;
         for (self.pending.items, 0..) |pd, i| if (pd.index == e.header.index and pd.term == e.header.term) {
             _ = self.pending.swapRemove(i);
             self.unclaim(pd.queue, pd.claims);

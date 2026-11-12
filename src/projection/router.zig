@@ -7,9 +7,7 @@
 //! Routing table:
 //!   ts_write, ts_write_batch        → TSProjection
 //!   stream_append, stream_trim      → None (UAL direct reads, zero-copy)
-//!   cg_commit, cg_delete            → None (applied to StreamProjection via
-//!                                      the stream handler's replay registry,
-//!                                      not this router)
+//!   group_*                         → None (the group machine)
 //!   raft_config, raft_noop          → None (consensus layer)
 //!   raft_snapshot                    → Snapshot installation
 //!   checkpoint                      → None (processing runtime)
@@ -205,16 +203,14 @@ pub fn routeTarget(entry_type: EntryType) RouteTarget {
         // KV: its contract machine (kv/machine.zig).
         .kv_put, .kv_delete, .kv_batch, .kv_incr, .kv_expire, .kv_json_patch => .none,
 
-        // Consumer-group durability: cg_commit / cg_delete carry
-        // consumer-group state, which lives on the StreamProjection. They are
-        // applied via the stream handler's replay registry (registerReplay),
-        // not the projection router, so route to .none here to avoid also
-        // landing them in the KV keyspace (where they could collide with user
-        // keys). cg_create is unused (groups auto-create on first commit).
-        .cg_commit, .cg_create, .cg_delete => .none,
+        // Never written.
+        .cg_create => .none,
 
         // Queues: their contract machine (queue/machine.zig).
         .queue_enqueue, .queue_deliver, .queue_settle, .queue_release, .queue_extend, .queue_expire, .queue_purge => .none,
+
+        // Consumer groups: their contract machine (stream/group_machine.zig).
+        .group_create, .group_delete, .group_deliver, .group_settle, .group_release, .group_extend, .group_expire, .group_clean => .none,
 
         // TimeSeries
         .ts_write, .ts_write_batch, .ts_delete, .ts_retention => .ts,
@@ -293,9 +289,7 @@ test "router: routing table correctness" {
     try testing.expectEqual(RouteTarget.none, routeTarget(.kv_batch));
 
     // Consumer group → none (applied via stream handler replay registry)
-    try testing.expectEqual(RouteTarget.none, routeTarget(.cg_commit));
     try testing.expectEqual(RouteTarget.none, routeTarget(.cg_create));
-    try testing.expectEqual(RouteTarget.none, routeTarget(.cg_delete));
 
     // Queues: a contract machine's
     try testing.expectEqual(RouteTarget.none, routeTarget(.queue_enqueue));
@@ -331,14 +325,12 @@ test "router: ts entry routed to ts projection" {
 }
 
 test "router: consumer group entry not routed to a projection" {
-    // cg_commit / cg_delete carry consumer-group state owned by the
-    // StreamProjection and are applied via the stream handler's replay
-    // registry, so the projection router must not route them to a projection.
+    // A consumer group's entries are its machine's, never a projection's.
     var q_proj = TestProjection{};
     var router = ProjectionRouter.init();
     router.registerTS(q_proj.handle());
 
-    const entry = makeEntry(.cg_commit, 1);
+    const entry = makeEntry(.group_settle, 1);
     const result = try applyOne(&router, &entry);
 
     try testing.expectEqual(ApplyResult.skipped_no_projection, result);
@@ -463,7 +455,7 @@ test "router: mixed entry types across all projections" {
     _ = try applyOne(&router, &makeEntry(.kv_put, 1)); // → none (the KV machine)
     _ = try applyOne(&router, &makeEntry(.queue_enqueue, 2)); // → none (the queue machine)
     _ = try applyOne(&router, &makeEntry(.ts_write, 3));
-    _ = try applyOne(&router, &makeEntry(.cg_commit, 4)); // → none (stream replay registry)
+    _ = try applyOne(&router, &makeEntry(.group_settle, 4)); // → none (the group machine)
     _ = try applyOne(&router, &makeEntry(.ts_write_batch, 5));
 
     try testing.expectEqual(@as(u32, 2), ts_proj.apply_count); // write + write_batch

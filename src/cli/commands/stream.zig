@@ -33,6 +33,7 @@ const MAX_BATCH_RECORDS = proto.MAX_STREAM_BATCH_RECORDS;
 const output = @import("../output.zig");
 const cli_config = @import("../config.zig");
 const gen = @import("../gen.zig");
+const queue_ops = @import("../../protocol/queue_ops.zig");
 const stream_ops = @import("../../protocol/stream_ops.zig");
 
 /// Wrapper to cast *anyopaque to *Context
@@ -189,21 +190,21 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
                         .stringFlag("consumer", 'c', "", "Consumer ID (required)")
-                        .uintFlag("limit", 'l', 1, "Maximum records to read; appends are returned whole, so one larger append comes back entire")
+                        .uintFlag("limit", 'l', 1, "Maximum records to lease, each on its own (at most 100 a read; more reads 100)")
                         .uintFlag("block", 'b', 0, "Block for new data (ms, at most 300000; 0 = don't wait)")
                         .action(wrapHandler(runGroupRead)),
                 )
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("ack")
-                        .about("Acknowledge records by StreamID")
+                        .about("Acknowledge records by the delivery a read gave each")
                         .examples(&.{
-                            "flo stream group ack events --group mygroup --ids 1703350800000-0,1703350800000-1",
+                            "flo stream group ack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .stringFlag("consumer", 'c', "", "Consumer ID (for correct pending key matching)")
-                        .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to acknowledge")
+                        .stringFlag("consumer", 'c', "", "The consumer that read them")
+                        .stringFlag("ids", 'i', "", "Comma-separated deliveries, as a read printed them: term.index.id.deliveries")
                         .action(wrapHandler(runGroupAck)),
                 )
                 .subcommand(
@@ -219,15 +220,6 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 )
                 .subcommand(
                     commander.newBuilder(allocator)
-                        .name("join")
-                        .about("Join a consumer group")
-                        .arg("stream", "Stream name")
-                        .arg("group", "Group name")
-                        .arg("consumer", "Consumer ID")
-                        .action(wrapHandler(runGroupJoin)),
-                )
-                .subcommand(
-                    commander.newBuilder(allocator)
                         .name("pending")
                         .about("Show pending messages in a consumer group")
                         .arg("stream", "Stream name")
@@ -238,40 +230,32 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("nack")
-                        .about("Release messages back for redelivery")
+                        .about("Fail records: ready again after --delay, or dead once their attempts are spent")
                         .examples(&.{
-                            "flo stream group nack events --group mygroup --ids 1703350800000-0,1703350800000-1",
+                            "flo stream group nack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1 --delay 10000 --error \"upstream timed out\"",
+                            "flo stream group nack events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1 --dlq",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .stringFlag("consumer", 'c', "", "Consumer ID (for correct pending key matching)")
-                        .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to release")
+                        .stringFlag("consumer", 'c', "", "The consumer that read them")
+                        .stringFlag("ids", 'i', "", "Comma-separated deliveries, as a read printed them: term.index.id.deliveries")
+                        .uintFlag("delay", 0, 0, "How long before they're ready again (ms, at most a day)")
+                        .boolFlag("dlq", 0, "Dead-letter them now, whatever attempts are left")
+                        .stringFlag("error", 0, "", "Why they failed")
                         .action(wrapHandler(runGroupNack)),
                 )
                 .subcommand(
                     commander.newBuilder(allocator)
                         .name("touch")
-                        .about("Extend ack deadline for pending messages")
+                        .about("Keep records: with half their lease or less left, a full lease from now")
                         .examples(&.{
-                            "flo stream group touch events --group mygroup --consumer worker1 --ids 1703350800000-0",
+                            "flo stream group touch events --group mygroup --consumer worker1 --ids 3.42.1703350800000-0.1",
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .stringFlag("consumer", 'c', "", "Consumer ID that owns the messages (required)")
-                        .stringFlag("ids", 'i', "", "Comma-separated StreamIDs to touch")
+                        .stringFlag("consumer", 'c', "", "The consumer that read them")
+                        .stringFlag("ids", 'i', "", "Comma-separated deliveries, as a read printed them: term.index.id.deliveries")
                         .action(wrapHandler(runGroupTouch)),
-                )
-                .subcommand(
-                    commander.newBuilder(allocator)
-                        .name("leave")
-                        .about("Remove a consumer from a group")
-                        .examples(&.{
-                            "flo stream group leave events --group mygroup --consumer worker1",
-                        })
-                        .arg("stream", "Stream name")
-                        .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .stringFlag("consumer", 'c', "", "Consumer ID to remove")
-                        .action(wrapHandler(runGroupLeave)),
                 )
                 .subcommand(
                     commander.newBuilder(allocator)
@@ -279,8 +263,10 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         .about("Create a consumer group with configuration")
                         .longAbout(
                             \\Create a consumer group. Its consumers compete for records: each
-                            \\record goes to one of them. --ack-timeout and --max-deliver set when
-                            \\an unacked record is redelivered and when it is given up on.
+                            \\record goes to one of them, leased until acked. --ack-timeout is the
+                            \\lease: a record not acked or touched that long is delivered again.
+                            \\--max-deliver is the attempts: a record nacked or expired that many
+                            \\times is dead.
                         )
                         .examples(&.{
                             "flo stream group create events --group processors",
@@ -288,8 +274,8 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                         })
                         .arg("stream", "Stream name")
                         .stringFlag("group", 'g', "", "Consumer group name (required)")
-                        .uintFlag("ack-timeout", 0, 30000, "Ack timeout (ms) before auto-redeliver")
-                        .uintFlag("max-deliver", 0, 10, "Max delivery attempts before DLQ (0=unlimited)")
+                        .uintFlag("ack-timeout", 0, 30000, "The lease (ms, 5000 to 43200000): a record not acked this long is delivered again")
+                        .uintFlag("max-deliver", 0, 5, "The attempts (1 to 255): a record nacked or expired this many times is dead")
                         .action(wrapHandler(runGroupCreate)),
                 )
                 .subcommand(
@@ -297,13 +283,8 @@ pub fn createStreamCommand(allocator: Allocator) !*commander.Command {
                     .name("delete")
                     .about("Delete a consumer group and all its state")
                     .longAbout(
-                        \\Delete a consumer group, removing all associated state:
-                        \\  - Group configuration
-                        \\  - Committed offset
-                        \\  - Active lease (exclusive mode)
-                        \\  - Pending messages
-                        \\  - Consumer slot assignments
-                        \\  - Standby consumer list
+                        \\Delete a consumer group: its settings, cursor, leases and dead
+                        \\records. It is gone at once; its records are cleaned out after.
                         \\
                         \\This is a destructive operation and cannot be undone.
                     )
@@ -931,28 +912,6 @@ fn runTrim(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-fn runGroupJoin(ctx: *commander.Context) commander.Error!void {
-    const stream = ctx.getPositional("stream").?; // validated by commander
-    const group = ctx.getPositional("group").?; // validated by commander
-    const consumer = ctx.getPositional("consumer").?; // validated by commander
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    // groupJoin(client, namespace, stream, group, consumer)
-    var response = client_mod.stream.groupJoin(&client, namespace, stream, group, consumer) catch |err| return outcome.requestFailed(ctx, err);
-    defer response.deinit();
-
-    try outcome.check(ctx, response);
-
-    ctx.print("Joined group '{s}' as consumer '{s}'\n", .{ group, consumer });
-}
-
 fn runGroupRead(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
     const group = ctx.getString("group") orelse "";
@@ -991,23 +950,28 @@ fn runGroupRead(ctx: *commander.Context) commander.Error!void {
 
     try outcome.check(ctx, response);
 
-    // Parse response data - wire format similar to stream read. Empty is no
-    // messages; anything shorter than a count is cut.
-    if (response.data.len == 0) {
-        if (json_output) {
-            ctx.print("[]\n", .{});
-        } else {
-            ctx.print("(no messages)\n", .{});
-        }
-        return;
-    }
-
     // Checked whole first, then printed, so a cut answer prints nothing.
     printGroupRecords(null, response.data, stream, json_output) catch return outcome.malformed(ctx, "group records");
     printGroupRecords(ctx, response.data, stream, json_output) catch return outcome.malformed(ctx, "group records");
 }
 
-/// Prints a group read's records; with no `out`, only checks them.
+/// A record's delivery, as a read prints it and an ack, nack or touch
+/// takes it: `term.index.id.deliveries`, the id as `ms-seq`.
+const Delivery = struct { term: u64, index: u64, id: StreamID, deliveries: u32 };
+
+fn parseDelivery(text: []const u8) ?Delivery {
+    var it = std.mem.splitScalar(u8, text, '.');
+    const term = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const index = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const id = StreamID.parse(it.next() orelse return null) catch return null;
+    const deliveries = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null) return null;
+    return .{ .term = term, .index = index, .id = id, .deliveries = deliveries };
+}
+
+/// Prints a group read's records; with no `out`, only checks them. The
+/// answer is `[term:u64][index:u64][expires_at_ms:i64][count:u32]`, then each
+/// record as a stream read gives it, followed by its `[deliveries:u32]`.
 fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const u8, json_output: bool) error{Truncated}!void {
     const ctx: struct {
         c: ?*commander.Context,
@@ -1016,6 +980,9 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
         }
     } = .{ .c = out };
     var reader = wire.WireReader.init(data);
+    const term = reader.readU64() orelse return error.Truncated;
+    const index = reader.readU64() orelse return error.Truncated;
+    const expires_at_ms = reader.readI64() orelse return error.Truncated;
     const msg_count = reader.readU32() orelse return error.Truncated;
 
     if (msg_count == 0) {
@@ -1027,9 +994,7 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
         return;
     }
 
-    if (json_output) {
-        ctx.print("[", .{});
-    }
+    if (json_output) ctx.print("[", .{});
 
     var i: u32 = 0;
     while (i < msg_count) : (i += 1) {
@@ -1038,15 +1003,9 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
         _ = reader.readU8() orelse return error.Truncated; // tier
         _ = reader.readU32() orelse return error.Truncated; // partition
         const key_present = reader.readU8() orelse return error.Truncated;
-        // The server leaves the name out; it's the stream that was read.
-        var stream_name: ?[]const u8 = stream;
-        if (key_present != 0) {
-            stream_name = reader.readLengthPrefixed(u32) orelse return error.Truncated;
-        }
+        if (key_present != 0) _ = reader.readLengthPrefixed(u32) orelse return error.Truncated;
         const payload = reader.readLengthPrefixed(u32) orelse return error.Truncated;
         const header_count = reader.readU32() orelse return error.Truncated;
-
-        // Read headers
         var hdr_keys: [64][]const u8 = undefined;
         var hdr_vals: [64][]const u8 = undefined;
         const hdr_n = @min(header_count, 64);
@@ -1059,18 +1018,17 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
                 hdr_vals[h] = hv;
             }
         }
+        const deliveries = reader.readU32() orelse return error.Truncated;
 
         const record_id = StreamID{ .timestamp_ms = @intCast(@as(u64, @bitCast(timestamp_ms))), .sequence = msg_sequence };
         var id_buf: [64]u8 = undefined;
         const id_str = record_id.format(&id_buf) catch "0-0";
+        var dbuf: [128]u8 = undefined;
+        const delivery = std.fmt.bufPrint(&dbuf, "{d}.{d}.{s}.{d}", .{ term, index, id_str, deliveries }) catch "";
 
         if (json_output) {
             if (i > 0) ctx.print(",", .{});
-            ctx.print("{{\"id\":{f},\"timestamp_ms\":{d}", .{ output.jsonString(id_str), timestamp_ms });
-            if (stream_name) |sn| {
-                ctx.print(",\"stream\":{f}", .{output.jsonString(sn)});
-            }
-            ctx.print(",\"data\":{f}", .{output.jsonString(payload)});
+            ctx.print("{{\"delivery\":{f},\"id\":{f},\"deliveries\":{d},\"expires_at_ms\":{d},\"stream\":{f},\"data\":{f}", .{ output.jsonString(delivery), output.jsonString(id_str), deliveries, expires_at_ms, output.jsonString(stream), output.jsonString(payload) });
             if (hdr_n > 0) {
                 ctx.print(",\"headers\":{{", .{});
                 var hi: u32 = 0;
@@ -1082,30 +1040,22 @@ fn printGroupRecords(out: ?*commander.Context, data: []const u8, stream: []const
             }
             ctx.print("}}", .{});
         } else {
-            if (stream_name) |sn| {
-                ctx.print("{s} [{s}]: {s}", .{ id_str, sn, payload });
-            } else {
-                ctx.print("{s}: {s}", .{ id_str, payload });
-            }
+            ctx.print("{s} {s}", .{ delivery, payload });
             var hi: u32 = 0;
-            while (hi < hdr_n) : (hi += 1) {
-                ctx.print(" {s}={s}", .{ hdr_keys[hi], hdr_vals[hi] });
-            }
+            while (hi < hdr_n) : (hi += 1) ctx.print(" {s}={s}", .{ hdr_keys[hi], hdr_vals[hi] });
             ctx.print("\n", .{});
         }
     }
-
-    if (json_output) {
-        ctx.print("]\n", .{});
-    }
+    if (json_output) ctx.print("]\n", .{});
 }
 
-fn runGroupAck(ctx: *commander.Context) commander.Error!void {
+/// Report on records by their deliveries: one request per delivery, its
+/// answer said record by record.
+fn runGroupReport(ctx: *commander.Context, kind: client_mod.stream.GroupReport) commander.Error!void {
     const stream = ctx.getPositional("stream").?; // validated by commander
     const group = ctx.getString("group") orelse "";
     const consumer = ctx.getString("consumer") orelse "";
     const ids_str = ctx.getString("ids") orelse "";
-
     if (group.len == 0) {
         ctx.printErr("Error: --group is required\n", .{});
         return error.MissingRequiredArg;
@@ -1114,47 +1064,107 @@ fn runGroupAck(ctx: *commander.Context) commander.Error!void {
         ctx.printErr("Error: --ids is required\n", .{});
         return error.MissingRequiredArg;
     }
-
+    var nack: client_mod.stream.NackOptions = .{};
+    if (kind == .nack) {
+        nack.delay_ms = ctx.getUint("delay") orelse 0;
+        if (nack.delay_ms > 86_400_000) return outcome.usage(ctx, "--delay is at most 86400000 (a day), not {d}", .{nack.delay_ms});
+        nack.dead = ctx.getBool("dlq");
+        nack.error_text = ctx.getString("error") orelse "";
+    }
     const namespace = cli_config.getNamespace(ctx);
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    // Parse comma-separated StreamIDs
-    var ids: std.ArrayList(StreamID) = .empty;
-    defer ids.deinit(ctx.allocator);
-
+    var deliveries: std.ArrayList(Delivery) = .empty;
+    defer deliveries.deinit(ctx.allocator);
     var iter = std.mem.splitScalar(u8, ids_str, ',');
-    while (iter.next()) |id_str| {
-        const trimmed = std.mem.trim(u8, id_str, " ");
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
         if (trimmed.len == 0) continue;
-
-        const stream_id = StreamID.parse(trimmed) catch {
-            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
-        };
-        try ids.append(ctx.allocator, stream_id);
-    }
-
-    if (ids.items.len == 0) {
-        ctx.printErr("Error: No valid StreamIDs provided\n", .{});
-        return error.MissingRequiredArg;
+        const d = parseDelivery(trimmed) orelse
+            return outcome.usage(ctx, "'{s}' isn't a delivery: give term.index.id.deliveries, as a read printed it (e.g. 3.42.1703350800000-0.1)", .{trimmed});
+        try deliveries.append(ctx.allocator, d);
     }
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
-
     client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
 
-    // groupAck(client, namespace, stream, group, consumer, ids)
-    var response = client_mod.stream.groupAck(&client, namespace, stream, group, consumer, ids.items) catch |err| return outcome.requestFailed(ctx, err);
-    defer response.deinit();
-
-    try outcome.check(ctx, response);
-
-    if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"acknowledged\":{d}}}\n", .{ids.items.len});
-    } else {
-        ctx.print("Acknowledged {d} message(s)\n", .{ids.items.len});
+    var applied: u64 = 0;
+    var refused: u64 = 0;
+    // Said once every request is answered, with the exit that says so.
+    var said: std.ArrayList(struct { ms: u64, seq: u64, why: queue_ops.Why }) = .empty;
+    defer said.deinit(ctx.allocator);
+    var done = std.ArrayList(bool).empty;
+    defer done.deinit(ctx.allocator);
+    try done.appendNTimes(ctx.allocator, false, deliveries.items.len);
+    if (json_output) ctx.print("{{\"refused\":[", .{});
+    for (deliveries.items, 0..) |first, i| {
+        if (done.items[i]) continue;
+        var items: std.ArrayList(client_mod.stream.GroupItem) = .empty;
+        defer items.deinit(ctx.allocator);
+        for (deliveries.items[i..], i..) |d, j| if (d.term == first.term and d.index == first.index) {
+            try items.append(ctx.allocator, .{ .id = d.id, .deliveries = d.deliveries });
+            done.items[j] = true;
+        };
+        var response = client_mod.stream.groupReport(&client, namespace, stream, group, consumer, kind, first.term, first.index, items.items, nack) catch |err| return outcome.requestFailed(ctx, err);
+        defer response.deinit();
+        try outcome.check(ctx, response);
+        var r = wire.WireReader.init(response.data);
+        if (kind == .touch) _ = r.readI64() orelse return outcome.malformed(ctx, "touch answer");
+        applied += r.readU32() orelse return outcome.malformed(ctx, "report answer");
+        const n = r.readU32() orelse return outcome.malformed(ctx, "report answer");
+        for (0..n) |_| {
+            const ms = r.readU64() orelse return outcome.malformed(ctx, "report answer");
+            const seq = r.readU64() orelse return outcome.malformed(ctx, "report answer");
+            const why: queue_ops.Why = std.enums.fromInt(queue_ops.Why, r.readU8() orelse return outcome.malformed(ctx, "report answer")) orelse return outcome.malformed(ctx, "report answer");
+            if (json_output) {
+                if (refused > 0) ctx.print(",", .{});
+                ctx.print("{{\"id\":\"{d}-{d}\",\"why\":\"{s}\",\"reason\":{f}}}", .{ ms, seq, @tagName(why), output.jsonString(groupWhy(why)) });
+            } else {
+                try said.append(ctx.allocator, .{ .ms = ms, .seq = seq, .why = why });
+            }
+            refused += 1;
+        }
     }
+    const verb = switch (kind) {
+        .ack => "Acknowledged",
+        .nack => "Failed",
+        .touch => "Kept",
+    };
+    if (json_output) {
+        ctx.print("],\"applied\":{d}}}\n", .{applied});
+    } else {
+        ctx.print("{s} {d} record(s)\n", .{ verb, applied });
+    }
+    if (refused > 0) {
+        for (said.items) |x| ctx.printErr("Error: {d}-{d}: {s}\n", .{ x.ms, x.seq, groupWhy(x.why) });
+        return error.Refused;
+    }
+}
+
+/// What became of a record a report didn't apply to, said for a group.
+fn groupWhy(w: queue_ops.Why) []const u8 {
+    return switch (w) {
+        .gone => "gone: not out to this group: acked already, trimmed, or never read",
+        .delivered_again => "stale: the record was delivered again since",
+        .other_holder => "stale: another consumer holds this delivery",
+        .expired => "stale: the lease ran out and the record moved on",
+        .released => "stale: the record was nacked",
+        .not_held => "stale: the record isn't held",
+    };
+}
+
+fn runGroupAck(ctx: *commander.Context) commander.Error!void {
+    return runGroupReport(ctx, .ack);
+}
+
+fn runGroupNack(ctx: *commander.Context) commander.Error!void {
+    return runGroupReport(ctx, .nack);
+}
+
+fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
+    return runGroupReport(ctx, .touch);
 }
 
 fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
@@ -1180,26 +1190,32 @@ fn runGroupInfo(ctx: *commander.Context) commander.Error!void {
 
     try outcome.check(ctx, response);
 
-    // Wire format (serializeGroupInfo):
-    // [pel_count:u64][member_count:u32][created_at_ns:u64]
+    // [pending:u64][holders:u32][created_at_ns:u64][ready:u64][leased:u64]
+    // [dead:u64][trimmed_pending:u64]
     var reader = wire.WireReader.init(response.data);
-    const pel_count = reader.readU64() orelse return outcome.malformed(ctx, "group info");
-    const member_count = reader.readU32() orelse return outcome.malformed(ctx, "group info");
+    const pending = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const holders = reader.readU32() orelse return outcome.malformed(ctx, "group info");
     const created_at_ns = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const ready = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const leased = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const dead = reader.readU64() orelse return outcome.malformed(ctx, "group info");
+    const trimmed_pending = reader.readU64() orelse return outcome.malformed(ctx, "group info");
 
     if (json_output) {
         // JSON keeps the raw epoch-ns for machine consumers.
         ctx.print(
-            "{{\"stream\":{f},\"group\":{f},\"pending\":{d},\"members\":{d},\"created_at_ns\":{d}}}\n",
-            .{ output.jsonString(stream), output.jsonString(group), pel_count, member_count, created_at_ns },
+            "{{\"stream\":{f},\"group\":{f},\"pending\":{d},\"members\":{d},\"created_at_ns\":{d},\"ready\":{d},\"leased\":{d},\"dead\":{d},\"trimmed_pending\":{d}}}\n",
+            .{ output.jsonString(stream), output.jsonString(group), pending, holders, created_at_ns, ready, leased, dead, trimmed_pending },
         );
     } else {
-        // Human view: render created_at as ISO-8601 UTC (helper takes ms).
         const created_ms: i64 = @intCast(created_at_ns / std.time.ns_per_ms);
         const ts_buf = output.formatTimestamp(created_ms);
         ctx.print("Consumer Group: {s}/{s}\n", .{ stream, group });
-        ctx.print("  Members:    {d}\n", .{member_count});
-        ctx.print("  Pending:    {d} message(s)\n", .{pel_count});
+        ctx.print("  Members:    {d} holding records\n", .{holders});
+        ctx.print("  Ready:      {d}\n", .{ready});
+        ctx.print("  Leased:     {d}\n", .{leased});
+        ctx.print("  Dead:       {d}\n", .{dead});
+        if (trimmed_pending > 0) ctx.print("  Trimmed, not yet cleaned: {d} (counted above)\n", .{trimmed_pending});
         ctx.print("  Created:    {s}\n", .{ts_buf[0..20]});
     }
 }
@@ -1298,139 +1314,6 @@ fn runGroupPending(ctx: *commander.Context) commander.Error!void {
     }
 }
 
-fn runGroupNack(ctx: *commander.Context) commander.Error!void {
-    const stream = ctx.getPositional("stream").?;
-    const group = ctx.getString("group") orelse "";
-    const consumer = ctx.getString("consumer") orelse "";
-    const ids_str = ctx.getString("ids") orelse "";
-
-    if (group.len == 0) {
-        ctx.printErr("Error: --group is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    if (ids_str.len == 0) {
-        ctx.printErr("Error: --ids is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = output.getFormat(ctx) == .json;
-
-    // Parse StreamIDs for the wire protocol
-    var ids: std.ArrayList(StreamID) = .empty;
-    defer ids.deinit(ctx.allocator);
-
-    var it = std.mem.splitScalar(u8, ids_str, ',');
-    while (it.next()) |id_str| {
-        const trimmed = std.mem.trim(u8, id_str, " ");
-        if (trimmed.len == 0) continue;
-
-        const stream_id = StreamID.parse(trimmed) catch {
-            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
-        };
-        try ids.append(ctx.allocator, stream_id);
-    }
-
-    if (ids.items.len == 0) {
-        ctx.printErr("Error: No valid StreamIDs provided\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var response = client_mod.stream.groupNack(
-        &client,
-        namespace,
-        stream,
-        group,
-        consumer,
-        ids.items,
-    ) catch |err| return outcome.requestFailed(ctx, err);
-    defer response.deinit();
-
-    try outcome.check(ctx, response);
-
-    if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"released\":{d}}}\n", .{ids.items.len});
-    } else {
-        ctx.print("Released {d} messages for redelivery\n", .{ids.items.len});
-    }
-}
-
-fn runGroupTouch(ctx: *commander.Context) commander.Error!void {
-    const stream = ctx.getPositional("stream").?;
-    const group = ctx.getString("group") orelse "";
-    const consumer = ctx.getString("consumer") orelse "";
-    const ids_str = ctx.getString("ids") orelse "";
-
-    if (group.len == 0) {
-        ctx.printErr("Error: --group is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    if (consumer.len == 0) {
-        ctx.printErr("Error: --consumer is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    if (ids_str.len == 0) {
-        ctx.printErr("Error: --ids is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = output.getFormat(ctx) == .json;
-
-    // Parse StreamIDs for the wire protocol
-    var ids: std.ArrayList(StreamID) = .empty;
-    defer ids.deinit(ctx.allocator);
-
-    var it = std.mem.splitScalar(u8, ids_str, ',');
-    while (it.next()) |id_str| {
-        const trimmed = std.mem.trim(u8, id_str, " ");
-        if (trimmed.len == 0) continue;
-
-        const stream_id = StreamID.parse(trimmed) catch {
-            return outcome.usage(ctx, "Invalid StreamID format '{s}'. Use '<timestamp>-<sequence>' (e.g., '1703350800000-0')", .{trimmed});
-        };
-        try ids.append(ctx.allocator, stream_id);
-    }
-
-    if (ids.items.len == 0) {
-        ctx.printErr("Error: No valid StreamIDs provided\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    const result = client_mod.stream.groupTouch(
-        &client,
-        namespace,
-        stream,
-        group,
-        consumer,
-        ids.items,
-    ) catch |err| {
-        if (err == error.ServerError) return serverRefused(ctx, &client);
-        return outcome.requestFailed(ctx, err);
-    };
-
-    if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"touched\":{d}}}\n", .{result.touched_count});
-    } else {
-        ctx.print("Extended deadline for {d} message(s)\n", .{result.touched_count});
-    }
-}
-
 fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     const stream = ctx.getPositional("stream").?;
     const group = ctx.getString("group") orelse "";
@@ -1444,8 +1327,12 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     const endpoint = cli_config.getEndpoint(ctx);
     const json_output = output.getFormat(ctx) == .json;
 
-    const ack_timeout = @as(u32, @intCast(ctx.getUint("ack-timeout") orelse 30000));
-    const max_deliver = @as(u8, @intCast(ctx.getUint("max-deliver") orelse 10));
+    const ack_timeout_raw = ctx.getUint("ack-timeout") orelse 30000;
+    if (ack_timeout_raw < 5000 or ack_timeout_raw > 43_200_000) return outcome.usage(ctx, "--ack-timeout is 5000 to 43200000 ms, not {d}", .{ack_timeout_raw});
+    const max_deliver_raw = ctx.getUint("max-deliver") orelse 5;
+    if (max_deliver_raw < 1 or max_deliver_raw > 255) return outcome.usage(ctx, "--max-deliver is 1 to 255, not {d}", .{max_deliver_raw});
+    const ack_timeout: u32 = @intCast(ack_timeout_raw);
+    const max_deliver: u8 = @intCast(max_deliver_raw);
 
     var client = Client.init(ctx.allocator, endpoint);
     defer client.deinit();
@@ -1462,47 +1349,16 @@ fn runGroupCreate(ctx: *commander.Context) commander.Error!void {
     defer response.deinit();
 
     try outcome.check(ctx, response);
+    // [created:u8]: 0 when the group was there with these settings.
+    if (response.data.len != 1) return outcome.malformed(ctx, "group create answer");
+    const created = response.data[0] != 0;
 
     if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"group\":{f},\"stream\":{f}}}\n", .{ output.jsonString(group), output.jsonString(stream) });
-    } else {
+        ctx.print("{{\"status\":\"ok\",\"created\":{},\"group\":{f},\"stream\":{f}}}\n", .{ created, output.jsonString(group), output.jsonString(stream) });
+    } else if (created) {
         ctx.print("Created consumer group '{s}' on stream '{s}'\n", .{ group, stream });
-    }
-}
-
-fn runGroupLeave(ctx: *commander.Context) commander.Error!void {
-    const stream = ctx.getPositional("stream").?;
-    const group = ctx.getString("group") orelse "";
-    const consumer = ctx.getString("consumer") orelse "";
-
-    if (group.len == 0) {
-        ctx.printErr("Error: --group is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    if (consumer.len == 0) {
-        ctx.printErr("Error: --consumer is required\n", .{});
-        return error.MissingRequiredArg;
-    }
-
-    const namespace = cli_config.getNamespace(ctx);
-    const endpoint = cli_config.getEndpoint(ctx);
-    const json_output = output.getFormat(ctx) == .json;
-
-    var client = Client.init(ctx.allocator, endpoint);
-    defer client.deinit();
-
-    client.connect() catch |err| return outcome.connectFailed(ctx, err, client.endpoint);
-
-    var response = client_mod.stream.groupLeave(&client, namespace, stream, group, consumer) catch |err| return outcome.requestFailed(ctx, err);
-    defer response.deinit();
-
-    try outcome.check(ctx, response);
-
-    if (json_output) {
-        ctx.print("{{\"status\":\"ok\",\"consumer\":{f},\"group\":{f}}}\n", .{ output.jsonString(consumer), output.jsonString(group) });
     } else {
-        ctx.print("Consumer '{s}' left group '{s}'\n", .{ consumer, group });
+        ctx.print("Consumer group '{s}' on stream '{s}' exists, with these settings\n", .{ group, stream });
     }
 }
 
@@ -1587,10 +1443,12 @@ test "stream read --follow ends with retryable (exit 4) on an unavailable answer
 }
 
 test "stream group read: records cut short are Truncated before anything prints" {
-    // [count:u32] then [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload][headers:u32]([klen:u32][k][vlen:u32][v])*
+    // [term:u64][index:u64][expires_at_ms:i64][count:u32] then each
+    // [seq:u64][ts:i64][tier:u8][partition:u32][key_present:u8][len:u32][payload]
+    // [headers:u32]([klen:u32][k][vlen:u32][v])*[deliveries:u32]
     const record = [_]u8{1} ++ @as([7]u8, @splat(0)) ++ [_]u8{2} ++ @as([7]u8, @splat(0)) ++ [_]u8{0} ++ @as([4]u8, @splat(0)) ++ [_]u8{0} ++ [_]u8{ 1, 0, 0, 0 } ++ "x".* ++
-        [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 1, 0, 0, 0 } ++ "v".*;
-    const answer = [_]u8{ 2, 0, 0, 0 } ++ record ++ record;
+        [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ "k".* ++ [_]u8{ 1, 0, 0, 0 } ++ "v".* ++ [_]u8{ 1, 0, 0, 0 };
+    const answer = @as([24]u8, @splat(0)) ++ [_]u8{ 2, 0, 0, 0 } ++ record ++ record;
     try printGroupRecords(null, &answer, "s", false);
     for (1..answer.len) |n| try std.testing.expectError(error.Truncated, printGroupRecords(null, answer[0..n], "s", false));
 }
