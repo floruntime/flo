@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const stdx = @import("stdx");
+const limits = @import("../protocol/limits.zig");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
@@ -703,7 +704,7 @@ fn parseOneSink(allocator: Allocator, d: D, item: JsonValue, index: usize, defau
             snk.separator = try dupe(allocator, sep);
         }
         // Every key a sink writes is prefix + separator + the record's key.
-        const max_key = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+        const max_key = limits.MAX_QUALIFIED_KEY;
         if (snk.key_prefix.len > 0 and snk.key_prefix.len + snk.separator.len >= max_key) return d.fail(ParseError.InvalidFormat, "\"key_prefix\" and \"separator\" take {d} bytes, leaving no room for a key of at most {d}", .{ snk.key_prefix.len + snk.separator.len, max_key });
         if (try optPositive(u64, d, obj, "ttl_ms", ParseError.InvalidFormat)) |ttl| {
             // A TTL is applied in nanoseconds; one that can't be is refused here.
@@ -1931,7 +1932,7 @@ test "parser: classify operator with default tag" {
     try std.testing.expect(has_default);
 }
 
-test "parser: a stream or queue name holding a NUL, or too long for its namespace, is refused at submit" {
+test "parser: a stream or queue name holding a NUL, or too long, is refused at submit" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{
         \\{"kind":"Processing","name":"j","sources":[{"stream":{"name":"in\u0000x"}}],"sinks":[{"stream":{"name":"out"}}]}
@@ -1942,11 +1943,20 @@ test "parser: a stream or queue name holding a NUL, or too long for its namespac
         defer def.deinit(allocator);
         try std.testing.expectEqualStrings("stream or queue name must not contain NUL", def.namespaceRefusal().?);
     }
-    const long = stdx.repeat("s", 4096);
-    const too_long = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"" ++ long ++ "\"}}],\"sinks\":[{\"stream\":{\"name\":\"out\"}}]}";
-    var def = try parseJobDefinitionWithNamespace(allocator, too_long, "acme", null);
-    defer def.deinit(allocator);
-    try std.testing.expectEqualStrings("stream or queue name too long for its namespace", def.namespaceRefusal().?);
+    // The limit is the name's own, as for a stream or queue outside a job:
+    // the namespace's name doesn't count against it.
+    const max = limits.MAX_QUALIFIED_KEY;
+    inline for (.{ max, max + 1 }) |len| {
+        const name = stdx.repeat("s", len);
+        const json_def = "{\"kind\":\"Processing\",\"name\":\"j\",\"sources\":[{\"stream\":{\"name\":\"in\"}}],\"sinks\":[{\"queue\":{\"name\":\"" ++ name ++ "\"}}]}";
+        var def = try parseJobDefinitionWithNamespace(allocator, json_def, "acme", null);
+        defer def.deinit(allocator);
+        if (len == max) {
+            try std.testing.expect(def.namespaceRefusal() == null);
+        } else {
+            try std.testing.expectEqualStrings("stream or queue name too long", def.namespaceRefusal().?);
+        }
+    }
 }
 
 /// The diagnostic a job definition is refused with.
@@ -2119,7 +2129,7 @@ test "parser: a KV sink fed by a TS source is refused, prefixed or not" {
 }
 
 test "parser: a KV sink whose prefix and separator leave no room for a key is refused" {
-    const max_key = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+    const max_key = limits.MAX_QUALIFIED_KEY;
     const prefix = comptime @import("stdx").repeat("p", max_key);
     try std.testing.expectError(ParseError.InvalidFormat, parseJobDefinition(std.testing.allocator,
         \\{ "kind": "Processing", "sources": [ { "stream": { "name": "in" } } ],

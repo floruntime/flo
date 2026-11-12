@@ -7,8 +7,8 @@
 //!
 //! ## Namespace key utilities
 //!
-//! `validateKeySize` checks a key early; `qualifyKey` builds the
-//! `"ns\x00key"` form for the subsystems still keyed by name.
+//! `qualifyKey` builds the `"ns\x00key"` form for the subsystems still
+//! keyed by name.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -68,20 +68,10 @@ pub fn nameRefusal(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Maximum length of a namespace-qualified key (namespace + '\x00' + raw key).
-/// Sized as a practical stack-friendly limit: 128 (max namespace) + 1 (separator)
-/// + ~3967 bytes for the raw key portion = 4096 bytes total.
-///
-/// The wire protocol allows u16 keys (65535 bytes) but keys beyond 4KB are
-/// pathological — they bloat Raft log entries, dominate stack frames, and
-/// degrade hash table performance. All subsystems should validate against
-/// `MAX_KEY_LENGTH` at the dispatch layer.
+/// Longest key, or stream or queue name: a namespace's name doesn't count
+/// against it, since those are keyed by the namespace's id. Keys beyond
+/// 4 KiB bloat log entries and stack frames.
 pub const MAX_QUALIFIED_KEY: usize = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
-
-/// Maximum raw key length that a user can create (accounting for namespace
-/// prefix overhead). This is the limit to validate at key creation time so
-/// users get a clear error before data is stored.
-pub const MAX_KEY_LENGTH: usize = MAX_QUALIFIED_KEY - MAX_NAMESPACE_LEN - 1; // 3967
 
 /// Null byte separator between namespace and key in qualified keys: no
 /// namespace name can contain it (see `nameRefusal`).
@@ -112,27 +102,6 @@ pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const 
     buf[ns.len] = NAMESPACE_SEPARATOR;
     @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
     return buf[0..total];
-}
-
-/// Validate a key for namespace ns: non-empty, no NUL, and fits once qualified.
-///
-/// Call this at the dispatch layer (before any business logic) to give users
-/// a clear error message upfront rather than a confusing qualification failure
-/// deep in the handler.
-///
-/// Returns an error message string if invalid, or `null` if the key is valid.
-pub fn validateKeySize(ns: []const u8, key: []const u8) ?[]const u8 {
-    if (key.len == 0) return "key is required";
-    if (std.mem.indexOfScalar(u8, key, NAMESPACE_SEPARATOR) != null) return "key must not contain NUL";
-    const has_ns = ns.len > 0 and !std.mem.eql(u8, ns, "default");
-    if (has_ns) {
-        if (ns.len + 1 + key.len > MAX_QUALIFIED_KEY)
-            return "key too large for namespace (max 3967 bytes with namespace prefix)";
-    } else {
-        if (key.len > MAX_QUALIFIED_KEY)
-            return std.fmt.comptimePrint("key too large (max {d} bytes)", .{MAX_QUALIFIED_KEY});
-    }
-    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1178,26 +1147,6 @@ test "qualifyKey: oversized key returns KeyTooLarge" {
     try testing.expectError(error.KeyTooLarge, result);
 }
 
-test "validateKeySize: valid keys" {
-    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("myapp", "mykey"));
-    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("", "mykey"));
-    try testing.expectEqual(@as(?[]const u8, null), validateKeySize("default", "mykey"));
-}
-
-test "validateKeySize: empty key" {
-    try testing.expect(validateKeySize("myapp", "") != null);
-}
-
-test "validateKeySize: oversized key with namespace" {
-    const big = &@as([MAX_QUALIFIED_KEY]u8, @splat('x'));
-    try testing.expect(validateKeySize("ns", big) != null);
-}
-
-test "validateKeySize: oversized key without namespace" {
-    const big = &@as([(MAX_QUALIFIED_KEY + 1)]u8, @splat('x'));
-    try testing.expect(validateKeySize("", big) != null);
-}
-
 // ── Raft Apply Tests ────────────────────────────────────────────────────────
 
 test "namespace handler: applyCreate adds to local registry" {
@@ -1240,5 +1189,4 @@ test "namespace handler: a key holding a NUL is never qualified" {
     var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
     try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "", "b\x00k"));
     try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "a", "b\x00k"));
-    try testing.expectEqualStrings("key must not contain NUL", validateKeySize("default", "b\x00x").?);
 }
