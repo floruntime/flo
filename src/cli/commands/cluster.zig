@@ -3,9 +3,13 @@
 //! Usage:
 //!   flo cluster status [--endpoint <host:port>]     Show cluster health
 //!   flo cluster members [--endpoint <host:port>]    List cluster members
-//!   flo cluster promote <id>...                     Make caught-up replicas voters
-//!   flo cluster remove <id> [--yes]                 Remove a member
+//!   flo cluster promote <id>... [--data-dir D]      Make caught-up replicas voters
+//!   flo cluster remove <id> [--yes] [--data-dir D]  Remove a member
 //!   flo cluster repair skip --index I [--yes]       Skip the entry the group halted at
+//!
+//! promote, remove and repair administer the node: they go to its admin
+//! socket (--config/--data-dir locate it), which carries them to the leader.
+//! status and members are reads, served on the client --endpoint.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -72,11 +76,16 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\A node joins as a replica: it takes the log but does not vote. The
                     \\leader makes up to three voters on its own; past that, promote a
                     \\replica here. Odd numbers of voters tolerate more failures.
+                    \\
+                    \\Run it on any member: it goes to the node's admin socket, then to
+                    \\the leader.
                 )
                 .variadicArg("ids", "Ids of the replicas to promote")
+                .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
+                .stringFlag("data-dir", 'd', "", "The node's data directory (overrides the config)")
                 .examples(&.{
-                    "flo cluster promote 4",
-                    "flo cluster promote 4 5",
+                    "flo cluster promote 4 --data-dir /var/lib/flo",
+                    "flo cluster promote 4 5 --data-dir /var/lib/flo",
                 })
                 .action(wrapHandler(runPromote)),
         )
@@ -88,12 +97,17 @@ pub fn createClusterCommand(allocator: Allocator) !*commander.Command {
                     \\The node stops taking part and cannot rejoin under its id. Removing
                     \\the leader works: it hands over after the change commits. A
                     \\removal that leaves an even number of voters, or two, needs --yes.
+                    \\
+                    \\Run it on any member: it goes to the node's admin socket, then to
+                    \\the leader.
                 )
                 .arg("id", "Id of the member to remove")
                 .boolFlag("yes", 0, "Remove even when it leaves an even number of voters, or two")
+                .stringFlag("config", 'c', "", "The node's config, naming its data directory or [admin] socket")
+                .stringFlag("data-dir", 'd', "", "The node's data directory (overrides the config)")
                 .examples(&.{
-                    "flo cluster remove 3",
-                    "flo cluster remove 3 --yes",
+                    "flo cluster remove 3 --data-dir /var/lib/flo",
+                    "flo cluster remove 3 --yes --data-dir /var/lib/flo",
                 })
                 .action(wrapHandler(runRemove)),
         )
@@ -311,10 +325,37 @@ fn runRemove(ctx: *commander.Context) commander.Error!void {
     ctx.print("node {d} removed; it cannot rejoin under that id\n", .{id});
 }
 
-/// Send a membership change; it is answered once it commits.
+/// Send a membership change to the node's admin socket; it carries it to the
+/// leader and answers once it commits. A membership change is admin-only —
+/// the client port refuses it — so it goes over the socket, like a repair.
 fn sendChange(ctx: *commander.Context, op: proto.OpCode, value: []const u8) commander.Error!void {
-    var response = try ask(ctx, op, value);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try server_cmd.adminSocketPath(ctx, &path_buf);
+    if (path.len > stdx.net.UNIX_PATH_MAX) {
+        return outcome.localRefusal(ctx, "the admin socket {s} is {d} bytes, past the {d} a Unix socket path may hold, so the node started without one. Set [admin] socket to a shorter path in its config and restart it", .{ path, path.len, stdx.net.UNIX_PATH_MAX });
+    }
+    var response = try sendAdmin(ctx, path, op, value);
     response.deinit();
+}
+
+/// Connect to the node's admin socket at `path` and send one op; its ok
+/// answer, which the caller frees.
+fn sendAdmin(ctx: *commander.Context, path: []const u8, op: proto.OpCode, value: []const u8) commander.Error!client_mod.Response {
+    var client = client_mod.Client.init(ctx.allocator, path);
+    defer client.deinit();
+    client.connectUnix(path) catch |err| return switch (err) {
+        error.ConnectionRefused => outcome.localRefusal(ctx, "no server listens on the admin socket {s}: is a node running on this data directory? One that started without its socket logged why", .{path}),
+        error.PermissionDenied => outcome.localRefusal(ctx, "permission denied on the admin socket {s}: run as the user the server runs as", .{path}),
+        // Another user's socket could answer as the server would.
+        error.NotOurs => outcome.localRefusal(ctx, "{s} isn't a socket you own, so it isn't your server's admin socket: run as the user the server runs as, or check [admin] socket", .{path}),
+        else => outcome.localRefusal(ctx, "cannot connect to the admin socket {s}: {s}", .{ path, @errorName(err) }),
+    };
+    var response = client.sendRequest(op, "", "", value) catch |err| return outcome.requestFailed(ctx, err);
+    outcome.check(ctx, response) catch |err| {
+        response.deinit();
+        return err;
+    };
+    return response;
 }
 
 fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
@@ -350,23 +391,9 @@ fn runRepairSkip(ctx: *commander.Context) commander.Error!void {
 /// Send a repair skip to the node's admin socket at `path`; its ok answer,
 /// which the caller frees.
 fn askAdmin(ctx: *commander.Context, path: []const u8, body: wire.RepairSkip) commander.Error!client_mod.Response {
-    var client = client_mod.Client.init(ctx.allocator, path);
-    defer client.deinit();
-    client.connectUnix(path) catch |err| return switch (err) {
-        error.ConnectionRefused => outcome.localRefusal(ctx, "no server listens on the admin socket {s}: is a node running on this data directory? One that started without its socket logged why", .{path}),
-        error.PermissionDenied => outcome.localRefusal(ctx, "permission denied on the admin socket {s}: run as the user the server runs as", .{path}),
-        // Another user's socket could answer as the server would.
-        error.NotOurs => outcome.localRefusal(ctx, "{s} isn't a socket you own, so it isn't your server's admin socket: run as the user the server runs as, or check [admin] socket", .{path}),
-        else => outcome.localRefusal(ctx, "cannot connect to the admin socket {s}: {s}", .{ path, @errorName(err) }),
-    };
     var buf: [wire.RepairSkip.MAX_SIZE]u8 = undefined;
     const value = body.encode(&buf) catch unreachable; // the reason's length is checked
-    var response = client.sendRequest(.cluster_repair_skip, "", "", value) catch |err| return outcome.requestFailed(ctx, err);
-    outcome.check(ctx, response) catch |err| {
-        response.deinit();
-        return err;
-    };
-    return response;
+    return sendAdmin(ctx, path, .cluster_repair_skip, value);
 }
 
 // ==================== Testing ====================

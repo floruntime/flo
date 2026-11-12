@@ -76,9 +76,15 @@ pub fn internalFromClient(op: u16, origin: Origin) bool {
 
 pub const ADMIN_ONLY_MESSAGE = "unauthorized: this op is served only on the node's admin socket (admin.sock in its data directory, unless [admin] socket places it elsewhere); run the command on the node itself";
 
-/// Ops that administer the node rather than its data.
+/// Ops that administer the node rather than its data. The membership
+/// changes join the repair here: they alter the voter set, so like a repair
+/// they run from the admin socket (or carried from a peer), never from an
+/// anonymous client.
 fn adminOnly(op: u16) bool {
-    return op == @backingInt(proto.OpCode.cluster_repair_skip) or table.isAdmin(op);
+    return op == @backingInt(proto.OpCode.cluster_repair_skip) or
+        op == @backingInt(proto.OpCode.cluster_promote) or
+        op == @backingInt(proto.OpCode.cluster_remove) or
+        table.isAdmin(op);
 }
 
 /// What makes an Authorized without `authorize`, or reaches a handler
@@ -244,4 +250,43 @@ test "run: an admin op runs only from the admin socket or as a request already a
         try std.testing.expectEqual(proto.Reason.admin_only, r.refusal.reason);
     }
     inline for (@typeInfo(Origin).@"enum".field_names) |name| try std.testing.expect(authorize(.anonymous, @field(Origin, name), data_req) == .ok);
+}
+
+test "run: across the whole cluster page, only the reads are open to a client" {
+    // The cluster ops (0x030–0x04F) are legacy opcodes outside the op table,
+    // so `table.isAdmin` can't class them: each must be named in `adminOnly`
+    // or it falls open to an anonymous client. Walk the page so a new write
+    // op added here without the gate fails this test. Only `cluster_status`
+    // and `cluster_members` — reads — may answer a client.
+    const open = [_]u16{ @backingInt(proto.OpCode.cluster_status), @backingInt(proto.OpCode.cluster_members) };
+    var op: u16 = 0x030;
+    while (op <= 0x04F) : (op += 1) {
+        var h = proto.RequestHeader.init(.cluster_status, 1);
+        h.op_code = op;
+        const req: proto.Request = .{ .header = h, .namespace = "", .key = "", .value = "" };
+        var is_open = false;
+        for (open) |o| {
+            if (op == o) is_open = true;
+        }
+        if (is_open) {
+            try std.testing.expect(authorize(.anonymous, .client, req) == .ok);
+            continue;
+        }
+        if (adminOnly(op)) {
+            // A membership change or the repair: refused from a client,
+            // carried from the admin socket or a peer.
+            const r = authorize(.anonymous, .client, req).refused;
+            try std.testing.expectEqual(proto.Reason.admin_only, r.refusal.reason);
+            inline for (.{ Origin.admin, Origin.peer, Origin.held }) |o|
+                try std.testing.expect(authorize(.anonymous, o, req) == .ok);
+        } else {
+            // An unused code in the page: the gate passes it, and dispatch
+            // answers it as unknown. Reads are the only open defined ops.
+            try std.testing.expect(authorize(.anonymous, .client, req) == .ok);
+        }
+    }
+    // Named so the gate can't be narrowed without noticing.
+    try std.testing.expect(adminOnly(@backingInt(proto.OpCode.cluster_promote)));
+    try std.testing.expect(adminOnly(@backingInt(proto.OpCode.cluster_remove)));
+    try std.testing.expect(adminOnly(@backingInt(proto.OpCode.cluster_repair_skip)));
 }

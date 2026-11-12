@@ -2137,10 +2137,10 @@ pub const Shard = struct {
                 return;
             }
             // A replica serves reads and sends writers to the leader
-            // rather than carrying their writes. A repair came over the
-            // admin socket, which the leader's client port would refuse,
-            // so it is carried like a voter's.
-            if (!self.raft_node.timer_enabled and self.raft_node.self_named and !repair_op) return self.redirectToLeader(conn, req);
+            // rather than carrying their writes. A repair or a membership
+            // change came over the admin socket, which the leader's client
+            // port would refuse, so it is carried like a voter's.
+            if (!self.raft_node.timer_enabled and self.raft_node.self_named and !repair_op and !membership_op) return self.redirectToLeader(conn, req);
             if (conn.replyTo() == .remote) {
                 // Already forwarded once; a second hop during an election
                 // could bounce between nodes. The client retries instead.
@@ -15532,7 +15532,7 @@ test "Shard: a leader still applying earlier terms still takes KV's writes, its 
     var remove: [5]u8 = undefined;
     std.mem.writeInt(u32, remove[0..4], 2, .little);
     remove[4] = 1;
-    c.t.shard.runRequest(c.other, try ParkTest.request(.cluster_remove, 5, "", "", &remove, ""), .client);
+    c.t.shard.runRequest(c.other, try ParkTest.request(.cluster_remove, 5, "", "", &remove, ""), .admin);
     try std.testing.expectEqual(last + 1, raft.log.lastIndex());
 }
 
@@ -18509,25 +18509,32 @@ const AdminTest = struct {
         _ = std.c.close(self.pipe_fds[1]);
     }
 
-    /// Send `op` with `value`; return the one answer's status and text.
+    /// Send `op` with `value` from a client; return the one answer.
     fn ask(self: *AdminTest, op: proto.OpCode, value: []const u8, buf: []u8) !proto.Response {
-        self.shard.runRequest(self.conn, try ParkTest.request(op, 7, "", "", value, ""), .client);
+        return self.askFrom(.client, op, value, buf);
+    }
+
+    /// Send `op` with `value` from `origin`; return the one answer.
+    fn askFrom(self: *AdminTest, origin: run_mod.Origin, op: proto.OpCode, value: []const u8, buf: []u8) !proto.Response {
+        self.shard.runRequest(self.conn, try ParkTest.request(op, 7, "", "", value, ""), origin);
         var into: [1]proto.Response = undefined;
         try ParkTest.responses(&self.shard, self.conn, self.pair[1], buf, &into);
         return into[0];
     }
 
+    // Membership changes are admin-only: a client is refused, so they come
+    // over the admin socket (`.admin`).
     fn promote(self: *AdminTest, id: u32, buf: []u8) !proto.Response {
         var v: [4]u8 = undefined;
         std.mem.writeInt(u32, &v, id, .little);
-        return self.ask(.cluster_promote, &v, buf);
+        return self.askFrom(.admin, .cluster_promote, &v, buf);
     }
 
     fn remove(self: *AdminTest, id: u32, yes: bool, buf: []u8) !proto.Response {
         var v: [5]u8 = undefined;
         std.mem.writeInt(u32, v[0..4], id, .little);
         v[4] = @intFromBool(yes);
-        return self.ask(.cluster_remove, &v, buf);
+        return self.askFrom(.admin, .cluster_remove, &v, buf);
     }
 
     /// A repair skip of `index` from `origin`.
@@ -18579,7 +18586,7 @@ test "Shard: promote and remove refuse by name; promoting a voter is done alread
 
     // Caught up now: promoted, answered once it commits.
     t.caughtUp(2);
-    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .client);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .admin);
     try ParkTest.ack(&t.shard);
     var into: [1]proto.Response = undefined;
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &into);
@@ -18688,6 +18695,35 @@ test "Shard: a replica sends writers to the leader by name, and a quiet replica 
     // No leader for longer than an election: it may have been aged out
     // without being told, so it asks again.
     try std.testing.expect(t.shard.joinWanted(now + raft.config.election_timeout_max_ms + 1));
+}
+
+test "Shard: a client's membership change to a follower is refused admin-only, never carried to the leader" {
+    var t: AdminTest = undefined;
+    try t.init(3, .join);
+    defer t.deinit();
+    const raft = t.shard.raft_node;
+    const cfg = membership.Config.ofVoters(&.{ 1, 2 }).withJoiner(3, true);
+    raft.setMembership(&cfg, 1);
+    raft.lost_log = .none;
+    raft.leader_id = 1;
+    var buf: [512]u8 = undefined;
+    // A client's write to a follower is sent on to the leader (the replica rule).
+    try expectAnswer(try t.ask(.kv_put, "v", &buf), .unavailable, "this node is a replica; send writes to the leader, node 1");
+    // But a membership change is admin-only, and runRequest authorizes
+    // (src/node/run.zig authorize) before it ever routes — so a client's
+    // promote or remove is refused here, on a follower as on a leader,
+    // and is never carried to the leader. The redirect/carry exemption
+    // deeper in dispatchLocal is unreachable for a .client origin.
+    var pv: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pv, 2, .little);
+    try expectAnswer(try t.askFrom(.client, .cluster_promote, &pv, &buf), .unauthorized, "served only on the node's admin socket");
+    var rv: [5]u8 = undefined;
+    std.mem.writeInt(u32, rv[0..4], 2, .little);
+    rv[4] = 1;
+    try expectAnswer(try t.askFrom(.client, .cluster_remove, &rv, &buf), .unauthorized, "served only on the node's admin socket");
+    // The config is untouched: nothing was proposed or forwarded.
+    try std.testing.expect(raft.latest_config.isVoter(2));
+    try std.testing.expect(raft.latest_config.names(3));
 }
 
 test "Shard: a list page whose scan couldn't hold its names is refused, not cut short" {
@@ -19242,7 +19278,7 @@ test "a halted group still changes its members: a remove is taken and answered o
     std.mem.writeInt(u32, body[0..4], 2, .little);
     body[4] = 1;
     // Leaving a lone voter, it commits as it is proposed.
-    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 1, "", "", &body, ""), .client);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 1, "", "", &body, ""), .admin);
     _ = t.shard.applyCommitted();
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
@@ -19264,7 +19300,7 @@ test "a halted leader of three removes a voter once a peer acks it, and answers 
     var body: [5]u8 = undefined;
     std.mem.writeInt(u32, body[0..4], 3, .little);
     body[4] = 1;
-    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 8, "", "", &body, ""), .client);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_remove, 8, "", "", &body, ""), .admin);
     // Two voters left: it waits for node 2.
     try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
     const last = raft.log.lastIndex();
@@ -19288,7 +19324,7 @@ test "a halted group promotes a caught-up learner and answers ok" {
     try std.testing.expect(t.shard.applyCommitted());
     t.caughtUp(2);
     haltForTest(&t.shard, raft.last_applied + 1);
-    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .client);
+    t.shard.runRequest(t.conn, try ParkTest.request(.cluster_promote, 8, "", "", &[_]u8{ 2, 0, 0, 0 }, ""), .admin);
     const last = raft.log.lastIndex();
     raft.peers[raft.peerIndex(2).?].sent_up_to = last;
     raft.handleAppendResponse(.{ .term = raft.current_term, .success = true, .match_index = last, .from = 2 });

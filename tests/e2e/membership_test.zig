@@ -107,9 +107,10 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     var id_buf: [16]u8 = undefined;
     const fourth_s = try std.fmt.bufPrint(&id_buf, "{d}", .{fourth});
 
-    // Promoted from any node: a follower carries it to the leader.
+    // Promoted from any node: a membership change goes to that node's admin
+    // socket, which carries it to the leader.
     const via: usize = if (replica == 1) 2 else 1;
-    try cluster.execOn(via, &.{ "cluster", "promote", fourth_s });
+    try cluster.execAdminOn(via, &.{ "cluster", "promote", fourth_s });
     var view = try members(&cluster, 0);
     try testing.expectEqual(@as(usize, 4), countRole(view.value, "voter"));
     view.deinit();
@@ -121,7 +122,7 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     const victim_id = try idOf(&cluster, victim);
     var victim_buf: [16]u8 = undefined;
     const victim_s = try std.fmt.bufPrint(&victim_buf, "{d}", .{victim_id});
-    try cluster.execOn(leader, &.{ "cluster", "remove", victim_s });
+    try cluster.execAdminOn(leader, &.{ "cluster", "remove", victim_s });
     view = try members(&cluster, leader);
     try testing.expectEqual(@as(usize, 3), countRole(view.value, "voter"));
     try testing.expectEqual(@as(usize, 1), view.value.removed.len);
@@ -133,7 +134,7 @@ test "e2e/membership: a fourth node stays a replica until promoted; removal is r
     const other_id = try idOf(&cluster, other);
     var other_buf: [16]u8 = undefined;
     const other_s = try std.fmt.bufPrint(&other_buf, "{d}", .{other_id});
-    var refused = try cluster.clis[leader].?.run(&.{ "cluster", "remove", other_s });
+    var refused = try cluster.clis[leader].?.run(&.{ "cluster", "remove", other_s, "--config", cluster.configFileOf(leader).? });
     defer refused.deinit();
     try stdx.testing.assertFailed(refused);
     try testing.expect(refused.contains("leaves 2 voters, which tolerate no failure; add --yes to remove it anyway"));
@@ -163,7 +164,7 @@ test "e2e/membership: the leader removes itself: one election, and no acknowledg
 
     var keys: [20][16]u8 = undefined;
     for (0..10) |i| try cluster.execOn(leader, &.{ "kv", "set", try std.fmt.bufPrint(&keys[i], "before-{d}", .{i}), "v" });
-    try cluster.execOn(leader, &.{ "cluster", "remove", leader_s, "--yes" });
+    try cluster.execAdminOn(leader, &.{ "cluster", "remove", leader_s, "--yes" });
     var a: usize = 0;
     while (a == leader) a += 1;
     var b: usize = a + 1;
