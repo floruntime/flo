@@ -99,9 +99,9 @@ const Small = struct {
             const k = std.fmt.bufPrint(&kbuf, "s-{d:0>6}", .{i % KEYS}) catch unreachable;
             i += 1;
             var r = (if (self.is_get)
-                client.kv.get(&conn, "", k, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null })
+                client.kv.get(&conn, "", k, .{ .wait_ms = 0, .wait_for = .exists, .txn = null })
             else
-                client.kv.set(&conn, "", k, .{ .value = VALUE, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null })) catch {
+                client.kv.set(&conn, "", k, .{ .value = VALUE, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null })) catch {
                 self.errors += 1;
                 return;
             };
@@ -149,7 +149,7 @@ const Txns = struct {
         var n: usize = 0;
         while (due < self.stop_at) : (due += interval) {
             sleepUntil(due);
-            var b = try client.kv.call(&conn, "kv.txn.begin", "", "r", .{});
+            var b = try client.kv.call(&conn, "kv.txn.begin", "", "{r}", .{});
             if (b.status != .ok) {
                 b.deinit();
                 self.errors += 1;
@@ -159,8 +159,8 @@ const Txns = struct {
             const txn = (try kv_ops.op("kv.txn.begin").response.decodeAll(b.data, &diag)).txn;
             b.deinit();
             for (0..self.ops) |i| {
-                const k = std.fmt.bufPrint(&kbuf, "t-{d:0>6}", .{(n * self.ops + i) % KEYS}) catch unreachable;
-                var r = try client.kv.set(&conn, "", k, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "r", .txn = txn });
+                const k = std.fmt.bufPrint(&kbuf, "{{r}}t-{d:0>6}", .{(n * self.ops + i) % KEYS}) catch unreachable;
+                var r = try client.kv.set(&conn, "", k, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = txn });
                 if (r.status != .ok) self.errors += 1;
                 r.deinit();
             }
@@ -202,7 +202,7 @@ pub fn main() !void {
         var kbuf: [32]u8 = undefined;
         for (0..KEYS) |i| {
             const k = try std.fmt.bufPrint(&kbuf, "s-{d:0>6}", .{i});
-            var r = try client.kv.set(&conn, "", k, .{ .value = VALUE, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+            var r = try client.kv.set(&conn, "", k, .{ .value = VALUE, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
             if (r.status != .ok) return error.PrefillRefused;
             r.deinit();
         }

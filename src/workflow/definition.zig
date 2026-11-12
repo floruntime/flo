@@ -579,36 +579,6 @@ pub const ScheduleDef = struct {
 // Stream Trigger Definition (event-driven workflow activation)
 // =============================================================================
 
-/// Consumer group mode for stream triggers.
-/// Mirrors stream/log.zig GroupMode but is self-contained so definition.zig
-/// has no dependency on the stream module.
-pub const TriggerMode = enum(u8) {
-    /// Multiple consumers compete for messages (scale-out, no ordering)
-    shared = 0,
-    /// Single consumer with lease (strict ordering, failover)
-    exclusive = 1,
-    /// Messages with same partition key go to same consumer
-    key_shared = 2,
-
-    pub fn toString(self: TriggerMode) []const u8 {
-        return switch (self) {
-            .shared => "shared",
-            .exclusive => "exclusive",
-            .key_shared => "key_shared",
-        };
-    }
-
-    pub fn fromString(s: []const u8) ?TriggerMode {
-        const map = std.StaticStringMap(TriggerMode).initComptime(.{
-            .{ "shared", .shared },
-            .{ "exclusive", .exclusive },
-            .{ "key_shared", .key_shared },
-            .{ "key-shared", .key_shared },
-        });
-        return map.get(s);
-    }
-};
-
 /// Stream trigger definition — starts a workflow run on each stream event.
 /// Embedded in workflow YAML under the `trigger:` key.
 ///
@@ -617,22 +587,17 @@ pub const TriggerMode = enum(u8) {
 /// trigger:
 ///   stream: "orders"              # source stream name (required)
 ///   namespace: "prod"             # source namespace (optional, defaults to workflow ns)
-///   consumer_group: "wf-orders"   # consumer group name (optional, auto-generated)
-///   mode: shared                  # shared | exclusive | key_shared
 ///   batch_size: 1                 # events per workflow run (1 = one event, N = array)
 /// ```
 ///
-/// The event payload (or array of payloads when batch_size > 1) becomes `$.input`
+/// The trigger reads its stream with its own cursor, each event once, in
+/// order. The event payload (or array of payloads when batch_size > 1) becomes `$.input`
 /// inside the workflow and is accessible via JSONPath resolution.
 pub const StreamTriggerDef = struct {
     /// Source stream name (required)
     stream: []const u8,
     /// Source namespace (null = inherit workflow's namespace)
     namespace: ?[]const u8 = null,
-    /// Consumer group name (null = auto-generate "wf-{workflow_name}")
-    consumer_group: ?[]const u8 = null,
-    /// Consumer group mode
-    mode: TriggerMode = .shared,
     /// Number of events per workflow run (1 = single event, >1 = array of events)
     batch_size: u32 = 1,
     /// Timeout in milliseconds to flush a partial batch (default 5s)
@@ -641,20 +606,15 @@ pub const StreamTriggerDef = struct {
     pub fn deinit(self: *StreamTriggerDef, allocator: Allocator) void {
         allocator.free(self.stream);
         if (self.namespace) |ns| allocator.free(ns);
-        if (self.consumer_group) |cg| allocator.free(cg);
     }
 
     pub fn clone(self: StreamTriggerDef, allocator: Allocator) !StreamTriggerDef {
         const stream_copy = try allocator.dupe(u8, self.stream);
         errdefer allocator.free(stream_copy);
         const ns_copy = if (self.namespace) |ns| try allocator.dupe(u8, ns) else null;
-        errdefer if (ns_copy) |ns| allocator.free(ns);
-        const cg_copy = if (self.consumer_group) |cg| try allocator.dupe(u8, cg) else null;
         return .{
             .stream = stream_copy,
             .namespace = ns_copy,
-            .consumer_group = cg_copy,
-            .mode = self.mode,
             .batch_size = self.batch_size,
             .batch_timeout_ms = self.batch_timeout_ms,
         };
@@ -663,19 +623,6 @@ pub const StreamTriggerDef = struct {
     /// Check if this trigger definition is valid
     pub fn isValid(self: StreamTriggerDef) bool {
         return self.stream.len > 0 and self.batch_size > 0;
-    }
-
-    /// Get the effective consumer group name (auto-generate if not set)
-    pub fn effectiveConsumerGroup(self: StreamTriggerDef, allocator: Allocator, workflow_name: []const u8) ![]u8 {
-        if (self.consumer_group) |cg| {
-            return try allocator.dupe(u8, cg);
-        }
-        // Auto-generate: "wf-{workflow_name}"
-        const prefix = "wf-";
-        const result = try allocator.alloc(u8, prefix.len + workflow_name.len);
-        @memcpy(result[0..prefix.len], prefix);
-        @memcpy(result[prefix.len..], workflow_name);
-        return result;
     }
 };
 

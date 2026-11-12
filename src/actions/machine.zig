@@ -9,6 +9,9 @@
 //! - `action.deadline`: each lease's deadline, keyed (expiry, ns, run) in
 //!   no namespace, so the expire duty reads the earliest without a scan.
 //!
+//! The namespace is its id, leading each key (inside the deadline key), so
+//! one action or run id in two namespaces is two keys.
+//!
 //! The ready, deadline and request families and the lease rules are the
 //! delivery model's (`contract/delivery.zig`).
 //!
@@ -54,6 +57,7 @@ const Optional = schema.Optional;
 const Record = schema.Record;
 
 const Stored = delivery.Stored;
+const NamespaceId = @import("../namespace/table.zig").Id;
 
 pub const Def = Record(&.{
     .{ .name = "owner", .T = Bytes(ae.MAX_OWNER) },
@@ -104,7 +108,8 @@ pub const Empty = delivery.Empty;
 pub const Deadline = delivery.Deadline;
 pub const Request = delivery.Request;
 
-/// A run's leases: the delivery model, in actions' own families.
+/// A run's leases: the delivery model, in actions' own families, keyed by
+/// namespace id.
 const M = delivery.Model(.{
     .ready_id = 22,
     .ready_name = "action.ready",
@@ -115,7 +120,6 @@ const M = delivery.Model(.{
     .scope = "action",
     .max_scope = ae.MAX_ACTION_NAME,
     .max_id = ae.MAX_RUN_ID,
-    .max_namespace = limits.MAX_NAMESPACE_NAME,
     .noun = "run",
 });
 
@@ -153,53 +157,59 @@ fn keys(e: *const Entry, out: *KeySet) error{OutOfMemory}!void {
     switch (typeOf(e)) {
         .action_register => {
             const p = ae.Register.decodeAll(e.payload, &diag) catch return;
-            try out.add(Defs.ID, p.ns, p.name);
+            try out.addIn(Defs.ID, .of(p.ns), p.name);
         },
         .action_delete => {
             const p = ae.Delete.decodeAll(e.payload, &diag) catch return;
-            try out.add(Defs.ID, p.ns, p.name);
+            try out.addIn(Defs.ID, .of(p.ns), p.name);
         },
         .action_invoke => {
             const p = ae.Invoke.decodeAll(e.payload, &diag) catch return;
-            try out.add(Defs.ID, p.ns, p.action);
-            try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, stamp, p.run));
+            const ns: NamespaceId = .of(p.ns);
+            try out.addIn(Defs.ID, ns, p.action);
+            try out.addIn(Runs.ID, ns, p.run);
+            try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, stamp, p.run));
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return;
-            try out.add(Defs.ID, p.ns, p.action);
-            try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, p.due_ns, p.run));
-            try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), p.ns, p.run));
-            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
+            const ns: NamespaceId = .of(p.ns);
+            try out.addIn(Defs.ID, ns, p.action);
+            try out.addIn(Runs.ID, ns, p.run);
+            try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, p.due_ns, p.run));
+            try out.add(Deadlines.ID, "", deadlineKey(&b, after(stamp, p.lease_ms), ns, p.run));
+            if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return;
-            try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
-            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
+            const ns: NamespaceId = .of(p.ns);
+            try out.addIn(Runs.ID, ns, p.run);
+            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
+            if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return;
-            try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Ready.ID, p.ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
-            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
-            if (p.request_key) |k| try out.add(Requests.ID, p.ns, requestKey(&rb, p.holder, k));
+            const ns: NamespaceId = .of(p.ns);
+            try out.addIn(Runs.ID, ns, p.run);
+            try out.addIn(Ready.ID, ns, readyKey(&b, p.action, {}, after(stamp, p.delay_ms), p.run));
+            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
+            if (p.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, p.holder, k));
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return;
-            try out.add(Runs.ID, p.ns, p.run);
-            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, p.ns, p.run));
-            try out.add(Deadlines.ID, "", deadlineKey(&b, extendedTo(stamp, p.lease_ms, p.held_since_ns), p.ns, p.run));
+            const ns: NamespaceId = .of(p.ns);
+            try out.addIn(Runs.ID, ns, p.run);
+            try out.add(Deadlines.ID, "", deadlineKey(&b, p.expiry_ns, ns, p.run));
+            try out.add(Deadlines.ID, "", deadlineKey(&b, extendedTo(stamp, p.lease_ms, p.held_since_ns), ns, p.run));
         },
         .action_expire => {
             const p = ae.Expire.decodeAll(e.payload, &diag) catch return;
             var it = p.items.iterator();
             while (it.next() catch return) |item| {
-                try out.add(Runs.ID, item.ns, item.run);
-                try out.add(Deadlines.ID, "", deadlineKey(&b, item.expiry_ns, item.ns, item.run));
-                try out.add(Ready.ID, item.ns, readyKey(&b, item.action, {}, stamp, item.run));
-                if (item.request_key) |k| try out.add(Requests.ID, item.ns, requestKey(&rb, item.holder, k));
+                const ns: NamespaceId = .of(item.ns);
+                try out.addIn(Runs.ID, ns, item.run);
+                try out.add(Deadlines.ID, "", deadlineKey(&b, item.expiry_ns, ns, item.run));
+                try out.addIn(Ready.ID, ns, readyKey(&b, item.action, {}, stamp, item.run));
+                if (item.request_key) |k| try out.addIn(Requests.ID, ns, requestKey(&rb, item.holder, k));
             }
         },
         else => {},
@@ -226,9 +236,8 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
     switch (typeOf(e)) {
         .action_register => {
             const p = ae.Register.decodeAll(e.payload, &diag) catch return error.Halt;
-            if (p.ns.len == 0) return error.Halt;
             if (std.mem.indexOfScalar(u8, p.name, 0) != null) return out.refuse(.bad_request, .malformed, NAME_HAS_NUL);
-            const k = try nsKey(view, p.ns, p.name);
+            const k = try idKey(view, .of(p.ns), p.name);
             const old = try view.get(Defs, k);
             const version: u32 = if (old) |d| d.v.version +| 1 else 1;
             try view.put(Defs, k, .{ .v = .{ .owner = p.owner, .version = version, .lease_ms = p.lease_ms, .max_attempts = p.max_attempts, .created_ns = if (old) |d| d.v.created_ns else stamp } });
@@ -237,14 +246,14 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .action_delete => {
             const p = ae.Delete.decodeAll(e.payload, &diag) catch return error.Halt;
-            const k = try nsKey(view, p.ns, p.name);
+            const k = try idKey(view, .of(p.ns), p.name);
             if (try view.get(Defs, k) == null) return out.refuse(.not_found, .not_found, NO_ACTION);
             try view.delete(Defs, k);
         },
         .action_invoke => {
             const p = ae.Invoke.decodeAll(e.payload, &diag) catch return error.Halt;
-            const def = (try view.get(Defs, try nsKey(view, p.ns, p.action))) orelse return out.refuse(.not_found, .not_found, NO_ACTION);
-            const rk = try nsKey(view, p.ns, p.run);
+            const def = (try view.get(Defs, try idKey(view, .of(p.ns), p.action))) orelse return out.refuse(.not_found, .not_found, NO_ACTION);
+            const rk = try idKey(view, .of(p.ns), p.run);
             if (try view.get(Runs, rk) != null) return out.refuse(.conflict, .unclassified, RUN_EXISTS);
             try view.put(Runs, rk, .{ .v = .{
                 .action = p.action,
@@ -274,25 +283,25 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 .@"error" = "",
             } });
             var b: KeyBuf = undefined;
-            try view.put(Ready, try nsKey(view, p.ns, readyKey(&b, p.action, {}, stamp, p.run)), .{});
+            try view.put(Ready, try idKey(view, .of(p.ns), readyKey(&b, p.action, {}, stamp, p.run)), .{});
             out.putBytes(p.run);
         },
         .action_deliver => {
             const p = ae.Deliver.decodeAll(e.payload, &diag) catch return error.Halt;
-            if (try view.get(Defs, try nsKey(view, p.ns, p.action)) == null) return out.refuse(.not_found, .not_found, NO_ACTION);
-            const rk = try nsKey(view, p.ns, p.run);
+            if (try view.get(Defs, try idKey(view, .of(p.ns), p.action)) == null) return out.refuse(.not_found, .not_found, NO_ACTION);
+            const rk = try idKey(view, .of(p.ns), p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
             // The ready key the leader chose by must still be the run's,
             // and due by the log's clock.
             if (run.v.status != .ready or run.v.due_ns != p.due_ns or p.due_ns > stamp)
                 return out.refuse(.conflict, .unclassified, NOT_READY);
-            try M.deliver(view, p.ns, p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
+            try M.deliver(view, .of(p.ns), p.run, &run.v, p.holder, p.request_key, .{ .term = e.header.term, .index = e.header.index }, p.lease_ms, stamp);
             try view.put(Runs, rk, run);
             out.putInt(u32, run.v.deliveries);
         },
         .action_settle => {
             const p = ae.Settle.decodeAll(e.payload, &diag) catch return error.Halt;
-            const rk = try nsKey(view, p.ns, p.run);
+            const rk = try idKey(view, .of(p.ns), p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
             if (!holds(run.v, p.holder, p.deliveries, p.token)) {
                 // A resend of the settle that applied answers as it did; a
@@ -303,7 +312,7 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
                 }
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
-            try M.endLease(view, p.ns, p.run, run.v, p.holder, p.request_key, p.expiry_ns);
+            try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             run.v.status = .completed;
             run.v.ended = .settled;
             run.v.outcome = p.outcome;
@@ -314,37 +323,37 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
         },
         .action_release => {
             const p = ae.Release.decodeAll(e.payload, &diag) catch return error.Halt;
-            const rk = try nsKey(view, p.ns, p.run);
+            const rk = try idKey(view, .of(p.ns), p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
             if (!holds(run.v, p.holder, p.deliveries, p.token)) {
                 const ended: Ended = if (p.abandoned) .abandoned else .released;
                 if (sameDelivery(run.v, p.holder, p.deliveries, p.token) and run.v.ended == ended) return;
                 return stale(out, run.v, p.holder, p.deliveries, p.token);
             }
-            try M.endLease(view, p.ns, p.run, run.v, p.holder, p.request_key, p.expiry_ns);
+            try M.endLease(view, .of(p.ns), p.run, run.v, p.holder, p.request_key, p.expiry_ns);
             run.v.@"error" = p.@"error";
             if (p.abandoned) {
                 run.v.ended = .abandoned;
-                try M.readyAgain(view, p.ns, p.run, &run.v, after(stamp, p.delay_ms));
+                try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             } else {
                 run.v.ended = .released;
                 run.v.failures +|= 1;
                 if (!p.retry or run.v.failures >= run.v.max_attempts) {
                     run.v.status = .failed;
                     run.v.completed_ns = stamp;
-                } else try M.readyAgain(view, p.ns, p.run, &run.v, after(stamp, p.delay_ms));
+                } else try M.readyAgain(view, .of(p.ns), p.run, &run.v, after(stamp, p.delay_ms));
             }
             try view.put(Runs, rk, run);
         },
         .action_extend => {
             const p = ae.Extend.decodeAll(e.payload, &diag) catch return error.Halt;
-            const rk = try nsKey(view, p.ns, p.run);
+            const rk = try idKey(view, .of(p.ns), p.run);
             var run = (try inScope(view, rk, p.action)) orelse return out.refuse(.not_found, .not_found, NO_RUN);
             if (!holds(run.v, p.holder, run.v.deliveries, p.token)) return stale(out, run.v, p.holder, run.v.deliveries, p.token);
             if (p.lease_ms != run.v.lease_ms or p.held_since_ns != run.v.delivered_ns) return out.refuse(.bad_request, .unclassified, NOT_ITS_LEASE);
             // More than half the lease left, or held to the ceiling: the
             // lease stands, and nothing is written.
-            const to = (try M.extend(view, p.ns, p.run, &run.v, p.expiry_ns, stamp)) orelse return out.putInt(u64, run.v.expiry_ns);
+            const to = (try M.extend(view, .of(p.ns), p.run, &run.v, p.expiry_ns, stamp)) orelse return out.putInt(u64, run.v.expiry_ns);
             try view.put(Runs, rk, run);
             out.putInt(u64, to);
         },
@@ -368,18 +377,18 @@ fn apply(view: *View, e: *const Entry, out: *Result) ApplyError!void {
 /// a live one would leave its lease with none.
 fn expireOne(view: *View, item: ae.ExpireItem.Value, stamp: u64) ApplyError!bool {
     if (item.expiry_ns > stamp) return false;
-    const rk = try nsKey(view, item.ns, item.run);
+    const rk = try idKey(view, .of(item.ns), item.run);
     const found = try view.get(Runs, rk);
-    if (!try M.expireKey(view, item.ns, item.run, item.action, item.expiry_ns, if (found) |r| r.v else null, stamp)) return false;
+    if (!try M.expireKey(view, .of(item.ns), item.run, item.action, item.expiry_ns, if (found) |r| r.v else null, stamp)) return false;
     var run = found.?;
-    try M.dropRequest(view, item.ns, item.holder, item.request_key, item.run);
+    try M.dropRequest(view, .of(item.ns), item.holder, item.request_key, item.run);
     run.v.ended = .expired;
     run.v.failures +|= 1;
     run.v.@"error" = "lease expired";
     if (run.v.failures >= run.v.max_attempts) {
         run.v.status = .timed_out;
         run.v.completed_ns = stamp;
-    } else try M.readyAgain(view, item.ns, item.run, &run.v, stamp);
+    } else try M.readyAgain(view, .of(item.ns), item.run, &run.v, stamp);
     try view.put(Runs, rk, run);
     return true;
 }
@@ -396,7 +405,8 @@ const holds = delivery.holds;
 const sameDelivery = delivery.sameDelivery;
 const stale = M.stale;
 pub const staleWhy = M.staleWhy;
-const nsKey = delivery.nsKey;
+/// `k` in `ns`; an entry naming no namespace (`.invalid`) halts.
+const idKey = M.inNs;
 
 pub const machine: machine_mod.Machine = .{
     .name = "actions",
@@ -458,9 +468,9 @@ pub const TestActions = struct {
         for (self.log.items) |l| _ = try other.applyLogged(l);
     }
 
-    pub fn run(self: *TestActions, ns: []const u8, id: []const u8) ?Run.Value {
-        var b: [1 + limits.MAX_NAMESPACE_NAME + ae.MAX_RUN_ID]u8 = undefined;
-        const k = view_mod.key(&b, ns, id) catch unreachable;
+    pub fn run(self: *TestActions, ns: NamespaceId, id: []const u8) ?Run.Value {
+        var b: [4 + ae.MAX_RUN_ID]u8 = undefined;
+        const k = view_mod.idKey(&b, ns, id) catch unreachable;
         const got = (view_mod.ReadView{ .store = &self.store }).get(Runs, k) catch unreachable;
         return if (got) |r| r.v else null;
     }
@@ -491,7 +501,7 @@ pub const TestActions = struct {
             if (k.expiry_ns > stamp) break;
             const d = try Stored(Deadline).decode(rec.value);
             var ib: [ae.ExpireItem.max_size]u8 = undefined;
-            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns, .action = d.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
+            try buf.appendSlice(self.store.allocator, try ae.ExpireItem.encodeInto(&ib, .{ .ns = k.ns.int(), .action = d.v.scope, .run = k.id, .expiry_ns = k.expiry_ns, .holder = "w1", .request_key = null }));
             n += 1;
         }
         if (n == 0) return;
@@ -506,47 +516,49 @@ const sec = std.time.ns_per_s;
 /// Every test lease: the floor.
 const LEASE_MS = ae.MIN_LEASE_MS;
 const LEASE = LEASE_MS * ms;
+/// The default namespace's id, as an entry carries it.
+const DEFAULT = NamespaceId.default.int();
 
-fn registerIn(t: *TestActions, ns: []const u8, max_attempts: u32) !void {
-    const r = try t.apply(.action_register, ae.Register.Value{ .ns = ns, .name = "send", .owner = "", .lease_ms = LEASE_MS, .max_attempts = max_attempts }, 1);
+fn registerIn(t: *TestActions, ns: NamespaceId, max_attempts: u32) !void {
+    const r = try t.apply(.action_register, ae.Register.Value{ .ns = ns.int(), .name = "send", .owner = "", .lease_ms = LEASE_MS, .max_attempts = max_attempts }, 1);
     try testing.expect(r.refused() == null);
 }
 
 fn register(t: *TestActions, max_attempts: u32) !void {
-    return registerIn(t, "default", max_attempts);
+    return registerIn(t, .default, max_attempts);
 }
 
-fn invokeIn(t: *TestActions, ns: []const u8, run_id: []const u8, stamp: u64) !void {
-    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns, .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, stamp);
+fn invokeIn(t: *TestActions, ns: NamespaceId, run_id: []const u8, stamp: u64) !void {
+    const r = try t.apply(.action_invoke, ae.Invoke.Value{ .ns = ns.int(), .action = "send", .run = run_id, .input = "in", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, stamp);
     try testing.expect(r.refused() == null);
 }
 
 fn invoke(t: *TestActions, run_id: []const u8, stamp: u64) !void {
-    return invokeIn(t, "default", run_id, stamp);
+    return invokeIn(t, .default, run_id, stamp);
 }
 
-fn deliverIn(t: *TestActions, ns: []const u8, run_id: []const u8, due: u64, stamp: u64) !Result {
-    return t.apply(.action_deliver, ae.Deliver.Value{ .ns = ns, .action = "send", .run = run_id, .due_ns = due, .holder = "w1", .request_key = null, .lease_ms = LEASE_MS }, stamp);
+fn deliverIn(t: *TestActions, ns: NamespaceId, run_id: []const u8, due: u64, stamp: u64) !Result {
+    return t.apply(.action_deliver, ae.Deliver.Value{ .ns = ns.int(), .action = "send", .run = run_id, .due_ns = due, .holder = "w1", .request_key = null, .lease_ms = LEASE_MS }, stamp);
 }
 
 fn deliver(t: *TestActions, run_id: []const u8, due: u64, stamp: u64) !Result {
-    return deliverIn(t, "default", run_id, due, stamp);
+    return deliverIn(t, .default, run_id, due, stamp);
 }
 
 /// A settle of the run's live delivery, as its leader would propose it.
 fn settleOf(t: *TestActions, run_id: []const u8) ae.Settle.Value {
-    const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .outcome = "", .result = "done" };
+    const r = t.run(.default, run_id).?;
+    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .outcome = "", .result = "done" };
 }
 
 fn releaseOf(t: *TestActions, run_id: []const u8, abandoned: bool) ae.Release.Value {
-    const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .abandoned = abandoned, .retry = true, .delay_ms = 5, .@"error" = "boom" };
+    const r = t.run(.default, run_id).?;
+    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .holder = "w1", .request_key = null, .deliveries = r.deliveries, .token = r.token, .expiry_ns = r.expiry_ns, .abandoned = abandoned, .retry = true, .delay_ms = 5, .@"error" = "boom" };
 }
 
 fn extendOf(t: *TestActions, run_id: []const u8) ae.Extend.Value {
-    const r = t.run("default", run_id).?;
-    return .{ .ns = "default", .action = "send", .run = run_id, .holder = "w1", .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
+    const r = t.run(.default, run_id).?;
+    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .holder = "w1", .token = r.token, .expiry_ns = r.expiry_ns, .held_since_ns = r.delivered_ns, .lease_ms = r.lease_ms };
 }
 
 /// An expire of `item` alone.
@@ -555,7 +567,7 @@ fn expiring(buf: []u8, item: ae.ExpireItem.Value) !ae.Expire.Value {
 }
 
 fn keyOf(run_id: []const u8, expiry_ns: u64) ae.ExpireItem.Value {
-    return .{ .ns = "default", .action = "send", .run = run_id, .expiry_ns = expiry_ns, .holder = "w1", .request_key = null };
+    return .{ .ns = DEFAULT, .action = "send", .run = run_id, .expiry_ns = expiry_ns, .holder = "w1", .request_key = null };
 }
 
 test "actions machine: a run is delivered once, settled by its holder, and a resent settle answers as it did" {
@@ -566,7 +578,7 @@ test "actions machine: a run is delivered once, settled by its holder, and a res
     try testing.expectEqual(@as(usize, 1), t.count(Ready));
 
     try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
-    const leased = t.run("default", "r1").?;
+    const leased = t.run(.default, "r1").?;
     try testing.expectEqual(Status.leased, leased.status);
     try testing.expectEqual(@as(u32, 1), leased.deliveries);
     try testing.expectEqual(20 * ms + LEASE, leased.expiry_ns);
@@ -580,7 +592,7 @@ test "actions machine: a run is delivered once, settled by its holder, and a res
     var settle = settleOf(&t, "r1");
     settle.outcome = "failure";
     try testing.expect((try t.apply(.action_settle, settle, 30 * ms)).refused() == null);
-    const done = t.run("default", "r1").?;
+    const done = t.run(.default, "r1").?;
     try testing.expectEqual(Status.completed, done.status);
     try testing.expectEqualStrings("failure", done.outcome);
     // The settle took its deadline key with it.
@@ -628,7 +640,7 @@ test "actions machine: a refused entry changes nothing: a stale token, an early 
 
     // An expire before the deadline, or naming another action, leaves the
     // lease and its key.
-    const expiry = t.run("default", "r1").?.expiry_ns;
+    const expiry = t.run(.default, "r1").?.expiry_ns;
     _ = try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", expiry)), expiry - 1);
     var other = keyOf("r1", expiry);
     other.action = "other";
@@ -655,7 +667,7 @@ test "actions machine: failures count to max_attempts; an abandoned delivery cou
         try testing.expectEqual(before, t.sums());
         // A settle or the other kind of release for that delivery is
         // refused: it ended otherwise.
-        const settle: ae.Settle.Value = .{ .ns = "default", .action = "send", .run = "r1", .holder = rel.holder, .request_key = null, .deliveries = rel.deliveries, .token = rel.token, .expiry_ns = rel.expiry_ns, .outcome = "", .result = "" };
+        const settle: ae.Settle.Value = .{ .ns = DEFAULT, .action = "send", .run = "r1", .holder = rel.holder, .request_key = null, .deliveries = rel.deliveries, .token = rel.token, .expiry_ns = rel.expiry_ns, .outcome = "", .result = "" };
         try testing.expectEqualStrings("stale report: the run was released", (try t.apply(.action_settle, settle, stamp + 2 * ms)).refused().?.refusal.message);
         var other = rel;
         other.abandoned = !abandon;
@@ -664,7 +676,7 @@ test "actions machine: failures count to max_attempts; an abandoned delivery cou
         due = stamp + ms + 5 * ms;
         stamp = due + ms;
     }
-    const done = t.run("default", "r1").?;
+    const done = t.run(.default, "r1").?;
     try testing.expectEqual(Status.failed, done.status);
     try testing.expectEqual(@as(u32, 3), done.deliveries);
     try testing.expectEqual(@as(u32, 2), done.failures);
@@ -683,7 +695,7 @@ test "actions machine: 500 deliver and abandon cycles leave no deadline key" {
         due = stamp + ms + 5 * ms;
     }
     try testing.expectEqual(@as(usize, 0), t.count(Deadlines));
-    try testing.expectEqual(@as(u32, 0), t.run("default", "r1").?.failures);
+    try testing.expectEqual(@as(u32, 0), t.run(.default, "r1").?.failures);
 }
 
 test "actions machine: touches every millisecond, each racing an extend, keep at most three keys for the lease" {
@@ -706,7 +718,7 @@ test "actions machine: touches every millisecond, each racing an extend, keep at
         most = @max(most, t.count(Deadlines));
     }
     try testing.expect(most <= 3);
-    try testing.expectEqual(Status.leased, t.run("default", "r1").?.status);
+    try testing.expectEqual(Status.leased, t.run(.default, "r1").?.status);
 
     // An extend asking another lease, or naming another start, is refused.
     var other = extendOf(&t, "r1");
@@ -723,18 +735,18 @@ test "actions machine: a delivery touched forever is held no longer than the cei
     try register(&t, 1);
     try invoke(&t, "r1", 10 * ms);
     try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
-    const ceiling = t.run("default", "r1").?.delivered_ns + ae.MAX_HOLD_MS * ms;
+    const ceiling = t.run(.default, "r1").?.delivered_ns + ae.MAX_HOLD_MS * ms;
     var stamp: u64 = 21 * ms;
     while (stamp < ceiling + 10 * LEASE) : (stamp += LEASE / 4) {
-        const r = t.run("default", "r1").?;
+        const r = t.run(.default, "r1").?;
         if (r.status != .leased) break;
         _ = try t.apply(.action_extend, extendOf(&t, "r1"), stamp);
         try t.duty(stamp);
         try testing.expect(t.count(Deadlines) <= 1);
-        try testing.expect(t.run("default", "r1").?.expiry_ns <= ceiling);
+        try testing.expect(t.run(.default, "r1").?.expiry_ns <= ceiling);
     }
     // Its last extend reached the ceiling, and the lease ran out there.
-    const r = t.run("default", "r1").?;
+    const r = t.run(.default, "r1").?;
     try testing.expectEqual(Status.timed_out, r.status);
     try testing.expectEqual(ceiling, r.expiry_ns);
 }
@@ -757,10 +769,10 @@ test "actions machine: an extend to the same instant keeps one deadline, and the
     try testing.expect((try t.apply(.action_extend, again, at)).refused() == null);
     try testing.expectEqual(@as(usize, 1), t.count(Deadlines));
 
-    const expiry = t.run("default", "r1").?.expiry_ns;
+    const expiry = t.run(.default, "r1").?.expiry_ns;
     try testing.expectEqual(at + LEASE, expiry);
     _ = try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", expiry)), expiry);
-    try testing.expectEqual(Status.timed_out, t.run("default", "r1").?.status);
+    try testing.expectEqual(Status.timed_out, t.run(.default, "r1").?.status);
 }
 
 test "actions machine: an expire drops a stale key, and ends a live lease with attempts left by readying it at the expire's stamp" {
@@ -770,7 +782,7 @@ test "actions machine: an expire drops a stale key, and ends a live lease with a
     try register(&t, 3);
     try invoke(&t, "r1", 10 * ms);
     try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
-    const old = t.run("default", "r1").?.expiry_ns;
+    const old = t.run(.default, "r1").?.expiry_ns;
     // An extend that missed the expiry it named leaves the old key behind.
     var ext = extendOf(&t, "r1");
     ext.expiry_ns = 0;
@@ -782,13 +794,13 @@ test "actions machine: an expire drops a stale key, and ends a live lease with a
     var misnamed = keyOf("r1", old);
     misnamed.action = "other";
     _ = try t.apply(.action_expire, try expiring(&ibuf, misnamed), old + ms);
-    try testing.expectEqual(Status.leased, t.run("default", "r1").?.status);
+    try testing.expectEqual(Status.leased, t.run(.default, "r1").?.status);
     try testing.expectEqual(@as(usize, 1), t.count(Deadlines));
 
-    const live = t.run("default", "r1").?.expiry_ns;
+    const live = t.run(.default, "r1").?.expiry_ns;
     const stamp = live + 7 * ms;
     try testing.expect((try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", live)), stamp)).refused() == null);
-    const run = t.run("default", "r1").?;
+    const run = t.run(.default, "r1").?;
     try testing.expectEqual(Status.ready, run.status);
     try testing.expectEqual(Ended.expired, run.ended);
     try testing.expectEqual(@as(u32, 1), run.failures);
@@ -812,18 +824,18 @@ test "actions machine: a settle after the expiry instant but before the expire i
     try register(&t, 3);
     try invoke(&t, "r1", 10 * ms);
     try testing.expect((try deliver(&t, "r1", 10 * ms, 20 * ms)).refused() == null);
-    const expiry = t.run("default", "r1").?.expiry_ns;
+    const expiry = t.run(.default, "r1").?.expiry_ns;
     try testing.expect((try t.apply(.action_settle, settleOf(&t, "r1"), expiry + ms)).refused() == null);
     const r = try t.apply(.action_expire, try expiring(&ibuf, keyOf("r1", expiry)), expiry + 2 * ms);
     var answer = r.reader();
     try testing.expectEqual(@as(u32, 0), answer.int(u32).?);
-    try testing.expectEqual(Status.completed, t.run("default", "r1").?.status);
+    try testing.expectEqual(Status.completed, t.run(.default, "r1").?.status);
 }
 
 test "actions machine: one run id in two namespaces has two deadline keys" {
     var t = TestActions.init(testing.allocator);
     defer t.deinit();
-    for ([_][]const u8{ "default", "other" }) |ns| {
+    for ([_]NamespaceId{ .default, .of(16) }) |ns| {
         try registerIn(&t, ns, 1);
         try invokeIn(&t, ns, "r1", 10 * ms);
         try testing.expect((try deliverIn(&t, ns, "r1", 10 * ms, 20 * ms)).refused() == null);
@@ -831,9 +843,47 @@ test "actions machine: one run id in two namespaces has two deadline keys" {
     try testing.expectEqual(@as(usize, 2), t.count(Deadlines));
 }
 
+test "actions machine: one action and run id in two namespaces are two of each, by the keys an entry declares and the state it leaves" {
+    const other: NamespaceId = .of(16);
+    // The keys an entry declares, built as a shard builds them: a register
+    // in one namespace covers its own definition, never the other's.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pb: [ae.Register.max_size]u8 = undefined;
+    const payload = try ae.Register.encodeInto(&pb, .{ .ns = DEFAULT, .name = "send", .owner = "", .lease_ms = LEASE_MS, .max_attempts = 1 });
+    const e = entry_mod.buildEntry(.action_register, entry_mod.Flags.NONE, 1, 1, 1, payload);
+    var declared = KeySet.init(arena.allocator());
+    try keys(&e, &declared);
+    var kb: [4 + ae.MAX_ACTION_NAME]u8 = undefined;
+    try testing.expect(declared.covers(Defs.ID, try view_mod.idKey(&kb, .default, "send")));
+    try testing.expect(!declared.covers(Defs.ID, try view_mod.idKey(&kb, other, "send")));
+
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    for ([_]NamespaceId{ .default, other }) |ns| {
+        try registerIn(&t, ns, 1);
+        try invokeIn(&t, ns, "r1", 10 * ms);
+    }
+    // Delivered in one, the other's run is still ready.
+    try testing.expect((try deliverIn(&t, .default, "r1", 10 * ms, 20 * ms)).refused() == null);
+    try testing.expectEqual(Status.leased, t.run(.default, "r1").?.status);
+    try testing.expectEqual(Status.ready, t.run(other, "r1").?.status);
+    // Deleted in one, the action is still the other's to invoke.
+    try testing.expect((try t.apply(.action_delete, ae.Delete.Value{ .ns = DEFAULT, .name = "send" }, 30 * ms)).refused() == null);
+    try testing.expectEqualStrings(NO_ACTION, (try t.apply(.action_invoke, ae.Invoke.Value{ .ns = DEFAULT, .action = "send", .run = "r2", .input = "", .labels = null, .source = .direct, .caller_run = null, .caller_workflow = null, .caller_shard = null }, 40 * ms)).refused().?.refusal.message);
+    try invokeIn(&t, other, "r2", 40 * ms);
+    try testing.expect(t.run(.default, "r2") == null);
+}
+
+test "actions machine: an entry naming no namespace halts" {
+    var t = TestActions.init(testing.allocator);
+    defer t.deinit();
+    try testing.expectError(error.Halt, t.apply(.action_register, ae.Register.Value{ .ns = NamespaceId.invalid.int(), .name = "send", .owner = "", .lease_ms = LEASE_MS, .max_attempts = 1 }, 1));
+}
+
 test "actions machine: a lease below the floor, or past the ceiling, doesn't encode" {
     var buf: [ae.Deliver.max_size]u8 = undefined;
-    const body: ae.Deliver.Value = .{ .ns = "default", .action = "send", .run = "r1", .due_ns = 0, .holder = "w1", .request_key = null, .lease_ms = 0 };
+    const body: ae.Deliver.Value = .{ .ns = DEFAULT, .action = "send", .run = "r1", .due_ns = 0, .holder = "w1", .request_key = null, .lease_ms = 0 };
     try testing.expectError(error.OutOfRange, ae.Deliver.encodeInto(&buf, body));
     var long = body;
     long.lease_ms = ae.MAX_LEASE_MS + 1;
@@ -851,11 +901,11 @@ test "actions machine: one log replayed onto another store leaves the same state
     _ = try deliver(&a, "r2", 11 * ms, 21 * ms);
     _ = try a.apply(.action_extend, extendOf(&a, "r1"), 20 * ms + LEASE * 3 / 4);
     _ = try a.apply(.action_settle, settleOf(&a, "r1"), 30 * ms);
-    const e2 = a.run("default", "r2").?.expiry_ns;
+    const e2 = a.run(.default, "r2").?.expiry_ns;
     _ = try a.apply(.action_expire, try expiring(&ibuf, keyOf("r2", e2)), e2 + ms);
     _ = try deliver(&a, "r2", e2 + ms, e2 + 2 * ms);
     _ = try a.apply(.action_release, releaseOf(&a, "r2", false), e2 + 3 * ms);
-    try testing.expectEqual(Status.failed, a.run("default", "r2").?.status);
+    try testing.expectEqual(Status.failed, a.run(.default, "r2").?.status);
 
     var b = TestActions.init(testing.allocator);
     defer b.deinit();
@@ -883,7 +933,7 @@ test "actions machine: a report from a worker that doesn't hold the delivery is 
     var second = settle;
     second.result = "other";
     try testing.expectEqualStrings(OTHER_RESULT, (try t.apply(.action_settle, second, 31 * ms)).refused().?.refusal.message);
-    try testing.expectEqualStrings("done", t.run("default", "r1").?.result);
+    try testing.expectEqualStrings("done", t.run(.default, "r1").?.result);
 }
 
 test "actions machine: a delivery's request key is recorded at its deliver and goes when it settles, releases or expires" {
@@ -895,7 +945,7 @@ test "actions machine: a delivery's request key is recorded at its deliver and g
     try invoke(&t, "r2", 10 * ms);
     try invoke(&t, "r3", 10 * ms);
     for ([_][]const u8{ "r1", "r2", "r3" }, [_][]const u8{ "k1", "k2", "k3" }) |id, k| {
-        const r = try t.apply(.action_deliver, ae.Deliver.Value{ .ns = "default", .action = "send", .run = id, .due_ns = 10 * ms, .holder = "w1", .request_key = k, .lease_ms = LEASE_MS }, 20 * ms);
+        const r = try t.apply(.action_deliver, ae.Deliver.Value{ .ns = DEFAULT, .action = "send", .run = id, .due_ns = 10 * ms, .holder = "w1", .request_key = k, .lease_ms = LEASE_MS }, 20 * ms);
         try testing.expect(r.refused() == null);
     }
     try testing.expectEqual(@as(usize, 3), t.count(Requests));
@@ -906,7 +956,7 @@ test "actions machine: a delivery's request key is recorded at its deliver and g
     rel.request_key = "k2";
     _ = try t.apply(.action_release, rel, 30 * ms);
     try testing.expectEqual(@as(usize, 1), t.count(Requests));
-    const expiry = t.run("default", "r3").?.expiry_ns;
+    const expiry = t.run(.default, "r3").?.expiry_ns;
     var item = keyOf("r3", expiry);
     item.request_key = "k3";
     _ = try t.apply(.action_expire, try expiring(&ibuf, item), expiry);
@@ -922,8 +972,8 @@ test "actions machine: a run completed after a failed attempt keeps no error" {
     var rel = releaseOf(&t, "r1", false);
     rel.delay_ms = 0;
     _ = try t.apply(.action_release, rel, 21 * ms);
-    try testing.expectEqualStrings("boom", t.run("default", "r1").?.@"error");
+    try testing.expectEqualStrings("boom", t.run(.default, "r1").?.@"error");
     try testing.expect((try deliver(&t, "r1", 21 * ms, 22 * ms)).refused() == null);
     _ = try t.apply(.action_settle, settleOf(&t, "r1"), 23 * ms);
-    try testing.expectEqualStrings("", t.run("default", "r1").?.@"error");
+    try testing.expectEqualStrings("", t.run(.default, "r1").?.@"error");
 }

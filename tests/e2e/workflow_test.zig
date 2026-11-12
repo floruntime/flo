@@ -2376,7 +2376,6 @@ test "e2e/workflow: create workflow with trigger definition" {
         \\name: st-def-test
         \\version: 1.0.0
         \\trigger.stream: order-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-echo
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -2412,7 +2411,6 @@ test "e2e/workflow: append to stream triggers workflow run" {
         \\name: st-auto-start
         \\version: 1.0.0
         \\trigger.stream: trigger-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-process
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -2449,7 +2447,6 @@ test "e2e/workflow: multiple appends trigger multiple runs" {
         \\name: st-multi-run
         \\version: 1.0.0
         \\trigger.stream: multi-trigger-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-multi
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -2474,10 +2471,10 @@ test "e2e/workflow: multiple appends trigger multiple runs" {
 }
 
 // =============================================================================
-// Stream Trigger: Trigger with Custom Consumer Group
+// Stream Trigger: consumer_group and mode are refused
 // =============================================================================
 
-test "e2e/workflow: trigger with custom consumer group" {
+test "e2e/workflow: a trigger's consumer_group or mode is refused at create, naming why" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
@@ -2489,7 +2486,6 @@ test "e2e/workflow: trigger with custom consumer group" {
         \\version: 1.0.0
         \\trigger.stream: cg-events
         \\trigger.consumer_group: my-custom-cg
-        \\trigger.mode: exclusive
         \\start.run: @actions/st-cg-action
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -2500,15 +2496,13 @@ test "e2e/workflow: trigger with custom consumer group" {
 
     var create_result = try ctx.cli.run(&.{ "workflow", "create", "-f", path });
     defer create_result.deinit();
-    try stdx.testing.assertSucceeded(create_result);
+    try testing.expect(create_result.exit_code != 0);
+    try testing.expect(create_result.stderrContains("\"consumer_group\" is not a trigger option: a trigger reads its stream with its own cursor"));
 
-    // Append to stream — workflow should be triggered
-    try ctx.exec(&.{ "stream", "append", "cg-events", "{\"item\":\"widget\"}" });
-
-    var list_result = try ctx.cli.run(&.{ "workflow", "list-runs", "--workflow", "st-cg-test" });
-    defer list_result.deinit();
-    try stdx.testing.assertSucceeded(list_result);
-    try stdx.testing.assertContains(list_result, "st-cg-test");
+    // Nothing was made.
+    var get_result = try ctx.cli.run(&.{ "workflow", "definition", "st-cg-test" });
+    defer get_result.deinit();
+    try testing.expect(get_result.exit_code != 0);
 }
 
 // =============================================================================
@@ -2563,7 +2557,6 @@ test "e2e/workflow: triggered workflow with multi-step pipeline" {
         \\name: st-pipeline
         \\version: 1.0.0
         \\trigger.stream: pipeline-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-validate
         \\start.transitions.success: process-step
         \\start.transitions.failure: flo.Failed
@@ -2605,7 +2598,6 @@ test "e2e/workflow: batch_size accumulates events and fires on full batch" {
         \\trigger.stream: batch-events
         \\trigger.batch_size: 3
         \\trigger.batch_timeout_ms: 60000
-        \\trigger.mode: shared
         \\start.run: @actions/st-batch-action
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -3183,7 +3175,6 @@ test "e2e/workflow: a stream trigger survives restart and resumes at its cursor"
         \\name: st-restart-trig
         \\version: 1.0.0
         \\trigger.stream: restart-trigger-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-restart-act
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed
@@ -3280,7 +3271,6 @@ test "e2e/workflow: a batched append starts one run per record" {
         \\name: st-batch-run
         \\version: 1.0.0
         \\trigger.stream: batch-trigger-events
-        \\trigger.mode: shared
         \\start.run: @actions/st-batch
         \\start.transitions.success: flo.Completed
         \\start.transitions.failure: flo.Failed

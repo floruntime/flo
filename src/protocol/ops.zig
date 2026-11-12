@@ -25,11 +25,8 @@ pub const Scope = enum { namespace, server };
 
 /// How a request finds the shard that runs it.
 pub const Route = union(enum) {
-    /// The request's routing key if it has one, else its key.
+    /// Its key's {tag}, or the whole key when it has none.
     key,
-    /// A decoded request field (never a namespace field). An optional one
-    /// that's absent leaves the request on the connection's shard.
-    field: []const u8,
     /// The partition bits in a run id; an id that doesn't decode is refused.
     run_id,
     /// The connection's own shard.
@@ -224,13 +221,6 @@ fn opRule(comptime op: Op, comptime before: []const Op) ?[]const u8 {
     if (op.response.kind != .record) return "response is not a schema.Record";
     if (schema.fitsRule(op.request, MAX_REQUEST_BODY, "request")) |m| return m;
     if (schema.fitsRule(op.response, MAX_RESPONSE_BODY, "response")) |m| return m;
-    switch (op.route) {
-        .field => |name| {
-            const f = fieldOf(op.request, name) orelse return "routes on field '" ++ name ++ "', which its request doesn't have";
-            if (f.T.kind == .namespace) return "routes on namespace field '" ++ name ++ "'; a namespace never picks a shard";
-        },
-        else => {},
-    }
     if (op.wait) |w| {
         const f = fieldOf(op.request, w.field) orelse return "waits on field '" ++ w.field ++ "', which its request doesn't have";
         const T = if (@hasDecl(f.T, "Inner")) f.T.Inner else f.T;
@@ -397,7 +387,6 @@ pub fn tableHash(comptime ops: []const Op, comptime entries: anytype) u64 {
             hashNum(&h, @intFromBool(op.takes_items));
             hashNum(&h, @backingInt(op.fanout));
             hashStr(&h, @tagName(op.route));
-            if (op.route == .field) hashStr(&h, op.route.field);
             hashStr(&h, op.txn orelse "no txn");
             if (op.wait) |w| {
                 hashStr(&h, w.field);
@@ -620,7 +609,7 @@ test "ops: the hash covers route, wait and entry payloads" {
     const base = [_]Op{.{ .name = "kv.x", .code = 0x110, .class = .read, .request = R, .response = schema.Record(&.{}), .doc = "x" }};
     const h0 = comptime tableHash(&base, NoEntries);
     comptime var routed = base;
-    routed[0].route = .{ .field = "who" };
+    routed[0].route = .local;
     try testing.expect(h0 != comptime tableHash(&routed, NoEntries));
     comptime var waited = base;
     waited[0].wait = .{ .field = "wait_ms", .default_ms = 0, .max_ms = 1000 };
@@ -663,25 +652,18 @@ test "ops: the table hash of a fixed table is pinned" {
     // Changing anything the hash covers, the refusal reasons included,
     // changes this value; so does an accidental change to how it's computed.
     // Update it only together with a deliberate change to the hash.
-    try testing.expectEqual(@as(u64, 0xe179cd20ab48eb87), comptime tableHash(&test_table, NoEntries));
+    try testing.expectEqual(@as(u64, 0xb590bd8b979955b5), comptime tableHash(&test_table, NoEntries));
 }
 
-test "ops: the hash covers which field a route names and a wait's default" {
+test "ops: the hash covers a wait's default" {
     const R = schema.Record(&.{
         .{ .name = "wait_ms", .T = schema.Defaulted(schema.DurationMs(1000), 0) },
-        .{ .name = "who", .T = schema.String(8) },
-        .{ .name = "whom", .T = schema.String(8) },
     });
     const R2 = schema.Record(&.{
         .{ .name = "wait_ms", .T = schema.Defaulted(schema.DurationMs(1000), 7) },
-        .{ .name = "who", .T = schema.String(8) },
-        .{ .name = "whom", .T = schema.String(8) },
     });
-    const base = [_]Op{.{ .name = "kv.x", .code = 0x110, .class = .read, .route = .{ .field = "who" }, .wait = .{ .field = "wait_ms", .default_ms = 0, .max_ms = 1000 }, .request = R, .response = schema.Record(&.{}), .doc = "x" }};
+    const base = [_]Op{.{ .name = "kv.x", .code = 0x110, .class = .read, .wait = .{ .field = "wait_ms", .default_ms = 0, .max_ms = 1000 }, .request = R, .response = schema.Record(&.{}), .doc = "x" }};
     const h0 = comptime tableHash(&base, NoEntries);
-    comptime var other_field = base;
-    other_field[0].route = .{ .field = "whom" };
-    try testing.expect(h0 != comptime tableHash(&other_field, NoEntries));
     comptime var other_default = base;
     other_default[0].request = R2;
     other_default[0].wait = .{ .field = "wait_ms", .default_ms = 7, .max_ms = 1000 };

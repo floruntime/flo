@@ -42,7 +42,7 @@ test "e2e/catch-up: a follower stopped past the leader's ring catches up from it
     const WRITES = 512;
     for (0..WRITES) |i| {
         const key = try std.fmt.bufPrint(&key_buf, "k-{d}", .{i});
-        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         defer r.deinit();
         try testing.expectEqual(proto.StatusCode.ok, r.status);
     }

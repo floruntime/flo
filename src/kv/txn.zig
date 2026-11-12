@@ -1,15 +1,15 @@
 //! Per-Shard KV Transactions.
 //!
-//! A transaction is pinned to one shard's partition at BEGIN time, and every
-//! op inside it gives the routing key it was begun with (or is refused with
-//! `wrong_routing_key`). On COMMIT, the entire write set is appended
-//! to the UAL as a single `kv_batch` entry — atomicity is the same as any
-//! single Raft propose.
+//! A transaction is pinned at BEGIN time to the routing hash of its key's
+//! {tag} (the whole key when it has none), and every key an op inside it
+//! names must route the same way (or is refused with `keys_not_colocated`).
+//! On COMMIT, the entire write set is appended to the UAL as a single
+//! `kv_batch` entry — atomicity is the same as any single Raft propose.
 //!
 //! ## Lifecycle
 //!
 //! ```
-//! BEGIN(routing_key)        → server pins txn to hash(namespace id, routing_key)
+//! BEGIN(key)                → server pins txn to hash(namespace id, key's {tag})
 //!                             returns txn_id (per-shard, monotonically increasing)
 //! PUT/DEL/INCR/...(--txn T) → buffered in TxnState.write_set
 //! GET/EXISTS(--txn T)       → checks write_set first (read-your-writes),
@@ -98,8 +98,8 @@ pub const TxnOp = struct {
 
 pub const TxnState = struct {
     txn_id: u64,
-    /// The pinned partition's routing hash: the namespace's id and the
-    /// routing key (`router.routeNsKey`).
+    /// The routing hash of the key it was begun with: the namespace's id
+    /// and the key's {tag}, or the whole key (`router.routeNsKey`).
     pinned_hash: u64,
     /// The namespace the txn was begun in; it is found only from there.
     ns_id: NamespaceId,

@@ -95,6 +95,8 @@ pub const ProcessingHandler = struct {
     /// more writes for now: the pipeline stops and keeps its cursor, and the
     /// next tick reads the batch again (at-least-once), so nothing is dropped.
     sink_overloaded: bool = false,
+    /// When a held pipeline was last said to be waiting (`noteHeld`).
+    held_warn_ms: i64 = 0,
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
@@ -197,6 +199,9 @@ pub const ProcessingHandler = struct {
         last_read_count: u32 = 0,
         /// Highest event-time watermark observed (0 = none / processing-time source).
         watermark_ms: i64 = 0,
+        /// When its ticks began stopping for room in a sink's shard; 0 while
+        /// they complete.
+        held_since_ms: i64 = 0,
         /// Per-tick processing time (ns) over productive ticks: last/max/sum/count.
         tick_ns_last: u64 = 0,
         tick_ns_max: u64 = 0,
@@ -1658,23 +1663,26 @@ pub const ProcessingHandler = struct {
         const cursor_before = pipe.ts_cursor_ns;
         self.sink_overloaded = false;
 
+        // One point at a time: its JSON and what its chain allocates are
+        // freed once its outputs are written.
+        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        defer arena.deinit();
         for (points) |pt| {
+            defer _ = arena.reset(.retain_capacity);
             // Format TS point as JSON record. Short of memory, the tick
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(shard.allocator, pipe.src_measurement, pt.field_value, ts_ms) catch break;
-            defer shard.allocator.free(json);
+            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.field_value, ts_ms) catch break;
 
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
             // raw would write what the operators were there to change.
-            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, shard.allocator) catch |err| blk: {
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
 
             if (output_records) |records| {
-                defer if (records.len > 0) shard.allocator.free(records);
                 for (records) |rec| {
                     self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), rec.tags);
                 }
@@ -1683,11 +1691,13 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), 0);
             }
 
-            // A sink found the shard full: this tick's points are read again
-            // next tick, from where it began.
+            // A sink found its shard full: the next tick reads again from
+            // this point's time. Points before it at that time are written
+            // again; those before it are not.
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
-                pipe.ts_cursor_ns = cursor_before;
+                pipe.ts_cursor_ns = @max(cursor_before, pt.timestamp_ns);
+                self.noteHeld(shard, pipe);
                 return;
             }
 
@@ -1702,6 +1712,7 @@ pub const ProcessingHandler = struct {
             job.records_processed += 1;
             pipe.records_in += 1;
         }
+        pipe.held_since_ms = 0;
         // As a stream source does: a restart resumes here, not from the
         // measurement's first point.
         maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
@@ -1733,15 +1744,19 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        for (result.payloads) |payload| {
+        // One payload's chain at a time: what it allocates is freed once its
+        // outputs are written.
+        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        defer arena.deinit();
+        for (result.payloads, 0..) |payload, i| {
+            defer _ = arena.reset(.retain_capacity);
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
-            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), shard.allocator) catch |err| blk: {
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
 
             if (output_records) |records| {
-                defer if (records.len > 0) shard.allocator.free(records);
                 log.debug("TICK: chain returned {d} records for job", .{records.len});
                 for (records) |rec| {
                     log.debug("TICK: value_len={d} first50='{s}'", .{ rec.value.len, if (rec.value.len > 50) rec.value[0..50] else rec.value });
@@ -1752,10 +1767,15 @@ pub const ProcessingHandler = struct {
                 self.writeSinkRecordFromStream(pipe, shard, "", payload, 0);
             }
 
-            // A sink found the shard full: the batch is read again next tick,
-            // from the same cursor.
+            // A sink found its shard full: the next tick reads again from
+            // this record, every sink of those before it written.
             if (self.sink_overloaded) {
                 self.sink_overloaded = false;
+                if (i > 0) {
+                    pipe.stream_cursor_ts = result.ids[i - 1].timestamp_ms;
+                    pipe.stream_cursor_seq = result.ids[i - 1].sequence;
+                }
+                self.noteHeld(shard, pipe);
                 return;
             }
 
@@ -1766,6 +1786,7 @@ pub const ProcessingHandler = struct {
         // Advance cursor to last StreamID read
         pipe.stream_cursor_ts = result.last_id.timestamp_ms;
         pipe.stream_cursor_seq = result.last_id.sequence;
+        pipe.held_since_ms = 0;
 
         // Persist the advanced cursor durably (throttled) so the pipeline
         // resumes from here after restart instead of re-reading from the start.
@@ -1808,61 +1829,31 @@ pub const ProcessingHandler = struct {
         if (shard.metrics_registry) |m| m.processing.recordCheckpoint();
     }
 
-    /// Apply the operator chain to a single input value.
-    /// Returns owned slice of output records (caller must free), or null if no operators.
-    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
+    /// The operator chain over one input value: its output records, or
+    /// null with no operators. Everything the chain allocates, the records
+    /// and what they point at, is in `arena`, which the caller frees (or
+    /// resets) once it has written them; a record may also point into
+    /// `value`, which must live as long.
+    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
-
-        // Set up collector + context for the chain
-        var collector = OutputCollector.init(allocator);
-        defer collector.deinit();
+        var collector = OutputCollector.init(arena);
         var metrics = OperatorMetrics{};
         var ctx = OperatorContext{
             .collector = &collector,
             .metrics = &metrics,
-            .allocator = allocator,
+            .allocator = arena,
             .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .operator_name = "",
         };
-
-        // Feed the initial record into the first operator
-        const input_rec = ProcessingRecord.fromValue(value, event_time_ms);
-        log.debug("applyOperatorChain: calling operator[0] name='{s}'", .{operators[0].getName()});
-        try operators[0].processElement(input_rec, &ctx);
-        log.debug("applyOperatorChain: operator[0] done, collector count={d}", .{collector.count()});
-
-        // Chain: each operator processes the output of the previous one
-        var i: usize = 1;
-        while (i < operators.len) : (i += 1) {
-            // Snapshot current output before clearing
-            const prev_count = collector.count();
-            const prev_output = collector.drain();
-            // Dupe the records since clear will allow the backing to be reused
-            const staged = allocator.dupe(ProcessingRecord, prev_output[0..prev_count]) catch return null;
-            defer allocator.free(staged);
-            // Transfer ownership out of collector BEFORE clear frees owned memory
-            for (collector.records.items) |*rec| {
-                rec.owns_memory = false;
-            }
-            collector.clear();
-            log.debug("applyOperatorChain: calling operator[{d}] name='{s}' with {d} records", .{ i, operators[i].getName(), staged.len });
-            for (staged) |rec| {
-                try operators[i].processElement(rec, &ctx);
-            }
-            log.debug("applyOperatorChain: operator[{d}] done, collector count={d}", .{ i, collector.count() });
+        try operators[0].processElement(ProcessingRecord.fromValue(value, event_time_ms), &ctx);
+        // Each operator takes the one before's output; a staged record and
+        // what it points at stay in the arena, so one passed through, still
+        // pointing at them, stays good.
+        for (operators[1..]) |op| {
+            const staged = try collector.records.toOwnedSlice(arena);
+            for (staged) |rec| try op.processElement(rec, &ctx);
         }
-
-        // Transfer ownership out of collector BEFORE deinit frees owned memory
-        for (collector.records.items) |*rec| {
-            rec.owns_memory = false;
-        }
-
-        // Return final output — must dupe since collector.deinit() frees the backing array
-        const final = collector.drain();
-        if (final.len == 0) {
-            return &.{};
-        }
-        return allocator.dupe(ProcessingRecord, final) catch &.{};
+        return collector.records.items;
     }
 
     /// A record a sink could not write is lost to that sink (the cursor
@@ -1871,6 +1862,20 @@ pub const ProcessingHandler = struct {
     fn holdForRoom(self: *ProcessingHandler) void {
         self.sink_overloaded = true;
     }
+
+    /// A tick stopped for room. A pipeline held this long by the same full
+    /// shard is said so, once per interval, as a stuck one would be.
+    fn noteHeld(self: *ProcessingHandler, shard: *Shard, pipe: *PipelineState) void {
+        if (shard.metrics_registry) |m| m.processing.recordHeldTick();
+        const now = @import("stdx").time.milliTimestamp();
+        if (pipe.held_since_ms == 0) pipe.held_since_ms = now;
+        const held_for = now - pipe.held_since_ms;
+        if (held_for < HELD_WARN_MS or now - self.held_warn_ms < 30_000) return;
+        self.held_warn_ms = now;
+        log.warn("job '{s}': a pipeline has waited {d} s for room in a sink's shard", .{ self.ticking_job, @divTrunc(held_for, 1000) });
+    }
+
+    const HELD_WARN_MS: i64 = 30_000;
 
     /// How many source records a tick may take now: the writes this shard
     /// can still propose before its cap, shared among the pipeline's sinks
@@ -1882,10 +1887,24 @@ pub const ProcessingHandler = struct {
         // One spare, for a sink namespace's implicit create.
         const room = raft_node_mod.MAX_OUTSTANDING -| used -| 1;
         var proposing: usize = 0;
+        var kv_sinks: usize = 0;
         for (pipe.sinks) |snk| {
             if (snk.kind != .ts) proposing += 1;
+            if (snk.kind == .kv) kv_sinks += 1;
         }
-        return @intCast(room / @max(proposing, 1));
+        const log_room = room / @max(proposing, 1);
+        // A KV sink's write for a key on another shard goes through that
+        // shard's inbox, which no larger batch fits: a send it refuses holds
+        // the tick, and a batch that never fits would be refused at the same
+        // record every tick.
+        const mailboxes = shard.peer_mailboxes orelse return log_room;
+        if (kv_sinks == 0 or mailboxes.len <= 1) return log_room;
+        var inbox_room: usize = std.math.maxInt(usize);
+        for (mailboxes, 0..) |mb, i| {
+            if (i == shard.id) continue;
+            inbox_room = @min(inbox_room, mb.inbox.capacity -| mb.inbox.pending());
+        }
+        return @min(log_room, inbox_room / kv_sinks);
     }
 
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
@@ -2094,7 +2113,7 @@ pub const ProcessingHandler = struct {
 
     /// The shard that owns KV `key` in `namespace`: this one when there are
     /// no others to send to.
-    fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
+    pub fn kvOwner(self: *const ProcessingHandler, shard: *const Shard, namespace: []const u8, key: []const u8) u16 {
         const mailboxes = shard.peer_mailboxes orelse return @intCast(shard.id);
         if (mailboxes.len <= 1 or self.peer_partition_count == 0 or self.peer_shard_count == 0) return @intCast(shard.id);
         const owner = self.peerShardId(namespace, key);
@@ -2410,10 +2429,11 @@ test "ProcessingHandler: applyOperatorChain with passthrough operator" {
     defer create_result.deinit(allocator);
 
     var ops = [_]Operator{create_result.op};
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, arena.allocator());
     try std.testing.expect(result != null);
     const records = result.?;
-    defer allocator.free(records);
 
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqualStrings("test-value", records[0].value);
@@ -2438,12 +2458,51 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
 
     // Feed a record with no key — filter should reject it
     var ops = [_]Operator{create_result.op};
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, arena.allocator());
     try std.testing.expect(result != null);
     const records = result.?;
-    defer allocator.free(records);
     // key_not_empty filter rejects records with empty key
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "ProcessingHandler: a flatmap, map, pass-through and aggregate chain frees all it allocates, over many inputs" {
+    // Operators and the chain's arena on the leak-checking allocator: an
+    // output left on an operator's own allocator leaks, and one freed twice
+    // is caught.
+    const allocator = std.testing.allocator;
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const flatmap_cfg = [_]Entry{ .{ .key = "array_field", .value = "$.items" }, .{ .key = "element_key", .value = "$.k" } };
+    const map_cfg = [_]Entry{.{ .key = "v", .value = "$.v" }};
+    const aggregate_cfg = [_]Entry{.{ .key = "function", .value = "count" }};
+    var specs = [_]definition.OperatorSpec{
+        .{ .type_name = "flatmap", .name = "fm", .config = &flatmap_cfg },
+        .{ .type_name = "map", .name = "m", .config = &map_cfg },
+        .{ .type_name = "passthrough", .name = "p", .config = null },
+        .{ .type_name = "aggregate", .name = "a", .config = &aggregate_cfg },
+    };
+    var made: [specs.len]native_registry.CreateResult = undefined;
+    var ops: [specs.len]Operator = undefined;
+    var n: usize = 0;
+    defer for (made[0..n]) |*m| m.deinit(allocator);
+    for (&specs, &made, &ops) |*spec, *m, *op| {
+        m.* = try native_registry.create(allocator, spec, null);
+        n += 1;
+        op.* = m.op;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const input = "{\"items\":[{\"k\":\"a\",\"v\":1},{\"k\":\"b\",\"v\":2},{\"k\":\"a\",\"v\":3}]}";
+    for (0..1000) |i| {
+        defer _ = arena.reset(.retain_capacity);
+        const records = (try ProcessingHandler.applyOperatorChain(&ops, input, @intCast(i), arena.allocator())).?;
+        // One aggregate result per element, keyed by its element's key.
+        try std.testing.expectEqual(@as(usize, 3), records.len);
+        try std.testing.expectEqualStrings("a", records[2].key);
+        if (i == 999) try std.testing.expect(std.mem.indexOf(u8, records[2].value, "\"count\":2000") != null);
+    }
 }
 
 test "ProcessingHandler: a job is created at its submit entry's stamp, not the host's clock" {
@@ -2809,7 +2868,7 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
     handler.peer_shard_count = 2;
     handler.setPeerKvHandlers(&peers);
 
-    // A key whose hash names shard 1, written here (as a routing key does).
+    // A key whose hash names shard 1, written here.
     var elsewhere: []const u8 = "";
     for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" }) |c| {
         if (handler.peerShardId("default", c) == 1) elsewhere = c;

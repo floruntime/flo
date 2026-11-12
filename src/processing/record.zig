@@ -1,6 +1,13 @@
 //! Processing Record Types
 //!
 //! ProcessingRecord, the unit of data a pipeline's operators pass along.
+//!
+//! A record owns nothing. What it points at is the chain's input, which
+//! outlives the chain, or what an operator allocated from its context's
+//! allocator, an arena the caller frees once it has written that input's
+//! outputs (`OperatorContext.allocator`). So a record passed through, or
+//! one aliasing another's bytes, never outlives what it points at, and
+//! nothing along the chain frees a record.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,18 +20,6 @@ const StreamID = @import("../stream/stream_id.zig").StreamID;
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
-
-    pub fn deinit(self: *const Header, allocator: Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.value);
-    }
-
-    pub fn clone(self: *const Header, allocator: Allocator) !Header {
-        return .{
-            .name = try allocator.dupe(u8, self.name),
-            .value = try allocator.dupe(u8, self.value),
-        };
-    }
 };
 
 // =============================================================================
@@ -44,18 +39,6 @@ pub const SourceRef = struct {
         .partition = 0,
         .offset = StreamID.MIN,
     };
-
-    pub fn clone(self: *const SourceRef, allocator: Allocator) !SourceRef {
-        return .{
-            .topic = try allocator.dupe(u8, self.topic),
-            .partition = self.partition,
-            .offset = self.offset,
-        };
-    }
-
-    pub fn deinit(self: *const SourceRef, allocator: Allocator) void {
-        if (self.topic.len > 0) allocator.free(self.topic);
-    }
 };
 
 // =============================================================================
@@ -83,8 +66,6 @@ pub const ProcessingRecord = struct {
     source: SourceRef,
     /// Optional headers/metadata
     headers: []const Header,
-    /// Whether this record owns its memory (and should free on deinit)
-    owns_memory: bool,
     /// Tag bitfield — operators set bits to label records for sink routing.
     /// Bit positions are assigned by the pipeline's tag registry.
     tags: u32 = 0,
@@ -95,11 +76,10 @@ pub const ProcessingRecord = struct {
         .event_time_ms = 0,
         .source = SourceRef.EMPTY,
         .headers = &.{},
-        .owns_memory = false,
         .tags = 0,
     };
 
-    /// Create a record with key and value (borrows memory)
+    /// A record with key and value
     pub fn init(key: []const u8, value: []const u8, event_time_ms: i64) ProcessingRecord {
         return .{
             .key = key,
@@ -107,7 +87,6 @@ pub const ProcessingRecord = struct {
             .event_time_ms = event_time_ms,
             .source = SourceRef.EMPTY,
             .headers = &.{},
-            .owns_memory = false,
             .tags = 0,
         };
     }
@@ -120,44 +99,8 @@ pub const ProcessingRecord = struct {
             .event_time_ms = event_time_ms,
             .source = SourceRef.EMPTY,
             .headers = &.{},
-            .owns_memory = false,
             .tags = 0,
         };
-    }
-
-    /// Deep clone the record, allocating all data
-    pub fn clone(self: *const ProcessingRecord, allocator: Allocator) !ProcessingRecord {
-        var cloned_headers: []Header = &.{};
-        if (self.headers.len > 0) {
-            const h = try allocator.alloc(Header, self.headers.len);
-            for (self.headers, 0..) |hdr, i| {
-                h[i] = try hdr.clone(allocator);
-            }
-            cloned_headers = h;
-        }
-
-        return .{
-            .key = if (self.key.len > 0) try allocator.dupe(u8, self.key) else &.{},
-            .value = if (self.value.len > 0) try allocator.dupe(u8, self.value) else &.{},
-            .event_time_ms = self.event_time_ms,
-            .source = try self.source.clone(allocator),
-            .headers = cloned_headers,
-            .owns_memory = true,
-            .tags = self.tags,
-        };
-    }
-
-    /// Free owned memory
-    pub fn deinit(self: *const ProcessingRecord, allocator: Allocator) void {
-        if (!self.owns_memory) return;
-
-        if (self.key.len > 0) allocator.free(self.key);
-        if (self.value.len > 0) allocator.free(self.value);
-        self.source.deinit(allocator);
-        for (self.headers) |hdr| {
-            hdr.deinit(allocator);
-        }
-        if (self.headers.len > 0) allocator.free(self.headers);
     }
 
     /// Check if this record has a key (is keyed)
@@ -194,7 +137,6 @@ test "ProcessingRecord.init creates borrowed record" {
     try std.testing.expectEqualStrings("user:42", rec.key);
     try std.testing.expectEqualStrings("hello", rec.value);
     try std.testing.expectEqual(@as(i64, 1000), rec.event_time_ms);
-    try std.testing.expect(!rec.owns_memory);
     try std.testing.expect(rec.isKeyed());
 }
 
@@ -202,18 +144,4 @@ test "ProcessingRecord.fromValue creates non-keyed record" {
     const rec = ProcessingRecord.fromValue("payload", 2000);
     try std.testing.expectEqualStrings("payload", rec.value);
     try std.testing.expect(!rec.isKeyed());
-}
-
-test "ProcessingRecord.clone deep copies" {
-    const allocator = std.testing.allocator;
-
-    const original = ProcessingRecord.init("key1", "value1", 5000);
-    const cloned = try original.clone(allocator);
-    defer cloned.deinit(allocator);
-
-    try std.testing.expectEqualStrings("key1", cloned.key);
-    try std.testing.expectEqualStrings("value1", cloned.value);
-    try std.testing.expect(cloned.owns_memory);
-    // Ensure they are different memory locations
-    try std.testing.expect(cloned.key.ptr != original.key.ptr);
 }

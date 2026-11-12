@@ -44,8 +44,8 @@ fn write(ctx: *stdx.testing.TestContext) !void {
         var end = at;
         while (end < begun.len and std.ascii.isDigit(begun[end])) end += 1;
         const txn = begun[at..end];
-        try ctx.exec(&.{ "kv", "set", "{t}same", try std.fmt.bufPrint(&b1, "{s}-v3", .{ns}), "--routing-key", "{t}", "--txn", txn, "-n", ns });
-        try ctx.exec(&.{ "kv", "set", "{t}txn", try std.fmt.bufPrint(&b1, "{s}-txn", .{ns}), "--routing-key", "{t}", "--txn", txn, "-n", ns });
+        try ctx.exec(&.{ "kv", "set", "{t}same", try std.fmt.bufPrint(&b1, "{s}-v3", .{ns}), "--txn", txn, "-n", ns });
+        try ctx.exec(&.{ "kv", "set", "{t}txn", try std.fmt.bufPrint(&b1, "{s}-txn", .{ns}), "--txn", txn, "-n", ns });
         const committed = try run(ctx, &.{ "kv", "txn", "commit", txn, "-n", ns }, 0);
         defer testing.allocator.free(committed);
         try testing.expect(std.mem.endsWith(u8, committed, "ops: 2"));

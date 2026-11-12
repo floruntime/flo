@@ -312,6 +312,10 @@ pub const WorkflowHandler = struct {
         /// Absolute time the next poll re-invocation is due (ms; 0 = not polling).
         poll_next_at_ms: i64 = 0,
 
+        /// The current step's start was refused for room and is retried on
+        /// the poll timer; the retries add nothing more to history.
+        waiting_for_room: bool = false,
+
         /// Retry attempt counter for the current step (reset on step transition).
         retry_count: u32 = 0,
 
@@ -1953,10 +1957,14 @@ pub const WorkflowHandler = struct {
                 const held_parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
                 return self.holdStepForRoom(held_parent, step_label, now_ms);
             },
-            .failed => return definition.StepOutcome.execution_failure,
+            .failed => {
+                if (self.runs.getPtr(parent_ns_key)) |p| p.waiting_for_room = false;
+                return definition.StepOutcome.execution_failure;
+            },
         };
 
         const parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
+        parent.waiting_for_room = false;
         // The index is in the target shard's log: known only when that is
         // this shard.
         self.parkForChild(parent, child_rid, step_label, child_name, target_shard_id, now_ms, if (is_local) child_index else 0);
@@ -2007,8 +2015,8 @@ pub const WorkflowHandler = struct {
     /// poll timer and runs the step again, rather than failing it. Its
     /// history says so once per wait.
     fn holdStepForRoom(self: *WorkflowHandler, run: *RunRecord, step_label: []const u8, now_ms: i64) ?[]const u8 {
-        const said = if (run.history.items.len > 0) std.mem.eql(u8, run.history.items[run.history.items.len - 1].event_type_owned, "step_waiting_for_room") else false;
-        if (!said) self.addHistoryEvent(run, "step_waiting_for_room", step_label, now_ms);
+        if (!run.waiting_for_room) self.addHistoryEvent(run, "step_waiting_for_room", step_label, now_ms);
+        run.waiting_for_room = true;
         run.status = .waiting;
         run.poll_next_at_ms = now_ms + STEP_ROOM_RETRY_MS;
         self.armTimer(run, run.poll_next_at_ms);
@@ -2106,7 +2114,8 @@ pub const WorkflowHandler = struct {
             // Track natural index for async resume health recording
             run.plan_executor_natural_idx = natural_idx;
 
-            self.addHistoryEvent(run, "plan_executor_start", executor.name, now_ms);
+            // A retry for room is the same start, already recorded.
+            if (!run.waiting_for_room) self.addHistoryEvent(run, "plan_executor_start", executor.name, now_ms);
 
             // Plan executor action_name stores the raw YAML "run" value
             // (e.g. "@actions/process-payment").  Strip the prefix so the
@@ -2189,12 +2198,10 @@ pub const WorkflowHandler = struct {
         // old findActionShard scan.
         const target_shard_id = self.resolveActionShardId(shard, ns, action_name);
         const is_local = (target_shard_id == shard.id);
-        // Actions are kept by their namespace's name.
-        const namespace = namespaceName(shard, ns) orelse return definition.StepOutcome.execution_failure;
 
-        if (is_local and ActionsHandler.actionExists(shard, namespace, action_name)) {
+        if (is_local and ActionsHandler.actionExists(shard, ns, action_name)) {
             // Local shard: use invokeByName directly (same thread, no threading concerns)
-            return self.invokeActionLocal(shard, run, namespace, action_name, input, step_label, target_shard_id, now_ms);
+            return self.invokeActionLocal(shard, run, ns, action_name, input, step_label, target_shard_id, now_ms);
         }
 
         // The action's shard creates the run on its own thread, through its
@@ -2204,7 +2211,7 @@ pub const WorkflowHandler = struct {
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(ns, action_name);
         const pre_run_id = shard.run_id_gen.next(.action, partition_id, &run_id_buf);
-        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, namespace, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned, can_wait) orelse {
+        const message = ActionsHandler.encodeStartRunMessage(shard.allocator, ns, pre_run_id, action_name, input, run.run_id_owned, run.workflow_name_owned, can_wait) orelse {
             return definition.StepOutcome.execution_failure;
         };
         if (is_local) {
@@ -2244,7 +2251,7 @@ pub const WorkflowHandler = struct {
         self: *WorkflowHandler,
         shard: *Shard,
         run: *RunRecord,
-        namespace: []const u8,
+        ns: NamespaceId,
         action_name: []const u8,
         input: []const u8,
         step_label: []const u8,
@@ -2252,11 +2259,15 @@ pub const WorkflowHandler = struct {
         now_ms: i64,
     ) ?[]const u8 {
         var action_id_buf: [32]u8 = undefined;
-        const invoked = switch (ActionsHandler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf)) {
+        const invoked = switch (ActionsHandler.invokeByName(shard, ns, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf)) {
             .invoked => |i| i,
             .held => return self.holdStepForRoom(run, step_label, now_ms),
-            .missing, .failed => return definition.StepOutcome.execution_failure,
+            .missing, .failed => {
+                run.waiting_for_room = false;
+                return definition.StepOutcome.execution_failure;
+            },
         };
+        run.waiting_for_room = false;
         // The run exists once the invoke applies; `checkPendingActions`
         // resumes this one when it finishes.
         self.parkForAction(run, invoked.id, step_label, action_name, target_shard_id, now_ms, invoked.index);
@@ -2299,7 +2310,7 @@ pub const WorkflowHandler = struct {
     /// the message was lost.
     fn getActionRunResult(shard: *Shard, run_ns_key: []const u8, target_shard_id: ?u16, action_rid: []const u8) ?ActionsHandler.InternalRunResult {
         const tid = target_shard_id orelse shard.id;
-        const ns = namespaceName(shard, keyNamespace(run_ns_key)) orelse return null;
+        const ns = keyNamespace(run_ns_key);
         if (tid == shard.id) {
             if (shard.actions_handler.finished.getPtr(action_rid)) |f| return finishedResult(f.*);
             return ActionsHandler.getRunResult(shard, ns, action_rid);
@@ -3782,13 +3793,6 @@ pub const WorkflowHandler = struct {
         return std.fmt.allocPrint(allocator, "{s}{d}:{s}{d}:{s}{s}", .{ &ns.bytes(), workflow.len, workflow, plan_name.len, plan_name, executor_name });
     }
 
-    /// The name of namespace `ns`, which actions are still kept by: as the
-    /// node's table has it, or, on shard 0 before it publishes a create,
-    /// as this shard does.
-    fn namespaceName(shard: *Shard, ns: NamespaceId) ?[]const u8 {
-        return shard.namespace_handler.table.nameOf(ns) orelse shard.namespace_handler.nameOf(ns);
-    }
-
     fn addHistoryEvent(self: *WorkflowHandler, run: *RunRecord, event_type: []const u8, detail: []const u8, timestamp_ms: i64) void {
         const owned_type = self.allocator.dupe(u8, event_type) catch return;
         const owned_detail = self.allocator.dupe(u8, detail) catch {
@@ -4691,14 +4695,14 @@ fn applyTestActionEntry(shard: *Shard, comptime etype: @import("../storage/ual/e
 /// Register a test action, with one attempt: a run whose lease runs out
 /// times out.
 fn registerTestAction(shard: *Shard, name: []const u8) void {
-    applyTestActionEntry(shard, .action_register, test_action_entries.Register.Value{ .ns = "default", .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 1 }, 1);
+    applyTestActionEntry(shard, .action_register, test_action_entries.Register.Value{ .ns = NamespaceId.default.int(), .name = name, .owner = "", .lease_ms = 300_000, .max_attempts = 1 }, 1);
 }
 
 /// A run a worker took: its deliver applied.
 fn deliverTestAction(shard: *Shard, run_id: []const u8) ?test_action_machine.Run.Value {
-    const run = ActionsHandler.for_tests.run(shard, "default", run_id) orelse return null;
-    applyTestActionEntry(shard, .action_deliver, test_action_entries.Deliver.Value{ .ns = "default", .action = run.action, .run = run_id, .due_ns = run.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 }, run.due_ns);
-    return ActionsHandler.for_tests.run(shard, "default", run_id);
+    const run = ActionsHandler.for_tests.run(shard, .default, run_id) orelse return null;
+    applyTestActionEntry(shard, .action_deliver, test_action_entries.Deliver.Value{ .ns = NamespaceId.default.int(), .action = run.action, .run = run_id, .due_ns = run.due_ns, .holder = "w", .request_key = null, .lease_ms = 300_000 }, run.due_ns);
+    return ActionsHandler.for_tests.run(shard, .default, run_id);
 }
 
 /// Complete a test action run with outcome "success".
@@ -4711,14 +4715,14 @@ fn completeTestAction(shard: *Shard, run_id: []const u8) void {
 /// then settled by it.
 fn completeTestActionWith(shard: *Shard, run_id: []const u8, outcome: []const u8) void {
     const run = deliverTestAction(shard, run_id) orelse return;
-    applyTestActionEntry(shard, .action_settle, test_action_entries.Settle.Value{ .ns = "default", .action = run.action, .run = run_id, .holder = "w", .request_key = null, .deliveries = run.deliveries, .token = run.token, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = "" }, run.delivered_ns + 1);
+    applyTestActionEntry(shard, .action_settle, test_action_entries.Settle.Value{ .ns = NamespaceId.default.int(), .action = run.action, .run = run_id, .holder = "w", .request_key = null, .deliveries = run.deliveries, .token = run.token, .expiry_ns = run.expiry_ns, .outcome = outcome, .result = "" }, run.delivered_ns + 1);
 }
 
 /// A test action run whose only attempt's lease ran out.
 fn timeOutTestAction(shard: *Shard, run_id: []const u8) void {
     const run = deliverTestAction(shard, run_id) orelse return;
     var ib: [test_action_entries.ExpireItem.max_size]u8 = undefined;
-    const item = test_action_entries.ExpireItem.encodeInto(&ib, .{ .ns = "default", .action = run.action, .run = run_id, .expiry_ns = run.expiry_ns, .holder = "w", .request_key = null }) catch unreachable;
+    const item = test_action_entries.ExpireItem.encodeInto(&ib, .{ .ns = NamespaceId.default.int(), .action = run.action, .run = run_id, .expiry_ns = run.expiry_ns, .holder = "w", .request_key = null }) catch unreachable;
     applyTestActionEntry(shard, .action_expire, test_action_entries.Expire.Value{ .items = .{ .bytes = item, .count = 1 } }, run.expiry_ns);
 }
 
@@ -5310,7 +5314,7 @@ test "step executor: past MAX_HELD waiting steps, a step fails at once" {
     var id_buf: [32]u8 = undefined;
     for (0..ActionsHandler.MAX_HELD + 1) |i| {
         const run_id = try std.fmt.bufPrint(&id_buf, "h{d}", .{i});
-        const message = ActionsHandler.encodeStartRunMessage(allocator, "default", run_id, "nope", "{}", "wf-run", "wf", true).?;
+        const message = ActionsHandler.encodeStartRunMessage(allocator, .default, run_id, "nope", "{}", "wf-run", "wf", true).?;
         defer allocator.free(message);
         actions.startRunFromInbox(&shard, shard.id, message);
     }
@@ -5384,7 +5388,7 @@ test "step executor: an action deleted after its invoke was proposed fails the s
     createTestRun(&handler, testKey(.default, "run-x"), "run-x", "test-wf");
     handler.advanceWorkflow(&shard, testKey(.default, "run-x"));
     // The delete comes first in the log: the invoke applies to no action.
-    applyTestActionEntry(&shard, .action_delete, test_action_entries.Delete.Value{ .ns = "default", .name = "step-a" }, 1);
+    applyTestActionEntry(&shard, .action_delete, test_action_entries.Delete.Value{ .ns = NamespaceId.default.int(), .name = "step-a" }, 1);
     _ = shard.applyCommitted();
     try testing.expectEqual(@as(u32, 0), actions.held.count());
     handler.checkPendingActions(&shard);
@@ -5412,7 +5416,7 @@ test "step executor: a start too long to log fails its step, and isn't held" {
     const input = try allocator.alloc(u8, 70 * 1024);
     defer allocator.free(input);
     @memset(input, 'x');
-    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "big", "nope", input, "wf-run", "wf", true).?;
+    const message = ActionsHandler.encodeStartRunMessage(allocator, .default, "big", "nope", input, "wf-run", "wf", true).?;
     defer allocator.free(message);
     actions.startRunFromInbox(&shard, shard.id, message);
     try testing.expectEqual(@as(u32, 0), actions.held.count());
@@ -5428,7 +5432,7 @@ test "step executor: a held start that can't be proposed is tried until the wait
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
 
-    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "stuck", "late", "{}", "wf-run", "wf", true).?;
+    const message = ActionsHandler.encodeStartRunMessage(allocator, .default, "stuck", "late", "{}", "wf-run", "wf", true).?;
     defer allocator.free(message);
     actions.startRunFromInbox(&shard, shard.id, message);
     registerTestAction(&shard, "late");
@@ -6071,7 +6075,7 @@ test "a halted shard's expire duty holds back the starts it holds, and lets them
     defer actions.deinit();
     var shard = try createTestShard(&actions);
     defer destroyTestShard(&shard);
-    const message = ActionsHandler.encodeStartRunMessage(allocator, "default", "held-run", "late", "{}", "wf-run", "wf", true).?;
+    const message = ActionsHandler.encodeStartRunMessage(allocator, .default, "held-run", "late", "{}", "wf-run", "wf", true).?;
     defer allocator.free(message);
     actions.startRunFromInbox(&shard, shard.id, message);
     registerTestAction(&shard, "late");
@@ -6502,7 +6506,7 @@ test "step executor: checkPendingActions handles completed async action" {
     // A completed action run, of an action the transitions resolve.
     registerTestAction(&shard, "step-a");
     registerTestAction(&shard, "step-b");
-    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = "default", .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null, .caller_shard = null }, 1000);
+    applyTestActionEntry(&shard, .action_invoke, test_action_entries.Invoke.Value{ .ns = NamespaceId.default.int(), .action = "step-a", .run = "action-42", .input = "", .labels = null, .source = .workflow, .caller_run = "run-8", .caller_workflow = null, .caller_shard = null }, 1000);
     completeTestAction(&shard, "action-42");
 
     // checkPendingActions should detect the completed action and resume step-a

@@ -292,6 +292,8 @@ pub const ProcessingMetrics = struct {
     checkpoints_completed_total: Atomic(u64) = Atomic(u64).init(0),
     /// Total processing errors
     errors_total: Atomic(u64) = Atomic(u64).init(0),
+    /// Pipeline ticks stopped because a sink's shard was full.
+    ticks_held_total: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn init() ProcessingMetrics {
         return .{};
@@ -336,6 +338,10 @@ pub const ProcessingMetrics = struct {
         _ = self.errors_total.fetchAdd(1, .monotonic);
     }
 
+    pub fn recordHeldTick(self: *ProcessingMetrics) void {
+        _ = self.ticks_held_total.fetchAdd(1, .monotonic);
+    }
+
     pub const Snapshot = struct {
         active_jobs: u64,
         jobs_submitted_total: u64,
@@ -346,6 +352,7 @@ pub const ProcessingMetrics = struct {
         records_dropped_total: u64,
         checkpoints_completed_total: u64,
         errors_total: u64,
+        ticks_held_total: u64,
     };
 
     pub fn snapshot(self: *const ProcessingMetrics) Snapshot {
@@ -359,6 +366,7 @@ pub const ProcessingMetrics = struct {
             .records_dropped_total = self.records_dropped_total.load(.monotonic),
             .checkpoints_completed_total = self.checkpoints_completed_total.load(.monotonic),
             .errors_total = self.errors_total.load(.monotonic),
+            .ticks_held_total = self.ticks_held_total.load(.monotonic),
         };
     }
 };
@@ -1627,6 +1635,10 @@ fn writeProcessingMetrics(writer: anytype, snapshot: ProcessingMetrics.Snapshot)
     try writer.print("# HELP flo_processing_errors_total Total processing errors\n", .{});
     try writer.print("# TYPE flo_processing_errors_total counter\n", .{});
     try writer.print("flo_processing_errors_total {d}\n", .{snapshot.errors_total});
+
+    try writer.print("# HELP flo_processing_ticks_held_total Pipeline ticks stopped because a sink's shard was full\n", .{});
+    try writer.print("# TYPE flo_processing_ticks_held_total counter\n", .{});
+    try writer.print("flo_processing_ticks_held_total {d}\n", .{snapshot.ticks_held_total});
 }
 
 /// Write replication metrics in Prometheus format

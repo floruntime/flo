@@ -134,7 +134,7 @@ test "Reader: a request whose time is spent reads nothing, and says it timed out
     // before any timeout is set.
     var late: Reader = .{ .client = client_mod.Client.init(allocator, "127.0.0.1:1"), .deadline_ms = Reader.nowMs() - 1 };
     defer late.deinit();
-    try std.testing.expectError(error.OutOfTime, late.call(@import("../../../protocol/kv_ops.zig").op("kv.get"), "default", "k", .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }));
+    try std.testing.expectError(error.OutOfTime, late.call(@import("../../../protocol/kv_ops.zig").op("kv.get"), "default", "k", .{ .wait_ms = 0, .wait_for = .exists, .txn = null }));
     try std.testing.expectError(error.NodeDidNotAnswer, readFailed(allocator, "KV scan", error.OutOfTime));
     const answer = try readFailed(allocator, "KV scan", error.ConnectionRefused);
     defer allocator.free(answer);
