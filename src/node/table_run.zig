@@ -127,37 +127,11 @@ fn decodeMessage(buf: []u8, comptime name: []const u8, diag: schema.Diagnostic) 
 // Each decodes the body; one that doesn't decode is answered as the
 // handler refuses it, so these treat it as carrying nothing.
 
-/// The routing hash of a table op routed by key: its `routing_key` when
-/// given, else its key.
-pub fn routeByKey(comptime name: []const u8) dispatcher_mod.PreRouteFn {
-    const Request = op(name).request;
-    return struct {
-        fn route(req: proto.Request) ?u64 {
-            if (req.key.len == 0) return 0;
-            if (@hasField(Request.Value, "routing_key")) {
-                var diag: schema.Diagnostic = .{};
-                if (Request.decodeAll(req.value, &diag)) |body| {
-                    if (body.routing_key) |k| return router.routeNsKey(req.ns_id, k);
-                } else |_| {}
-            }
-            return router.routeNsKey(req.ns_id, req.key);
-        }
-    }.route;
-}
-
-/// The routing hash of a table op routed by `field`: the field's hash when
-/// the body carries it, else null, which leaves the request where it is.
-pub fn routeByField(comptime name: []const u8) dispatcher_mod.PreRouteFn {
-    const o = op(name);
-    const field = o.route.field;
-    return struct {
-        fn route(req: proto.Request) ?u64 {
-            var diag: schema.Diagnostic = .{};
-            const body = o.request.decodeAll(req.value, &diag) catch return null;
-            const v = @field(body, field) orelse return null;
-            return router.routeNsKey(req.ns_id, v);
-        }
-    }.route;
+/// The routing hash of a table op routed by key: its key's {tag}, or the
+/// whole key when it has none.
+pub fn routeByKey(req: proto.Request) ?u64 {
+    if (req.key.len == 0) return 0;
+    return router.routeNsKey(req.ns_id, req.key);
 }
 
 /// Whether a table op's body decodes.
@@ -289,7 +263,6 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "system.runs_page", .field = "room", .tests = &.{"list runs: a shard's page stops before its entries pass the room it was given"} },
     .{ .op = "kv.get", .field = "wait_ms", .tests = &.{"kv table: wait_ms with wait_for exists answers at once when the key exists, else when it is written"} },
     .{ .op = "kv.get", .field = "wait_for", .tests = &.{"kv table: wait_for change waits for the version after the one there"} },
-    .{ .op = "kv.get", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.get", .field = "txn", .tests = &.{
         "kv table: a set in a transaction is buffered, read back inside it, and unseen outside until it commits",
         "kv table: a forged or stale transaction id is refused as no such transaction",
@@ -299,37 +272,27 @@ pub const coverage = [_]struct { op: []const u8, field: []const u8, tests: []con
     .{ .op = "kv.set", .field = "ttl_ms", .tests = &.{"kv table: ttl_ms is written with the value, get answers when it runs out, and none means no expiry"} },
     .{ .op = "kv.set", .field = "condition", .tests = &.{"kv table: condition if_absent and if_present refuse, unrun, when they don't hold"} },
     .{ .op = "kv.set", .field = "cas_version", .tests = &.{"kv table: cas_version must be the key's version, and 0 means absent"} },
-    .{ .op = "kv.set", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.set", .field = "txn", .tests = &.{
         "kv table: a set in a transaction is buffered, read back inside it, and unseen outside until it commits",
         "kv table: a forged or stale transaction id is refused as no such transaction",
     } },
     .{ .op = "kv.delete", .field = "cas_version", .tests = &.{"kv ops: delete answers whether the key existed, and cas_version guards it"} },
-    .{ .op = "kv.delete", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.delete", .field = "txn", .tests = &.{"kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one"} },
     .{ .op = "kv.scan", .field = "limit", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
     .{ .op = "kv.scan", .field = "cursor", .tests = &.{"kv ops: scan pages names by limit and cursor, under a prefix, without reserved keys"} },
-    .{ .op = "kv.history", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.history", .field = "limit", .tests = &.{"kv ops: history answers versions newest first, at most limit; a missing key is not found"} },
     .{ .op = "kv.history", .field = "before_version", .tests = &.{"kv ops: history pages below before_version, and more says older versions follow"} },
-    .{ .op = "kv.mget", .field = "routing_key", .tests = &.{ "Shard: kv.mget with a routing key is answered on that key's shard; without one, each key is found on its own", "kv table: kv.mget routes on its routing key, and stays where it lands without one" } },
     .{ .op = "kv.mget", .field = "keys", .tests = &.{"kv ops: mget answers each key in order, found or not, and next when they don't all fit"} },
     .{ .op = "kv.incr", .field = "delta", .tests = &.{"kv ops: incr adds delta to a counter from 0, and refuses a value that isn't one or a sum past i64"} },
-    .{ .op = "kv.incr", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.incr", .field = "txn", .tests = &.{"kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one"} },
     .{ .op = "kv.expire", .field = "ttl_ms", .tests = &.{"kv ops: expire sets a TTL from now, 0 clears it, and cas_version guards it; a missing key is not found"} },
     .{ .op = "kv.expire", .field = "cas_version", .tests = &.{"kv ops: expire sets a TTL from now, 0 clears it, and cas_version guards it; a missing key is not found"} },
-    .{ .op = "kv.expire", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.expire", .field = "txn", .tests = &.{"kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one"} },
-    .{ .op = "kv.exists", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.exists", .field = "txn", .tests = &.{"kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one"} },
     .{ .op = "kv.json.get", .field = "path", .tests = &.{"kv ops: json_get, json_set and json_del work at a path, and $ is the whole document"} },
-    .{ .op = "kv.json.get", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.json.set", .field = "path", .tests = &.{"kv ops: json_get, json_set and json_del work at a path, and $ is the whole document"} },
     .{ .op = "kv.json.set", .field = "document", .tests = &.{"kv ops: json_get, json_set and json_del work at a path, and $ is the whole document"} },
-    .{ .op = "kv.json.set", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.json.del", .field = "path", .tests = &.{"kv ops: json_get, json_set and json_del work at a path, and $ is the whole document"} },
-    .{ .op = "kv.json.del", .field = "routing_key", .tests = &.{"kv table: routing_key routes the request in place of its key"} },
     .{ .op = "kv.txn.commit", .field = "txn", .tests = &.{ "kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one", "kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it" } },
     .{ .op = "kv.txn.rollback", .field = "txn", .tests = &.{"kv ops: rollback drops a transaction's writes, and then neither rollback nor commit finds it"} },
     .{ .op = "worker.list", .field = "limit", .tests = &.{ "worker.list: pages over shards whose ids interleave give every worker once, in id order, whatever the limit", "Shard: worker.list on a node of two shards lists both shards' workers, in id order and paged" } },

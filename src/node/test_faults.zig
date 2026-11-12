@@ -28,6 +28,9 @@ pub const Fault = enum {
     /// Panics answering a read that waited for the key: only a node with
     /// such a reader reaches it, so nothing records it.
     panic_answering_waiter,
+    /// Opens a snapshot window at the set's entry, suspending apply for a
+    /// while on every replica, as a snapshot bar does.
+    snapshot_window,
 
     pub fn key(f: Fault) []const u8 {
         return switch (f) {
@@ -37,6 +40,7 @@ pub const Fault = enum {
             .panic_after_apply => "flo-test-fault-panic-after-apply",
             .panic_leader_step => "flo-test-fault-panic-leader-step",
             .panic_answering_waiter => "flo-test-fault-panic-answering-waiter",
+            .snapshot_window => "flo-test-fault-snapshot-window",
         };
     }
 };
@@ -72,6 +76,6 @@ pub fn crash(f: Fault) void {
             const p: *allowzero volatile u8 = @ptrFromInt(0);
             p.* = 1;
         },
-        .halt, .panic_after_apply, .panic_leader_step, .panic_answering_waiter => {},
+        .halt, .panic_after_apply, .panic_leader_step, .panic_answering_waiter, .snapshot_window => {},
     }
 }

@@ -113,7 +113,7 @@ test "e2e/namespace: writes cannot create namespaces past the limit, and the ref
     var buf: [16]u8 = undefined;
     for (0..4096) |i| {
         const ns = if (i == 0) "default" else try std.fmt.bufPrint(&buf, "ns{d}", .{i});
-        var resp = try cli.kv.set(&client, ns, "k", .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        var resp = try cli.kv.set(&client, ns, "k", .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         defer resp.deinit();
         try testing.expectEqual(.ok, resp.status);
     }

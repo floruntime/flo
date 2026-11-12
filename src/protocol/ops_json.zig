@@ -107,15 +107,7 @@ fn writeOp(jw: *Stringify, comptime op: ops.Op) Stringify.Error!void {
     try jw.objectField("creates");
     try jw.write(op.creates);
     try jw.objectField("route");
-    switch (op.route) {
-        .field => |name| {
-            try jw.beginObject();
-            try jw.objectField("field");
-            try jw.write(name);
-            try jw.endObject();
-        },
-        else => try jw.write(@tagName(op.route)),
-    }
+    try jw.write(@tagName(op.route));
     try jw.objectField("fanout");
     try jw.write(@tagName(op.fanout));
     try jw.objectField("wait");

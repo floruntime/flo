@@ -136,7 +136,7 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
         while (from < n) {
             var list = Keys.Builder.init(keys_buf);
             for (names[from..n]) |name| if (!(try list.add(name))) break;
-            var got = reader.call(kv_ops.op("kv.mget"), namespace, "", .{ .keys = list.value(), .routing_key = null }) catch |err|
+            var got = reader.call(kv_ops.op("kv.mget"), namespace, "", .{ .keys = list.value() }) catch |err|
                 return try readFailed(allocator, "KV mget", err);
             defer got.deinit();
             if (got.isError()) return try h.jsonError(allocator, got.errorMessage());
@@ -184,7 +184,7 @@ pub fn getKVKeys(allocator: Allocator, namespace: []const u8, query_string: ?[]c
 pub fn getKVKeyValue(allocator: Allocator, namespace: []const u8, key: []const u8, ctx: *DashboardContext) ![]const u8 {
     var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV get", err);
     defer reader.deinit();
-    var got = reader.call(kv_ops.op("kv.get"), namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch |err|
+    var got = reader.call(kv_ops.op("kv.get"), namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .txn = null }) catch |err|
         return try readFailed(allocator, "KV get", err);
     defer got.deinit();
 
@@ -226,7 +226,7 @@ pub fn getKVKeyHistory(allocator: Allocator, namespace: []const u8, key: []const
 
     var reader = Reader.open(allocator, ctx) catch |err| return try readFailed(allocator, "KV history", err);
     defer reader.deinit();
-    var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .before_version = before_version, .routing_key = null }) catch |err|
+    var got = reader.call(kv_ops.op("kv.history"), namespace, key, .{ .limit = limit, .before_version = before_version }) catch |err|
         return try readFailed(allocator, "KV history", err);
     defer got.deinit();
 
@@ -294,7 +294,7 @@ pub fn putKVKey(allocator: Allocator, namespace: []const u8, key: []const u8, bo
         .string => |s| value = s,
         else => {},
     };
-    var opts: client_mod.kv.set_op.request.Value = .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null };
+    var opts: client_mod.kv.set_op.request.Value = .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null };
     // A TTL that can't be read is refused: ignored, the key would never
     // expire.
     if (obj_in.get("ttl_ms")) |t| switch (t) {
@@ -339,7 +339,7 @@ pub fn deleteKVKey(allocator: Allocator, namespace: []const u8, key: []const u8,
     var client = loopback.connect(allocator, ctx) catch
         return try h.jsonError(allocator, "Loopback connect failed");
     defer client.deinit();
-    var resp = client_mod.kv.call(&client, "kv.delete", namespace, key, .{ .cas_version = null, .routing_key = null, .txn = null }) catch
+    var resp = client_mod.kv.call(&client, "kv.delete", namespace, key, .{ .cas_version = null, .txn = null }) catch
         return try h.jsonError(allocator, "KV delete failed");
     defer resp.deinit();
     if (resp.isError()) return try h.jsonError(allocator, resp.errorMessage());

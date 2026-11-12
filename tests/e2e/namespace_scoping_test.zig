@@ -118,7 +118,7 @@ test "e2e/scoping: a transaction is committed or rolled back only from its own n
         try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, r.stderr, "\n"), "[not_found/no_such_transaction]"));
     }
     // A write in it from elsewhere learns no more: not found.
-    var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "--routing-key", "k", "--txn", tid, "-n", "b" });
+    var put = try ctx.cli.run(&.{ "kv", "set", "k", "v", "--txn", tid, "-n", "b" });
     defer put.deinit();
     try testing.expectEqual(@as(u8, 1), put.exit_code);
     try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, put.stderr, "\n"), "[not_found/no_such_transaction]"));
