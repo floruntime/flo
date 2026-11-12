@@ -42,7 +42,8 @@ pub const Token = ae.Token;
 pub const LeaseMs = ae.LeaseMs;
 
 /// A group of a stream, with its lease and attempts. A create of a group
-/// that exists changes nothing.
+/// that exists with these settings changes nothing; with others it is
+/// refused, naming the group's own.
 pub const Create = Record(&.{
     .{ .name = "ns", .T = NamespaceId },
     .{ .name = "stream", .T = StreamName },

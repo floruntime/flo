@@ -297,7 +297,7 @@ pub fn groupRead(
 
 /// Room for one read's worth of records (at most a read's count) plus
 /// group, consumer and delivery.
-const ITEM_LIST_BYTES = 2 + 1024 + 2 + 1024 + 8 + 8 + 4 + 20 * @as(usize, @import("../../protocol/proto.zig").MAX_STREAM_READ_RECORDS);
+const ITEM_LIST_BYTES = 2 + 1024 + 2 + 1024 + 8 + 8 + 4 + 20 * @as(usize, @import("../../protocol/proto.zig").MAX_STREAM_READ_RECORDS) + 2 + 1024;
 
 /// A record a report names: its id, and the deliveries it came with.
 pub const GroupItem = struct { id: StreamID, deliveries: u32 };
@@ -335,12 +335,12 @@ pub fn groupReport(
         try writer.writeU64(it.id.sequence);
         try writer.writeU32(it.deliveries);
     }
-    var options_buf: [64 + 1024]u8 = undefined;
+    var options_buf: [64]u8 = undefined;
     var builder = proto.OptionsBuilder.init(&options_buf);
     if (kind == .nack) {
+        try writer.writeLengthPrefixed(u16, nack.error_text);
         if (nack.delay_ms > 0) try builder.addU64(.delay_ms, nack.delay_ms);
         if (nack.dead) try builder.addFlag(.dead);
-        if (nack.error_text.len > 0) try builder.addString(.error_text, nack.error_text);
     }
     const op: proto.OpCode = switch (kind) {
         .ack => .stream_group_ack,

@@ -728,6 +728,8 @@ fn report(view: *View, out: *Result, p: anytype, kind: Report, stamp: u64) Apply
     const found = try view.get(Metas, mk);
     const rec = try streamRec(view, streamOf(ns, p.stream));
     var meta = if (found) |m| (if (live(m.v, rec) and std.mem.eql(u8, m.v.stream, p.stream) and std.mem.eql(u8, m.v.group, p.group)) m else null) else null;
+    // No such group: the whole report is refused, not each record gone.
+    if (meta == null) return out.refuse(.not_found, .not_found, NO_GROUP);
     var applied: u32 = 0;
     var to: u64 = 0;
     // Refused items are said after the count: room for each, then filled.
@@ -1240,6 +1242,21 @@ test "group machine: a deliver takes no more than its leader chose: the ready re
     try testing.expectEqual(@as(u32, 3), answerInt(u32, r2));
     try testing.expectEqual(Status.ready, t.item("s", "g", first).?.status);
     try testing.expectEqual(@as(u32, 1), t.item("s", "g", sid(first.timestamp_ms, first.sequence + 1)).?.deliveries);
+}
+
+test "group machine: a report to a group that isn't there is refused not_found, not answered record by record" {
+    var t = TestGroups.init(testing.allocator);
+    defer t.deinit();
+    _ = try t.append("s", 100, 2);
+    const d = try deliver(&t, 2, 1 << 20, "c1", 10 * ms);
+    var buf: [512]u8 = undefined;
+    const items = try itemsOf(&buf, &t, d.records[0..2]);
+    // Another group's name, and then this one's once it's deleted.
+    for ([_][]const u8{ "other", "g" }) |group| {
+        if (std.mem.eql(u8, group, "g")) _ = try t.apply(.group_delete, ge.Delete.Value{ .ns = NS.int(), .stream = "s", .group = "g" }, 20 * ms);
+        const r = try t.apply(.group_settle, ge.Settle.Value{ .ns = NS.int(), .stream = "s", .group = group, .holder = "c1", .token = d.token, .expiry_ns = 0, .items = items }, 21 * ms);
+        try testing.expectEqual(@import("../protocol/proto.zig").StatusCode.not_found, r.refused().?.status);
+    }
 }
 
 test "group machine: acking one record of an append acks only that record" {

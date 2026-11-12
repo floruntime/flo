@@ -3455,7 +3455,14 @@ pub const Shard = struct {
     /// Whether `op` runs within a namespace: every op but the node's own
     /// (system, namespace, cluster) and those another shard sends.
     fn namespaced(op: u16) bool {
-        return op > ops.Family.range(.cluster).hi and !table.isInternal(op) and !table.serverScoped(op);
+        return op > ops.Family.range(.cluster).hi and !table.isInternal(op) and !table.serverScoped(op) and !removedGroupOp(op);
+    }
+
+    /// A group op that's gone is answered with what replaces it, whatever
+    /// namespace it names.
+    fn removedGroupOp(op: u16) bool {
+        for (group_handler.REMOVED) |r| if (op == @backingInt(r)) return true;
+        return false;
     }
 
     /// A read in a namespace this node's table doesn't have. The table
@@ -15128,7 +15135,9 @@ test "Shard: a nack wakes a parked group read, and the next read serves the nack
     std.mem.writeInt(u64, nack[off + 20 ..][0..8], ms, .little);
     std.mem.writeInt(u64, nack[off + 28 ..][0..8], seq, .little);
     std.mem.writeInt(u32, nack[off + 36 ..][0..4], 1, .little);
-    off += 40;
+    // No error: [error_len:u16] 0.
+    std.mem.writeInt(u16, nack[off + 40 ..][0..2], 0, .little);
+    off += 42;
     shard.runRequest(conn, try ParkTest.request(.stream_group_nack, 4, "app", "s", nack[0..off], ""), .client);
     try ParkTest.ack(&shard);
     try ParkTest.ack(&shard);
