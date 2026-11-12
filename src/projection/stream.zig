@@ -20,11 +20,55 @@ const Allocator = std.mem.Allocator;
 const entry_mod = @import("../storage/ual/entry.zig");
 const router_mod = @import("router.zig");
 const stream_id_mod = @import("../stream/stream_id.zig");
+const node_router = @import("../node/router.zig");
+const MAX_QUALIFIED_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 
 const Entry = entry_mod.Entry;
 const EntryType = entry_mod.EntryType;
 const CommandPayload = entry_mod.CommandPayload;
 pub const StreamID = stream_id_mod.StreamID;
+
+/// A stream's records, as the projection keys them: its namespace's id, then
+/// its name's hash (`router.nsNameKey`). Leading with the id, two namespaces'
+/// streams never share state, even when their names' hashes collide.
+pub const StreamKey = [12]u8;
+
+pub fn streamKey(ns: NamespaceId, name: []const u8) StreamKey {
+    return node_router.nsNameKey(ns, name);
+}
+
+/// The longest name key: an id, then a stream's name or `stream\x00group`.
+pub const MAX_NAME_KEY = 4 + MAX_QUALIFIED_KEY;
+
+/// A stream's name and settings key: its namespace's id, then its name.
+/// The id is fixed width, so one namespace's names never prefix another's,
+/// and a namespace's streams are the keys with its id as their first four
+/// bytes. Null for a name too long to be one.
+pub fn nameKey(buf: *[MAX_NAME_KEY]u8, ns: NamespaceId, name: []const u8) ?[]const u8 {
+    if (name.len > MAX_QUALIFIED_KEY) return null;
+    buf[0..4].* = ns.bytes();
+    @memcpy(buf[4..][0..name.len], name);
+    return buf[0 .. 4 + name.len];
+}
+
+/// A consumer group's key: the id, the stream's name, a NUL, the group's
+/// name. A group belongs to one stream, and neither name may hold a NUL,
+/// so the first NUL ends the stream's part. A cg_commit or cg_delete
+/// entry carries the key past the id; the entry carries the id itself.
+/// Null for names too long to be one.
+pub fn groupKey(buf: *[MAX_NAME_KEY]u8, ns: NamespaceId, stream: []const u8, group: []const u8) ?[]const u8 {
+    if (stream.len + 1 + group.len > MAX_QUALIFIED_KEY) return null;
+    buf[0..4].* = ns.bytes();
+    @memcpy(buf[4..][0..stream.len], stream);
+    buf[4 + stream.len] = 0;
+    @memcpy(buf[5 + stream.len ..][0..group.len], group);
+    return buf[0 .. 5 + stream.len + group.len];
+}
+
+/// The namespace a name or group key is in.
+pub fn keyNamespace(key: []const u8) NamespaceId {
+    return .of(std.mem.readInt(u32, key[0..4], .big));
+}
 
 /// What a trim removes: every record up to a boundary id, or every record
 /// older than an age. An age is resolved where the trim applies, against
@@ -333,22 +377,22 @@ pub const StreamState = struct {
     /// appends, so this is the last record of the last append it cut, which
     /// can lie past the trim's own bound. MIN until a trim removes one.
     removed_through: StreamID,
-    /// Stream name hash (for cross-referencing).
-    name_hash: u64,
+    /// The stream's key in its projection.
+    key: StreamKey,
     /// Running sum of `record_count` over live entries — the logical record
     /// count, maintained incrementally so `stream info` stays O(1).
     total_records: u64,
     /// Running sum of `byte_len` over live entries.
     total_bytes: u64,
 
-    pub fn init(name_hash: u64) StreamState {
+    pub fn init(key: StreamKey) StreamState {
         return .{
             .id_gen = StreamIdGenerator.init(),
             .records = .empty,
             .first_id = StreamID.MIN,
             .last_id = StreamID.MIN,
             .removed_through = StreamID.MIN,
-            .name_hash = name_hash,
+            .key = key,
             .total_records = 0,
             .total_bytes = 0,
         };
@@ -1078,8 +1122,6 @@ pub const GroupCommit = struct {
 /// Stream metadata — partition count, retention policy, and other per-stream config.
 pub const StreamMetadata = struct {
     partition_count: u32 = 1,
-    /// Pre-computed name hash for background trim lookups.
-    name_hash: u64 = 0,
     /// Retention: max age in seconds (0 = forever).
     retention_age_s: u64 = 0,
     /// Retention: max record count (0 = unlimited).
@@ -1100,28 +1142,20 @@ pub const StreamMetadata = struct {
 pub const StreamProjection = struct {
     allocator: Allocator,
 
-    /// Consumer groups by name.
+    /// Consumer groups by `groupKey`.
     groups: std.StringHashMap(ConsumerGroup),
 
-    /// Registered stream names (for listing).
+    /// Registered streams, by `nameKey` (for listing).
     stream_names: std.StringHashMap(void),
 
-    /// Stream metadata (partition count, etc.).
+    /// Stream metadata (partition count, etc.), by `nameKey`.
     stream_metadata: std.StringHashMap(StreamMetadata),
 
     /// Per-stream state — each stream has its own StreamID space.
-    streams: std.AutoHashMap(u64, StreamState),
+    streams: std.AutoHashMap(StreamKey, StreamState),
 
     /// Stats.
     stats: Stats,
-
-    /// Optional namespace resolver (hash → name), wired at shard init. A
-    /// stream_append entry carries only the namespace hash, so on replay the
-    /// apply path cannot recover the namespace string on its own. Without it,
-    /// recovered streams register under their bare name and are invisible to
-    /// `stream list`, which filters on the namespace prefix.
-    ns_resolver: ?*const fn (ctx: *anyopaque, ns: NamespaceId) ?[]const u8 = null,
-    ns_resolver_ctx: ?*anyopaque = null,
 
     pub const Stats = struct {
         appended: u64 = 0,
@@ -1138,7 +1172,7 @@ pub const StreamProjection = struct {
             .groups = std.StringHashMap(ConsumerGroup).init(allocator),
             .stream_names = std.StringHashMap(void).init(allocator),
             .stream_metadata = std.StringHashMap(StreamMetadata).init(allocator),
-            .streams = std.AutoHashMap(u64, StreamState).init(allocator),
+            .streams = std.AutoHashMap(StreamKey, StreamState).init(allocator),
             .stats = .{},
         };
     }
@@ -1254,34 +1288,34 @@ pub const StreamProjection = struct {
     // ─── PEL-aware Stream Operations ───────────────────────────────────────
 
     /// Get or create per-stream state for a given name hash.
-    pub fn getOrCreateStream(self: *StreamProjection, name_hash: u64) !*StreamState {
-        const gop = try self.streams.getOrPut(name_hash);
+    pub fn getOrCreateStream(self: *StreamProjection, key: StreamKey) !*StreamState {
+        const gop = try self.streams.getOrPut(key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = StreamState.init(name_hash);
+            gop.value_ptr.* = StreamState.init(key);
         }
         return gop.value_ptr;
     }
 
     /// Append anchored to the originating UAL entry's timestamp (ms), so
     /// replay reproduces identical StreamIDs.
-    pub fn appendToStreamAt(self: *StreamProjection, name_hash: u64, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
-        const ss = try self.getOrCreateStream(name_hash);
+    pub fn appendToStreamAt(self: *StreamProjection, key: StreamKey, ual_index: u64, partition_index: u32, ts_ms: u64, record_count: u32, byte_len: u32) !StreamID {
+        const ss = try self.getOrCreateStream(key);
         const id = try ss.appendAt(self.allocator, ual_index, partition_index, ts_ms, record_count, byte_len);
         self.stats.appended += 1;
         return id;
     }
 
     /// Read records from a stream with IDs in (after_id, to_id].
-    pub fn readStreamRange(self: *StreamProjection, name_hash: u64, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn readStreamRange(self: *StreamProjection, key: StreamKey, after_id: StreamID, to_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(key) orelse return 0;
         const n = ss.readRange(after_id, to_id, filter_partition, buf);
         self.stats.reads += n;
         return n;
     }
 
     /// Read records from a stream after a given ID (exclusive).
-    pub fn readStreamAfter(self: *StreamProjection, name_hash: u64, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn readStreamAfter(self: *StreamProjection, key: StreamKey, after_id: StreamID, filter_partition: ?u32, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(key) orelse return 0;
         const n = ss.readAfter(after_id, filter_partition, buf);
         self.stats.reads += n;
         return n;
@@ -1290,73 +1324,73 @@ pub const StreamProjection = struct {
     /// Resolve specific StreamIDs back to records (preserves input order, skips
     /// missing IDs). Used by `stream_group_claim` to turn claimed PEL IDs into
     /// full records (payload + headers) for the wire response.
-    pub fn readStreamByIds(self: *StreamProjection, name_hash: u64, ids: []const StreamID, buf: []StreamRecord) usize {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn readStreamByIds(self: *StreamProjection, key: StreamKey, ids: []const StreamID, buf: []StreamRecord) usize {
+        const ss = self.streams.getPtr(key) orelse return 0;
         const n = ss.readByIds(ids, buf);
         self.stats.reads += n;
         return n;
     }
 
     /// Get the last StreamID for a stream.
-    pub fn streamLastId(self: *const StreamProjection, name_hash: u64) StreamID {
-        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+    pub fn streamLastId(self: *const StreamProjection, key: StreamKey) StreamID {
+        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         return ss.last_id;
     }
 
     /// Get the first StreamID for a stream.
-    pub fn streamFirstId(self: *const StreamProjection, name_hash: u64) StreamID {
-        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+    pub fn streamFirstId(self: *const StreamProjection, key: StreamKey) StreamID {
+        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         return ss.first_id;
     }
 
     /// The last record a trim removed from a stream (`StreamState.removed_through`).
-    pub fn streamRemovedThrough(self: *const StreamProjection, name_hash: u64) StreamID {
-        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+    pub fn streamRemovedThrough(self: *const StreamProjection, key: StreamKey) StreamID {
+        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         return ss.removed_through;
     }
 
     /// The ids of a stream's records after `after_id`, one per record.
-    pub fn streamIdsAfter(self: *const StreamProjection, name_hash: u64, after_id: StreamID, out: []StreamID) usize {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn streamIdsAfter(self: *const StreamProjection, key: StreamKey, after_id: StreamID, out: []StreamID) usize {
+        const ss = self.streams.getPtr(key) orelse return 0;
         return ss.idsAfter(after_id, out);
     }
 
     /// Get the record count for a stream.
-    pub fn streamRecordCount(self: *const StreamProjection, name_hash: u64) usize {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn streamRecordCount(self: *const StreamProjection, key: StreamKey) usize {
+        const ss = self.streams.getPtr(key) orelse return 0;
         return ss.count();
     }
 
     /// Logical record count — sums each append batch's contents. This is the
     /// number a user sees from `stream read`, and what `stream info` reports.
-    pub fn streamLogicalCount(self: *const StreamProjection, name_hash: u64) u64 {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn streamLogicalCount(self: *const StreamProjection, key: StreamKey) u64 {
+        const ss = self.streams.getPtr(key) orelse return 0;
         return ss.logicalCount();
     }
 
     /// Stored size of a stream's live records, in bytes.
-    pub fn streamByteSize(self: *const StreamProjection, name_hash: u64) u64 {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn streamByteSize(self: *const StreamProjection, key: StreamKey) u64 {
+        const ss = self.streams.getPtr(key) orelse return 0;
         return ss.byteSize();
     }
 
     /// Trim a stream — remove records with IDs <= up_to_id.
-    pub fn trimStream(self: *StreamProjection, name_hash: u64, up_to_id: StreamID) u64 {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn trimStream(self: *StreamProjection, key: StreamKey, up_to_id: StreamID) u64 {
+        const ss = self.streams.getPtr(key) orelse return 0;
         const trimmed = ss.trim(self.allocator, up_to_id);
         self.stats.trimmed += trimmed;
         return trimmed;
     }
 
     /// The logical records a trim to `up_to_id` would remove, removing none.
-    pub fn trimCount(self: *const StreamProjection, name_hash: u64, up_to_id: StreamID) u64 {
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+    pub fn trimCount(self: *const StreamProjection, key: StreamKey, up_to_id: StreamID) u64 {
+        const ss = self.streams.getPtr(key) orelse return 0;
         return ss.trimExtent(up_to_id).records;
     }
 
     /// The first id left after a trim to `up_to_id`; MIN when none would be.
-    pub fn firstIdAfterTrim(self: *const StreamProjection, name_hash: u64, up_to_id: StreamID) StreamID {
-        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+    pub fn firstIdAfterTrim(self: *const StreamProjection, key: StreamKey, up_to_id: StreamID) StreamID {
+        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         const cut = ss.trimExtent(up_to_id).entries;
         if (cut >= ss.records.items.len) return StreamID.MIN;
         return ss.records.items[cut].id;
@@ -1365,8 +1399,8 @@ pub const StreamProjection = struct {
     /// Resolve the StreamID of the Nth record in a stream (1-indexed).
     /// Used by trim-by-count to convert a count to a deterministic StreamID
     /// before persisting through Raft.
-    pub fn resolveNthRecordId(self: *const StreamProjection, name_hash: u64, count: u64) StreamID {
-        const ss = self.streams.getPtr(name_hash) orelse return StreamID.MIN;
+    pub fn resolveNthRecordId(self: *const StreamProjection, key: StreamKey, count: u64) StreamID {
+        const ss = self.streams.getPtr(key) orelse return StreamID.MIN;
         const records = ss.records.items;
         if (records.len == 0 or count == 0) return StreamID.MIN;
         // `count` is in logical records, so walk batch contents rather than
@@ -1391,46 +1425,30 @@ pub const StreamProjection = struct {
         return cut;
     }
 
-    /// Delete a stream entirely: drop its records (by `name_hash`) plus its name
-    /// registry and metadata entries, and cascade-delete its consumer groups.
-    /// Mirror of `registerStream` / `trimStream`.
+    /// Delete a stream entirely: drop its records (by `key`) plus its name
+    /// registry and metadata entries (by `name_key`, its `nameKey`), and
+    /// cascade-delete its consumer groups. Mirror of `registerStream` /
+    /// `trimStream`.
     ///
-    /// Consumer groups are per-(stream, group): their key is
-    /// `qualifyKey(ns, stream) ++ "\x00" ++ group` (see `ns_keys.qualifyGroupKey`),
-    /// so every group whose key has `qualified_name ++ "\x00"` as a prefix belongs
-    /// to this stream and is removed with it. Because `deleteStream` runs on all
-    /// four rebuild paths (leader live, follower replication, restart replay,
+    /// Consumer groups are per-(stream, group): a group's key is the
+    /// stream's name key, a NUL, then the group (`groupKey`), so every group
+    /// whose key has `name_key ++ "\x00"` as a prefix belongs to this stream
+    /// and is removed with it. Because `deleteStream` runs on all four
+    /// rebuild paths (leader live, follower replication, restart replay,
     /// projection apply), this cleanup is durable and replicated without a
-    /// separate cg_delete entry.
-    ///
-    /// The name registry and the metadata map are both keyed by the
-    /// namespace-qualified name, on the live and replay paths alike; the raw
-    /// form is swept too, so an entry written under a bare name is not left
-    /// behind. Returns true if the stream existed.
-    pub fn deleteStream(self: *StreamProjection, name_hash: u64, raw_name: []const u8, qualified_name: []const u8) bool {
+    /// separate cg_delete entry. Returns true if the stream existed.
+    pub fn deleteStream(self: *StreamProjection, key: StreamKey, name_key: []const u8) bool {
         var existed = false;
-        if (self.streams.fetchRemove(name_hash)) |kv| {
+        if (self.streams.fetchRemove(key)) |kv| {
             var ss = kv.value;
             ss.deinit(self.allocator);
             existed = true;
         }
-        if (self.stream_names.fetchRemove(qualified_name)) |kv| {
+        if (self.stream_names.fetchRemove(name_key)) |kv| {
             self.allocator.free(@constCast(kv.key));
             existed = true;
         }
-        if (!std.mem.eql(u8, raw_name, qualified_name)) {
-            if (self.stream_names.fetchRemove(raw_name)) |kv| {
-                self.allocator.free(@constCast(kv.key));
-                existed = true;
-            }
-        }
-        // Metadata is keyed by the qualified name; the raw form is swept too,
-        // so an entry written under a bare name is not left behind.
-        if (self.stream_metadata.fetchRemove(qualified_name)) |kv| {
-            self.allocator.free(@constCast(kv.key));
-            existed = true;
-        }
-        if (self.stream_metadata.fetchRemove(raw_name)) |kv| {
+        if (self.stream_metadata.fetchRemove(name_key)) |kv| {
             self.allocator.free(@constCast(kv.key));
             existed = true;
         }
@@ -1445,9 +1463,9 @@ pub const StreamProjection = struct {
             var it = self.groups.keyIterator();
             while (it.next()) |k| {
                 const gk = k.*;
-                if (gk.len > qualified_name.len and
-                    gk[qualified_name.len] == 0 and
-                    std.mem.startsWith(u8, gk, qualified_name))
+                if (gk.len > name_key.len and
+                    gk[name_key.len] == 0 and
+                    std.mem.startsWith(u8, gk, name_key))
                 {
                     match = gk;
                     break;
@@ -1469,9 +1487,9 @@ pub const StreamProjection = struct {
     /// The whole appends a group read of `count` records would deliver,
     /// delivering none: the reply is built from these before the pending
     /// list takes them.
-    pub fn groupPeek(self: *StreamProjection, group_name: []const u8, name_hash: u64, count: usize, buf: []StreamRecord) !usize {
+    pub fn groupPeek(self: *StreamProjection, group_name: []const u8, key: StreamKey, count: usize, buf: []StreamRecord) !usize {
         const group = self.groups.getPtr(group_name) orelse return error.GroupNotFound;
-        const ss = self.streams.getPtr(name_hash) orelse return 0;
+        const ss = self.streams.getPtr(key) orelse return 0;
         const read_n = ss.readAfter(group.last_delivered_id, null, buf[0..@min(count, buf.len)]);
         return wholeEntriesWithin(buf[0..read_n], count);
     }
@@ -1485,8 +1503,8 @@ pub const StreamProjection = struct {
         if (through.greaterThan(group.last_delivered_id)) group.last_delivered_id = through;
     }
 
-    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, name_hash: u64, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
-        const n = try self.groupPeek(group_name, name_hash, count, buf);
+    pub fn groupDeliver(self: *StreamProjection, group_name: []const u8, key: StreamKey, consumer_id: []const u8, count: usize, now_ms: u64, buf: []StreamRecord) !usize {
+        const n = try self.groupPeek(group_name, key, count, buf);
         const through = if (n > 0) lastRecordOf(buf[n - 1]) else StreamID.MIN;
         try self.groupDeliverRecords(group_name, consumer_id, buf[0..n], through, now_ms);
         return n;
@@ -1603,19 +1621,7 @@ pub const StreamProjection = struct {
 
     // ─── Stream Name Registry ──────────────────────────────────────────────
 
-    /// Register a stream name. No-op if already registered.
-    /// Resolve a namespace hash to its name via the wired resolver, falling
-    /// back to "default" (the implicit namespace, which is never registered).
-    /// The namespace an entry's hash names, or null when the shard has
-    /// never bound it: the log is missing the namespace's create or bind, and
-    /// the applier halts rather than file the entry under another namespace.
-    /// Without a resolver (a projection on its own, in a test), every hash
-    /// is "default".
-    pub fn resolveNamespace(self: *const StreamProjection, ns: NamespaceId) ?[]const u8 {
-        const resolver = self.ns_resolver orelse return "default";
-        return resolver(self.ns_resolver_ctx.?, ns);
-    }
-
+    /// Register a stream by its `nameKey`. No-op if already registered.
     pub fn registerStream(self: *StreamProjection, name: []const u8) !void {
         if (name.len == 0) return;
         const gop = try self.stream_names.getOrPut(name);
@@ -1637,7 +1643,6 @@ pub const StreamProjection = struct {
         }
         gop.value_ptr.* = .{
             .partition_count = @max(1, meta.partition_count),
-            .name_hash = meta.name_hash,
             .retention_age_s = meta.retention_age_s,
             .retention_count = meta.retention_count,
             .retention_bytes = meta.retention_bytes,
@@ -1650,14 +1655,17 @@ pub const StreamProjection = struct {
         return 1;
     }
 
-    /// Scan registered stream names into a buffer. Returns the count written.
-    /// Returns borrowed references into the HashMap (zero-copy, valid until mutation).
-    pub fn scanStreamNames(self: *const StreamProjection, buf: [][]const u8) usize {
+    /// Namespace `ns`'s stream names into a buffer, past the id that leads
+    /// their keys. Returns the count written. Borrowed from the map (valid
+    /// until it changes).
+    pub fn scanStreamNames(self: *const StreamProjection, ns: NamespaceId, buf: [][]const u8) usize {
+        const prefix = ns.bytes();
         var count: usize = 0;
         var it = self.stream_names.keyIterator();
         while (it.next()) |key| {
             if (count >= buf.len) break;
-            buf[count] = key.*;
+            if (!std.mem.startsWith(u8, key.*, &prefix)) continue;
+            buf[count] = key.*[prefix.len..];
             count += 1;
         }
         return count;
@@ -1702,6 +1710,55 @@ const testing = std.testing;
 /// The stamp test appends take: ids from a fixed time, as replay's are.
 const TEST_MS: u64 = 1_700_000_000_000;
 
+/// A stream key for a test that names its stream by a number.
+fn testKey(n: u32) StreamKey {
+    return streamKey(.default, std.mem.asBytes(&n));
+}
+
+test "stream: same-named streams in two namespaces share no state, even when their names' hashes are equal" {
+    var s = StreamProjection.init(testing.allocator);
+    defer s.deinit();
+    const one: NamespaceId = .of(16);
+    const two: NamespaceId = .of(17);
+    // Different names, their hashes forced equal: only the id that leads
+    // the key tells them apart.
+    const a = streamKey(one, "orders");
+    var b = streamKey(two, "other");
+    b[4..12].* = a[4..12].*;
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+
+    _ = try s.appendToStreamAt(a, 1, 0, TEST_MS, 3, 30);
+    _ = try s.appendToStreamAt(b, 2, 0, TEST_MS, 1, 10);
+    try testing.expectEqual(@as(u64, 3), s.streamLogicalCount(a));
+    try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
+
+    // The same stream and group names in both: two names, two groups.
+    var na: [MAX_NAME_KEY]u8 = undefined;
+    var nb: [MAX_NAME_KEY]u8 = undefined;
+    try s.registerStream(nameKey(&na, one, "orders").?);
+    try s.registerStream(nameKey(&nb, two, "orders").?);
+    var ga: [MAX_NAME_KEY]u8 = undefined;
+    var gb: [MAX_NAME_KEY]u8 = undefined;
+    try s.createGroup(groupKey(&ga, one, "orders", "g").?, 1000);
+    try s.createGroup(groupKey(&gb, two, "orders", "g").?, 1000);
+    var buf: [4]StreamRecord = undefined;
+    try testing.expectEqual(@as(usize, 1), try s.groupDeliver(groupKey(&ga, one, "orders", "g").?, a, "c", 4, 1000, &buf));
+    try testing.expectEqual(@as(usize, 0), try s.groupPelCount(groupKey(&gb, two, "orders", "g").?));
+
+    // Each namespace lists its own name, past the id.
+    var names: [4][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), s.scanStreamNames(one, &names));
+    try testing.expectEqualStrings("orders", names[0]);
+    try testing.expectEqual(@as(usize, 0), s.scanStreamNames(.default, &names));
+
+    // Deleting one namespace's stream leaves the other's records, name and group.
+    try testing.expect(s.deleteStream(a, nameKey(&na, one, "orders").?));
+    try testing.expectEqual(@as(u64, 1), s.streamLogicalCount(b));
+    try testing.expect(s.stream_names.contains(nameKey(&nb, two, "orders").?));
+    try testing.expect(s.getGroup(groupKey(&gb, two, "orders", "g").?) != null);
+    try testing.expect(s.getGroup(groupKey(&ga, one, "orders", "g").?) == null);
+}
+
 test "stream: consumer group lifecycle" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
@@ -1739,7 +1796,7 @@ test "stream: stats tracking" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
@@ -1752,7 +1809,7 @@ test "stream: memory usage estimate" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    _ = try s.appendToStreamAt(42, 100, 0, TEST_MS, 1, 0);
+    _ = try s.appendToStreamAt(testKey(42), 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
 
     try testing.expect(s.memoryUsage() > 0);
@@ -1762,7 +1819,7 @@ test "stream: ackFloor reflects lowest unacked" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 7;
+    const hash = testKey(7);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
 
@@ -1819,7 +1876,7 @@ test "stream: restart redelivers only the unacked tail" {
     // redelivered. "Restart" = a fresh projection that replays the same UAL
     // entries (same name_hash / ual_index / entry-timestamp) so StreamIDs are
     // reproduced identically, then applies the persisted cg_commit cursor.
-    const hash: u64 = 99;
+    const hash = testKey(99);
     const ts: u64 = 100; // single entry-timestamp ms → ids {100,0..3}
 
     // ── before restart ──
@@ -1884,7 +1941,7 @@ test "stream: GroupCommit encode/decode round-trip" {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "stream: StreamState append and read" {
-    var ss = StreamState.init(42);
+    var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
     const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
@@ -1912,7 +1969,7 @@ test "stream: StreamState append and read" {
 }
 
 test "stream: StreamState readByIds preserves order and skips missing" {
-    var ss = StreamState.init(42);
+    var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
     const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
@@ -1948,7 +2005,7 @@ test "stream: StreamState readByIds preserves order and skips missing" {
 }
 
 test "stream: StreamState trim" {
-    var ss = StreamState.init(42);
+    var ss = StreamState.init(testKey(42));
     defer ss.deinit(testing.allocator);
 
     const id1 = try ss.appendAt(testing.allocator, 100, 0, TEST_MS, 1, 0);
@@ -1966,7 +2023,7 @@ test "stream: appendToStreamAt creates stream and returns StreamID" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 12345;
+    const hash = testKey(12345);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
 
@@ -1983,7 +2040,7 @@ test "stream: the next append in the same millisecond is past a cursor at the pr
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 7;
+    const hash = testKey(7);
     const first = try s.appendToStreamAt(hash, 1, 0, 1_000, 1, 0);
     const second = try s.appendToStreamAt(hash, 2, 0, 1_000, 1, 0);
     try testing.expectEqual(first.timestamp_ms, second.timestamp_ms);
@@ -1999,7 +2056,7 @@ test "stream: readStreamRange and readStreamAfter" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     const id3 = try s.appendToStreamAt(hash, 102, 1, TEST_MS, 1, 0);
@@ -2019,7 +2076,7 @@ test "stream: readStreamRange and readStreamAfter" {
     try testing.expectEqual(@as(usize, 2), n3);
 
     // Non-existent stream returns 0
-    const n4 = s.readStreamRange(999, StreamID.MIN, StreamID.MAX, null, &buf);
+    const n4 = s.readStreamRange(testKey(999), StreamID.MIN, StreamID.MAX, null, &buf);
     try testing.expectEqual(@as(usize, 0), n4);
 }
 
@@ -2027,7 +2084,7 @@ test "stream: trimStream" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
@@ -2041,7 +2098,7 @@ test "stream: groupDeliver adds to PEL" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
@@ -2066,7 +2123,7 @@ test "stream: groupAck removes from PEL" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     const id2 = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
@@ -2105,7 +2162,7 @@ test "stream: a nacked entry is served again by the group's next read, to any co
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
@@ -2133,7 +2190,7 @@ test "stream: a nacked and an expired entry are dropped after the same number of
     for ([_]bool{ true, false }) |by_nack| {
         var s = StreamProjection.init(testing.allocator);
         defer s.deinit();
-        const hash: u64 = 42;
+        const hash = testKey(42);
         const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
         try s.createGroup("g", 1000);
         _ = try s.joinGroup("g", "c1", 1000);
@@ -2162,7 +2219,7 @@ test "stream: groupClaim transfers ownership" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
@@ -2187,7 +2244,7 @@ test "stream: the sweeper makes an idle entry ready without counting a delivery,
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("g", 1000);
@@ -2226,7 +2283,7 @@ test "stream: the sweeper makes an idle entry ready without counting a delivery,
 test "stream: a consumer touching an entry that expired keeps it, but not one it nacked or another's" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
@@ -2250,7 +2307,7 @@ test "stream: a consumer touching an entry that expired keeps it, but not one it
 test "stream: lowering max_deliver drops a ready entry already delivered that often" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
@@ -2265,7 +2322,7 @@ test "stream: lowering max_deliver drops a ready entry already delivered that of
 test "stream: a ready entry whose record was trimmed is dropped by the read that finds it gone" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
@@ -2283,7 +2340,7 @@ test "stream: sweeper disabled when ack_timeout_ms is 0" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 7;
+    const hash = testKey(7);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     try s.createGroup("g", 1000);
     _ = try s.joinGroup("g", "c1", 1000);
@@ -2302,7 +2359,7 @@ test "stream: groupAutoclaim auto-transfers idle entries" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
 
@@ -2329,7 +2386,7 @@ test "stream: groupAutoclaim drains own pending (reconnect) and paginates" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 77;
+    const hash = testKey(77);
     _ = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 101, 0, TEST_MS, 1, 0);
     _ = try s.appendToStreamAt(hash, 102, 0, TEST_MS, 1, 0);
@@ -2358,7 +2415,7 @@ test "stream: groupTouch resets idle timer" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const id1 = try s.appendToStreamAt(hash, 100, 0, TEST_MS, 1, 0);
 
     try s.createGroup("mygroup", 1000);
@@ -2383,15 +2440,15 @@ test "stream: groupDeliver to non-existent group" {
     defer s.deinit();
 
     var buf: [10]StreamRecord = undefined;
-    try testing.expectError(error.GroupNotFound, s.groupDeliver("nope", 42, "c1", 1, 1000, &buf));
+    try testing.expectError(error.GroupNotFound, s.groupDeliver("nope", testKey(42), "c1", 1, 1000, &buf));
 }
 
 test "stream: multiple streams are independent" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash_a: u64 = 1;
-    const hash_b: u64 = 2;
+    const hash_a = testKey(1);
+    const hash_b = testKey(2);
 
     const a1 = try s.appendToStreamAt(hash_a, 100, 0, TEST_MS, 1, 0);
     const a2 = try s.appendToStreamAt(hash_a, 101, 0, TEST_MS, 1, 0);
@@ -2411,7 +2468,7 @@ test "stream: batch append reserves one sequence per record" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 42;
+    const hash = testKey(42);
     const ts: u64 = 1_700_000_000_000;
 
     // A 3-record batch, then a single record in the SAME millisecond.
@@ -2430,7 +2487,7 @@ test "stream: info counts logical records and bytes, not entries" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 43;
+    const hash = testKey(43);
     const ts: u64 = 1_700_000_000_000;
 
     _ = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
@@ -2450,7 +2507,7 @@ test "stream: trim decrements logical counters" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 44;
+    const hash = testKey(44);
     const ts: u64 = 1_700_000_000_000;
 
     const b1 = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
@@ -2472,7 +2529,7 @@ test "stream: count retention resolves by records, not batches" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 45;
+    const hash = testKey(45);
     const ts: u64 = 1_700_000_000_000;
 
     _ = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
@@ -2501,7 +2558,7 @@ test "stream: trimCount predicts trim in records, not batches" {
     var s = StreamProjection.init(testing.allocator);
     defer s.deinit();
 
-    const hash: u64 = 45;
+    const hash = testKey(45);
     const ts: u64 = 1_700_000_000_000;
 
     const b1 = try s.appendToStreamAt(hash, 10, 0, ts, 3, 25);
