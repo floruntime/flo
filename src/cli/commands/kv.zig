@@ -43,7 +43,7 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
     gen.addCommands(allocator, kv, &kv_ops.table, &kv_ops.groups);
     _ = kv.subcommand(gen.command(allocator, kv_ops.op("kv.history")).action(wrapHandler(runHistory)));
     const mget_op = kv_ops.op("kv.mget");
-    return kv.subcommand(
+    const cmd = try kv.subcommand(
         commander.newBuilder(allocator)
             .name("mget")
             .about(mget_op.doc)
@@ -55,7 +55,11 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
             .variadicArg("keys", mget_op.request.field_list[0].doc)
             .action(wrapHandler(runMget)),
     ).build();
+    cmd.retired_flags = &.{.{ .long = "routing-key", .short = 'r', .hint = ROUTING_KEY_GONE }};
+    return cmd;
 }
+
+pub const ROUTING_KEY_GONE = "keys stored together share a {tag} in the key, e.g. {user:1}:balance";
 
 /// An ok answer to KV op `name`, decoded; its slices point into `resp`.
 fn Answer(comptime name: []const u8) type {

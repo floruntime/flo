@@ -364,7 +364,7 @@ test "kv table: a set in a transaction is buffered, read back inside it, and uns
     _ = try expectRefused((try h.get("{user:1}:bal", getBody(.{}))).?, .not_found, .not_found);
     // A key that doesn't route with the transaction's is refused.
     const refused = try expectRefused(try h.set("bal", setBody("6", .{ .txn = id })), .bad_request, .keys_not_colocated);
-    try testing.expectEqualStrings("bad request: this key routes elsewhere than the transaction's first key; give every key in a transaction the same {tag}, e.g. {user:1}:balance", refused.message);
+    try testing.expectEqualStrings("bad request: this key routes elsewhere than the key the transaction was begun with; give every key in a transaction the same {tag}, e.g. {user:1}:balance", refused.message);
     _ = try expectRefused((try h.get("{user:1}:bal", getBody(.{ .txn = id, .wait_ms = 10 }))).?, .bad_request, .conflicting_fields);
     try testing.expectEqual(@as(usize, 1), txn_table.get(id).?.ops.items.len);
 }

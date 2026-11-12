@@ -2324,7 +2324,7 @@ test "e2e/kv: on 4 shards, a txn op on a key that doesn't route with the first i
     var refused = try ctx.cli.run(&.{ "kv", "set", "plain", "v", "--txn", tid });
     defer refused.deinit();
     try testing.expectEqual(@as(u8, 3), refused.exit_code);
-    try testing.expectEqualStrings("Error: bad request: this key routes elsewhere than the transaction's first key; give every key in a transaction the same {tag}, e.g. {user:1}:balance [bad_request/keys_not_colocated]\n", refused.stderr);
+    try testing.expectEqualStrings("Error: bad request: this key routes elsewhere than the key the transaction was begun with; give every key in a transaction the same {tag}, e.g. {user:1}:balance [bad_request/keys_not_colocated]\n", refused.stderr);
 
     // Nothing was buffered: the commit writes none, and the key is absent.
     var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid });
@@ -2335,14 +2335,16 @@ test "e2e/kv: on 4 shards, a txn op on a key that doesn't route with the first i
     try expectNotFound(plain);
 }
 
-test "e2e/kv: --routing-key and -r are unknown flags" {
+test "e2e/kv: --routing-key and -r are unknown flags that point at {tag}" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
+    const hint = "keys stored together share a {tag} in the key, e.g. {user:1}:balance";
     for ([_]struct { args: []const []const u8, want: []const u8 }{
-        .{ .args = &.{ "kv", "get", "k", "--routing-key", "x" }, .want = "Error: unknown flag --routing-key\n" },
-        .{ .args = &.{ "kv", "set", "k", "v", "-r", "x" }, .want = "Error: unknown flag -r\n" },
-        .{ .args = &.{ "kv", "mget", "k", "--routing-key", "x" }, .want = "Error: unknown flag --routing-key\n" },
+        .{ .args = &.{ "kv", "get", "k", "--routing-key", "x" }, .want = "Error: unknown flag --routing-key: " ++ hint ++ "\n" },
+        .{ .args = &.{ "kv", "set", "k", "v", "-r", "x" }, .want = "Error: unknown flag -r: " ++ hint ++ "\n" },
+        .{ .args = &.{ "kv", "mget", "k", "--routing-key=x" }, .want = "Error: unknown flag --routing-key: " ++ hint ++ "\n" },
+        .{ .args = &.{ "kv", "txn", "begin", "{t}k", "-r", "x" }, .want = "Error: unknown flag -r: " ++ hint ++ "\n" },
     }) |c| {
         var result = try ctx.cli.run(c.args);
         defer result.deinit();

@@ -564,6 +564,13 @@ pub const HelpSection = struct {
 };
 
 /// Command represents a CLI command or subcommand
+/// A flag that was removed, and what replaces it.
+pub const RetiredFlag = struct {
+    long: []const u8,
+    short: ?u8 = null,
+    hint: []const u8,
+};
+
 pub const Command = struct {
     allocator: Allocator,
 
@@ -592,6 +599,11 @@ pub const Command = struct {
     persistent_pre_run: ?HookFn,
     persistent_post_run: ?HookFn,
     args_validator: ?ArgValidatorFn,
+
+    /// Flags that no longer exist, each with what to do instead, so a
+    /// script still passing one is told why. A command's subcommands see
+    /// its list too.
+    retired_flags: []const RetiredFlag = &.{},
 
     // Parent and children
     parent: ?*Command,
@@ -924,6 +936,29 @@ pub const Command = struct {
     }
 
     /// Print to stderr (unbuffered)
+    fn retiredFlag(self: *const Command, long: ?[]const u8, short: ?u8) ?RetiredFlag {
+        var at: ?*const Command = self;
+        while (at) |c| : (at = c.parent) {
+            for (c.retired_flags) |r| {
+                if (long) |l| if (std.mem.eql(u8, l, r.long)) return r;
+                if (short) |sh| if (r.short == sh) return r;
+            }
+        }
+        return null;
+    }
+
+    fn unknownLong(self: *Command, name: []const u8) void {
+        if (self.retiredFlag(name, null)) |r| {
+            self.printErrf("Error: unknown flag --{s}: {s}\n", .{ name, r.hint });
+        } else self.printErrf("Error: unknown flag --{s}\n", .{name});
+    }
+
+    fn unknownShort(self: *Command, short: u8) void {
+        if (self.retiredFlag(null, short)) |r| {
+            self.printErrf("Error: unknown flag -{c}: {s}\n", .{ short, r.hint });
+        } else self.printErrf("Error: unknown flag -{c}\n", .{short});
+    }
+
     pub fn printErrf(self: *Command, comptime fmt: []const u8, fmtargs: anytype) void {
         writeFormatted(self.allocator, self.stderr_file, fmt, fmtargs);
     }
@@ -1163,7 +1198,7 @@ pub const Command = struct {
                     try self.setFlagValue(flag, flag_value);
                 } else {
                     if (!self.silence_errors) {
-                        self.printErrf("Error: unknown flag --{s}\n", .{flag_name});
+                        self.unknownLong(flag_name);
                     }
                     return error.UnknownFlag;
                 }
@@ -1186,7 +1221,7 @@ pub const Command = struct {
                     }
                 } else {
                     if (!self.silence_errors) {
-                        self.printErrf("Error: unknown flag --{s}\n", .{flag_part});
+                        self.unknownLong(flag_part);
                     }
                     return error.UnknownFlag;
                 }
@@ -1205,7 +1240,7 @@ pub const Command = struct {
                         try self.setFlagValue(flag, flag_value);
                     } else {
                         if (!self.silence_errors) {
-                            self.printErrf("Error: unknown flag -{c}\n", .{short});
+                            self.unknownShort(short);
                         }
                         return error.UnknownFlag;
                     }
@@ -1237,7 +1272,7 @@ pub const Command = struct {
                         }
                     } else {
                         if (!self.silence_errors) {
-                            self.printErrf("Error: unknown flag -{c}\n", .{short});
+                            self.unknownShort(short);
                         }
                         return error.UnknownFlag;
                     }
@@ -1379,6 +1414,15 @@ pub const Command = struct {
             self.printUsageLine();
         }
         self.printf("\n", .{});
+
+        // Arguments, when any says what it is
+        var described = false;
+        for (self.positional_args.items) |a| described = described or a.description.len > 0;
+        if (described) {
+            self.printf("\x1b[1mARGUMENTS:\x1b[0m\n", .{});
+            for (self.positional_args.items) |a| self.printf("  <{s}>  {s}\n", .{ a.name, a.description });
+            self.printf("\n", .{});
+        }
 
         // Aliases
         if (self.aliases.len > 0) {
