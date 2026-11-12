@@ -352,7 +352,7 @@ pub const STAMP_SKEW_WARN_NS: u64 = 5 * std.time.ns_per_s;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const MAX_PEERS: usize = 7;
-/// Most entries a leader appends beyond its commit index before refusing
+/// Most entries a leader appends beyond its applied index before refusing
 /// proposals.
 pub const MAX_OUTSTANDING: u64 = 1024;
 
@@ -1613,13 +1613,19 @@ pub const RaftNode = struct {
         if (self.role != .leader) return error.NotLeader;
         if (self.writes_stopped) return error.WritesStopped;
         if (self.halt_at != null and entry_type != .raft_config and entry_type != .raft_noop and entry_type != .repair_skip) return error.Halted;
-        // A leader far ahead of its followers holds that many clients; past
-        // the cap the client is told, and its reads are the backpressure.
+        // Entries proposed and not yet applied each hold a client in the
+        // shard's pending table, which is sized to twice this cap; past it
+        // the client is told, and its reads are the backpressure. Counted to
+        // the applied index, not commit, and on every node: commit runs ahead
+        // of apply while apply is suspended at a snapshot bar or blocked on a
+        // read, and a lone node commits at once.
         // A repair is exempt: it is what lets a halted group take writes
         // again. It is not exempt from `writes_stopped` above: that means an
         // entry may not reach disk, and a skip lost from disk would be
-        // applied past on some replicas and not others.
-        if (entry_type != .repair_skip and self.voterPeers() > 0 and self.log.lastIndex() - self.commit_index >= MAX_OUTSTANDING) return error.Overloaded;
+        // applied past on some replicas and not others. So are Raft's own
+        // no-op and configs, without which a leader never becomes ready.
+        const exempt = entry_type == .repair_skip or entry_type == .raft_noop or entry_type == .raft_config;
+        if (!exempt and self.log.lastIndex() - self.last_applied >= MAX_OUTSTANDING) return error.Overloaded;
 
         var e = entry_mod.buildEntry(
             entry_type,
@@ -5238,7 +5244,7 @@ test "raft node: a repair skip is proposed past the outstanding cap and while ha
     _ = candidacy(&node).?;
     _ = node.handleVoteResponse(.{ .term = 1, .vote_granted = true, .from = 2 });
     try testing.expectEqual(Role.leader, node.role);
-    while (node.log.lastIndex() - node.commit_index < MAX_OUTSTANDING) _ = try node.propose(.kv_put, 0, "x");
+    while (node.log.lastIndex() - node.last_applied < MAX_OUTSTANDING) _ = try node.propose(.kv_put, 0, "x");
     try testing.expectError(error.Overloaded, node.propose(.kv_put, 0, "x"));
     node.halt_at = .{ .index = 2, .term = 1, .crc = 0 };
     _ = try node.propose(.repair_skip, 0, "s");

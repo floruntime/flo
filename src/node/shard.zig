@@ -599,6 +599,17 @@ pub const Shard = struct {
     /// The last apply pass stopped at its budget with committed entries
     /// left; the next poll does not wait, and the tick applies on.
     apply_behind: bool,
+    /// Apply is suspended at a snapshot bar while the state at it is
+    /// serialized. Raft runs on, and commit advances; writes committed
+    /// meanwhile wait in the pending table and are answered on resume.
+    snapshot_window: ?SnapshotWindow = null,
+    /// Tests only: the next bar. Bars proper come with snapshots; until then
+    /// a window opens only here, or at a test fault's entry.
+    test_bar: u64 = 0,
+    /// Bars a leader still applying earlier terms passed without a snapshot
+    /// (cumulative): followers at the same bar take theirs, and this leader's
+    /// next is at the next bar.
+    snapshot_skips_leader_not_ready: u64 = 0,
     /// A committed entry could not be read to apply it — a resource or IO
     /// failure reading below the ring, not a hole. The shard holds it unapplied
     /// and retries, but not on every call: `read_retry_at_ms` paces the retry,
@@ -3077,7 +3088,7 @@ pub const Shard = struct {
             // Reached its entry, or the pass drained fully (not stopped by the
             // budget, and not held by a blocked read): otherwise it parks and
             // is answered when the rest applies.
-            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked);
+            break :here self.raft_node.last_applied >= proposed.index or (!self.apply_behind and !self.read_blocked and self.snapshot_window == null);
         };
         if (answered_here) {
             defer if (release) |r| r(self, ctx);
@@ -4492,6 +4503,7 @@ pub const Shard = struct {
             sm.setVouch(self.replica.strangers_dropped, self.replica.vouch_asks, self.replica.vouches_taken, self.replica.vouchedIndex());
             sm.setReadBlocked(self.read_blocked);
             sm.persist_failures.store(self.persist_failures, .monotonic);
+            sm.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
             // A duration, not the monotonic start: a raw clock reading means
             // nothing to a reader and Prometheus can't subtract it.
             sm.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
@@ -4548,6 +4560,10 @@ pub const Shard = struct {
         // A lone blocked shard keeps the node ready; a cluster one is a 503.
         slot.read_blocked_serves.store(self.read_blocked and self.raft_network == null, .release);
         slot.persist_failures.store(self.persist_failures, .monotonic);
+        slot.snapshot_skipped_leader_not_ready.store(self.snapshot_skips_leader_not_ready, .monotonic);
+        const window = self.snapshot_window;
+        slot.snapshot_bar.store(if (window) |w| w.s else 0, .monotonic);
+        slot.snapshot_suspended_for_ms.store(if (window) |w| nowMs() -| w.opened_ms else 0, .monotonic);
         slot.flushes_failing_for_ms.store(if (self.flushes_failing_since_ms == 0) 0 else nowMs() -| self.flushes_failing_since_ms, .monotonic);
         if (self.hard_state_store) |hs| {
             slot.hardstate_failures.store(hs.hardstate_failures, .monotonic);
@@ -4818,6 +4834,53 @@ pub const Shard = struct {
         return self.applyThrough(std.math.maxInt(u64));
     }
 
+    /// Whether the entry just applied is a bar, and if so how long a test
+    /// window holds (0 for none). Bars proper come with snapshots.
+    fn barAt(self: *const Shard, e: *const entry_mod.Entry) ?u64 {
+        if (self.test_bar != 0 and e.header.index == self.test_bar) return 0;
+        if (comptime build_options.test_faults) {
+            if (@import("test_faults.zig").of(e) == .snapshot_window) return TEST_FAULT_WINDOW_MS;
+        }
+        return null;
+    }
+
+    /// At bar `s`, just applied: suspend apply while the state at it is
+    /// serialized, unless this node leads and hasn't applied what earlier
+    /// terms committed. Such a leader passes the bar with no snapshot: holding
+    /// apply here could keep it from ever getting ready, and its followers
+    /// take theirs. It snapshots again at the next bar, not later at this one.
+    /// Returns whether apply is now suspended.
+    fn openSnapshotWindow(self: *Shard, s: u64, hold_ms: u64) bool {
+        if (self.leaderApplying()) {
+            self.snapshot_skips_leader_not_ready += 1;
+            log.warn("shard {d}: passed snapshot bar {d} without a snapshot: this leader is still applying what earlier terms committed ({d} so far); its next snapshot is at the next bar", .{ self.id, s, self.snapshot_skips_leader_not_ready });
+            return false;
+        }
+        const now = nowMs();
+        self.snapshot_window = .{ .s = s, .opened_ms = now, .slices_left = TEST_BAR_SLICES, .hold_until_ms = if (hold_ms > 0) now + hold_ms else 0 };
+        return true;
+    }
+
+    /// One tick of an open window: queue a slice, or, with none left, end it
+    /// and apply what committed meanwhile. A shard that stopped applying
+    /// (halted, offline, diverged) drops the window and its snapshot; its
+    /// own state holds apply from there.
+    fn stepSnapshotWindow(self: *Shard) void {
+        const w = &(self.snapshot_window orelse return);
+        if (self.halted != null or self.offline != null or self.replica.diverged) {
+            log.warn("shard {d}: dropped the snapshot at bar {d}: the shard stopped applying", .{ self.id, w.s });
+            self.snapshot_window = null;
+            return;
+        }
+        if (w.slices_left > 0) {
+            w.slices_left -= 1;
+            return;
+        }
+        if (nowMs() < w.hold_until_ms) return;
+        self.snapshot_window = null;
+        _ = self.applyCommitted();
+    }
+
     /// How long to wait between re-attempting a blocked read, so a block
     /// costs one disk probe a fraction of a second, not one per request.
     const READ_RETRY_MS: u64 = 250;
@@ -4870,6 +4933,13 @@ pub const Shard = struct {
         // With sync durability a leader's writes commit only once on disk:
         // flushing first lets what that commits apply now.
         self.syncFlushIfNeeded();
+        // Suspended at a bar: after the flush, so a sync leader still makes
+        // its writes durable and commits them; they apply on resume. Replies
+        // held for entries at or below the bar go now.
+        if (self.snapshot_window != null) {
+            if (self.replies_held > 0) self.releaseReplies();
+            return true;
+        }
         // Called after every request: nothing to apply is the common case.
         if (self.raft_node.last_applied >= @min(self.raft_node.commit_index, limit) and self.replies_held == 0) {
             self.apply_behind = false;
@@ -4968,6 +5038,9 @@ pub const Shard = struct {
                                 break :drain;
                             }
                             self.seal_skip = true;
+                        }
+                        if (self.barAt(&e)) |hold_ms| {
+                            if (self.openSnapshotWindow(next_idx, hold_ms)) break :drain;
                         }
                     },
                     .absent => {
@@ -5222,6 +5295,7 @@ pub const Shard = struct {
         // The producers above only proposed. What has committed (at once
         // on a single node) applies here, outside any module's work.
         _ = self.applyCommitted();
+        self.stepSnapshotWindow();
         _ = self.coldCaughtUp();
 
         // Shard 0: namespaces created this tick go to disk, then into the
@@ -5324,7 +5398,8 @@ pub const Shard = struct {
         var failing = false;
         while (!self.stop_requested.load(.acquire)) {
             // Connections re-queued while the last tick settled run next.
-            const busy = self.more_work or self.apply_behind or self.resume_fds.items.len > 0;
+            const slicing = if (self.snapshot_window) |w| w.slices_left > 0 else false;
+            const busy = self.more_work or self.apply_behind or slicing or self.resume_fds.items.len > 0;
             _ = self.tick(if (busy) 0 else 100) catch |err| {
                 // A shard whose tick keeps failing serves nothing: say so,
                 // not once per tick, and do not spin a core while it lasts.
@@ -7147,6 +7222,23 @@ pub const Pending = struct {
     ctx: u64 = 0,
 };
 pub const PENDING_SLOTS: usize = 2 * raft_node_mod.MAX_OUTSTANDING;
+
+/// Apply suspended at bar `s` while the state at it is serialized.
+pub const SnapshotWindow = struct {
+    s: u64,
+    opened_ms: u64,
+    /// Slices of the state still to queue. The serializer comes with
+    /// snapshots; until then a window queues a stub slice per tick.
+    slices_left: u32,
+    /// A window opened by a test fault holds until this monotonic time, so
+    /// an e2e test can write through it.
+    hold_until_ms: u64 = 0,
+};
+
+/// Stub slices a test bar's window queues before it closes.
+pub const TEST_BAR_SLICES: u32 = 3;
+/// How long a window a test fault opens holds apply.
+pub const TEST_FAULT_WINDOW_MS: u64 = 2_000;
 
 /// A client's write sent to the leader, and what came back.
 /// Removal notices held toward a quorum: each sender's latest, by the
@@ -22708,4 +22800,253 @@ test "shard: a committed entry that cannot be read is held unapplied, applies on
     var rbuf: [1024]u8 = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &rbuf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+}
+
+/// A lone node with no data dir, answering a client over a socket pair.
+const AsyncAlone = struct {
+    pipe_fds: [2]i32,
+    pair: [2]std.posix.fd_t,
+    shard: Shard,
+    conn: *Connection,
+
+    fn init(self: *AsyncAlone) !void {
+        self.pipe_fds = try @import("stdx").io.pipe();
+        self.shard = try Shard.init(std.testing.allocator, 0, 1, 4096, self.pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+        self.shard.wireHandlerShardPtrs();
+        try std.testing.expect(self.shard.applyCommitted());
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &self.pair));
+        // Room for a thousand answers at once: on resume the shard writes
+        // them all before the test reads, and a full socket would block it.
+        const big: c_int = 1 << 20;
+        for (self.pair) |fd| {
+            _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, @ptrCast(&big), @sizeOf(c_int));
+            _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, @ptrCast(&big), @sizeOf(c_int));
+        }
+        self.conn = try self.shard.addConnection(self.pair[0]);
+    }
+
+    fn deinit(self: *AsyncAlone) void {
+        self.shard.deinit();
+        _ = std.c.close(self.pair[1]);
+        _ = std.c.close(self.pipe_fds[0]);
+        _ = std.c.close(self.pipe_fds[1]);
+    }
+};
+
+/// Steps an open window until it closes; fails if it doesn't within a few.
+fn stepWindowClosed(sh: *Shard) !void {
+    var steps: u32 = 0;
+    while (sh.snapshot_window != null) : (steps += 1) {
+        try std.testing.expect(steps <= TEST_BAR_SLICES);
+        sh.stepSnapshotWindow();
+    }
+}
+
+test "Shard: alone, a write at a snapshot bar is answered and suspends apply; writes after it commit, park, read the state at the bar, and are answered on resume" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    t.shard.test_bar = r.log.lastIndex() + 1;
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 1, "a", "v");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    const window = t.shard.snapshot_window.?;
+    try std.testing.expectEqual(t.shard.test_bar, window.s);
+    try std.testing.expectEqual(window.s, r.last_applied);
+
+    // Committed at once on a lone node, but not applied: it waits.
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 3, "c", "v");
+    try std.testing.expect(r.commit_index >= window.s + 2);
+    try std.testing.expectEqual(window.s, r.last_applied);
+    try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
+    // A read sees the state at the bar.
+    try ParkTest.send(&t.shard, t.conn, .kv_get, 4, "b", "");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 4), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), one[0].header.status);
+
+    try stepWindowClosed(&t.shard);
+    var two: [2]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &two);
+    for (two, [_]u64{ 2, 3 }) |a, id| {
+        try std.testing.expectEqual(id, a.header.request_id);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+    }
+    try std.testing.expectEqual(@as(u32, 0), t.shard.pending_count);
+    try std.testing.expectEqual(r.commit_index, r.last_applied);
+}
+
+test "Shard: alone and suspended, writes past the outstanding cap are refused before they're proposed, and the pending table never wraps" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    t.shard.test_bar = r.log.lastIndex() + 1;
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 1, "a", "v");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    const s = t.shard.snapshot_window.?.s;
+
+    var id: u64 = 2;
+    while (r.log.lastIndex() - s < raft_node_mod.MAX_OUTSTANDING) : (id += 1) {
+        const before = r.log.lastIndex();
+        try ParkTest.send(&t.shard, t.conn, .kv_put, id, "k", "v");
+        if (r.log.lastIndex() == before) {
+            // Refused before it was proposed: say why.
+            try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+            std.debug.print("write {d} at {d} outstanding refused: {d} {s}\n", .{ id, before - s, one[0].header.status, (try one[0].refused()).message });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(raft_node_mod.MAX_OUTSTANDING)), t.shard.pending_count);
+    const last = r.log.lastIndex();
+    try ParkTest.send(&t.shard, t.conn, .kv_put, id, "k", "v");
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(id, one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), one[0].header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try one[0].refused()).ran);
+    try std.testing.expectEqual(last, r.log.lastIndex());
+
+    // On resume every parked write is answered, none lost to a wrapped slot.
+    try stepWindowClosed(&t.shard);
+    var answered: u32 = 0;
+    var rbuf: [1 << 20]u8 = undefined;
+    var have: usize = 0;
+    var rounds: u32 = 0;
+    while (answered < raft_node_mod.MAX_OUTSTANDING and rounds < 1000) : (rounds += 1) {
+        t.shard.flushToClient(t.conn.fd);
+        const n = std.c.recv(t.pair[1], rbuf[have..].ptr, rbuf.len - have, std.c.MSG.DONTWAIT);
+        if (n <= 0) {
+            _ = try t.shard.tick(0);
+            continue;
+        }
+        have += @intCast(n);
+        // Whole answers only; a partial one waits for the rest.
+        var off: usize = 0;
+        while (proto.Response.parse(rbuf[off..have])) |a| {
+            try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), a.header.status);
+            off += @sizeOf(proto.ResponseHeader) + a.data.len;
+            answered += 1;
+        } else |_| {}
+        std.mem.copyForwards(u8, rbuf[0 .. have - off], rbuf[off..have]);
+        have -= off;
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(raft_node_mod.MAX_OUTSTANDING)), answered);
+}
+
+test "Shard: alone with sync durability, a suspended leader still flushes and commits what it's sent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var t: SyncAlone = undefined;
+    try t.init(&tmp);
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    var buf: [4096]u8 = undefined;
+
+    t.shard.test_bar = r.log.lastIndex() + 1;
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try t.put(1, "a", &buf)).header.status);
+    const s = t.shard.snapshot_window.?.s;
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
+    // Flushed and committed, though not applied.
+    try std.testing.expect(r.durable_index >= s + 1);
+    try std.testing.expect(r.commit_index >= s + 1);
+    try std.testing.expectEqual(s, r.last_applied);
+    try stepWindowClosed(&t.shard);
+    var one: [1]proto.Response = undefined;
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+}
+
+test "Shard: in a cluster, a leader suspended at a bar keeps its term and commits what its follower acks; the writes are answered on resume" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+
+    t.shard.test_bar = r.log.lastIndex() + 1;
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 1, "a", "v");
+    try ParkTest.ack(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    const s = t.shard.snapshot_window.?.s;
+    const term = r.current_term;
+
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
+    try ParkTest.ack(&t.shard);
+    try std.testing.expect(r.commit_index > s);
+    try std.testing.expectEqual(s, r.last_applied);
+    try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
+    // Raft keeps running through ticks: heartbeats, no election.
+    for (0..5) |_| _ = try t.shard.tick(0);
+    try std.testing.expectEqual(raft_node_mod.Role.leader, r.role);
+    try std.testing.expectEqual(term, r.current_term);
+
+    try stepWindowClosed(&t.shard);
+    try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+}
+
+test "Shard: a leader still applying earlier terms passes a bar without a snapshot and counts it; a follower at the bar takes its window" {
+    var t: RaceTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+
+    // Two writes proposed, then elected again before they commit: not ready
+    // until it has applied them.
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 1, "a", "v");
+    try ParkTest.send(&t.shard, t.conn, .kv_put, 2, "b", "v");
+    const bar = r.log.lastIndex() - 1;
+    t.shard.test_bar = bar;
+    r.current_term += 1;
+    r.ready_index = r.log.lastIndex();
+    try std.testing.expect(t.shard.leaderApplying());
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    try ParkTest.ack(&t.shard);
+    try std.testing.expect(r.last_applied > bar);
+    try std.testing.expect(t.shard.snapshot_window == null);
+    try std.testing.expectEqual(@as(u64, 1), t.shard.snapshot_skips_leader_not_ready);
+    // Ready now, and past the bar: no snapshot is taken for it later.
+    try std.testing.expect(!t.shard.leaderApplying());
+    _ = try t.shard.tick(0);
+    try std.testing.expect(t.shard.snapshot_window == null);
+    // Counted where metrics and /status read it.
+    var registry = MetricsRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.initShards(1);
+    t.shard.setMetricsRegistry(&registry);
+    t.shard.publishHealth();
+    try std.testing.expectEqual(@as(u64, 1), t.shard.shard_metrics.?.snapshot().snapshot_skipped_leader_not_ready);
+}
+
+test "Shard: a follower reaching a bar suspends apply; one that stops applying drops its window" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const r = t.shard.raft_node;
+    // Entries in the log, committed, applied as a follower would apply them.
+    t.shard.test_bar = r.log.lastIndex() + 1;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    r.role = .follower;
+    try std.testing.expect(t.shard.applyCommitted());
+    try std.testing.expectEqual(t.shard.test_bar, t.shard.snapshot_window.?.s);
+    try std.testing.expectEqual(t.shard.test_bar, r.last_applied);
+    try std.testing.expect(r.commit_index > r.last_applied);
+    t.shard.replica.diverged = true;
+    t.shard.stepSnapshotWindow();
+    try std.testing.expect(t.shard.snapshot_window == null);
+    t.shard.replica.diverged = false;
+    r.role = .leader;
 }
