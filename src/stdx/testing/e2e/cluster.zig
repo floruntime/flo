@@ -255,6 +255,29 @@ pub const ClusterContext = struct {
         }
     }
 
+    /// Run an admin command on `node` — one the node serves on its admin
+    /// socket (cluster promote/remove, repair) rather than the client port —
+    /// passing `--config` so the CLI finds that node's `[admin]` socket. The
+    /// node carries the change to the leader, so any member may run it.
+    pub fn execAdminOn(self: *Self, node: usize, args: []const []const u8) !void {
+        if (node >= self.node_count) return error.InvalidNodeIndex;
+        const server = self.servers[node] orelse return error.NodeNotRunning;
+        var full: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer full.deinit(self.allocator);
+        try full.appendSlice(self.allocator, args);
+        try full.append(self.allocator, "--config");
+        try full.append(self.allocator, server.config_file);
+        return self.execOn(node, full.items);
+    }
+
+    /// The config file for `node`, to pass as `--config` when driving an admin
+    /// command whose result the caller inspects itself.
+    pub fn configFileOf(self: *const Self, node: usize) ?[]const u8 {
+        if (node >= self.node_count) return null;
+        const server = self.servers[node] orelse return null;
+        return server.config_file;
+    }
+
     /// Execute command and capture output on specific node
     /// Caller owns returned memory
     pub fn execCaptureOn(self: *Self, node: usize, args: []const []const u8) ![]const u8 {
