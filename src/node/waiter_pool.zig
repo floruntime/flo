@@ -111,8 +111,8 @@ pub const WaiterKind = enum(u8) {
 /// only with records the read asked for, and an append proposed before the
 /// read parked but applied after still wakes it.
 pub const StreamWindow = struct {
-    name_hash: u64 = 0,
-    /// The stream as `router.nsNameKey` names it, for its disk reads.
+    /// The stream, as its projection and its disk reads key it
+    /// (`router.nsNameKey`).
     stream: [12]u8 = @splat(0),
     after: StreamID = StreamID.MIN,
     end: StreamID = StreamID.MAX,
@@ -149,7 +149,7 @@ pub const Waiter = struct {
     ///             namespace and action name inside `key`
     min_version: u64,
 
-    /// Stream reads: the window re-run on wake. Group reads: `name_hash`,
+    /// Stream reads: the window re-run on wake. Group reads: `stream`,
     /// and `after` = the stream's last id when the read parked.
     stream: StreamWindow,
 

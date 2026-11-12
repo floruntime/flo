@@ -2,7 +2,9 @@
 //! namespace nobody created has no id, so nothing could ever wake the wait:
 //! it is refused no_namespace at once, not answered empty when the block
 //! runs out, and the namespace stays uncreated. In a namespace that exists
-//! the same read still waits, and an append or an enqueue wakes it.
+//! the same read still waits, and an append or an enqueue wakes it. A group
+//! read that doesn't wait is refused the same way: its group would be made
+//! under that id.
 
 const std = @import("std");
 const testing = std.testing;
@@ -30,6 +32,10 @@ fn refusedAtOnce(ctx: *stdx.testing.TestContext, args: []const []const u8) !void
 fn neverCreated(ctx: *stdx.testing.TestContext) !void {
     try refusedAtOnce(ctx, &.{ "stream", "group", "read", "events", "--group", "g", "--consumer", "c1", "--block", BLOCK_MS, "-n", "never-made" });
     try refusedAtOnce(ctx, &.{ "queue", "dequeue", "jobs", "--block", BLOCK_MS, "-n", "never-made" });
+    var read = try ctx.cli.run(&.{ "stream", "group", "read", "events", "--group", "g", "--consumer", "c1", "-n", "never-made" });
+    defer read.deinit();
+    try testing.expectEqual(1, read.exit_code);
+    try testing.expectEqualStrings("Error: namespace not found [no_namespace/not_found]", std.mem.trim(u8, read.stderr, " \r\n"));
     // Refusing the wait made nothing.
     var listed = try ctx.cli.run(&.{ "namespace", "list", "-o", "json" });
     defer listed.deinit();

@@ -801,13 +801,6 @@ pub const Shard = struct {
         namespace_handler.* = try NamespaceHandler.initFor(allocator, shard_id, boot.namespaces);
         errdefer namespace_handler.deinit();
 
-        // Wire the stream projection's namespace resolver to the (stable,
-        // heap-allocated) namespace handler. Done HERE — before replaySegments
-        // runs below — so that streams re-registered during replay resolve
-        // their real namespace instead of falling back to "default".
-        stream_handler.stream.ns_resolver = resolveQueueNamespace;
-        stream_handler.stream.ns_resolver_ctx = @ptrCast(namespace_handler);
-
         // Create Actions handler
         const actions_handler = try allocator.create(ActionsHandler);
         errdefer allocator.destroy(actions_handler);
@@ -1233,11 +1226,6 @@ pub const Shard = struct {
     /// name via the shard's namespace registry. `ctx` is the (stable, heap-allocated)
     /// `*NamespaceHandler`, so this is safe to call during replay — before the
     /// shard's back-pointers are wired.
-    fn resolveQueueNamespace(ctx: *anyopaque, ns: ns_table.Id) ?[]const u8 {
-        const nh: *NamespaceHandler = @ptrCast(@alignCast(ctx));
-        return nh.nameOf(ns);
-    }
-
     /// Wire shard back-pointers into handlers that need Raft access.
     /// Must be called after shards are at their final heap addresses.
     pub fn wireHandlerShardPtrs(self: *Shard) void {
@@ -1974,6 +1962,14 @@ pub const Shard = struct {
         return req.header.op_code < proto.MAX_OPCODES and dispatcher_mod.opWrites(@fromBackingInt(@intCast(req.header.op_code)));
     }
 
+    /// Whether a request can't run without its namespace's id, so one in
+    /// a namespace never created is refused: a wait names what it waits for
+    /// by the id, and nothing could wake it without one; a group read makes
+    /// its group under the id, waiting or not, and creates no namespace.
+    fn needsNamespaceId(req: proto.Request) bool {
+        return blockingWait(req) != null or req.header.op_code == @backingInt(proto.OpCode.stream_group_read);
+    }
+
     /// How long a read may wait on purpose for its data, or null for any
     /// other request. Such a read holds a slot of its own class, and is not
     /// a slow answer while it waits.
@@ -2184,9 +2180,7 @@ pub const Shard = struct {
             }
             if (req.ns_id == .invalid) req.ns_id = self.namespaceIdOf(req);
         }
-        // A wait names what it waits for by its namespace's id; one in a
-        // namespace never created has none, and nothing could wake it.
-        if (req.ns_id == .invalid and namespaced(req.header.op_code) and blockingWait(req) != null)
+        if (req.ns_id == .invalid and namespaced(req.header.op_code) and needsNamespaceId(req))
             return self.sendRefusal(conn, req.header.request_id, .no_namespace, NO_NAMESPACE);
         if (internal_from_client) return answerUnknownOp(@ptrCast(self), @ptrCast(conn), req.header.request_id, req.header.op_code);
         self.dispatcher.dispatch(auth, @ptrCast(self), @ptrCast(conn), req);
@@ -5667,8 +5661,10 @@ pub const Shard = struct {
         while (it.next()) |kv| {
             const meta = kv.value_ptr;
             if (!meta.hasRetention()) continue;
-            const name_hash = meta.name_hash;
-            if (name_hash == 0) continue;
+            // Settings are keyed by the stream's id and name; its records,
+            // by the id and the name's hash.
+            const name_key = kv.key_ptr.*;
+            const key = stream_mod.streamKey(stream_mod.keyNamespace(name_key), name_key[4..]);
 
             // Age-based retention: the trim carries the age, and each replica
             // cuts at its entry's stamp; this node's time only decides
@@ -5676,9 +5672,9 @@ pub const Shard = struct {
             if (meta.retention_age_s > 0) {
                 const bound: stream_handler_mod.TrimBound = .{ .age_ms = meta.retention_age_s *| std.time.ms_per_s };
                 if (bound.resolve(now_ns)) |cutoff_id| {
-                    const first_id = proj.streamFirstId(name_hash);
+                    const first_id = proj.streamFirstId(key);
                     if (!first_id.eql(StreamID.MIN) and !first_id.greaterThan(cutoff_id)) {
-                        if (self.stream_handler.persistTrim(name_hash, bound)) trims_proposed += 1;
+                        if (self.stream_handler.persistTrim(key, bound)) trims_proposed += 1;
                     }
                 }
             }
@@ -5686,12 +5682,12 @@ pub const Shard = struct {
             // Count-based retention: resolve Nth record ID, persist trim through Raft
             if (meta.retention_count > 0) {
                 // Retention is expressed in records, not append entries.
-                const count = proj.streamLogicalCount(name_hash);
+                const count = proj.streamLogicalCount(key);
                 if (count > meta.retention_count) {
                     const excess = count - meta.retention_count;
-                    const trim_id = proj.resolveNthRecordId(name_hash, excess);
+                    const trim_id = proj.resolveNthRecordId(key, excess);
                     if (!trim_id.eql(StreamID.MIN)) {
-                        if (self.stream_handler.persistTrim(name_hash, .{ .id = trim_id })) trims_proposed += 1;
+                        if (self.stream_handler.persistTrim(key, .{ .id = trim_id })) trims_proposed += 1;
                     }
                 }
             }
@@ -6983,7 +6979,7 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
         // Everything up to the stream's last id (or `end`) was scanned and none
         // of it is in the window; ids only grow, so the next wake starts there
         // instead of rescanning from the parked cursor.
-        const last = handler.stream.streamLastId(window.name_hash);
+        const last = handler.stream.streamLastId(window.stream);
         const scanned = if (last.greaterThan(window.end)) window.end else last;
         if (scanned.greaterThan(window.after)) window.after = scanned;
         return false;
@@ -7004,7 +7000,7 @@ pub fn resolveStreamWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
 /// blocking poll; the client retries and gets data through `handleGroupRead`.
 pub fn resolveGroupReadWaiter(waiter: *Waiter, ctx: *anyopaque) bool {
     const shard: *Shard = @ptrCast(@alignCast(ctx));
-    const last = shard.stream_handler.stream.streamLastId(waiter.stream.name_hash);
+    const last = shard.stream_handler.stream.streamLastId(waiter.stream.stream);
     if (!last.greaterThan(waiter.stream.after)) return false;
 
     shard.deliverDeferredOk(waiter.reply_to, waiter.request_id, "");
@@ -7380,6 +7376,78 @@ pub fn raiseNamespaceIdFloor(shards: []Shard) void {
     if (shards.len == 0) return;
     for (shards[1..]) |*s| {
         if (s.namespace_handler.highestId()) |id| shards[0].namespace_handler.raiseIdFloor(id);
+        // Some writes stamp a published namespace's id without binding it
+        // here first (a group read makes its group), so what was applied
+        // counts too.
+        const named = s.defaultPartition().highest_namespace;
+        if (named != 0) shards[0].namespace_handler.raiseIdFloor(named);
+    }
+}
+
+/// Raise `partition.highest_namespace` by the entry's namespace ids.
+/// The fixed ids sit below every allocated one, and an id past the table
+/// was never allocated, so neither can collide with a later create.
+fn noteNamespace(partition: *Partition, entry: *const entry_mod.Entry) void {
+    const id = entryNamespaceId(entry) orelse return;
+    if (id < ns_table.FIRST_ALLOCATED.int() or id >= ns_table.CAPACITY) return;
+    partition.highest_namespace = @max(partition.highest_namespace, id);
+}
+
+/// The highest namespace id an entry names, or null for none. Read by
+/// payload layout, not by entry type, so a new entry is covered by its
+/// layout: a command payload leads with the id; a table entry leads with
+/// an `ns` id, a KV key (the id is its prefix), or a list of items that
+/// each lead with an `ns` id. A table entry holding an `ns` id anywhere
+/// else fails the build (`nsLead`).
+pub fn entryNamespaceId(entry: *const entry_mod.Entry) ?u32 {
+    const code: u8 = entry.header.entry_type;
+    inline for (table.entry_table) |e| {
+        if (e.type_code == code) return payloadNamespaceId(e.payload, entry.payload);
+    }
+    const etype = std.enums.fromInt(entry_mod.EntryType, code) orelse return null;
+    if (!etype.hasKeyValue() or entry.payload.len < 4) return null;
+    return std.mem.readInt(u32, entry.payload[0..4], .little);
+}
+
+const NsLead = enum { none, id, kv_key, items };
+
+fn isNsId(comptime f: schema.Field) bool {
+    return std.mem.eql(u8, f.name, "ns") and f.T == kv_entries.NamespaceId;
+}
+
+fn holdsNsId(comptime T: type) bool {
+    if (T.kind == .list) return holdsNsId(T.Element);
+    if (T.kind != .record) return false;
+    for (T.field_list) |f| if (isNsId(f) or holdsNsId(f.T)) return true;
+    return false;
+}
+
+fn nsLead(comptime P: type) NsLead {
+    const first = P.field_list[0];
+    if (isNsId(first)) return .id;
+    if (std.mem.eql(u8, first.name, "key") and first.T == kv_entries.Key) return .kv_key;
+    if (first.T.kind == .list and first.T.Element.kind == .record and isNsId(first.T.Element.field_list[0])) return .items;
+    if (holdsNsId(P)) @compileError("an entry names a namespace id other than up front; entryNamespaceId can't find it");
+    return .none;
+}
+
+fn payloadNamespaceId(comptime P: type, payload: []const u8) ?u32 {
+    var diag: schema.Diagnostic = .{};
+    var r: schema.Reader = .{ .bytes = payload, .diag = &diag };
+    switch (comptime nsLead(P)) {
+        .none => return null,
+        .id => return kv_entries.NamespaceId.decode(&r, "") catch null,
+        .kv_key => {
+            const key = kv_entries.Key.decode(&r, "") catch return null;
+            return if (key.len < 4) null else std.mem.readInt(u32, key[0..4], .big);
+        },
+        .items => {
+            const items = P.field_list[0].T.decode(&r, "") catch return null;
+            var it = items.iterator();
+            var top: ?u32 = null;
+            while (it.next() catch null) |item| top = @max(top orelse 0, item.ns);
+            return top;
+        },
     }
 }
 
@@ -7510,6 +7578,7 @@ fn applyEntryCoreWith(comptime machines: []const contract_machine.Machine, parti
         }
     }
     const etype: entry_mod.EntryType = @fromBackingInt(@intCast(entry.header.entry_type));
+    noteNamespace(partition, entry);
     const applied = partition.applyRouted(entry, out) catch |err| return .{ .partition_reject = err };
     if (routedToProjection(etype)) return if (applied.failed) |err| .{ .router_error = err } else .applied;
     if (contract_machine.ownerOf(machines, etype)) |m| {
@@ -9906,11 +9975,12 @@ test "Shard: stream.group.members answers the named group's members by id, and a
     defer f.deinit();
     // Each shard holds the group: the request is answered by whichever owns the stream.
     for (&f.two.shards) |*s| {
-        try s.stream_handler.stream.createGroup("s\x00g", 1_000_000);
-        const g = s.stream_handler.stream.getGroup("s\x00g").?;
+        // Keyed by the default namespace's id (1), the stream, then the group.
+        try s.stream_handler.stream.createGroup("\x00\x00\x00\x01s\x00g", 1_000_000);
+        const g = s.stream_handler.stream.getGroup("\x00\x00\x00\x01s\x00g").?;
         // Joined out of order; listed by id.
         for ([_][]const u8{ "c-9", "c-1", "c-5", "c-3" }) |id| _ = try g.join(id, 2_000_000);
-        try s.stream_handler.stream.createGroup("s\x00other", 1_000_000);
+        try s.stream_handler.stream.createGroup("\x00\x00\x00\x01s\x00other", 1_000_000);
     }
     const a = &f.two.shards[0];
     const Members = table_run.op("stream.group.members");
@@ -11768,6 +11838,27 @@ test "Shard: at boot, shard 0 proposes no id another shard has bound, though its
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
     two.settle();
     try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), two.namespaces.lookup("fresh"));
+    try std.testing.expect(a.halted == null);
+}
+
+test "Shard: at boot, shard 0 proposes no id a group entry on another shard names, though nothing bound it" {
+    var two: TwoShards = undefined;
+    try two.init();
+    defer two.deinit();
+    const a = &two.shards[0];
+    const b = &two.shards[1];
+    const lost: u32 = a.namespace_handler.next_id + 7;
+    var val: [stream_mod.GroupCommit.WIRE_LEN]u8 = undefined;
+    (stream_mod.GroupCommit{ .floor = .{ .timestamp_ms = 0, .sequence = 0 }, .ack_timeout_ms = 30_000, .max_deliver = 5 }).encode(&val);
+    var pbuf: [256]u8 = undefined;
+    var e = entry_mod.buildCommandEntry(.cg_commit, entry_mod.Flags.NONE, 1, 1, 1, .of(lost), "s\x00g", &val, &pbuf).?;
+    e.header.crc32c = e.computeCrc();
+    var out = persistence_mod.Result{ .index = 1 };
+    try std.testing.expect(applyEntryCore(b.defaultPartition(), &b.replay_registry, &e, &out) == .applied);
+    try std.testing.expect(b.namespace_handler.highestId() == null);
+    raiseNamespaceIdFloor(&two.shards);
+    try std.testing.expect(a.namespace_handler.proposeCreateOn(a.raft_node, "fresh") == .proposed);
+    try std.testing.expectEqual(@as(?ns_table.Id, .of(lost + 1)), a.namespace_handler.idOf("fresh"));
     try std.testing.expect(a.halted == null);
 }
 
@@ -13721,7 +13812,7 @@ fn parkAnswersFromOwnEntry(apart: bool) !void {
     // the one the first write was answered with. A record is named by its
     // whole ID: the sequence alone restarts each millisecond.
     try std.testing.expect(shard.applyCommitted());
-    const hash = node_router.nameHash(.default, "s");
+    const hash = stream_mod.streamKey(.default, "s");
     const first_id = shard.stream_handler.stream.streamFirstId(hash);
     const last_id = shard.stream_handler.stream.streamLastId(hash);
     try std.testing.expect(Seen.id.?.eql(first_id));
@@ -13776,7 +13867,7 @@ const ColdStream = struct {
     }
 
     fn window(limit: u32) waiter_pool_mod.StreamWindow {
-        return .{ .name_hash = node_router.nameHash(.default, "s"), .stream = node_router.nsNameKey(.default, "s"), .limit = limit };
+        return .{ .stream = stream_mod.streamKey(.default, "s"), .limit = limit };
     }
 
     /// Read `w`, landing disk reads and reading again while it is held, as
@@ -13888,7 +13979,7 @@ test "Shard: a cold group read and claim deliver and claim only what their reply
     // and served ones are evicted.
     d.cache_budget = 4096;
     var all: [60]stream_mod.StreamRecord = undefined;
-    const name_hash = node_router.nameHash(.default, "s");
+    const name_hash = stream_mod.streamKey(.default, "s");
     try std.testing.expectEqual(@as(usize, 60), c.shard.stream_handler.stream.readStreamAfter(name_hash, StreamID.MIN, null, &all));
 
     var pair: [2]std.posix.fd_t = undefined;
@@ -13930,8 +14021,8 @@ test "Shard: a cold group read and claim deliver and claim only what their reply
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), r.header.status);
     const answered = std.mem.readInt(u32, r.data[0..4], .little);
     try std.testing.expect(answered > 0 and answered < delivered);
-    var qbuf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
-    const group = try @import("../namespace/handler.zig").qualifyGroupKey(&qbuf, "", "s", "g");
+    var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+    const group = stream_mod.groupKey(&qbuf, .default, "s", "g").?;
     var pending: [64]stream_mod.PendingEntry = undefined;
     try std.testing.expectEqual(@as(usize, answered), try c.shard.stream_handler.stream.groupPending(group, "c2", &pending));
 }
@@ -13966,7 +14057,7 @@ test "Shard: a job on another shard's thread reads cold records by copy, once th
     try std.testing.expect(second.payloads.len > 0);
     try std.testing.expect(second.copies.len > 0);
     var all: [1]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
     try std.testing.expect(second.ids[0].eql(all[0].id));
 }
 
@@ -13990,7 +14081,7 @@ test "Shard: a job on another shard's thread skips records the log no longer hol
     defer c.deinit();
     c.shard.stream_disk.?.setOwner();
     var all: [100]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
     // The segments holding the first records are gone from the durable log.
     const dropped_through = all[25].ual_index;
     _ = try c.shard.durable_log.?.dropThrough(dropped_through);
@@ -14023,7 +14114,7 @@ test "Shard: a job on another shard's thread waits out a blocked disk read rathe
     const d = c.shard.stream_disk.?;
     d.setOwner();
     var all: [1]stream_mod.StreamRecord = undefined;
-    _ = c.shard.stream_handler.stream.readStreamAfter(node_router.nameHash(.default, "s"), StreamID.MIN, null, &all);
+    _ = c.shard.stream_handler.stream.readStreamAfter(stream_mod.streamKey(.default, "s"), StreamID.MIN, null, &all);
     c.shard.durable_log.?.test_open_error = error.SystemResources;
     // Asked, read and blocked; asked again while backing off: still not gone.
     for (0..3) |_| {
@@ -14176,7 +14267,7 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     defer _ = std.c.close(pair[1]);
     const conn = try shard.addConnection(pair[0]);
 
-    // The append's applier names the stream by resolving its namespace, so
+    // The append is stamped with its namespace's id and listed under it, so
     // the namespace's create must apply first, here and on every replay.
     shard.runRequest(conn, try ParkTest.request(.stream_append, 40, "fresh", "s", "\x01\x00\x00\x00" ++ "\x01\x00\x00\x00" ++ "a" ++ "\x00\x00", ""), .client);
     try ParkTest.ack(&shard);
@@ -14184,10 +14275,11 @@ test "Shard: a stream's first append to a namespace nobody created is listed und
     var one: [1]proto.Response = undefined;
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
-    var q_buf: [handler_mod.MAX_QUALIFIED_KEY]u8 = undefined;
+    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
     const names = shard.stream_handler.stream.stream_names;
-    try std.testing.expect(names.contains(try handler_mod.qualifyKey(&q_buf, "fresh", "s")));
-    try std.testing.expect(!names.contains("s"));
+    try std.testing.expect(shard.namespaceId("fresh") != .invalid);
+    try std.testing.expect(names.contains(stream_mod.nameKey(&k_buf, shard.namespaceId("fresh"), "s").?));
+    try std.testing.expect(!names.contains(stream_mod.nameKey(&k_buf, .default, "s").?));
 }
 
 test "Shard: a blocking stream read wakes on its own namespace's append, even one proposed before it parked, and returns only what is past its cursor" {
@@ -14290,7 +14382,7 @@ test "Shard: a blocking read on one partition skips other partitions' appends wi
     try std.testing.expectEqual(@as(u64, 2), one[0].header.request_id);
     // Still parked, with its cursor at the last id it scanned.
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_read));
-    const scanned = shard.stream_handler.stream.streamLastId(shard.waiter_pool.waiters[0].stream.name_hash);
+    const scanned = shard.stream_handler.stream.streamLastId(shard.waiter_pool.waiters[0].stream.stream);
     try std.testing.expect(shard.waiter_pool.waiters[0].stream.after.eql(scanned));
 
     var p2_buf: [16]u8 = undefined;
@@ -14389,8 +14481,8 @@ test "Shard: a nack wakes a parked group read, and the next read serves the nack
     try std.testing.expectEqual(@as(u16, 1), shard.waiter_pool.countByKind(.stream_group_read));
 
     // The consumer nacks what it got: the parked read is woken, empty.
-    var qbuf: [@import("../namespace/handler.zig").MAX_QUALIFIED_KEY]u8 = undefined;
-    const group_key = try @import("../namespace/handler.zig").qualifyGroupKey(&qbuf, "app", "s", "g");
+    var qbuf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+    const group_key = stream_mod.groupKey(&qbuf, shard.namespaceId("app"), "s", "g").?;
     var pel: [4]stream_mod.PendingEntry = undefined;
     try std.testing.expectEqual(@as(usize, 1), try shard.stream_handler.stream.groupPending(group_key, null, &pel));
     var nack: [64]u8 = undefined;
@@ -15107,7 +15199,7 @@ test "Shard: a stream delete proposed behind an append not yet applied is refuse
     const refused = try c.otherAnswer();
     try CondTest.expectConflict(refused, .unclassified);
     try std.testing.expectEqualStrings(@import("../stream/handler.zig").StreamHandler.NOT_EMPTY_MESSAGE, (try refused.refused()).message);
-    const name_hash = node_router.nameHash(.default, "s");
+    const name_hash = stream_mod.streamKey(.default, "s");
     try std.testing.expectEqual(@as(usize, 1), c.t.shard.defaultPartition().stream.streamRecordCount(name_hash));
 
     // Forced, it goes whatever the stream holds.
@@ -18351,8 +18443,9 @@ test "a stream's retention age counts in seconds when the sweeper trims by it" {
     try std.testing.expect(shard.applyCommitted());
 
     const stream = shard.stream_handler.stream;
-    const h = node_router.nameHash(.default, "aged");
-    try stream.registerStreamMetadata("aged", .{ .name_hash = h, .retention_age_s = 5 });
+    const h = stream_mod.streamKey(.default, "aged");
+    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+    try stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "aged").?, .{ .retention_age_s = 5 });
     const now_ms: u64 = @intCast(@import("stdx").time.milliTimestamp());
     _ = try stream.appendToStreamAt(h, 1, 0, now_ms - 10_000, 1, 10);
     _ = try stream.appendToStreamAt(h, 2, 0, now_ms - 1_000, 1, 10);
@@ -19317,8 +19410,9 @@ test "a halted shard's duties stop, and one with work counts as held until the s
     try std.testing.expectEqual(@as(u32, 0), shard.duties.held());
 
     // A stream past its retention: no trim while halted.
-    const h = node_router.nameHash(.default, "kept");
-    try shard.stream_handler.stream.registerStreamMetadata("kept", .{ .name_hash = h, .retention_count = 1 });
+    const h = stream_mod.streamKey(.default, "kept");
+    var k_buf: [stream_mod.MAX_NAME_KEY]u8 = undefined;
+    try shard.stream_handler.stream.registerStreamMetadata(stream_mod.nameKey(&k_buf, .default, "kept").?, .{ .retention_count = 1 });
     for (1..4) |i| _ = try shard.stream_handler.stream.appendToStreamAt(h, i, 0, 1, 1, 1);
     shard.halted = .{ .index = 1, .term = 1, .crc = 0 };
     try std.testing.expectEqual(@as(u64, 0), Shard.streamRetentionTask(@ptrCast(&shard)));
@@ -21079,7 +21173,7 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
 
     const view_mod = @import("../contract/view.zig");
     const Reader = struct {
-        var hash: u64 = 0;
+        var hash: stream_mod.StreamKey = @splat(0);
         var seen: [8]StreamID = undefined;
         var n: usize = 0;
         fn keys(_: *const entry_mod.Entry, _: *view_mod.KeySet) error{OutOfMemory}!void {}
@@ -21088,7 +21182,7 @@ test "applyEntryCore: a machine reads the streams every entry below its own left
         }
         const machine: contract_machine.Machine = .{ .name = "reader", .entry_types = &.{.cg_create}, .families = &.{}, .keys = keys, .apply = apply };
     };
-    Reader.hash = node_router.nameHash(.default, "s");
+    Reader.hash = stream_mod.streamKey(.default, "s");
 
     const v = try stream_mod.encodeAppendValue(std.testing.allocator, 0, "a");
     defer std.testing.allocator.free(v);
@@ -21214,6 +21308,34 @@ test "Shard: a lone node's read of a namespace never created is answered missing
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try nextAnswer(c, &shard, &out)).header.status);
     shard.runRequest(c.conn, edgeGet(&body, 3, "nope", "other"), .client);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.not_found), (try nextAnswer(c, &shard, &out)).header.status);
+}
+
+test "Shard: a group read in a namespace never created is refused no_namespace, not run, waiting or not, and makes no group" {
+    const pipe_fds = try @import("stdx").io.pipe();
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var shard = try Shard.init(std.testing.allocator, 0, 1, 4096, pipe_fds[0], null, Partition.DEFAULT_UAL_CAPACITY, 0, 0, .async_flush, 1, .single, .{}, .{});
+    defer shard.deinit();
+    shard.wireHandlerShardPtrs();
+    try std.testing.expect(shard.applyCommitted());
+    const c = try TestClient.open(&shard);
+    defer _ = std.c.close(c.pair[1]);
+    var out: [512]u8 = undefined;
+    const group_consumer = "\x01\x00" ++ "g" ++ "\x01\x00" ++ "c";
+    var ob_buf: [16]u8 = undefined;
+    var ob = proto.OptionsBuilder.init(&ob_buf);
+    try ob.addU32(.block_ms, 5000);
+    const last = shard.raft_node.log.lastIndex();
+    for ([_][]const u8{ "", ob.getOptions() }, 1..) |options, id| {
+        shard.runRequest(c.conn, testReq(.stream_group_read, id, "nope", "s", group_consumer, options), .client);
+        const refused = try nextAnswer(c, &shard, &out);
+        try std.testing.expectEqual(@backingInt(proto.StatusCode.no_namespace), refused.header.status);
+        try std.testing.expectEqual(proto.Ran.no, (try refused.refused()).ran);
+    }
+    try std.testing.expectEqual(last, shard.raft_node.log.lastIndex());
+    try std.testing.expectEqual(@as(usize, 0), shard.defaultPartition().stream.groups.count());
+    try std.testing.expectEqual(@as(u16, 0), shard.waiter_pool.countByKind(.stream_group_read));
+    try std.testing.expect(shard.namespace_handler.idOf("nope") == null);
 }
 
 test "Shard: a follower's reads of a namespace it doesn't know share one ask of the leader, wait for its table, and run once it gets there" {
