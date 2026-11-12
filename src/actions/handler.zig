@@ -1772,21 +1772,40 @@ pub const ActionsHandler = struct {
     /// Invoke an action for a workflow run on this shard: the run exists
     /// once the invoke applies. Null if the action doesn't exist or the
     /// invoke could not be proposed.
-    pub fn invokeByName(shard: *Shard, namespace: []const u8, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) ?Invoked {
+    /// What became of a workflow's invoke.
+    pub const InvokeResult = union(enum) {
+        invoked: Invoked,
+        /// No such action.
+        missing,
+        /// The log is too full to take it now: the step tries again.
+        held,
+        /// Refused for good.
+        failed,
+    };
+
+    pub fn invokeByName(shard: *Shard, namespace: []const u8, action_name: []const u8, input: ?[]const u8, caller_run_id: ?[]const u8, caller_workflow_name: ?[]const u8, id_buf: *[32]u8) InvokeResult {
         const caller_shard: ?u16 = if (caller_run_id != null) @intCast(shard.id) else null;
         const ns = homeOf(namespace);
-        if (!actionExists(shard, ns, action_name)) return null;
+        if (!actionExists(shard, ns, action_name)) return .missing;
         const run_id = shard.run_id_gen.next(.action, shard.router.keyToPartitionNs(shard.namespaceId(namespace), action_name), id_buf);
-        const index = proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard) orelse return null;
-        return .{ .id = run_id, .index = index };
+        return switch (proposeInvoke(shard, ns, action_name, run_id, input orelse "", caller_run_id, caller_workflow_name, caller_shard)) {
+            .index => |index| .{ .invoked = .{ .id = run_id, .index = index } },
+            .held => .held,
+            .failed => .failed,
+        };
     }
 
-    fn proposeInvoke(shard: *Shard, ns: []const u8, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8, caller_shard: ?u16) ?u64 {
+    /// An invoke proposed (its index), refused for now because the log is
+    /// full, or refused for good.
+    const Proposed = union(enum) { index: u64, held, failed };
+
+    fn proposeInvoke(shard: *Shard, ns: []const u8, action: []const u8, run_id: []const u8, input: []const u8, caller_run: ?[]const u8, caller_workflow: ?[]const u8, caller_shard: ?u16) Proposed {
         const proposed = propose(shard, .action_invoke, ae.Invoke.Value{ .ns = ns, .action = action, .run = run_id, .input = input, .labels = null, .source = if (caller_run != null) .workflow else .direct, .caller_run = caller_run, .caller_workflow = caller_workflow, .caller_shard = caller_shard }) catch |err| {
+            if (err == error.Overloaded) return .held;
             if (!shard.quietHalted(err)) log.err("shard {d}: action run {s} not started: {s}", .{ shard.id, run_id, @errorName(err) });
-            return null;
+            return .failed;
         };
-        return proposed.index;
+        return .{ .index = proposed.index };
     }
 
     /// A workflow on another shard asking this one to start a run it will
@@ -1809,9 +1828,27 @@ pub const ActionsHandler = struct {
             if (m.can_wait) return self.hold(shard, from, bytes, m.run, m.ns, m.action);
             return self.failHeld(shard, from, m.run, m.ns, m.action, "");
         }
-        if (!self.startRun(shard, from, m)) {
-            log.err("shard {d}: action run {s} asked for by a workflow could not be started; that workflow's step fails", .{ shard.id, m.run });
+        switch (self.startRun(shard, from, m)) {
+            .index => {},
+            // Tried again each tick, as a start held for its action is.
+            .held => self.holdForRoom(shard, from, bytes, m),
+            .failed => log.err("shard {d}: action run {s} asked for by a workflow could not be started; that workflow's step fails", .{ shard.id, m.run }),
         }
+    }
+
+    /// Most a start held because the log is full waits for room.
+    const ROOM_WAIT_MS: u64 = 10 * 60 * 1000;
+
+    /// Hold a start the log was too full to take, beside those held for
+    /// their action: `stepHeld` proposes it again each tick.
+    fn holdForRoom(self: *ActionsHandler, shard: *Shard, from: u16, bytes: []const u8, m: StartMessage) void {
+        if (self.held.count() >= MAX_HELD) {
+            log.err("shard {d}: action run {s} asked for by a workflow could not be started: the log is full and too many starts already wait; that workflow's step fails", .{ shard.id, m.run });
+            return;
+        }
+        const owned = self.allocator.dupe(u8, bytes) catch return;
+        const run = StartMessage.parse(owned).?.run;
+        self.held.put(self.allocator, run, .{ .from = from, .bytes = owned, .until_ms = @import("stdx").time.monotonicMs() +| ROOM_WAIT_MS }) catch self.allocator.free(owned);
     }
 
     const StartMessage = struct {
@@ -1845,11 +1882,12 @@ pub const ActionsHandler = struct {
         }
     };
 
-    fn startRun(self: *ActionsHandler, shard: *Shard, from: u16, m: StartMessage) bool {
-        _ = proposeInvoke(shard, m.ns, m.action, m.run, m.input, if (m.caller.len == 0) null else m.caller, if (m.workflow.len == 0) null else m.workflow, if (m.caller.len == 0) null else from) orelse return false;
-        const k = self.allocator.dupe(u8, m.run) catch return true;
+    fn startRun(self: *ActionsHandler, shard: *Shard, from: u16, m: StartMessage) Proposed {
+        const proposed = proposeInvoke(shard, m.ns, m.action, m.run, m.input, if (m.caller.len == 0) null else m.caller, if (m.workflow.len == 0) null else m.workflow, if (m.caller.len == 0) null else from);
+        if (proposed != .index) return proposed;
+        const k = self.allocator.dupe(u8, m.run) catch return proposed;
         self.starting.put(self.allocator, k, @import("stdx").time.monotonicMs()) catch self.allocator.free(k);
-        return true;
+        return proposed;
     }
 
     /// Whether a run asked for here is yet to exist, not lost: its invoke
@@ -1905,7 +1943,7 @@ pub const ActionsHandler = struct {
             const m = StartMessage.parse(e.value_ptr.bytes).?;
             if (actionExists(shard, m.ns, m.action)) {
                 // Not proposed: tried again next tick, until the wait ends.
-                if (!self.startRun(shard, e.value_ptr.from, m)) {
+                if (self.startRun(shard, e.value_ptr.from, m) != .index) {
                     if (now_ms < e.value_ptr.until_ms) continue;
                     self.sendFinished(shard, e.value_ptr.from, m.run, .cancelled, "", "");
                 }

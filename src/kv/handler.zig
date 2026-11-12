@@ -972,33 +972,38 @@ pub const KVHandler = struct {
         }
     };
 
-    /// The processing KV sink's write of `raw_key` in `namespace`, which
-    /// this shard owns: proposed as any put is, unanswered. The reason it
-    /// couldn't be, or null. The caller counts a refusal as a dropped record.
-    /// What `sinkPropose` answers when its shard can take no more writes
-    /// for now: the sink holds its source and tries again, it doesn't drop.
-    pub const SINK_OVERLOADED = "too many writes wait to apply";
+    /// What became of a processing KV sink's write.
+    pub const SinkResult = union(enum) {
+        proposed,
+        /// The shard can take no more writes for now: the sink holds its
+        /// source, or its message, and tries again.
+        held,
+        /// Refused for good, for this reason; the caller counts it dropped.
+        dropped: []const u8,
+    };
 
-    pub fn sinkPropose(shard: *Shard, namespace: []const u8, raw_key: []const u8, value: []const u8, ttl_ms: ?u64) ?[]const u8 {
-        checkKey(raw_key) catch |err| return refusal(err).refusal.message;
+    /// The processing KV sink's write of `raw_key` in `namespace`, which
+    /// this shard owns: proposed as any put is, unanswered.
+    pub fn sinkPropose(shard: *Shard, namespace: []const u8, raw_key: []const u8, value: []const u8, ttl_ms: ?u64) SinkResult {
+        checkKey(raw_key) catch |err| return .{ .dropped = refusal(err).refusal.message };
         shard.namespace_handler.proposeImplicitCreate(namespace, shard);
         const ns_id = shard.namespaceId(namespace);
         if (ns_id == .invalid) {
             // Its create was refused for room: held like the write would be.
             const raft = shard.raft_node;
-            if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return SINK_OVERLOADED;
-            return "the namespace isn't created on this shard yet";
+            if (raft.log.lastIndex() -| raft.last_applied >= raft_node_mod.MAX_OUTSTANDING) return .held;
+            return .{ .dropped = "the namespace isn't created on this shard yet" };
         }
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         _ = proposeKV(shard, .kv_put, .{ .key = Key.init(&kbuf, ns_id, raw_key).stored, .value = value, .ttl_ms = ttl_ms, .condition = .always, .cas_version = null }) catch |err| return switch (err) {
-            error.NotLeader => "this node doesn't lead its group",
-            error.WritesStopped => "the shard stopped taking writes",
-            error.Halted => "the shard is halted",
-            error.Overloaded => SINK_OVERLOADED,
-            else => @errorName(err),
+            error.Overloaded => .held,
+            error.NotLeader => .{ .dropped = "this node doesn't lead its group" },
+            error.WritesStopped => .{ .dropped = "the shard stopped taking writes" },
+            error.Halted => .{ .dropped = "the shard is halted" },
+            else => .{ .dropped = @errorName(err) },
         };
         shard.namespace_handler.markNamespaceHasData(namespace, shard);
-        return null;
+        return .proposed;
     }
 
     // ── Blocking GET Waiter Management ──────────────────────────────────

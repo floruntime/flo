@@ -1947,8 +1947,14 @@ pub const WorkflowHandler = struct {
 
         var child_id_buf: [32]u8 = undefined;
         var child_index: u64 = 0;
-        const child_rid = target_handler.spawnRun(target_shard, ns, child_name, step_input, "child_started", &child_id_buf, &child_index) orelse
-            return definition.StepOutcome.execution_failure;
+        const child_rid = switch (target_handler.spawnRun(target_shard, ns, child_name, step_input, "child_started", &child_id_buf, &child_index)) {
+            .started => |rid| rid,
+            .held => {
+                const held_parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
+                return self.holdStepForRoom(held_parent, step_label, now_ms);
+            },
+            .failed => return definition.StepOutcome.execution_failure,
+        };
 
         const parent = self.runs.getPtr(parent_ns_key) orelse return definition.StepOutcome.execution_failure;
         // The index is in the target shard's log: known only when that is
@@ -1981,11 +1987,32 @@ pub const WorkflowHandler = struct {
         evt_type: []const u8,
         id_buf: *[32]u8,
         index: *u64,
-    ) ?[]const u8 {
+    ) union(enum) { started: []const u8, held, failed } {
         const partition_id = shard.router.keyToPartitionNs(ns, wf_name);
         const run_id_str = shard.run_id_gen.next(.workflow, partition_id, id_buf);
-        index.* = self.proposeRun(shard, ns, run_id_str, wf_name, "latest", input, null, evt_type) orelse return null;
-        return run_id_str;
+        const proposed = self.proposeStart(shard, ns, run_id_str, wf_name, "latest", input, null, evt_type) catch |err| {
+            if (err == error.Overloaded) return .held;
+            if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ wf_name, run_id_str, @errorName(err) });
+            return .failed;
+        };
+        index.* = proposed.index;
+        return .{ .started = run_id_str };
+    }
+
+    /// How long a step whose start the log was too full to take waits
+    /// before it's tried again.
+    pub const STEP_ROOM_RETRY_MS: i64 = 100;
+
+    /// A step's start the log was too full to take: the run waits on its
+    /// poll timer and runs the step again, rather than failing it. Its
+    /// history says so once per wait.
+    fn holdStepForRoom(self: *WorkflowHandler, run: *RunRecord, step_label: []const u8, now_ms: i64) ?[]const u8 {
+        const said = if (run.history.items.len > 0) std.mem.eql(u8, run.history.items[run.history.items.len - 1].event_type_owned, "step_waiting_for_room") else false;
+        if (!said) self.addHistoryEvent(run, "step_waiting_for_room", step_label, now_ms);
+        run.status = .waiting;
+        run.poll_next_at_ms = now_ms + STEP_ROOM_RETRY_MS;
+        self.armTimer(run, run.poll_next_at_ms);
+        return null;
     }
 
     /// Whether the run `run` waits for, which the caller did not find, was
@@ -2225,8 +2252,10 @@ pub const WorkflowHandler = struct {
         now_ms: i64,
     ) ?[]const u8 {
         var action_id_buf: [32]u8 = undefined;
-        const invoked = ActionsHandler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf) orelse {
-            return definition.StepOutcome.execution_failure;
+        const invoked = switch (ActionsHandler.invokeByName(shard, namespace, action_name, input, run.run_id_owned, run.workflow_name_owned, &action_id_buf)) {
+            .invoked => |i| i,
+            .held => return self.holdStepForRoom(run, step_label, now_ms),
+            .missing, .failed => return definition.StepOutcome.execution_failure,
         };
         // The run exists once the invoke applies; `checkPendingActions`
         // resumes this one when it finishes.

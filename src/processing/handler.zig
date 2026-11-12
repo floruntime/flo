@@ -2067,8 +2067,8 @@ pub const ProcessingHandler = struct {
     /// KV sink: write the record under `key_prefix + separator + record_key`
     /// on the shard that owns that key, so a later `kv get` finds it: here,
     /// or, when another shard owns it, by a message that shard proposes
-    /// from. A message to a full inbox is not retried: the record is lost,
-    /// and counted, until channels give sinks durable delivery.
+    /// from. A full inbox holds the source as a full log does, so the batch
+    /// is read and sent again.
     fn writeKvSink(self: *ProcessingHandler, snk: SinkConfig, shard: *Shard, record_key: []const u8, payload: []const u8) void {
         var key_buf: [MAX_SINK_KEY]u8 = undefined;
         const full_key = self.kvSinkKeyOrDrop(&key_buf, snk, shard.metrics_registry, record_key) orelse return;
@@ -2076,9 +2076,10 @@ pub const ProcessingHandler = struct {
         if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
         const owner = self.kvOwner(shard, snk.namespace, full_key);
         if (owner == shard.id) {
-            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| {
-                if (why.ptr == kv_handler_mod.KVHandler.SINK_OVERLOADED.ptr) return self.holdForRoom();
-                self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            switch (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) {
+                .proposed => {},
+                .held => self.holdForRoom(),
+                .dropped => |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why),
             }
             return;
         }
@@ -2087,7 +2088,7 @@ pub const ProcessingHandler = struct {
         if (!shard.peer_mailboxes.?[owner].inbox.send(.{ .tag = .kv_sink_put, .src_shard = @intCast(shard.id), .payload_len = @intCast(message.len), .payload_ptr = message.ptr })) {
             shard.allocator.free(message);
             if (shard.shard_metrics) |sm| sm.recordCrossShardOverloaded(.engine);
-            self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "the owning shard's inbox is full; the record is lost");
+            self.holdForRoom();
         }
     }
 
