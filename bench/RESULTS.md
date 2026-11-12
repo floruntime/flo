@@ -68,6 +68,18 @@ load (33–54), 2026-11-12; three runs each.
 The scan grows with the listing, which grows with every flush; the read's remainder is the file open
 and whole-file read per segment.
 
+### One record from a large segment (`bench-segment-read`)
+
+Single records at random indices from two 16 MiB segments (50,000 entries of 300 B each), alternating so
+each read opens its segment. Segments of 64 KiB or less are still read whole, so the small-segment walk
+above is unchanged (15.0–15.7 µs a record before, 14.8–16.0 after, same runs). ReleaseSafe, shared Mac,
+load 10–13, 2026-11-12; three runs each, interleaved.
+
+| Build | p50 µs | p99 µs |
+|---|---:|---:|
+| whole-file reads | 4,734–4,771 | 5,036–5,109 |
+| positioned reads | 18–21 | 26–31 |
+
 ## Comparison with Old Architecture
 
 The New column is older than the tables above: its figures come from Zig 0.15.2, with their build also

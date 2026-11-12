@@ -4,10 +4,10 @@
 //! one sealed segment, and is woken when the result is in.
 //!
 //! The thread never touches a shard's durable log: it opens the segment file
-//! itself, through a one-segment cache of its own. A truncation may rewrite or
-//! delete that file under it; the rename leaves an open file reading the old
-//! contents whole, and the shard drops a result whose truncation generation
-//! has moved, so a read is never torn, only stale.
+//! itself, for that read alone. A truncation may rewrite or delete the file
+//! during the read; the rename leaves the open file reading the old contents,
+//! and the shard drops a result whose truncation generation has moved, so a
+//! read is never torn, only stale.
 //!
 //! Three lanes: catch-up (a leader's reads for its peers), stream (payloads
 //! a stream reader waits on), and background (work nobody waits on, such as
@@ -17,7 +17,7 @@
 const std = @import("std");
 const stdx = @import("stdx");
 const entry_mod = @import("ual/entry.zig");
-const SegmentReader = @import("ual/reader.zig").SegmentReader;
+const PositionedSegment = @import("ual/reader.zig").PositionedSegment;
 const durable_log = @import("durable_log.zig");
 const CatchUpResult = @import("../raft/log.zig").CatchUpResult;
 
@@ -90,17 +90,11 @@ pub const BulkIo = struct {
     thread: ?std.Thread = null,
     wake_rd: std.posix.fd_t = -1,
     wake_wr: std.posix.fd_t = -1,
-    /// The thread's own one-segment cache, kept for one truncation
-    /// generation: a rewrite reuses the file's name.
-    cached: ?Cached = null,
+    /// Where the thread's reads land before their entries are copied out;
+    /// allocated on its first read.
+    scratch: []u8 = &.{},
 
-    const Cached = struct {
-        path: [MAX_PATH]u8,
-        path_len: usize,
-        generation: u64,
-        buf: []u8,
-        reader: SegmentReader,
-    };
+    const SCRATCH_SIZE = 64 * 1024;
 
     pub fn init(allocator: std.mem.Allocator) !BulkIo {
         const fds = try stdx.io.pipe();
@@ -127,7 +121,7 @@ pub const BulkIo = struct {
 
     pub fn deinit(self: *BulkIo) void {
         self.stop();
-        self.dropCache();
+        self.allocator.free(self.scratch);
         if (self.wake_rd >= 0) _ = std.c.close(self.wake_rd);
         if (self.wake_wr >= 0) _ = std.c.close(self.wake_wr);
     }
@@ -190,7 +184,7 @@ pub const BulkIo = struct {
     /// segment. A failure to open or read it is classified as the shard's own
     /// read would classify it.
     fn read(self: *BulkIo, r: *SealedRead) CatchUpResult {
-        const opened = self.open(r.pathSlice(), r.generation) catch |err| {
+        const got = self.readSealed(r) catch |err| {
             return switch (durable_log.DurableLog.readBlockClass(err)) {
                 .resource => .{ .blocked = true },
                 .disk => .{ .blocked = true, .disk_failing = true, .permission = durable_log.DurableLog.isPermission(err) },
@@ -199,26 +193,18 @@ pub const BulkIo = struct {
                 .fault => .{},
             };
         };
-        const offset = opened.reader.findOffset(r.start) orelse return .{};
-        const data = opened.buf[opened.reader.data_start + offset .. opened.reader.data_end];
-        return .{ .count = durable_log.copyFrom(data, r.start, r.entries, r.arena) };
+        return .{ .count = got.count };
     }
 
-    fn open(self: *BulkIo, path: []const u8, generation: u64) !*const Cached {
-        if (self.cached) |*c| {
-            if (c.generation == generation and std.mem.eql(u8, c.path[0..c.path_len], path)) return c;
-        }
-        const opened = try SegmentReader.initFromFile(self.allocator, path);
-        self.dropCache();
-        var c: Cached = .{ .path = undefined, .path_len = path.len, .generation = generation, .buf = opened.buf, .reader = opened.reader };
-        @memcpy(c.path[0..path.len], path);
-        self.cached = c;
-        return &self.cached.?;
-    }
-
-    fn dropCache(self: *BulkIo) void {
-        if (self.cached) |c| self.allocator.free(c.buf);
-        self.cached = null;
+    /// Opens the segment for this read alone and closes it after: a file
+    /// kept open past the read would hold a segment's disk space after
+    /// compaction deletes it. An open reads only the header, footer and
+    /// sparse index (or a small file whole), so it's cheap to repeat.
+    fn readSealed(self: *BulkIo, r: *SealedRead) !PositionedSegment.Read {
+        var opened = try PositionedSegment.open(self.allocator, r.pathSlice());
+        defer opened.close(self.allocator);
+        if (self.scratch.len == 0) self.scratch = try self.allocator.alloc(u8, SCRATCH_SIZE);
+        return opened.read(r.start, r.entries, r.arena, self.scratch);
     }
 };
 

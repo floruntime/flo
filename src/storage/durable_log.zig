@@ -13,6 +13,7 @@ const segment = @import("ual/segment.zig");
 const entry_mod = @import("ual/entry.zig");
 const SegmentWriter = @import("ual/writer.zig").SegmentWriter;
 const SegmentReader = @import("ual/reader.zig").SegmentReader;
+const PositionedSegment = @import("ual/reader.zig").PositionedSegment;
 const log = stdx.log;
 
 const Entry = entry_mod.Entry;
@@ -69,9 +70,12 @@ pub const DurableLog = struct {
     /// provoking a real one. Null in production.
     test_open_error: ?anyerror = null,
     /// The segment last read below the ring, kept open: a deferred tail
-    /// reads one entry per call, and re-opening and CRC-checking the whole
-    /// file each time is quadratic.
-    open: ?Open = null,
+    /// reads one entry per call, and re-opening it each time would read its
+    /// sparse index again.
+    open: ?PositionedSegment = null,
+    /// Where reads below the ring land before their entries are copied
+    /// out; allocated on the first such read.
+    scratch: []u8 = &.{},
     /// Where a read from `start` would come from, for a reader on another
     /// thread: null when the writer's buffer holds it (that read stays here),
     /// or when nothing durable does. The path is copied into `path_buf`;
@@ -117,12 +121,9 @@ pub const DurableLog = struct {
     /// operator may fix, which every report says plainly.
     pub const ReadResult = struct { count: usize = 0, blocked: bool = false, disk_failing: bool = false, permission: bool = false };
 
-    const Open = struct {
-        first_index: u64,
-        last_index: u64,
-        buf: []u8,
-        reader: SegmentReader,
-    };
+    /// Enough for a run of small entries per read; a bigger entry is read
+    /// straight into the caller's arena.
+    const SCRATCH_SIZE = 64 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, writer: *SegmentWriter, segs_path: []const u8) !DurableLog {
         return .{
@@ -134,6 +135,7 @@ pub const DurableLog = struct {
 
     pub fn deinit(self: *DurableLog) void {
         self.invalidate();
+        self.allocator.free(self.scratch);
         self.allocator.free(self.segs_path);
     }
 
@@ -222,7 +224,8 @@ pub const DurableLog = struct {
         if (self.pending_cut) |cut| {
             if (start > cut) return .{};
         }
-        const opened = self.openCovering(start) catch |err| {
+        const limit = if (self.pending_cut) |cut| @min(buf.len, @as(usize, @intCast(cut - start + 1))) else buf.len;
+        const read = self.readSealed(start, buf[0..limit], arena) catch |err| {
             // A resource or IO failure means "not now", not "not there": the
             // segment is listed, so the data exists; the caller retries. A
             // corrupt or missing segment is a genuine fault.
@@ -235,13 +238,14 @@ pub const DurableLog = struct {
                 },
             }
         } orelse return .{};
-        const offset = opened.reader.findOffset(start) orelse {
-            log.err("durable log: the segment covering index {d} does not hold it", .{start});
-            return .{};
-        };
-        const data = opened.buf[opened.reader.data_start + offset .. opened.reader.data_end];
-        const limit = if (self.pending_cut) |cut| @min(buf.len, @as(usize, @intCast(cut - start + 1))) else buf.len;
-        return .{ .count = copyFrom(data, start, buf[0..limit], arena) };
+        if (read.missing) log.err("durable log: the segment covering index {d} does not hold it", .{start});
+        return .{ .count = read.count };
+    }
+
+    fn readSealed(self: *DurableLog, start: u64, buf: []Entry, arena: []u8) !?PositionedSegment.Read {
+        const opened = try self.openCovering(start) orelse return null;
+        if (self.scratch.len == 0) self.scratch = try self.allocator.alloc(u8, SCRATCH_SIZE);
+        return try opened.read(start, buf, arena, self.scratch);
     }
 
     pub const ReadBlockClass = enum {
@@ -585,15 +589,17 @@ pub const DurableLog = struct {
             self.freeSegments(l);
             self.listing = null;
         }
-        if (self.open) |o| {
-            self.allocator.free(o.buf);
-            self.open = null;
-        }
+        self.closeOpen();
+    }
+
+    fn closeOpen(self: *DurableLog) void {
+        if (self.open) |*o| o.close(self.allocator);
+        self.open = null;
     }
 
     /// The open segment covering `index`, opening (and caching) it if the
     /// one held does not. Null when no sealed segment holds the index.
-    fn openCovering(self: *DurableLog, index: u64) !?*const Open {
+    fn openCovering(self: *DurableLog, index: u64) !?*const PositionedSegment {
         if (self.open) |*o| {
             if (index >= o.first_index and index <= o.last_index) return o;
         }
@@ -601,9 +607,9 @@ pub const DurableLog = struct {
         // injected error; one that must be opened hits it.
         if (self.test_open_error) |e| return e;
         const f = covering(try self.segments(), index) orelse return null;
-        const opened = try SegmentReader.initFromFile(self.allocator, f.path);
-        if (self.open) |o| self.allocator.free(o.buf);
-        self.open = .{ .first_index = f.first_index, .last_index = f.last_index, .buf = opened.buf, .reader = opened.reader };
+        const opened = try PositionedSegment.open(self.allocator, f.path);
+        self.closeOpen();
+        self.open = opened;
         return &self.open.?;
     }
 
@@ -898,6 +904,213 @@ test "durable log: every index is found in its own segment among many, and none 
         try testing.expectEqual(@as(usize, 0), dl.readRange(i, &buf, &arena).count);
         try testing.expect((try dl.sealedSource(i, &path_buf)) == null);
     }
+}
+
+/// Payload `i` is `i % 7 * 50` bytes of `i`'s low byte, so sizes vary and
+/// some are empty.
+fn variedPayload(buf: []u8, i: u64) []const u8 {
+    const len: usize = @intCast(i % 7 * 50);
+    @memset(buf[0..len], @truncate(i));
+    return buf[0..len];
+}
+
+test "durable log: a positioned read finds every start in a large segment, through any scratch size" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    // 1,000 entries from index 11: several sparse index points.
+    var pbuf: [512]u8 = undefined;
+    for (11..1011) |i| try writer.addEntry(&testEntry(i, 1, variedPayload(&pbuf, i)));
+    try writer.writeToFile(td.path);
+    var name_buf: [32]u8 = undefined;
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ td.path, segment.segmentFilename(&name_buf, 11).? });
+    defer testing.allocator.free(path);
+
+    var seg = try PositionedSegment.open(testing.allocator, path);
+    defer seg.close(testing.allocator);
+    try testing.expect(seg.sparse.len > 1);
+    try testing.expect(seg.whole == null);
+
+    var buf: [5]Entry = undefined;
+    var arena: [4096]u8 = undefined;
+    // A scratch smaller than most entries reads them straight into the arena.
+    var small: [64]u8 = undefined;
+    var large: [16 * 1024]u8 = undefined;
+    for ([_][]u8{ &small, &large }) |scratch| {
+        for (11..1011) |start| {
+            const got = try seg.read(start, &buf, &arena, scratch);
+            const want = @min(5, 1011 - start);
+            try testing.expectEqual(want, got.count);
+            try testing.expect(!got.missing);
+            for (buf[0..got.count], 0..) |e, k| {
+                try testing.expectEqual(@as(u64, start + k), e.header.index);
+                try testing.expectEqualSlices(u8, variedPayload(&pbuf, start + k), e.payload);
+            }
+        }
+        // Outside the segment: nothing, and not "missing".
+        for ([_]u64{ 10, 1011 }) |start| {
+            const got = try seg.read(start, &buf, &arena, scratch);
+            try testing.expectEqual(@as(usize, 0), got.count);
+            try testing.expect(!got.missing);
+        }
+    }
+    // An arena too small for the next payload stops the read there: from
+    // 14, payloads of 0, 50 and 100 bytes fit 150, and 17's 150 doesn't.
+    const got = try seg.read(14, &buf, arena[0..150], &large);
+    try testing.expectEqual(@as(usize, 3), got.count);
+}
+
+test "durable log: a positioned read refuses an entry whose bytes don't match its CRC" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    // Two segments: a large one, read by position, and a small one, read whole.
+    var name_buf: [32]u8 = undefined;
+    var paths: [2][]const u8 = undefined;
+    for ([_]u64{ 300, 3 }, [_]u64{ 1, 1001 }, 0..) |n, first, k| {
+        var writer = SegmentWriter.init(testing.allocator, 0);
+        defer writer.deinit();
+        var pbuf: [300]u8 = undefined;
+        for (first..first + n) |i| {
+            @memset(&pbuf, 'p');
+            if (i == first + 1) @memcpy(pbuf[0..6], "second");
+            try writer.addEntry(&testEntry(i, 1, &pbuf));
+        }
+        try writer.writeToFile(td.path);
+        paths[k] = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ td.path, segment.segmentFilename(&name_buf, first).? });
+        // Flip a byte of the second entry's payload in place.
+        const bytes = try stdx.fs.readFileAlloc(testing.allocator, paths[k], 1 << 20);
+        defer testing.allocator.free(bytes);
+        bytes[std.mem.indexOf(u8, bytes, "second").?] ^= 0xff;
+        const f = try stdx.fs.createFile(paths[k], .{});
+        defer stdx.fs.closeFile(f);
+        try stdx.fs.writeAll(f, bytes);
+    }
+    defer for (paths) |p| testing.allocator.free(p);
+
+    var seg = try PositionedSegment.open(testing.allocator, paths[0]);
+    defer seg.close(testing.allocator);
+    try testing.expect(seg.whole == null);
+    var buf: [3]Entry = undefined;
+    var arena: [1024]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    // Entry 1 is good on its own; a read that reaches entry 2 fails.
+    try testing.expectEqual(@as(usize, 1), (try seg.read(1, buf[0..1], &arena, &scratch)).count);
+    try testing.expectError(error.InvalidCrc, seg.read(1, &buf, &arena, &scratch));
+    try testing.expectError(error.InvalidCrc, seg.read(2, &buf, &arena, &scratch));
+    try testing.expectEqual(@as(usize, 3), (try seg.read(3, &buf, &arena, &scratch)).count);
+    // The small one is read whole, and its whole-file CRC refuses it.
+    try testing.expectError(error.InvalidCrc, PositionedSegment.open(testing.allocator, paths[1]));
+    // The durable log reads either as a fault: nothing, and not blocked.
+    var dl_writer = SegmentWriter.init(testing.allocator, 0);
+    defer dl_writer.deinit();
+    var dl = try DurableLog.init(testing.allocator, &dl_writer, td.path);
+    defer dl.deinit();
+    for ([_]u64{ 2, 1002 }) |i| {
+        const r = dl.readRange(i, &buf, &arena);
+        try testing.expectEqual(@as(usize, 0), r.count);
+        try testing.expect(!r.blocked);
+    }
+}
+
+/// Writes one segment of `payloads` from index `first` into `dir`, and
+/// returns its path; the caller frees it.
+fn writeTestSegment(dir: []const u8, first: u64, payloads: []const []const u8) ![]const u8 {
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    for (payloads, first..) |p, i| try writer.addEntry(&testEntry(i, 1, p));
+    try writer.writeToFile(dir);
+    var name_buf: [32]u8 = undefined;
+    return std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir, segment.segmentFilename(&name_buf, first).? });
+}
+
+/// Applies `edit` to the file at `path` in place.
+fn editFile(path: []const u8, edit: *const fn ([]u8) void) !void {
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 4 << 20);
+    defer testing.allocator.free(bytes);
+    edit(bytes);
+    const f = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(f);
+    try stdx.fs.writeAll(f, bytes);
+}
+
+test "durable log: a positioned read checks an entry bigger than its scratch, and refuses a bad length or index" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    // 100 KiB payloads: the file is read by position, and each entry is
+    // bigger than the 4 KiB scratch, so it's read straight into the arena.
+    const big = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(big);
+    var scratch: [4096]u8 = undefined;
+    var buf: [3]Entry = undefined;
+    const arena = try testing.allocator.alloc(u8, 400 * 1024);
+    defer testing.allocator.free(arena);
+
+    const Edits = struct {
+        /// A byte of the second entry's payload: its marker.
+        fn payload(bytes: []u8) void {
+            bytes[std.mem.indexOf(u8, bytes, "SECOND").?] ^= 0xff;
+        }
+        /// The second entry's length, past the file's end.
+        fn length(bytes: []u8) void {
+            const at = std.mem.indexOf(u8, bytes, "SECOND").? - entry_mod.HEADER_SIZE + @offsetOf(entry_mod.Header, "payload_len");
+            std.mem.writeInt(u32, bytes[at..][0..4], 0xFFFF_FFF0, .little);
+        }
+        /// The footer's sparse index offset, into the data section.
+        fn index(bytes: []u8) void {
+            const footer = bytes.len - segment.FOOTER_SIZE;
+            std.mem.writeInt(u32, bytes[footer..][0..4], segment.HEADER_SIZE + 10, .little);
+        }
+        /// A sparse index entry's offset, past the data.
+        fn sparse(bytes: []u8) void {
+            const footer = bytes.len - segment.FOOTER_SIZE;
+            const idx = std.mem.readInt(u32, bytes[footer..][0..4], .little);
+            std.mem.writeInt(u32, bytes[idx + 8 ..][0..4], 0xFFFF_FFFF, .little);
+        }
+        /// The header's data size, one short.
+        fn data_size(bytes: []u8) void {
+            const at = @offsetOf(segment.SegmentHeader, "data_size");
+            const v = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            std.mem.writeInt(u32, bytes[at..][0..4], v - 1, .little);
+        }
+    };
+    var first: u64 = 1;
+    for ([_]*const fn ([]u8) void{ Edits.payload, Edits.length, Edits.index, Edits.sparse, Edits.data_size }, 0..) |edit, k| {
+        @memset(big, 'b');
+        var second = try testing.allocator.dupe(u8, big);
+        defer testing.allocator.free(second);
+        @memcpy(second[0..6], "SECOND");
+        const path = try writeTestSegment(td.path, first, &.{ big, second, big });
+        defer testing.allocator.free(path);
+        try editFile(path, edit);
+        defer first += 10;
+        if (k >= 2) {
+            try testing.expectError(error.InvalidIndex, PositionedSegment.open(testing.allocator, path));
+            continue;
+        }
+        var seg = try PositionedSegment.open(testing.allocator, path);
+        defer seg.close(testing.allocator);
+        try testing.expect(seg.whole == null and seg.file != null);
+        // The first entry alone is good; a read that reaches the second fails.
+        try testing.expectEqual(@as(usize, 1), (try seg.read(first, buf[0..1], arena, &scratch)).count);
+        try testing.expectEqualSlices(u8, big, buf[0].payload);
+        const want: anyerror = if (k == 0) error.InvalidCrc else error.ShortRead;
+        try testing.expectError(want, seg.read(first, &buf, arena, &scratch));
+    }
+}
+
+test "durable log: a small segment is read whole and holds no file open" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    const path = try writeTestSegment(td.path, 1, &.{ "one", "two" });
+    defer testing.allocator.free(path);
+    var seg = try PositionedSegment.open(testing.allocator, path);
+    defer seg.close(testing.allocator);
+    try testing.expect(seg.whole != null and seg.file == null);
+    var buf: [2]Entry = undefined;
+    var arena: [16]u8 = undefined;
+    var scratch: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), (try seg.read(1, &buf, &arena, &scratch)).count);
 }
 
 test "durable log: truncateAfter rewrites the sealed tail under its own name and deletes emptied files" {
@@ -1445,10 +1658,7 @@ test "durable log: a resource or IO read failure is held as blocked, corruption 
         var dpath: [600:0]u8 = undefined;
         const z = try std.fmt.bufPrintSentinel(&dpath, "{s}", .{path3}, 0);
         _ = std.c.chmod(z, 0);
-        dl.open = blk: {
-            if (dl.open) |o| testing.allocator.free(o.buf);
-            break :blk null;
-        };
+        dl.closeOpen();
         const r = dl.readRange(6, &buf, &arena);
         // Root reads through any mode: only check the block where it bites.
         if (std.c.getuid() != 0) try testing.expect(r.blocked and r.disk_failing);

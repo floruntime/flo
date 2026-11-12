@@ -184,6 +184,185 @@ pub const SegmentReader = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PositionedSegment
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A sealed segment opened to read a few entries: its file, bounds and
+/// sparse index, without its entries. A read seeks to the nearest indexed
+/// entry and reads a window from there, so a record costs what is near it,
+/// not the whole file. The whole-file CRC can't be checked that way; each
+/// entry a read returns is checked against its own CRC instead. A segment
+/// of at most `WHOLE_MAX` bytes is read whole when opened, its whole-file
+/// CRC checked, as one read costs less than several small ones.
+pub const PositionedSegment = struct {
+    /// The open file, for a large segment; a small one is closed once read.
+    file: ?std.Io.File = null,
+    /// The whole file, for a small segment.
+    whole: ?[]u8 = null,
+    first_index: u64,
+    last_index: u64,
+    /// File offsets of the entry data section.
+    data_start: u64,
+    data_end: u64,
+    sparse: []segment.SparseIndexEntry,
+
+    pub const WHOLE_MAX = 64 * 1024;
+
+    pub fn open(allocator: std.mem.Allocator, path: []const u8) !PositionedSegment {
+        const stdx = @import("stdx");
+        const file = try stdx.fs.openFile(path, .{});
+        errdefer stdx.fs.closeFile(file);
+        const size = try file.length(stdx.io.instance());
+        if (size < segment.HEADER_SIZE + segment.FOOTER_SIZE) return error.TooSmall;
+        if (size <= WHOLE_MAX) {
+            const whole = try allocator.alloc(u8, @intCast(size));
+            errdefer allocator.free(whole);
+            if (try stdx.fs.readAt(file, whole, 0) != whole.len) return error.ShortRead;
+            const reader = try SegmentReader.init(whole);
+            if (reader.header.compression != @backingInt(segment.Compression.none)) return error.Compressed;
+            const sparse = try allocator.dupe(segment.SparseIndexEntry, reader.sparse_index);
+            // Everything is in memory: no fd is held for it.
+            stdx.fs.closeFile(file);
+            return .{
+                .whole = whole,
+                .first_index = reader.header.first_index,
+                .last_index = reader.header.last_index,
+                .data_start = reader.data_start,
+                .data_end = reader.data_end,
+                .sparse = sparse,
+            };
+        }
+
+        var hdr_bytes: [segment.HEADER_SIZE]u8 = undefined;
+        if (try stdx.fs.readAt(file, &hdr_bytes, 0) != hdr_bytes.len) return error.ShortRead;
+        const hdr: *const segment.SegmentHeader = @ptrCast(&hdr_bytes);
+        if (!std.mem.eql(u8, &hdr.magic, &segment.HEADER_MAGIC)) return error.InvalidHeaderMagic;
+        if (hdr.version != segment.SEGMENT_VERSION) return error.InvalidVersion;
+        if (hdr.compression != @backingInt(segment.Compression.none)) return error.Compressed;
+
+        var ftr_bytes: [segment.FOOTER_SIZE]u8 = undefined;
+        const footer_start = size - segment.FOOTER_SIZE;
+        if (try stdx.fs.readAt(file, &ftr_bytes, footer_start) != ftr_bytes.len) return error.ShortRead;
+        const ftr: *const segment.Footer = @ptrCast(&ftr_bytes);
+        if (!std.mem.eql(u8, &ftr.magic, &segment.FOOTER_MAGIC)) return error.InvalidFooterMagic;
+
+        const idx_offset: u64 = ftr.sparse_index_offset;
+        const idx_count: usize = ftr.sparse_index_count;
+        if (idx_offset < segment.HEADER_SIZE or idx_offset + idx_count * segment.SPARSE_ENTRY_SIZE != footer_start) return error.InvalidIndex;
+        // The header's data size and the footer's index offset must agree.
+        if (segment.HEADER_SIZE + @as(u64, hdr.data_size) != idx_offset) return error.InvalidIndex;
+        const sparse = try allocator.alloc(segment.SparseIndexEntry, idx_count);
+        errdefer allocator.free(sparse);
+        const sparse_bytes = std.mem.sliceAsBytes(sparse);
+        if (try stdx.fs.readAt(file, sparse_bytes, idx_offset) != sparse_bytes.len) return error.ShortRead;
+        for (sparse) |e| if (e.offset > idx_offset - segment.HEADER_SIZE) return error.InvalidIndex;
+
+        return .{
+            .file = file,
+            .first_index = hdr.first_index,
+            .last_index = hdr.last_index,
+            .data_start = segment.HEADER_SIZE,
+            .data_end = idx_offset,
+            .sparse = sparse,
+        };
+    }
+
+    pub fn close(self: *PositionedSegment, allocator: std.mem.Allocator) void {
+        if (self.file) |f| @import("stdx").fs.closeFile(f);
+        if (self.whole) |w| allocator.free(w);
+        allocator.free(self.sparse);
+    }
+
+    /// `dst.len` bytes from file offset `at`: from memory for a small
+    /// segment, else from the file.
+    fn bytesAt(self: *const PositionedSegment, dst: []u8, at: u64) !void {
+        if (self.whole) |w| {
+            if (at + dst.len > w.len) return error.ShortRead;
+            const from: usize = @intCast(at);
+            @memcpy(dst, w[from..][0..dst.len]);
+            return;
+        }
+        if (try @import("stdx").fs.readAt(self.file.?, dst, at) != dst.len) return error.ShortRead;
+    }
+
+    /// File offset of the last indexed entry at or below `index`.
+    fn seekOffset(self: *const PositionedSegment, index: u64) u64 {
+        var offset: u64 = 0;
+        var lo: usize = 0;
+        var hi: usize = self.sparse.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.sparse[mid].index <= index) {
+                offset = self.sparse[mid].offset;
+                lo = mid + 1;
+            } else hi = mid;
+        }
+        return self.data_start + offset;
+    }
+
+    pub const Read = struct {
+        count: usize = 0,
+        /// The segment covers `start` but holds no entry with that index.
+        missing: bool = false,
+    };
+
+    /// Copy contiguous entries from `start` into `buf`, payloads packed into
+    /// `arena`, through `scratch` (any size; an entry bigger than it is read
+    /// straight into `arena`). Stops at the segment's end, a full `buf` or
+    /// `arena`, or a gap. An entry whose CRC doesn't match fails the read.
+    pub fn read(self: *const PositionedSegment, start: u64, buf: []Entry, arena: []u8, scratch: []u8) !Read {
+        if (start < self.first_index or start > self.last_index or buf.len == 0) return .{};
+        std.debug.assert(scratch.len >= ENTRY_HEADER_SIZE);
+        var cursor = self.seekOffset(start);
+        var count: usize = 0;
+        var arena_used: usize = 0;
+        while (count < buf.len and cursor < self.data_end) {
+            const want: usize = @intCast(@min(scratch.len, self.data_end - cursor));
+            // Stray bytes too short for an entry: damage, but what was read
+            // before them checked out, so it's returned.
+            if (want < ENTRY_HEADER_SIZE) return if (count > 0) .{ .count = count } else error.ShortRead;
+            try self.bytesAt(scratch[0..want], cursor);
+            var off: usize = 0;
+            while (off + ENTRY_HEADER_SIZE <= want) {
+                const e = Entry.deserialize(scratch[off..want]) orelse break;
+                if (e.header.index >= start) {
+                    if (e.header.index != start + count) return .{ .count = count, .missing = count == 0 };
+                    if (e.computeCrc() != e.header.crc32c) return error.InvalidCrc;
+                    if (arena_used + e.payload.len > arena.len) return .{ .count = count };
+                    @memcpy(arena[arena_used..][0..e.payload.len], e.payload);
+                    buf[count] = .{ .header = e.header, .payload = arena[arena_used..][0..e.payload.len] };
+                    arena_used += e.payload.len;
+                    count += 1;
+                }
+                off += e.totalSize();
+                if (count == buf.len) return .{ .count = count };
+            }
+            if (off > 0) {
+                cursor += off;
+                continue;
+            }
+            // The entry here doesn't fit `scratch`: its header does.
+            const hdr: *align(1) const entry_mod.Header = @ptrCast(scratch[0..ENTRY_HEADER_SIZE]);
+            const total = ENTRY_HEADER_SIZE + @as(u64, hdr.payload_len);
+            if (cursor + total > self.data_end) return error.ShortRead;
+            if (hdr.index >= start) {
+                if (hdr.index != start + count) return .{ .count = count, .missing = count == 0 };
+                if (arena_used + hdr.payload_len > arena.len) return .{ .count = count };
+                const payload = arena[arena_used..][0..hdr.payload_len];
+                try self.bytesAt(payload, cursor + ENTRY_HEADER_SIZE);
+                const e: Entry = .{ .header = hdr.*, .payload = payload };
+                if (e.computeCrc() != e.header.crc32c) return error.InvalidCrc;
+                buf[count] = e;
+                arena_used += payload.len;
+                count += 1;
+            }
+            cursor += total;
+        }
+        return .{ .count = count, .missing = count == 0 };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
