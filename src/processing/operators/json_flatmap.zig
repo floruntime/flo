@@ -128,15 +128,13 @@ pub const JsonFlatMapOperator = struct {
         // Emit one record per array element
         for (items) |element| {
             // Serialize element to JSON string
-            const elem_str = try json_out.valueAlloc(self.allocator, element);
-            errdefer self.allocator.free(elem_str);
+            const elem_str = try json_out.valueAlloc(ctx.allocator, element);
 
             // Extract key from element if configured, otherwise use original key
-            const key = if (self.key_segments) |key_segs| blk: {
-                const key_val = navigateJson(element, key_segs);
-                break :blk try extractStringValue(self.allocator, key_val) orelse
-                    try self.allocator.dupe(u8, rec.key);
-            } else try self.allocator.dupe(u8, rec.key);
+            const key = if (self.key_segments) |key_segs|
+                try extractStringValue(ctx.allocator, navigateJson(element, key_segs)) orelse rec.key
+            else
+                rec.key;
 
             try ctx.emit(.{
                 .key = key,
@@ -144,7 +142,6 @@ pub const JsonFlatMapOperator = struct {
                 .event_time_ms = rec.event_time_ms,
                 .source = rec.source,
                 .headers = &.{},
-                .owns_memory = true,
             });
         }
     }
@@ -227,13 +224,16 @@ test "JsonFlatMapOperator — explode simple array" {
     var fm = try JsonFlatMapOperator.init(allocator, "explode", "$.items", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -258,13 +258,16 @@ test "JsonFlatMapOperator — explode object array" {
     var fm = try JsonFlatMapOperator.init(allocator, "explode", "$.events", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -292,13 +295,16 @@ test "JsonFlatMapOperator — with element_key extraction" {
     var fm = try JsonFlatMapOperator.init(allocator, "keyed-explode", "$.items", "$.id");
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -321,13 +327,16 @@ test "JsonFlatMapOperator — nested array field" {
     var fm = try JsonFlatMapOperator.init(allocator, "nested", "$.data.records", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -348,13 +357,16 @@ test "JsonFlatMapOperator — missing array field produces zero records" {
     var fm = try JsonFlatMapOperator.init(allocator, "strict", "$.items", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -372,13 +384,16 @@ test "JsonFlatMapOperator — non-array field produces zero records" {
     var fm = try JsonFlatMapOperator.init(allocator, "type-check", "$.items", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -396,13 +411,16 @@ test "JsonFlatMapOperator — invalid JSON skipped" {
     var fm = try JsonFlatMapOperator.init(allocator, "validate", "$.items", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -420,13 +438,16 @@ test "JsonFlatMapOperator — empty array produces zero records" {
     var fm = try JsonFlatMapOperator.init(allocator, "empty", "$.items", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -444,13 +465,16 @@ test "JsonFlatMapOperator — string array elements" {
     var fm = try JsonFlatMapOperator.init(allocator, "strings", "$.tags", null);
     defer fm.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };
@@ -470,13 +494,16 @@ test "JsonFlatMapOperator — each element is written as JSON" {
     const allocator = std.testing.allocator;
     var fm = try JsonFlatMapOperator.init(allocator, "explode", "$.items", null);
     defer fm.deinit();
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-flatmap",
     };

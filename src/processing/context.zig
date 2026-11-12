@@ -51,7 +51,10 @@ pub const OperatorContext = struct {
     collector: *OutputCollector,
     /// Per-operator metrics
     metrics: *OperatorMetrics,
-    /// Allocator for temporary allocations during processing
+    /// What an operator emits is allocated here: an arena that lives until
+    /// the caller has written this input's outputs, then is freed whole.
+    /// An operator frees nothing it emits, and keeps nothing from here
+    /// past this call (its own state uses its own allocator).
     allocator: Allocator,
     /// Current processing time (wall clock, milliseconds)
     current_processing_time_ms: i64,

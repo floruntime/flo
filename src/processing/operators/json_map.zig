@@ -178,21 +178,16 @@ pub const JsonMapOperator = struct {
         };
         const output_buf = out.written();
 
-        // Emit as owned record
-        const output = try self.allocator.dupe(u8, output_buf);
-        errdefer self.allocator.free(output);
+        const output = try ctx.allocator.dupe(u8, output_buf);
 
         log.debug("JsonMapOperator: emitting output='{s}'", .{output});
 
-        const key_dupe = try self.allocator.dupe(u8, rec.key);
-
         try ctx.emit(.{
-            .key = key_dupe,
+            .key = rec.key,
             .value = output,
             .event_time_ms = rec.event_time_ms,
             .source = rec.source,
             .headers = &.{},
-            .owns_memory = true,
         });
     }
 
@@ -268,13 +263,16 @@ test "JsonMapOperator — extract single field" {
     var mapper = try JsonMapOperator.init(allocator, "extract", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -301,13 +299,16 @@ test "JsonMapOperator — multiple fields with rename" {
     var mapper = try JsonMapOperator.init(allocator, "project", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -340,13 +341,16 @@ test "JsonMapOperator — constant values" {
     var mapper = try JsonMapOperator.init(allocator, "tag", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -375,13 +379,16 @@ test "JsonMapOperator — nested field extraction" {
     var mapper = try JsonMapOperator.init(allocator, "flatten", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -410,13 +417,16 @@ test "JsonMapOperator — missing field becomes null" {
     var mapper = try JsonMapOperator.init(allocator, "nullable", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -444,13 +454,16 @@ test "JsonMapOperator — invalid JSON input skipped" {
     var mapper = try JsonMapOperator.init(allocator, "strict", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -472,13 +485,16 @@ test "JsonMapOperator — preserves nested objects/arrays" {
     var mapper = try JsonMapOperator.init(allocator, "preserve", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -509,13 +525,16 @@ test "JsonMapOperator — no mappings passes through" {
     var mapper = try JsonMapOperator.init(allocator, "noop", &entries);
     defer mapper.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };
@@ -539,13 +558,16 @@ test "JsonMapOperator — output is JSON for any value, field name and constant"
     };
     var mapper = try JsonMapOperator.init(allocator, "m", &entries);
     defer mapper.deinit();
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-map",
     };

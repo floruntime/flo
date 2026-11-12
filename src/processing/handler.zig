@@ -1658,23 +1658,26 @@ pub const ProcessingHandler = struct {
         const cursor_before = pipe.ts_cursor_ns;
         self.sink_overloaded = false;
 
+        // One point at a time: its JSON and what its chain allocates are
+        // freed once its outputs are written.
+        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        defer arena.deinit();
         for (points) |pt| {
+            defer _ = arena.reset(.retain_capacity);
             // Format TS point as JSON record. Short of memory, the tick
             // stops here, the point still ahead of the cursor.
             const ts_ms: i64 = @intCast(pt.timestamp_ns / 1_000_000);
-            const json = tsPointJson(shard.allocator, pipe.src_measurement, pt.field_value, ts_ms) catch break;
-            defer shard.allocator.free(json);
+            const json = tsPointJson(arena.allocator(), pipe.src_measurement, pt.field_value, ts_ms) catch break;
 
             // Apply operator chain (or pass through directly). A record
             // the chain failed on is counted and skipped: passing it through
             // raw would write what the operators were there to change.
-            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, shard.allocator) catch |err| blk: {
+            const output_records = applyOperatorChain(pipe.operators, json, ts_ms, arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
 
             if (output_records) |records| {
-                defer if (records.len > 0) shard.allocator.free(records);
                 for (records) |rec| {
                     self.writeSinkRecord(pipe, shard, rec.value, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), rec.tags);
                 }
@@ -1733,15 +1736,19 @@ pub const ProcessingHandler = struct {
             return;
         }
 
+        // One payload's chain at a time: what it allocates is freed once its
+        // outputs are written.
+        var arena = std.heap.ArenaAllocator.init(shard.allocator);
+        defer arena.deinit();
         for (result.payloads) |payload| {
+            defer _ = arena.reset(.retain_capacity);
             log.debug("tickStreamSource: payload len={d} first100='{s}'", .{ payload.len, if (payload.len > 100) payload[0..100] else payload });
-            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), shard.allocator) catch |err| blk: {
+            const output_records = applyOperatorChain(pipe.operators, payload, @import("stdx").time.milliTimestamp(), arena.allocator()) catch |err| blk: {
                 self.noteChainError(shard, err);
                 break :blk @as(?[]const ProcessingRecord, &.{});
             };
 
             if (output_records) |records| {
-                defer if (records.len > 0) shard.allocator.free(records);
                 log.debug("TICK: chain returned {d} records for job", .{records.len});
                 for (records) |rec| {
                     log.debug("TICK: value_len={d} first50='{s}'", .{ rec.value.len, if (rec.value.len > 50) rec.value[0..50] else rec.value });
@@ -1808,61 +1815,31 @@ pub const ProcessingHandler = struct {
         if (shard.metrics_registry) |m| m.processing.recordCheckpoint();
     }
 
-    /// Apply the operator chain to a single input value.
-    /// Returns owned slice of output records (caller must free), or null if no operators.
-    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, allocator: Allocator) !?[]const ProcessingRecord {
+    /// The operator chain over one input value: its output records, or
+    /// null with no operators. Everything the chain allocates, the records
+    /// and what they point at, is in `arena`, which the caller frees (or
+    /// resets) once it has written them; a record may also point into
+    /// `value`, which must live as long.
+    fn applyOperatorChain(operators: []Operator, value: []const u8, event_time_ms: i64, arena: Allocator) !?[]const ProcessingRecord {
         if (operators.len == 0) return null;
-
-        // Set up collector + context for the chain
-        var collector = OutputCollector.init(allocator);
-        defer collector.deinit();
+        var collector = OutputCollector.init(arena);
         var metrics = OperatorMetrics{};
         var ctx = OperatorContext{
             .collector = &collector,
             .metrics = &metrics,
-            .allocator = allocator,
+            .allocator = arena,
             .current_processing_time_ms = @import("stdx").time.milliTimestamp(),
             .operator_name = "",
         };
-
-        // Feed the initial record into the first operator
-        const input_rec = ProcessingRecord.fromValue(value, event_time_ms);
-        log.debug("applyOperatorChain: calling operator[0] name='{s}'", .{operators[0].getName()});
-        try operators[0].processElement(input_rec, &ctx);
-        log.debug("applyOperatorChain: operator[0] done, collector count={d}", .{collector.count()});
-
-        // Chain: each operator processes the output of the previous one
-        var i: usize = 1;
-        while (i < operators.len) : (i += 1) {
-            // Snapshot current output before clearing
-            const prev_count = collector.count();
-            const prev_output = collector.drain();
-            // Dupe the records since clear will allow the backing to be reused
-            const staged = allocator.dupe(ProcessingRecord, prev_output[0..prev_count]) catch return null;
-            defer allocator.free(staged);
-            // Transfer ownership out of collector BEFORE clear frees owned memory
-            for (collector.records.items) |*rec| {
-                rec.owns_memory = false;
-            }
-            collector.clear();
-            log.debug("applyOperatorChain: calling operator[{d}] name='{s}' with {d} records", .{ i, operators[i].getName(), staged.len });
-            for (staged) |rec| {
-                try operators[i].processElement(rec, &ctx);
-            }
-            log.debug("applyOperatorChain: operator[{d}] done, collector count={d}", .{ i, collector.count() });
+        try operators[0].processElement(ProcessingRecord.fromValue(value, event_time_ms), &ctx);
+        // Each operator takes the one before's output; a staged record and
+        // what it points at stay in the arena, so one passed through, still
+        // pointing at them, stays good.
+        for (operators[1..]) |op| {
+            const staged = try collector.records.toOwnedSlice(arena);
+            for (staged) |rec| try op.processElement(rec, &ctx);
         }
-
-        // Transfer ownership out of collector BEFORE deinit frees owned memory
-        for (collector.records.items) |*rec| {
-            rec.owns_memory = false;
-        }
-
-        // Return final output — must dupe since collector.deinit() frees the backing array
-        const final = collector.drain();
-        if (final.len == 0) {
-            return &.{};
-        }
-        return allocator.dupe(ProcessingRecord, final) catch &.{};
+        return collector.records.items;
     }
 
     /// A record a sink could not write is lost to that sink (the cursor
@@ -2409,10 +2386,11 @@ test "ProcessingHandler: applyOperatorChain with passthrough operator" {
     defer create_result.deinit(allocator);
 
     var ops = [_]Operator{create_result.op};
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "test-value", 42, arena.allocator());
     try std.testing.expect(result != null);
     const records = result.?;
-    defer allocator.free(records);
 
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqualStrings("test-value", records[0].value);
@@ -2437,12 +2415,51 @@ test "ProcessingHandler: applyOperatorChain with filter operator rejects" {
 
     // Feed a record with no key — filter should reject it
     var ops = [_]Operator{create_result.op};
-    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try ProcessingHandler.applyOperatorChain(&ops, "some-data", 0, arena.allocator());
     try std.testing.expect(result != null);
     const records = result.?;
-    defer allocator.free(records);
     // key_not_empty filter rejects records with empty key
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "ProcessingHandler: a flatmap, map, pass-through and aggregate chain frees all it allocates, over many inputs" {
+    // Operators and the chain's arena on the leak-checking allocator: an
+    // output left on an operator's own allocator leaks, and one freed twice
+    // is caught.
+    const allocator = std.testing.allocator;
+    const Entry = definition.OperatorSpec.ConfigEntry;
+    const flatmap_cfg = [_]Entry{ .{ .key = "array_field", .value = "$.items" }, .{ .key = "element_key", .value = "$.k" } };
+    const map_cfg = [_]Entry{.{ .key = "v", .value = "$.v" }};
+    const aggregate_cfg = [_]Entry{.{ .key = "function", .value = "count" }};
+    var specs = [_]definition.OperatorSpec{
+        .{ .type_name = "flatmap", .name = "fm", .config = &flatmap_cfg },
+        .{ .type_name = "map", .name = "m", .config = &map_cfg },
+        .{ .type_name = "passthrough", .name = "p", .config = null },
+        .{ .type_name = "aggregate", .name = "a", .config = &aggregate_cfg },
+    };
+    var made: [specs.len]native_registry.CreateResult = undefined;
+    var ops: [specs.len]Operator = undefined;
+    var n: usize = 0;
+    defer for (made[0..n]) |*m| m.deinit(allocator);
+    for (&specs, &made, &ops) |*spec, *m, *op| {
+        m.* = try native_registry.create(allocator, spec, null);
+        n += 1;
+        op.* = m.op;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const input = "{\"items\":[{\"k\":\"a\",\"v\":1},{\"k\":\"b\",\"v\":2},{\"k\":\"a\",\"v\":3}]}";
+    for (0..1000) |i| {
+        defer _ = arena.reset(.retain_capacity);
+        const records = (try ProcessingHandler.applyOperatorChain(&ops, input, @intCast(i), arena.allocator())).?;
+        // One aggregate result per element, keyed by its element's key.
+        try std.testing.expectEqual(@as(usize, 3), records.len);
+        try std.testing.expectEqualStrings("a", records[2].key);
+        if (i == 999) try std.testing.expect(std.mem.indexOf(u8, records[2].value, "\"count\":2000") != null);
+    }
 }
 
 test "ProcessingHandler: a job is created at its submit entry's stamp, not the host's clock" {

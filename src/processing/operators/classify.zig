@@ -136,13 +136,16 @@ test "ClassifyOperator single rule match" {
     var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "test-classify"), rules, null);
     defer op.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test",
     };
@@ -171,13 +174,16 @@ test "ClassifyOperator no rules match — record still emitted" {
     var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "test-classify"), rules, null);
     defer op.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test",
     };
@@ -213,13 +219,16 @@ test "ClassifyOperator multiple rules compose" {
     var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "multi-classify"), rules, null);
     defer op.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test",
     };
@@ -257,13 +266,16 @@ test "ClassifyOperator default tag on unmatched records" {
     var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "default-classify"), rules, 3);
     defer op.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test",
     };
@@ -300,13 +312,16 @@ test "ClassifyOperator default tag null — unmatched gets no tags" {
     var op = ClassifyOperator.init(allocator, try allocator.dupe(u8, "no-default"), rules, null);
     defer op.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test",
     };
