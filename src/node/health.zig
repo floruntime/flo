@@ -156,6 +156,11 @@ pub const ShardSlot = struct {
     snapshot_skipped_leader_not_ready: Atomic(u64) = .init(0),
     /// The bar apply is suspended at, and for how long in ms; 0 with none.
     snapshot_bar: Atomic(u64) = .init(0),
+    /// Snapshot bars: the last one's index (0 before the first), the logical
+    /// bytes applied since, and how many more bring the next.
+    bar_last: Atomic(u64) = .init(0),
+    bar_bytes: Atomic(u64) = .init(0),
+    bar_threshold: Atomic(u64) = .init(0),
     snapshot_suspended_for_ms: Atomic(u64) = .init(0),
     /// HARDSTATE writes (term + vote) that could not be persisted (cumulative)
     /// and how long the current run has lasted in ms (0 while they persist),
@@ -279,6 +284,8 @@ pub const NodeHealth = struct {
             if (persist_failures > 0) try w.print(",\"persist_failures\":{d},\"flushes_failing_for_ms\":{d}", .{ persist_failures, s.flushes_failing_for_ms.load(.monotonic) });
             const skipped = s.snapshot_skipped_leader_not_ready.load(.monotonic);
             if (skipped > 0) try w.print(",\"snapshot_skipped_leader_not_ready\":{d}", .{skipped});
+            const bar_threshold = s.bar_threshold.load(.monotonic);
+            if (bar_threshold > 0) try w.print(",\"bars\":{{\"last\":{d},\"bytes\":{d},\"threshold\":{d}}}", .{ s.bar_last.load(.monotonic), s.bar_bytes.load(.monotonic), bar_threshold });
             const bar = s.snapshot_bar.load(.monotonic);
             if (bar > 0) try w.print(",\"snapshot\":{{\"bar\":{d},\"suspended_for_ms\":{d}}}", .{ bar, s.snapshot_suspended_for_ms.load(.monotonic) });
             const hardstate_failures = s.hardstate_failures.load(.monotonic);
@@ -567,4 +574,23 @@ test "health: /status shows a leader's snapshot skips and an open window's bar, 
     const quiet = parsed.value.object.get("shards").?.array.items[1].object;
     try testing.expect(quiet.get("snapshot_skipped_leader_not_ready") == null);
     try testing.expect(quiet.get("snapshot") == null);
+}
+
+test "health: /status shows a shard's snapshot bars: the last, the bytes since, and the threshold" {
+    var h = try NodeHealth.init(testing.allocator, 1, 1);
+    defer h.deinit(testing.allocator);
+    h.accepting.store(true, .release);
+    h.shards[0].bar_last.store(1200, .monotonic);
+    h.shards[0].bar_bytes.store(4096, .monotonic);
+    h.shards[0].bar_threshold.store(64 * 1024 * 1024, .monotonic);
+    h.shards[0].publish(.ok, .leader, 10, 10);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try h.writeStatus(&out.writer, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const bars = parsed.value.object.get("shards").?.array.items[0].object.get("bars").?.object;
+    try testing.expectEqual(@as(i64, 1200), bars.get("last").?.integer);
+    try testing.expectEqual(@as(i64, 4096), bars.get("bytes").?.integer);
+    try testing.expectEqual(@as(i64, 64 * 1024 * 1024), bars.get("threshold").?.integer);
 }

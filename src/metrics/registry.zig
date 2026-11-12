@@ -646,6 +646,9 @@ pub const ShardMetrics = struct {
     /// Snapshot bars passed without a snapshot by a leader still applying
     /// earlier terms (cumulative).
     snapshot_skipped_leader_not_ready: Atomic(u64) = Atomic(u64).init(0),
+    /// The last snapshot bar's index, and the logical bytes applied since.
+    bar_last: Atomic(u64) = Atomic(u64).init(0),
+    bar_bytes: Atomic(u64) = Atomic(u64).init(0),
     /// HARDSTATE writes (term + vote) that could not be persisted (cumulative),
     /// and how long the current run of failures has lasted in ms (0 while they
     /// persist), computed at publish. While a run holds, each unpersisted vote
@@ -847,6 +850,8 @@ pub const ShardMetrics = struct {
         persist_failures: u64,
         flushes_failing_for_ms: u64,
         snapshot_skipped_leader_not_ready: u64,
+        bar_last: u64,
+        bar_bytes: u64,
         hardstate_failures: u64,
         hardstate_failing_for_ms: u64,
         buffer_failures: u64,
@@ -897,6 +902,8 @@ pub const ShardMetrics = struct {
             .persist_failures = self.persist_failures.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
             .snapshot_skipped_leader_not_ready = self.snapshot_skipped_leader_not_ready.load(.monotonic),
+            .bar_last = self.bar_last.load(.monotonic),
+            .bar_bytes = self.bar_bytes.load(.monotonic),
             .hardstate_failures = self.hardstate_failures.load(.monotonic),
             .hardstate_failing_for_ms = self.hardstate_failing_for_ms.load(.monotonic),
             .buffer_failures = self.buffer_failures.load(.monotonic),
@@ -1684,6 +1691,8 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
     try writer.print("flo_shard_snapshot_skipped_total{{shard_id=\"{d}\",reason=\"leader_not_ready\"}} {d}\n", .{ snap.shard_id, snap.snapshot_skipped_leader_not_ready });
+    try writer.print("flo_shard_snapshot_bar_last{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_last });
+    try writer.print("flo_shard_snapshot_bar_bytes{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.bar_bytes });
     try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });
     try writer.print("flo_shard_hardstate_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.hardstate_failing_for_ms / 1000, snap.hardstate_failing_for_ms % 1000 });
     try writer.print("flo_shard_buffer_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.buffer_failures });
