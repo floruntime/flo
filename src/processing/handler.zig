@@ -47,6 +47,7 @@ const ts_handler_mod = @import("../ts/handler.zig");
 const queue_handler_mod = @import("../queue/handler.zig");
 const StreamID = @import("../projection/stream.zig").StreamID;
 const Shard = shard_mod.Shard;
+const raft_node_mod = @import("../raft/node.zig");
 const Connection = connection_mod.Connection;
 
 const entry_mod = @import("../storage/ual/entry.zig");
@@ -90,6 +91,10 @@ pub const ProcessingHandler = struct {
     chain_warn_ms: i64 = 0,
     /// The job whose pipeline is ticking, so a drop or chain error names it.
     ticking_job: []const u8 = "",
+    /// A sink write in this tick was refused because the shard can take no
+    /// more writes for now: the pipeline stops and keeps its cursor, and the
+    /// next tick reads the batch again (at-least-once), so nothing is dropped.
+    sink_overloaded: bool = false,
 
     /// Per-job pipeline execution state (keyed by same job_id as jobs map).
     pipelines: std.StringHashMap(PipelineState),
@@ -1645,8 +1650,13 @@ pub const ProcessingHandler = struct {
             &point_buf,
         ) catch return;
 
-        const points = point_buf[0..result.points_in_buffer];
+        const room = sinkRoom(shard, pipe);
+        // Room for none: the source waits, its cursor where it is.
+        if (room == 0) return;
+        const points = point_buf[0..@min(result.points_in_buffer, room)];
         if (points.len == 0) return;
+        const cursor_before = pipe.ts_cursor_ns;
+        self.sink_overloaded = false;
 
         for (points) |pt| {
             // Format TS point as JSON record. Short of memory, the tick
@@ -1671,6 +1681,14 @@ pub const ProcessingHandler = struct {
             } else {
                 // No operators — direct passthrough
                 self.writeSinkRecord(pipe, shard, json, pt.field_value, pt.timestamp_ns, shard.ts_handler.ts.tagsForHash(src_ns, pt.tag_hash), 0);
+            }
+
+            // A sink found the shard full: this tick's points are read again
+            // next tick, from where it began.
+            if (self.sink_overloaded) {
+                self.sink_overloaded = false;
+                pipe.ts_cursor_ns = cursor_before;
+                return;
             }
 
             // Advance cursor past this point
@@ -1698,8 +1716,13 @@ pub const ProcessingHandler = struct {
         // Resolve the stream handler that owns the source stream (may be on a different shard)
         const src_handler = self.resolveStreamHandler(shard.stream_handler, pipe.src_stream, pipe.src_namespace);
 
+        // As many as this shard can write out now; with room for none the
+        // source waits, its cursor where it is.
+        const room = sinkRoom(shard, pipe);
+        if (room == 0) return;
         // Read from the named source stream using namespace-qualified name-hash filtering
-        const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, pipe.batch_size);
+        const result = src_handler.readPayloadsForStream(pipe.src_stream, pipe.src_namespace, cursor, @min(pipe.batch_size, room));
+        self.sink_overloaded = false;
         log.debug("TICK: read {d} payloads, last_id ts={d} seq={d}", .{ result.payloads.len, result.last_id.timestamp_ms, result.last_id.sequence });
         defer result.deinit(src_handler.allocator);
         if (result.payloads.len == 0) {
@@ -1727,6 +1750,13 @@ pub const ProcessingHandler = struct {
             } else {
                 log.debug("tickStreamSource: no operators, passthrough", .{});
                 self.writeSinkRecordFromStream(pipe, shard, "", payload, 0);
+            }
+
+            // A sink found the shard full: the batch is read again next tick,
+            // from the same cursor.
+            if (self.sink_overloaded) {
+                self.sink_overloaded = false;
+                return;
             }
 
             job.records_processed += 1;
@@ -1837,6 +1867,27 @@ pub const ProcessingHandler = struct {
 
     /// A record a sink could not write is lost to that sink (the cursor
     /// has moved past it); said once per interval with the count.
+    /// A sink write found the shard full: stop the tick here.
+    fn holdForRoom(self: *ProcessingHandler) void {
+        self.sink_overloaded = true;
+    }
+
+    /// How many source records a tick may take now: the writes this shard
+    /// can still propose before its cap, shared among the pipeline's sinks
+    /// that propose here. An operator that emits several records per input
+    /// can still exceed it; that write is held (`holdForRoom`), not dropped.
+    fn sinkRoom(shard: *const Shard, pipe: *const PipelineState) usize {
+        const raft = shard.raft_node;
+        const used = raft.log.lastIndex() -| raft.last_applied;
+        // One spare, for a sink namespace's implicit create.
+        const room = raft_node_mod.MAX_OUTSTANDING -| used -| 1;
+        var proposing: usize = 0;
+        for (pipe.sinks) |snk| {
+            if (snk.kind != .ts) proposing += 1;
+        }
+        return @intCast(room / @max(proposing, 1));
+    }
+
     pub fn noteSinkDrop(self: *ProcessingHandler, metrics: ?*MetricsRegistry, kind: []const u8, target: []const u8, why: []const u8) void {
         self.sink_drops += 1;
         if (metrics) |m| m.processing.recordDropped();
@@ -1861,6 +1912,7 @@ pub const ProcessingHandler = struct {
     /// Tag filtering: sinks with required_tags=0 (firehose) get all records;
     /// sinks with required_tags set only get records where record_tags matches.
     fn writeSinkRecord(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, payload: []const u8, field_value: f64, timestamp_ns: u64, src_tags: []const u8, record_tags: u32) void {
+        if (self.sink_overloaded) return;
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
@@ -1883,6 +1935,7 @@ pub const ProcessingHandler = struct {
                     }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
+                        if (err == error.Overloaded) return self.holdForRoom();
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
                     };
@@ -1913,6 +1966,7 @@ pub const ProcessingHandler = struct {
     /// `record_key` is the record's partitioning key (set by `keyby`, empty otherwise);
     /// it is used to construct the KV sink key.
     fn writeSinkRecordFromStream(self: *ProcessingHandler, pipe: *PipelineState, shard: *Shard, record_key: []const u8, payload: []const u8, record_tags: u32) void {
+        if (self.sink_overloaded) return;
         pipe.records_out += 1; // operator chain emitted a record into the sink stage
         for (pipe.sinks) |snk| {
             if (snk.required_tags != 0 and (record_tags & snk.required_tags) != snk.required_tags) continue;
@@ -1935,6 +1989,7 @@ pub const ProcessingHandler = struct {
                     }
                     if (sink_handler == shard.stream_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
                     sink_handler.appendPayloadToStream(snk.target, snk.namespace, payload) catch |err| {
+                        if (err == error.Overloaded) return self.holdForRoom();
                         self.noteSinkDrop(shard.metrics_registry, "stream", snk.target, @errorName(err));
                         continue;
                     };
@@ -2021,7 +2076,10 @@ pub const ProcessingHandler = struct {
         if (std.mem.indexOfScalar(u8, full_key, 0) != null) return self.noteSinkDrop(shard.metrics_registry, "kv", full_key, "key must not contain NUL");
         const owner = self.kvOwner(shard, snk.namespace, full_key);
         if (owner == shard.id) {
-            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            if (kv_handler_mod.KVHandler.sinkPropose(shard, snk.namespace, full_key, payload, snk.kv_ttl_ms)) |why| {
+                if (why.ptr == kv_handler_mod.KVHandler.SINK_OVERLOADED.ptr) return self.holdForRoom();
+                self.noteSinkDrop(shard.metrics_registry, "kv", full_key, why);
+            }
             return;
         }
         const message = (kv_handler_mod.KVHandler.SinkPut{ .namespace = snk.namespace, .key = full_key, .value = payload, .ttl_ms = snk.kv_ttl_ms }).encode(shard.allocator) orelse
@@ -2071,7 +2129,10 @@ pub const ProcessingHandler = struct {
         if (q == shard.queue_handler) shard.namespace_handler.proposeImplicitCreate(snk.namespace, shard);
         const result = q.sinkEnqueue(req);
         defer q.freeResult(result);
-        if (result == .err) self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, result.err.message);
+        if (result == .err) {
+            if (result.err.code == .overloaded) return self.holdForRoom();
+            self.noteSinkDrop(shard.metrics_registry, "queue", snk.target, result.err.message);
+        }
     }
 
     /// Build a minimal in-process request header carrying just the opcode.

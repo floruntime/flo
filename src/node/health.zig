@@ -151,6 +151,12 @@ pub const ShardSlot = struct {
     /// in the log. A duration, not a raw clock reading.
     persist_failures: Atomic(u64) = .init(0),
     flushes_failing_for_ms: Atomic(u64) = .init(0),
+    /// Snapshot bars a leader still applying earlier terms passed without a
+    /// snapshot (cumulative): one that keeps counting is stuck not ready.
+    snapshot_skipped_leader_not_ready: Atomic(u64) = .init(0),
+    /// The bar apply is suspended at, and for how long in ms; 0 with none.
+    snapshot_bar: Atomic(u64) = .init(0),
+    snapshot_suspended_for_ms: Atomic(u64) = .init(0),
     /// HARDSTATE writes (term + vote) that could not be persisted (cumulative)
     /// and how long the current run has lasted in ms (0 while they persist),
     /// computed at publish: while a run holds, each unpersisted vote or term
@@ -271,6 +277,10 @@ pub const NodeHealth = struct {
             // Shown once any flush has failed, so a healthy shard stays quiet.
             const persist_failures = s.persist_failures.load(.monotonic);
             if (persist_failures > 0) try w.print(",\"persist_failures\":{d},\"flushes_failing_for_ms\":{d}", .{ persist_failures, s.flushes_failing_for_ms.load(.monotonic) });
+            const skipped = s.snapshot_skipped_leader_not_ready.load(.monotonic);
+            if (skipped > 0) try w.print(",\"snapshot_skipped_leader_not_ready\":{d}", .{skipped});
+            const bar = s.snapshot_bar.load(.monotonic);
+            if (bar > 0) try w.print(",\"snapshot\":{{\"bar\":{d},\"suspended_for_ms\":{d}}}", .{ bar, s.snapshot_suspended_for_ms.load(.monotonic) });
             const hardstate_failures = s.hardstate_failures.load(.monotonic);
             if (hardstate_failures > 0) try w.print(",\"hardstate_failures\":{d},\"hardstate_failing_for_ms\":{d}", .{ hardstate_failures, s.hardstate_failing_for_ms.load(.monotonic) });
             const buffer_failures = s.buffer_failures.load(.monotonic);
@@ -532,4 +542,29 @@ test "health: /status shows removal notices held, and the quorum once acted on" 
     aw.clearRetainingCapacity();
     try h.writeStatus(&aw.writer, null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "\"removal\":{\"notices\":2,\"of\":2,\"config_index\":10,\"at_ms\":1000,\"from\":[2,3]}") != null);
+}
+
+test "health: /status shows a leader's snapshot skips and an open window's bar, and stays quiet without them" {
+    var h = try NodeHealth.init(testing.allocator, 1, 2);
+    defer h.deinit(testing.allocator);
+    h.accepting.store(true, .release);
+    h.shards[0].snapshot_skipped_leader_not_ready.store(4, .monotonic);
+    h.shards[0].snapshot_bar.store(1234, .monotonic);
+    h.shards[0].snapshot_suspended_for_ms.store(80, .monotonic);
+    h.shards[0].publish(.ok, .leader, 10, 10);
+    h.shards[1].publish(.ok, .follower, 10, 10);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try h.writeStatus(&out.writer, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const s0 = parsed.value.object.get("shards").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 4), s0.get("snapshot_skipped_leader_not_ready").?.integer);
+    const window = s0.get("snapshot").?.object;
+    try testing.expectEqual(@as(i64, 1234), window.get("bar").?.integer);
+    try testing.expectEqual(@as(i64, 80), window.get("suspended_for_ms").?.integer);
+    const quiet = parsed.value.object.get("shards").?.array.items[1].object;
+    try testing.expect(quiet.get("snapshot_skipped_leader_not_ready") == null);
+    try testing.expect(quiet.get("snapshot") == null);
 }

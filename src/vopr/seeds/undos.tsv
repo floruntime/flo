@@ -6,7 +6,7 @@ stale-member-wedge.json	no_vouches	-	-	convergence	vouches_taken=0 stranger_fram
 stale-member-wedge-small-ring.json	no_vouches	--small-ring	-	convergence	vouches_taken=0 stranger_frames=[1-9]
 stale-member-wedge-membership.json	no_vouches	--membership	-	convergence	vouches_taken=0 stranger_frames=[1-9]
 truncate-evict-hang.json	truncate_keeps_write_pos	--small-ring	-	crash	 in append 
-paused-apply-erasure.json	erasure_from_apply	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
+paused-apply-erasure.json	erasure_from_apply	--catching-up	request_percent=30	state_machine_safety	applied entry differs from the canonical entry
 async-boot-applies-erased.json	async_boot_applies	--catching-up	-	state_machine_safety	applied entry differs from the canonical entry
 async-boot-applies-erased-123.json	async_boot_applies	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
 async-boot-applies-erased-190.json	async_boot_applies	--catching-up	request_percent=60	state_machine_safety	applied entry differs from the canonical entry
