@@ -4717,6 +4717,9 @@ fn createTestShard(actions: *ActionsHandler) !Shard {
     shard.skip_scan_from = 0;
     shard.diverged_damage = null;
     shard.offline_published = .init(false);
+    shard.snapshot_window = null;
+    shard.test_bar = 0;
+    shard.snapshot_skips_leader_not_ready = 0;
     shard.replica.diverged = false;
     shard.losses = .{};
     const raft_node = try std.testing.allocator.create(RaftNode);
