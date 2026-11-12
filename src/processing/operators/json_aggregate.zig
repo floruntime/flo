@@ -254,20 +254,14 @@ pub const JsonAggregateOperator = struct {
     }
 
     fn emitResult(self: *Self, key: []const u8, group: *const Group, event_time_ms: i64, ctx: *OperatorContext) !void {
-        const output = try resultJson(self.allocator, key, group.getResult(self.function), group.count);
-        errdefer self.allocator.free(output);
-
-        // Dupe key to match owned-memory contract
-        const key_dupe = try self.allocator.dupe(u8, key);
-
-        // Emit as an owned record — collector will free via clearRetained
+        const output = try resultJson(ctx.allocator, key, group.getResult(self.function), group.count);
+        // `key` is the input's, which lives as long as the outputs do.
         try ctx.emit(.{
-            .key = key_dupe,
+            .key = key,
             .value = output,
             .event_time_ms = event_time_ms,
             .source = record_mod.SourceRef.EMPTY,
             .headers = &.{},
-            .owns_memory = true,
         });
     }
 
@@ -356,13 +350,16 @@ test "JsonAggregateOperator — running sum" {
     var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.amount", .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -388,13 +385,16 @@ test "JsonAggregateOperator — running count" {
     var agg = try JsonAggregateOperator.init(allocator, "counter", .count, null, .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -418,13 +418,16 @@ test "JsonAggregateOperator — running avg" {
     var agg = try JsonAggregateOperator.init(allocator, "avg-latency", .avg, "$.latency", .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -445,13 +448,16 @@ test "JsonAggregateOperator — min and max" {
     var agg_min = try JsonAggregateOperator.init(allocator, "min-price", .min, "$.price", .none);
     defer agg_min.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -480,13 +486,16 @@ test "JsonAggregateOperator — count-based tumbling window" {
     );
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -515,13 +524,16 @@ test "JsonAggregateOperator — nested JSON field" {
     var agg = try JsonAggregateOperator.init(allocator, "nested", .sum, "$.stats.value", .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -540,13 +552,16 @@ test "JsonAggregateOperator — skips non-numeric / missing field" {
     var agg = try JsonAggregateOperator.init(allocator, "strict", .sum, "$.amount", .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -574,13 +589,16 @@ test "JsonAggregateOperator — multiple keys grouping" {
     var agg = try JsonAggregateOperator.init(allocator, "per-user", .sum, "$.amount", .none);
     defer agg.deinit();
 
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };
@@ -602,13 +620,16 @@ test "JsonAggregateOperator — output is JSON for any key, and a value past f64
     const allocator = std.testing.allocator;
     var agg = try JsonAggregateOperator.init(allocator, "total", .sum, "$.amount", .none);
     defer agg.deinit();
+    // What the operator emits lives in the context's arena, as in a chain.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
     var collector = OutputCollector.init(allocator);
     defer collector.deinit();
     var metrics = OperatorMetrics{};
     var ctx = OperatorContext{
         .collector = &collector,
         .metrics = &metrics,
-        .allocator = allocator,
+        .allocator = arena.allocator(),
         .current_processing_time_ms = 0,
         .operator_name = "test-agg",
     };

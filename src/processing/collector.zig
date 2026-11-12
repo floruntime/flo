@@ -37,7 +37,6 @@ pub const OutputCollector = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.clearRetained();
         self.records.deinit(self.allocator);
     }
 
@@ -55,7 +54,6 @@ pub const OutputCollector = struct {
 
     /// Clear the output buffer for the next operator invocation.
     pub fn clear(self: *Self) void {
-        self.clearRetained();
         self.records.clearRetainingCapacity();
     }
 
@@ -68,14 +66,6 @@ pub const OutputCollector = struct {
     /// Number of records currently buffered
     pub fn count(self: *const Self) usize {
         return self.records.items.len;
-    }
-
-    fn clearRetained(self: *Self) void {
-        for (self.records.items) |rec| {
-            if (rec.owns_memory) {
-                rec.deinit(self.allocator);
-            }
-        }
     }
 };
 
