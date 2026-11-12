@@ -21,14 +21,14 @@ pub fn main() !void {
     var kbuf: [32]u8 = undefined;
     for (0..KEYS) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "bench-key-{d:0>6}", .{i});
-        var r = try src.cli_client.kv.set(&conn, "", k, .{ .value = "bench-value-padding-padding-padding", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        var r = try src.cli_client.kv.set(&conn, "", k, .{ .value = "bench-value-padding-padding-padding", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         r.deinit();
     }
     for (0..2) |round| {
         const t0 = stdx.time.nanoTimestamp();
         for (0..GETS) |i| {
             const k = try std.fmt.bufPrint(&kbuf, "bench-key-{d:0>6}", .{(i * 7919) % KEYS});
-            var r = try src.cli_client.kv.get(&conn, "", k, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null });
+            var r = try src.cli_client.kv.get(&conn, "", k, .{ .wait_ms = 0, .wait_for = .exists, .txn = null });
             if (r.status != .ok) return error.NotOk;
             r.deinit();
         }

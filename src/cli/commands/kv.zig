@@ -50,10 +50,9 @@ pub fn createKvCommand(allocator: Allocator) !*commander.Command {
             .examples(&.{
                 "flo kv mget key1 key2 key3",
                 "flo kv mget user:1 user:2 user:3 -o json",
-                "flo kv mget user:42:name user:42:visits -r user:42",
+                "flo kv mget {user:42}:name {user:42}:visits",
             })
             .variadicArg("keys", mget_op.request.field_list[0].doc)
-            .stringFlag("routing-key", 'r', "", mget_op.request.field_list[1].doc)
             .action(wrapHandler(runMget)),
     ).build();
 }
@@ -91,11 +90,6 @@ fn dialClient(ctx: *commander.Context) commander.Error!Client {
     return client;
 }
 
-fn optionalRoutingKey(ctx: *commander.Context) ?[]const u8 {
-    const rk = ctx.getString("routing-key") orelse return null;
-    return if (rk.len > 0) rk else null;
-}
-
 fn runMget(ctx: *commander.Context) commander.Error!void {
     const keys = ctx.getVariadicArgs("keys") orelse &.{};
     if (keys.len == 0) return outcome.usage(ctx, "at least one key is required", .{});
@@ -115,7 +109,7 @@ fn runMget(ctx: *commander.Context) commander.Error!void {
     while (from < keys.len) {
         var list = Keys.Builder.init(buf);
         for (keys[from..]) |k| if (!(list.add(k) catch return outcome.usage(ctx, "a key is longer than {d} bytes", .{kv_ops.op("kv.mget").request.field_list[0].T.Element.bound}))) break;
-        var a = try send(ctx, &client, "kv.mget", namespace, "", .{ .keys = list.value(), .routing_key = optionalRoutingKey(ctx) });
+        var a = try send(ctx, &client, "kv.mget", namespace, "", .{ .keys = list.value() });
         defer a.deinit();
         var it = a.value.entries.iterator();
         var i = from;
@@ -168,7 +162,7 @@ fn runHistory(ctx: *commander.Context) commander.Error!void {
     var shown: u64 = 0;
     var more = false;
     while (true) {
-        var a = try send(ctx, &client, "kv.history", namespace, key, .{ .limit = @intCast(limit - shown), .before_version = before, .routing_key = optionalRoutingKey(ctx) });
+        var a = try send(ctx, &client, "kv.history", namespace, key, .{ .limit = @intCast(limit - shown), .before_version = before });
         defer a.deinit();
         var got: u64 = 0;
         var it = a.value.versions.iterator();

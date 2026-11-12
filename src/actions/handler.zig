@@ -302,8 +302,8 @@ pub const ActionsHandler = struct {
         // An await runs where its worker is registered: its labels, whether
         // it drains, the actions it runs. The runs it takes live on their
         // actions' shards, which it asks.
-        dispatcher.registerWithRoute(.action_await, table_run.handler("action.await", ActionsHandler, runAwait), table_run.routeByKey("action.await"));
-        dispatcher.registerWithRoute(.action_deliver, table_run.handler("action.deliver", ActionsHandler, runDeliver), table_run.routeByKey("action.deliver"));
+        dispatcher.registerWithRoute(.action_await, table_run.handler("action.await", ActionsHandler, runAwait), table_run.routeByKey);
+        dispatcher.registerWithRoute(.action_deliver, table_run.handler("action.deliver", ActionsHandler, runDeliver), table_run.routeByKey);
         dispatcher.registerWithRoute(.action_complete, table_run.handler("action.complete", ActionsHandler, runComplete), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_fail, table_run.handler("action.fail", ActionsHandler, runFail), run_id_mod.preRouteByRunId);
         dispatcher.registerWithRoute(.action_touch, table_run.handler("action.touch", ActionsHandler, runTouch), run_id_mod.preRouteByRunId);

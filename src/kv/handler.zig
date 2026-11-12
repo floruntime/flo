@@ -123,7 +123,7 @@ pub const KVHandler = struct {
     // ── Dispatcher Registration ─────────────────────────────────────────
 
     /// Register KV opcode handlers with the Dispatcher.
-    /// Uses pre-route hooks for routing key extraction.
+    /// Key-routed ops route by the key's {tag}, or the whole key.
     pub fn register(dispatcher: *Dispatcher) void {
         inline for (.{
             .{ "kv.get", OpCode.kv_get, get },
@@ -140,13 +140,12 @@ pub const KVHandler = struct {
             .{ "kv.txn.commit", OpCode.kv_commit_txn, txnCommit },
             .{ "kv.txn.rollback", OpCode.kv_rollback_txn, txnRollback },
         }) |o| {
-            dispatcher.registerWithRoute(o[1], table_run.handler(o[0], KVHandler, o[2]), table_run.routeByKey(o[0]));
+            dispatcher.registerWithRoute(o[1], table_run.handler(o[0], KVHandler, o[2]), table_run.routeByKey);
             // A request in a transaction runs on the shard its id names.
             if (table_run.op(o[0]).txn != null) dispatcher.setShardRoute(o[1], txnShardOfBody);
         }
-        // Many keys: on the routing key's shard when given, else where the
-        // client is.
-        dispatcher.registerWithRoute(.kv_mget, table_run.handler("kv.mget", KVHandler, mget), table_run.routeByField("kv.mget"));
+        // Many keys: run where the client is, gathering the rest.
+        dispatcher.register(.kv_mget, table_run.handler("kv.mget", KVHandler, mget));
         // Every shard: walked from the client's.
         dispatcher.registerPagedWalk(.kv_scan, table_run.handler("kv.scan", KVHandler, scan), localScanKeys);
     }
@@ -162,7 +161,7 @@ pub const KVHandler = struct {
         ReservedKey,
         NotFound,
         NoSuchTransaction,
-        WrongRoutingKey,
+        KeysNotColocated,
         TxnTooLarge,
         WaitInTxn,
         TooManyWaiters,
@@ -192,7 +191,7 @@ pub const KVHandler = struct {
             error.ReservedKey => refused(.unauthorized, .reserved_key, "unauthorized: the key is in a prefix the server keeps for itself"),
             error.NotFound => refused(.not_found, .not_found, "not found"),
             error.NoSuchTransaction => refused(.not_found, .no_such_transaction, "not found: no such transaction — it committed, rolled back, or was begun in another namespace"),
-            error.WrongRoutingKey => refused(.bad_request, .wrong_routing_key, "bad request: the routing key (the key, when none is given) isn't the one the transaction was begun with"),
+            error.KeysNotColocated => refused(.bad_request, .keys_not_colocated, "bad request: this key routes elsewhere than the transaction's first key; give every key in a transaction the same {tag}, e.g. {user:1}:balance"),
             error.TxnTooLarge => refused(.bad_request, .txn_too_large, "bad request: the transaction holds as many ops or bytes as it may"),
             error.WaitInTxn => refused(.bad_request, .conflicting_fields, "bad request: a read in a transaction can't wait: give wait_ms or txn, not both"),
             error.TooManyWaiters => refused(.overloaded, .too_many_waiters, "overloaded: too many reads waiting on this shard — retry"),
@@ -236,10 +235,9 @@ pub const KVHandler = struct {
         req: Request,
         wait_ms: u64,
         wait_for: kv_ops.WaitFor,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(GetResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         const kv = shard.kv_handler.*.kv;
@@ -298,10 +296,9 @@ pub const KVHandler = struct {
         ttl_ms: ?u64,
         condition: kv_ops.Condition,
         cas_version: ?u64,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(SetResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         const ttl = ttl_ms orelse 0;
@@ -338,19 +335,20 @@ pub const KVHandler = struct {
         if (raw.len > MAX_QUALIFIED_KEY) return error.KeyTooLong;
     }
 
-    /// Transaction `id`, open in the request's namespace, which the
-    /// request's key routes to.
-    fn openTxn(shard: *Shard, req: Request, id: u64, routing_key: ?[]const u8) Error!*txn_mod.TxnState {
+    /// Transaction `id`, open in the request's namespace, if the request's
+    /// key routes with the key it was begun with. The routing hash is
+    /// compared, not the shard: keys that share a shard today needn't later.
+    fn openTxn(shard: *Shard, req: Request, id: u64) Error!*txn_mod.TxnState {
         const t = txnIn(&shard.kv_handler.*.txn_table, id, req.ns_id) orelse return error.NoSuchTransaction;
-        if (t.pinned_hash != router.routeNsKey(req.ns_id, routing_key orelse req.key)) return error.WrongRoutingKey;
+        if (t.pinned_hash != router.routeNsKey(req.ns_id, req.key)) return error.KeysNotColocated;
         return t;
     }
 
     /// The transaction a request names, if any. Looked up before any other
     /// check: a request refused for its key still uses the
     /// transaction, and one that is gone is answered as gone.
-    fn txnOf(shard: *Shard, req: Request, txn: ?u64, routing_key: ?[]const u8) Error!?*txn_mod.TxnState {
-        return if (txn) |id| try openTxn(shard, req, id, routing_key) else null;
+    fn txnOf(shard: *Shard, req: Request, txn: ?u64) Error!?*txn_mod.TxnState {
+        return if (txn) |id| try openTxn(shard, req, id) else null;
     }
 
     fn proposeError(err: anyerror) Error {
@@ -390,10 +388,9 @@ pub const KVHandler = struct {
         _: *Connection,
         req: Request,
         cas_version: ?u64,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(DeleteResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
@@ -461,7 +458,7 @@ pub const KVHandler = struct {
     /// A key's versions, newest first, below `before_version` when given,
     /// as many as `limit` and one answer hold; `more` says whether older
     /// kept versions follow. A key with no history at all is not found.
-    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, before_version: ?u64, _: ?[]const u8) Error!table_run.Outcome(HistoryResponse) {
+    fn history(shard: *Shard, _: *Connection, req: Request, limit: u32, before_version: ?u64) Error!table_run.Outcome(HistoryResponse) {
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         const self = shard.kv_handler;
@@ -484,13 +481,13 @@ pub const KVHandler = struct {
 
     /// Many keys at once, in the order asked, as many as one answer holds;
     /// `next` is the first key left out.
-    fn mget(shard: *Shard, conn: *Connection, req: Request, keys: MgetKeys.Value, routing_key: ?[]const u8) Error!table_run.Outcome(MgetResponse) {
+    fn mget(shard: *Shard, conn: *Connection, req: Request, keys: MgetKeys.Value) Error!table_run.Outcome(MgetResponse) {
         // Another shard asked this one for the keys it owns: a key that
         // routes elsewhere is refused, never read here or answered missing.
         const forwarded = conn.proxy_for != null;
         // Keys other shards own are read on those shards: each owner gets
         // its part, and the answers are merged here once all have come.
-        if (routing_key == null and !forwarded and shard.shardCount() > 1) {
+        if (!forwarded and shard.shardCount() > 1) {
             var plan = mget_mod.plan(shard.allocator, keys, MgetOwner{ .shard = shard, .ns_id = req.ns_id }, MgetOwner.of) catch return error.Internal;
             defer plan.deinit(shard.allocator);
             if (plan.owners.len > 1 or (plan.owners.len == 1 and plan.owners[0] != shard.id)) {
@@ -504,7 +501,7 @@ pub const KVHandler = struct {
         var it = keys.iterator();
         var index: u16 = 0;
         while (it.next() catch return error.Internal) |raw_key| : (index += 1) {
-            const found = try mgetLookup(shard, req.ns_id, raw_key, routing_key != null);
+            const found = try mgetLookup(shard, req.ns_id, raw_key);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 return .{ .answer = .{ .entries = entries.value(), .next = index } };
             }
@@ -513,20 +510,16 @@ pub const KVHandler = struct {
     }
 
     /// One key of an mget, from this shard's own map. A key that can't be
-    /// one, or one the server keeps, is not found. Without a routing key the
-    /// key must be this shard's: one another shard owns is never read here
-    /// or answered missing.
-    fn mgetLookup(shard: *Shard, ns_id: router.NamespaceId, raw_key: []const u8, routed: bool) Error!MgetLookup {
+    /// one, or one the server keeps, is not found. The key must be this
+    /// shard's: one another shard owns is never read here or answered
+    /// missing.
+    fn mgetLookup(shard: *Shard, ns_id: router.NamespaceId, raw_key: []const u8) Error!MgetLookup {
         const none: MgetLookup = .{ .found = false, .value = "", .version = 0 };
         checkKey(raw_key) catch return none;
-        // With a routing key the request was routed to its shard, where
-        // every key lives.
-        if (!routed) {
-            const owner = MgetOwner.of(.{ .shard = shard, .ns_id = ns_id }, raw_key);
-            if (owner != shard.id) {
-                log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
-                return error.NotOwner;
-            }
+        const owner = MgetOwner.of(.{ .shard = shard, .ns_id = ns_id }, raw_key);
+        if (owner != shard.id) {
+            log.err("shard {d}: kv.mget was asked for key \"{s}\", which shard {d} owns", .{ shard.id, raw_key, owner });
+            return error.NotOwner;
         }
         const entry = shard.kv_handler.*.kv.getIn(ns_id, raw_key) orelse return none;
         return .{ .found = true, .value = entry.value, .version = entry.version };
@@ -573,7 +566,7 @@ pub const KVHandler = struct {
         var entries = Entries.Builder.init(&shard.kv_handler.answer_buf);
         var next: ?u16 = null;
         for (keys, 0..) |raw_key, i| {
-            const found = try mgetLookup(shard, ns_id, raw_key, false);
+            const found = try mgetLookup(shard, ns_id, raw_key);
             if (!(entries.add(.{ .found = found.found, .version = found.version, .value = found.value }) catch return error.Internal)) {
                 next = @intCast(i);
                 break;
@@ -604,10 +597,9 @@ pub const KVHandler = struct {
         _: *Connection,
         req: Request,
         delta: i64,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(IncrResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         var delta_bytes: [8]u8 = undefined;
@@ -638,10 +630,9 @@ pub const KVHandler = struct {
         req: Request,
         ttl_ms: u64,
         cas_version: ?u64,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(ExpireResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
@@ -663,10 +654,9 @@ pub const KVHandler = struct {
         shard: *Shard,
         _: *Connection,
         req: Request,
-        routing_key: ?[]const u8,
         txn: ?u64,
     ) Error!table_run.Outcome(ExistsResponse) {
-        const in_txn = try txnOf(shard, req, txn, routing_key);
+        const in_txn = try txnOf(shard, req, txn);
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
         if (in_txn) |t| {
@@ -686,7 +676,6 @@ pub const KVHandler = struct {
         _: *Connection,
         req: Request,
         path: []const u8,
-        _: ?[]const u8,
     ) Error!table_run.Outcome(JsonGetResponse) {
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
@@ -708,7 +697,6 @@ pub const KVHandler = struct {
         req: Request,
         path: []const u8,
         document: []const u8,
-        _: ?[]const u8,
     ) Error!table_run.Outcome(JsonSetResponse) {
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
@@ -733,7 +721,6 @@ pub const KVHandler = struct {
         _: *Connection,
         req: Request,
         path: []const u8,
-        _: ?[]const u8,
     ) Error!table_run.Outcome(JsonDelResponse) {
         var kbuf: [MAX_KV_KEY]u8 = undefined;
         const key = try tableKey(&kbuf, req);
@@ -759,8 +746,9 @@ pub const KVHandler = struct {
         };
     }
 
-    /// Begin a transaction pinned to the shard the request's key routes to:
-    /// the key is the routing key every op in it gives.
+    /// Begin a transaction pinned to the routing hash of the request's key:
+    /// its {tag}, or the whole key when it has none. Every key in the
+    /// transaction must route with it.
     fn txnBegin(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(TxnBeginResponse) {
         if (req.key.len == 0) return error.KeyEmpty;
         const pinned = router.routeNsKey(req.ns_id, req.key);
@@ -1021,8 +1009,8 @@ test "kv handler: every KV op in the table has a handler, and the key-routed one
     KVHandler.register(&dispatcher);
     inline for (kv_ops.table) |o| {
         try testing.expect(dispatcher.serves(o.code));
-        // scan walks every shard; mget routes on its routing key.
-        const routed = (o.route == .key and o.fanout == .none) or o.route == .field;
+        // scan walks every shard; mget runs where it lands.
+        const routed = o.route == .key and o.fanout == .none;
         try testing.expectEqual(routed, dispatcher.pre_route[o.code] != null);
         try testing.expectEqual(o.txn != null, dispatcher.shard_route[o.code] != null);
     }

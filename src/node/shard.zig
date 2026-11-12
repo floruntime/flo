@@ -8314,7 +8314,7 @@ test "Shard: a forwarded request that cannot be parsed is answered, and a large 
     for (value, 0..) |*b, i| b.* = @truncate(i *% 7);
     const set_body = try std.testing.allocator.alloc(u8, table_run.op("kv.set").request.max_size);
     defer std.testing.allocator.free(set_body);
-    const body = try table_run.op("kv.set").request.encodeInto(set_body, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    const body = try table_run.op("kv.set").request.encodeInto(set_body, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
     const put = try Shard.serializeRequest(std.testing.allocator, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "big", .value = body });
     defer std.testing.allocator.free(put);
     shard.runRequest(conn, try proto.Request.parse(put), .client);
@@ -8526,7 +8526,7 @@ fn testReq(op: proto.OpCode, id: u64, ns: []const u8, key: []const u8, value: []
 
 fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8) []const u8 {
     switch (op) {
-        .kv_put => return table_run.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }) catch unreachable,
+        .kv_put => return table_run.op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }) catch unreachable,
         .kv_get => {
             const opts: proto.Request = .{ .header = undefined, .namespace = "", .key = "", .value = "", .options = options };
             var w: schema.Writer = .{ .buf = buf };
@@ -8535,7 +8535,7 @@ fn testBody(buf: []u8, op: proto.OpCode, value: []const u8, options: []const u8)
                 w.int(u64, ms) catch unreachable;
                 w.put(&.{ 1, @backingInt(kv_ops.WaitFor.exists) }) catch unreachable;
             } else w.put(&.{ 0, 0 }) catch unreachable;
-            w.put(&.{ 0, 0 }) catch unreachable; // no routing key, no txn
+            w.put(&.{0}) catch unreachable; // no txn
             return w.written();
         },
         // The namespace ops' bodies are empty records.
@@ -8834,7 +8834,7 @@ fn nextAnswer(c: TestClient, shard: *Shard, out: []u8) !proto.Response {
 
 /// kv.get inside transaction `id`, its body in `buf`.
 fn txnGet(buf: []u8, id: u64) proto.Request {
-    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = id }) catch unreachable;
+    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .txn = id }) catch unreachable;
     return .{ .header = proto.RequestHeader.init(.kv_get, 9), .namespace = "", .key = "k", .value = body };
 }
 
@@ -8903,7 +8903,7 @@ test "Shard: a request in a transaction goes to the shard its id names, and comm
     }
 }
 
-test "Shard: kv.mget with a routing key is answered on that key's shard; without one, each key is found on its own" {
+test "Shard: kv.mget runs where it lands, and tagged keys another shard owns are answered through the gather" {
     var two: TwoShards = undefined;
     try two.init();
     defer two.deinit();
@@ -8914,73 +8914,57 @@ test "Shard: kv.mget with a routing key is answered on that key's shard; without
         }
     }.of;
     const a = &two.shards[0];
-    // A routing key on shard 1, and a key whose own shard is 0: written
-    // with the routing key, it lives on shard 1 only.
-    var name_bufs: [2][12]u8 = undefined;
-    const tenant = for (0..64) |i| {
-        const k = try std.fmt.bufPrint(&name_bufs[0], "tenant{d}", .{i});
+    // Two keys sharing a {tag} that shard 1 owns, and one shard 0 owns.
+    var name_bufs: [3][16]u8 = undefined;
+    const tagged = for (0..64) |i| {
+        const k = try std.fmt.bufPrint(&name_bufs[0], "{{t{d}}}a", .{i});
         if (shardOf(a, k) == 1) break k;
     } else return error.TestUnexpectedResult;
-    const far = for (0..64) |i| {
-        const k = try std.fmt.bufPrint(&name_bufs[1], "k{d}", .{i});
+    const close = i: {
+        @memcpy(name_bufs[1][0..tagged.len], tagged);
+        name_bufs[1][tagged.len - 1] = 'b';
+        break :i name_bufs[1][0..tagged.len];
+    };
+    try std.testing.expectEqual(@as(u16, 1), shardOf(a, close));
+    const own = for (0..64) |i| {
+        const k = try std.fmt.bufPrint(&name_bufs[2], "own{d}", .{i});
         if (shardOf(a, k) == 0) break k;
     } else return error.TestUnexpectedResult;
     var qbuf: [limits.MAX_KV_KEY]u8 = undefined;
-    try two.shards[1].defaultPartition().kv.putForTest(testKvKey(&qbuf, far), "routed");
-    try two.shards[shardOf(a, "own")].defaultPartition().kv.putForTest(testKvKey(&qbuf, "own"), "plain");
+    try two.shards[1].defaultPartition().kv.putForTest(testKvKey(&qbuf, tagged), "va");
+    try two.shards[1].defaultPartition().kv.putForTest(testKvKey(&qbuf, close), "vb");
+    try two.shards[0].defaultPartition().kv.putForTest(testKvKey(&qbuf, own), "vo");
 
-    const op = table_run.op("kv.mget");
-    const Keys = op.request.field_list[0].T;
-    const Mget = struct {
-        kbuf: [64]u8 = undefined,
-        body_buf: [128]u8 = undefined,
-        fn req(self: *@This(), id: u64, key: []const u8, routing_key: ?[]const u8) !proto.Request {
-            var keys = Keys.Builder.init(&self.kbuf);
-            try std.testing.expect(try keys.add(key));
-            const body = try op.request.encodeInto(&self.body_buf, .{ .keys = keys.value(), .routing_key = routing_key });
-            return .{ .header = proto.RequestHeader.init(.kv_mget, id), .namespace = "default", .ns_id = .default, .key = "", .value = body };
-        }
-    };
-    var m: Mget = .{};
-
-    // With the routing key, shard 0 sends the whole batch to shard 1, its
-    // keys' owning shard, before anything runs.
-    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_mget), try m.req(1, far, tenant))) {
-        .local => return error.TestUnexpectedResult,
-        .shard => |t| try std.testing.expectEqual(@as(u16, 1), t.shard_id),
-    }
-    // Without one it runs where it lands.
-    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_mget), try m.req(2, far, null))) {
+    const keys = [_][]const u8{ tagged, own, close };
+    var body_buf: [128]u8 = undefined;
+    const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_mget, 1), .namespace = "default", .ns_id = .default, .key = "", .value = try mget_mod.pieceBody(&body_buf, &keys) };
+    // Nothing in the body picks a shard: it runs where it lands.
+    switch (a.resolveTarget(@backingInt(proto.OpCode.kv_mget), req)) {
         .local => {},
         .shard => return error.TestUnexpectedResult,
     }
 
+    const c = try TestClient.open(a);
+    defer _ = std.c.close(c.pair[1]);
+    a.runRequest(c.conn, req, .client);
+    two.settle();
     var out: [4096]u8 = undefined;
+    const resp = try nextAnswer(c, a, &out);
+    try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), resp.header.status);
     var diag: schema.Diagnostic = .{};
-    for ([_]struct { on: u16, key: []const u8, routing_key: ?[]const u8, value: ?[]const u8 }{
-        // On the routing key's shard, a local read finds it.
-        .{ .on = 1, .key = far, .routing_key = tenant, .value = "routed" },
-        // Without it, the key is looked up on its own shard, 0, and isn't there.
-        .{ .on = 0, .key = far, .routing_key = null, .value = null },
-        .{ .on = 0, .key = "own", .routing_key = null, .value = "plain" },
-    }, 3..) |case, id| {
-        const sh = &two.shards[case.on];
-        const c = try TestClient.open(sh);
-        defer _ = std.c.close(c.pair[1]);
-        sh.runRequest(c.conn, try m.req(id, case.key, case.routing_key), .client);
-        two.settle();
-        const resp = try nextAnswer(c, sh, &out);
-        try std.testing.expectEqual(@as(u8, @backingInt(proto.StatusCode.ok)), resp.header.status);
-        const got = try op.response.decodeAll(resp.data, &diag);
-        var it = got.entries.iterator();
+    const got = try table_run.op("kv.mget").response.decodeAll(resp.data, &diag);
+    try std.testing.expectEqual(@as(?u16, null), got.next);
+    try std.testing.expectEqual(@as(u16, keys.len), got.entries.count);
+    var it = got.entries.iterator();
+    for ([_][]const u8{ "va", "vo", "vb" }) |want| {
         const e = (try it.next()).?;
-        try std.testing.expectEqual(case.value != null, e.found);
-        if (case.value) |v| try std.testing.expectEqualStrings(v, e.value);
+        try std.testing.expect(e.found);
+        try std.testing.expectEqualStrings(want, e.value);
     }
 }
 
-/// Two shards with keys on each, and a client on shard 0 asking kv.mget
-/// without a routing key: the gather's tests.
+/// Two shards with keys on each, and a client on shard 0 asking kv.mget:
+/// the gather's tests.
 const MgetGatherFixture = struct {
     two: TwoShards,
     client: TestClient,
@@ -12853,13 +12837,13 @@ test "Shard: of two incrs that both pass the leader's check, the one that would 
     var counter: [8]u8 = undefined;
     std.mem.writeInt(i64, &counter, std.math.maxInt(i64) - 1, .little);
     _ = &counter;
-    t.send(.kv_put, 1, "c", try set.request.encodeInto(&set_buf, .{ .value = &counter, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    t.send(.kv_put, 1, "c", try set.request.encodeInto(&set_buf, .{ .value = &counter, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }));
     try ParkTest.ack(&t.shard);
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
 
     const incr = table_run.op("kv.incr");
     var incr_buf: [32]u8 = undefined;
-    const by_one = try incr.request.encodeInto(&incr_buf, .{ .delta = 1, .routing_key = null, .txn = null });
+    const by_one = try incr.request.encodeInto(&incr_buf, .{ .delta = 1, .txn = null });
     t.send(.kv_incr, 2, "c", by_one);
     t.send(.kv_incr, 3, "c", by_one);
     try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
@@ -12884,13 +12868,13 @@ test "Shard: of two deletes of one key that both pass the leader's check, only t
 
     const set = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
-    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }));
     try ParkTest.ack(&t.shard);
     try ParkTest.responses(&t.shard, t.conn, t.pair[1], &buf, &one);
 
     const delete = table_run.op("kv.delete");
     var del_buf: [32]u8 = undefined;
-    const body = try delete.request.encodeInto(&del_buf, .{ .cas_version = null, .routing_key = null, .txn = null });
+    const body = try delete.request.encodeInto(&del_buf, .{ .cas_version = null, .txn = null });
     t.send(.kv_delete, 2, "k", body);
     t.send(.kv_delete, 3, "k", body);
     try std.testing.expectEqual(@as(u32, 2), t.shard.pending_count);
@@ -13153,10 +13137,10 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
         }
     }.run;
 
-    const id = try shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
+    const id = try shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
     const set = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
-    const in_txn = try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
+    const in_txn = try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = id });
     send(&shard, conn, .kv_put, 1, "k", in_txn);
     try ParkTest.responses(&shard, conn, pair[1], &buf, &one);
 
@@ -13171,7 +13155,7 @@ test "Shard: a KV transaction whose commit waits on a peer takes no second commi
     // Until it applies, the transaction is closed: a second commit would
     // propose the batch again, and a write or rollback would change what
     // the first commit answers for.
-    const later_set = try set.request.encodeInto(&set_buf, .{ .value = "w", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "rk", .txn = id });
+    const later_set = try set.request.encodeInto(&set_buf, .{ .value = "w", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = id });
     for ([_]struct { op: proto.OpCode, key: []const u8, body: []const u8 }{
         .{ .op = .kv_commit_txn, .key = "", .body = by_id },
         .{ .op = .kv_rollback_txn, .key = "", .body = by_id },
@@ -13225,7 +13209,7 @@ const CondTest = struct {
     }
 
     fn set(self: *CondTest, c: *Connection, id: u64, key: []const u8, value: []const u8, condition: kv_ops.Condition, cas: ?u64, txn: ?u64) !void {
-        try self.send(c, .kv_put, id, key, "kv.set", .{ .value = value, .ttl_ms = null, .condition = condition, .cas_version = cas, .routing_key = if (txn != null) "rk" else null, .txn = txn });
+        try self.send(c, .kv_put, id, key, "kv.set", .{ .value = value, .ttl_ms = null, .condition = condition, .cas_version = cas, .txn = txn });
     }
 
     /// The one answer on the first client.
@@ -13283,14 +13267,14 @@ test "Shard: of two racing writers with one cas_version, the second is refused; 
     _ = try c.answer();
 
     try c.set(c.t.conn, 2, "k", "v2", .always, 1, null);
-    try c.send(c.other, .kv_delete, 3, "k", "kv.delete", .{ .cas_version = 1, .routing_key = null, .txn = null });
+    try c.send(c.other, .kv_delete, 3, "k", "kv.delete", .{ .cas_version = 1, .txn = null });
     try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try CondTest.expectConflict(try c.otherAnswer(), .cas_mismatch);
     try std.testing.expectEqualStrings("v2", c.held("k").?.value);
 
     try c.set(c.t.conn, 4, "k", "v3", .always, 2, null);
-    try c.send(c.other, .kv_expire, 5, "k", "kv.expire", .{ .ttl_ms = 1000, .cas_version = 2, .routing_key = null, .txn = null });
+    try c.send(c.other, .kv_expire, 5, "k", "kv.expire", .{ .ttl_ms = 1000, .cas_version = 2, .txn = null });
     try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     try CondTest.expectConflict(try c.otherAnswer(), .cas_mismatch);
@@ -13307,7 +13291,7 @@ test "Shard: a condition counts a write its leader inherited, committed and not 
     // what the last leader committed.
     _ = try t.shard.raft_node.propose(.kv_put, entry_mod.Flags.NONE, try kv_entries.Put.encodeInto(&pbuf, .{ .key = TEST_KV_K, .value = "from-old-leader", .ttl_ms = null, .condition = .always, .cas_version = null }));
     var enc: [64]u8 = undefined;
-    const body = try table_run.op("kv.set").request.encodeInto(&enc, .{ .value = "mine", .ttl_ms = null, .condition = .if_absent, .cas_version = null, .routing_key = null, .txn = null });
+    const body = try table_run.op("kv.set").request.encodeInto(&enc, .{ .value = "mine", .ttl_ms = null, .condition = .if_absent, .cas_version = null, .txn = null });
     t.shard.runRequest(t.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = body }, .client);
     try std.testing.expect(t.shard.applyCommitted());
     var buf: [512]u8 = undefined;
@@ -13330,7 +13314,7 @@ test "Shard: an incr is decided as it applies: a write not yet applied can make 
     var counter: [8]u8 = undefined;
     std.mem.writeInt(i64, &counter, 41, .little);
     try c.set(c.t.conn, 2, "k", &counter, .always, null, null);
-    try c.send(c.other, .kv_incr, 3, "k", "kv.incr", .{ .delta = 1, .routing_key = null, .txn = null });
+    try c.send(c.other, .kv_incr, 3, "k", "kv.incr", .{ .delta = 1, .txn = null });
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
     var diag: schema.Diagnostic = .{};
@@ -13338,7 +13322,7 @@ test "Shard: an incr is decided as it applies: a write not yet applied can make 
 
     // And the other way round: refused as it applies, ran=no.
     try c.set(c.t.conn, 4, "k", "text", .always, null, null);
-    try c.send(c.other, .kv_incr, 5, "k", "kv.incr", .{ .delta = 1, .routing_key = null, .txn = null });
+    try c.send(c.other, .kv_incr, 5, "k", "kv.incr", .{ .delta = 1, .txn = null });
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
     const refused = try (try c.otherAnswer()).refused();
@@ -13370,8 +13354,8 @@ test "Shard: a transaction's condition is answered at commit, not at the op, and
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
 
-    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
-    try c.set(c.t.conn, 2, "other", "x", .always, null, id);
+    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
+    try c.set(c.t.conn, 2, "{k}other", "x", .always, null, id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
     // Would fail now, and buffers all the same.
     try c.set(c.t.conn, 3, "k", "no", .if_absent, null, id);
@@ -13381,7 +13365,7 @@ test "Shard: a transaction's condition is answered at commit, not at the op, and
     const resp = try c.answer();
     try CondTest.expectConflict(resp, .condition_failed);
     try std.testing.expectEqualStrings("the transaction's op 2: conflict: the condition didn't hold; nothing in the transaction applied", (try resp.refused()).message);
-    try std.testing.expect(c.held("other") == null);
+    try std.testing.expect(c.held("{k}other") == null);
     try std.testing.expectEqualStrings("v1", c.held("k").?.value);
 }
 
@@ -13394,11 +13378,11 @@ test "Shard: a delete or expire in a transaction keeps its cas_version: a wrong 
         try ParkTest.ack(&c.t.shard);
         _ = try c.answer();
 
-        const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
+        const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
         const body: table_run.op(name).request.Value = if (op == .kv_delete)
-            .{ .cas_version = 9, .routing_key = "rk", .txn = id }
+            .{ .cas_version = 9, .txn = id }
         else
-            .{ .ttl_ms = 1000, .cas_version = 9, .routing_key = "rk", .txn = id };
+            .{ .ttl_ms = 1000, .cas_version = 9, .txn = id };
         try c.send(c.t.conn, op, 2, "k", name, body);
         try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
         try c.send(c.t.conn, .kv_commit_txn, 3, "", "kv.txn.commit", .{ .txn = id });
@@ -13416,7 +13400,7 @@ test "Shard: a delete or expire of a missing key goes through the log, and is an
     const raft = c.t.shard.raft_node;
     var last = raft.log.lastIndex();
 
-    try c.send(c.t.conn, .kv_delete, 1, "none", "kv.delete", .{ .cas_version = null, .routing_key = null, .txn = null });
+    try c.send(c.t.conn, .kv_delete, 1, "none", "kv.delete", .{ .cas_version = null, .txn = null });
     try std.testing.expectEqual(last + 1, raft.log.lastIndex());
     try ParkTest.ack(&c.t.shard);
     var diag: schema.Diagnostic = .{};
@@ -13424,7 +13408,7 @@ test "Shard: a delete or expire of a missing key goes through the log, and is an
     try std.testing.expect(c.held("none") == null);
 
     last = raft.log.lastIndex();
-    try c.send(c.t.conn, .kv_expire, 2, "none", "kv.expire", .{ .ttl_ms = 1000, .cas_version = 7, .routing_key = null, .txn = null });
+    try c.send(c.t.conn, .kv_expire, 2, "none", "kv.expire", .{ .ttl_ms = 1000, .cas_version = 7, .txn = null });
     try std.testing.expectEqual(last + 1, raft.log.lastIndex());
     try ParkTest.ack(&c.t.shard);
     try std.testing.expectEqual(proto.Reason.not_found, (try (try c.answer()).refused()).reason);
@@ -14908,10 +14892,10 @@ test "Shard: a KV transaction left idle is dropped by the shard's background tas
     table_.get(id).?.last_active_ms = 0;
     const set_op = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
-    const failing = try set_op.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = "another", .txn = id });
-    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 10), .namespace = "", .key = "k", .value = failing }, .client);
+    const failing = try set_op.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = id });
+    shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 10), .namespace = "", .key = "another", .value = failing }, .client);
     const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
-    try std.testing.expectEqual(proto.Reason.wrong_routing_key, (try refused.refused()).reason);
+    try std.testing.expectEqual(proto.Reason.keys_not_colocated, (try refused.refused()).reason);
     try std.testing.expectEqual(@as(usize, 0), table_.reapIdle(now));
 
     table_.get(id).?.last_active_ms = now -| txn_mod.IDLE_TIMEOUT_MS;
@@ -15516,7 +15500,7 @@ test "Shard: a leader still applying earlier terms still takes KV's writes, its 
     try c.set(c.t.conn, 1, "k", "v1", .always, null, null);
     try ParkTest.ack(&c.t.shard);
     _ = try c.answer();
-    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "rk"), .default);
+    const id = try c.t.shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "in-txn"), .default);
     try c.set(c.t.conn, 2, "in-txn", "x", .always, null, id);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), (try c.answer()).header.status);
 
@@ -15616,7 +15600,7 @@ test "Shard: a read inside a transaction on a leader still applying earlier term
     const id = try shard.kv_handler.txn_table.begin(node_router.routeNsKey(.default, "k"), .default);
     const get = txnGet(&body_buf, id);
     var exists_buf: [64]u8 = undefined;
-    const exists_body = try table_run.op("kv.exists").request.encodeInto(&exists_buf, .{ .routing_key = null, .txn = id });
+    const exists_body = try table_run.op("kv.exists").request.encodeInto(&exists_buf, .{ .txn = id });
     const exists: proto.Request = .{ .header = proto.RequestHeader.init(.kv_exists, 10), .namespace = "", .key = "k", .value = exists_body };
 
     const raft = shard.raft_node;
@@ -19272,7 +19256,7 @@ test "a halted shard refuses a client's write, saying where it halted and why, a
     defer _ = std.c.close(c.pair[1]);
     var body: [64]u8 = undefined;
     var out: [1024]u8 = undefined;
-    const set = try table_run.op("kv.set").request.encodeInto(&body, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    const set = try table_run.op("kv.set").request.encodeInto(&body, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
     shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_put, 1), .namespace = "", .key = "k", .value = set }, .client);
     const refused = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.unavailable), refused.header.status);
@@ -19285,7 +19269,7 @@ test "a halted shard refuses a client's write, saying where it halted and why, a
     try std.testing.expect(refused.header.flags & proto.RESPONSE_STALE == 0);
 
     // A read is answered, from the state before the halt, marked stale.
-    const get = try table_run.op("kv.get").request.encodeInto(&body, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null });
+    const get = try table_run.op("kv.get").request.encodeInto(&body, .{ .wait_ms = 0, .wait_for = .exists, .txn = null });
     shard.runRequest(c.conn, .{ .header = proto.RequestHeader.init(.kv_get, 2), .namespace = "", .key = "k", .value = get }, .client);
     const read = try proto.Response.parse(out[0..c.conn.write_buf.read(&out)]);
     try std.testing.expectEqual(@as(u64, 2), read.header.request_id);
@@ -19382,7 +19366,7 @@ test "a gathered read whose part a halted shard answers is answered, marked stal
     var c: ConcatOp = .{};
     const a = &f.two.shards[0];
     const local = try a.allocator.dupe(u8, "local");
-    const set = try table_run.op("kv.set").request.encodeInto(&f.body_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    const set = try table_run.op("kv.set").request.encodeInto(&f.body_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
     const req: proto.Request = .{ .header = proto.RequestHeader.init(.kv_put, 8), .namespace = "default", .key = f.keys[1], .value = set };
     try a.startGather(f.client.conn, req, &.{ .{ .owner = 0, .body = local }, .{ .owner = 1, .body = set } }, &ConcatOp.op, &c);
     f.two.settle();
@@ -19446,7 +19430,7 @@ test "a write committed past the halt is told it will apply when the shard resum
     const r = t.shard.raft_node;
     const h = (try r.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
     var set_buf: [64]u8 = undefined;
-    t.send(.kv_put, 1, "k", try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    t.send(.kv_put, 1, "k", try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }));
     const last = r.log.lastIndex();
     r.peers[0].sent_up_to = last;
     r.handleAppendResponse(.{ .term = r.current_term, .success = true, .match_index = last, .from = 2 });
@@ -19470,7 +19454,7 @@ test "a write parked past the halt whose entry a later leader replaces is told t
     const h = (try r.propose(.cg_create, entry_mod.Flags.NONE, "")).index;
     const set = table_run.op("kv.set");
     var set_buf: [64]u8 = undefined;
-    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }));
+    t.send(.kv_put, 1, "k", try set.request.encodeInto(&set_buf, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }));
     try std.testing.expectEqual(@as(u32, 1), t.shard.pending_count);
     const term = r.current_term;
     r.peers[0].sent_up_to = h;
@@ -21625,7 +21609,7 @@ test "applyEntryCore: a KV entry delivered twice applies once" {
 
 /// kv.get of `key` in `namespace`, its body in `buf`.
 fn edgeGet(buf: []u8, id: u64, namespace: []const u8, key: []const u8) proto.Request {
-    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch unreachable;
+    const body = table_run.op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .txn = null }) catch unreachable;
     return .{ .header = proto.RequestHeader.init(.kv_get, id), .namespace = namespace, .key = key, .value = body };
 }
 
@@ -22321,7 +22305,7 @@ test "Shard: a create cut with the log's tail by a new leader takes its write wi
         // A write to a namespace this leader doesn't know: the create, then
         // the write stamped with its id, neither committed.
         var set_buf: [64]u8 = undefined;
-        const body = try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "orders'", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        const body = try table_run.op("kv.set").request.encodeInto(&set_buf, .{ .value = "orders'", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         t.shard.runRequest(t.conn, testReq(.kv_put, 1, "orders", "k", body, ""), .client);
         try std.testing.expectEqual(before + 2, r.log.lastIndex());
         try std.testing.expectEqual(@as(?ns_table.Id, id), nh.idOf("orders"));

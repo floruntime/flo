@@ -1422,7 +1422,7 @@ test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
 
     // Sixteen keys spread across the shards; each is read from a client
     // connection on whichever shard accepted it.
-    var key_buf: [16]u8 = undefined;
+    var key_buf: [24]u8 = undefined;
     for (0..16) |i| {
         const key = try std.fmt.bufPrint(&key_buf, "spread-{d}", .{i});
         try ctx.exec(&.{ "kv", "set", key, "one" });
@@ -1436,12 +1436,11 @@ test "e2e/kv: history finds a key on whichever of 4 shards owns it" {
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.stdout, "\n"));
         try testing.expect(std.mem.startsWith(u8, result.stdout, "2\t"));
     }
-    // A key written with a routing key lives on that key's shard; history
-    // given the same routing key finds it there.
+    // A tagged key lives on its {tag}'s shard, and history finds it there.
     for (0..16) |i| {
-        const key = try std.fmt.bufPrint(&key_buf, "routed-{d}", .{i});
-        try ctx.exec(&.{ "kv", "set", key, "one", "-r", "tenant-7" });
-        var result = try ctx.cli.run(&.{ "kv", "history", key, "-r", "tenant-7", "-o", "raw" });
+        const key = try std.fmt.bufPrint(&key_buf, "{{tenant-7}}routed-{d}", .{i});
+        try ctx.exec(&.{ "kv", "set", key, "one" });
+        var result = try ctx.cli.run(&.{ "kv", "history", key, "-o", "raw" });
         defer result.deinit();
         try testing.expectEqual(@as(u8, 0), result.exit_code);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.stdout, "\n"));
@@ -1714,39 +1713,34 @@ test "e2e/kv: mget asks for every key when they overflow one request" {
     try testing.expectEqual(@as(usize, 256), n);
 }
 
-test "e2e/kv: mget with a routing key finds keys written with it, and without one finds each key on its own shard" {
+test "e2e/kv: mget over tagged and untagged keys spread across 4 shards answers every key in the order asked" {
     var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
     defer ctx.deinit();
 
-    // Sixteen keys co-located by a routing key, sixteen left to their own
-    // shards: across 4 shards most of the first live away from their own.
-    var names: [32][16]u8 = undefined;
-    var keys: [32][]const u8 = undefined;
-    for (&keys, 0..) |*k, i| {
-        k.* = try std.fmt.bufPrint(&names[i], "{s}-{d}", .{ if (i < 16) "routed" else "plain", i });
-        if (i < 16) try ctx.exec(&.{ "kv", "set", k.*, "r", "-r", "tenant-9" }) else try ctx.exec(&.{ "kv", "set", k.*, "p" });
+    // Tagged keys, all on their {tag}'s shard, interleaved with untagged
+    // ones on whichever shards they hash to, and one never written.
+    var names: [33][24]u8 = undefined;
+    var keys: [33][]const u8 = undefined;
+    for (keys[0..32], 0..) |*k, i| {
+        k.* = if (i % 2 == 0)
+            try std.fmt.bufPrint(&names[i], "{{tenant-9}}routed-{d}", .{i})
+        else
+            try std.fmt.bufPrint(&names[i], "plain-{d}", .{i});
+        try ctx.exec(&.{ "kv", "set", k.*, if (i % 2 == 0) "r" else "p" });
     }
+    keys[32] = "{tenant-9}never-written";
 
-    var args: [6 + 16][]const u8 = undefined;
-    args[0..6].* = .{ "kv", "mget", "-r", "tenant-9", "-o", "raw" };
-    @memcpy(args[6..], keys[0..16]);
-    var routed = try ctx.cli.run(&args);
-    defer routed.deinit();
-    try testing.expectEqual(@as(u8, 0), routed.exit_code);
+    var args: [4 + 33][]const u8 = undefined;
+    args[0..4].* = .{ "kv", "mget", "-o", "raw" };
+    @memcpy(args[4..], &keys);
+    var result = try ctx.cli.run(&args);
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 0), result.exit_code);
     var want = std.ArrayList(u8).empty;
     defer want.deinit(testing.allocator);
-    for (keys[0..16]) |k| try want.print(testing.allocator, "{s}\tr\n", .{k});
-    try testing.expectEqualStrings(want.items, routed.stdout);
-
-    var plain_args: [4 + 16][]const u8 = undefined;
-    plain_args[0..4].* = .{ "kv", "mget", "-o", "raw" };
-    @memcpy(plain_args[4..], keys[16..]);
-    var plain = try ctx.cli.run(&plain_args);
-    defer plain.deinit();
-    try testing.expectEqual(@as(u8, 0), plain.exit_code);
-    want.clearRetainingCapacity();
-    for (keys[16..]) |k| try want.print(testing.allocator, "{s}\tp\n", .{k});
-    try testing.expectEqualStrings(want.items, plain.stdout);
+    for (keys[0..32], 0..) |k, i| try want.print(testing.allocator, "{s}\t{s}\n", .{ k, if (i % 2 == 0) "r" else "p" });
+    try want.print(testing.allocator, "{s}\t(nil)\n", .{keys[32]});
+    try testing.expectEqualStrings(want.items, result.stdout);
 }
 
 test "e2e/kv: mget across shards pages answers too large for one, keeping the order asked" {
@@ -2196,8 +2190,8 @@ test "e2e/kv: txn begin/put/get-RYW/commit/get" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // BEGIN — pin to a routing key.
-    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "tenant-A" });
+    // BEGIN — pinned to the key's {tag}.
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "{tenant-A}txn:k1" });
     // Output: "txn: <N>\npinned: <M>\n"
     const tid_prefix = "txn: ";
     const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
@@ -2207,15 +2201,15 @@ test "e2e/kv: txn begin/put/get-RYW/commit/get" {
     try testing.expect(tid_str.len > 0);
 
     // Stage two writes inside the txn — they should not be visible outside.
-    try ctx.exec(&.{ "kv", "set", "txn:k1", "v1", "--routing-key", "tenant-A", "--txn", tid_str });
-    try ctx.exec(&.{ "kv", "set", "txn:k2", "v2", "--routing-key", "tenant-A", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "{tenant-A}txn:k1", "v1", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "{tenant-A}txn:k2", "v2", "--txn", tid_str });
 
     // RYW: a GET inside the same txn must see staged value.
-    const ryw = try ctx.execCapture(&.{ "kv", "get", "txn:k1", "--routing-key", "tenant-A", "--txn", tid_str });
+    const ryw = try ctx.execCapture(&.{ "kv", "get", "{tenant-A}txn:k1", "--txn", tid_str });
     try testing.expect(std.mem.indexOf(u8, ryw, "v1") != null);
 
     // Outside the txn, the staged value must not yet be visible.
-    var pre_commit = try ctx.cli.run(&.{ "kv", "get", "txn:k1" });
+    var pre_commit = try ctx.cli.run(&.{ "kv", "get", "{tenant-A}txn:k1" });
     defer pre_commit.deinit();
     try testing.expectEqual(@as(u8, 1), pre_commit.exit_code);
 
@@ -2223,9 +2217,9 @@ test "e2e/kv: txn begin/put/get-RYW/commit/get" {
     const commit_out = try ctx.execCapture(&.{ "kv", "txn", "commit", tid_str });
     try testing.expect(std.mem.endsWith(u8, commit_out, "ops: 2"));
 
-    const post = try ctx.execCapture(&.{ "kv", "get", "txn:k1" });
+    const post = try ctx.execCapture(&.{ "kv", "get", "{tenant-A}txn:k1" });
     try testing.expect(std.mem.indexOf(u8, post, "v1") != null);
-    const post2 = try ctx.execCapture(&.{ "kv", "get", "txn:k2" });
+    const post2 = try ctx.execCapture(&.{ "kv", "get", "{tenant-A}txn:k2" });
     try testing.expect(std.mem.indexOf(u8, post2, "v2") != null);
 }
 
@@ -2233,14 +2227,14 @@ test "e2e/kv: txn rollback discards staged ops" {
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "rb-tenant" });
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "rb:k" });
     const tid_prefix = "txn: ";
     const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
     var end = idx + tid_prefix.len;
     while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
     const tid_str = begin_out[idx + tid_prefix.len .. end];
 
-    try ctx.exec(&.{ "kv", "set", "rb:k", "should-not-persist", "--routing-key", "rb-tenant", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "rb:k", "should-not-persist", "--txn", tid_str });
     try ctx.exec(&.{ "kv", "txn", "rollback", tid_str });
 
     var result = try ctx.cli.run(&.{ "kv", "get", "rb:k", "--output", "table" });
@@ -2252,19 +2246,19 @@ test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes,
     var ctx = try stdx.testing.TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "whole" });
+    const begin_out = try ctx.execCapture(&.{ "kv", "txn", "begin", "{whole}a" });
     const tid_prefix = "txn: ";
     const idx = std.mem.indexOf(u8, begin_out, tid_prefix) orelse return error.MissingTxnId;
     var end = idx + tid_prefix.len;
     while (end < begin_out.len and std.ascii.isDigit(begin_out[end])) end += 1;
     const tid_str = begin_out[idx + tid_prefix.len .. end];
 
-    try ctx.exec(&.{ "kv", "set", "whole:a", "1", "--routing-key", "whole", "--txn", tid_str });
-    try ctx.exec(&.{ "kv", "set", "whole:b", "2", "--routing-key", "whole", "--txn", tid_str });
-    try ctx.exec(&.{ "kv", "incr", "whole:text", "--routing-key", "whole", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "{whole}a", "1", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "set", "{whole}b", "2", "--txn", tid_str });
+    try ctx.exec(&.{ "kv", "incr", "{whole}text", "--txn", tid_str });
     // Between the incr's buffering and the commit, the key stops being a
     // counter: only the commit's apply can find that out.
-    try ctx.exec(&.{ "kv", "set", "whole:text", "not a counter", "--routing-key", "whole" });
+    try ctx.exec(&.{ "kv", "set", "{whole}text", "not a counter" });
 
     var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid_str });
     defer commit.deinit();
@@ -2274,10 +2268,10 @@ test "e2e/kv: a txn whose incr can't apply at commit commits none of its writes,
     try testing.expect(std.mem.indexOf(u8, commit.stderr, "[bad_request/wrong_type]") != null);
 
     // Neither put applied, and the value the incr met is as it was.
-    var a = try ctx.cli.run(&.{ "kv", "get", "whole:a", "--routing-key", "whole" });
+    var a = try ctx.cli.run(&.{ "kv", "get", "{whole}a" });
     defer a.deinit();
     try expectNotFound(a);
-    const text = try ctx.execCapture(&.{ "kv", "get", "whole:text", "--routing-key", "whole" });
+    const text = try ctx.execCapture(&.{ "kv", "get", "{whole}text" });
     try testing.expect(std.mem.indexOf(u8, text, "not a counter") != null);
 }
 
@@ -2287,10 +2281,73 @@ test "e2e/kv: txn unknown id is rejected" {
 
     // A never-issued id, and one naming a shard the node doesn't have.
     for ([_][]const u8{ "99999", "18446462598732840961" }) |id| {
-        var result = try ctx.cli.run(&.{ "kv", "set", "ghost", "value", "--routing-key", "ghost-tenant", "--txn", id });
+        var result = try ctx.cli.run(&.{ "kv", "set", "ghost", "value", "--txn", id });
         defer result.deinit();
         try testing.expectEqual(@as(u8, 1), result.exit_code);
         try testing.expectEqualStrings("Error: not found: no such transaction — it committed, rolled back, or was begun in another namespace [not_found/no_such_transaction]", std.mem.trimEnd(u8, result.stderr, "\n"));
+    }
+}
+
+/// The id `kv txn begin key` answers.
+fn beginTxn(ctx: *stdx.testing.TestContext, key: []const u8) ![]const u8 {
+    const out = try ctx.execCapture(&.{ "kv", "txn", "begin", key });
+    const prefix = "txn: ";
+    const at = (std.mem.indexOf(u8, out, prefix) orelse return error.MissingTxnId) + prefix.len;
+    var end = at;
+    while (end < out.len and std.ascii.isDigit(out[end])) end += 1;
+    if (end == at) return error.MissingTxnId;
+    return out[at..end];
+}
+
+test "e2e/kv: on 4 shards, a txn over keys sharing a {tag} commits, and both are read back" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    const tid = try beginTxn(ctx, "{t}a");
+    try ctx.exec(&.{ "kv", "set", "{t}a", "va", "--txn", tid });
+    try ctx.exec(&.{ "kv", "set", "{t}b", "vb", "--txn", tid });
+    var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid });
+    defer commit.deinit();
+    try testing.expectEqual(@as(u8, 0), commit.exit_code);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, commit.stdout, "\n"), "ops: 2"));
+
+    try testing.expectEqualStrings("va", try ctx.execCapture(&.{ "kv", "get", "{t}a", "-o", "raw" }));
+    try testing.expectEqualStrings("vb", try ctx.execCapture(&.{ "kv", "get", "{t}b", "-o", "raw" }));
+}
+
+test "e2e/kv: on 4 shards, a txn op on a key that doesn't route with the first is refused, naming {tag}" {
+    var ctx = try stdx.testing.TestContext.initWithConfig(testing.allocator, .{ .server = .{ .shards = 4 } });
+    defer ctx.deinit();
+
+    const tid = try beginTxn(ctx, "{t}a");
+    // Untagged, so its whole key routes it, and "plain" hashes apart from "t".
+    var refused = try ctx.cli.run(&.{ "kv", "set", "plain", "v", "--txn", tid });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 3), refused.exit_code);
+    try testing.expectEqualStrings("Error: bad request: this key routes elsewhere than the transaction's first key; give every key in a transaction the same {tag}, e.g. {user:1}:balance [bad_request/keys_not_colocated]\n", refused.stderr);
+
+    // Nothing was buffered: the commit writes none, and the key is absent.
+    var commit = try ctx.cli.run(&.{ "kv", "txn", "commit", tid });
+    defer commit.deinit();
+    try testing.expectEqual(@as(u8, 0), commit.exit_code);
+    var plain = try ctx.cli.run(&.{ "kv", "get", "plain" });
+    defer plain.deinit();
+    try expectNotFound(plain);
+}
+
+test "e2e/kv: --routing-key and -r are unknown flags" {
+    var ctx = try stdx.testing.TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    for ([_]struct { args: []const []const u8, want: []const u8 }{
+        .{ .args = &.{ "kv", "get", "k", "--routing-key", "x" }, .want = "Error: unknown flag --routing-key\n" },
+        .{ .args = &.{ "kv", "set", "k", "v", "-r", "x" }, .want = "Error: unknown flag -r\n" },
+        .{ .args = &.{ "kv", "mget", "k", "--routing-key", "x" }, .want = "Error: unknown flag --routing-key\n" },
+    }) |c| {
+        var result = try ctx.cli.run(c.args);
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 2), result.exit_code);
+        try testing.expectEqualStrings(c.want, result.stderr);
     }
 }
 
@@ -2376,17 +2433,17 @@ test "e2e/kv: a 90 KB transaction batch is applied, not just acked" {
     // Three 30 KB values in one commit: a 90 KB kv_batch entry. It must be
     // readable immediately, not only after a restart replays the segment.
     // `kv txn begin` prints `txn: N` and `pinned: H`, a line each.
-    const begin = try ctx.execCapture(&.{ "kv", "txn", "begin", "rk", "-o", "raw" });
+    const begin = try ctx.execCapture(&.{ "kv", "txn", "begin", "{rk}", "-o", "raw" });
     const id_start = (std.mem.indexOf(u8, begin, "txn: ") orelse return error.NoTxnId) + "txn: ".len;
     const id_end = std.mem.indexOfScalarPos(u8, begin, id_start, '\n') orelse begin.len;
     const txn_id = begin[id_start..id_end];
     const value = stdx.repeat("t", 30_000);
-    try ctx.exec(&.{ "kv", "set", "txn_a", value, "-t", txn_id, "-r", "rk" });
-    try ctx.exec(&.{ "kv", "set", "txn_b", value, "-t", txn_id, "-r", "rk" });
-    try ctx.exec(&.{ "kv", "set", "txn_c", value, "-t", txn_id, "-r", "rk" });
+    try ctx.exec(&.{ "kv", "set", "{rk}txn_a", value, "-t", txn_id });
+    try ctx.exec(&.{ "kv", "set", "{rk}txn_b", value, "-t", txn_id });
+    try ctx.exec(&.{ "kv", "set", "{rk}txn_c", value, "-t", txn_id });
     try ctx.exec(&.{ "kv", "txn", "commit", txn_id });
-    for ([_][]const u8{ "txn_a", "txn_b", "txn_c" }) |key| {
-        const got = try ctx.execCapture(&.{ "kv", "get", key, "-r", "rk", "-o", "raw" });
+    for ([_][]const u8{ "{rk}txn_a", "{rk}txn_b", "{rk}txn_c" }) |key| {
+        const got = try ctx.execCapture(&.{ "kv", "get", key, "-o", "raw" });
         try testing.expectEqualStrings(value, got);
     }
 }
@@ -2462,16 +2519,16 @@ test "e2e/kv: json set refuses a merge past the largest value" {
     defer testing.allocator.free(filler);
     @memset(filler, 'x');
     try ctx.exec(&.{ "kv", "json", "set", "big", "{\"a\":\"\",\"b\":\"\",\"c\":\"\",\"d\":\"\"}" });
-    for ([_]struct { path: []const u8, len: usize }{ .{ .path = "$.a", .len = 100_000 }, .{ .path = "$.b", .len = 100_000 }, .{ .path = "$.c", .len = 51_000 } }) |part| {
+    for ([_]struct { path: []const u8, len: usize }{ .{ .path = "$.a", .len = 100_000 }, .{ .path = "$.b", .len = 100_000 }, .{ .path = "$.c", .len = 55_000 } }) |part| {
         const more = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..part.len]});
         defer testing.allocator.free(more);
         try ctx.exec(&.{ "kv", "json", "set", "big", more, "--path", part.path });
     }
-    // About 251,000 bytes now, under the largest value.
+    // About 255,000 bytes now, under the largest value.
     var before = try ctx.cli.run(&.{ "kv", "get", "big", "--output", "raw" });
     defer before.deinit();
     try testing.expectEqual(@as(u8, 0), before.exit_code);
-    try testing.expect(before.stdout.len > 250_000);
+    try testing.expect(before.stdout.len > 254_000);
 
     const last = try std.fmt.allocPrint(testing.allocator, "\"{s}\"", .{filler[0..3_000]});
     defer testing.allocator.free(last);

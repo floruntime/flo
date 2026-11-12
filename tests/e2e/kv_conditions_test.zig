@@ -63,7 +63,6 @@ const Racer = struct {
                 .ttl_ms = null,
                 .condition = if (self.mode == .if_absent) .if_absent else .always,
                 .cas_version = if (self.mode == .cas) 1 else null,
-                .routing_key = null,
                 .txn = null,
             });
             defer r.deinit();
@@ -136,7 +135,7 @@ test "e2e/kv-conditions: two writers racing with one cas_version: one wins, the 
     for (0..ROUNDS) |i| {
         var key_buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "race-cas-{d}", .{i});
-        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = "start", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = "start", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         defer r.deinit();
         try testing.expectEqual(proto.StatusCode.ok, r.status);
     }
@@ -158,7 +157,7 @@ test "e2e/kv-conditions: after failover, a condition counts every write the old 
     for (0..WRITES) |i| {
         var key_buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "acked-{d}", .{i});
-        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = "old-leader", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+        var r = try src.cli_client.kv.set(&conn, "", key, .{ .value = "old-leader", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
         defer r.deinit();
         try testing.expectEqual(proto.StatusCode.ok, r.status);
     }
@@ -177,7 +176,7 @@ test "e2e/kv-conditions: after failover, a condition counts every write the old 
         var key_buf: [32]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "acked-{d}", .{i});
         for (0..400) |_| {
-            var r = try src.cli_client.kv.set(&client, "", key, .{ .value = "new-writer", .ttl_ms = null, .condition = .if_absent, .cas_version = null, .routing_key = null, .txn = null });
+            var r = try src.cli_client.kv.set(&client, "", key, .{ .value = "new-writer", .ttl_ms = null, .condition = .if_absent, .cas_version = null, .txn = null });
             defer r.deinit();
             errdefer std.debug.print("{s}: status {t}\n", .{ key, r.status });
             try testing.expect(r.status != .ok);

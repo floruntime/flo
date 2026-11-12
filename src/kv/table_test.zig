@@ -138,12 +138,12 @@ const Harness = struct {
     }
 };
 
-fn getBody(fields: struct { wait_ms: u64 = 0, wait_for: kv_ops.WaitFor = .exists, routing_key: ?[]const u8 = null, txn: ?u64 = null }) GetBody {
-    return .{ .wait_ms = fields.wait_ms, .wait_for = fields.wait_for, .routing_key = fields.routing_key, .txn = fields.txn };
+fn getBody(fields: struct { wait_ms: u64 = 0, wait_for: kv_ops.WaitFor = .exists, txn: ?u64 = null }) GetBody {
+    return .{ .wait_ms = fields.wait_ms, .wait_for = fields.wait_for, .txn = fields.txn };
 }
 
-fn setBody(value: []const u8, fields: struct { ttl_ms: ?u64 = null, condition: kv_ops.Condition = .always, cas_version: ?u64 = null, routing_key: ?[]const u8 = null, txn: ?u64 = null }) SetBody {
-    return .{ .value = value, .ttl_ms = fields.ttl_ms, .condition = fields.condition, .cas_version = fields.cas_version, .routing_key = fields.routing_key, .txn = fields.txn };
+fn setBody(value: []const u8, fields: struct { ttl_ms: ?u64 = null, condition: kv_ops.Condition = .always, cas_version: ?u64 = null, txn: ?u64 = null }) SetBody {
+    return .{ .value = value, .ttl_ms = fields.ttl_ms, .condition = fields.condition, .cas_version = fields.cas_version, .txn = fields.txn };
 }
 
 fn expectValue(resp: proto.Response, version: u64, value: []const u8) !void {
@@ -178,25 +178,25 @@ test "kv table: a body that doesn't decode is refused unrun, naming its field an
     try h.init();
     defer h.deinit();
 
-    // wait_ms past its cap: [present][u64], then wait_for, routing_key, txn absent.
-    var long: [12]u8 = undefined;
+    // wait_ms past its cap: [present][u64], then wait_for and txn absent.
+    var long: [11]u8 = undefined;
     long[0] = 1;
     std.mem.writeInt(u64, long[1..9], kv_ops.MAX_WAIT_MS + 1, .little);
-    @memcpy(long[9..12], &[_]u8{ 0, 0, 0 });
+    @memcpy(long[9..11], &[_]u8{ 0, 0 });
     _ = h.send(get_op.code, "k", &long);
     var r = try expectRefused((try h.answer()).?, .bad_request, .out_of_range);
     try testing.expectEqualStrings("bad request: kv.get: wait_ms is out of range (at most 300000)", r.message);
 
     // A byte past the end of a whole body.
-    _ = h.send(get_op.code, "k", &.{ 0, 0, 0, 0, 7 });
+    _ = h.send(get_op.code, "k", &.{ 0, 0, 0, 7 });
     r = try expectRefused((try h.answer()).?, .bad_request, .malformed);
     try testing.expectEqualStrings("bad request: kv.get: 1 bytes past the end of the body", r.message);
 
     // Cut short inside a field, and an enum value the schema doesn't have.
-    _ = h.send(get_op.code, "k", &.{ 0, 0, 0 });
+    _ = h.send(get_op.code, "k", &.{ 0, 0 });
     r = try expectRefused((try h.answer()).?, .bad_request, .malformed);
     try testing.expectEqualStrings("bad request: kv.get: txn is malformed", r.message);
-    _ = h.send(get_op.code, "k", &.{ 0, 1, 9, 0, 0 });
+    _ = h.send(get_op.code, "k", &.{ 0, 1, 9, 0 });
     r = try expectRefused((try h.answer()).?, .bad_request, .malformed);
     try testing.expectEqualStrings("bad request: kv.get: wait_for is malformed", r.message);
 
@@ -240,8 +240,8 @@ test "kv table: every op that takes a key refuses one in a reserved prefix" {
     var checked: usize = 0;
     inline for (kv_ops.table) |op| {
         // scan's key is a prefix and mget's keys are in its body (both
-        // tested on their own); a transaction's begin key is its routing
-        // key, and commit and rollback take none.
+        // tested on their own); a transaction's begin key only pins it,
+        // and commit and rollback take none.
         const skip = comptime for ([_][]const u8{ "kv.scan", "kv.mget", "kv.txn.begin", "kv.txn.commit", "kv.txn.rollback" }) |name| {
             if (std.mem.eql(u8, op.name, name)) break true;
         } else false;
@@ -329,39 +329,12 @@ test "kv table: cas_version must be the key's version, and 0 means absent" {
     try expectValue((try h.get("k", getBody(.{}))).?, 2, "w");
 }
 
-test "kv table: routing_key routes the request in place of its key" {
-    var buf: [512]u8 = undefined;
-    var routed: usize = 0;
-    inline for (kv_ops.table) |op| {
-        // mget routes on its routing_key field alone: tested on its own.
-        if (@hasField(op.request.Value, "routing_key") and op.route == .key) {
-            routed += 1;
-            const route = table_run.routeByKey(op.name);
-            const header = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 1);
-            var given = plainBody(op);
-            given.routing_key = "user:1";
-            const req: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "balance", .value = try op.request.encodeInto(&buf, given) };
-            try testing.expectEqual(router.routeNsKey(.of(16), "user:1"), route(req).?);
-            const plain: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "balance", .value = try op.request.encodeInto(&buf, plainBody(op)) };
-            try testing.expectEqual(router.routeNsKey(.of(16), "balance"), route(plain).?);
-        }
-    }
-    try testing.expectEqual(@as(usize, 10), routed);
-}
-
-test "kv table: kv.mget routes on its routing key, and stays where it lands without one" {
-    const op = table_run.op("kv.mget");
-    const route = table_run.routeByField("kv.mget");
-    var kbuf: [16]u8 = undefined;
-    var keys = op.request.field_list[0].T.Builder.init(&kbuf);
-    try testing.expect(try keys.add("balance"));
-    var buf: [64]u8 = undefined;
-    const header = proto.RequestHeader.init(.kv_mget, 1);
-    const routed: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "", .value = try op.request.encodeInto(&buf, .{ .keys = keys.value(), .routing_key = "user:1" }) };
-    try testing.expectEqual(router.routeNsKey(.of(16), "user:1"), route(routed).?);
-    var buf2: [64]u8 = undefined;
-    const plain: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "", .value = try op.request.encodeInto(&buf2, .{ .keys = keys.value(), .routing_key = null }) };
-    try testing.expectEqual(@as(?u64, null), route(plain));
+test "kv table: a key-routed op routes by its key's {tag}, or the whole key without one" {
+    const header = proto.RequestHeader.init(.kv_get, 1);
+    const tagged: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "{user:1}:balance", .value = "" };
+    try testing.expectEqual(router.routeNsKey(.of(16), "user:1"), table_run.routeByKey(tagged).?);
+    const plain: proto.Request = .{ .header = header, .namespace = "ns", .ns_id = .of(16), .key = "balance", .value = "" };
+    try testing.expectEqual(router.routeNsKey(.of(16), "balance"), table_run.routeByKey(plain).?);
 }
 
 /// A body for `op` with every field absent, at its default, or empty.
@@ -384,14 +357,15 @@ test "kv table: a set in a transaction is buffered, read back inside it, and uns
     try h.init();
     defer h.deinit();
     const txn_table = &h.shard.kv_handler.txn_table;
-    const id = try txn_table.begin(router.routeNsKey(.default, "user:1"), .default);
+    const id = try txn_table.begin(router.routeNsKey(.default, "{user:1}:name"), .default);
 
-    try expectSet(try h.set("bal", setBody("5", .{ .routing_key = "user:1", .txn = id })), null);
-    try expectValue((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id }))).?, 0, "5");
-    _ = try expectRefused((try h.get("bal", getBody(.{ .routing_key = "user:1" }))).?, .not_found, .not_found);
-    // Its routing key is the transaction's, or it's refused.
-    _ = try expectRefused(try h.set("bal", setBody("6", .{ .txn = id })), .bad_request, .wrong_routing_key);
-    _ = try expectRefused((try h.get("bal", getBody(.{ .routing_key = "user:1", .txn = id, .wait_ms = 10 }))).?, .bad_request, .conflicting_fields);
+    try expectSet(try h.set("{user:1}:bal", setBody("5", .{ .txn = id })), null);
+    try expectValue((try h.get("{user:1}:bal", getBody(.{ .txn = id }))).?, 0, "5");
+    _ = try expectRefused((try h.get("{user:1}:bal", getBody(.{}))).?, .not_found, .not_found);
+    // A key that doesn't route with the transaction's is refused.
+    const refused = try expectRefused(try h.set("bal", setBody("6", .{ .txn = id })), .bad_request, .keys_not_colocated);
+    try testing.expectEqualStrings("bad request: this key routes elsewhere than the transaction's first key; give every key in a transaction the same {tag}, e.g. {user:1}:balance", refused.message);
+    _ = try expectRefused((try h.get("{user:1}:bal", getBody(.{ .txn = id, .wait_ms = 10 }))).?, .bad_request, .conflicting_fields);
     try testing.expectEqual(@as(usize, 1), txn_table.get(id).?.ops.items.len);
 }
 
@@ -424,7 +398,7 @@ test "kv table: a request in a transaction goes to the leader, and to the shard 
     try testing.expectEqual(@as(u16, 3), txn_mod.idShard(id));
 }
 
-test "kv table: the longest value applies with the longest key and routing key, TTL and cas, and one byte more is refused unrun" {
+test "kv table: the longest value applies with the longest key, TTL and cas, and one byte more is refused unrun" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
@@ -432,12 +406,9 @@ test "kv table: the longest value applies with the longest key and routing key, 
     const key = try a.alloc(u8, 4000);
     defer a.free(key);
     @memset(key, 'k');
-    const rk = try a.alloc(u8, 4000);
-    defer a.free(rk);
-    @memset(rk, 'r');
 
     // Hand-coded so the over-long value reaches the server.
-    const body = try a.alloc(u8, 4 + kv_ops.MAX_VALUE + 1 + 9 + 2 + 9 + 3 + rk.len + 1);
+    const body = try a.alloc(u8, 4 + kv_ops.MAX_VALUE + 1 + 9 + 2 + 9 + 1);
     defer a.free(body);
     for ([_]u32{ kv_ops.MAX_VALUE, kv_ops.MAX_VALUE + 1 }) |n| {
         var w: schema.Writer = .{ .buf = body };
@@ -449,9 +420,6 @@ test "kv table: the longest value applies with the longest key and routing key, 
         try w.put(&.{ 1, 0 }); // condition always
         try w.put(&.{1});
         try w.int(u64, 0); // cas_version: absent
-        try w.put(&.{1});
-        try w.int(u16, @intCast(rk.len));
-        try w.put(rk);
         try w.put(&.{0}); // no txn
         _ = h.send(set_op.code, key, w.written());
         const resp = (try h.answer()).?;
@@ -459,7 +427,7 @@ test "kv table: the longest value applies with the longest key and routing key, 
             try expectSet(resp, 1);
         } else {
             const r = try expectRefused(resp, .bad_request, .field_too_long);
-            try testing.expectEqualStrings("bad request: kv.set: value is longer than 253817 bytes", r.message);
+            try testing.expectEqualStrings("bad request: kv.set: value is longer than 257916 bytes", r.message);
         }
     }
     var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
@@ -480,40 +448,43 @@ test "kv ops: delete answers whether the key existed, and cas_version guards it"
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    try testing.expectEqual(@as(?bool, false), (try h.ok("kv.delete", "k", .{ .cas_version = null, .routing_key = null, .txn = null })).existed);
+    try testing.expectEqual(@as(?bool, false), (try h.ok("kv.delete", "k", .{ .cas_version = null, .txn = null })).existed);
     try expectSet(try h.set("k", setBody("v", .{})), 1);
-    try h.no("kv.delete", "k", .{ .cas_version = 7, .routing_key = null, .txn = null }, .conflict, .cas_mismatch);
-    try testing.expectEqual(@as(?bool, true), (try h.ok("kv.delete", "k", .{ .cas_version = 1, .routing_key = null, .txn = null })).existed);
+    try h.no("kv.delete", "k", .{ .cas_version = 7, .txn = null }, .conflict, .cas_mismatch);
+    try testing.expectEqual(@as(?bool, true), (try h.ok("kv.delete", "k", .{ .cas_version = 1, .txn = null })).existed);
     _ = try expectRefused((try h.get("k", getBody(.{}))).?, .not_found, .not_found);
     // A key the server keeps is refused, not reported absent.
-    try h.no("kv.delete", "_flo:x", .{ .cas_version = null, .routing_key = null, .txn = null }, .unauthorized, .reserved_key);
+    try h.no("kv.delete", "_flo:x", .{ .cas_version = null, .txn = null }, .unauthorized, .reserved_key);
 }
 
 test "kv ops: delete, incr, expire and exists in a transaction are buffered, and commit writes them as one" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    for ([_][]const u8{ "gone", "ttl" }) |k| try expectSet(try h.set(k, setBody("v", .{ .routing_key = "rk" })), 1);
-    const begun = try h.ok("kv.txn.begin", "rk", .{});
+    for ([_][]const u8{ "{rk}gone", "{rk}ttl" }) |k| try expectSet(try h.set(k, setBody("v", .{})), 1);
+    const begun = try h.ok("kv.txn.begin", "{rk}gone", .{});
     try testing.expectEqual(router.routeNsKey(.default, "rk"), begun.pinned);
     const txn = begun.txn;
 
-    try testing.expectEqual(@as(?bool, null), (try h.ok("kv.delete", "gone", .{ .cas_version = null, .routing_key = "rk", .txn = txn })).existed);
-    const counted = try h.ok("kv.incr", "count", .{ .delta = 5, .routing_key = "rk", .txn = txn });
+    try testing.expectEqual(@as(?bool, null), (try h.ok("kv.delete", "{rk}gone", .{ .cas_version = null, .txn = txn })).existed);
+    const counted = try h.ok("kv.incr", "{rk}count", .{ .delta = 5, .txn = txn });
     try testing.expectEqual(@as(?u64, null), counted.version);
     try testing.expectEqual(@as(?i64, null), counted.value);
-    _ = try h.ok("kv.expire", "ttl", .{ .ttl_ms = 60_000, .cas_version = null, .routing_key = "rk", .txn = txn });
+    _ = try h.ok("kv.expire", "{rk}ttl", .{ .ttl_ms = 60_000, .cas_version = null, .txn = txn });
     // Inside, the delete shows; outside, nothing has happened yet.
-    try testing.expect(!(try h.ok("kv.exists", "gone", .{ .routing_key = "rk", .txn = txn })).exists);
-    try testing.expect((try h.ok("kv.exists", "gone", .{ .routing_key = "rk", .txn = null })).exists);
-    try h.no("kv.incr", "count", .{ .delta = 1, .routing_key = "other", .txn = txn }, .bad_request, .wrong_routing_key);
+    try testing.expect(!(try h.ok("kv.exists", "{rk}gone", .{ .txn = txn })).exists);
+    try testing.expect((try h.ok("kv.exists", "{rk}gone", .{ .txn = null })).exists);
+    try h.no("kv.incr", "{other}count", .{ .delta = 1, .txn = txn }, .bad_request, .keys_not_colocated);
+    // The pin is the routing hash: an untagged key whose whole key hashes
+    // the same routes with the transaction's keys, so it is taken.
+    try testing.expect(!(try h.ok("kv.exists", "rk", .{ .txn = txn })).exists);
 
     try testing.expectEqual(@as(u16, 3), (try h.ok("kv.txn.commit", "", .{ .txn = txn })).ops);
     var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     const kv = &h.shard.defaultPartition().kv;
-    try testing.expect(kv.get(qualified(&qbuf, "gone")) == null);
-    try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, kv.get(qualified(&qbuf, "count")).?.value[0..8], .little));
-    try testing.expect(kv.get(qualified(&qbuf, "ttl")).?.expiry_ns != 0);
+    try testing.expect(kv.get(qualified(&qbuf, "{rk}gone")) == null);
+    try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, kv.get(qualified(&qbuf, "{rk}count")).?.value[0..8], .little));
+    try testing.expect(kv.get(qualified(&qbuf, "{rk}ttl")).?.expiry_ns != 0);
     // Committed: the id names no transaction now.
     try h.no("kv.txn.commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
 }
@@ -522,10 +493,10 @@ test "kv ops: rollback drops a transaction's writes, and then neither rollback n
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const txn = (try h.ok("kv.txn.begin", "rk", .{})).txn;
-    try expectSet(try h.set("k", setBody("v", .{ .routing_key = "rk", .txn = txn })), null);
+    const txn = (try h.ok("kv.txn.begin", "{rk}k", .{})).txn;
+    try expectSet(try h.set("{rk}k", setBody("v", .{ .txn = txn })), null);
     _ = try h.ok("kv.txn.rollback", "", .{ .txn = txn });
-    _ = try expectRefused((try h.get("k", getBody(.{}))).?, .not_found, .not_found);
+    _ = try expectRefused((try h.get("{rk}k", getBody(.{}))).?, .not_found, .not_found);
     try h.no("kv.txn.rollback", "", .{ .txn = txn }, .not_found, .no_such_transaction);
     try h.no("kv.txn.commit", "", .{ .txn = txn }, .not_found, .no_such_transaction);
     // Begun with no key, a transaction has nothing to pin it.
@@ -607,7 +578,7 @@ test "kv ops: scan resumes after the last name it sent, so writes between pages 
             // Before the cursor: an offset into the scan would now send a2 again.
             try expectSet(try h.set("a0", setBody("v", .{})), 1);
             // After it: gone before its page.
-            try testing.expectEqual(@as(?bool, true), (try h.ok("kv.delete", "a4", .{ .cas_version = null, .routing_key = null, .txn = null })).existed);
+            try testing.expectEqual(@as(?bool, true), (try h.ok("kv.delete", "a4", .{ .cas_version = null, .txn = null })).existed);
         }
         page = try h.ok("kv.scan", "a", .{ .limit = 2, .cursor = cursor_buf[0..next.len] });
     }
@@ -655,7 +626,7 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
     try h.init();
     defer h.deinit();
     for ([_][]const u8{ "v1", "v2", "v3" }) |v| _ = try h.set("k", setBody(v, .{}));
-    const two = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null, .routing_key = null });
+    const two = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null });
     try testing.expectEqual(@as(u32, 2), two.versions.count);
     var it = two.versions.iterator();
     for ([_]struct { version: u64, value: []const u8 }{ .{ .version = 3, .value = "v3" }, .{ .version = 2, .value = "v2" } }) |want| {
@@ -664,8 +635,8 @@ test "kv ops: history answers versions newest first, at most limit; a missing ke
         try testing.expectEqualStrings(want.value, v.value);
         try testing.expect(v.at_ms > 0);
     }
-    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null, .routing_key = null })).versions.count);
-    try h.no("kv.history", "absent", .{ .limit = 10, .before_version = null, .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(u32, 3), (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null })).versions.count);
+    try h.no("kv.history", "absent", .{ .limit = 10, .before_version = null }, .not_found, .not_found);
 }
 
 test "kv ops: history pages below before_version, and more says older versions follow" {
@@ -674,15 +645,15 @@ test "kv ops: history pages below before_version, and more says older versions f
     defer h.deinit();
     for ([_][]const u8{ "v1", "v2", "v3", "v4" }) |v| _ = try h.set("k", setBody(v, .{}));
     // A limit stops the page: more follows.
-    const first = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null, .routing_key = null });
+    const first = try h.ok("kv.history", "k", .{ .limit = 2, .before_version = null });
     try testing.expectEqual(@as(u32, 2), first.versions.count);
     try testing.expect(first.more);
-    const rest = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 3, .routing_key = null });
+    const rest = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 3 });
     var it = rest.versions.iterator();
     for ([_]u64{ 2, 1 }) |want| try testing.expectEqual(want, (try it.next()).?.version);
     try testing.expect(!rest.more);
     // Nothing older than the oldest: an empty page, not not-found.
-    const none = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 1, .routing_key = null });
+    const none = try h.ok("kv.history", "k", .{ .limit = 10, .before_version = 1 });
     try testing.expectEqual(@as(u32, 0), none.versions.count);
     try testing.expect(!none.more);
 
@@ -699,7 +670,7 @@ test "kv ops: history pages below before_version, and more says older versions f
     var seen: usize = 0;
     var pages: usize = 0;
     while (true) {
-        const page = try h.ok("kv.history", "big", .{ .limit = kv_ops.MAX_HISTORY, .before_version = before, .routing_key = null });
+        const page = try h.ok("kv.history", "big", .{ .limit = kv_ops.MAX_HISTORY, .before_version = before });
         pages += 1;
         var pit = page.versions.iterator();
         while (try pit.next()) |v| {
@@ -718,9 +689,9 @@ test "kv ops: history marks a delete's version deleted" {
     try h.init();
     defer h.deinit();
     _ = try h.set("k", setBody("v1", .{}));
-    _ = try h.ok("kv.delete", "k", .{ .cas_version = null, .routing_key = null, .txn = null });
+    _ = try h.ok("kv.delete", "k", .{ .cas_version = null, .txn = null });
     _ = try h.set("k", setBody("v3", .{}));
-    var it = (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null, .routing_key = null })).versions.iterator();
+    var it = (try h.ok("kv.history", "k", .{ .limit = 10, .before_version = null })).versions.iterator();
     for ([_]struct { version: u64, deleted: bool }{ .{ .version = 3, .deleted = false }, .{ .version = 2, .deleted = true }, .{ .version = 1, .deleted = false } }) |want| {
         const v = (try it.next()).?;
         try testing.expectEqual(want.version, v.version);
@@ -749,7 +720,7 @@ test "kv ops: mget answers each key in order, found or not, and next when they d
     var kbuf: [256]u8 = undefined;
     var keys = Keys.Builder.init(&kbuf);
     for ([_][]const u8{ "small", "absent", "_flo:x", "b1", "b2", "b3" }) |k| try testing.expect(try keys.add(k));
-    const got = try h.ok("kv.mget", "", .{ .keys = keys.value(), .routing_key = null });
+    const got = try h.ok("kv.mget", "", .{ .keys = keys.value() });
     // Two 100 KiB values fill the answer; the third goes in the next ask.
     try testing.expectEqual(@as(?u16, 5), got.next);
     try testing.expectEqual(@as(u32, 5), got.entries.count);
@@ -763,7 +734,7 @@ test "kv ops: mget answers each key in order, found or not, and next when they d
 
     var rest = Keys.Builder.init(&kbuf);
     try testing.expect(try rest.add("b3"));
-    const last = try h.ok("kv.mget", "", .{ .keys = rest.value(), .routing_key = null });
+    const last = try h.ok("kv.mget", "", .{ .keys = rest.value() });
     try testing.expectEqual(@as(?u16, null), last.next);
     try testing.expectEqual(@as(u32, 1), last.entries.count);
 }
@@ -772,14 +743,14 @@ test "kv ops: incr adds delta to a counter from 0, and refuses a value that isn'
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const once = try h.ok("kv.incr", "c", .{ .delta = 1, .routing_key = null, .txn = null });
+    const once = try h.ok("kv.incr", "c", .{ .delta = 1, .txn = null });
     try testing.expectEqual(@as(?i64, 1), once.value);
     try testing.expectEqual(@as(?u64, 1), once.version);
-    try testing.expectEqual(@as(?i64, -4), (try h.ok("kv.incr", "c", .{ .delta = -5, .routing_key = null, .txn = null })).value);
+    try testing.expectEqual(@as(?i64, -4), (try h.ok("kv.incr", "c", .{ .delta = -5, .txn = null })).value);
     try expectSet(try h.set("text", setBody("hello", .{})), 1);
-    try h.no("kv.incr", "text", .{ .delta = 1, .routing_key = null, .txn = null }, .bad_request, .wrong_type);
-    _ = try h.ok("kv.incr", "max", .{ .delta = std.math.maxInt(i64), .routing_key = null, .txn = null });
-    try h.no("kv.incr", "max", .{ .delta = 1, .routing_key = null, .txn = null }, .bad_request, .out_of_range);
+    try h.no("kv.incr", "text", .{ .delta = 1, .txn = null }, .bad_request, .wrong_type);
+    _ = try h.ok("kv.incr", "max", .{ .delta = std.math.maxInt(i64), .txn = null });
+    try h.no("kv.incr", "max", .{ .delta = 1, .txn = null }, .bad_request, .out_of_range);
 }
 
 test "kv ops: expire sets a TTL from now, 0 clears it, and cas_version guards it; a missing key is not found" {
@@ -789,24 +760,24 @@ test "kv ops: expire sets a TTL from now, 0 clears it, and cas_version guards it
     var qbuf: [@import("../protocol/limits.zig").MAX_KV_KEY]u8 = undefined;
     const kv = &h.shard.defaultPartition().kv;
     try expectSet(try h.set("k", setBody("v", .{})), 1);
-    _ = try h.ok("kv.expire", "k", .{ .ttl_ms = 60_000, .cas_version = null, .routing_key = null, .txn = null });
+    _ = try h.ok("kv.expire", "k", .{ .ttl_ms = 60_000, .cas_version = null, .txn = null });
     const e = kv.get(qualified(&qbuf, "k")).?;
     try testing.expectEqual(e.timestamp_ns + 60_000 * std.time.ns_per_ms, e.expiry_ns);
-    try h.no("kv.expire", "k", .{ .ttl_ms = 0, .cas_version = 99, .routing_key = null, .txn = null }, .conflict, .cas_mismatch);
-    _ = try h.ok("kv.expire", "k", .{ .ttl_ms = 0, .cas_version = kv.get(qualified(&qbuf, "k")).?.version, .routing_key = null, .txn = null });
+    try h.no("kv.expire", "k", .{ .ttl_ms = 0, .cas_version = 99, .txn = null }, .conflict, .cas_mismatch);
+    _ = try h.ok("kv.expire", "k", .{ .ttl_ms = 0, .cas_version = kv.get(qualified(&qbuf, "k")).?.version, .txn = null });
     try testing.expectEqual(@as(u64, 0), kv.get(qualified(&qbuf, "k")).?.expiry_ns);
-    try h.no("kv.expire", "absent", .{ .ttl_ms = 1000, .cas_version = null, .routing_key = null, .txn = null }, .not_found, .not_found);
+    try h.no("kv.expire", "absent", .{ .ttl_ms = 1000, .cas_version = null, .txn = null }, .not_found, .not_found);
 }
 
 test "kv ops: exists answers whether a key exists, and its version" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    const none = try h.ok("kv.exists", "k", .{ .routing_key = null, .txn = null });
+    const none = try h.ok("kv.exists", "k", .{ .txn = null });
     try testing.expect(!none.exists);
     try expectSet(try h.set("k", setBody("v", .{})), 1);
     try expectSet(try h.set("k", setBody("w", .{})), 2);
-    const some = try h.ok("kv.exists", "k", .{ .routing_key = null, .txn = null });
+    const some = try h.ok("kv.exists", "k", .{ .txn = null });
     try testing.expect(some.exists);
     try testing.expectEqual(@as(u64, 2), some.version);
 }
@@ -816,35 +787,35 @@ test "kv ops: json_get, json_set and json_del work at a path, and $ is the whole
     try h.init();
     defer h.deinit();
     // $ on a missing key writes the whole document; another path is not found.
-    try h.no("kv.json.set", "doc", .{ .path = "$.a", .document = "1", .routing_key = null }, .not_found, .not_found);
-    try testing.expectEqual(@as(u64, 1), (try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":1,\"b\":{\"c\":2}}", .routing_key = null })).version);
-    try testing.expectEqual(@as(u64, 2), (try h.ok("kv.json.set", "doc", .{ .path = "$.a", .document = "5", .routing_key = null })).version);
-    const a = try h.ok("kv.json.get", "doc", .{ .path = "$.a", .routing_key = null });
+    try h.no("kv.json.set", "doc", .{ .path = "$.a", .document = "1" }, .not_found, .not_found);
+    try testing.expectEqual(@as(u64, 1), (try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":1,\"b\":{\"c\":2}}" })).version);
+    try testing.expectEqual(@as(u64, 2), (try h.ok("kv.json.set", "doc", .{ .path = "$.a", .document = "5" })).version);
+    const a = try h.ok("kv.json.get", "doc", .{ .path = "$.a" });
     try testing.expectEqualStrings("5", a.document);
     try testing.expectEqual(@as(u64, 2), a.version);
-    try testing.expectEqual(@as(?u64, 3), (try h.ok("kv.json.del", "doc", .{ .path = "$.b", .routing_key = null })).version);
-    try h.no("kv.json.get", "doc", .{ .path = "$.b", .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(?u64, 3), (try h.ok("kv.json.del", "doc", .{ .path = "$.b" })).version);
+    try h.no("kv.json.get", "doc", .{ .path = "$.b" }, .not_found, .not_found);
 
-    try h.no("kv.json.set", "doc", .{ .path = "$", .document = "{not json", .routing_key = null }, .bad_request, .malformed);
-    try h.no("kv.json.get", "doc", .{ .path = "a.b[", .routing_key = null }, .bad_request, .malformed);
+    try h.no("kv.json.set", "doc", .{ .path = "$", .document = "{not json" }, .bad_request, .malformed);
+    try h.no("kv.json.get", "doc", .{ .path = "a.b[" }, .bad_request, .malformed);
     try expectSet(try h.set("text", setBody("hello", .{})), 1);
-    try h.no("kv.json.get", "text", .{ .path = "$.a", .routing_key = null }, .bad_request, .wrong_type);
+    try h.no("kv.json.get", "text", .{ .path = "$.a" }, .bad_request, .wrong_type);
 
     // $ deletes the key.
-    try testing.expectEqual(@as(?u64, null), (try h.ok("kv.json.del", "doc", .{ .path = "$", .routing_key = null })).version);
-    try h.no("kv.json.get", "doc", .{ .path = "$", .routing_key = null }, .not_found, .not_found);
+    try testing.expectEqual(@as(?u64, null), (try h.ok("kv.json.del", "doc", .{ .path = "$" })).version);
+    try h.no("kv.json.get", "doc", .{ .path = "$" }, .not_found, .not_found);
 }
 
 test "kv ops: two json sets at different paths, both proposed before either applies, both land" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
-    _ = try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":0,\"b\":0}", .routing_key = null });
+    _ = try h.ok("kv.json.set", "doc", .{ .path = "$", .document = "{\"a\":0,\"b\":0}" });
     const op = table_run.op("kv.json.set");
     var b1: [256]u8 = undefined;
     var b2: [256]u8 = undefined;
-    const p1 = try op.request.encodeInto(&b1, .{ .path = "$.a", .document = "1", .routing_key = null });
-    const p2 = try op.request.encodeInto(&b2, .{ .path = "$.b", .document = "2", .routing_key = null });
+    const p1 = try op.request.encodeInto(&b1, .{ .path = "$.a", .document = "1" });
+    const p2 = try op.request.encodeInto(&b2, .{ .path = "$.b", .document = "2" });
     var hd1 = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 100);
     hd1.payload_length = 0;
     var hd2 = proto.RequestHeader.init(@fromBackingInt(@intCast(op.code)), 101);
@@ -864,6 +835,6 @@ test "kv ops: two json sets at different paths, both proposed before either appl
     h.shard.raft_node.config.self_counts_when_durable = false;
     _ = try h.answer();
     _ = try h.answer();
-    const got = try h.ok("kv.json.get", "doc", .{ .path = "$", .routing_key = null });
+    const got = try h.ok("kv.json.get", "doc", .{ .path = "$" });
     try testing.expectEqualStrings("{\"a\":1,\"b\":2}", got.document);
 }
