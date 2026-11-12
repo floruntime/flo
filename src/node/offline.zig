@@ -193,11 +193,11 @@ pub fn skippable(dir: []const u8, shard: u16, e: *const Entry) SkipError!void {
         .repair_skip => return error.IsSkip,
         // Applied around a halt, so never what a shard halts at.
         .raft_config, .raft_noop => return error.NotSkippable,
-        // The writes behind a create or bind carry its id. Skipped, it
-        // leaves them applying under an id that names another namespace or
-        // none, and a later create could take it and read them. Cutting
-        // the log before it drops them with it.
-        .namespace_create, .namespace_bind => return error.NamespaceEntry,
+        // The writes behind a create carry its id. Skipped, it leaves them
+        // applying under an id that names another namespace or none, and a
+        // later create could take it and read them. Cutting the log before
+        // it drops them with it.
+        .namespace_create => return error.NamespaceEntry,
         else => {},
     }
     const held = apply_marker.read(dir, shard);
@@ -649,34 +649,33 @@ test "offline: a retired secret is recognised, with when, and others are not" {
     try testing.expectEqualStrings("2025-10-09", formatDate(&d, 1_760_000_000));
 }
 
-test "offline: a skip is only of the entry the shard is halted at, and never of a config, a no-op, a skip or a namespace create or bind" {
+test "offline: a skip is only of the entry the shard is halted at, and never of a config, a no-op, a skip or a namespace create" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try stdx.fs.dirRealpathAlloc(tmp.dir, testing.allocator, ".");
     defer testing.allocator.free(root);
     var cfg_buf: [membership.MAX_SIZE]u8 = undefined;
-    var es: [6]Entry = .{
+    var es: [5]Entry = .{
         entry_mod.buildEntry(.raft_noop, entry_mod.Flags.NONE, 1, 1, 10, ""),
         entry_mod.buildEntry(.raft_config, entry_mod.Flags.NONE, 1, 2, 20, membership.encode(&membership.Config.ofVoters(&.{1}), &cfg_buf)),
         entry_mod.buildEntry(.repair_skip, entry_mod.Flags.NONE, 1, 3, 30, ""),
         entry_mod.buildEntry(.namespace_create, entry_mod.Flags.NONE, 1, 4, 40, "c"),
-        entry_mod.buildEntry(.namespace_bind, entry_mod.Flags.NONE, 1, 5, 50, "b"),
-        entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 6, 60, "x"),
+        entry_mod.buildEntry(.kv_put, entry_mod.Flags.NONE, 1, 5, 50, "x"),
     };
     for (&es) |*e| e.header.crc32c = e.computeCrc();
-    try testing.expectError(error.NotHalted, skippable(root, 0, &es[5]));
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[4]));
     var m = try apply_marker.Marker.open(root, 0);
     defer m.close();
     // Even halted there.
-    for (es[0..5], [_]anyerror{ error.NotSkippable, error.NotSkippable, error.IsSkip, error.NamespaceEntry, error.NamespaceEntry }) |*e, want| {
+    for (es[0..4], [_]anyerror{ error.NotSkippable, error.NotSkippable, error.IsSkip, error.NamespaceEntry }) |*e, want| {
         m.halted(e.header.index, e.header.term, e.header.crc32c);
         try testing.expectError(want, skippable(root, 0, e));
     }
-    m.halted(6, 1, es[5].header.crc32c);
-    try skippable(root, 0, &es[5]);
-    try testing.expectError(error.NotHalted, skippable(root, 1, &es[5]));
-    m.halted(6, 2, es[5].header.crc32c);
-    try testing.expectError(error.NotHalted, skippable(root, 0, &es[5]));
+    m.halted(5, 1, es[4].header.crc32c);
+    try skippable(root, 0, &es[4]);
+    try testing.expectError(error.NotHalted, skippable(root, 1, &es[4]));
+    m.halted(5, 2, es[4].header.crc32c);
+    try testing.expectError(error.NotHalted, skippable(root, 0, &es[4]));
 }
 
 test "offline: an entry the repair can't read for a resource failure is not taken as missing from the log" {

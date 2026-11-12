@@ -174,6 +174,18 @@ pub const ShardSlot = struct {
     /// other node could serve. In a cluster it is false and `read_blocked` is a
     /// 503, like `offline` versus `diverged`.
     read_blocked_serves: Atomic(bool) = .init(false),
+    /// Shard 0's: namespace ids other shards hold data under that the
+    /// node's table doesn't have (`NamespaceHandler.unknownIds`), the first
+    /// `MAX_UNKNOWN_LISTED` of them, and how many there are in all.
+    namespace_ids_unknown: [MAX_UNKNOWN_LISTED]Atomic(u32) = @splat(.init(0)),
+    namespace_ids_unknown_count: Atomic(u32) = .init(0),
+
+    pub const MAX_UNKNOWN_LISTED = 64;
+
+    pub fn publishUnknownNamespaces(self: *ShardSlot, ids: []const u32, count: u32) void {
+        for (ids[0..@min(ids.len, MAX_UNKNOWN_LISTED)], 0..) |id, i| self.namespace_ids_unknown[i].store(id, .monotonic);
+        self.namespace_ids_unknown_count.store(count, .release);
+    }
 
     pub fn get(self: *const ShardSlot) ShardState {
         return @fromBackingInt(@intCast(self.state.load(.acquire)));
@@ -262,7 +274,18 @@ pub const NodeHealth = struct {
     /// `/status`: the node, then each shard with what it has lost.
     pub fn writeStatus(self: *const NodeHealth, w: *std.Io.Writer, registry: ?*MetricsRegistry) std.Io.Writer.Error!void {
         const r = self.readiness();
-        try w.print("{{\"node_id\":{d},\"ready\":{},\"state\":\"{s}\",\"shards\":[", .{ self.node_id, r.ready, r.word });
+        try w.print("{{\"node_id\":{d},\"ready\":{},\"state\":\"{s}\",\"namespace_ids_unknown\":[", .{ self.node_id, r.ready, r.word });
+        // Data under these ids is out of reach: shard 0's log lacks their
+        // creates. The first ones, if there are more than fit.
+        if (self.shards.len > 0) {
+            const s0 = &self.shards[0];
+            const n = @min(s0.namespace_ids_unknown_count.load(.acquire), ShardSlot.MAX_UNKNOWN_LISTED);
+            for (s0.namespace_ids_unknown[0..n], 0..) |*id, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print("{d}", .{id.load(.monotonic)});
+            }
+        }
+        try w.writeAll("],\"shards\":[");
         for (self.shards, 0..) |*s, i| {
             if (i > 0) try w.writeByte(',');
             const state = s.get();
@@ -523,6 +546,30 @@ test "health: /status names each shard's state, its reason when offline, and its
     try testing.expectEqual(@as(i64, 0), s0.get("processing_failed_jobs").?.integer);
     try testing.expectEqual(@as(i64, 4), s1.get("processing_failed_jobs").?.integer);
     try testing.expectEqual(@as(i64, 2), s1.get("processing_held_jobs").?.integer);
+}
+
+test "health: /status lists the namespace ids shard 0 doesn't know, and an empty list when none" {
+    var h = try NodeHealth.init(testing.allocator, 1, 2);
+    defer h.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"namespace_ids_unknown\":[],") != null);
+
+    h.shards[0].publishUnknownNamespaces(&.{ 20, 21 }, 2);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const ids = parsed.value.object.get("namespace_ids_unknown").?.array.items;
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqual(@as(i64, 20), ids[0].integer);
+    try testing.expectEqual(@as(i64, 21), ids[1].integer);
+
+    h.shards[0].publishUnknownNamespaces(&.{}, 0);
+    aw.clearRetainingCapacity();
+    try h.writeStatus(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"namespace_ids_unknown\":[],") != null);
 }
 
 test "health: /status shows removal notices held, and the quorum once acted on" {

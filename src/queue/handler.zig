@@ -787,9 +787,11 @@ pub const QueueHandler = struct {
         shard.deliverDeferred(a.reply_to, if (result.refused() != null) a.leased else a.answer);
     }
 
+    /// Metered under the namespace's name as the node's table has it; one
+    /// shard 0 hasn't published yet is not metered rather than mislabelled.
     fn recordDequeue(self: *QueueHandler, shard: *Shard, ns: NamespaceId, name: []const u8, n: usize, bytes: usize) void {
         const mr = self.metrics_registry orelse return;
-        const namespace = shard.namespace_handler.nameOf(ns) orelse return;
+        const namespace = shard.namespace_handler.table.nameOf(ns) orelse return;
         const qm = mr.registerQueue(namespace, name) catch return;
         if (n == 0) qm.recordEmptyDequeue() else qm.recordDequeue(n, bytes);
     }

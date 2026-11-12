@@ -53,8 +53,8 @@ pub const Partition = struct {
     current_term: u64,
     committed_index: u64,
 
-    /// The highest allocated namespace id an entry applied here named,
-    /// bound on this shard or not: state here may be keyed by it.
+    /// The highest allocated namespace id an entry applied here named:
+    /// state here may be keyed by it.
     highest_namespace: u32 = 0,
 
     /// Warm store — payload copies for entries evicted from the hot ring buffer.
