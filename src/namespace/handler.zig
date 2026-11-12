@@ -4,11 +4,6 @@
 //! route to shard 0. The namespace an op acts on is its key, not the
 //! envelope's namespace. A name with a leading `_` is the system's and is
 //! never created.
-//!
-//! ## Namespace key utilities
-//!
-//! `qualifyKey` builds the `"ns\x00key"` form for the subsystems still
-//! keyed by name.
 
 const std = @import("std");
 const stdx = @import("stdx");
@@ -37,12 +32,8 @@ const Shard = shard_mod.Shard;
 const Connection = connection_mod.Connection;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Namespace Key Utilities — public API for all subsystems
+// Names and limits
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Room reserved for the namespace in a qualified key; names are at most
-/// `MAX_NAME_LEN`.
-pub const MAX_NAMESPACE_LEN: usize = 128;
 
 /// The longest namespace name.
 pub const MAX_NAME_LEN: usize = @import("../protocol/limits.zig").MAX_NAMESPACE_NAME;
@@ -50,10 +41,8 @@ pub const MAX_NAME_LEN: usize = @import("../protocol/limits.zig").MAX_NAMESPACE_
 /// Why `name` cannot name a namespace, or null if it can: 1–63 of
 /// `[a-z0-9_-]`, starting with a letter or digit and not ending in `-`; a
 /// leading `_` is the system's. Lowercase only, so no two names differ by
-/// case alone. No `:` or NUL: workflow runs and definitions are keyed
-/// "namespace:name" and read back to the first `:`, and keys are
-/// "namespace\x00key". The applier checks it too, so it is part of the
-/// replicated state: loosening it later is safe, tightening it is not.
+/// case alone. The applier checks it too, so it is part of the replicated
+/// state: loosening it later is safe, tightening it is not.
 pub fn nameRefusal(name: []const u8) ?[]const u8 {
     if (name.len == 0) return "namespace name is required";
     if (name.len > MAX_NAME_LEN) return std.fmt.comptimePrint("namespace name too long (at most {d} bytes)", .{MAX_NAME_LEN});
@@ -72,37 +61,6 @@ pub fn nameRefusal(name: []const u8) ?[]const u8 {
 /// against it, since those are keyed by the namespace's id. Keys beyond
 /// 4 KiB bloat log entries and stack frames.
 pub const MAX_QUALIFIED_KEY: usize = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
-
-/// Null byte separator between namespace and key in qualified keys: no
-/// namespace name can contain it (see `nameRefusal`).
-pub const NAMESPACE_SEPARATOR: u8 = 0;
-
-/// Build a namespace-qualified internal key: `"<namespace>\x00<key>"`.
-///
-/// For empty or "default" namespace, returns the raw key unchanged (no prefix).
-/// This is the canonical function — all subsystems should use this for
-/// namespace isolation rather than implementing their own qualification.
-///
-/// Returns `error.KeyHasNul` if raw_key contains the separator: a "default"
-/// key is stored bare, so it could otherwise name another namespace's entry
-/// (refused in every namespace so the rule is one rule). Callers must fail
-/// closed; falling back to raw_key reopens that reach.
-/// Returns `error.KeyTooLarge` if the combined length exceeds the buffer.
-///
-/// Lifetime: the returned slice borrows from `buf` (when prefixed) or from
-/// `raw_key` (when no prefix). Safe for synchronous operations, waiter
-/// registration (pool copies to inline buffer), and Raft propose (serializes
-/// immediately).
-pub fn qualifyKey(buf: *[MAX_QUALIFIED_KEY]u8, ns: []const u8, raw_key: []const u8) error{ KeyTooLarge, KeyHasNul }![]const u8 {
-    if (std.mem.indexOfScalar(u8, raw_key, NAMESPACE_SEPARATOR) != null) return error.KeyHasNul;
-    if (ns.len == 0 or std.mem.eql(u8, ns, "default")) return raw_key;
-    const total = ns.len + 1 + raw_key.len;
-    if (total > MAX_QUALIFIED_KEY) return error.KeyTooLarge;
-    @memcpy(buf[0..ns.len], ns);
-    buf[ns.len] = NAMESPACE_SEPARATOR;
-    @memcpy(buf[ns.len + 1 ..][0..raw_key.len], raw_key);
-    return buf[0..total];
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // NamespaceHandler
@@ -1120,33 +1078,6 @@ test "namespace handler: default has its own id from the start, and id 0 names n
     try testing.expect(handler.nameOf(.invalid) == null);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Namespace Key Utilities — Tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-test "qualifyKey: default namespace returns raw key" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const raw = "mykey";
-    try testing.expectEqualStrings(raw, try qualifyKey(&buf, "", raw));
-    try testing.expectEqualStrings(raw, try qualifyKey(&buf, "default", raw));
-}
-
-test "qualifyKey: non-default namespace prefixes correctly" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const result = try qualifyKey(&buf, "myapp", "mykey");
-    try testing.expectEqual(@as(usize, 11), result.len); // "myapp" + \0 + "mykey"
-    try testing.expectEqualStrings("myapp", result[0..5]);
-    try testing.expectEqual(@as(u8, 0), result[5]);
-    try testing.expectEqualStrings("mykey", result[6..]);
-}
-
-test "qualifyKey: oversized key returns KeyTooLarge" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    const big_key = &@as([(MAX_QUALIFIED_KEY)]u8, @splat('x')); // exactly fills buffer
-    const result = qualifyKey(&buf, "ns", big_key);
-    try testing.expectError(error.KeyTooLarge, result);
-}
-
 // ── Raft Apply Tests ────────────────────────────────────────────────────────
 
 test "namespace handler: applyCreate adds to local registry" {
@@ -1183,10 +1114,4 @@ test "namespace: a committed entry's id resolves to the name" {
     try std.testing.expectEqualStrings("prod", handler.nameOf(id).?);
     try std.testing.expect(handler.nameOf(.of(id.int() + 1)) == null);
     try std.testing.expect(handler.idOf("never") == null);
-}
-
-test "namespace handler: a key holding a NUL is never qualified" {
-    var buf: [MAX_QUALIFIED_KEY]u8 = undefined;
-    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "", "b\x00k"));
-    try testing.expectError(error.KeyHasNul, qualifyKey(&buf, "a", "b\x00k"));
 }

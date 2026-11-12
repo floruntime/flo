@@ -202,7 +202,7 @@ fn executeGet(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    var result = client_mod.kv.get(client, namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null }) catch |err| {
+    var result = client_mod.kv.get(client, namespace, key, .{ .wait_ms = 0, .wait_for = .exists, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };
@@ -242,7 +242,7 @@ fn executeSet(client: *Client, ctx: *commander.Context, namespace: []const u8, r
         return;
     }
 
-    var result = client_mod.kv.set(client, namespace, key, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }) catch |err| {
+    var result = client_mod.kv.set(client, namespace, key, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };
@@ -262,7 +262,7 @@ fn executeDel(client: *Client, ctx: *commander.Context, namespace: []const u8, k
         return;
     }
 
-    var result = client_mod.kv.call(client, "kv.delete", namespace, key, .{ .cas_version = null, .routing_key = null, .txn = null }) catch |err| {
+    var result = client_mod.kv.call(client, "kv.delete", namespace, key, .{ .cas_version = null, .txn = null }) catch |err| {
         ctx.print("(error) {}\n", .{err});
         return;
     };

@@ -2808,7 +2808,7 @@ test "ProcessingHandler: kv_lookup reads its own shard's KV, whatever the key ha
     handler.peer_shard_count = 2;
     handler.setPeerKvHandlers(&peers);
 
-    // A key whose hash names shard 1, written here (as a routing key does).
+    // A key whose hash names shard 1, written here.
     var elsewhere: []const u8 = "";
     for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" }) |c| {
         if (handler.peerShardId("default", c) == 1) elsewhere = c;

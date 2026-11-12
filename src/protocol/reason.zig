@@ -48,9 +48,9 @@ pub const Reason = enum(u16) {
     /// committing, rolled back, was begun in another namespace, or never
     /// existed.
     no_such_transaction = 17,
-    /// The request's routing key (its key, when it gives none) isn't the
-    /// one its transaction was begun with.
-    wrong_routing_key = 18,
+    /// The key doesn't route with the key its transaction was begun with:
+    /// a different {tag}, or a different whole key when there is none.
+    keys_not_colocated = 18,
     /// The transaction holds as many ops or bytes as it may.
     txn_too_large = 19,
     /// The shard holds as many waiting reads as it may.

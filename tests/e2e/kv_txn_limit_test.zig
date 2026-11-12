@@ -11,10 +11,11 @@ const ServerProcess = stdx.testing.ServerProcess;
 
 const TOO_LARGE = "/txn_too_large]";
 
-/// A transaction begun through `cli`, its id in `buf`. Null if the node
-/// refused, as it does with no leader.
-fn begin(cli: *CliRunner, routing: []const u8, buf: []u8) !?[]const u8 {
-    var out = try cli.run(&.{ "kv", "txn", "begin", routing });
+/// A transaction pinned to `{tag}`, begun through `cli`, its id in `buf`.
+/// Null if the node refused, as it does with no leader.
+fn begin(cli: *CliRunner, tag: []const u8, buf: []u8) !?[]const u8 {
+    var key_buf: [32]u8 = undefined;
+    var out = try cli.run(&.{ "kv", "txn", "begin", try std.fmt.bufPrint(&key_buf, "{{{s}}}", .{tag}) });
     defer out.deinit();
     const prefix = "txn: ";
     const at = std.mem.indexOf(u8, out.stdout, prefix) orelse return null;
@@ -25,15 +26,15 @@ fn begin(cli: *CliRunner, routing: []const u8, buf: []u8) !?[]const u8 {
 
 const Fill = struct { accepted: usize, too_large: bool };
 
-/// Puts `<prefix><i>` = `v<i>` into the transaction until `want` are in or one
-/// is refused for the transaction's size. Null on any other refusal.
-fn fill(cli: *CliRunner, txn: []const u8, routing: []const u8, prefix: []const u8, want: usize) !?Fill {
+/// Puts `{tag}<prefix><i>` = `v<i>` into the transaction until `want` are in
+/// or one is refused for the transaction's size. Null on any other refusal.
+fn fill(cli: *CliRunner, txn: []const u8, tag: []const u8, prefix: []const u8, want: usize) !?Fill {
     for (0..want) |i| {
         var key_buf: [32]u8 = undefined;
         var val_buf: [16]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "{s}{d}", .{ prefix, i });
+        const key = try std.fmt.bufPrint(&key_buf, "{{{s}}}{s}{d}", .{ tag, prefix, i });
         const val = try std.fmt.bufPrint(&val_buf, "v{d}", .{i});
-        var out = try cli.run(&.{ "kv", "set", key, val, "--routing-key", routing, "--txn", txn });
+        var out = try cli.run(&.{ "kv", "set", key, val, "--txn", txn });
         defer out.deinit();
         if (out.contains(TOO_LARGE)) return .{ .accepted = i, .too_large = true };
         if (out.exit_code == 0) continue;
@@ -111,7 +112,7 @@ fn expectBytes(config: ServerProcess.ServerConfig, size: usize, fits: usize) !vo
     const txn = (try begin(cli, "r", &buf)) orelse return error.BeginRefused;
     for (0..fits + 1) |i| {
         var key_buf: [16]u8 = undefined;
-        var out = try cli.run(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "b{d}", .{i}), value, "--routing-key", "r", "--txn", txn });
+        var out = try cli.run(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "{{r}}b{d}", .{i}), value, "--txn", txn });
         defer out.deinit();
         if (i == fits) {
             if (!out.contains(TOO_LARGE)) std.debug.print("put {d}: {s}\n", .{ i, out.stderr });
@@ -159,30 +160,31 @@ test "e2e/kv/txn-limit: every shard of a node takes both settings" {
     defer testing.allocator.free(value);
     @memset(value, 'x');
 
-    // Routing keys until a transaction has been refused on each shard, which
-    // a transaction's id names in its top 16 bits.
+    // Tags until a transaction has been refused on each shard, which a
+    // transaction's id names in its top 16 bits.
     var seen: [4]bool = @splat(false);
     var attempt: usize = 0;
     while (std.mem.indexOfScalar(bool, &seen, false) != null) : (attempt += 1) {
         if (attempt == 64) return error.ShardNeverReached;
-        var routing_buf: [16]u8 = undefined;
-        const routing = try std.fmt.bufPrint(&routing_buf, "r{d}", .{attempt});
+        var tag_buf: [16]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "r{d}", .{attempt});
         var buf: [32]u8 = undefined;
-        const txn = (try begin(cli, routing, &buf)) orelse return error.BeginRefused;
+        const txn = (try begin(cli, tag, &buf)) orelse return error.BeginRefused;
         const shard: usize = @intCast((try std.fmt.parseInt(u64, txn, 10)) >> 48);
         if (seen[shard]) continue;
         seen[shard] = true;
         // Ops: three small ones, and the fourth refused.
-        const got = (try fill(cli, txn, routing, "s", 4)) orelse return error.PutRefused;
+        const got = (try fill(cli, txn, tag, "s", 4)) orelse return error.PutRefused;
         try testing.expectEqual(@as(usize, 3), got.accepted);
         try testing.expect(got.too_large);
         // Bytes: one large value, and the next refused.
         var byte_buf: [32]u8 = undefined;
-        const bytes = (try begin(cli, routing, &byte_buf)) orelse return error.BeginRefused;
-        var first = try cli.run(&.{ "kv", "set", "l0", value, "--routing-key", routing, "--txn", bytes });
+        const bytes = (try begin(cli, tag, &byte_buf)) orelse return error.BeginRefused;
+        var key_buf: [32]u8 = undefined;
+        var first = try cli.run(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "{{{s}}}l0", .{tag}), value, "--txn", bytes });
         defer first.deinit();
         try testing.expectEqual(@as(u8, 0), first.exit_code);
-        var second = try cli.run(&.{ "kv", "set", "l1", value, "--routing-key", routing, "--txn", bytes });
+        var second = try cli.run(&.{ "kv", "set", try std.fmt.bufPrint(&key_buf, "{{{s}}}l1", .{tag}), value, "--txn", bytes });
         defer second.deinit();
         try testing.expect(second.contains(TOO_LARGE));
     }
@@ -207,9 +209,9 @@ fn expectData(cluster: *ClusterContext, node: usize, count: usize) !void {
     for (0..count) |i| {
         var key_buf: [32]u8 = undefined;
         var want_buf: [32]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "m{d}", .{i});
+        const key = try std.fmt.bufPrint(&key_buf, "{{r}}m{d}", .{i});
         const want = try std.fmt.bufPrint(&want_buf, "\"value\":\"v{d}\"", .{i});
-        cluster.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", key, "--routing-key", "r", "--output", "json" }, want, 80, 100));
+        cluster.allocator.free(try cluster.pollUntilContains(node, &.{ "kv", "get", key, "--output", "json" }, want, 80, 100));
     }
 }
 

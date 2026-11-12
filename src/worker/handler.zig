@@ -29,7 +29,8 @@ const dispatcher_mod = @import("../node/dispatcher.zig");
 const shard_mod = @import("../node/shard.zig");
 const connection_mod = @import("../node/connection.zig");
 const router = @import("../node/router.zig");
-const ns_keys = @import("../namespace/handler.zig");
+const limits = @import("../protocol/limits.zig");
+const NamespaceId = @import("../namespace/table.zig").Id;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const table_run = @import("../node/table_run.zig");
 const gather_mod = @import("../node/gather.zig");
@@ -74,8 +75,8 @@ pub const WorkerRecord = struct {
     id_owned: []const u8,
     worker_type: WorkerType,
     status: WorkerStatus,
-    /// Namespace this worker belongs to
-    namespace_owned: []const u8,
+    /// The namespace this worker belongs to.
+    namespace: NamespaceId,
     /// JSON metadata: labels, extra user data
     metadata_owned: ?[]const u8 = null,
     /// Machine/host identifier — groups workers on the same machine
@@ -157,27 +158,26 @@ pub const WorkerHandler = struct {
         w.processes.deinit(self.allocator);
         self.allocator.free(w.key_owned);
         self.allocator.free(w.id_owned);
-        self.allocator.free(w.namespace_owned);
         if (w.metadata_owned) |m| self.allocator.free(m);
         if (w.machine_id_owned) |mid| self.allocator.free(mid);
     }
 
-    /// The registry key of worker `id` in `namespace`: "ns\x00id", or the
-    /// id alone in "default". Null if too long to be one, or if the id
-    /// holds a NUL and so could spell another namespace's worker.
-    pub fn workerKey(buf: *[ns_keys.MAX_QUALIFIED_KEY]u8, namespace: []const u8, id: []const u8) ?[]const u8 {
-        if (std.mem.indexOfScalar(u8, id, 0) != null) return null;
-        return ns_keys.qualifyKey(buf, namespace, id) catch null;
+    /// The longest registry key: a namespace's id, then a worker id.
+    pub const MAX_WORKER_KEY = @sizeOf(u32) + limits.MAX_QUALIFIED_KEY;
+
+    /// The registry key of worker `id` in `ns`: the namespace's id, then
+    /// the worker's. Null if the id is too long or holds a NUL.
+    pub fn workerKey(buf: *[MAX_WORKER_KEY]u8, ns: NamespaceId, id: []const u8) ?[]const u8 {
+        if (id.len > limits.MAX_QUALIFIED_KEY or std.mem.indexOfScalar(u8, id, 0) != null) return null;
+        buf[0..4].* = ns.bytes();
+        @memcpy(buf[4..][0..id.len], id);
+        return buf[0 .. 4 + id.len];
     }
 
-    /// Worker `id` as registered in `namespace`.
-    pub fn find(self: *WorkerHandler, namespace: []const u8, id: []const u8) ?*WorkerRecord {
-        var buf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        return self.workers.getPtr(workerKey(&buf, namespace, id) orelse return null);
-    }
-
-    fn homeOf(namespace: []const u8) []const u8 {
-        return if (namespace.len == 0) "default" else namespace;
+    /// Worker `id` as registered in `ns`.
+    pub fn find(self: *WorkerHandler, ns: NamespaceId, id: []const u8) ?*WorkerRecord {
+        var buf: [MAX_WORKER_KEY]u8 = undefined;
+        return self.workers.getPtr(workerKey(&buf, ns, id) orelse return null);
     }
 
     // ── Dispatcher Registration ─────────────────────────────────────────
@@ -201,8 +201,8 @@ pub const WorkerHandler = struct {
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
         const op: OpCode = @fromBackingInt(@intCast(req.header.op_code));
 
-        // A worker id is part of the registry key ("ns\x00id"), so one
-        // holding a NUL could spell another namespace's worker.
+        // A worker id is a run's holder, and a holder's request keys are
+        // `[holder][0][key]`: one holding a NUL could spell another's.
         if (std.mem.indexOfScalar(u8, req.key, 0) != null) {
             shard.sendErrorResponse(conn, req.header.request_id, .bad_request, "worker id must not contain NUL");
             return;
@@ -257,8 +257,8 @@ pub const WorkerHandler = struct {
     /// Why the worker was not registered, or null.
     fn handleRegister(self: *WorkerHandler, req: Request) ?Refused {
         if (req.key.len == 0) return .{ .why = "worker id is required" };
-        var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = workerKey(&kbuf, req.namespace, req.key) orelse return .{ .why = "worker id too long, or holds a NUL" };
+        var kbuf: [MAX_WORKER_KEY]u8 = undefined;
+        const key = workerKey(&kbuf, req.ns_id, req.key) orelse return .{ .why = "worker id too long, or holds a NUL" };
         if (self.workers.count() >= MAX_WORKERS and !self.workers.contains(key)) return .{ .why = "worker limit reached" };
 
         var reg = switch (parseRegistration(self.allocator, req.value) catch return .{ .why = "worker not registered: out of memory" }) {
@@ -392,8 +392,6 @@ pub const WorkerHandler = struct {
         errdefer self.allocator.free(owned_key);
         const owned_id = try self.allocator.dupe(u8, req.key);
         errdefer self.allocator.free(owned_id);
-        const owned_namespace = try self.allocator.dupe(u8, homeOf(req.namespace));
-        errdefer self.allocator.free(owned_namespace);
         const owned_metadata: ?[]const u8 = if (reg.metadata) |m| try self.allocator.dupe(u8, m) else null;
         errdefer if (owned_metadata) |m| self.allocator.free(m);
         const owned_machine_id: ?[]const u8 = if (reg.machine_id) |m| try self.allocator.dupe(u8, m) else null;
@@ -411,7 +409,7 @@ pub const WorkerHandler = struct {
             .id_owned = owned_id,
             .worker_type = reg.worker_type,
             .status = .active,
-            .namespace_owned = owned_namespace,
+            .namespace = req.ns_id,
             .metadata_owned = owned_metadata,
             .machine_id_owned = owned_machine_id,
             .processes = reg.processes,
@@ -426,7 +424,7 @@ pub const WorkerHandler = struct {
     /// value = [current_load:u32]
     /// Returns the worker's current status (so the SDK can detect draining).
     fn handleHeartbeat(self: *WorkerHandler, req: Request) ?WorkerStatus {
-        const worker = self.find(req.namespace, req.key) orelse return null;
+        const worker = self.find(req.ns_id, req.key) orelse return null;
         worker.last_heartbeat_ms = @import("stdx").time.milliTimestamp();
         worker.last_seen_ms = @import("stdx").time.monotonicMs();
 
@@ -445,15 +443,15 @@ pub const WorkerHandler = struct {
     /// Drain a worker — marks it as draining so no new tasks are assigned.
     /// key = worker_id. Returns true if the worker was found.
     fn handleDrain(self: *WorkerHandler, req: Request) bool {
-        const worker = self.find(req.namespace, req.key) orelse return false;
+        const worker = self.find(req.ns_id, req.key) orelse return false;
         worker.status = .draining;
         return true;
     }
 
     /// Deregister a worker. key = worker_id.
     fn handleDeregister(self: *WorkerHandler, req: Request) void {
-        var kbuf: [ns_keys.MAX_QUALIFIED_KEY]u8 = undefined;
-        const key = workerKey(&kbuf, req.namespace, req.key) orelse return;
+        var kbuf: [MAX_WORKER_KEY]u8 = undefined;
+        const key = workerKey(&kbuf, req.ns_id, req.key) orelse return;
         if (self.workers.fetchRemove(key)) |old| {
             var old_val = old.value;
             self.freeWorkerRecord(&old_val);
@@ -492,16 +490,16 @@ pub const WorkerHandler = struct {
     }
 
     /// Increment completed count for a worker + specific process (called by actions handler).
-    pub fn recordCompletion(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
-        if (self.find(namespace, worker_id)) |w| {
+    pub fn recordCompletion(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8, process_name: ?[]const u8) void {
+        if (self.find(ns, worker_id)) |w| {
             w.tasks_completed += 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, false);
         }
     }
 
     /// Increment failed count for a worker + specific process (called by actions handler).
-    pub fn recordFailure(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8, process_name: ?[]const u8) void {
-        if (self.find(namespace, worker_id)) |w| {
+    pub fn recordFailure(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8, process_name: ?[]const u8) void {
+        if (self.find(ns, worker_id)) |w| {
             w.tasks_failed += 1;
             if (process_name) |pn| self.updateProcessRun(w, pn, true);
         }
@@ -509,8 +507,8 @@ pub const WorkerHandler = struct {
 
     /// Why worker `worker_id` takes no new task, or null if it takes one.
     /// An unregistered worker takes tasks: registering is optional.
-    pub fn refusesWork(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) ?proto.Refusal {
-        const w = self.find(namespace, worker_id) orelse return null;
+    pub fn refusesWork(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8) ?proto.Refusal {
+        const w = self.find(ns, worker_id) orelse return null;
         return switch (w.status) {
             .draining => .{ .reason = .worker_draining, .ran = .no, .message = "worker is draining" },
             .unhealthy => .{ .reason = .worker_unhealthy, .ran = .no, .message = "worker missed its heartbeats; send one, or register again" },
@@ -539,14 +537,13 @@ pub const WorkerHandler = struct {
     /// worker.info: the worker's row, metadata and processes, from the
     /// shard its id routes to.
     fn runInfo(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(InfoResponse) {
-        return .{ .answer = try shard.worker_handler.info(req.namespace, req.key) };
+        return .{ .answer = try shard.worker_handler.info(req.ns_id, req.key) };
     }
 
-    fn info(self: *WorkerHandler, namespace: []const u8, worker_id: []const u8) Error!InfoResponse.Value {
-        // A worker id is part of the registry key ("ns\x00id"), so one
-        // holding a NUL could spell another namespace's worker.
+    fn info(self: *WorkerHandler, ns: NamespaceId, worker_id: []const u8) Error!InfoResponse.Value {
+        // No worker's id holds a NUL (`dispatchWorkerCmd`).
         if (std.mem.indexOfScalar(u8, worker_id, 0) != null) return error.InvalidId;
-        const w = self.find(namespace, worker_id) orelse return error.NotFound;
+        const w = self.find(ns, worker_id) orelse return error.NotFound;
         const buf = self.info_buf orelse blk: {
             const b = try self.allocator.alloc(u8, worker_ops.Processes.byte_bound.?);
             self.info_buf = b;
@@ -582,11 +579,11 @@ pub const WorkerHandler = struct {
     /// A worker.list another shard sent here is that gather's part.
     fn runList(shard: *Shard, conn: *Connection, req: Request, limit: u32, cursor: []const u8, action: []const u8) Error!table_run.Outcome(ListResponse) {
         const h = shard.worker_handler;
-        if (conn == shard.forward_proxy) return .{ .answer = try h.page(req.namespace, limit, cursor, action) };
+        if (conn == shard.forward_proxy) return .{ .answer = try h.page(req.ns_id, limit, cursor, action) };
 
         const shards: usize = if (shard.peer_mailboxes) |m| m.len else 1;
         var parts: [gather_mod.MAX_PARTS]gather_mod.Part = undefined;
-        const local = try encodeBody(h.allocator, try h.page(req.namespace, limit, cursor, action));
+        const local = try encodeBody(h.allocator, try h.page(req.ns_id, limit, cursor, action));
         const state = ListGather.create(h.allocator, limit) catch |err| {
             h.allocator.free(local);
             return err;
@@ -598,15 +595,15 @@ pub const WorkerHandler = struct {
         return .wait;
     }
 
-    /// This shard's workers in `namespace` after `cursor` that run `action`
+    /// This shard's workers in `ns` after `cursor` that run `action`
     /// (any, if empty), in id order, as many as `limit` and the answer allow.
     /// The cursor is the last id given when more are left.
-    fn page(self: *WorkerHandler, namespace: []const u8, limit: u32, cursor: []const u8, action: []const u8) Error!ListResponse.Value {
+    fn page(self: *WorkerHandler, ns: NamespaceId, limit: u32, cursor: []const u8, action: []const u8) Error!ListResponse.Value {
         var after: std.ArrayList(*const WorkerRecord) = .empty;
         defer after.deinit(self.allocator);
         var it = self.workers.valueIterator();
         while (it.next()) |w| {
-            if (!std.mem.eql(u8, w.namespace_owned, homeOf(namespace))) continue;
+            if (w.namespace != ns) continue;
             if (std.mem.order(u8, w.id_owned, cursor) != .gt) continue;
             if (action.len > 0 and !runsAction(w, action)) continue;
             try after.append(self.allocator, w);
@@ -737,20 +734,25 @@ fn expectRefusedAs(h: *WorkerHandler, req: Request, reason: proto.Reason, why: [
     try std.testing.expectEqualStrings(why, refused.why);
 }
 
-fn testRequest(namespace: []const u8, id: []const u8) Request {
+/// Namespaces' ids in tests, as dispatch resolves a request's.
+const A: NamespaceId = .of(16);
+const B: NamespaceId = .of(17);
+const NS: NamespaceId = .of(18);
+const OTHER: NamespaceId = .of(19);
+
+fn testRequest(ns: NamespaceId, id: []const u8) Request {
     const header = proto.RequestHeader.init(.worker_register, 0);
-    return .{ .header = header, .namespace = namespace, .key = id, .value = "", .options = "" };
+    return .{ .header = header, .namespace = "", .ns_id = ns, .key = id, .value = "", .options = "" };
 }
 
 test "workers: one id in two namespaces is two workers, and an id holding a NUL names none" {
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
-    try std.testing.expect(h.handleRegister(testRequest("b", "w")) == null);
-    try std.testing.expect(h.find("b", "w") != null);
-    try std.testing.expect(h.find("a", "w") == null);
-    // In "default" keys are bare, so "b\x00w" would be b's worker w.
-    try std.testing.expect(h.find("", "b\x00w") == null);
-    try std.testing.expect(h.handleRegister(testRequest("", "b\x00w")) != null);
+    try std.testing.expect(h.handleRegister(testRequest(B, "w")) == null);
+    try std.testing.expect(h.find(B, "w") != null);
+    try std.testing.expect(h.find(A, "w") == null);
+    try std.testing.expect(h.find(.default, "b\x00w") == null);
+    try std.testing.expect(h.handleRegister(testRequest(.default, "b\x00w")) != null);
     try std.testing.expectEqual(@as(usize, 1), h.workers.count());
 }
 
@@ -758,12 +760,12 @@ test "workers: an unknown worker type or process kind is refused, and nothing is
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
 
-    var bad_type = testRequest("", "w1");
+    var bad_type = testRequest(.default, "w1");
     bad_type.value = &.{2};
     try std.testing.expectEqualStrings("unknown worker type", h.handleRegister(bad_type).?.why);
 
     // [type][max_concurrency:u32][count:u16]([len:u16][name][kind])* — the second kind is unknown.
-    var bad_kind = testRequest("", "w2");
+    var bad_kind = testRequest(.default, "w2");
     bad_kind.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 'b', 0xee };
     try std.testing.expectEqualStrings("unknown process kind", h.handleRegister(bad_kind).?.why);
     // Not a limit: no reason of its own yet.
@@ -779,13 +781,13 @@ test "workers: a machine id longer than worker.list's bound is refused" {
     @memcpy(value[0..9], &[_]u8{ 0, 4, 0, 0, 0, 0, 0, 0, 1 });
     std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID + 1, .little);
     @memset(value[11..], 'm');
-    var req = testRequest("", "w");
+    var req = testRequest(.default, "w");
     req.value = &value;
     try expectRefusedAs(&h, req, .field_too_long, std.fmt.comptimePrint("machine id longer than {d} bytes", .{worker_ops.MAX_MACHINE_ID}));
     req.value = value[0 .. value.len - 1];
     std.mem.writeInt(u16, value[9..11], worker_ops.MAX_MACHINE_ID, .little);
     try std.testing.expect(h.handleRegister(req) == null);
-    try std.testing.expectEqual(@as(usize, worker_ops.MAX_MACHINE_ID), h.find("", "w").?.machine_id_owned.?.len);
+    try std.testing.expectEqual(@as(usize, worker_ops.MAX_MACHINE_ID), h.find(.default, "w").?.machine_id_owned.?.len);
 }
 
 /// A registration of `count` action processes named `name_len` x's, then
@@ -807,11 +809,11 @@ test "worker.info: the row, metadata and processes, as registered; an unknown wo
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
     // Two processes, metadata "{}" and machine id "m1".
-    var req = testRequest("b", "w");
+    var req = testRequest(B, "w");
     req.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 's', 1, 1, 2, 0, '{', '}', 1, 2, 0, 'm', '1' };
     try std.testing.expect(h.handleRegister(req) == null);
 
-    const got = try h.info("b", "w");
+    const got = try h.info(B, "w");
     try std.testing.expectEqualStrings("w", got.worker.id);
     try std.testing.expectEqual(@as(u32, 4), got.worker.max_concurrency);
     try std.testing.expectEqualStrings("m1", got.worker.machine_id.?);
@@ -833,8 +835,8 @@ test "worker.info: the row, metadata and processes, as registered; an unknown wo
     try std.testing.expectEqualStrings("m1", back.worker.machine_id.?);
     try std.testing.expectEqual(@as(u32, 2), back.processes.count);
 
-    try std.testing.expectError(error.NotFound, h.info("a", "w"));
-    try std.testing.expectError(error.InvalidId, h.info("", "b\x00w"));
+    try std.testing.expectError(error.NotFound, h.info(A, "w"));
+    try std.testing.expectError(error.InvalidId, h.info(.default, "b\x00w"));
 }
 
 test "workers: a registration whose processes worker.info couldn't list is refused" {
@@ -842,7 +844,7 @@ test "workers: a registration whose processes worker.info couldn't list is refus
     defer h.deinit();
     const buf = try std.testing.allocator.alloc(u8, 256 * 1024);
     defer std.testing.allocator.free(buf);
-    var req = testRequest("", "w");
+    var req = testRequest(.default, "w");
 
     req.value = processesValue(buf, worker_ops.MAX_PROCESSES + 1, 1, &.{});
     try expectRefusedAs(&h, req, .out_of_range, std.fmt.comptimePrint("more than {d} processes", .{worker_ops.MAX_PROCESSES}));
@@ -858,7 +860,7 @@ test "workers: a registration whose processes worker.info couldn't list is refus
     // At the bounds, it registers and lists.
     req.value = processesValue(buf, worker_ops.MAX_PROCESSES, 100, &.{});
     try std.testing.expect(h.handleRegister(req) == null);
-    try std.testing.expectEqual(worker_ops.MAX_PROCESSES, (try h.info("", "w")).processes.count);
+    try std.testing.expectEqual(worker_ops.MAX_PROCESSES, (try h.info(.default, "w")).processes.count);
 }
 
 test "workers: processes landing exactly on worker.info's bound register and list whole; a byte more is refused" {
@@ -894,14 +896,14 @@ test "workers: processes landing exactly on worker.info's bound register and lis
         var h = WorkerHandler.init(a);
         defer h.deinit();
         const id: [4000]u8 = @splat('w');
-        var req = testRequest("", &id);
+        var req = testRequest(.default, &id);
         req.value = w.written();
         if (over == 1) {
             try expectRefusedAs(&h, req, .field_too_long, "processes too long to list together");
             continue;
         }
         try std.testing.expect(h.handleRegister(req) == null);
-        const got = try h.info("", &id);
+        const got = try h.info(.default, &id);
         try std.testing.expectEqual(@as(u32, full + 1), got.processes.count);
         const size = try InfoResponse.encodedSize(got);
         try std.testing.expect(size <= InfoResponse.max_size);
@@ -914,16 +916,16 @@ test "workers: processes landing exactly on worker.info's bound register and lis
 test "worker.info: a process's runs, failures and last run are what the worker's tasks reported" {
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
-    var req = testRequest("", "w");
+    var req = testRequest(.default, "w");
     req.value = &.{ 0, 4, 0, 0, 0, 2, 0, 1, 0, 'a', 0, 1, 0, 'b', 0 };
     try std.testing.expect(h.handleRegister(req) == null);
     const before = @import("stdx").time.milliTimestamp();
-    h.recordCompletion("", "w", "a");
-    h.recordCompletion("", "w", "a");
-    h.recordFailure("", "w", "a");
-    h.recordFailure("", "w", "b");
+    h.recordCompletion(.default, "w", "a");
+    h.recordCompletion(.default, "w", "a");
+    h.recordFailure(.default, "w", "a");
+    h.recordFailure(.default, "w", "b");
 
-    const got = try h.info("", "w");
+    const got = try h.info(.default, "w");
     try std.testing.expectEqual(@as(u64, 2), got.worker.tasks_completed);
     try std.testing.expectEqual(@as(u64, 2), got.worker.tasks_failed);
     var it = got.processes.iterator();
@@ -949,22 +951,22 @@ const ListShards = struct {
         for (&self.registries) |*h| h.deinit();
     }
 
-    fn add(self: *ListShards, shard: usize, namespace: []const u8, id: []const u8) !void {
-        if (self.registries[shard].handleRegister(testRequest(namespace, id))) |refused| {
+    fn add(self: *ListShards, shard: usize, ns: NamespaceId, id: []const u8) !void {
+        if (self.registries[shard].handleRegister(testRequest(ns, id))) |refused| {
             std.debug.print("{s}\n", .{refused.why});
             return error.Refused;
         }
     }
 
     /// Register `id` running one process, `name`, of `kind`.
-    fn addRunning(self: *ListShards, shard: usize, namespace: []const u8, id: []const u8, kind: ProcessKind, name: []const u8) !void {
+    fn addRunning(self: *ListShards, shard: usize, ns: NamespaceId, id: []const u8, kind: ProcessKind, name: []const u8) !void {
         var buf: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try w.writeAll(&.{ 0, 4, 0, 0, 0, 1, 0 });
         try w.writeInt(u16, @intCast(name.len), .little);
         try w.writeAll(name);
         try w.writeAll(&.{ @backingInt(kind), 0, 0 }); // no metadata, no machine id
-        var req = testRequest(namespace, id);
+        var req = testRequest(ns, id);
         req.value = w.buffered();
         if (self.registries[shard].handleRegister(req)) |why| {
             std.debug.print("{s}\n", .{why.why});
@@ -974,7 +976,7 @@ const ListShards = struct {
 
     /// Every page from the start, merged as a gather merges them; the ids
     /// in order, and the number of pages.
-    fn listAll(self: *ListShards, namespace: []const u8, limit: u32, action: []const u8, ids: *std.ArrayList([]u8)) !usize {
+    fn listAll(self: *ListShards, ns: NamespaceId, limit: u32, action: []const u8, ids: *std.ArrayList([]u8)) !usize {
         const a = std.testing.allocator;
         var buf: [Workers.byte_bound.?]u8 = undefined;
         var cursor: std.ArrayList(u8) = .empty;
@@ -984,7 +986,7 @@ const ListShards = struct {
             // Every page moves the cursor on; one that doesn't would loop.
             if (pages > 10_000) return error.CursorStuck;
             var bodies: [3][]u8 = undefined;
-            for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(namespace, limit, cursor.items, action));
+            for (&self.registries, &bodies) |*h, *b| b.* = try encodeBody(a, try h.page(ns, limit, cursor.items, action));
             defer for (bodies) |b| a.free(b);
             const merged = try mergePages(a, &buf, limit, &bodies);
             try std.testing.expect(merged.workers.count <= limit);
@@ -1009,13 +1011,13 @@ test "worker.list: pages over shards whose ids interleave give every worker once
     defer s.deinit();
     // Ids spread so each page boundary falls between two shards' ids.
     var name: [8]u8 = undefined;
-    for (0..20) |i| try s.add(i * 7 % 3, "ns", try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
-    try s.add(0, "other", "w99");
+    for (0..20) |i| try s.add(i * 7 % 3, NS, try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
+    try s.add(0, OTHER, "w99");
 
     for ([_]u32{ 1, 2, 3, 7, 20, worker_ops.MAX_LIST }) |limit| {
         var ids: std.ArrayList([]u8) = .empty;
         defer freeIds(&ids);
-        const pages = try s.listAll("ns", limit, "", &ids);
+        const pages = try s.listAll(NS, limit, "", &ids);
         try std.testing.expectEqual(@as(usize, 20), ids.items.len);
         for (ids.items, 0..) |id, i| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}), id);
         try std.testing.expectEqual((20 + limit - 1) / limit, pages);
@@ -1027,11 +1029,11 @@ test "worker.list: workers all on one shard are paged to the last, though the ot
     s.init();
     defer s.deinit();
     var name: [8]u8 = undefined;
-    for (0..20) |i| try s.add(1, "ns", try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
+    for (0..20) |i| try s.add(1, NS, try std.fmt.bufPrint(&name, "w{d:0>2}", .{i}));
     for ([_]u32{ 1, 5, 20 }) |limit| {
         var ids: std.ArrayList([]u8) = .empty;
         defer freeIds(&ids);
-        _ = try s.listAll("ns", limit, "", &ids);
+        _ = try s.listAll(NS, limit, "", &ids);
         try std.testing.expectEqual(@as(usize, 20), ids.items.len);
     }
 }
@@ -1047,17 +1049,17 @@ test "worker.list: an action filter pages only that action's workers, each page 
         const id = try std.fmt.bufPrint(&name, "w{d:0>2}", .{i});
         const shard = i * 7 % 3;
         switch (i % 3) {
-            0 => try s.addRunning(shard, "ns", id, .action, "a"),
-            1 => try s.addRunning(shard, "ns", id, .action, "b"),
-            else => try s.addRunning(shard, "ns", id, .stream_consumer, "a"),
+            0 => try s.addRunning(shard, NS, id, .action, "a"),
+            1 => try s.addRunning(shard, NS, id, .action, "b"),
+            else => try s.addRunning(shard, NS, id, .stream_consumer, "a"),
         }
     }
-    try s.addRunning(0, "other", "w99", .action, "a");
+    try s.addRunning(0, OTHER, "w99", .action, "a");
 
     for ([_]u32{ 1, 3, 4, 10 }) |limit| {
         var ids: std.ArrayList([]u8) = .empty;
         defer freeIds(&ids);
-        const pages = try s.listAll("ns", limit, "a", &ids);
+        const pages = try s.listAll(NS, limit, "a", &ids);
         try std.testing.expectEqual(@as(usize, 10), ids.items.len);
         for (ids.items, 0..) |id, i| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "w{d:0>2}", .{i * 3}), id);
         try std.testing.expectEqual((10 + limit - 1) / limit, pages);
@@ -1065,7 +1067,7 @@ test "worker.list: an action filter pages only that action's workers, each page 
 
     var ids: std.ArrayList([]u8) = .empty;
     defer freeIds(&ids);
-    _ = try s.listAll("ns", 10, "none", &ids);
+    _ = try s.listAll(NS, 10, "none", &ids);
     try std.testing.expectEqual(@as(usize, 0), ids.items.len);
 }
 
@@ -1079,11 +1081,11 @@ test "worker.list: a page cut short by the answer's room still loses no worker" 
     @memset(&name, 'x');
     for (0..150) |i| {
         _ = std.fmt.bufPrint(name[name.len - 4 ..], "{d:0>4}", .{i}) catch unreachable;
-        try s.add(i * 5 % 3, "ns", &name);
+        try s.add(i * 5 % 3, NS, &name);
     }
     var ids: std.ArrayList([]u8) = .empty;
     defer freeIds(&ids);
-    const pages = try s.listAll("ns", worker_ops.MAX_LIST, "", &ids);
+    const pages = try s.listAll(NS, worker_ops.MAX_LIST, "", &ids);
     try std.testing.expect(pages > 1);
     try std.testing.expectEqual(@as(usize, 150), ids.items.len);
     for (ids.items, 0..) |id, i| {
@@ -1119,10 +1121,10 @@ test "worker.list: a namespace with no workers is one empty page" {
     var s: ListShards = undefined;
     s.init();
     defer s.deinit();
-    try s.add(1, "other", "w1");
+    try s.add(1, OTHER, "w1");
     var ids: std.ArrayList([]u8) = .empty;
     defer freeIds(&ids);
-    try std.testing.expectEqual(@as(usize, 1), try s.listAll("ns", 10, "", &ids));
+    try std.testing.expectEqual(@as(usize, 1), try s.listAll(NS, 10, "", &ids));
     try std.testing.expectEqual(@as(usize, 0), ids.items.len);
 }
 
@@ -1131,8 +1133,7 @@ test "worker.list: a page that doesn't decode is refused before anything is answ
     try std.testing.expectError(error.Corrupt, mergePages(std.testing.allocator, &buf, 10, &.{"\x01"}));
 }
 
-// A worker id is a qualified registry key at most; the id alone is shorter
-// by its namespace and separator.
+// A worker id is as long as a key may be, short of room for its namespace.
 const ops_max_key = @import("../protocol/ops.zig").MAX_KEY - 8;
 
 test "workers: a silent worker is marked unhealthy and refused work, then removed; a heartbeat brings it back" {
@@ -1140,54 +1141,54 @@ test "workers: a silent worker is marked unhealthy and refused work, then remove
     defer h.deinit();
     h.heartbeat_timeout_ms = 100;
     h.remove_after_ms = 1000;
-    for ([_][]const u8{ "a", "b", "c" }) |id| try std.testing.expect(h.handleRegister(testRequest("", id)) == null);
+    for ([_][]const u8{ "a", "b", "c" }) |id| try std.testing.expect(h.handleRegister(testRequest(.default, id)) == null);
     const t0: u64 = 1_000_000;
-    for ([_][]const u8{ "a", "b", "c" }) |id| h.find("", id).?.last_seen_ms = t0;
-    h.find("", "a").?.current_load = 4;
-    h.find("", "c").?.status = .draining;
+    for ([_][]const u8{ "a", "b", "c" }) |id| h.find(.default, id).?.last_seen_ms = t0;
+    h.find(.default, "a").?.current_load = 4;
+    h.find(.default, "c").?.status = .draining;
 
     try std.testing.expectEqual(@as(usize, 0), h.checkHealth(t0 + 100));
-    try std.testing.expect(h.refusesWork("", "a") == null);
+    try std.testing.expect(h.refusesWork(.default, "a") == null);
 
     // Silent past the timeout: a and b unhealthy; c stays draining.
     try std.testing.expectEqual(@as(usize, 2), h.checkHealth(t0 + 101));
-    try std.testing.expectEqual(WorkerStatus.unhealthy, h.find("", "a").?.status);
-    try std.testing.expectEqual(@as(u32, 0), h.find("", "a").?.current_load);
-    try std.testing.expectEqual(WorkerStatus.draining, h.find("", "c").?.status);
-    try std.testing.expectEqual(proto.Reason.worker_unhealthy, h.refusesWork("", "a").?.reason);
-    try std.testing.expectEqual(proto.Reason.worker_draining, h.refusesWork("", "c").?.reason);
+    try std.testing.expectEqual(WorkerStatus.unhealthy, h.find(.default, "a").?.status);
+    try std.testing.expectEqual(@as(u32, 0), h.find(.default, "a").?.current_load);
+    try std.testing.expectEqual(WorkerStatus.draining, h.find(.default, "c").?.status);
+    try std.testing.expectEqual(proto.Reason.worker_unhealthy, h.refusesWork(.default, "a").?.reason);
+    try std.testing.expectEqual(proto.Reason.worker_draining, h.refusesWork(.default, "c").?.reason);
     // An unregistered worker takes work.
-    try std.testing.expect(h.refusesWork("", "nobody") == null);
+    try std.testing.expect(h.refusesWork(.default, "nobody") == null);
 
     // A heartbeat makes a healthy again, from then on.
-    try std.testing.expectEqual(WorkerStatus.active, h.handleHeartbeat(testRequest("", "a")).?);
-    h.find("", "a").?.last_seen_ms = t0 + 950;
-    try std.testing.expect(h.refusesWork("", "a") == null);
+    try std.testing.expectEqual(WorkerStatus.active, h.handleHeartbeat(testRequest(.default, "a")).?);
+    h.find(.default, "a").?.last_seen_ms = t0 + 950;
+    try std.testing.expect(h.refusesWork(.default, "a") == null);
 
     // Silent past the grace, b and c are removed, draining or not; a isn't.
     try std.testing.expectEqual(@as(usize, 2), h.checkHealth(t0 + 1001));
     try std.testing.expectEqual(@as(usize, 1), h.workers.count());
-    try std.testing.expect(h.find("", "a") != null);
+    try std.testing.expect(h.find(.default, "a") != null);
 }
 
 test "workers: current_load is what the worker last reported" {
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
-    try std.testing.expect(h.handleRegister(testRequest("", "w")) == null);
-    var beat = testRequest("", "w");
+    try std.testing.expect(h.handleRegister(testRequest(.default, "w")) == null);
+    var beat = testRequest(.default, "w");
     beat.value = &.{ 3, 0, 0, 0 };
     _ = h.handleHeartbeat(beat);
-    h.recordCompletion("", "w", null);
-    h.recordFailure("", "w", null);
-    try std.testing.expectEqual(@as(u32, 3), h.find("", "w").?.current_load);
-    try std.testing.expectEqual(@as(u64, 1), h.find("", "w").?.tasks_completed);
+    h.recordCompletion(.default, "w", null);
+    h.recordFailure(.default, "w", null);
+    try std.testing.expectEqual(@as(u32, 3), h.find(.default, "w").?.current_load);
+    try std.testing.expectEqual(@as(u64, 1), h.find(.default, "w").?.tasks_completed);
 }
 
 test "workers: expiry reads the monotonic clock, so a wall-clock step expires no one" {
     var h = WorkerHandler.init(std.testing.allocator);
     defer h.deinit();
-    try std.testing.expect(h.handleRegister(testRequest("", "w")) == null);
-    const w = h.find("", "w").?;
+    try std.testing.expect(h.handleRegister(testRequest(.default, "w")) == null);
+    const w = h.find(.default, "w").?;
     // The wall clock stepped: the last heartbeat now reads a day ago.
     w.last_heartbeat_ms -= std.time.ms_per_day;
     try std.testing.expectEqual(@as(usize, 0), h.checkHealth(w.last_seen_ms + 1000));
@@ -1210,26 +1211,26 @@ test "workers: a registration cut inside a field, with a bad flag, or with bytes
         .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 0, 1, 5, 0, 'h' }, .why = "registration cut short in its machine id" },
         .{ .value = &.{ 0, 4, 0, 0, 0, 0, 0, 0, 0, 0xff }, .why = "registration has bytes past its end" },
     }) |c| {
-        var req = testRequest("", "w");
+        var req = testRequest(.default, "w");
         req.value = c.value;
         try std.testing.expectEqualStrings(c.why, h.handleRegister(req).?.why);
     }
     try std.testing.expectEqual(@as(usize, 0), h.workers.count());
 
     // Whole, it is kept in full; one that stops after a whole field takes defaults.
-    var full = testRequest("", "w");
+    var full = testRequest(.default, "w");
     full.value = &.{ 1, 4, 0, 0, 0, 1, 0, 1, 0, 'a', 1, 1, 2, 0, '{', '}', 1, 1, 0, 'h' };
     try std.testing.expect(h.handleRegister(full) == null);
-    const w = h.find("", "w").?;
+    const w = h.find(.default, "w").?;
     try std.testing.expectEqual(WorkerType.stream, w.worker_type);
     try std.testing.expectEqual(@as(u32, 4), w.max_concurrency);
     try std.testing.expectEqualStrings("a", w.processes.items[0].name_owned);
     try std.testing.expectEqualStrings("{}", w.metadata_owned.?);
     try std.testing.expectEqualStrings("h", w.machine_id_owned.?);
-    var short = testRequest("", "v");
+    var short = testRequest(.default, "v");
     short.value = &.{ 0, 7, 0, 0, 0 };
     try std.testing.expect(h.handleRegister(short) == null);
-    try std.testing.expectEqual(@as(u32, 7), h.find("", "v").?.max_concurrency);
+    try std.testing.expectEqual(@as(u32, 7), h.find(.default, "v").?.max_concurrency);
 }
 
 test "workers: a re-registration short of memory at any point keeps the old one whole" {
@@ -1237,20 +1238,20 @@ test "workers: a re-registration short of memory at any point keeps the old one 
         fn f(allocator: Allocator) !void {
             var h = WorkerHandler.init(allocator);
             defer h.deinit();
-            var first = testRequest("", "w");
+            var first = testRequest(.default, "w");
             first.value = &.{ 0, 1, 0, 0, 0, 1, 0, 1, 0, 'a', 0, 0, 0 };
             if (h.handleRegister(first)) |_| return error.OutOfMemory;
-            var again = testRequest("", "w");
+            var again = testRequest(.default, "w");
             again.value = &.{ 0, 9, 0, 0, 0, 1, 0, 1, 0, 'b', 0, 1, 2, 0, '{', '}', 1, 1, 0, 'h' };
             if (h.handleRegister(again)) |refused| {
                 try std.testing.expectEqualStrings("worker not registered: out of memory", refused.why);
                 // The old registration is still there, untouched.
-                const w = h.find("", "w").?;
+                const w = h.find(.default, "w").?;
                 try std.testing.expectEqual(@as(u32, 1), w.max_concurrency);
                 try std.testing.expectEqualStrings("a", w.processes.items[0].name_owned);
                 return error.OutOfMemory;
             }
-            const w = h.find("", "w").?;
+            const w = h.find(.default, "w").?;
             try std.testing.expectEqual(@as(u32, 9), w.max_concurrency);
             try std.testing.expectEqual(@as(usize, 1), w.processes.items.len);
             try std.testing.expectEqualStrings("b", w.processes.items[0].name_owned);

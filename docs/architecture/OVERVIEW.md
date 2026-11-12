@@ -32,8 +32,8 @@ Dedicated thread running a TCP accept loop. On each new connection:
 
 1. Accept the socket
 2. Peek at the first bytes to detect the protocol (binary, HTTP, WebSocket)
-3. Parse the routing key from the first request
-4. Hash the routing key → partition → shard
+3. Read the first request's key (its `{tag}`, or the whole key)
+4. Hash it with the namespace → partition → shard
 5. Hand off the file descriptor to the target shard via a pipe
 
 Connections have **shard affinity** — once assigned, a connection stays on its shard to avoid cross-core cache thrashing.
