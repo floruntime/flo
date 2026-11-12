@@ -19,6 +19,16 @@
 //! (no request for IDLE_TIMEOUT_MS) → dropped by the shard's reaper
 //! ```
 //!
+//! A txn is named by its `txn_id`, not by the connection that began it: every
+//! op carries `--txn T` and the server finds the txn by id, so it outlives its
+//! connection on purpose. The CLI depends on this — `kv txn begin`,
+//! `kv put --txn T` and `kv commit T` each open a fresh connection — and the
+//! SDKs keep a txn by id over a shared, possibly reconnecting client. So a txn
+//! is never dropped when a connection closes; the `IDLE_TIMEOUT_MS` reaper
+//! (`kvTxnReapTask`, `node/shard.zig:5637`) is the only thing that reclaims one
+//! no client is still driving, and `MAX_OPEN_TXNS` bounds how many can be open
+//! at once.
+//!
 //! ## Caps
 //!
 //! - `TxnTable.max_ops` (`[kv] max_txn_ops`, 64 unless set, at most
