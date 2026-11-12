@@ -81,6 +81,7 @@
 //! ```
 
 const std = @import("std");
+const limits = @import("../protocol/limits.zig");
 const Allocator = std.mem.Allocator;
 
 // =============================================================================
@@ -371,18 +372,18 @@ pub const JobDefinition = struct {
         for (self.operators.items) |*op| {
             if (op.getConfig("namespace")) |ns| if (ns.len > 0) if (nameRefusal(ns)) |why| return why;
         }
-        // Stream and queue names are keyed under their namespace with NUL
-        // separators: one holding a NUL, or too long to qualify, could be
-        // read or listed as another namespace's.
-        for (self.sources.items) |src| if (resourceRefusal(src.namespace, src.stream)) |why| return why;
-        for (self.sinks.items) |snk| if (resourceRefusal(snk.namespace, snk.target)) |why| return why;
+        // Refused here as the stream and queue handlers would refuse them,
+        // so a job never runs against a name its writes can't use. A group
+        // key separates stream from group with a NUL.
+        for (self.sources.items) |src| if (resourceRefusal(src.stream)) |why| return why;
+        for (self.sinks.items) |snk| if (resourceRefusal(snk.target)) |why| return why;
         return null;
     }
 
-    fn resourceRefusal(namespace: []const u8, name: []const u8) ?[]const u8 {
+    fn resourceRefusal(name: []const u8) ?[]const u8 {
         if (name.len == 0) return null; // kv and ts endpoints name no stream or queue
         if (std.mem.indexOfScalar(u8, name, 0) != null) return "stream or queue name must not contain NUL";
-        if (@import("../namespace/handler.zig").validateKeySize(namespace, name) != null) return "stream or queue name too long for its namespace";
+        if (name.len > limits.MAX_QUALIFIED_KEY) return "stream or queue name too long";
         return null;
     }
 

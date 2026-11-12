@@ -629,7 +629,7 @@ fn parseSchedule(allocator: Allocator, root: JsonValue, d: D) ParseError!?Schedu
 }
 
 /// Longest stream name a trigger may name: a stream's own name limit.
-pub const MAX_TRIGGER_STREAM = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+pub const MAX_TRIGGER_STREAM = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 
 /// Optional stream trigger block:
 /// ```yaml

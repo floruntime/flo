@@ -1998,7 +1998,7 @@ pub const ProcessingHandler = struct {
         ts_h.ts.insert(shard.namespaceId(snk.namespace), snk.measurement, "value", value, now_ns, ual_idx, sink_tags) catch |err| self.noteSinkDrop(shard.metrics_registry, "ts", snk.measurement, @errorName(err));
     }
 
-    const MAX_SINK_KEY = @import("../namespace/handler.zig").MAX_KEY_LENGTH;
+    const MAX_SINK_KEY = @import("../protocol/limits.zig").MAX_QUALIFIED_KEY;
 
     /// A KV sink's key for a record: `prefix + separator + record_key` (a
     /// record with no key writes `prefix + separator`), or the record's key
