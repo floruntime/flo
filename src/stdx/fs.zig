@@ -224,15 +224,15 @@ pub fn readToEndAlloc(file: File, allocator: std.mem.Allocator, max_bytes: usize
     return buf[0..read_total];
 }
 
-/// Read up to `buffer.len` bytes from an opened file at the current position.
-/// Advances the file's position (sequential read). Returns total bytes read,
-/// which may be less than `buffer.len` on EOF.
 /// Read up to `buffer.len` bytes at `offset`, leaving the file position
 /// alone; fewer only at the end of the file.
 pub fn readAt(file: File, buffer: []u8, offset: u64) !usize {
     return file.readPositionalAll(io(), buffer, offset);
 }
 
+/// Read up to `buffer.len` bytes from an opened file at the current position.
+/// Advances the file's position (sequential read). Returns total bytes read,
+/// which may be less than `buffer.len` on EOF.
 pub fn readAll(file: File, buffer: []u8) !usize {
     var read_total: usize = 0;
     while (read_total < buffer.len) {

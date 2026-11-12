@@ -195,7 +195,8 @@ pub const SegmentReader = struct {
 /// of at most `WHOLE_MAX` bytes is read whole when opened, its whole-file
 /// CRC checked, as one read costs less than several small ones.
 pub const PositionedSegment = struct {
-    file: std.Io.File,
+    /// The open file, for a large segment; a small one is closed once read.
+    file: ?std.Io.File = null,
     /// The whole file, for a small segment.
     whole: ?[]u8 = null,
     first_index: u64,
@@ -220,8 +221,9 @@ pub const PositionedSegment = struct {
             const reader = try SegmentReader.init(whole);
             if (reader.header.compression != @backingInt(segment.Compression.none)) return error.Compressed;
             const sparse = try allocator.dupe(segment.SparseIndexEntry, reader.sparse_index);
+            // Everything is in memory: no fd is held for it.
+            stdx.fs.closeFile(file);
             return .{
-                .file = file,
                 .whole = whole,
                 .first_index = reader.header.first_index,
                 .last_index = reader.header.last_index,
@@ -247,6 +249,8 @@ pub const PositionedSegment = struct {
         const idx_offset: u64 = ftr.sparse_index_offset;
         const idx_count: usize = ftr.sparse_index_count;
         if (idx_offset < segment.HEADER_SIZE or idx_offset + idx_count * segment.SPARSE_ENTRY_SIZE != footer_start) return error.InvalidIndex;
+        // The header's data size and the footer's index offset must agree.
+        if (segment.HEADER_SIZE + @as(u64, hdr.data_size) != idx_offset) return error.InvalidIndex;
         const sparse = try allocator.alloc(segment.SparseIndexEntry, idx_count);
         errdefer allocator.free(sparse);
         const sparse_bytes = std.mem.sliceAsBytes(sparse);
@@ -264,7 +268,7 @@ pub const PositionedSegment = struct {
     }
 
     pub fn close(self: *PositionedSegment, allocator: std.mem.Allocator) void {
-        @import("stdx").fs.closeFile(self.file);
+        if (self.file) |f| @import("stdx").fs.closeFile(f);
         if (self.whole) |w| allocator.free(w);
         allocator.free(self.sparse);
     }
@@ -278,7 +282,7 @@ pub const PositionedSegment = struct {
             @memcpy(dst, w[from..][0..dst.len]);
             return;
         }
-        if (try @import("stdx").fs.readAt(self.file, dst, at) != dst.len) return error.ShortRead;
+        if (try @import("stdx").fs.readAt(self.file.?, dst, at) != dst.len) return error.ShortRead;
     }
 
     /// File offset of the last indexed entry at or below `index`.
@@ -314,7 +318,9 @@ pub const PositionedSegment = struct {
         var arena_used: usize = 0;
         while (count < buf.len and cursor < self.data_end) {
             const want: usize = @intCast(@min(scratch.len, self.data_end - cursor));
-            if (want < ENTRY_HEADER_SIZE) return error.ShortRead;
+            // Stray bytes too short for an entry: damage, but what was read
+            // before them checked out, so it's returned.
+            if (want < ENTRY_HEADER_SIZE) return if (count > 0) .{ .count = count } else error.ShortRead;
             try self.bytesAt(scratch[0..want], cursor);
             var off: usize = 0;
             while (off + ENTRY_HEADER_SIZE <= want) {

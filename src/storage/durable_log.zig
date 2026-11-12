@@ -1013,6 +1013,106 @@ test "durable log: a positioned read refuses an entry whose bytes don't match it
     }
 }
 
+/// Writes one segment of `payloads` from index `first` into `dir`, and
+/// returns its path; the caller frees it.
+fn writeTestSegment(dir: []const u8, first: u64, payloads: []const []const u8) ![]const u8 {
+    var writer = SegmentWriter.init(testing.allocator, 0);
+    defer writer.deinit();
+    for (payloads, first..) |p, i| try writer.addEntry(&testEntry(i, 1, p));
+    try writer.writeToFile(dir);
+    var name_buf: [32]u8 = undefined;
+    return std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir, segment.segmentFilename(&name_buf, first).? });
+}
+
+/// Applies `edit` to the file at `path` in place.
+fn editFile(path: []const u8, edit: *const fn ([]u8) void) !void {
+    const bytes = try stdx.fs.readFileAlloc(testing.allocator, path, 4 << 20);
+    defer testing.allocator.free(bytes);
+    edit(bytes);
+    const f = try stdx.fs.createFile(path, .{});
+    defer stdx.fs.closeFile(f);
+    try stdx.fs.writeAll(f, bytes);
+}
+
+test "durable log: a positioned read checks an entry bigger than its scratch, and refuses a bad length or index" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    // 100 KiB payloads: the file is read by position, and each entry is
+    // bigger than the 4 KiB scratch, so it's read straight into the arena.
+    const big = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(big);
+    var scratch: [4096]u8 = undefined;
+    var buf: [3]Entry = undefined;
+    const arena = try testing.allocator.alloc(u8, 400 * 1024);
+    defer testing.allocator.free(arena);
+
+    const Edits = struct {
+        /// A byte of the second entry's payload: its marker.
+        fn payload(bytes: []u8) void {
+            bytes[std.mem.indexOf(u8, bytes, "SECOND").?] ^= 0xff;
+        }
+        /// The second entry's length, past the file's end.
+        fn length(bytes: []u8) void {
+            const at = std.mem.indexOf(u8, bytes, "SECOND").? - entry_mod.HEADER_SIZE + @offsetOf(entry_mod.Header, "payload_len");
+            std.mem.writeInt(u32, bytes[at..][0..4], 0xFFFF_FFF0, .little);
+        }
+        /// The footer's sparse index offset, into the data section.
+        fn index(bytes: []u8) void {
+            const footer = bytes.len - segment.FOOTER_SIZE;
+            std.mem.writeInt(u32, bytes[footer..][0..4], segment.HEADER_SIZE + 10, .little);
+        }
+        /// A sparse index entry's offset, past the data.
+        fn sparse(bytes: []u8) void {
+            const footer = bytes.len - segment.FOOTER_SIZE;
+            const idx = std.mem.readInt(u32, bytes[footer..][0..4], .little);
+            std.mem.writeInt(u32, bytes[idx + 8 ..][0..4], 0xFFFF_FFFF, .little);
+        }
+        /// The header's data size, one short.
+        fn data_size(bytes: []u8) void {
+            const at = @offsetOf(segment.SegmentHeader, "data_size");
+            const v = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            std.mem.writeInt(u32, bytes[at..][0..4], v - 1, .little);
+        }
+    };
+    var first: u64 = 1;
+    for ([_]*const fn ([]u8) void{ Edits.payload, Edits.length, Edits.index, Edits.sparse, Edits.data_size }, 0..) |edit, k| {
+        @memset(big, 'b');
+        var second = try testing.allocator.dupe(u8, big);
+        defer testing.allocator.free(second);
+        @memcpy(second[0..6], "SECOND");
+        const path = try writeTestSegment(td.path, first, &.{ big, second, big });
+        defer testing.allocator.free(path);
+        try editFile(path, edit);
+        defer first += 10;
+        if (k >= 2) {
+            try testing.expectError(error.InvalidIndex, PositionedSegment.open(testing.allocator, path));
+            continue;
+        }
+        var seg = try PositionedSegment.open(testing.allocator, path);
+        defer seg.close(testing.allocator);
+        try testing.expect(seg.whole == null and seg.file != null);
+        // The first entry alone is good; a read that reaches the second fails.
+        try testing.expectEqual(@as(usize, 1), (try seg.read(first, buf[0..1], arena, &scratch)).count);
+        try testing.expectEqualSlices(u8, big, buf[0].payload);
+        const want: anyerror = if (k == 0) error.InvalidCrc else error.ShortRead;
+        try testing.expectError(want, seg.read(first, &buf, arena, &scratch));
+    }
+}
+
+test "durable log: a small segment is read whole and holds no file open" {
+    var td = try TestDir.init();
+    defer td.deinit();
+    const path = try writeTestSegment(td.path, 1, &.{ "one", "two" });
+    defer testing.allocator.free(path);
+    var seg = try PositionedSegment.open(testing.allocator, path);
+    defer seg.close(testing.allocator);
+    try testing.expect(seg.whole != null and seg.file == null);
+    var buf: [2]Entry = undefined;
+    var arena: [16]u8 = undefined;
+    var scratch: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), (try seg.read(1, &buf, &arena, &scratch)).count);
+}
+
 test "durable log: truncateAfter rewrites the sealed tail under its own name and deletes emptied files" {
     var td = try TestDir.init();
     defer td.deinit();
