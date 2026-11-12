@@ -30,6 +30,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = @import("stdx").log;
+const raft_node_mod = @import("../raft/node.zig");
 const proto = @import("../protocol/proto.zig");
 const dispatcher_mod = @import("../node/dispatcher.zig");
 const system_ops = @import("../protocol/system_ops.zig");
@@ -3438,7 +3439,7 @@ pub const WorkflowHandler = struct {
         self.triggers_dirty = false;
 
         var it = self.stream_triggers.iterator();
-        while (it.next()) |entry| {
+        while (it.next()) |entry| tick: {
             const trigger = entry.value_ptr;
 
             // Enforce poll interval unless a push-wake forced this poll.
@@ -3460,11 +3461,16 @@ pub const WorkflowHandler = struct {
             // reads as empty.
             const stream_ns = if (trigger.stream_namespace_owned) |n| shard.namespaceId(n) else trigger.ns;
             const stream_handler = resolveStreamHandler(shard, stream_ns, trigger.stream_name_owned);
+            // As many events as this shard can start runs for now; with room
+            // for none the trigger waits, its cursor where it is.
+            const raft = shard.raft_node;
+            const room: usize = @intCast(raft_node_mod.MAX_OUTSTANDING -| (raft.log.lastIndex() -| raft.last_applied));
+            if (room == 0) continue;
             const result = stream_handler.readPayloadsForStreamIn(
                 trigger.stream_name_owned,
                 stream_ns,
                 cursor,
-                @max(batch_limit, 1) * 10, // read ahead for batching
+                @min(@max(batch_limit, 1) * 10, room * @max(batch_limit, 1)), // read ahead for batching
             );
             defer result.deinit(stream_handler.allocator);
             if (result.payloads.len == 0) {
@@ -3476,11 +3482,14 @@ pub const WorkflowHandler = struct {
                 continue;
             }
 
-            // Start one run per event (or per batch if batch_size > 1)
+            // Start one run per event (or per batch if batch_size > 1). A
+            // start the log refuses (full for now) leaves the cursor where the
+            // read began: the next tick reads these events again, and those
+            // already started are the same runs, by their idempotency keys.
             if (trigger.batch_size <= 1) {
                 // One run per event
                 for (result.payloads, result.ids) |payload, event_id| {
-                    self.startRunFromTrigger(shard, trigger, payload, event_id);
+                    if (!self.startRunFromTrigger(shard, trigger, payload, event_id)) break :tick;
                 }
             } else {
                 // Batch mode: collect batch_size events into a JSON array per run
@@ -3493,7 +3502,7 @@ pub const WorkflowHandler = struct {
                         continue;
                     };
                     defer self.allocator.free(batch_json);
-                    self.startRunFromTrigger(shard, trigger, batch_json, result.ids[end - 1]);
+                    if (!self.startRunFromTrigger(shard, trigger, batch_json, result.ids[end - 1])) break :tick;
                     i = end;
                 }
             }
@@ -3547,14 +3556,15 @@ pub const WorkflowHandler = struct {
     /// idempotency key ("trigger:<stream>@<ts>:<seq>", the last event of a
     /// batch). The applier reads it back to restore the trigger's cursor at
     /// boot, so a restart neither re-runs consumed events nor skips
-    /// unconsumed ones.
+    /// unconsumed ones. False when the start was refused for now: the
+    /// trigger reads the event again next tick.
     fn startRunFromTrigger(
         self: *WorkflowHandler,
         shard: *Shard,
         trigger: *const StreamTriggerState,
         input: []const u8,
         event_id: StreamID,
-    ) void {
+    ) bool {
         // Generate run ID with embedded partition bits
         var run_id_buf: [32]u8 = undefined;
         const partition_id = shard.router.keyToPartitionNs(trigger.ns, trigger.workflow_name_owned);
@@ -3565,14 +3575,24 @@ pub const WorkflowHandler = struct {
         var idem_buf: [parser.MAX_TRIGGER_STREAM + "trigger:@:".len + 2 * 20]u8 = undefined;
         const idem = std.fmt.bufPrint(&idem_buf, "trigger:{s}@{d}:{d}", .{ trigger.stream_name_owned, event_id.timestamp_ms, event_id.sequence }) catch {
             log.err("workflow {s}: trigger on stream of {d} bytes not started: its key doesn't fit", .{ trigger.workflow_name_owned, trigger.stream_name_owned.len });
-            return;
+            return true;
         };
 
         // The first-step queue is shared with a parent run on another
         // shard starting a child here, which holds this handler's lock.
         self.mu.lock();
         defer self.mu.unlock();
-        _ = self.proposeRun(shard, trigger.ns, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started");
+        _ = self.proposeStart(shard, trigger.ns, run_id_str, trigger.workflow_name_owned, "latest", input, idem, "trigger_started") catch |err| {
+            if (!shard.quietHalted(err)) log.err("workflow {s}: run {s} not started: {s}", .{ trigger.workflow_name_owned, run_id_str, @errorName(err) });
+            // One that can pass (the log full for now, this node not leading
+            // or not writing) is read again; one that can't is passed over,
+            // or it would hold the trigger for good.
+            return switch (err) {
+                error.Overloaded, error.NotLeader, error.WritesStopped, error.Halted => false,
+                else => true,
+            };
+        };
+        return true;
     }
 
     /// Advance a stream trigger's cursor to the event a restored run came

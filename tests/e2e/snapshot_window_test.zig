@@ -45,7 +45,8 @@ test "e2e/snapshot: on a three-node group every node suspends apply at the bar; 
     const leader = try leaderNode(&cluster);
 
     // The bar: a set every replica applies, then holds apply for a while.
-    try cluster.execOn(leader, &.{ "kv", "set", WINDOW_KEY, "x" });
+    // The CLI exits 0 on a refusal too, so each write is read back exactly.
+    try cluster.execOn(leader, &.{ "kv", "set", WINDOW_KEY, "bar-value-7f3c" });
 
     // Each node shows the same bar while it holds apply.
     var bar: ?i64 = null;
@@ -63,10 +64,14 @@ test "e2e/snapshot: on a three-node group every node suspends apply at the bar; 
     }
 
     // Sent while the leader holds apply, it commits, waits, and is answered.
-    try cluster.execOn(leader, &.{ "kv", "set", "during", "v" });
+    try cluster.execOn(leader, &.{ "kv", "set", "during", "written-while-suspended-91ab" });
     for (0..3) |i| {
-        const out = try cluster.pollAnyUntilContains(i, &.{ "kv", "get", "during" }, "v", 40, 250);
-        testing.allocator.free(out);
+        const out = try cluster.pollAnyUntilContains(i, &.{ "kv", "get", "during" }, "written-while-suspended-91ab", 40, 250);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("written-while-suspended-91ab", std.mem.trim(u8, out, &std.ascii.whitespace));
+        const bar_out = try cluster.execCaptureAnyOn(i, &.{ "kv", "get", WINDOW_KEY });
+        defer testing.allocator.free(bar_out);
+        try testing.expectEqualStrings("bar-value-7f3c", std.mem.trim(u8, bar_out, &std.ascii.whitespace));
     }
 
     // Same leader, and every window closed with apply caught up.

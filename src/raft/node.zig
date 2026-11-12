@@ -1622,10 +1622,9 @@ pub const RaftNode = struct {
         // A repair is exempt: it is what lets a halted group take writes
         // again. It is not exempt from `writes_stopped` above: that means an
         // entry may not reach disk, and a skip lost from disk would be
-        // applied past on some replicas and not others. So are Raft's own
-        // no-op and configs, without which a leader never becomes ready.
-        const exempt = entry_type == .repair_skip or entry_type == .raft_noop or entry_type == .raft_config;
-        if (!exempt and self.log.lastIndex() - self.last_applied >= MAX_OUTSTANDING) return error.Overloaded;
+        // applied past on some replicas and not others. A new term's no-op
+        // and configs don't come through here.
+        if (entry_type != .repair_skip and self.log.lastIndex() - self.last_applied >= MAX_OUTSTANDING) return error.Overloaded;
 
         var e = entry_mod.buildEntry(
             entry_type,

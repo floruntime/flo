@@ -4857,7 +4857,7 @@ pub const Shard = struct {
             return false;
         }
         const now = nowMs();
-        self.snapshot_window = .{ .s = s, .opened_ms = now, .slices_left = TEST_BAR_SLICES, .hold_until_ms = if (hold_ms > 0) now + hold_ms else 0 };
+        self.snapshot_window = .{ .s = s, .opened_ms = now, .slices_left = TEST_BAR_SLICES, .hold_until_ms = if (hold_ms > 0) now + hold_ms else 0, .as_leader = self.raft_node.role == .leader };
         return true;
     }
 
@@ -4870,6 +4870,22 @@ pub const Shard = struct {
         if (self.halted != null or self.offline != null or self.replica.diverged) {
             log.warn("shard {d}: dropped the snapshot at bar {d}: the shard stopped applying", .{ self.id, w.s });
             self.snapshot_window = null;
+            return;
+        }
+        // An async-durability rewind cut what it had applied below the bar:
+        // the state at the bar is gone, and isn't what the group committed.
+        if (self.raft_node.last_applied < w.s) {
+            log.warn("shard {d}: dropped the snapshot at bar {d}: the log was cut below it", .{ self.id, w.s });
+            self.snapshot_window = null;
+            return;
+        }
+        // Won an election while suspended: a leader not yet ready passes the
+        // bar, as one that reached it so would have, and applies on.
+        if (self.raft_node.role == .leader and !w.as_leader) {
+            self.snapshot_skips_leader_not_ready += 1;
+            log.warn("shard {d}: dropped the snapshot at bar {d}: this node was elected leader while suspended; its next snapshot is at the next bar", .{ self.id, w.s });
+            self.snapshot_window = null;
+            _ = self.applyCommitted();
             return;
         }
         if (w.slices_left > 0) {
@@ -7233,6 +7249,10 @@ pub const SnapshotWindow = struct {
     /// A window opened by a test fault holds until this monotonic time, so
     /// an e2e test can write through it.
     hold_until_ms: u64 = 0,
+    /// The node led when the window opened. A follower that wins an
+    /// election meanwhile drops the window: until it has applied its term's
+    /// start it isn't ready, and would refuse writes for the rest of it.
+    as_leader: bool = false,
 };
 
 /// Stub slices a test bar's window queues before it closes.
@@ -23049,4 +23069,230 @@ test "Shard: a follower reaching a bar suspends apply; one that stops applying d
     try std.testing.expect(t.shard.snapshot_window == null);
     t.shard.replica.diverged = false;
     r.role = .leader;
+}
+
+test "Shard: a processing sink whose shard is capped while apply is suspended holds its source, and writes every record once room comes back" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    const yaml =
+        \\kind: Processing
+        \\name: capped
+        \\sources:
+        \\  - name: src
+        \\    stream: { name: in }
+        \\sinks:
+        \\  - name: out
+        \\    stream: { name: out }
+    ;
+    sh.runRequest(t.conn, try ParkTest.request(.processing_submit, 1, proto.DEFAULT_NAMESPACE, "", yaml, ""), .client);
+    _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(u32, 1), sh.processing_handler.jobs.count());
+
+    // More source records than the cap.
+    const records = 1500;
+    for (0..records) |k| {
+        var pbuf: [16]u8 = undefined;
+        try sh.stream_handler.appendPayloadToStream("in", "default", try std.fmt.bufPrint(&pbuf, "rec-{d}", .{k}));
+        if (k % 256 == 0) _ = sh.applyCommitted();
+    }
+    _ = sh.applyCommitted();
+    try std.testing.expectEqual(r.commit_index, r.last_applied);
+
+    // Apply suspends at the next entry; the pipeline then fills the cap.
+    sh.test_bar = r.log.lastIndex() + 1;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    _ = sh.applyCommitted();
+    try std.testing.expect(sh.snapshot_window != null);
+    const from = r.log.lastIndex() + 1;
+    const Tick = struct {
+        fn pipelines(s: *Shard) void {
+            var it = s.processing_handler.pipelines.valueIterator();
+            while (it.next()) |p| p.last_poll_ms = 0;
+            _ = s.processing_handler.tickPipelines(s);
+        }
+    };
+    for (0..40) |_| Tick.pipelines(sh);
+    const suspended_writes = entriesOf(sh, .stream_append, from);
+    try std.testing.expect(suspended_writes > 0);
+    try std.testing.expect(r.log.lastIndex() - r.last_applied <= raft_node_mod.MAX_OUTSTANDING);
+    try std.testing.expectEqual(@as(u64, 0), sh.processing_handler.sink_drops);
+
+    // Resumed, every record reaches the sink exactly once, and none dropped.
+    try stepWindowClosed(sh);
+    for (0..200) |_| {
+        Tick.pipelines(sh);
+        _ = sh.applyCommitted();
+        if (entriesOf(sh, .stream_append, from) >= records) break;
+    }
+    try std.testing.expectEqual(@as(usize, records), entriesOf(sh, .stream_append, from));
+    try std.testing.expectEqual(@as(u64, 0), sh.processing_handler.sink_drops);
+}
+
+/// A lone node suspended at a fresh test bar; returns the bar.
+fn suspendAtTestBar(sh: *Shard) !u64 {
+    const r = sh.raft_node;
+    sh.test_bar = r.log.lastIndex() + 1;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    _ = sh.applyCommitted();
+    return sh.snapshot_window.?.s;
+}
+
+test "Shard: a window is dropped when its shard halts, goes offline, has its applied entries cut below the bar, or wins an election" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+
+    _ = try suspendAtTestBar(sh);
+    sh.halted = .{ .index = r.last_applied + 1, .term = r.current_term, .crc = 0 };
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window == null);
+    sh.halted = null;
+
+    _ = try suspendAtTestBar(sh);
+    sh.offline = silent_loss.Damage.init(.segment_unreadable, "segment {d} is unreadable", .{7});
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window == null);
+    sh.offline = null;
+
+    // An async-durability rewind below the bar.
+    const s = try suspendAtTestBar(sh);
+    r.last_applied = s - 1;
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window == null);
+    r.last_applied = s;
+
+    // Opened as a follower, then elected: dropped, counted, and apply goes on.
+    _ = try suspendAtTestBarAsFollower(sh);
+    // Elected, with an entry of its own committed behind the window.
+    r.role = .leader;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    r.commit_index = r.log.lastIndex();
+    const skips = sh.snapshot_skips_leader_not_ready;
+    sh.stepSnapshotWindow();
+    try std.testing.expect(sh.snapshot_window == null);
+    try std.testing.expectEqual(skips + 1, sh.snapshot_skips_leader_not_ready);
+    try std.testing.expectEqual(r.commit_index, r.last_applied);
+}
+
+/// `suspendAtTestBar` on a node acting as a follower: its entries are
+/// proposed as leader, then applied as a follower applies them.
+fn suspendAtTestBarAsFollower(sh: *Shard) !u64 {
+    const r = sh.raft_node;
+    r.role = .leader;
+    sh.test_bar = r.log.lastIndex() + 1;
+    _ = try r.propose(.raft_noop, entry_mod.Flags.NONE, "");
+    r.role = .follower;
+    _ = sh.applyCommitted();
+    try std.testing.expect(!sh.snapshot_window.?.as_leader);
+    return sh.snapshot_window.?.s;
+}
+
+test "Shard: alone with a committed entry it can't read, writes past the cap are refused before they're proposed, not left in a wrapped slot" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    var buf: [4096]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    // Reads blocked: committed entries wait unapplied, retried later.
+    sh.read_blocked = true;
+    sh.read_retry_at_ms = Shard.nowMs() + 60_000;
+    var id: u64 = 1;
+    while (r.log.lastIndex() - r.last_applied < raft_node_mod.MAX_OUTSTANDING) : (id += 1) {
+        try ParkTest.send(sh, t.conn, .kv_put, id, "k", "v");
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(raft_node_mod.MAX_OUTSTANDING)), sh.pending_count);
+    const last = r.log.lastIndex();
+    try ParkTest.send(sh, t.conn, .kv_put, id, "k", "v");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.overloaded), one[0].header.status);
+    try std.testing.expectEqual(proto.Ran.no, (try one[0].refused()).ran);
+    try std.testing.expectEqual(last, r.log.lastIndex());
+    sh.read_blocked = false;
+    sh.read_retry_at_ms = 0;
+    // Apply runs in budgeted passes.
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+    try std.testing.expectEqual(@as(u32, 0), sh.pending_count);
+}
+
+test "Shard: a duty with an entry in flight during a window isn't proposed again" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const def =
+        \\{"kind":"Workflow","name":"flow","version":"1.0.0",
+        \\"start":{"wait_for_signal":{"type":"go"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "flow", def);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try ParkTest.send(sh, t.conn, .workflow_start, 2, "flow", "");
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+    try std.testing.expectEqual(@as(u32, 1), sh.workflow_handler.to_step.count());
+
+    // Suspended: the first step's entry is proposed once, however many
+    // passes the duty takes before it applies.
+    _ = try suspendAtTestBar(sh);
+    const from = sh.raft_node.log.lastIndex() + 1;
+    for (0..5) |_| sh.workflow_handler.advanceStartedRuns(sh);
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(sh, .workflow_step_started, from));
+    try stepWindowClosed(sh);
+    for (0..5) |_| sh.workflow_handler.advanceStartedRuns(sh);
+    try std.testing.expectEqual(@as(usize, 1), entriesOf(sh, .workflow_step_started, from));
+}
+
+test "Shard: a stream trigger whose shard is capped while apply is suspended keeps its cursor, and starts a run for every event once room comes back" {
+    var t: AsyncAlone = undefined;
+    try t.init();
+    defer t.deinit();
+    const sh = &t.shard;
+    const r = sh.raft_node;
+    var buf: [2048]u8 = undefined;
+    var one: [1]proto.Response = undefined;
+    const triggered =
+        \\{"kind":"Workflow","name":"on-events","version":"1.0.0","trigger":{"stream":"events"},
+        \\"start":{"wait_for_signal":{"type":"never"},"transitions":{"success":"flo.Completed"}}}
+    ;
+    try ParkTest.send(sh, t.conn, .workflow_create, 1, "on-events", triggered);
+    try ParkTest.responses(sh, t.conn, t.pair[1], &buf, &one);
+    try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), one[0].header.status);
+
+    const events = 1500;
+    for (0..events) |k| {
+        var pbuf: [16]u8 = undefined;
+        try sh.stream_handler.appendPayloadToStream("events", "default", try std.fmt.bufPrint(&pbuf, "ev-{d}", .{k}));
+        if (k % 256 == 0) _ = sh.applyCommitted();
+    }
+    var passes: u32 = 0;
+    while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+
+    _ = try suspendAtTestBar(sh);
+    const Tick = struct {
+        fn triggers(s: *Shard) void {
+            s.workflow_handler.triggers_dirty = true;
+            s.workflow_handler.tickStreamTriggers(s);
+        }
+    };
+    // Ten events a tick: enough ticks to reach the cap while suspended.
+    for (0..200) |_| Tick.triggers(sh);
+    try std.testing.expectEqual(raft_node_mod.MAX_OUTSTANDING, r.log.lastIndex() - r.last_applied);
+
+    try stepWindowClosed(sh);
+    for (0..400) |_| {
+        Tick.triggers(sh);
+        passes = 0;
+        while (r.last_applied < r.commit_index and passes < 100) : (passes += 1) _ = sh.applyCommitted();
+        if (sh.workflow_handler.runs.count() >= events) break;
+    }
+    try std.testing.expectEqual(@as(usize, events), sh.workflow_handler.runs.count());
 }
