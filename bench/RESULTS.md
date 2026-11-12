@@ -58,7 +58,7 @@ A full 32 MiB warm store holds about 330,000 entries of that size, eight times t
 
 A walk of 10,000 one-entry segments, as a sync log seals one per flush. `lookup` is `sealedSource`, the
 lookup a stream disk read makes; `read` also opens and reads each segment. ReleaseSafe, shared Mac under
-load (33–54), 2026-11-13; three runs each.
+load (33–54), 2026-11-12; three runs each.
 
 | Build | lookup ns/index | read ns/index |
 |---|---:|---:|
