@@ -131,30 +131,24 @@ fn writeEntryTo(op: OpCode, ctx: *anyopaque, ns: dispatcher_mod.WalkNamespace, n
         },
         .processing_list => {
             const handler: *const ProcessingHandler = @ptrCast(@alignCast(ctx));
-            const job = handler.listedJob(namespace, name) orelse return;
+            const job = handler.listedJob(ns.id, name) orelse return;
             if (ProcessingHandler.entrySize(job) > w.buffer.len) return error.EntryTooLarge;
             try ProcessingHandler.writeEntry(job, w);
         },
         // [name_len:u16][name][version_len:u16][version][created_at:i64][enabled:u8]
         .workflow_list_definitions => {
             const handler: *WorkflowHandler = @ptrCast(@alignCast(ctx));
-            var it = handler.definitions.iterator();
-            while (it.next()) |entry| {
-                const def = entry.value_ptr;
-                if (!std.mem.eql(u8, def.name_owned, name)) continue;
-                if (namespace.len > 0) {
-                    const map_key = entry.key_ptr.*;
-                    if (!std.mem.startsWith(u8, map_key, namespace)) continue;
-                    if (map_key.len <= namespace.len or map_key[namespace.len] != ':') continue;
-                }
-                try w.writeInt(u16, @intCast(def.name_owned.len), .little);
-                try w.writeAll(def.name_owned);
-                try w.writeInt(u16, @intCast(def.version_owned.len), .little);
-                try w.writeAll(def.version_owned);
-                try w.writeInt(i64, def.created_at_ms, .little);
-                try w.writeByte(@intFromBool(!handler.disabled.contains(entry.key_ptr.*)));
-                return;
-            }
+            const workflow_mod = @import("../workflow/handler.zig");
+            var kbuf: [WorkflowHandler.MAX_START_KEY]u8 = undefined;
+            if (workflow_mod.KEY_PREFIX + name.len > kbuf.len) return;
+            const key = workflow_mod.writeKey(&kbuf, ns.id, name);
+            const def = handler.definitions.get(key) orelse return;
+            try w.writeInt(u16, @intCast(def.name_owned.len), .little);
+            try w.writeAll(def.name_owned);
+            try w.writeInt(u16, @intCast(def.version_owned.len), .little);
+            try w.writeAll(def.version_owned);
+            try w.writeInt(i64, def.created_at_ms, .little);
+            try w.writeByte(@intFromBool(!handler.disabled.contains(key)));
         },
         .action_list => try ActionsHandler.writeListEntry(@ptrCast(@alignCast(ctx)), namespace, name, w),
         // [name_len:u16][name]

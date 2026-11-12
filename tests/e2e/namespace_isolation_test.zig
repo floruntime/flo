@@ -1,9 +1,10 @@
-//! Two namespaces holding a stream, a consumer group, a queue and a
-//! measurement of the same name keep them apart: each is keyed by the
-//! namespace's id and its name, from a request and from the log alike, so a read in one
-//! never sees the other's records, messages or points, on one shard or
-//! many, and after a restart replays the log. The two namespaces are a pair
-//! whose names once hashed to the same 32 bits.
+//! Two namespaces holding a stream, a consumer group, a queue, a
+//! measurement, a workflow or a processing job of the same name keep them
+//! apart: each is keyed by the namespace's id and its name, from a request
+//! and from the log alike, so a read in one never sees the other's records,
+//! messages, points, runs or jobs, on one shard or many, and after a
+//! restart replays the log. The two namespaces are a pair whose names once
+//! hashed to the same 32 bits.
 
 const std = @import("std");
 const testing = std.testing;
@@ -303,6 +304,208 @@ fn verifySeries(ctx: *stdx.testing.TestContext, _: bool) !void {
     }
 }
 
+// ── Workflows ────────────────────────────────────────────────────────────────
+
+/// A workflow whose runs wait for a signal, so they stay where they are
+/// until one comes; version 1.0.<i> in namespace i.
+fn workflowYaml(buf: []u8, name: []const u8, i: usize, schedule: bool) ![]const u8 {
+    return std.fmt.bufPrint(buf,
+        \\kind: Workflow
+        \\name: {s}
+        \\version: 1.0.{d}
+        \\{s}start:
+        \\  wait_for_signal:
+        \\    type: go
+        \\  transitions:
+        \\    success: flo.Completed
+        \\
+    , .{ name, i, if (schedule) "schedule:\n  interval: 200\n  max_concurrent: 1\n" else "" });
+}
+
+fn runInput(buf: []u8, ns: []const u8, k: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"ns\":\"{s}\",\"k\":{d}}}", .{ ns, k });
+}
+
+const RunRow = struct { run_id: []const u8, workflow: []const u8, status: []const u8 };
+
+/// The runs of `workflow` in `ns`, as list-runs prints them.
+fn listRuns(ctx: *stdx.testing.TestContext, workflow: []const u8, ns: []const u8) !std.json.Parsed([]const RunRow) {
+    const listed = try run(ctx, &.{ "workflow", "list-runs", "--workflow", workflow, "-o", "json", "-n", ns }, 0);
+    defer testing.allocator.free(listed);
+    // Copied out: the text is freed here.
+    return std.json.parseFromSlice([]const RunRow, testing.allocator, listed, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+/// The line of `text` that starts with `label`, whole.
+fn line(text: []const u8, label: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, label)) return l;
+    return null;
+}
+
+/// In each namespace: workflow "same" (its own version) with count(i)
+/// runs, the first by the run id both namespaces choose, and "tick", a
+/// schedule held at one run. Then namespace 0's chosen run is signalled.
+fn writeWorkflows(ctx: *stdx.testing.TestContext) !void {
+    var yaml: [512]u8 = undefined;
+    var file: [64]u8 = undefined;
+    var input: [64]u8 = undefined;
+    for (NAMESPACES, 0..) |ns, i| {
+        for ([_][]const u8{ "same", "tick" }) |name| {
+            const path = try stdx.testing.writeTempYaml(testing.allocator, try workflowYaml(&yaml, name, i, std.mem.eql(u8, name, "tick")), try std.fmt.bufPrint(&file, "ns-iso-{s}-{s}.yaml", .{ name, ns }));
+            defer stdx.testing.cleanupTempFile(testing.allocator, path);
+            try ctx.exec(&.{ "workflow", "create", "-f", path, "-n", ns });
+        }
+        for (1..count(i) + 1) |k| {
+            const in = try runInput(&input, ns, k);
+            const started = if (k == 1)
+                try run(ctx, &.{ "workflow", "start", "same", in, "--run-id", "chosen", "-o", "json", "-n", ns }, 0)
+            else
+                try run(ctx, &.{ "workflow", "start", "same", in, "-o", "json", "-n", ns }, 0);
+            defer testing.allocator.free(started);
+            if (k == 1) try testing.expectEqualStrings("{\"run_id\":\"chosen\"}", started);
+        }
+    }
+    const signalled = try run(ctx, &.{ "workflow", "signal", "chosen", "--type", "go", "-n", NAMESPACES[0] }, 0);
+    defer testing.allocator.free(signalled);
+    try testing.expectEqualStrings("Signal 'go' sent to workflow chosen", signalled);
+    // The schedule's first slot: one run in each namespace, then no more.
+    for (NAMESPACES) |ns| {
+        var waited: usize = 0;
+        while (true) : (waited += 1) {
+            const ticks = try listRuns(ctx, "tick", ns);
+            defer ticks.deinit();
+            if (ticks.value.len > 0) break;
+            if (waited == 50) return error.ScheduleNeverFired;
+            stdx.time.sleep(100 * std.time.ns_per_ms);
+        }
+    }
+    stdx.time.sleep(600 * std.time.ns_per_ms);
+}
+
+fn verifyWorkflows(ctx: *stdx.testing.TestContext, restarted: bool) !void {
+    var buf: [64]u8 = undefined;
+    for (NAMESPACES, 0..) |ns, i| {
+        // Its own two definitions, at its own version.
+        const listed = try run(ctx, &.{ "workflow", "list", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(listed);
+        const defs = try parse([]const struct { name: []const u8, version: []const u8 }, listed);
+        defer defs.deinit();
+        try testing.expectEqual(2, defs.value.len);
+        for (defs.value) |d| {
+            try testing.expect(std.mem.eql(u8, d.name, "same") or std.mem.eql(u8, d.name, "tick"));
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "1.0.{d}", .{i}), d.version);
+        }
+
+        // Its own runs, and the schedule held at one in each.
+        const runs = try listRuns(ctx, "same", ns);
+        defer runs.deinit();
+        try testing.expectEqual(count(i), runs.value.len);
+        var chosen: usize = 0;
+        for (runs.value) |r| {
+            try testing.expectEqualStrings("same", r.workflow);
+            chosen += @intFromBool(std.mem.eql(u8, r.run_id, "chosen"));
+        }
+        try testing.expectEqual(1, chosen);
+        const ticks = try listRuns(ctx, "tick", ns);
+        defer ticks.deinit();
+        try testing.expectEqual(1, ticks.value.len);
+
+        // The run both chose: this namespace's input, and only namespace
+        // 0's took the signal.
+        const status = try run(ctx, &.{ "workflow", "status", "chosen", "-n", ns }, 0);
+        defer testing.allocator.free(status);
+        var want: [96]u8 = undefined;
+        try testing.expectEqualStrings("Workflow: same (latest)", line(status, "Workflow:") orelse return error.NoLine);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Input:    {s}", .{try runInput(&buf, ns, 1)}), line(status, "Input:") orelse return error.NoLine);
+        // A run's first step isn't taken again after a restart: one that
+        // waited reads as running at its start.
+        const want_status = if (i == 0) "completed" else if (restarted) "running" else "waiting";
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Status:   {s}", .{want_status}), line(status, "Status:") orelse return error.NoLine);
+
+        const history = try run(ctx, &.{ "workflow", "history", "chosen", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(history);
+        const events = try parse([]const struct { type: []const u8, detail: []const u8 }, history);
+        defer events.deinit();
+        try testing.expectEqualStrings("workflow_started", events.value[0].type);
+        try testing.expectEqualStrings(try runInput(&buf, ns, 1), events.value[0].detail);
+    }
+}
+
+// ── Processing jobs ──────────────────────────────────────────────────────────
+
+/// The jobs each namespace submitted, by its index.
+var job_ids: [NAMESPACES.len][3][32]u8 = undefined;
+var job_id_lens: [NAMESPACES.len][3]usize = undefined;
+
+fn jobId(i: usize, k: usize) []const u8 {
+    return job_ids[i][k][0..job_id_lens[i][k]];
+}
+
+/// count(i) jobs named "same" in each namespace, the first then stopped.
+fn writeJobs(ctx: *stdx.testing.TestContext) !void {
+    const path = try stdx.testing.writeDottedToTempYaml(testing.allocator,
+        \\kind: Processing
+        \\name: same
+        \\sources.[0].stream.name: in
+        \\sinks.[0].name: out
+        \\sinks.[0].kv.key_prefix: out
+    , "ns-iso-job.yaml");
+    defer stdx.testing.cleanupTempFile(testing.allocator, path);
+    for (NAMESPACES, 0..) |ns, i| {
+        for (0..count(i)) |k| {
+            const submitted = try run(ctx, &.{ "processing", "submit", path, "-n", ns }, 0);
+            defer testing.allocator.free(submitted);
+            const prefix = "Job submitted: ";
+            if (!std.mem.startsWith(u8, submitted, prefix)) return error.NoJobId;
+            const id = submitted[prefix.len..];
+            @memcpy(job_ids[i][k][0..id.len], id);
+            job_id_lens[i][k] = id.len;
+        }
+        var want: [64]u8 = undefined;
+        const stopped = try run(ctx, &.{ "processing", "stop", jobId(i, 0), "-n", ns }, 0);
+        defer testing.allocator.free(stopped);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Job stopped: {s}", .{jobId(i, 0)}), stopped);
+    }
+}
+
+fn verifyJobs(ctx: *stdx.testing.TestContext, restarted: bool) !void {
+    var want: [96]u8 = undefined;
+    for (NAMESPACES, 0..) |ns, i| {
+        const other = 1 - i;
+        const listed = try run(ctx, &.{ "processing", "list", "-o", "json", "-n", ns }, 0);
+        defer testing.allocator.free(listed);
+        const jobs = try parse([]const struct { name: []const u8, job_id: []const u8, status: []const u8 }, listed);
+        defer jobs.deinit();
+        try testing.expectEqual(count(i), jobs.value.len);
+        for (jobs.value) |j| {
+            try testing.expectEqualStrings("same", j.name);
+            var k: ?usize = null;
+            for (0..count(i)) |n| if (std.mem.eql(u8, jobId(i, n), j.job_id)) {
+                k = n;
+            };
+            try testing.expectEqualStrings(if ((k orelse return error.NotOwnJob) == 0) "STOPPED" else "RUNNING", j.status);
+        }
+
+        const status = try run(ctx, &.{ "processing", "status", jobId(i, 0), "-n", ns }, 0);
+        defer testing.allocator.free(status);
+        try testing.expectEqualStrings("Name:       same", line(status, "Name:") orelse return error.NoLine);
+        try testing.expectEqualStrings("Status:     STOPPED", line(status, "Status:") orelse return error.NoLine);
+
+        // The other namespace's jobs are not found from here, to read or
+        // to stop.
+        const theirs = try run(ctx, &.{ "processing", "status", jobId(other, 1), "-n", ns }, 1);
+        testing.allocator.free(theirs);
+        if (!restarted) {
+            const stop = try run(ctx, &.{ "processing", "stop", jobId(other, 1), "-n", ns }, 1);
+            testing.allocator.free(stop);
+        }
+        const still = try run(ctx, &.{ "processing", "status", jobId(other, 1), "-n", NAMESPACES[other] }, 0);
+        defer testing.allocator.free(still);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Status:     {s}", .{"RUNNING"}), line(still, "Status:") orelse return error.NoLine);
+    }
+}
+
 fn lessThanStr(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }
@@ -355,4 +558,20 @@ test "e2e/stream/isolation: namespaces \"a\" and \"ab\" each list only their own
 
 test "e2e/stream/isolation: namespaces \"a\" and \"ab\" each list only their own streams, on 4 shards and after a restart" {
     try isolated(4, writePrefixed, verifyPrefixed);
+}
+
+test "e2e/workflow/isolation: a workflow named in two namespaces lists, starts, signals and reports only its own runs, on 1 shard and after a restart" {
+    try isolated(1, writeWorkflows, verifyWorkflows);
+}
+
+test "e2e/workflow/isolation: a workflow named in two namespaces lists, starts, signals and reports only its own runs, on 4 shards and after a restart" {
+    try isolated(4, writeWorkflows, verifyWorkflows);
+}
+
+test "e2e/processing/isolation: jobs named in two namespaces list, stop and report only their own, on 1 shard and after a restart" {
+    try isolated(1, writeJobs, verifyJobs);
+}
+
+test "e2e/processing/isolation: jobs named in two namespaces list, stop and report only their own, on 4 shards and after a restart" {
+    try isolated(4, writeJobs, verifyJobs);
 }

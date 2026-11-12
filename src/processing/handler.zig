@@ -220,8 +220,8 @@ pub const ProcessingHandler = struct {
     pub const JobRecord = struct {
         job_id_owned: []const u8,
         name_owned: []const u8,
-        namespace_owned: []const u8,
-        /// The id its submit carried: the namespace a remove must name.
+        /// The namespace its submit was stamped with: the one every request
+        /// about the job must name.
         ns_id: NamespaceId,
         status: JobStatus,
         batch_size: u32,
@@ -395,7 +395,6 @@ pub const ProcessingHandler = struct {
     fn freeJobRecord(self: *ProcessingHandler, job: *JobRecord) void {
         self.allocator.free(job.job_id_owned);
         self.allocator.free(job.name_owned);
-        self.allocator.free(job.namespace_owned);
         self.allocator.free(job.yaml_owned);
         if (job.failure_owned.len > 0) self.allocator.free(job.failure_owned);
         self.freeHeldReason(job);
@@ -514,17 +513,15 @@ pub const ProcessingHandler = struct {
         _: ?[]const u8,
         _: u32,
     ) dispatcher_mod.NameWalker.ScanResult {
-        const namespace = ns.name;
         const handler: *ProcessingHandler = @ptrCast(@alignCast(ctx));
         const name_buf = dispatcher_mod.scanScratch(handler.jobs.count());
 
-        const req_ns = if (namespace.len > 0) namespace else "default";
         var count: usize = 0;
         var it = handler.jobs.iterator();
         while (it.next()) |entry| {
             if (count >= name_buf.len) break;
             const job = entry.value_ptr;
-            if (!std.mem.eql(u8, job.namespace_owned, req_ns)) continue;
+            if (job.ns_id != ns.id) continue;
             name_buf[count] = job.job_id_owned;
             count += 1;
         }
@@ -573,9 +570,9 @@ pub const ProcessingHandler = struct {
     /// and its memory, when the entry applies.
     fn runRemove(shard: *Shard, _: *Connection, req: Request) Error!table_run.Outcome(RemoveResponse) {
         const self = shard.processing_handler;
-        const job = self.ownedJob(req.key, req.namespace) orelse return error.NotFound;
+        const job = self.ownedJob(req.key, req.ns_id) orelse return error.NotFound;
         if (job.status == .running) return error.Running;
-        const proposed = persistence_mod.proposeEntry(shard, .processing_remove, Flags.NONE, req.namespace, req.key, "") catch |err|
+        const proposed = persistence_mod.proposeEntryIn(shard, .processing_remove, Flags.NONE, job.ns_id, req.key, "") catch |err|
             return .{ .refused = .{ .status = persistence_mod.failureStatus(err), .refusal = persistence_mod.failureRefusal(err, "remove not persisted") } };
         return .{ .park = .{ .proposed = proposed, .answer = answerRemove } };
     }
@@ -682,7 +679,10 @@ pub const ProcessingHandler = struct {
         // pipelines from the entry — the same applier a restart uses.
         // Admitted at dispatch; the definition has now passed, so reserve.
         shard.namespace_handler.proposeImplicitCreate(req.namespace, shard);
-        const proposed = self.proposeSubmit(shard, req.namespace, job_id, .running, def.batch_size, home, yaml) catch |err| {
+        // A namespace this submit creates had no id at dispatch; shard 0,
+        // where every submit runs, knows the one it just proposed.
+        const ns_id = if (req.ns_id != .invalid) req.ns_id else shard.namespaceId(req.namespace);
+        const proposed = self.proposeSubmit(shard, ns_id, job_id, .running, def.batch_size, home, yaml) catch |err| {
             shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "job not persisted"));
             return;
         };
@@ -698,19 +698,12 @@ pub const ProcessingHandler = struct {
 
     // ── Stop ─────────────────────────────────────────────────────────────
 
-    /// The job `job_id`, if it lives in `namespace` (empty is "default"):
-    /// a job is seen, stopped and changed only from its own namespace, so
-    /// from any other it is not found.
-    fn ownedJob(self: *ProcessingHandler, job_id: []const u8, namespace: []const u8) ?*JobRecord {
+    /// The job `job_id`, if it lives in namespace `ns`: a job is seen,
+    /// stopped and changed only from its own namespace, so from any other it
+    /// is not found.
+    fn ownedJob(self: *ProcessingHandler, job_id: []const u8, ns: NamespaceId) ?*JobRecord {
         const job = self.jobs.getPtr(job_id) orelse return null;
-        const home = if (namespace.len > 0) namespace else "default";
-        return if (std.mem.eql(u8, job.namespace_owned, home)) job else null;
-    }
-
-    /// Whether `job` lives in the namespace an entry's hash names; a bare
-    /// namespace is "default", as it is for ownedJob.
-    fn inNamespace(job: *const JobRecord, ns_id: NamespaceId) bool {
-        return ns_id == job.ns_id;
+        return if (job.ns_id == ns) job else null;
     }
 
     fn handleStop(self: *ProcessingHandler, shard: *Shard, conn: *Connection, req: Request) void {
@@ -720,8 +713,8 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.ownedJob(job_id, req.namespace) != null) {
-            const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .stopped) catch |err| {
+        if (self.ownedJob(job_id, req.ns_id)) |job| {
+            const proposed = self.proposeStatusChange(shard, job.ns_id, job_id, .stopped) catch |err| {
                 shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "stop not persisted"));
                 return;
             };
@@ -740,8 +733,8 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.ownedJob(job_id, req.namespace) != null) {
-            const proposed = self.proposeStatusChange(shard, req.namespace, job_id, .cancelled) catch |err| {
+        if (self.ownedJob(job_id, req.ns_id)) |job| {
+            const proposed = self.proposeStatusChange(shard, job.ns_id, job_id, .cancelled) catch |err| {
                 shard.sendRefusal(conn, req.header.request_id, persistence_mod.failureStatus(err), persistence_mod.failureRefusal(err, "cancel not persisted"));
                 return;
             };
@@ -760,7 +753,7 @@ pub const ProcessingHandler = struct {
             return;
         }
 
-        if (self.ownedJob(job_id, req.namespace)) |job| {
+        if (self.ownedJob(job_id, req.ns_id)) |job| {
             // Binary wire format:
             // [job_id_len:u16][job_id][name_len:u16][name][status:u8]
             // [batch_size:u32][records_processed:u64][created_at:i64]
@@ -862,14 +855,13 @@ pub const ProcessingHandler = struct {
         var limit: u32 = 100;
         if (req.value.len >= 4) limit = std.mem.readInt(u32, req.value[0..4], .little);
         if (limit == 0) limit = 100;
-        const req_ns = if (req.namespace.len > 0) req.namespace else "default";
 
         var jobs: std.ArrayListUnmanaged(*const JobRecord) = .empty;
         defer jobs.deinit(self.allocator);
         var jit = self.jobs.iterator();
         while (jit.next()) |entry| {
             if (jobs.items.len >= limit) break;
-            if (!std.mem.eql(u8, entry.value_ptr.namespace_owned, req_ns)) continue;
+            if (entry.value_ptr.ns_id != req.ns_id) continue;
             jobs.append(self.allocator, entry.value_ptr) catch {
                 shard.sendErrorResponse(conn, req.header.request_id, .internal_error, "allocation failed");
                 return;
@@ -921,12 +913,10 @@ pub const ProcessingHandler = struct {
         try w.writeInt(u64, j.records_processed, .little);
     }
 
-    /// The job `job_id` in `namespace` (empty is "default"), if this shard
-    /// holds it.
-    pub fn listedJob(self: *const ProcessingHandler, namespace: []const u8, job_id: []const u8) ?*const JobRecord {
+    /// The job `job_id` in namespace `ns`, if this shard holds it.
+    pub fn listedJob(self: *const ProcessingHandler, ns: NamespaceId, job_id: []const u8) ?*const JobRecord {
         const job = self.jobs.getPtr(job_id) orelse return null;
-        const ns = if (namespace.len > 0) namespace else "default";
-        return if (std.mem.eql(u8, job.namespace_owned, ns)) job else null;
+        return if (job.ns_id == ns) job else null;
     }
 
     /// What status and list say beside a job's status: a failed job's
@@ -996,7 +986,7 @@ pub const ProcessingHandler = struct {
     /// A processing_submit entry. Key = job_id. The job is created at the
     /// entry's stamp.
     /// Value format: [layout:u8][status:u8][batch_size:u32][ns_len:u16][namespace][yaml...]
-    fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus, batch_size: u32, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
+    fn proposeSubmit(self: *ProcessingHandler, shard: *Shard, ns_id: NamespaceId, job_id: []const u8, status: JobStatus, batch_size: u32, job_namespace: []const u8, yaml: []const u8) !persistence_mod.ProposeResult {
         _ = self;
         var value_buf: [persistence_mod.MAX_PERSIST_PAYLOAD]u8 = undefined;
         var off: usize = 0;
@@ -1021,11 +1011,11 @@ pub const ProcessingHandler = struct {
         @memcpy(value_buf[off .. off + yaml.len], yaml);
         off += yaml.len;
 
-        return persistence_mod.proposeEntry(shard, .processing_submit, Flags.NONE, namespace, job_id, value_buf[0..off]);
+        return persistence_mod.proposeEntryIn(shard, .processing_submit, Flags.NONE, ns_id, job_id, value_buf[0..off]);
     }
 
     /// A processing_stop or processing_cancel entry. Key = job_id, value = [new_status:u8].
-    fn proposeStatusChange(self: *ProcessingHandler, shard: *Shard, namespace: []const u8, job_id: []const u8, status: JobStatus) !persistence_mod.ProposeResult {
+    fn proposeStatusChange(self: *ProcessingHandler, shard: *Shard, ns_id: NamespaceId, job_id: []const u8, status: JobStatus) !persistence_mod.ProposeResult {
         _ = self;
         const entry_type: EntryType = switch (status) {
             .stopped => .processing_stop,
@@ -1033,7 +1023,7 @@ pub const ProcessingHandler = struct {
             else => return error.NotATerminalStatus,
         };
         const value = &[_]u8{@backingInt(status)};
-        return persistence_mod.proposeEntry(shard, entry_type, Flags.NONE, namespace, job_id, value);
+        return persistence_mod.proposeEntryIn(shard, entry_type, Flags.NONE, ns_id, job_id, value);
     }
 
     // ── Replay ──────────────────────────────────────────────────────────
@@ -1122,21 +1112,13 @@ pub const ProcessingHandler = struct {
         }
 
         const name = self.allocator.dupe(u8, if (parsed) |def| def.name else job_id) catch return error.OutOfMemory;
-        // Use the embedded namespace (authoritative from original submit)
-        const namespace = self.allocator.dupe(u8, ns_raw) catch {
-            self.allocator.free(name);
-            return error.OutOfMemory;
-        };
-
         const owned_id = self.allocator.dupe(u8, job_id) catch {
             self.allocator.free(name);
-            self.allocator.free(namespace);
             return error.OutOfMemory;
         };
         const owned_yaml = self.allocator.dupe(u8, yaml) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
-            self.allocator.free(namespace);
             return error.OutOfMemory;
         };
 
@@ -1154,7 +1136,6 @@ pub const ProcessingHandler = struct {
         self.jobs.put(owned_id, .{
             .job_id_owned = owned_id,
             .name_owned = name,
-            .namespace_owned = namespace,
             .ns_id = ns_id,
             .status = status,
             .batch_size = batch_size,
@@ -1165,7 +1146,6 @@ pub const ProcessingHandler = struct {
         }) catch {
             self.allocator.free(owned_id);
             self.allocator.free(name);
-            self.allocator.free(namespace);
             self.allocator.free(owned_yaml);
             cursors.deinit(self.allocator);
             return error.OutOfMemory;
@@ -1222,7 +1202,7 @@ pub const ProcessingHandler = struct {
         const job = self.jobs.getPtr(key) orelse return out.refuse(.not_found, .not_found, "not found: no such processing job");
         // The leader checked this too (ownedJob); every replica holds the
         // entry to it, so a remove never reaches another namespace's job.
-        if (!inNamespace(job, ns_id)) return out.refuse(.not_found, .not_found, "not found: no such processing job");
+        if (job.ns_id != ns_id) return out.refuse(.not_found, .not_found, "not found: no such processing job");
         if (job.status == .running) return out.refuse(.conflict, .job_running, "job is running: stop or cancel it, then remove it");
         self.dropPipelines(key);
         var removed = self.jobs.fetchRemove(key).?;
@@ -1705,7 +1685,7 @@ pub const ProcessingHandler = struct {
         }
         // As a stream source does: a restart resumes here, not from the
         // measurement's first point.
-        maybePersistCheckpoint(pipeline_key, pipe, shard, job.namespace_owned);
+        maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
     }
 
     /// Tick a stream source pipeline: read payloads from stream, apply operators, write to sink.
@@ -1760,7 +1740,7 @@ pub const ProcessingHandler = struct {
         // resumes from here after restart instead of re-reading from the start.
         // At-least-once: a crash loses at most CHECKPOINT_INTERVAL_MS
         // of progress, which redelivers — it never skips records.
-        maybePersistCheckpoint(pipeline_key, pipe, shard, job.namespace_owned);
+        maybePersistCheckpoint(pipeline_key, pipe, shard, job.ns_id);
     }
 
     /// Minimum wall-clock gap between durable cursor checkpoints per pipeline.
@@ -1771,7 +1751,7 @@ pub const ProcessingHandler = struct {
     /// Persist a pipeline's source cursor as a processing_checkpoint UAL entry,
     /// debounced. Key = pipeline_key (job_id, or job_id\0idx for multi-source);
     /// value as `replayCheckpoint` reads it.
-    fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, namespace: []const u8) void {
+    fn maybePersistCheckpoint(pipeline_key: []const u8, pipe: *PipelineState, shard: *Shard, ns_id: NamespaceId) void {
         const a: u64, const b: u64 = switch (pipe.source_kind) {
             .stream => .{ pipe.stream_cursor_ts, pipe.stream_cursor_seq },
             .ts => .{ pipe.ts_cursor_ns, 0 },
@@ -1789,7 +1769,7 @@ pub const ProcessingHandler = struct {
         std.mem.writeInt(u64, val_buf[0..8], a, .little);
         std.mem.writeInt(u64, val_buf[8..16], b, .little);
         // The applier records the persisted cursor.
-        _ = persistence_mod.proposeEntry(shard, .processing_checkpoint, Flags.NONE, namespace, pipeline_key, &val_buf) catch |err| {
+        _ = persistence_mod.proposeEntryIn(shard, .processing_checkpoint, Flags.NONE, ns_id, pipeline_key, &val_buf) catch |err| {
             if (!shard.quietHalted(err)) log.err("pipeline {s}: checkpoint not persisted: {s}", .{ pipeline_key, @errorName(err) });
             if (shard.metrics_registry) |m| m.processing.recordError();
             return;
@@ -2830,7 +2810,7 @@ test "ProcessingHandler: replicas of different shard counts store the same statu
     // The list says so, beside the status.
     var entry_buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&entry_buf);
-    try ProcessingHandler.writeEntry(two.listedJob("", "job-1").?, &w);
+    try ProcessingHandler.writeEntry(two.listedJob(.default, "job-1").?, &w);
     var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     _ = r.readLengthPrefixed(u16).?;
     _ = r.readLengthPrefixed(u16).?;
@@ -3106,7 +3086,7 @@ test "ProcessingHandler: list shows a failed job's reason, through the walk ever
     // A definition that doesn't parse has no name of its own: the job's id stands in.
     var entry_buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&entry_buf);
-    try ProcessingHandler.writeEntry(handler.listedJob("", "job-r").?, &w);
+    try ProcessingHandler.writeEntry(handler.listedJob(.default, "job-r").?, &w);
     var r = @import("../util/wire.zig").WireReader.init(w.buffered());
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
     try std.testing.expectEqualStrings("job-r", r.readLengthPrefixed(u16).?);
@@ -3123,16 +3103,16 @@ test "ProcessingHandler: jobs that share a name are each listed" {
     const ids = [_][]const u8{ "job-a", "job-b", "job-c" };
     for (ids, 1..) |id, i| _ = try applySubmit(&handler, id, testSubmitValue(&buf, .stopped, lookup_yaml), @intCast(i));
 
-    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), .{ .name = "" }, "", null, 0);
+    const page = ProcessingHandler.localScanJobs(@ptrCast(&handler), .{ .name = "", .id = .default }, "", null, 0);
     try std.testing.expectEqual(ids.len, page.items.len);
     var seen: [ids.len]bool = @splat(false);
     for (page.items) |item| {
-        const job = handler.listedJob("", item).?;
+        const job = handler.listedJob(.default, item).?;
         try std.testing.expectEqualStrings("lookup", job.name_owned);
         for (ids, 0..) |id, i| if (std.mem.eql(u8, id, job.job_id_owned)) {
             seen[i] = true;
         };
     }
     for (seen) |s| try std.testing.expect(s);
-    try std.testing.expect(handler.listedJob("other", "job-a") == null);
+    try std.testing.expect(handler.listedJob(.of(16), "job-a") == null);
 }

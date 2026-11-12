@@ -16,6 +16,7 @@ const gather_mod = @import("../node/gather.zig");
 const Shard = @import("../node/shard.zig").Shard;
 const Connection = @import("../node/connection.zig").Connection;
 const WorkflowHandler = @import("handler.zig").WorkflowHandler;
+const NamespaceId = @import("../namespace/table.zig").Id;
 
 const PageOp = table_run.op("system.runs_page");
 const PageRequest = PageOp.request;
@@ -72,11 +73,11 @@ fn before(a: RunAt.Value, b: RunAt.Value) bool {
 /// This shard's page of the runs that match `q`, after `q.after`, from its
 /// own runs, into `buf`: at most `q.limit` runs, their entries at most
 /// `room` bytes.
-pub fn ownPage(handler: *WorkflowHandler, namespace: []const u8, workflow: []const u8, q: Query, room: u32, buf: []u8) error{OutOfMemory}!PageResponse.Value {
+pub fn ownPage(handler: *WorkflowHandler, ns: NamespaceId, workflow: []const u8, q: Query, room: u32, buf: []u8) error{OutOfMemory}!PageResponse.Value {
     const allocator = handler.allocator;
     var runs: std.ArrayListUnmanaged(WorkflowHandler.RunInfo) = .empty;
     defer runs.deinit(allocator);
-    try handler.collectMatchingRuns(&runs, namespace, workflow, if (q.status.len == 0) null else q.status, if (q.search.len == 0) null else q.search);
+    try handler.collectMatchingRuns(&runs, ns, workflow, if (q.status.len == 0) null else q.status, if (q.search.len == 0) null else q.search);
     var kept: usize = 0;
     for (runs.items) |r| {
         if (q.after) |after| if (!before(after, atOf(r))) continue;
@@ -132,7 +133,7 @@ pub fn handlePage(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Reques
     const buf = shard.allocator.alloc(u8, Runs.max_size) catch return outOfMemory(shard, conn, req.header.request_id);
     defer shard.allocator.free(buf);
     const q: Query = .{ .limit = @min(r.limit, MAX_LIMIT), .status = r.status, .search = r.search, .after = r.after };
-    const v = ownPage(shard.workflow_handler, req.namespace, req.key, q, r.room, buf) catch
+    const v = ownPage(shard.workflow_handler, req.ns_id, req.key, q, r.room, buf) catch
         return outOfMemory(shard, conn, req.header.request_id);
     table_run.answer(PageResponse, shard, conn, req.header.request_id, v);
 }
@@ -162,7 +163,7 @@ fn frame(w: *std.Io.Writer, entries: []const []const u8, last: ?RunAt.Value, mor
 pub fn answerOwn(shard: *Shard, conn: *Connection, req: proto.Request, q: Query) void {
     const buf = shard.allocator.alloc(u8, Runs.max_size) catch return outOfMemory(shard, conn, req.header.request_id);
     defer shard.allocator.free(buf);
-    const page = ownPage(shard.workflow_handler, req.namespace, req.key, q, @intCast(ROOM), buf) catch
+    const page = ownPage(shard.workflow_handler, req.ns_id, req.key, q, @intCast(ROOM), buf) catch
         return outOfMemory(shard, conn, req.header.request_id);
     var entries: [MAX_LIMIT][]const u8 = undefined;
     var last: ?RunAt.Value = null;
@@ -282,7 +283,7 @@ pub fn start(shard: *Shard, conn: *Connection, req: proto.Request, q: Query) Beg
 
     const buf = allocator.alloc(u8, Runs.max_size) catch return .{ .refused = OUT_OF_MEMORY };
     defer allocator.free(buf);
-    const v = ownPage(shard.workflow_handler, req.namespace, req.key, q, room, buf) catch return .{ .refused = OUT_OF_MEMORY };
+    const v = ownPage(shard.workflow_handler, req.ns_id, req.key, q, room, buf) catch return .{ .refused = OUT_OF_MEMORY };
     const size = PageResponse.encodedSize(v) catch return .{ .refused = OUT_OF_MEMORY };
     const own = allocator.alloc(u8, size) catch return .{ .refused = OUT_OF_MEMORY };
     var own_owned = false;

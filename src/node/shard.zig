@@ -99,6 +99,7 @@ const NamespaceHandler = handler_mod.NamespaceHandler;
 const ActionsHandler = @import("../actions/handler.zig").ActionsHandler;
 const WorkerHandler = @import("../worker/handler.zig").WorkerHandler;
 const WorkflowHandler = @import("../workflow/handler.zig").WorkflowHandler;
+const wf_test_key = @import("../workflow/handler.zig").testKey;
 const ProcessingHandler = @import("../processing/handler.zig").ProcessingHandler;
 const TaskScheduler = @import("task_scheduler.zig").TaskScheduler;
 const ual_mod = @import("../storage/ual/ual.zig");
@@ -1885,7 +1886,7 @@ pub const Shard = struct {
         defer self.allocator.free(parts);
         const Holds = table_run.op("system.holds_run").response;
         var own_buf: [Holds.max_size]u8 = undefined;
-        const own_body = Holds.encodeInto(&own_buf, .{ .holds = self.workflow_handler.holdsRun(req.namespace, run_id) }) catch unreachable;
+        const own_body = Holds.encodeInto(&own_buf, .{ .holds = self.workflow_handler.holdsRun(req.ns_id, run_id) }) catch unreachable;
         const own = self.allocator.dupe(u8, own_body) catch return self.sendRefusal(conn, id, .internal_error, proto.notRun("internal error: out of memory"));
         var own_owned = false;
         defer if (!own_owned) self.allocator.free(own);
@@ -1906,7 +1907,7 @@ pub const Shard = struct {
     fn handleHoldsRun(shard_ptr: *anyopaque, conn_ptr: *anyopaque, req: proto.Request) void {
         const shard: *Shard = @ptrCast(@alignCast(shard_ptr));
         const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-        table_run.answer(table_run.op("system.holds_run").response, shard, conn, req.header.request_id, .{ .holds = shard.workflow_handler.holdsRun(req.namespace, req.key) });
+        table_run.answer(table_run.op("system.holds_run").response, shard, conn, req.header.request_id, .{ .holds = shard.workflow_handler.holdsRun(req.ns_id, req.key) });
     }
 
     /// Where a request goes when it goes to another shard, and whether it
@@ -9946,7 +9947,7 @@ test "Shard: a start's retry choosing its run id, sent before its namespace is p
     };
     resp = try nextAnswer(ca, a, &out);
     try std.testing.expectEqual(@backingInt(proto.StatusCode.ok), resp.header.status);
-    try std.testing.expect(a.workflow_handler.holdsRun("wfresh", "r1"));
+    try std.testing.expect(a.workflow_handler.holdsRun(id, "r1"));
     try std.testing.expect(two.namespaces.lookup("wfresh") == null);
 
     // Its retry from shard 1 is the same start, decided on shard 0: the
@@ -12073,7 +12074,7 @@ const FollowerTest = struct {
 test "Shard: a start leaves its run to step on every replica; a step_started of the leader's own term queues its first step, once" {
     const start = [_]u8{ 2, 0, 'w', 'f', 1, 0, '1', 1 } ++ [_]u8{ 0, 0, 0, 0 };
     var pbuf: [128]u8 = undefined;
-    const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, "default:r1", &start, &pbuf).?;
+    const e = entry_mod.buildCommandEntry(.workflow_start, 0, 1, 1, 0, .default, wf_test_key(.default, "r1"), &start, &pbuf).?;
 
     // A follower holds the run as one to step, and queues nothing.
     var t: FollowerTest = undefined;
@@ -12082,7 +12083,7 @@ test "Shard: a start leaves its run to step on every replica; a step_started of 
     try std.testing.expect(t.shard.raft_node.role != .leader);
     var out = persistence_mod.Result.start(&e);
     try std.testing.expect(t.shard.applyEntry(&e, &out));
-    try std.testing.expect(t.shard.workflow_handler.to_step.contains("default:r1"));
+    try std.testing.expect(t.shard.workflow_handler.to_step.contains(wf_test_key(.default, "r1")));
     try std.testing.expectEqual(@as(usize, 0), t.shard.workflow_handler.started_to_advance.items.len);
 
     // The leader of a group of one.
@@ -12095,11 +12096,11 @@ test "Shard: a start leaves its run to step on every replica; a step_started of 
     try std.testing.expect(shard.applyCommitted());
     const r = shard.raft_node;
     var next = r.last_applied + 1;
-    const led = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, "default:r1", &start, &pbuf).?;
+    const led = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, wf_test_key(.default, "r1"), &start, &pbuf).?;
     out = persistence_mod.Result.start(&led);
     try std.testing.expect(shard.applyEntry(&led, &out));
     const wf = shard.workflow_handler;
-    try std.testing.expect(wf.to_step.contains("default:r1"));
+    try std.testing.expect(wf.to_step.contains(wf_test_key(.default, "r1")));
     // A start alone queues no step: the step is logged first.
     try std.testing.expectEqual(@as(usize, 0), wf.started_to_advance.items.len);
 
@@ -12107,21 +12108,21 @@ test "Shard: a start leaves its run to step on every replica; a step_started of 
     // leader takes that step.
     next += 1;
     var sb: [64]u8 = undefined;
-    const earlier = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term - 1, next, 0, .default, "default:r1", "", &sb).?;
+    const earlier = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term - 1, next, 0, .default, wf_test_key(.default, "r1"), "", &sb).?;
     out = persistence_mod.Result.start(&earlier);
     try std.testing.expect(shard.applyEntry(&earlier, &out));
-    try std.testing.expect(!wf.to_step.contains("default:r1"));
+    try std.testing.expect(!wf.to_step.contains(wf_test_key(.default, "r1")));
     try std.testing.expectEqual(@as(usize, 0), wf.started_to_advance.items.len);
 
     // A second run: its step_started of this term queues its first step.
     next += 1;
     var pbuf2: [128]u8 = undefined;
-    const second = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, "default:r2", &start, &pbuf2).?;
+    const second = entry_mod.buildCommandEntry(.workflow_start, 0, r.current_term, next, 0, .default, wf_test_key(.default, "r2"), &start, &pbuf2).?;
     out = persistence_mod.Result.start(&second);
     try std.testing.expect(shard.applyEntry(&second, &out));
     next += 1;
     var sb2: [64]u8 = undefined;
-    const own = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, "default:r2", "", &sb2).?;
+    const own = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, wf_test_key(.default, "r2"), "", &sb2).?;
     out = persistence_mod.Result.start(&own);
     try std.testing.expect(shard.applyEntry(&own, &out));
     try std.testing.expectEqual(@as(usize, 1), wf.started_to_advance.items.len);
@@ -12129,7 +12130,7 @@ test "Shard: a start leaves its run to step on every replica; a step_started of 
     // Its step logged twice: the second is refused, and queues nothing.
     next += 1;
     var sb3: [64]u8 = undefined;
-    const again = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, "default:r2", "", &sb3).?;
+    const again = entry_mod.buildCommandEntry(.workflow_step_started, 0, r.current_term, next, 0, .default, wf_test_key(.default, "r2"), "", &sb3).?;
     out = persistence_mod.Result.start(&again);
     try std.testing.expect(shard.applyEntry(&again, &out));
     try std.testing.expect(out.refused() != null);
@@ -19885,7 +19886,7 @@ const SkipState = struct {
             .defs = shard.workflow_handler.definitions.count(),
             .action_runs = ActionsHandler.runCount(shard),
         };
-        if (shard.workflow_handler.definitions.get("default:wf")) |d| {
+        if (shard.workflow_handler.definitions.get(wf_test_key(.default, "wf"))) |d| {
             const n = @min(d.version_owned.len, st.def_version.len);
             @memcpy(st.def_version[0..n], d.version_owned[0..n]);
         }
@@ -19926,9 +19927,9 @@ const HaltCase = enum {
             .kv_malformed => return (try raft.propose(.kv_put, entry_mod.Flags.NONE, "\x01")).index,
             .queue_malformed => return (try raft.propose(.queue_enqueue, entry_mod.Flags.NONE, "\x01")).index,
             .workflow_redefine => {
-                _ = try persistence_mod.proposeEntry(shard, .workflow_create, entry_mod.Flags.NONE, "", "default:wf", WF_YAML);
+                _ = try persistence_mod.proposeEntryIn(shard, .workflow_create, entry_mod.Flags.NONE, .default, wf_test_key(.default, "wf"), WF_YAML);
                 try std.testing.expect(shard.applyCommitted());
-                return (try persistence_mod.proposeEntry(shard, .workflow_create, entry_mod.Flags.NONE, "", "default:wf", "kind: [")).index;
+                return (try persistence_mod.proposeEntryIn(shard, .workflow_create, entry_mod.Flags.NONE, .default, wf_test_key(.default, "wf"), "kind: [")).index;
             },
             .action_malformed => return (try raft.propose(.action_invoke, entry_mod.Flags.NONE, "\x01")).index,
         }
@@ -21801,15 +21802,17 @@ test "Shard: a shard holds a run by its id only in the namespace it was started 
     try two.init();
     defer two.deinit();
     const wh = two.shards[0].workflow_handler;
-    const key = try std.testing.allocator.dupe(u8, "team-a:shared");
+    const team_a = comptime ns_table.Id.of(16);
+    const team_b = comptime ns_table.Id.of(17);
+    const key = try std.testing.allocator.dupe(u8, wf_test_key(team_a, "shared"));
     try wh.runs.put(key, undefined);
     defer {
-        _ = wh.runs.remove("team-a:shared");
+        _ = wh.runs.remove(key);
         std.testing.allocator.free(key);
     }
-    try std.testing.expect(wh.holdsRun("team-a", "shared"));
-    try std.testing.expect(!wh.holdsRun("team-b", "shared"));
-    try std.testing.expect(!wh.holdsRun("team-a", "other"));
+    try std.testing.expect(wh.holdsRun(team_a, "shared"));
+    try std.testing.expect(!wh.holdsRun(team_b, "shared"));
+    try std.testing.expect(!wh.holdsRun(team_a, "other"));
 }
 
 test "Shard: a lookup by a chosen run id two shards hold is refused as a conflict, run on neither" {
@@ -21819,11 +21822,11 @@ test "Shard: a lookup by a chosen run id two shards hold is refused as a conflic
     // Two starts that raced with one id: each shard holds a run of it.
     var keys: [2][]u8 = undefined;
     for (&two.shards, &keys) |*s, *k| {
-        k.* = try std.testing.allocator.dupe(u8, "default:twice");
+        k.* = try std.testing.allocator.dupe(u8, wf_test_key(.default, "twice"));
         try s.workflow_handler.runs.put(k.*, undefined);
     }
     defer for (&two.shards, keys) |*s, k| {
-        _ = s.workflow_handler.runs.remove("default:twice");
+        _ = s.workflow_handler.runs.remove(k);
         std.testing.allocator.free(k);
     };
     const c = try TestClient.open(&two.shards[0]);

@@ -1917,12 +1917,17 @@ pub const StreamHandler = struct {
     };
 
     pub fn readPayloadsForStream(self: *StreamHandler, stream_name: []const u8, namespace: []const u8, after_id: StreamID, limit: usize) PayloadRead {
+        return self.readPayloadsForStreamIn(stream_name, self.namespaceId(namespace), after_id, limit);
+    }
+
+    /// `readPayloadsForStream` for a caller that holds the namespace's id.
+    pub fn readPayloadsForStreamIn(self: *StreamHandler, stream_name: []const u8, ns: router.NamespaceId, after_id: StreamID, limit: usize) PayloadRead {
         var results: [MAX_READ_BATCH][]const u8 = undefined;
         var result_ids: [MAX_READ_BATCH]StreamID = undefined;
         var count: usize = 0;
         const capped = @min(limit, MAX_READ_BATCH);
 
-        const stream_key = stream_mod.streamKey(self.namespaceId(namespace), stream_name);
+        const stream_key = stream_mod.streamKey(ns, stream_name);
 
         var rec_buf: [MAX_READ_BATCH]StreamRecord = undefined;
         const read_n = self.stream.readStreamAfter(stream_key, after_id, null, rec_buf[0..capped]);
