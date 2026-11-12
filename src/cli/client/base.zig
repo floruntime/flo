@@ -22,6 +22,9 @@ pub const Response = struct {
     status: proto.StatusCode,
     data: []const u8,
     allocator: Allocator,
+    /// The answer read state its shard couldn't bring up to date
+    /// (`RESPONSE_STALE`): writes since may be missing from it.
+    stale: bool = false,
 
     pub fn deinit(self: *Response) void {
         if (self.data.len > 0) {
@@ -92,6 +95,26 @@ pub var foreign_server: ?struct { version: u8, table_hash: u64 } = null;
 /// The length an answer claimed when it was over what an answer can hold
 /// (`error.AnswerTooLarge`), for the CLI to name.
 pub var oversized_answer: u32 = 0;
+
+/// Where the CLI warns, once per process, that an answer read stale state.
+/// Null says nothing: the server's own loopback clients and tests read
+/// answers that aren't shown to anyone as they come.
+pub var stale_warning_fd: ?std.posix.fd_t = null;
+var stale_warned = false;
+
+pub const STALE_WARNING = "Warning: this answer may be out of date: the shard that served it is halted, diverged or can't read its log, so writes since may be missing from it. The node's /status says why.\n";
+
+/// Warn again at the next stale answer: the REPL warns once per line.
+pub fn rearmStaleWarning() void {
+    stale_warned = false;
+}
+
+fn noteStale() void {
+    const fd = stale_warning_fd orelse return;
+    if (stale_warned) return;
+    stale_warned = true;
+    _ = @import("stdx").io.writeFd(fd, STALE_WARNING);
+}
 
 /// Flo Protocol Client
 pub const Client = struct {
@@ -298,10 +321,13 @@ pub const Client = struct {
         }
 
         const status: proto.StatusCode = @fromBackingInt(@intCast(response_header.status));
+        const stale = response_header.flags & proto.RESPONSE_STALE != 0;
+        if (stale) noteStale();
         return Response{
             .status = if (self.no_namespace_as_not_found and status == .no_namespace) .not_found else status,
             .data = data,
             .allocator = self.allocator,
+            .stale = stale,
         };
     }
 };
@@ -420,4 +446,39 @@ test "an answer claiming more than an answer can hold is refused before allocati
     try std.testing.expectError(error.AnswerTooLarge, client.sendRequest(.ping, "", "", ""));
     try std.testing.expect(client.stream == null);
     try std.testing.expectEqual(@as(u32, 5 + (1 << 24)), oversized_answer);
+}
+
+test "an answer marked stale says so, once per process, where the CLI warns" {
+    const outcome = @import("../outcome.zig");
+    var pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+    stale_warning_fd = pipe[1];
+    defer {
+        stale_warning_fd = null;
+        stale_warned = false;
+    }
+    for ([_]bool{ false, true, true }) |stale| {
+        const server = if (stale) try outcome.FakeServer.startStale("kept") else try outcome.FakeServer.start(.ok, "fresh");
+        defer server.stop();
+        var ep: [32]u8 = undefined;
+        var client = Client.init(std.testing.allocator, server.endpoint(&ep));
+        defer client.deinit();
+        try client.connect();
+        var resp = try client.sendRequest(.ping, "", "", "");
+        defer resp.deinit();
+        try std.testing.expectEqual(stale, resp.stale);
+    }
+    // Two stale answers, one warning.
+    _ = std.c.close(pipe[1]);
+    pipe[1] = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+    var buf: [2 * STALE_WARNING.len]u8 = undefined;
+    var got: usize = 0;
+    while (true) {
+        const n = std.c.read(pipe[0], buf[got..].ptr, buf.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    try std.testing.expectEqualStrings(STALE_WARNING, buf[0..got]);
 }
