@@ -1,6 +1,6 @@
 //! The KV family's ops. The namespace and key travel in the envelope, so
-//! they aren't fields; for `kv.scan` the key is the prefix, and for the
-//! transaction ops it is the routing key the transaction is pinned by.
+//! they aren't fields; for `kv.scan` the key is the prefix, and for
+//! `kv.txn.begin` it is the key whose {tag} the transaction is pinned to.
 
 const std = @import("std");
 const ops = @import("ops.zig");
@@ -15,7 +15,7 @@ const Defaulted = schema.Defaulted;
 const Record = schema.Record;
 
 /// The largest value a write takes: what one request holds once the
-/// longest key, routing key and every other `kv.set` field are in. KV
+/// longest key and every other `kv.set` field are in. KV
 /// builds its own log entries, sized to the request frame, so the frame is
 /// the bound.
 pub const MAX_VALUE: u32 = @intCast(ops.MAX_REQUEST_BODY - SetOthers.max_size - 4);
@@ -26,7 +26,6 @@ pub const MAX_DOCUMENT: u32 = @intCast(ops.MAX_REQUEST_BODY - JsonSetOthers.max_
 
 const JsonSetOthers = Record(&.{
     .{ .name = "path", .T = Defaulted(String(MAX_PATH), "$") },
-    .{ .name = "routing_key", .T = RoutingKey },
 });
 
 /// `kv.set`'s fields but its value (whose u32 length prefix is the 4).
@@ -34,7 +33,6 @@ const SetOthers = Record(&.{
     .{ .name = "ttl_ms", .T = Optional(Ttl) },
     .{ .name = "condition", .T = Defaulted(schema.Enum(Condition), .always) },
     .{ .name = "cas_version", .T = Optional(Version) },
-    .{ .name = "routing_key", .T = RoutingKey },
     .{ .name = "txn", .T = Txn },
 });
 /// The longest TTL: one that still fits in nanoseconds.
@@ -65,7 +63,6 @@ fn listRoom(comptime others: usize) u32 {
     return @intCast(ops.MAX_RESPONSE_BODY - others);
 }
 
-pub const RoutingKey = Optional(Bytes(ops.MAX_KEY));
 pub const Txn = Optional(Int(u64));
 pub const Version = Int(u64);
 pub const Ttl = DurationMs(MAX_TTL_MS);
@@ -105,12 +102,12 @@ pub const MgetEntry = Record(&.{
 /// A kv.set body carrying only `value`: every other field absent or its
 /// default.
 pub fn plainSetBody(buf: []u8, value: []const u8) schema.EncodeError![]const u8 {
-    return op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null });
+    return op("kv.set").request.encodeInto(buf, .{ .value = value, .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null });
 }
 
-/// A kv.get body that doesn't wait, route or join a transaction.
+/// A kv.get body that doesn't wait or join a transaction.
 pub fn plainGetBody(buf: []u8) schema.EncodeError![]const u8 {
-    return op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .routing_key = null, .txn = null });
+    return op("kv.get").request.encodeInto(buf, .{ .wait_ms = 0, .wait_for = .exists, .txn = null });
 }
 
 /// The op in `table` named `name`; a name not there fails the build.
@@ -120,14 +117,12 @@ pub fn op(comptime name: []const u8) ops.Op {
 }
 
 // Fields several ops share, with the help text their flags carry.
-const routing_key_field: schema.Field = .{ .name = "routing_key", .T = RoutingKey, .doc = "Routing key for shard co-location (same as {tag} in the key)" };
 const txn_field: schema.Field = .{ .name = "txn", .T = Txn, .doc = "Transaction id from `kv txn begin`; omit outside a transaction" };
 const cas_field: schema.Field = .{ .name = "cas_version", .T = Optional(Version), .doc = "Only if the key's version is this; 0 means the key doesn't exist" };
 const path_field: schema.Field = .{ .name = "path", .T = Defaulted(String(MAX_PATH), "$"), .doc = "JSONPath expression" };
 const txn_id_field: schema.Field = .{ .name = "txn", .T = Int(u64), .doc = "Transaction id from `kv txn begin`" };
 
 /// Short flags most KV commands share.
-const rk_short: ops.Short = .{ .field = "routing_key", .letter = 'r' };
 const txn_short: ops.Short = .{ .field = "txn", .letter = 't' };
 
 pub const table = [_]ops.Op{
@@ -140,7 +135,6 @@ pub const table = [_]ops.Op{
         .request = Record(&.{
             .{ .name = "wait_ms", .T = Defaulted(DurationMs(MAX_WAIT_MS), 0), .doc = "How long to wait: milliseconds, or a number and a unit (500ms, 30s, 5m); at most 5m; 0 doesn't wait" },
             .{ .name = "wait_for", .T = Defaulted(schema.Enum(WaitFor), .exists), .doc = "What to wait for: exists (answers at once if the key exists) or change (the next version); on timeout, a change wait prints the unchanged value" },
-            routing_key_field,
             txn_field,
         }),
         .response = Record(&.{
@@ -151,13 +145,12 @@ pub const table = [_]ops.Op{
         .cli = .{
             .render = .raw,
             .show = "value",
-            .short = &.{ .{ .field = "wait_ms", .letter = 'w' }, rk_short, txn_short },
+            .short = &.{ .{ .field = "wait_ms", .letter = 'w' }, txn_short },
             .examples = &.{
                 "flo kv get mykey",
                 "flo kv get mykey -o json",
                 "flo kv get mykey --wait-ms 5s",
                 "flo kv get mykey --wait-ms 5s --wait-for change",
-                "flo kv get balance:alice --routing-key user:123",
             },
         },
         .doc = "Read a key's value, waiting up to wait_ms for it to exist or change.",
@@ -173,20 +166,18 @@ pub const table = [_]ops.Op{
             .{ .name = "ttl_ms", .T = Optional(Ttl), .doc = "Time to live: milliseconds, or a number and a unit (500ms, 30s, 5m, 1h, 1d); omitted for none" },
             .{ .name = "condition", .T = Defaulted(schema.Enum(Condition), .always), .doc = "always, if_absent (only if the key doesn't exist) or if_present (only if it does)" },
             cas_field,
-            routing_key_field,
             txn_field,
         }),
         // Null inside a transaction: the write has no version until commit.
         .response = Record(&.{.{ .name = "version", .T = Optional(Version), .doc = "The key's new version" }}),
         .cli = .{
             .args = &.{"value"},
-            .short = &.{ rk_short, txn_short },
+            .short = &.{txn_short},
             .examples = &.{
                 "flo kv set mykey myvalue",
                 "flo kv set mykey myvalue --ttl-ms 1h",
                 "flo kv set mykey myvalue --condition if_absent",
                 "flo kv set mykey newvalue --cas-version 42",
-                "flo kv set balance:alice 500 --routing-key user:123",
             },
         },
         .doc = "Set a key's value.",
@@ -196,10 +187,10 @@ pub const table = [_]ops.Op{
         .code = 0x103,
         .class = .write,
         .txn = "txn",
-        .request = Record(&.{ cas_field, routing_key_field, txn_field }),
+        .request = Record(&.{ cas_field, txn_field }),
         // Null inside a transaction, where it isn't known until commit.
         .response = Record(&.{.{ .name = "existed", .T = Optional(Bool), .doc = "Whether the key existed" }}),
-        .cli = .{ .short = &.{ rk_short, txn_short } },
+        .cli = .{ .short = &.{txn_short} },
         .doc = "Delete a key; deleting one that doesn't exist succeeds.",
     },
     .{
@@ -236,27 +227,22 @@ pub const table = [_]ops.Op{
         .request = Record(&.{
             .{ .name = "limit", .T = Defaulted(schema.Range(u32, 1, MAX_HISTORY), 10), .doc = "Most versions to show" },
             .{ .name = "before_version", .T = Optional(Version), .doc = "Only versions older than this one; omitted for from the newest" },
-            routing_key_field,
         }),
         .response = Record(&.{
             .{ .name = "versions", .T = schema.BoundedList(HistoryEntry, MAX_HISTORY, listRoom(1 + Bool.max_size)), .doc = "The key's versions, newest first" },
             .{ .name = "more", .T = Bool, .doc = "Whether older kept versions follow: ask again with before_version set to the last one here" },
         }),
-        .cli = .{ .expose = .hand, .render = .table, .short = &.{ .{ .field = "limit", .letter = 'l' }, rk_short } },
+        .cli = .{ .expose = .hand, .render = .table, .short = &.{.{ .field = "limit", .letter = 'l' }} },
         .doc = "A key's versions, newest first, a page at a time.",
     },
     .{
         .name = "kv.mget",
         .code = 0x102,
         .class = .read,
-        // With a routing key the batch is answered on its shard; without
-        // one it runs where it lands and looks each key up on its own.
-        .route = .{ .field = "routing_key" },
+        // It runs where it lands and gathers keys other shards own.
+        .route = .local,
         .request = Record(&.{
-            .{ .name = "keys", .T = schema.BoundedList(Bytes(ops.MAX_KEY), MAX_MGET, ops.MAX_REQUEST_BODY - 2 - RoutingKey.max_size), .doc = "The keys to read" },
-            // Every key was written with this routing key: all are looked
-            // up on its shard. Without it, each key is on its own.
-            .{ .name = "routing_key", .T = RoutingKey, .doc = "The routing key every key was written with; all are read from its shard" },
+            .{ .name = "keys", .T = schema.BoundedList(Bytes(ops.MAX_KEY), MAX_MGET, ops.MAX_REQUEST_BODY - 2), .doc = "The keys to read" },
         }),
         .response = Record(&.{
             // In the order asked, as many as fit one answer.
@@ -277,7 +263,6 @@ pub const table = [_]ops.Op{
         .txn = "txn",
         .request = Record(&.{
             .{ .name = "delta", .T = Defaulted(Int(i64), 1), .doc = "What to add (may be negative)" },
-            routing_key_field,
             txn_field,
         }),
         // Both null inside a transaction: the sum isn't known until commit.
@@ -288,7 +273,7 @@ pub const table = [_]ops.Op{
         .cli = .{
             .render = .raw,
             .show = "value",
-            .short = &.{ .{ .field = "delta", .letter = 'd' }, rk_short, txn_short },
+            .short = &.{ .{ .field = "delta", .letter = 'd' }, txn_short },
             .examples = &.{ "flo kv incr counter", "flo kv incr counter --delta -1" },
         },
         .doc = "Add delta to a key's 8-byte counter, starting from 0.",
@@ -302,12 +287,11 @@ pub const table = [_]ops.Op{
             // 0 clears the key's TTL.
             .{ .name = "ttl_ms", .T = Ttl, .doc = "TTL from now: milliseconds, or a number and a unit (500ms, 30s, 5m, 1h, 1d); 0 clears it" },
             cas_field,
-            routing_key_field,
             txn_field,
         }),
         .response = Record(&.{}),
         .cli = .{
-            .short = &.{ rk_short, txn_short },
+            .short = &.{txn_short},
             .examples = &.{ "flo kv expire session:abc --ttl-ms 1h", "flo kv expire session:abc --ttl-ms 0" },
         },
         .doc = "Set or clear (ttl_ms 0) a key's TTL.",
@@ -317,19 +301,19 @@ pub const table = [_]ops.Op{
         .code = 0x115,
         .class = .read,
         .txn = "txn",
-        .request = Record(&.{ routing_key_field, txn_field }),
+        .request = Record(&.{txn_field}),
         .response = Record(&.{
             .{ .name = "exists", .T = Bool, .doc = "Whether the key exists" },
             .{ .name = "version", .T = Version, .doc = "Its version; 0 for a write buffered in a transaction" },
         }),
-        .cli = .{ .absent = "exists", .short = &.{ rk_short, txn_short } },
+        .cli = .{ .absent = "exists", .short = &.{txn_short} },
         .doc = "Whether a key exists, and its version (exit 0 if it does, 1 if not).",
     },
     .{
         .name = "kv.json.get",
         .code = 0x10C,
         .class = .read,
-        .request = Record(&.{ path_field, routing_key_field }),
+        .request = Record(&.{path_field}),
         .response = Record(&.{
             .{ .name = "version", .T = Version, .doc = "The key's version" },
             .{ .name = "document", .T = Bytes(MAX_VALUE), .doc = "The JSON at the path" },
@@ -337,7 +321,6 @@ pub const table = [_]ops.Op{
         .cli = .{
             .render = .raw,
             .show = "document",
-            .short = &.{rk_short},
             .examples = &.{ "flo kv json get user:123", "flo kv json get user:123 --path '$.addresses[0].city'" },
         },
         .doc = "Read the JSON at a path in a key's document.",
@@ -350,12 +333,10 @@ pub const table = [_]ops.Op{
         .request = Record(&.{
             path_field,
             .{ .name = "document", .T = schema.Parsed("json", MAX_DOCUMENT), .doc = "The JSON to put at the path" },
-            routing_key_field,
         }),
         .response = Record(&.{.{ .name = "version", .T = Version, .doc = "The key's new version" }}),
         .cli = .{
             .args = &.{"document"},
-            .short = &.{rk_short},
             .examples = &.{ "flo kv json set user:123 '{\"name\":\"alice\"}'", "flo kv json set user:123 '\"bob\"' --path '$.name'" },
         },
         .doc = "Set the JSON at a path in a key's document; $ on a missing key writes the whole document.",
@@ -364,10 +345,9 @@ pub const table = [_]ops.Op{
         .name = "kv.json.del",
         .code = 0x10E,
         .class = .write,
-        .request = Record(&.{ path_field, routing_key_field }),
+        .request = Record(&.{path_field}),
         // Null when the path is the whole document, which deletes the key.
         .response = Record(&.{.{ .name = "version", .T = Optional(Version), .doc = "The key's new version; none when the key was deleted" }}),
-        .cli = .{ .short = &.{rk_short} },
         .doc = "Delete the JSON at a path; the path $ deletes the key.",
     },
     .{
@@ -381,8 +361,8 @@ pub const table = [_]ops.Op{
             .{ .name = "pinned", .T = Int(u64), .doc = "The routing hash it is pinned to" },
         }),
         .cli = .{
-            .key = .{ .name = "routing-key", .doc = "The routing key every op in the transaction gives" },
-            .examples = &.{"flo kv txn begin user:123"},
+            .key = .{ .name = "key", .doc = "Pins the transaction to this key's {tag}, or to the whole key when it has none; every key in the transaction must route with it" },
+            .examples = &.{"flo kv txn begin {user:1}:balance"},
         },
         .doc = "Begin a transaction on the shard that owns the key.",
     },
@@ -426,8 +406,8 @@ test "kv ops: the table passes its rules, and a value is as large as the frame a
     try std.testing.expectEqual(@as(usize, 15), table.len);
     // The frame less its header, the longest namespace and key, and the
     // other kv.set fields at their largest.
-    try std.testing.expectEqual(@as(u32, 253817), MAX_VALUE);
-    try std.testing.expectEqual(@as(u32, 252819), MAX_DOCUMENT);
+    try std.testing.expectEqual(@as(u32, 257916), MAX_VALUE);
+    try std.testing.expectEqual(@as(u32, 256918), MAX_DOCUMENT);
     // A value that large still comes back in history and mget, one a page.
     inline for (.{ HistoryEntry, MgetEntry }) |E| try std.testing.expect(E.max_size < ops.MAX_RESPONSE_BODY);
 }

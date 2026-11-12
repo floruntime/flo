@@ -100,8 +100,6 @@ pub fn pieceBodySize(keys: []const []const u8) !usize {
 
 fn encodePiece(w: *schema.Writer, keys: []const []const u8) !void {
     try Keys.encodeSlice(w, keys);
-    // No routing key: the owner looks each key up on its own.
-    try Request.field_list[1].T.encode(w, null);
 }
 
 /// The mget's answer from its pieces' answers (`answers[p]` answers piece

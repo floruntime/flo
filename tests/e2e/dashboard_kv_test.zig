@@ -126,9 +126,9 @@ test "e2e/dashboard: listing keys under heavy writes always answers, and the nod
                 const i = self.next.fetchAdd(1, .monotonic);
                 const k = std.fmt.bufPrint(&key, "storm-{d}", .{i}) catch unreachable;
                 var r = if (i % 3 == 2)
-                    src.cli_client.kv.call(&conn, "kv.delete", "", k, .{ .cas_version = null, .routing_key = null, .txn = null }) catch return
+                    src.cli_client.kv.call(&conn, "kv.delete", "", k, .{ .cas_version = null, .txn = null }) catch return
                 else
-                    src.cli_client.kv.set(&conn, "", k, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .routing_key = null, .txn = null }) catch return;
+                    src.cli_client.kv.set(&conn, "", k, .{ .value = "v", .ttl_ms = null, .condition = .always, .cas_version = null, .txn = null }) catch return;
                 r.deinit();
                 _ = self.writes.fetchAdd(1, .monotonic);
             }

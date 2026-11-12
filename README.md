@@ -169,7 +169,7 @@ Client → Shard → Dispatcher → Handler
 
 | Component | Role |
 |-----------|------|
-| **Acceptor** | Dedicated thread. Accepts TCP, peeks first request, resolves routing key → shard, hands off fd via pipe |
+| **Acceptor** | Dedicated thread. Accepts TCP, peeks first request, routes it by its key's `{tag}` → shard, hands off fd via pipe |
 | **Reactor** | Single unified event loop per shard (kqueue/io_uring). Handles all I/O, timers, and inbox draining |
 | **Dispatcher** | Table-driven opcode→handler routing (~300 lines). Handlers self-register |
 | **Router** | Hash-based routing: `hash(key) → partition → shard` |
