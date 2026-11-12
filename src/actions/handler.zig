@@ -142,6 +142,9 @@ fn ownerOf(shard: *Shard, ns: NamespaceId, name: []const u8) u16 {
 /// Propose a schema'd action entry, encoded in the shard's entry buffer
 /// when it fits (a run's input can make an invoke larger).
 fn propose(shard: *Shard, comptime etype: EntryType, body: anytype) !persistence.ProposeResult {
+    // An entry naming no namespace halts every replica that applies it, so
+    // it is refused here rather than trusted to dispatch never sending one.
+    if (@hasField(@TypeOf(body), "ns")) if (body.ns == 0) return error.NamespaceUnknown;
     const P = ae.Payload(@backingInt(etype));
     const size = try P.encodedSize(body);
     if (size <= shard.entry_buf.len) return shard.raft_node.propose(etype, Flags.NONE, try P.encodeInto(shard.entry_buf[0..size], body));
@@ -1259,7 +1262,10 @@ pub const ActionsHandler = struct {
         var diag: schema.Diagnostic = .{};
         const got = AwaitResponse.decodeAll(resp.data, &diag) catch return;
         const task = got.task orelse return;
-        // The task names its namespace as the client does.
+        // The task names its namespace as the client does. One sent with
+        // no name had none the node could name: it isn't "default", so it
+        // is held until its lease runs out instead.
+        if (task.namespace.len == 0) return;
         shard.actions_handler.sendAbandon(shard, shard.namespaceId(task.namespace), "", task);
     }
 
@@ -2356,4 +2362,12 @@ test "action info's latency: percentiles of the completed runs, none without one
     try std.testing.expectEqual(@as(u64, 50), l.p50_ms);
     try std.testing.expectEqual(@as(u64, 95), l.p95_ms);
     try std.testing.expectEqual(@as(u64, 100), l.max_ms);
+}
+
+test "an action entry naming no namespace is refused before it is proposed" {
+    // The guard answers before the shard is touched: a committed entry with
+    // namespace 0 would halt every replica that applied it.
+    const shard: *Shard = undefined;
+    try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_register, ae.Register.Value{ .ns = 0, .name = "a", .owner = "", .lease_ms = 1000, .max_attempts = 1 }));
+    try std.testing.expectError(error.NamespaceUnknown, propose(shard, .action_delete, ae.Delete.Value{ .ns = 0, .name = "a" }));
 }

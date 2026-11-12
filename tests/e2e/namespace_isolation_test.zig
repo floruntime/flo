@@ -628,7 +628,8 @@ fn verifyActions(ctx: *stdx.testing.TestContext, restarted: bool) !void {
         var want: [80]u8 = undefined;
         try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "Payload: {s}", .{try payload(&buf, ns, prior)}), line(taken, "Payload: ") orelse return error.NoPayload);
         const completed = try run(ctx, &.{ "worker", "complete", task, "--worker-id", "w", "-n", ns }, 0);
-        testing.allocator.free(completed);
+        defer testing.allocator.free(completed);
+        try testing.expectEqualStrings("OK", completed);
 
         // "only" has a run in the second namespace alone.
         if (i == 0) {
