@@ -643,6 +643,19 @@ pub const ShardMetrics = struct {
     /// Prometheus see a plain duration, not a raw clock reading.
     persist_failures: Atomic(u64) = Atomic(u64).init(0),
     flushes_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// HARDSTATE writes (term + vote) that could not be persisted (cumulative),
+    /// and how long the current run of failures has lasted in ms (0 while they
+    /// persist), computed at publish. While a run holds, each unpersisted vote
+    /// or term change is refused; the next good persist ends the run.
+    hardstate_failures: Atomic(u64) = Atomic(u64).init(0),
+    hardstate_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
+    /// Times the in-memory segment buffer could not grow (out of memory) on a
+    /// Raft append — committed or not — cumulative, and how long the current run
+    /// has lasted in ms (0 while buffering succeeds), computed at publish. The
+    /// entry is not buffered for the next flush; free memory, then restart or
+    /// resync.
+    buffer_failures: Atomic(u64) = Atomic(u64).init(0),
+    buffer_failing_for_ms: Atomic(u64) = Atomic(u64).init(0),
     /// 1 while the shard is offline on this node.
     offline: Atomic(u8) = Atomic(u8).init(0),
     /// 1 while a committed entry cannot be read to apply it. Alert on this:
@@ -830,6 +843,10 @@ pub const ShardMetrics = struct {
         duty_oldest_held_ms: u64,
         persist_failures: u64,
         flushes_failing_for_ms: u64,
+        hardstate_failures: u64,
+        hardstate_failing_for_ms: u64,
+        buffer_failures: u64,
+        buffer_failing_for_ms: u64,
         offline: u8,
         read_blocked: u8,
         read_blocks_total: u64,
@@ -875,6 +892,10 @@ pub const ShardMetrics = struct {
             .duty_oldest_held_ms = self.duty_oldest_held_ms.load(.monotonic),
             .persist_failures = self.persist_failures.load(.monotonic),
             .flushes_failing_for_ms = self.flushes_failing_for_ms.load(.monotonic),
+            .hardstate_failures = self.hardstate_failures.load(.monotonic),
+            .hardstate_failing_for_ms = self.hardstate_failing_for_ms.load(.monotonic),
+            .buffer_failures = self.buffer_failures.load(.monotonic),
+            .buffer_failing_for_ms = self.buffer_failing_for_ms.load(.monotonic),
             .offline = self.offline.load(.monotonic),
             .read_blocked = self.read_blocked.load(.monotonic),
             .read_blocks_total = self.read_blocks_total.load(.monotonic),
@@ -1657,6 +1678,10 @@ fn writeShardMetrics(writer: anytype, snap: ShardMetrics.Snapshot) !void {
     try writer.print("flo_shard_duplicate_index_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.duplicate_index });
     try writer.print("flo_shard_persist_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.persist_failures });
     try writer.print("flo_shard_flushes_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.flushes_failing_for_ms / 1000, snap.flushes_failing_for_ms % 1000 });
+    try writer.print("flo_shard_hardstate_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.hardstate_failures });
+    try writer.print("flo_shard_hardstate_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.hardstate_failing_for_ms / 1000, snap.hardstate_failing_for_ms % 1000 });
+    try writer.print("flo_shard_buffer_failures_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.buffer_failures });
+    try writer.print("flo_shard_buffer_failing_for_seconds{{shard_id=\"{d}\"}} {d}.{d:0>3}\n", .{ snap.shard_id, snap.buffer_failing_for_ms / 1000, snap.buffer_failing_for_ms % 1000 });
     try writer.print("flo_shard_offline{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.offline });
     try writer.print("flo_shard_read_blocked{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocked });
     try writer.print("flo_shard_read_blocks_total{{shard_id=\"{d}\"}} {d}\n", .{ snap.shard_id, snap.read_blocks_total });

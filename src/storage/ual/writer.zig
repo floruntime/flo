@@ -42,10 +42,17 @@ pub const SegmentWriter = struct {
     commit_index_at_seal: u64,
     /// Whether a buffered entry is a repair skip.
     holds_skip: bool = false,
-    /// Entries the append hook could not buffer (allocation failure). Each
-    /// one is an entry that would be missing from disk after a restart, so
-    /// it is counted and logged rather than dropped silently.
+    /// Times the in-memory segment buffer could not grow (out of memory) on a
+    /// Raft append — committed or not — so the entry was not buffered for the
+    /// next flush. Counted and logged rather than dropped silently; a non-zero
+    /// count means memory ran out, so free memory, then restart or resync.
     buffer_failures: u64,
+    /// A raw monotonic reading when the current run of buffer failures began, or
+    /// 0 while buffering succeeds. Kept internal — set on the first failure of a
+    /// run and cleared when buffering catches up (in the append hook, or in
+    /// rebufferGap behind a sync gap); `/status` and metrics publish the elapsed
+    /// duration computed from it, not this raw reading.
+    buffer_failing_since_ms: u64 = 0,
     /// The first index that could not be buffered, when `stop_at_gap`.
     /// Nothing after it is buffered either, so a flush never writes past a
     /// gap; the owner re-buffers from here before flushing.
