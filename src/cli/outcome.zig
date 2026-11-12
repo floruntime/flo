@@ -64,6 +64,7 @@ pub fn ofStatus(status: proto.StatusCode) Error {
         .unauthorized,
         .conflict,
         .internal_error,
+        .limit,
         _,
         => error.Refused,
     };
@@ -385,7 +386,7 @@ fn statusName(status: proto.StatusCode) []const u8 {
 test "outcome: each status has its exit code" {
     try std.testing.expectEqual(@as(u8, 1), exitCode(ofStatus(.not_found)));
     try std.testing.expectEqual(@as(u8, 1), exitCode(ofStatus(.no_namespace)));
-    inline for (.{ .bad_request, .conflict, .unauthorized, .group_locked, .internal_error, .error_generic }) |s|
+    inline for (.{ .bad_request, .conflict, .unauthorized, .group_locked, .internal_error, .error_generic, .limit }) |s|
         try std.testing.expectEqual(@as(u8, 3), exitCode(ofStatus(s)));
     inline for (.{ .overloaded, .rate_limited, .unavailable }) |s|
         try std.testing.expectEqual(@as(u8, 4), exitCode(ofStatus(s)));
